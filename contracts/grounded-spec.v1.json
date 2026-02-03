@@ -1,0 +1,1178 @@
+{
+  "$defs": {
+    "APIField": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "required": {
+          "title": "Required",
+          "type": "boolean"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        }
+      },
+      "required": [
+        "name",
+        "type",
+        "required"
+      ],
+      "title": "APIField",
+      "type": "object"
+    },
+    "APIRequirement": {
+      "additionalProperties": false,
+      "properties": {
+        "api_req_id": {
+          "title": "Api Req Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "method": {
+          "enum": [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE"
+          ],
+          "title": "Method",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "purpose": {
+          "title": "Purpose",
+          "type": "string"
+        },
+        "request_fields": {
+          "items": {
+            "$ref": "#/$defs/APIField"
+          },
+          "title": "Request Fields",
+          "type": "array"
+        },
+        "response_fields": {
+          "items": {
+            "$ref": "#/$defs/APIField"
+          },
+          "title": "Response Fields",
+          "type": "array"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceLink"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "auth_required": {
+          "default": false,
+          "title": "Auth Required",
+          "type": "boolean"
+        },
+        "existing_in_template": {
+          "default": false,
+          "title": "Existing In Template",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "api_req_id",
+        "name",
+        "method",
+        "path",
+        "purpose",
+        "evidence"
+      ],
+      "title": "APIRequirement",
+      "type": "object"
+    },
+    "Actor": {
+      "additionalProperties": false,
+      "properties": {
+        "actor_id": {
+          "title": "Actor Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "role": {
+          "title": "Role",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "permissions_hint": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Permissions Hint",
+          "type": "array"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceLink"
+          },
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "actor_id",
+        "name",
+        "role",
+        "description",
+        "evidence"
+      ],
+      "title": "Actor",
+      "type": "object"
+    },
+    "Assumption": {
+      "additionalProperties": false,
+      "properties": {
+        "assumption_id": {
+          "title": "Assumption Id",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "active",
+            "confirmed",
+            "rejected"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "rationale": {
+          "title": "Rationale",
+          "type": "string"
+        },
+        "impact": {
+          "default": "medium",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Impact",
+          "type": "string"
+        }
+      },
+      "required": [
+        "assumption_id",
+        "text",
+        "status",
+        "rationale"
+      ],
+      "title": "Assumption",
+      "type": "object"
+    },
+    "Contradiction": {
+      "additionalProperties": false,
+      "properties": {
+        "contradiction_id": {
+          "title": "Contradiction Id",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "left_side": {
+          "title": "Left Side",
+          "type": "string"
+        },
+        "right_side": {
+          "title": "Right Side",
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "resolution_hint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolution Hint"
+        }
+      },
+      "required": [
+        "contradiction_id",
+        "description",
+        "left_side",
+        "right_side",
+        "severity"
+      ],
+      "title": "Contradiction",
+      "type": "object"
+    },
+    "DocRef": {
+      "additionalProperties": false,
+      "properties": {
+        "doc_ref_id": {
+          "title": "Doc Ref Id",
+          "type": "string"
+        },
+        "source_type": {
+          "enum": [
+            "project_doc",
+            "openapi",
+            "codebase",
+            "platform_doc",
+            "user_prompt",
+            "assumption"
+          ],
+          "title": "Source Type",
+          "type": "string"
+        },
+        "file_path": {
+          "title": "File Path",
+          "type": "string"
+        },
+        "chunk_id": {
+          "title": "Chunk Id",
+          "type": "string"
+        },
+        "section_title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Section Title"
+        },
+        "snippet": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Snippet"
+        },
+        "relevance": {
+          "title": "Relevance",
+          "type": "number"
+        }
+      },
+      "required": [
+        "doc_ref_id",
+        "source_type",
+        "file_path",
+        "chunk_id",
+        "relevance"
+      ],
+      "title": "DocRef",
+      "type": "object"
+    },
+    "DomainEntity": {
+      "additionalProperties": false,
+      "properties": {
+        "entity_id": {
+          "title": "Entity Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "attributes": {
+          "items": {
+            "$ref": "#/$defs/EntityAttribute"
+          },
+          "title": "Attributes",
+          "type": "array"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceLink"
+          },
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "entity_id",
+        "name",
+        "description",
+        "attributes",
+        "evidence"
+      ],
+      "title": "DomainEntity",
+      "type": "object"
+    },
+    "EntityAttribute": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "string",
+            "text",
+            "int",
+            "float",
+            "bool",
+            "date",
+            "datetime",
+            "phone",
+            "email",
+            "enum",
+            "object",
+            "array",
+            "uuid"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "required": {
+          "title": "Required",
+          "type": "boolean"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "pii": {
+          "default": false,
+          "title": "Pii",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "type",
+        "required"
+      ],
+      "title": "EntityAttribute",
+      "type": "object"
+    },
+    "EvidenceLink": {
+      "additionalProperties": false,
+      "properties": {
+        "doc_ref_id": {
+          "title": "Doc Ref Id",
+          "type": "string"
+        },
+        "evidence_type": {
+          "enum": [
+            "explicit",
+            "derived",
+            "cross_checked"
+          ],
+          "title": "Evidence Type",
+          "type": "string"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Note"
+        }
+      },
+      "required": [
+        "doc_ref_id",
+        "evidence_type"
+      ],
+      "title": "EvidenceLink",
+      "type": "object"
+    },
+    "FlowStep": {
+      "additionalProperties": false,
+      "properties": {
+        "step_id": {
+          "title": "Step Id",
+          "type": "string"
+        },
+        "order": {
+          "title": "Order",
+          "type": "integer"
+        },
+        "actor_id": {
+          "title": "Actor Id",
+          "type": "string"
+        },
+        "action": {
+          "title": "Action",
+          "type": "string"
+        },
+        "expected_system_response": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected System Response"
+        },
+        "input_data": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Input Data",
+          "type": "array"
+        },
+        "output_data": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Output Data",
+          "type": "array"
+        }
+      },
+      "required": [
+        "step_id",
+        "order",
+        "actor_id",
+        "action"
+      ],
+      "title": "FlowStep",
+      "type": "object"
+    },
+    "IntegrationRequirement": {
+      "additionalProperties": false,
+      "properties": {
+        "integration_req_id": {
+          "title": "Integration Req Id",
+          "type": "string"
+        },
+        "system_name": {
+          "title": "System Name",
+          "type": "string"
+        },
+        "direction": {
+          "enum": [
+            "inbound",
+            "outbound",
+            "bidirectional"
+          ],
+          "title": "Direction",
+          "type": "string"
+        },
+        "purpose": {
+          "title": "Purpose",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceLink"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "auth_type": {
+          "enum": [
+            "none",
+            "api_key",
+            "bearer",
+            "oauth2",
+            "telegram_initdata",
+            "custom"
+          ],
+          "title": "Auth Type",
+          "type": "string"
+        },
+        "contract_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Contract Ref"
+        }
+      },
+      "required": [
+        "integration_req_id",
+        "system_name",
+        "direction",
+        "purpose",
+        "evidence",
+        "auth_type"
+      ],
+      "title": "IntegrationRequirement",
+      "type": "object"
+    },
+    "Metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "workspace_id": {
+          "title": "Workspace Id",
+          "type": "string"
+        },
+        "conversation_id": {
+          "title": "Conversation Id",
+          "type": "string"
+        },
+        "prompt_turn_id": {
+          "title": "Prompt Turn Id",
+          "type": "string"
+        },
+        "template_revision_id": {
+          "title": "Template Revision Id",
+          "type": "string"
+        },
+        "language": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Language"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Created At"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "conversation_id",
+        "prompt_turn_id",
+        "template_revision_id"
+      ],
+      "title": "Metadata",
+      "type": "object"
+    },
+    "NonFunctionalRequirement": {
+      "additionalProperties": false,
+      "properties": {
+        "nfr_id": {
+          "title": "Nfr Id",
+          "type": "string"
+        },
+        "category": {
+          "enum": [
+            "performance",
+            "maintainability",
+            "observability",
+            "portability",
+            "testability",
+            "usability"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "priority": {
+          "enum": [
+            "must",
+            "should",
+            "could"
+          ],
+          "title": "Priority",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceLink"
+          },
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "nfr_id",
+        "category",
+        "description",
+        "priority",
+        "evidence"
+      ],
+      "title": "NonFunctionalRequirement",
+      "type": "object"
+    },
+    "PersistenceRequirement": {
+      "additionalProperties": false,
+      "properties": {
+        "persistence_req_id": {
+          "title": "Persistence Req Id",
+          "type": "string"
+        },
+        "entity_id": {
+          "title": "Entity Id",
+          "type": "string"
+        },
+        "operation": {
+          "enum": [
+            "create",
+            "read",
+            "update",
+            "delete",
+            "list"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "storage_type": {
+          "enum": [
+            "postgres",
+            "redis",
+            "memory",
+            "external"
+          ],
+          "title": "Storage Type",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceLink"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "retention_policy": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Retention Policy"
+        }
+      },
+      "required": [
+        "persistence_req_id",
+        "entity_id",
+        "operation",
+        "storage_type",
+        "evidence"
+      ],
+      "title": "PersistenceRequirement",
+      "type": "object"
+    },
+    "PlatformConstraint": {
+      "additionalProperties": false,
+      "properties": {
+        "constraint_id": {
+          "title": "Constraint Id",
+          "type": "string"
+        },
+        "category": {
+          "enum": [
+            "sdk",
+            "theme",
+            "viewport",
+            "navigation",
+            "button_api",
+            "launch_context",
+            "storage",
+            "security"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "rule": {
+          "title": "Rule",
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceLink"
+          },
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "constraint_id",
+        "category",
+        "rule",
+        "severity",
+        "evidence"
+      ],
+      "title": "PlatformConstraint",
+      "type": "object"
+    },
+    "PreviewProfile": {
+      "enum": [
+        "telegram_mock",
+        "max_mock",
+        "web_preview"
+      ],
+      "title": "PreviewProfile",
+      "type": "string"
+    },
+    "SecurityRequirement": {
+      "additionalProperties": false,
+      "properties": {
+        "security_req_id": {
+          "title": "Security Req Id",
+          "type": "string"
+        },
+        "category": {
+          "enum": [
+            "auth",
+            "input_validation",
+            "pii",
+            "secret_management",
+            "telegram_initdata",
+            "access_control",
+            "logging",
+            "rate_limit"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "rule": {
+          "title": "Rule",
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceLink"
+          },
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "security_req_id",
+        "category",
+        "rule",
+        "severity",
+        "evidence"
+      ],
+      "title": "SecurityRequirement",
+      "type": "object"
+    },
+    "TargetPlatform": {
+      "enum": [
+        "telegram_mini_app",
+        "max_mini_app"
+      ],
+      "title": "TargetPlatform",
+      "type": "string"
+    },
+    "UIRequirement": {
+      "additionalProperties": false,
+      "properties": {
+        "req_id": {
+          "title": "Req Id",
+          "type": "string"
+        },
+        "category": {
+          "enum": [
+            "screen",
+            "component",
+            "form",
+            "navigation",
+            "theme",
+            "responsive",
+            "feedback",
+            "validation"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "priority": {
+          "enum": [
+            "must",
+            "should",
+            "could"
+          ],
+          "title": "Priority",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceLink"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "screen_hint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Screen Hint"
+        }
+      },
+      "required": [
+        "req_id",
+        "category",
+        "description",
+        "priority",
+        "evidence"
+      ],
+      "title": "UIRequirement",
+      "type": "object"
+    },
+    "Unknown": {
+      "additionalProperties": false,
+      "properties": {
+        "unknown_id": {
+          "title": "Unknown Id",
+          "type": "string"
+        },
+        "question": {
+          "title": "Question",
+          "type": "string"
+        },
+        "impact": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Impact",
+          "type": "string"
+        },
+        "suggested_resolution": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Suggested Resolution"
+        }
+      },
+      "required": [
+        "unknown_id",
+        "question",
+        "impact"
+      ],
+      "title": "Unknown",
+      "type": "object"
+    },
+    "UserFlow": {
+      "additionalProperties": false,
+      "properties": {
+        "flow_id": {
+          "title": "Flow Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "goal": {
+          "title": "Goal",
+          "type": "string"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/FlowStep"
+          },
+          "title": "Steps",
+          "type": "array"
+        },
+        "acceptance_criteria": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Acceptance Criteria",
+          "type": "array"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceLink"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "preconditions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Preconditions",
+          "type": "array"
+        },
+        "postconditions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Postconditions",
+          "type": "array"
+        },
+        "error_paths": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Error Paths",
+          "type": "array"
+        }
+      },
+      "required": [
+        "flow_id",
+        "name",
+        "goal",
+        "steps",
+        "acceptance_criteria",
+        "evidence"
+      ],
+      "title": "UserFlow",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0",
+      "default": "1.0.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "metadata": {
+      "$ref": "#/$defs/Metadata"
+    },
+    "target_platform": {
+      "$ref": "#/$defs/TargetPlatform"
+    },
+    "preview_profile": {
+      "$ref": "#/$defs/PreviewProfile"
+    },
+    "product_goal": {
+      "title": "Product Goal",
+      "type": "string"
+    },
+    "actors": {
+      "items": {
+        "$ref": "#/$defs/Actor"
+      },
+      "title": "Actors",
+      "type": "array"
+    },
+    "domain_entities": {
+      "items": {
+        "$ref": "#/$defs/DomainEntity"
+      },
+      "title": "Domain Entities",
+      "type": "array"
+    },
+    "user_flows": {
+      "items": {
+        "$ref": "#/$defs/UserFlow"
+      },
+      "title": "User Flows",
+      "type": "array"
+    },
+    "ui_requirements": {
+      "items": {
+        "$ref": "#/$defs/UIRequirement"
+      },
+      "title": "Ui Requirements",
+      "type": "array"
+    },
+    "api_requirements": {
+      "items": {
+        "$ref": "#/$defs/APIRequirement"
+      },
+      "title": "Api Requirements",
+      "type": "array"
+    },
+    "persistence_requirements": {
+      "items": {
+        "$ref": "#/$defs/PersistenceRequirement"
+      },
+      "title": "Persistence Requirements",
+      "type": "array"
+    },
+    "integration_requirements": {
+      "items": {
+        "$ref": "#/$defs/IntegrationRequirement"
+      },
+      "title": "Integration Requirements",
+      "type": "array"
+    },
+    "security_requirements": {
+      "items": {
+        "$ref": "#/$defs/SecurityRequirement"
+      },
+      "title": "Security Requirements",
+      "type": "array"
+    },
+    "platform_constraints": {
+      "items": {
+        "$ref": "#/$defs/PlatformConstraint"
+      },
+      "title": "Platform Constraints",
+      "type": "array"
+    },
+    "non_functional_requirements": {
+      "items": {
+        "$ref": "#/$defs/NonFunctionalRequirement"
+      },
+      "title": "Non Functional Requirements",
+      "type": "array"
+    },
+    "assumptions": {
+      "items": {
+        "$ref": "#/$defs/Assumption"
+      },
+      "title": "Assumptions",
+      "type": "array"
+    },
+    "unknowns": {
+      "items": {
+        "$ref": "#/$defs/Unknown"
+      },
+      "title": "Unknowns",
+      "type": "array"
+    },
+    "contradictions": {
+      "items": {
+        "$ref": "#/$defs/Contradiction"
+      },
+      "title": "Contradictions",
+      "type": "array"
+    },
+    "doc_refs": {
+      "items": {
+        "$ref": "#/$defs/DocRef"
+      },
+      "title": "Doc Refs",
+      "type": "array"
+    }
+  },
+  "required": [
+    "metadata",
+    "target_platform",
+    "preview_profile",
+    "product_goal",
+    "actors",
+    "domain_entities",
+    "user_flows",
+    "ui_requirements",
+    "api_requirements",
+    "persistence_requirements",
+    "integration_requirements",
+    "security_requirements",
+    "platform_constraints",
+    "non_functional_requirements",
+    "assumptions",
+    "unknowns",
+    "contradictions",
+    "doc_refs"
+  ],
+  "title": "GroundedSpecModel",
+  "type": "object"
+}
