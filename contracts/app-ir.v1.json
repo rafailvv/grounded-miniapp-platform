@@ -1,0 +1,1224 @@
+{
+  "$defs": {
+    "Action": {
+      "additionalProperties": false,
+      "properties": {
+        "action_id": {
+          "title": "Action Id",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "navigate",
+            "submit_form",
+            "call_api",
+            "set_variable",
+            "branch",
+            "show_message",
+            "close_app"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "source_component_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Component Id"
+        },
+        "input_variable_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Input Variable Ids",
+          "type": "array"
+        },
+        "target_screen_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Screen Id"
+        },
+        "integration_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Integration Id"
+        },
+        "assignments": {
+          "items": {
+            "$ref": "#/$defs/Assignment"
+          },
+          "title": "Assignments",
+          "type": "array"
+        },
+        "success_transition_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Success Transition Id"
+        },
+        "error_transition_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error Transition Id"
+        },
+        "condition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Condition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "action_id",
+        "type"
+      ],
+      "title": "Action",
+      "type": "object"
+    },
+    "Assignment": {
+      "additionalProperties": false,
+      "properties": {
+        "target_variable_id": {
+          "title": "Target Variable Id",
+          "type": "string"
+        },
+        "expression": {
+          "title": "Expression",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target_variable_id",
+        "expression"
+      ],
+      "title": "Assignment",
+      "type": "object"
+    },
+    "AuthModel": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "public",
+            "telegram_session",
+            "custom"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "telegram_initdata_validation_required": {
+          "title": "Telegram Initdata Validation Required",
+          "type": "boolean"
+        },
+        "server_side_session": {
+          "default": true,
+          "title": "Server Side Session",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mode",
+        "telegram_initdata_validation_required"
+      ],
+      "title": "AuthModel",
+      "type": "object"
+    },
+    "Component": {
+      "additionalProperties": false,
+      "properties": {
+        "component_id": {
+          "title": "Component Id",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "text",
+            "input",
+            "textarea",
+            "select",
+            "checkbox",
+            "radio",
+            "date_picker",
+            "phone_input",
+            "email_input",
+            "button",
+            "card",
+            "list",
+            "banner"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "binding_variable_id": {
+          "title": "Binding Variable Id",
+          "type": "string"
+        },
+        "required": {
+          "title": "Required",
+          "type": "boolean"
+        },
+        "validators": {
+          "items": {
+            "$ref": "#/$defs/ValidatorRule"
+          },
+          "title": "Validators",
+          "type": "array"
+        },
+        "placeholder": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Placeholder"
+        },
+        "visibility_condition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Condition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "disabled_condition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Condition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "component_id",
+        "type",
+        "label",
+        "binding_variable_id",
+        "required",
+        "validators"
+      ],
+      "title": "Component",
+      "type": "object"
+    },
+    "Condition": {
+      "additionalProperties": false,
+      "properties": {
+        "expression": {
+          "title": "Expression",
+          "type": "string"
+        },
+        "referenced_variables": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Referenced Variables",
+          "type": "array"
+        }
+      },
+      "required": [
+        "expression"
+      ],
+      "title": "Condition",
+      "type": "object"
+    },
+    "DataField": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "string",
+            "text",
+            "int",
+            "float",
+            "bool",
+            "date",
+            "datetime",
+            "phone",
+            "email",
+            "enum",
+            "object",
+            "array",
+            "uuid"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "required": {
+          "title": "Required",
+          "type": "boolean"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "default": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Default"
+        },
+        "enum_values": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Enum Values",
+          "type": "array"
+        },
+        "pii": {
+          "default": false,
+          "title": "Pii",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "type",
+        "required"
+      ],
+      "title": "DataField",
+      "type": "object"
+    },
+    "Entity": {
+      "additionalProperties": false,
+      "properties": {
+        "entity_id": {
+          "title": "Entity Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "fields": {
+          "items": {
+            "$ref": "#/$defs/DataField"
+          },
+          "title": "Fields",
+          "type": "array"
+        }
+      },
+      "required": [
+        "entity_id",
+        "name",
+        "fields"
+      ],
+      "title": "Entity",
+      "type": "object"
+    },
+    "IRAssumption": {
+      "additionalProperties": false,
+      "properties": {
+        "assumption_id": {
+          "title": "Assumption Id",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "origin": {
+          "enum": [
+            "grounded_spec",
+            "repair_step",
+            "compiler_default"
+          ],
+          "title": "Origin",
+          "type": "string"
+        }
+      },
+      "required": [
+        "assumption_id",
+        "text",
+        "origin"
+      ],
+      "title": "IRAssumption",
+      "type": "object"
+    },
+    "IRMetadata": {
+      "additionalProperties": false,
+      "properties": {
+        "workspace_id": {
+          "title": "Workspace Id",
+          "type": "string"
+        },
+        "grounded_spec_version": {
+          "title": "Grounded Spec Version",
+          "type": "string"
+        },
+        "template_revision_id": {
+          "title": "Template Revision Id",
+          "type": "string"
+        },
+        "generated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Generated At"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "grounded_spec_version",
+        "template_revision_id"
+      ],
+      "title": "IRMetadata",
+      "type": "object"
+    },
+    "Integration": {
+      "additionalProperties": false,
+      "properties": {
+        "integration_id": {
+          "title": "Integration Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "rest",
+            "webhook"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "method": {
+          "enum": [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE"
+          ],
+          "title": "Method",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "request_schema": {
+          "items": {
+            "$ref": "#/$defs/DataField"
+          },
+          "title": "Request Schema",
+          "type": "array"
+        },
+        "response_schema": {
+          "items": {
+            "$ref": "#/$defs/DataField"
+          },
+          "title": "Response Schema",
+          "type": "array"
+        },
+        "auth_type": {
+          "enum": [
+            "none",
+            "service_token",
+            "bearer",
+            "telegram_initdata",
+            "custom"
+          ],
+          "title": "Auth Type",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "integration_id",
+        "name",
+        "type",
+        "method",
+        "path",
+        "request_schema",
+        "response_schema",
+        "auth_type"
+      ],
+      "title": "Integration",
+      "type": "object"
+    },
+    "OpenQuestion": {
+      "additionalProperties": false,
+      "properties": {
+        "question_id": {
+          "title": "Question Id",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "blocking": {
+          "title": "Blocking",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "question_id",
+        "text",
+        "blocking"
+      ],
+      "title": "OpenQuestion",
+      "type": "object"
+    },
+    "Permission": {
+      "additionalProperties": false,
+      "properties": {
+        "permission_id": {
+          "title": "Permission Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        }
+      },
+      "required": [
+        "permission_id",
+        "name",
+        "description"
+      ],
+      "title": "Permission",
+      "type": "object"
+    },
+    "PlatformHints": {
+      "additionalProperties": false,
+      "properties": {
+        "use_main_button": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Use Main Button"
+        },
+        "use_back_button": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Use Back Button"
+        },
+        "respect_theme": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Respect Theme"
+        },
+        "respect_viewport": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Respect Viewport"
+        }
+      },
+      "title": "PlatformHints",
+      "type": "object"
+    },
+    "PreviewProfile": {
+      "enum": [
+        "telegram_mock",
+        "max_mock",
+        "web_preview"
+      ],
+      "title": "PreviewProfile",
+      "type": "string"
+    },
+    "Screen": {
+      "additionalProperties": false,
+      "properties": {
+        "screen_id": {
+          "title": "Screen Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "landing",
+            "form",
+            "list",
+            "details",
+            "confirm",
+            "success",
+            "error",
+            "info"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "components": {
+          "items": {
+            "$ref": "#/$defs/Component"
+          },
+          "title": "Components",
+          "type": "array"
+        },
+        "actions": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "title": "Actions",
+          "type": "array"
+        },
+        "subtitle": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Subtitle"
+        },
+        "on_enter_actions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "On Enter Actions",
+          "type": "array"
+        },
+        "platform_hints": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlatformHints"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "screen_id",
+        "kind",
+        "title",
+        "components",
+        "actions"
+      ],
+      "title": "Screen",
+      "type": "object"
+    },
+    "SecurityPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "trusted_sources": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Trusted Sources",
+          "type": "array"
+        },
+        "untrusted_sources": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Untrusted Sources",
+          "type": "array"
+        },
+        "secret_handling": {
+          "enum": [
+            "server_only",
+            "server_env_only"
+          ],
+          "title": "Secret Handling",
+          "type": "string"
+        },
+        "pii_variables": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Pii Variables",
+          "type": "array"
+        }
+      },
+      "required": [
+        "trusted_sources",
+        "untrusted_sources",
+        "secret_handling"
+      ],
+      "title": "SecurityPolicy",
+      "type": "object"
+    },
+    "StorageBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "binding_id": {
+          "title": "Binding Id",
+          "type": "string"
+        },
+        "entity_id": {
+          "title": "Entity Id",
+          "type": "string"
+        },
+        "storage_type": {
+          "enum": [
+            "postgres",
+            "redis",
+            "memory",
+            "external"
+          ],
+          "title": "Storage Type",
+          "type": "string"
+        },
+        "table_or_collection": {
+          "title": "Table Or Collection",
+          "type": "string"
+        }
+      },
+      "required": [
+        "binding_id",
+        "entity_id",
+        "storage_type",
+        "table_or_collection"
+      ],
+      "title": "StorageBinding",
+      "type": "object"
+    },
+    "TargetPlatform": {
+      "enum": [
+        "telegram_mini_app",
+        "max_mini_app"
+      ],
+      "title": "TargetPlatform",
+      "type": "string"
+    },
+    "TelemetryHook": {
+      "additionalProperties": false,
+      "properties": {
+        "event_name": {
+          "title": "Event Name",
+          "type": "string"
+        },
+        "trigger_type": {
+          "enum": [
+            "screen_view",
+            "button_click",
+            "form_submit",
+            "api_result"
+          ],
+          "title": "Trigger Type",
+          "type": "string"
+        },
+        "screen_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Screen Id"
+        },
+        "action_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Action Id"
+        }
+      },
+      "required": [
+        "event_name",
+        "trigger_type"
+      ],
+      "title": "TelemetryHook",
+      "type": "object"
+    },
+    "TraceabilityLink": {
+      "additionalProperties": false,
+      "properties": {
+        "trace_id": {
+          "title": "Trace Id",
+          "type": "string"
+        },
+        "target_type": {
+          "enum": [
+            "variable",
+            "entity",
+            "screen",
+            "component",
+            "action",
+            "transition",
+            "integration"
+          ],
+          "title": "Target Type",
+          "type": "string"
+        },
+        "target_id": {
+          "title": "Target Id",
+          "type": "string"
+        },
+        "source_kind": {
+          "enum": [
+            "doc_ref",
+            "prompt_fragment",
+            "assumption",
+            "repair"
+          ],
+          "title": "Source Kind",
+          "type": "string"
+        },
+        "source_ref": {
+          "title": "Source Ref",
+          "type": "string"
+        },
+        "mapping_note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mapping Note"
+        }
+      },
+      "required": [
+        "trace_id",
+        "target_type",
+        "target_id",
+        "source_kind",
+        "source_ref"
+      ],
+      "title": "TraceabilityLink",
+      "type": "object"
+    },
+    "Transition": {
+      "additionalProperties": false,
+      "properties": {
+        "transition_id": {
+          "title": "Transition Id",
+          "type": "string"
+        },
+        "from_screen_id": {
+          "title": "From Screen Id",
+          "type": "string"
+        },
+        "to_screen_id": {
+          "title": "To Screen Id",
+          "type": "string"
+        },
+        "trigger": {
+          "title": "Trigger",
+          "type": "string"
+        },
+        "condition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Condition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "transition_id",
+        "from_screen_id",
+        "to_screen_id",
+        "trigger"
+      ],
+      "title": "Transition",
+      "type": "object"
+    },
+    "ValidatorRule": {
+      "additionalProperties": false,
+      "properties": {
+        "rule_type": {
+          "enum": [
+            "required",
+            "min_length",
+            "max_length",
+            "regex",
+            "email",
+            "phone",
+            "date_not_past",
+            "custom"
+          ],
+          "title": "Rule Type",
+          "type": "string"
+        },
+        "params": {
+          "additionalProperties": true,
+          "title": "Params",
+          "type": "object"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Message"
+        }
+      },
+      "required": [
+        "rule_type"
+      ],
+      "title": "ValidatorRule",
+      "type": "object"
+    },
+    "Variable": {
+      "additionalProperties": false,
+      "properties": {
+        "variable_id": {
+          "title": "Variable Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "string",
+            "text",
+            "int",
+            "float",
+            "bool",
+            "date",
+            "datetime",
+            "phone",
+            "email",
+            "enum",
+            "object",
+            "array",
+            "uuid"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "required": {
+          "title": "Required",
+          "type": "boolean"
+        },
+        "source": {
+          "enum": [
+            "user_input",
+            "api_response",
+            "derived",
+            "validated_init_data",
+            "constant",
+            "session_state"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "trust_level": {
+          "enum": [
+            "untrusted",
+            "validated",
+            "trusted"
+          ],
+          "title": "Trust Level",
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "screen",
+            "flow",
+            "session",
+            "persistent"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "default": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Default"
+        },
+        "pii": {
+          "default": false,
+          "title": "Pii",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "variable_id",
+        "name",
+        "type",
+        "required",
+        "source",
+        "trust_level",
+        "scope"
+      ],
+      "title": "Variable",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0",
+      "default": "1.0.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "metadata": {
+      "$ref": "#/$defs/IRMetadata"
+    },
+    "app_id": {
+      "title": "App Id",
+      "type": "string"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "platform": {
+      "$ref": "#/$defs/TargetPlatform"
+    },
+    "preview_profile": {
+      "$ref": "#/$defs/PreviewProfile"
+    },
+    "entry_screen_id": {
+      "title": "Entry Screen Id",
+      "type": "string"
+    },
+    "variables": {
+      "items": {
+        "$ref": "#/$defs/Variable"
+      },
+      "title": "Variables",
+      "type": "array"
+    },
+    "entities": {
+      "items": {
+        "$ref": "#/$defs/Entity"
+      },
+      "title": "Entities",
+      "type": "array"
+    },
+    "screens": {
+      "items": {
+        "$ref": "#/$defs/Screen"
+      },
+      "title": "Screens",
+      "type": "array"
+    },
+    "transitions": {
+      "items": {
+        "$ref": "#/$defs/Transition"
+      },
+      "title": "Transitions",
+      "type": "array"
+    },
+    "integrations": {
+      "items": {
+        "$ref": "#/$defs/Integration"
+      },
+      "title": "Integrations",
+      "type": "array"
+    },
+    "storage_bindings": {
+      "items": {
+        "$ref": "#/$defs/StorageBinding"
+      },
+      "title": "Storage Bindings",
+      "type": "array"
+    },
+    "auth_model": {
+      "$ref": "#/$defs/AuthModel"
+    },
+    "permissions": {
+      "items": {
+        "$ref": "#/$defs/Permission"
+      },
+      "title": "Permissions",
+      "type": "array"
+    },
+    "security": {
+      "$ref": "#/$defs/SecurityPolicy"
+    },
+    "telemetry_hooks": {
+      "items": {
+        "$ref": "#/$defs/TelemetryHook"
+      },
+      "title": "Telemetry Hooks",
+      "type": "array"
+    },
+    "assumptions": {
+      "items": {
+        "$ref": "#/$defs/IRAssumption"
+      },
+      "title": "Assumptions",
+      "type": "array"
+    },
+    "open_questions": {
+      "items": {
+        "$ref": "#/$defs/OpenQuestion"
+      },
+      "title": "Open Questions",
+      "type": "array"
+    },
+    "traceability": {
+      "items": {
+        "$ref": "#/$defs/TraceabilityLink"
+      },
+      "title": "Traceability",
+      "type": "array"
+    },
+    "terminal_screen_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Terminal Screen Ids",
+      "type": "array"
+    }
+  },
+  "required": [
+    "metadata",
+    "app_id",
+    "title",
+    "platform",
+    "preview_profile",
+    "entry_screen_id",
+    "variables",
+    "entities",
+    "screens",
+    "transitions",
+    "integrations",
+    "storage_bindings",
+    "auth_model",
+    "permissions",
+    "security",
+    "telemetry_hooks",
+    "assumptions",
+    "open_questions",
+    "traceability"
+  ],
+  "title": "AppIRModel",
+  "type": "object"
+}
