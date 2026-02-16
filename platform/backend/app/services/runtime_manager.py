@@ -105,3 +105,40 @@ class PreviewRuntimeManager:
 
     def backend_url(self, proxy_port: int) -> str:
         return f"http://localhost:{proxy_port}/api"
+
+    def wait_until_ready(self, proxy_port: int) -> None:
+        deadline = time.time() + self.settings.preview_start_timeout_sec
+        health_url = f"http://localhost:{proxy_port}/health"
+        while time.time() < deadline:
+            try:
+                with urlopen(health_url, timeout=2) as response:
+                    if response.status == 200:
+                        return
+            except (URLError, OSError):
+                time.sleep(1)
+        raise RuntimeError(f"Preview runtime did not become healthy at {health_url}.")
+
+    def _compose_env(self, proxy_port: int) -> dict[str, str]:
+        env = os.environ.copy()
+        env["PREVIEW_PROXY_PORT"] = str(proxy_port)
+        env["PREVIEW_AUTH_ENDPOINT"] = "/api/auth/telegram"
+        env["PREVIEW_API_BASE_URL"] = ""
+        env["PREVIEW_DEFAULT_ROLE"] = "client"
+        env["PREVIEW_POSTGRES_DB"] = "miniapp"
+        env["PREVIEW_POSTGRES_USER"] = "miniapp"
+        env["PREVIEW_POSTGRES_PASSWORD"] = "miniapp"
+        return env
+
+    @staticmethod
+    def _port_free(port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.1)
+            return sock.connect_ex(("127.0.0.1", port)) != 0
+
+    @staticmethod
+    def _docker_available() -> bool:
+        try:
+            result = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True)
+        except FileNotFoundError:
+            return False
+        return result.returncode == 0
