@@ -1,0 +1,200 @@
+openapi: 3.1.0
+info:
+  title: Base Mini-App API
+  version: 1.0.0
+paths:
+  /api/auth/telegram:
+    post:
+      summary: Authenticate Telegram mini-app user and resolve active role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                init_data:
+                  type: string
+                user_id:
+                  type: integer
+                  nullable: true
+                init_data_unsafe:
+                  type: object
+                  additionalProperties: true
+      responses:
+        "200":
+          description: Auth result
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [access_token, refresh_token, token_type, expires_at, role, user]
+                properties:
+                  access_token:
+                    type: string
+                  refresh_token:
+                    type: string
+                  token_type:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+                  role:
+                    type: string
+                    enum: [client, specialist, manager]
+                  user:
+                    type: object
+                    additionalProperties: true
+  /api/roles:
+    get:
+      summary: List supported mini-app roles
+      responses:
+        "200":
+          description: Role catalog
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                properties:
+                  roles:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      properties:
+                        role:
+                          type: string
+                        label:
+                          type: string
+  /api/dashboard/{role}:
+    get:
+      summary: Load role-specific dashboard payload
+      parameters:
+        - in: path
+          name: role
+          required: true
+          schema:
+            type: string
+            enum: [client, specialist, manager]
+      responses:
+        "200":
+          description: Dashboard payload
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [role, title, description, feature_text, metrics, primary_action_label]
+                properties:
+                  role:
+                    type: string
+                  title:
+                    type: string
+                  description:
+                    type: string
+                  feature_text:
+                    type: string
+                  primary_action_label:
+                    type: string
+                  secondary_action_label:
+                    type: string
+                    nullable: true
+                  metrics:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      properties:
+                        metric_id:
+                          type: string
+                        label:
+                          type: string
+                        value:
+                          type: string
+  /api/profiles/{role}:
+    get:
+      summary: Load profile by role
+      parameters:
+        - in: path
+          name: role
+          required: true
+          schema:
+            type: string
+            enum: [client, specialist, manager]
+      responses:
+        "200":
+          description: Role profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleProfile"
+    put:
+      summary: Save profile by role
+      parameters:
+        - in: path
+          name: role
+          required: true
+          schema:
+            type: string
+            enum: [client, specialist, manager]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoleProfile"
+      responses:
+        "200":
+          description: Stored role profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleProfile"
+  /api/submissions:
+    post:
+      summary: Store a generated submission
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Stored submission
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [submission_id, status]
+                properties:
+                  submission_id:
+                    type: string
+                  status:
+                    type: string
+components:
+  schemas:
+    RoleProfile:
+      type: object
+      additionalProperties: false
+      required: [first_name, last_name, email, phone]
+      properties:
+        first_name:
+          type: string
+        last_name:
+          type: string
+        email:
+          type: string
+        phone:
+          type: string
+        photo_url:
+          type: string
+          nullable: true
+        updated_at:
+          type: string
+          format: date-time

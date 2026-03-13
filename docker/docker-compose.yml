@@ -1,0 +1,50 @@
+name: grounded-miniapp-platform
+
+services:
+  platform-backend:
+    image: ${PLATFORM_BACKEND_IMAGE}
+    build:
+      context: ../platform/backend
+      dockerfile: Dockerfile
+    working_dir: /workspace/platform/backend
+    volumes:
+      - ..:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      PREVIEW_BASE_URL: ${PREVIEW_BASE_URL}
+      PLATFORM_DATA_DIR: /workspace/data
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL}
+    command: >
+      sh -c "pip install -e . &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "${PLATFORM_BACKEND_PORT}:8000"
+
+  platform-frontend:
+    image: ${PLATFORM_FRONTEND_IMAGE}
+    working_dir: /workspace/platform/frontend
+    volumes:
+      - ..:/workspace
+    environment:
+      VITE_PLATFORM_NAME: ${VITE_PLATFORM_NAME}
+      VITE_API_PROXY_TARGET: http://platform-backend:8000
+    command: >
+      sh -c "npm install &&
+             npm run dev -- --host 0.0.0.0 --port 5173"
+    ports:
+      - "${PLATFORM_FRONTEND_PORT}:5173"
+
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+
+  redis:
+    image: ${REDIS_IMAGE}
+    ports:
+      - "${REDIS_PORT}:6379"
