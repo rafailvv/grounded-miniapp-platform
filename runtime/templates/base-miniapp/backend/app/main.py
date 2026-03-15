@@ -6,12 +6,29 @@ from typing import cast
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from app.schemas import AppRole, AuthResponse, RoleDashboardResponse, RoleProfile, TelegramAuthRequest
-from app.store import ensure_state, get_role_dashboard, get_role_profile, register_submission, save_role_profile
+from app.schemas import (
+    AppRole,
+    AuthResponse,
+    RoleDashboardResponse,
+    RoleProfile,
+    RuntimeActionRequest,
+    RuntimeActionResponse,
+    RuntimeManifestResponse,
+    TelegramAuthRequest,
+)
+from app.store import (
+    ensure_state,
+    execute_action,
+    get_role_dashboard,
+    get_role_manifest,
+    get_role_profile,
+    register_submission,
+    save_role_profile,
+)
 
 ROLE_ORDER: tuple[AppRole, ...] = ("client", "specialist", "manager")
 
-app = FastAPI(title="Base Mini-App Backend", version="1.0.0")
+app = FastAPI(title="Base Mini-App Backend", version="2.0.0")
 
 
 def normalize_role(raw_role: str | None) -> AppRole:
@@ -59,9 +76,10 @@ def auth_telegram(payload: TelegramAuthRequest) -> AuthResponse:
     role = resolve_role(payload)
     user = payload.init_data_unsafe.get("user") if isinstance(payload.init_data_unsafe, dict) else None
     now = datetime.now(timezone.utc)
+    access_suffix = str(int(now.timestamp()))
     return AuthResponse(
-        access_token=f"demo-access-{role}",
-        refresh_token=f"demo-refresh-{role}",
+        access_token=f"runtime-access-{role}-{access_suffix}",
+        refresh_token=f"runtime-refresh-{role}-{access_suffix}",
         token_type="Bearer",
         expires_at=(now + timedelta(hours=12)).isoformat(),
         role=role,
@@ -77,9 +95,9 @@ def auth_telegram(payload: TelegramAuthRequest) -> AuthResponse:
 def get_roles() -> dict[str, list[dict[str, str]]]:
     return {
         "roles": [
-            {"role": "client", "label": "Клиент"},
-            {"role": "specialist", "label": "Специалист"},
-            {"role": "manager", "label": "Менеджер"},
+            {"role": "client", "label": "Client"},
+            {"role": "specialist", "label": "Specialist"},
+            {"role": "manager", "label": "Manager"},
         ]
     }
 
@@ -87,6 +105,16 @@ def get_roles() -> dict[str, list[dict[str, str]]]:
 @app.get("/api/dashboard/{role}", response_model=RoleDashboardResponse)
 def dashboard(role: AppRole) -> RoleDashboardResponse:
     return get_role_dashboard(role)
+
+
+@app.get("/api/runtime/{role}/manifest", response_model=RuntimeManifestResponse)
+def runtime_manifest(role: AppRole) -> RuntimeManifestResponse:
+    return get_role_manifest(role)
+
+
+@app.post("/api/runtime/{role}/actions/{action_id}", response_model=RuntimeActionResponse)
+def runtime_action(role: AppRole, action_id: str, payload: RuntimeActionRequest) -> RuntimeActionResponse:
+    return execute_action(role, action_id, payload=payload.payload, item_id=payload.item_id)
 
 
 @app.get("/api/profiles/{role}", response_model=RoleProfile)

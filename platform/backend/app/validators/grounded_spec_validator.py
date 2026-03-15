@@ -67,12 +67,12 @@ class GroundedSpecValidator:
             issues.append(
                 ValidationIssue(
                     code="spec.unknowns.high_impact",
-                    message="High-impact unknowns must be resolved before code generation.",
+                    message="High-impact unknowns remain unresolved; generation may continue with assumptions or require later clarification.",
                     severity="high",
                     location="unknowns",
+                    blocking=False,
                 )
             )
 
         blocking = any(issue.blocking for issue in issues)
         return GroundedSpecValidatorResult(valid=not issues, blocking=blocking, issues=issues)
-

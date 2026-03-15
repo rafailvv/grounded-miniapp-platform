@@ -22,7 +22,7 @@ class PreviewRuntimeManager:
             return mode
         if os.getenv("PYTEST_CURRENT_TEST"):
             return "inline"
-        return "docker" if self._docker_available() else "inline"
+        return "docker" if self._compose_command() else "inline"
 
     def allocate_port(self, workspace_id: str) -> int:
         start = self.settings.preview_port_base + (sum(ord(char) for char in workspace_id) % 1000)
@@ -35,8 +35,11 @@ class PreviewRuntimeManager:
         project_name = self.project_name(workspace_id)
         compose_file = source_dir / "docker" / "docker-compose.yml"
         env = self._compose_env(proxy_port)
+        compose_cmd = self._compose_command()
+        if compose_cmd is None:
+            raise RuntimeError("Docker Compose is not available inside the platform backend container.")
         result = subprocess.run(
-            ["docker", "compose", "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"],
+            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"],
             cwd=source_dir,
             capture_output=True,
             text=True,
@@ -52,8 +55,11 @@ class PreviewRuntimeManager:
         project_name = self.project_name(workspace_id)
         compose_file = source_dir / "docker" / "docker-compose.yml"
         env = self._compose_env(proxy_port)
+        compose_cmd = self._compose_command()
+        if compose_cmd is None:
+            raise RuntimeError("Docker Compose is not available inside the platform backend container.")
         result = subprocess.run(
-            ["docker", "compose", "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"],
+            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"],
             cwd=source_dir,
             capture_output=True,
             text=True,
@@ -70,8 +76,11 @@ class PreviewRuntimeManager:
         project_name = self.project_name(workspace_id)
         compose_file = source_dir / "docker" / "docker-compose.yml"
         env = self._compose_env(proxy_port)
+        compose_cmd = self._compose_command()
+        if compose_cmd is None:
+            raise RuntimeError("Docker Compose is not available inside the platform backend container.")
         result = subprocess.run(
-            ["docker", "compose", "-f", str(compose_file), "-p", project_name, "down", "-v", "--remove-orphans"],
+            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "down", "-v", "--remove-orphans"],
             cwd=source_dir,
             capture_output=True,
             text=True,
@@ -90,8 +99,11 @@ class PreviewRuntimeManager:
         project_name = self.project_name(workspace_id)
         compose_file = source_dir / "docker" / "docker-compose.yml"
         env = self._compose_env(proxy_port)
+        compose_cmd = self._compose_command()
+        if compose_cmd is None:
+            return ["Docker Compose is not available inside the platform backend container."]
         result = subprocess.run(
-            ["docker", "compose", "-f", str(compose_file), "-p", project_name, "logs", "--tail", "80"],
+            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "logs", "--tail", "80"],
             cwd=source_dir,
             capture_output=True,
             text=True,
@@ -136,9 +148,17 @@ class PreviewRuntimeManager:
             return sock.connect_ex(("127.0.0.1", port)) != 0
 
     @staticmethod
-    def _docker_available() -> bool:
+    def _compose_command() -> list[str] | None:
         try:
             result = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True)
         except FileNotFoundError:
-            return False
-        return result.returncode == 0
+            result = None
+        if result is not None and result.returncode == 0:
+            return ["docker", "compose"]
+        try:
+            legacy = subprocess.run(["docker-compose", "version"], capture_output=True, text=True)
+        except FileNotFoundError:
+            legacy = None
+        if legacy is not None and legacy.returncode == 0:
+            return ["docker-compose"]
+        return None

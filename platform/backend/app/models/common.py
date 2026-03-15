@@ -21,7 +21,12 @@ class PreviewProfile(str, Enum):
     WEB_PREVIEW = "web_preview"
 
 
+class GenerationMode(str, Enum):
+    QUALITY = "quality"
+    BALANCED = "balanced"
+    BASIC = "basic"
+
+
 Severity = Literal["low", "medium", "high", "critical"]
 Priority = Literal["must", "should", "could"]
 Impact = Literal["low", "medium", "high"]
-

@@ -9,9 +9,12 @@ class BuildValidator:
     def validate(self, workspace_path: Path) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         required_files = [
-            workspace_path / "frontend" / "src" / "shared" / "generated" / "role-experience.json",
             workspace_path / "backend" / "app" / "generated" / "app_ir.json",
+            workspace_path / "backend" / "app" / "generated" / "runtime_manifest.json",
             workspace_path / "backend" / "app" / "generated" / "role_seed.json",
+            workspace_path / "backend" / "app" / "generated" / "runtime_state.json",
+            workspace_path / "frontend" / "src" / "shared" / "generated" / "runtime-manifest.json",
+            workspace_path / "frontend" / "src" / "shared" / "generated" / "role-experience.json",
             workspace_path / "artifacts" / "grounded_spec.json",
         ]
         for file_path in required_files:

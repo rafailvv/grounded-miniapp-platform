@@ -38,6 +38,20 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
     def healthcheck() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/system/configuration")
+    def system_configuration() -> dict[str, object]:
+        llm = app.state.container.openrouter_client.configuration()
+        return {
+            "llm": {
+                "enabled": llm["enabled"],
+                "provider": "openrouter" if llm["enabled"] else None,
+                "models": llm["models"],
+            },
+            "defaults": {
+                "generation_mode": "quality",
+            },
+        }
+
     app.include_router(routes_auth.router)
     app.include_router(routes_workspaces.router)
     app.include_router(routes_documents.router)
@@ -51,4 +65,3 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
 
 
 app = create_app()
-

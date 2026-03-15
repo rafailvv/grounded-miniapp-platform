@@ -6,6 +6,17 @@ export type Workspace = {
   current_revision_id?: string | null;
 };
 
+export type SystemConfiguration = {
+  llm: {
+    enabled: boolean;
+    provider?: string | null;
+    models?: Record<string, unknown>;
+  };
+  defaults: {
+    generation_mode: "quality" | "balanced" | "basic";
+  };
+};
+
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, {
     headers: {
@@ -35,3 +46,12 @@ export async function ensureWorkspace(): Promise<Workspace> {
   });
 }
 
+export async function openWorkspace(workspaceId: string): Promise<Workspace> {
+  const workspace = await request<Workspace>(`/workspaces/${workspaceId}`);
+  if (workspace.template_cloned) {
+    return workspace;
+  }
+  return request<Workspace>(`/workspaces/${workspace.workspace_id}/clone-template`, {
+    method: "POST",
+  });
+}

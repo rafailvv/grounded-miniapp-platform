@@ -71,6 +71,103 @@ class AppIRValidator:
                     )
                 )
 
+        route_roles: set[str] = set()
+        for group in ir.route_groups:
+            route_roles.add(group.role)
+            route_paths: set[str] = set()
+            referenced_screen_ids = {route.screen_id for route in group.routes}
+            if not group.routes:
+                issues.append(
+                    ValidationIssue(
+                        code="ir.route_groups.empty",
+                        message=f"Route group {group.role} must contain at least one route.",
+                        severity="critical",
+                        location=f"route_groups.{group.role}",
+                    )
+                )
+            if not any(route.is_entry for route in group.routes):
+                issues.append(
+                    ValidationIssue(
+                        code="ir.route_groups.entry",
+                        message=f"Route group {group.role} must define one entry route.",
+                        severity="critical",
+                        location=f"route_groups.{group.role}",
+                    )
+                )
+            for route in group.routes:
+                if route.path in route_paths:
+                    issues.append(
+                        ValidationIssue(
+                            code="ir.route_groups.duplicate_path",
+                            message=f"Duplicate route path {route.path} in role {group.role}.",
+                            severity="critical",
+                            location=f"route_groups.{group.role}",
+                        )
+                    )
+                route_paths.add(route.path)
+                if route.screen_id not in screen_ids:
+                    issues.append(
+                        ValidationIssue(
+                            code="ir.route_groups.screen_ref",
+                            message=f"Route {route.route_id} references a missing screen.",
+                            severity="critical",
+                            location=f"route_groups.{group.role}.{route.route_id}",
+                        )
+                    )
+            if group.entry_path not in route_paths:
+                issues.append(
+                    ValidationIssue(
+                        code="ir.route_groups.entry_path",
+                        message=f"entry_path {group.entry_path} must match one of the generated routes for {group.role}.",
+                        severity="critical",
+                        location=f"route_groups.{group.role}",
+                    )
+                )
+            if not referenced_screen_ids:
+                issues.append(
+                    ValidationIssue(
+                        code="ir.route_groups.screens",
+                        message=f"Route group {group.role} does not reference any screens.",
+                        severity="critical",
+                        location=f"route_groups.{group.role}",
+                    )
+                )
+
+        if route_roles != {"client", "specialist", "manager"}:
+            issues.append(
+                ValidationIssue(
+                    code="ir.route_groups.roles",
+                    message="AppIR must include route groups for client, specialist, and manager.",
+                    severity="critical",
+                    location="route_groups",
+                )
+            )
+
+        source_ids = {source.source_id for source in ir.screen_data_sources}
+        self._check_uniqueness("screen_data_source", list(source_ids), issues)
+        for source in ir.screen_data_sources:
+            if source.screen_id not in screen_ids:
+                issues.append(
+                    ValidationIssue(
+                        code="ir.screen_data_sources.screen_ref",
+                        message=f"Screen data source {source.source_id} references a missing screen.",
+                        severity="critical",
+                        location=f"screen_data_sources.{source.source_id}",
+                    )
+                )
+
+        for action_group in ir.role_action_groups:
+            for action_id in action_group.action_ids:
+                if action_id not in {action.action_id for screen in ir.screens for action in screen.actions}:
+                    issues.append(
+                        ValidationIssue(
+                            code="ir.role_action_groups.action_ref",
+                            message=f"Role action group {action_group.role} references a missing action {action_id}.",
+                            severity="critical",
+                            location=f"role_action_groups.{action_group.role}",
+                        )
+                    )
+
         if ir.auth_model.mode == "telegram_session" and not ir.auth_model.telegram_initdata_validation_required:
             issues.append(
                 ValidationIssue(
@@ -140,4 +237,3 @@ class AppIRValidator:
                     location=label,
                 )
             )
-

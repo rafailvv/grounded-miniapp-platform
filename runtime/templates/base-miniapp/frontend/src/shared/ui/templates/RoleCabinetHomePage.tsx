@@ -4,7 +4,6 @@ import type { AppRole } from '@/shared/roles/role';
 import { getClientProfileDisplayName, loadRoleProfileView } from '@/shared/profile/clientProfile';
 import { fetchRoleDashboard, type RemoteDashboard } from '@/shared/profile/profileApi';
 import { ProfileCabinetCard } from '@/shared/ui/ProfileCabinetCard/ProfileCabinetCard';
-import generatedRoleExperience from '@/shared/generated/role-experience.json';
 import styles from '@/shared/ui/templates/RoleCabinetHomePage.module.css';
 
 type RoleCabinetHomePageProps = {
@@ -28,8 +27,7 @@ export function RoleCabinetHomePage({ role, featureText }: RoleCabinetHomePagePr
     };
   }, [role]);
 
-  const generatedFeatureText = generatedRoleExperience[role]?.featureText ?? featureText;
-  const resolvedFeatureText = dashboard?.feature_text ?? generatedFeatureText;
+  const resolvedFeatureText = dashboard?.feature_text ?? featureText;
 
   return (
     <section className={styles.page}>
@@ -42,7 +40,7 @@ export function RoleCabinetHomePage({ role, featureText }: RoleCabinetHomePagePr
 
       <div className={styles.featureBlock}>
         <div className={styles.featureContent}>
-          <span className={styles.featureTitle}>{dashboard?.title ?? generatedRoleExperience[role]?.title}</span>
+          <span className={styles.featureTitle}>{dashboard?.title ?? profile.roleLabel}</span>
           <span className={styles.featureText}>{resolvedFeatureText}</span>
           {dashboard?.metrics?.length ? (
             <div className={styles.metricsGrid}>

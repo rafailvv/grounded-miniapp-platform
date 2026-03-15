@@ -23,7 +23,7 @@ The current baseline is a tri-role mini-app:
 ## Frontend contract
 
 - The frontend bootstraps the role via Telegram auth or `?role=`.
-- The frontend consumes `src/shared/generated/role-experience.json`.
+- The frontend consumes runtime manifests from `/api/runtime/{role}/manifest` and uses an inline placeholder when runtime data is absent.
 - Profile pages sync with backend if `VITE_API_BASE_URL` is set.
 - Role home pages query backend dashboard data if the API is reachable.
 

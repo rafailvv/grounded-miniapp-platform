@@ -1,12 +1,19 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
-import { ensureWorkspace, request, Workspace } from "./lib/api";
+import { ensureWorkspace, openWorkspace, request, SystemConfiguration, Workspace } from "./lib/api";
 import "./styles/app.css";
 
 type Job = {
   job_id: string;
   workspace_id: string;
   status: string;
+  generation_mode: "quality" | "balanced" | "basic";
+  fidelity: "quality_app" | "balanced_app" | "basic_scaffold" | "blocked";
+  llm_enabled: boolean;
+  llm_provider?: string | null;
+  llm_model?: string | null;
+  failure_reason?: string | null;
+  compile_summary?: Record<string, number | string>;
   summary?: string | null;
   assumptions_report: Array<{ text: string; rationale: string }>;
   validation_snapshot?: {
@@ -14,7 +21,7 @@ type Job = {
     app_ir_valid: boolean;
     build_valid: boolean;
     blocking: boolean;
-    issues: Array<{ code: string; message: string }>;
+    issues: Array<{ code: string; message: string; severity?: string }>;
   } | null;
 };
 
@@ -40,10 +47,62 @@ type FileTreeNode = {
 type PreviewInfo = {
   url: string | null;
   role_urls?: Record<string, string>;
+  runtime_mode?: string;
+  status?: string;
+};
+
+type WorkspaceLogs = {
+  workspace_id: string;
+  job: Job | null;
+  events: Array<{
+    event_id: string;
+    event_type: string;
+    message: string;
+    created_at: string;
+    details?: Record<string, unknown>;
+  }>;
+  preview: {
+    status: string;
+    runtime_mode: string;
+    url: string | null;
+    logs: string[];
+  };
+  reports: {
+    trace?: {
+      workspace_id: string;
+      entries: Array<{
+        stage: string;
+        message: string;
+        created_at: string;
+        payload?: Record<string, unknown>;
+      }>;
+    } | null;
+    validation?: Record<string, unknown> | null;
+    assumptions?: Record<string, unknown> | null;
+    traceability?: Record<string, unknown> | null;
+    artifact_plan?: Record<string, unknown> | null;
+    spec_summary?: Record<string, unknown> | null;
+    ir_summary?: Record<string, unknown> | null;
+  };
 };
 
 const INITIAL_PROMPT =
   "Build a consultation booking form mini-app with name, phone, preferred date and comment fields.";
+
+function formatLogSection(title: string, lines: string[]): string {
+  return [title, ...lines, ""].join("\n");
+}
+
+function formatTimestamp(value?: string): string {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString();
+}
 
 function buildFileTree(entries: FileEntry[]): FileTreeNode[] {
   const root = new Map<string, FileTreeNode>();
@@ -183,21 +242,66 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "logs">("preview");
   const [previewUrl, setPreviewUrl] = useState<string>("");
   const [rolePreviewUrls, setRolePreviewUrls] = useState<Record<string, string>>({});
+  const [generationMode, setGenerationMode] = useState<"quality" | "balanced" | "basic">("quality");
+  const [previewRuntimeMode, setPreviewRuntimeMode] = useState<string>("");
   const [loading, setLoading] = useState(false);
+  const [initializing, setInitializing] = useState(true);
+  const [systemConfig, setSystemConfig] = useState<SystemConfiguration | null>(null);
+  const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
   const [error, setError] = useState<string>("");
   const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(new Set());
+  const [previewLoading, setPreviewLoading] = useState<Record<string, boolean>>({
+    client: false,
+    specialist: false,
+    manager: false,
+  });
 
   useEffect(() => {
-    ensureWorkspace()
-      .then(setWorkspace)
-      .catch((err: Error) => setError(err.message));
+    let isMounted = true;
+    const requestedWorkspaceId = new URLSearchParams(window.location.search).get("workspace_id");
+    const workspacePromise = requestedWorkspaceId ? openWorkspace(requestedWorkspaceId) : ensureWorkspace();
+    Promise.all([workspacePromise, request<SystemConfiguration>("/system/configuration")])
+      .then(([nextWorkspace, config]) => {
+        if (!isMounted) {
+          return;
+        }
+        setWorkspace(nextWorkspace);
+        setSystemConfig(config);
+        setGenerationMode(config.defaults.generation_mode);
+        const params = new URLSearchParams(window.location.search);
+        if (params.get("workspace_id") !== nextWorkspace.workspace_id) {
+          params.set("workspace_id", nextWorkspace.workspace_id);
+          window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+        }
+      })
+      .catch((err: Error) => {
+        if (!isMounted) {
+          return;
+        }
+        setError(err.message);
+      })
+      .finally(() => {
+        if (isMounted) {
+          setInitializing(false);
+        }
+      });
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   useEffect(() => {
     if (!workspace) {
       return;
     }
-    void refreshWorkspace(workspace.workspace_id);
+    void (async () => {
+      try {
+        await request(`/workspaces/${workspace.workspace_id}/preview/start`, { method: "POST" });
+      } catch {
+        // The subsequent refresh will surface the latest preview logs and mode.
+      }
+      await refreshWorkspace(workspace.workspace_id);
+    })();
   }, [workspace]);
 
   const changedFiles = useMemo(
@@ -205,24 +309,132 @@ export default function App() {
     [files],
   );
   const fileTree = useMemo(() => buildFileTree(files), [files]);
+  const autoNotices = useMemo(() => {
+    return (job?.assumptions_report ?? [])
+      .filter((assumption) => {
+        const text = assumption.text.toLowerCase();
+        return (
+          text.includes("single-role prompts are expanded") ||
+          text.includes("generated backend exposes a default submission api") ||
+          text.includes("preserves the client, specialist, and manager roles") ||
+          text.includes("linked client-specialist-manager workflow")
+        );
+      })
+      .map((assumption) => ({
+        title: assumption.text,
+        message: assumption.rationale,
+      }));
+  }, [job?.assumptions_report]);
+  const visibleWarnings = useMemo(() => {
+    const issues = (job?.validation_snapshot?.issues ?? []).filter((issue) => {
+      const severity = issue.severity ?? "";
+      return severity === "critical" || severity === "high";
+    });
+    const seen = new Set<string>();
+    const warningItems = issues
+      .filter((issue) => {
+        const key = `${issue.code}:${issue.message}`;
+        if (seen.has(key)) {
+          return false;
+        }
+        seen.add(key);
+        return true;
+      })
+      .map((issue) => ({
+        title: issue.code,
+        message: issue.message,
+      }));
+    if (job?.failure_reason) {
+      warningItems.unshift({
+        title: "Generation blocked",
+        message: job.failure_reason,
+      });
+    }
+    if (error) {
+      warningItems.unshift({
+        title: "Request failed",
+        message: error,
+      });
+    }
+    return warningItems;
+  }, [error, job?.failure_reason, job?.validation_snapshot?.issues]);
   const editorStats = useMemo(() => {
     const lines = fileContent ? fileContent.split("\n").length : 0;
     const characters = fileContent.length;
     return { lines, characters };
   }, [fileContent]);
+  const logOutput = useMemo(() => {
+    const logSource = workspaceLogs?.job ?? job;
+    const traceEntries = workspaceLogs?.reports?.trace?.entries ?? [];
+    const jobLines = [
+      `status: ${logSource?.status ?? "idle"}`,
+      `mode: ${logSource?.generation_mode ?? generationMode}`,
+      `fidelity: ${logSource?.fidelity ?? "n/a"}`,
+      `llm: ${logSource?.llm_model ?? (logSource?.llm_enabled || systemConfig?.llm.enabled ? "configured" : "off")}`,
+      `provider: ${logSource?.llm_provider ?? systemConfig?.llm.provider ?? "none"}`,
+      `failure_reason: ${logSource?.failure_reason ?? "none"}`,
+    ];
+    const eventLines =
+      workspaceLogs?.events?.length
+        ? workspaceLogs.events.flatMap((event) => {
+            const details = event.details && Object.keys(event.details).length ? ` | ${JSON.stringify(event.details)}` : "";
+            return [`- [${formatTimestamp(event.created_at)}] ${event.event_type}: ${event.message}${details}`];
+          })
+        : ["- no job events recorded"];
+    const traceLines = traceEntries.length
+      ? traceEntries.flatMap((entry) => {
+          const payload =
+            entry.payload && Object.keys(entry.payload).length ? [`  payload: ${JSON.stringify(entry.payload)}`] : [];
+          return [`- [${formatTimestamp(entry.created_at)}] ${entry.stage}: ${entry.message}`, ...payload];
+        })
+      : ["- no execution trace recorded"];
+    const previewLines = [
+      `status: ${workspaceLogs?.preview?.status ?? "unknown"}`,
+      `runtime_mode: ${workspaceLogs?.preview?.runtime_mode ?? "unknown"}`,
+      `url: ${workspaceLogs?.preview?.url ?? "none"}`,
+      ...(workspaceLogs?.preview?.logs?.length
+        ? ["logs:", ...workspaceLogs.preview.logs.map((line) => `- ${line}`)]
+        : ["logs: none"]),
+    ];
+    const reportLines = [
+      `validation: ${JSON.stringify(workspaceLogs?.reports?.validation ?? job?.validation_snapshot ?? validation ?? {}, null, 2)}`,
+      `spec_summary: ${JSON.stringify(workspaceLogs?.reports?.spec_summary ?? {}, null, 2)}`,
+      `ir_summary: ${JSON.stringify(workspaceLogs?.reports?.ir_summary ?? {}, null, 2)}`,
+      `artifact_plan: ${JSON.stringify(workspaceLogs?.reports?.artifact_plan ?? {}, null, 2)}`,
+      `traceability: ${JSON.stringify(workspaceLogs?.reports?.traceability ?? {}, null, 2)}`,
+      `assumptions: ${JSON.stringify(workspaceLogs?.reports?.assumptions ?? {}, null, 2)}`,
+    ];
+    const sections = [
+      formatLogSection("# JOB", jobLines),
+      formatLogSection("# EVENTS", eventLines),
+      formatLogSection("# EXECUTION TRACE", traceLines),
+      formatLogSection("# PREVIEW", previewLines),
+      formatLogSection("# REPORTS", reportLines),
+    ];
+    return sections.join("\n");
+  }, [generationMode, job, systemConfig, validation, workspaceLogs]);
 
   async function refreshWorkspace(workspaceId: string) {
-    const [tree, chatTurns, validationPayload, previewPayload] = await Promise.all([
+    const [tree, chatTurns, validationPayload, previewPayload, logsPayload] = await Promise.all([
       request<FileEntry[]>(`/workspaces/${workspaceId}/files/tree`),
       request<ChatTurn[]>(`/workspaces/${workspaceId}/chat/turns`),
       request<Record<string, unknown> | null>(`/workspaces/${workspaceId}/validation/current`),
       request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`),
+      request<WorkspaceLogs>(`/workspaces/${workspaceId}/logs`),
     ]);
     setFiles(tree);
     setTurns(chatTurns);
     setValidation(validationPayload);
     setPreviewUrl(previewPayload.url ?? "");
     setRolePreviewUrls(previewPayload.role_urls ?? {});
+    setPreviewRuntimeMode(previewPayload.runtime_mode ?? "");
+    setWorkspaceLogs(logsPayload);
+    const nextPreviewBase = previewPayload.url ?? "";
+    setPreviewLoading({
+      client: Boolean(nextPreviewBase),
+      specialist: Boolean(nextPreviewBase),
+      manager: Boolean(nextPreviewBase),
+    });
     setExpandedDirectories((current) => {
       if (current.size > 0) {
         return current;
@@ -250,10 +462,13 @@ export default function App() {
           prompt,
           target_platform: "telegram_mini_app",
           preview_profile: "telegram_mock",
+          generation_mode: generationMode,
         }),
       });
       setJob(nextJob);
-      await request(`/workspaces/${workspace.workspace_id}/preview/start`, { method: "POST" });
+      if (nextJob.status === "completed") {
+        await request(`/workspaces/${workspace.workspace_id}/preview/start`, { method: "POST" });
+      }
       await refreshWorkspace(workspace.workspace_id);
       setActiveTab("preview");
     } catch (err) {
@@ -329,6 +544,14 @@ export default function App() {
           <div className="status-pill">{job?.status ?? "idle"}</div>
           <div className="artifact-strip">
             <div className="artifact-chip">
+              <span>Mode</span>
+              <strong>{job?.generation_mode ?? generationMode}</strong>
+              <div className="artifact-popover">
+                <p>Current generation mode and default pipeline profile.</p>
+                <strong>{job?.fidelity ?? "pending"}</strong>
+              </div>
+            </div>
+            <div className="artifact-chip">
               <span>Changed</span>
               <strong>{changedFiles}</strong>
               <div className="artifact-popover">
@@ -347,19 +570,52 @@ export default function App() {
               </div>
             </div>
             <div className="artifact-chip">
-              <span>Assumptions</span>
-              <strong>{job?.assumptions_report?.length ?? 0}</strong>
+              <span>LLM</span>
+              <strong>
+                {job?.llm_model ??
+                  (job?.llm_enabled
+                    ? "configured"
+                    : systemConfig?.llm.enabled
+                      ? "configured"
+                      : initializing
+                        ? "checking"
+                        : "off")}
+              </strong>
               <div className="artifact-popover">
-                {job?.assumptions_report?.length ? (
-                  job.assumptions_report.map((assumption, index) => (
-                    <div key={`${assumption.text}-${index}`} className="artifact-popover-item">
-                      <strong>{assumption.text}</strong>
-                      <p>{assumption.rationale}</p>
+                <p>
+                  {job?.llm_enabled || systemConfig?.llm.enabled
+                    ? "OpenRouter-backed generation path is configured."
+                    : initializing
+                      ? "Startup configuration is still being checked."
+                      : "OpenRouter is not configured for this run."}
+                </p>
+                <strong>{job?.llm_provider ?? systemConfig?.llm.provider ?? "no provider"}</strong>
+              </div>
+            </div>
+            <div className="artifact-chip">
+              <span>Assumptions</span>
+              <strong>{visibleWarnings.length}</strong>
+              <div className="artifact-popover">
+                {visibleWarnings.length ? (
+                  visibleWarnings.map((warning, index) => (
+                    <div key={`${warning.title}-${index}`} className="artifact-popover-item">
+                      <strong>{warning.title}</strong>
+                      <p>{warning.message}</p>
                     </div>
                   ))
                 ) : (
-                  <p>No explicit assumptions recorded yet.</p>
+                  <p>No blocking warnings.</p>
                 )}
+              </div>
+            </div>
+            <div className="artifact-chip">
+              <span>Compile</span>
+              <strong>
+                {String(job?.compile_summary?.screen_count ?? 0)} / {String(job?.compile_summary?.route_count ?? 0)}
+              </strong>
+              <div className="artifact-popover">
+                <p>Screens and routes compiled into the generated runtime.</p>
+                <pre>{JSON.stringify(job?.compile_summary ?? {}, null, 2)}</pre>
               </div>
             </div>
             <div className="artifact-chip">
@@ -392,10 +648,18 @@ export default function App() {
             <p>Prompt turns, grounded summary, and manual iteration.</p>
           </header>
           <form onSubmit={handleGenerate} className="prompt-form">
+            <label className="generation-mode-field">
+              <span>Generation mode</span>
+              <select value={generationMode} onChange={(event) => setGenerationMode(event.target.value as typeof generationMode)}>
+                <option value="quality">quality</option>
+                <option value="balanced">balanced</option>
+                <option value="basic">basic</option>
+              </select>
+            </label>
             <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={8} />
             <div className="actions">
-              <button type="submit" disabled={loading || !workspace}>
-                {loading ? "Generating..." : "Generate"}
+              <button type="submit" disabled={initializing || loading || !workspace}>
+                {initializing ? "Preparing..." : loading ? "Generating..." : "Generate"}
               </button>
               <button type="button" className="ghost" onClick={handleShowDiff} disabled={!workspace}>
                 Show Diff
@@ -410,19 +674,29 @@ export default function App() {
               </article>
             ))}
           </div>
+          {autoNotices.length ? (
+            <div className="auto-notices">
+              <h3>Auto-completed</h3>
+              {autoNotices.map((notice, index) => (
+                <div key={`${notice.title}-${index}`} className="notice-card">
+                  <strong>{notice.title}</strong>
+                  <p>{notice.message}</p>
+                </div>
+              ))}
+            </div>
+          ) : null}
           <div className="warnings">
-            <h3>Assumptions / warnings</h3>
-            {job?.assumptions_report?.length ? (
-              job.assumptions_report.map((assumption, index) => (
-                <div key={`${assumption.text}-${index}`} className="warning-card">
-                  <strong>{assumption.text}</strong>
-                  <p>{assumption.rationale}</p>
+            <h3>Warnings</h3>
+            {visibleWarnings.length ? (
+              visibleWarnings.map((warning, index) => (
+                <div key={`${warning.title}-${index}`} className="warning-card">
+                  <strong>{warning.title}</strong>
+                  <p>{warning.message}</p>
                 </div>
               ))
             ) : (
-              <p className="muted">No explicit assumptions recorded yet.</p>
+              <p className="muted">No blocking warnings.</p>
             )}
-            {error ? <p className="error">{error}</p> : null}
           </div>
         </section>
 
@@ -455,14 +729,32 @@ export default function App() {
                 <div key={role} className="preview-column">
                   <div className="preview-heading">
                     <strong>{role}</strong>
-                    <span>{role === "client" ? "Role 1" : role === "specialist" ? "Role 2" : "Role 3"}</span>
+                    <span>
+                      {(role === "client" ? "Role 1" : role === "specialist" ? "Role 2" : "Role 3")} ·{" "}
+                      {previewRuntimeMode || "runtime"}
+                    </span>
                   </div>
                   <div className="phone-shell">
                     {previewUrl ? (
-                      <iframe
-                        title={`Live preview ${role}`}
-                        src={rolePreviewUrls[role] ?? `${previewUrl}?role=${role}`}
-                      />
+                      <>
+                        {previewLoading[role] ? (
+                          <div className="preview-loader">
+                            <div className="preview-loader-spinner" />
+                            <p>Loading runtime…</p>
+                          </div>
+                        ) : null}
+                        <iframe
+                          title={`Live preview ${role}`}
+                          src={rolePreviewUrls[role] ?? `${previewUrl}?role=${role}`}
+                          className={previewLoading[role] ? "is-loading" : ""}
+                          onLoad={() =>
+                            setPreviewLoading((current) => ({
+                              ...current,
+                              [role]: false,
+                            }))
+                          }
+                        />
+                      </>
                     ) : (
                       <div className="placeholder">Generate a workspace artifact to populate the preview.</div>
                     )}
@@ -515,7 +807,7 @@ export default function App() {
           ) : null}
           {activeTab === "logs" ? (
             <div className="terminal">
-              <pre>{JSON.stringify(job?.validation_snapshot ?? validation ?? {}, null, 2)}</pre>
+              <pre>{logOutput}</pre>
             </div>
           ) : null}
         </section>

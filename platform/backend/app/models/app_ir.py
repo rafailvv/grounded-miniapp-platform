@@ -171,6 +171,34 @@ class Transition(StrictModel):
     condition: Condition | None = None
 
 
+class RouteDefinition(StrictModel):
+    route_id: str
+    role: Literal["client", "specialist", "manager"]
+    path: str
+    screen_id: str
+    label: str | None = None
+    is_entry: bool = False
+
+
+class RoleRouteGroup(StrictModel):
+    role: Literal["client", "specialist", "manager"]
+    entry_path: str
+    routes: list[RouteDefinition]
+
+
+class ScreenDataSource(StrictModel):
+    source_id: str
+    screen_id: str
+    kind: Literal["dashboard", "list", "detail", "form", "profile", "timeline"]
+    state_key: str
+    role: Literal["client", "specialist", "manager"]
+
+
+class RoleActionGroup(StrictModel):
+    role: Literal["client", "specialist", "manager"]
+    action_ids: list[str] = Field(default_factory=list)
+
+
 class Integration(StrictModel):
     integration_id: str
     name: str
@@ -257,6 +285,9 @@ class AppIRModel(StrictModel):
     entities: list[Entity]
     screens: list[Screen]
     transitions: list[Transition]
+    route_groups: list[RoleRouteGroup] = Field(default_factory=list)
+    screen_data_sources: list[ScreenDataSource] = Field(default_factory=list)
+    role_action_groups: list[RoleActionGroup] = Field(default_factory=list)
     integrations: list[Integration]
     storage_bindings: list[StorageBinding]
     auth_model: AuthModel
@@ -267,4 +298,3 @@ class AppIRModel(StrictModel):
     open_questions: list[OpenQuestion]
     traceability: list[TraceabilityLink]
     terminal_screen_ids: list[str] = Field(default_factory=list)
-

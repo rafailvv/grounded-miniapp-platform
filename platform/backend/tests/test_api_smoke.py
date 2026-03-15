@@ -44,6 +44,7 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
             "prompt": "Create a consultation booking mini-app with name phone date and comment fields.",
             "target_platform": "telegram_mini_app",
             "preview_profile": "telegram_mock",
+            "generation_mode": "basic",
         },
     )
     assert job_response.status_code == 200
@@ -57,15 +58,18 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     file_tree = client.get(f"/workspaces/{workspace_id}/files/tree").json()
 
     assert spec_payload["product_goal"].startswith("Create a consultation booking")
-    assert ir_payload["entry_screen_id"] == "screen_form"
+    assert ir_payload["entry_screen_id"] == "client_home"
+    assert len(ir_payload["screens"]) >= 10
+    assert len(ir_payload["route_groups"]) == 3
     assert validation_payload["blocking"] is False
     assert preview_payload["url"].endswith(f"/preview/{workspace_id}")
     assert preview_payload["role_urls"]["client"].endswith(f"/preview/{workspace_id}?role=client")
+    assert any(item["path"] == "backend/app/generated/runtime_manifest.json" for item in file_tree)
     assert any(item["path"] == "artifacts/grounded_spec.json" for item in file_tree)
 
     preview_response = client.get(f"/preview/{workspace_id}?role=manager")
     assert preview_response.status_code == 200
-    assert "Manager role" in preview_response.text
+    assert "booking" in preview_response.text.lower()
 
     save_response = client.post(
         f"/workspaces/{workspace_id}/files/save",
@@ -88,3 +92,36 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     events_response = client.get(f"/jobs/{job['job_id']}/events")
     assert events_response.status_code == 200
     assert "job_completed" in events_response.text
+
+
+def test_quality_mode_blocks_without_openrouter(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Quality Workspace",
+            "description": "Quality mode should block without OpenRouter",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    clone_response = client.post(f"/workspaces/{workspace_id}/clone-template")
+    assert clone_response.status_code == 200
+
+    job_response = client.post(
+        f"/workspaces/{workspace_id}/generate",
+        json={
+            "prompt": "Build a high-quality role-aware consultation workflow mini-app.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+            "generation_mode": "quality",
+        },
+    )
+    assert job_response.status_code == 200
+    payload = job_response.json()
+    assert payload["status"] == "blocked"
+    assert payload["failure_reason"]

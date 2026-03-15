@@ -1,15 +1,15 @@
 MODEL_REGISTRY = {
     "spec_analysis": {
+        "primary": "openai/gpt-5.4",
+        "fallback": "anthropic/claude-opus-4.6",
+    },
+    "ir_codegen": {
         "primary": "anthropic/claude-opus-4.6",
         "fallback": "anthropic/claude-sonnet-4.6",
     },
-    "ir_codegen": {
-        "primary": "openai/gpt-5.3-codex",
-        "fallback": "openai/gpt-5.4",
-    },
     "repair": {
-        "primary": "openai/gpt-5.3-codex",
-        "fallback": "openai/gpt-5.4",
+        "primary": "anthropic/claude-opus-4.6",
+        "fallback": "anthropic/claude-sonnet-4.6",
     },
     "cheap_task": {
         "primary": "openai/o4-mini",
@@ -20,4 +20,3 @@ MODEL_REGISTRY = {
         "fallback": "openai/text-embedding-3-large",
     },
 }
-

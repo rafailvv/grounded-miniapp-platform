@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import Field
 
-from app.models.common import PreviewProfile, StrictModel, TargetPlatform
+from app.models.common import GenerationMode, PreviewProfile, StrictModel, TargetPlatform
 
 
 def utc_now() -> datetime:
@@ -92,6 +92,7 @@ class JobEvent(StrictModel):
         "job_completed",
     ]
     message: str
+    details: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -109,9 +110,16 @@ class JobRecord(StrictModel):
     workspace_id: str
     prompt: str
     status: Literal["pending", "running", "blocked", "completed", "failed"] = "pending"
+    generation_mode: GenerationMode = GenerationMode.QUALITY
     target_platform: TargetPlatform
     preview_profile: PreviewProfile
     current_revision_id: str | None = None
+    fidelity: Literal["quality_app", "balanced_app", "basic_scaffold", "blocked"] = "blocked"
+    llm_enabled: bool = False
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    failure_reason: str | None = None
+    compile_summary: dict[str, int | str] = Field(default_factory=dict)
     events: list[JobEvent] = Field(default_factory=list)
     summary: str | None = None
     assumptions_report: list[dict] = Field(default_factory=list)
@@ -177,6 +185,7 @@ class GenerateRequest(StrictModel):
     prompt: str
     target_platform: TargetPlatform = TargetPlatform.TELEGRAM
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
+    generation_mode: GenerationMode = GenerationMode.QUALITY
 
 
 class SaveFileRequest(StrictModel):

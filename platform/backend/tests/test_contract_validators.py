@@ -15,7 +15,11 @@ from app.models.app_ir import (
     IRMetadata,
     Integration,
     Permission,
+    RoleActionGroup,
+    RoleRouteGroup,
+    RouteDefinition,
     Screen,
+    ScreenDataSource,
     SecurityPolicy,
     StorageBinding,
     TelemetryHook,
@@ -231,6 +235,67 @@ def make_valid_ir() -> AppIRModel:
                 trigger="submit_success",
             )
         ],
+        route_groups=[
+            RoleRouteGroup(
+                role="client",
+                entry_path="/",
+                routes=[
+                    RouteDefinition(
+                        route_id="route_client_form",
+                        role="client",
+                        path="/",
+                        screen_id="screen_form",
+                        is_entry=True,
+                    ),
+                    RouteDefinition(
+                        route_id="route_client_success",
+                        role="client",
+                        path="/success",
+                        screen_id="screen_success",
+                    ),
+                ],
+            ),
+            RoleRouteGroup(
+                role="specialist",
+                entry_path="/",
+                routes=[
+                    RouteDefinition(
+                        route_id="route_specialist_form",
+                        role="specialist",
+                        path="/",
+                        screen_id="screen_form",
+                        is_entry=True,
+                    )
+                ],
+            ),
+            RoleRouteGroup(
+                role="manager",
+                entry_path="/",
+                routes=[
+                    RouteDefinition(
+                        route_id="route_manager_form",
+                        role="manager",
+                        path="/",
+                        screen_id="screen_form",
+                        is_entry=True,
+                    )
+                ],
+            ),
+        ],
+        screen_data_sources=[
+            ScreenDataSource(
+                source_id="source_form",
+                screen_id="screen_form",
+                kind="form",
+                state_key="forms.form",
+                role="client",
+            )
+        ],
+        role_action_groups=[
+            RoleActionGroup(role="client", action_ids=["action_submit"]),
+            RoleActionGroup(role="specialist", action_ids=["action_submit"]),
+            RoleActionGroup(role="manager", action_ids=["action_submit"]),
+        ],
         integrations=[
             Integration(
                 integration_id="integration_submit",
@@ -320,4 +385,3 @@ def test_app_ir_validator_blocks_trusted_user_input() -> None:
     result = AppIRValidator().validate(ir)
     assert result.valid is False
     assert any(issue.code == "ir.trusted_user_input" for issue in result.issues)
-

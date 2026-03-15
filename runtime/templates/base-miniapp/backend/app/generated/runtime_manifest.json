@@ -1,0 +1,31 @@
+{
+  "app": {
+    "title": "",
+    "goal": "",
+    "generation_mode": "basic",
+    "platform": "telegram_mini_app",
+    "preview_profile": "telegram_mock",
+    "route_count": 0,
+    "screen_count": 0
+  },
+  "roles": {
+    "client": {
+      "entry_path": "/",
+      "navigation": [],
+      "routes": [],
+      "screens": {}
+    },
+    "specialist": {
+      "entry_path": "/",
+      "navigation": [],
+      "routes": [],
+      "screens": {}
+    },
+    "manager": {
+      "entry_path": "/",
+      "navigation": [],
+      "routes": [],
+      "screens": {}
+    }
+  }
+}

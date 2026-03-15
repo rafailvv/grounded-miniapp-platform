@@ -12,10 +12,10 @@ function createMockWebApp(): TelegramWebApp {
     initData: '',
     initDataUnsafe: {
       user: {
-        id: 1000001,
-        first_name: 'Demo',
-        last_name: 'User',
-        username: 'demo_user',
+        id: 0,
+        first_name: '',
+        last_name: '',
+        username: '',
       },
       start_param: '',
     },
