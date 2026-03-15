@@ -138,7 +138,7 @@ class PreviewRecord(StrictModel):
     frontend_url: str | None = None
     backend_url: str | None = None
     proxy_port: int | None = None
-    runtime_mode: Literal["inline", "docker"] = "inline"
+    runtime_mode: Literal["inline", "docker"] = "docker"
     project_name: str | None = None
     logs: list[str] = Field(default_factory=list)
     started_at: datetime | None = None

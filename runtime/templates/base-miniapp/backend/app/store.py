@@ -91,12 +91,11 @@ DEFAULT_RUNTIME_STATE = {
     "activity": [],
 }
 
-def ensure_state() -> dict[str, Any]:
+def ensure_state() -> None:
     if not MANIFEST_PATH.exists():
         MANIFEST_PATH.write_text(json.dumps(DEFAULT_RUNTIME_MANIFEST, ensure_ascii=False, indent=2), encoding="utf-8")
     if not STATE_PATH.exists():
         STATE_PATH.write_text(json.dumps(DEFAULT_RUNTIME_STATE, ensure_ascii=False, indent=2), encoding="utf-8")
-    return load_state()
 
 
 def load_manifest() -> dict[str, Any]:

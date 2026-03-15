@@ -526,6 +526,20 @@ button.ghost,
     linear-gradient(180deg, #fafaff 0%, #f1f3ff 100%);
 }
 
+.placeholder strong {
+  display: block;
+  margin-bottom: 10px;
+}
+
+.placeholder p {
+  margin: 0;
+}
+
+.placeholder-error {
+  color: #5d3654;
+  background: linear-gradient(180deg, #fff8fb 0%, #f7edf5 100%);
+}
+
 .code-layout {
   display: grid;
   grid-template-columns: 340px minmax(0, 1fr);

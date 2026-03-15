@@ -17,12 +17,9 @@ class PreviewRuntimeManager:
         self.settings = settings
 
     def preferred_mode(self) -> str:
-        mode = self.settings.preview_runtime_mode.lower()
-        if mode in {"inline", "docker"}:
-            return mode
         if os.getenv("PYTEST_CURRENT_TEST"):
             return "inline"
-        return "docker" if self._compose_command() else "inline"
+        return "docker"
 
     def allocate_port(self, workspace_id: str) -> int:
         start = self.settings.preview_port_base + (sum(ord(char) for char in workspace_id) % 1000)
@@ -120,15 +117,25 @@ class PreviewRuntimeManager:
 
     def wait_until_ready(self, proxy_port: int) -> None:
         deadline = time.time() + self.settings.preview_start_timeout_sec
-        health_url = f"http://localhost:{proxy_port}/health"
+        health_urls = [
+            f"http://host.docker.internal:{proxy_port}/health",
+            f"http://127.0.0.1:{proxy_port}/health",
+            f"http://localhost:{proxy_port}/health",
+        ]
         while time.time() < deadline:
-            try:
-                with urlopen(health_url, timeout=2) as response:
-                    if response.status == 200:
-                        return
-            except (URLError, OSError):
-                time.sleep(1)
-        raise RuntimeError(f"Preview runtime did not become healthy at {health_url}.")
+            for health_url in health_urls:
+                try:
+                    with urlopen(health_url, timeout=2) as response:
+                        if response.status == 200:
+                            return
+                except (URLError, OSError):
+                    continue
+            time.sleep(1)
+        raise RuntimeError(
+            "Preview runtime did not become healthy at any of: "
+            + ", ".join(health_urls)
+            + "."
+        )
 
     def _compose_env(self, proxy_port: int) -> dict[str, str]:
         env = os.environ.copy()

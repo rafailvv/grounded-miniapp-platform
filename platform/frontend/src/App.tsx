@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 import { ensureWorkspace, openWorkspace, request, SystemConfiguration, Workspace } from "./lib/api";
 import "./styles/app.css";
@@ -50,6 +50,16 @@ type PreviewInfo = {
   runtime_mode?: string;
   status?: string;
 };
+
+const PREVIEW_BOOT_ROLES = {
+  client: true,
+  specialist: true,
+  manager: true,
+} as const;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
 
 type WorkspaceLogs = {
   workspace_id: string;
@@ -230,6 +240,7 @@ function FileTree({
 }
 
 export default function App() {
+  const previewRoles = ["client", "specialist", "manager"] as const;
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [prompt, setPrompt] = useState(INITIAL_PROMPT);
   const [job, setJob] = useState<Job | null>(null);
@@ -244,17 +255,26 @@ export default function App() {
   const [rolePreviewUrls, setRolePreviewUrls] = useState<Record<string, string>>({});
   const [generationMode, setGenerationMode] = useState<"quality" | "balanced" | "basic">("quality");
   const [previewRuntimeMode, setPreviewRuntimeMode] = useState<string>("");
+  const [previewStatus, setPreviewStatus] = useState<string>("");
+  const [previewBooting, setPreviewBooting] = useState(false);
   const [loading, setLoading] = useState(false);
   const [initializing, setInitializing] = useState(true);
   const [systemConfig, setSystemConfig] = useState<SystemConfiguration | null>(null);
   const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
   const [error, setError] = useState<string>("");
   const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(new Set());
+  const [previewCycle, setPreviewCycle] = useState(0);
   const [previewLoading, setPreviewLoading] = useState<Record<string, boolean>>({
     client: false,
     specialist: false,
     manager: false,
   });
+  const [previewFailed, setPreviewFailed] = useState<Record<string, boolean>>({
+    client: false,
+    specialist: false,
+    manager: false,
+  });
+  const previewTimeoutsRef = useRef<Record<string, number | undefined>>({});
 
   useEffect(() => {
     let isMounted = true;
@@ -295,14 +315,43 @@ export default function App() {
       return;
     }
     void (async () => {
+      setPreviewBooting(true);
+      setPreviewUrl("");
+      setRolePreviewUrls({});
+      setPreviewStatus("starting");
+      setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
       try {
         await request(`/workspaces/${workspace.workspace_id}/preview/start`, { method: "POST" });
-      } catch {
-        // The subsequent refresh will surface the latest preview logs and mode.
+        await waitForPreviewResolution(workspace.workspace_id);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to start preview runtime.");
+      } finally {
+        setPreviewBooting(false);
       }
       await refreshWorkspace(workspace.workspace_id);
     })();
   }, [workspace]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(previewTimeoutsRef.current).forEach((timeoutId) => {
+        if (timeoutId) {
+          window.clearTimeout(timeoutId);
+        }
+      });
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!previewUrl) {
+      return;
+    }
+    previewRoles.forEach((role) => {
+      if (previewLoading[role]) {
+        armPreviewTimeout(role);
+      }
+    });
+  }, [previewCycle, previewUrl]);
 
   const changedFiles = useMemo(
     () => files.filter((entry) => entry.type === "file" && entry.path.startsWith("artifacts/")).length,
@@ -415,32 +464,90 @@ export default function App() {
   }, [generationMode, job, systemConfig, validation, workspaceLogs]);
 
   async function refreshWorkspace(workspaceId: string) {
-    const [tree, chatTurns, validationPayload, previewPayload, logsPayload] = await Promise.all([
+    setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
+    setPreviewFailed({
+      client: false,
+      specialist: false,
+      manager: false,
+    });
+    const [treeResult, turnsResult, validationResult, previewResult, logsResult] = await Promise.allSettled([
       request<FileEntry[]>(`/workspaces/${workspaceId}/files/tree`),
       request<ChatTurn[]>(`/workspaces/${workspaceId}/chat/turns`),
       request<Record<string, unknown> | null>(`/workspaces/${workspaceId}/validation/current`),
       request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`),
       request<WorkspaceLogs>(`/workspaces/${workspaceId}/logs`),
     ]);
-    setFiles(tree);
-    setTurns(chatTurns);
-    setValidation(validationPayload);
-    setPreviewUrl(previewPayload.url ?? "");
-    setRolePreviewUrls(previewPayload.role_urls ?? {});
-    setPreviewRuntimeMode(previewPayload.runtime_mode ?? "");
-    setWorkspaceLogs(logsPayload);
-    const nextPreviewBase = previewPayload.url ?? "";
-    setPreviewLoading({
-      client: Boolean(nextPreviewBase),
-      specialist: Boolean(nextPreviewBase),
-      manager: Boolean(nextPreviewBase),
-    });
-    setExpandedDirectories((current) => {
-      if (current.size > 0) {
-        return current;
-      }
-      return new Set(collectExpandedDirectories(buildFileTree(tree)).slice(0, 8));
-    });
+
+    const refreshErrors: string[] = [];
+
+    if (treeResult.status === "fulfilled") {
+      setFiles(treeResult.value);
+      setExpandedDirectories((current) => {
+        if (current.size > 0) {
+          return current;
+        }
+        return new Set(collectExpandedDirectories(buildFileTree(treeResult.value)).slice(0, 8));
+      });
+    } else {
+      refreshErrors.push(`files: ${treeResult.reason instanceof Error ? treeResult.reason.message : "failed to load"}`);
+    }
+
+    if (turnsResult.status === "fulfilled") {
+      setTurns(turnsResult.value);
+    } else {
+      refreshErrors.push(`chat: ${turnsResult.reason instanceof Error ? turnsResult.reason.message : "failed to load"}`);
+    }
+
+    if (validationResult.status === "fulfilled") {
+      setValidation(validationResult.value);
+    } else {
+      refreshErrors.push(
+        `validation: ${validationResult.reason instanceof Error ? validationResult.reason.message : "failed to load"}`,
+      );
+    }
+
+    let nextPreviewBase = "";
+    if (previewResult.status === "fulfilled") {
+      const previewPayload = previewResult.value;
+      setPreviewUrl(previewPayload.url ?? "");
+      setRolePreviewUrls(previewPayload.role_urls ?? {});
+      setPreviewRuntimeMode(previewPayload.runtime_mode ?? "");
+      setPreviewStatus(previewPayload.status ?? "");
+      nextPreviewBase = previewPayload.url ?? "";
+    } else {
+      setPreviewUrl("");
+      setRolePreviewUrls({});
+      setPreviewStatus("error");
+      refreshErrors.push(`preview: ${previewResult.reason instanceof Error ? previewResult.reason.message : "failed to load"}`);
+    }
+
+    if (logsResult.status === "fulfilled") {
+      setWorkspaceLogs(logsResult.value);
+    } else {
+      refreshErrors.push(`logs: ${logsResult.reason instanceof Error ? logsResult.reason.message : "failed to load"}`);
+    }
+
+    if (nextPreviewBase) {
+      setPreviewCycle((current) => current + 1);
+      setPreviewLoading({
+        client: true,
+        specialist: true,
+        manager: true,
+      });
+    } else {
+      setPreviewLoading({
+        client: false,
+        specialist: false,
+        manager: false,
+      });
+      setPreviewFailed({
+        client: previewStatus === "error",
+        specialist: previewStatus === "error",
+        manager: previewStatus === "error",
+      });
+    }
+
+    setError(refreshErrors.length ? refreshErrors.join(" | ") : "");
   }
 
   async function handleGenerate(event: FormEvent) {
@@ -450,6 +557,16 @@ export default function App() {
     }
     setLoading(true);
     setError("");
+    setPreviewBooting(true);
+    setPreviewUrl("");
+    setRolePreviewUrls({});
+    setPreviewStatus("starting");
+    setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
+    setPreviewFailed({
+      client: false,
+      specialist: false,
+      manager: false,
+    });
     try {
       const createdTurn = await request<ChatTurn>(`/workspaces/${workspace.workspace_id}/chat/turns`, {
         method: "POST",
@@ -468,13 +585,71 @@ export default function App() {
       setJob(nextJob);
       if (nextJob.status === "completed") {
         await request(`/workspaces/${workspace.workspace_id}/preview/start`, { method: "POST" });
+        await waitForPreviewResolution(workspace.workspace_id);
       }
       await refreshWorkspace(workspace.workspace_id);
       setActiveTab("preview");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Generation failed.");
     } finally {
+      setPreviewBooting(false);
       setLoading(false);
+    }
+  }
+
+  async function waitForPreviewResolution(workspaceId: string): Promise<void> {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const preview = await request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`);
+      setPreviewRuntimeMode(preview.runtime_mode ?? "");
+      setPreviewStatus(preview.status ?? "");
+      if (preview.status === "error") {
+        setPreviewLoading({
+          client: false,
+          specialist: false,
+          manager: false,
+        });
+        setPreviewFailed({
+          client: true,
+          specialist: true,
+          manager: true,
+        });
+        return;
+      }
+      if (preview.status === "running" && preview.url) {
+        return;
+      }
+      await sleep(1000);
+    }
+    setPreviewStatus("error");
+    setPreviewLoading({
+      client: false,
+      specialist: false,
+      manager: false,
+    });
+    setPreviewFailed({
+      client: true,
+      specialist: true,
+      manager: true,
+    });
+    setError("preview: runtime startup timed out");
+  }
+
+  function armPreviewTimeout(role: "client" | "specialist" | "manager") {
+    const existing = previewTimeoutsRef.current[role];
+    if (existing) {
+      window.clearTimeout(existing);
+    }
+    previewTimeoutsRef.current[role] = window.setTimeout(() => {
+      setPreviewLoading((current) => ({ ...current, [role]: false }));
+      setPreviewFailed((current) => ({ ...current, [role]: true }));
+    }, 12000);
+  }
+
+  function clearPreviewTimeout(role: "client" | "specialist" | "manager") {
+    const existing = previewTimeoutsRef.current[role];
+    if (existing) {
+      window.clearTimeout(existing);
+      previewTimeoutsRef.current[role] = undefined;
     }
   }
 
@@ -725,7 +900,7 @@ export default function App() {
           </div>
           {activeTab === "preview" ? (
             <div className="preview-grid">
-              {(["client", "specialist", "manager"] as const).map((role) => (
+              {previewRoles.map((role) => (
                 <div key={role} className="preview-column">
                   <div className="preview-heading">
                     <strong>{role}</strong>
@@ -744,17 +919,40 @@ export default function App() {
                           </div>
                         ) : null}
                         <iframe
+                          key={`${role}-${previewCycle}-${rolePreviewUrls[role] ?? previewUrl}`}
                           title={`Live preview ${role}`}
                           src={rolePreviewUrls[role] ?? `${previewUrl}?role=${role}`}
                           className={previewLoading[role] ? "is-loading" : ""}
                           onLoad={() =>
-                            setPreviewLoading((current) => ({
-                              ...current,
-                              [role]: false,
-                            }))
+                            window.setTimeout(() => {
+                              clearPreviewTimeout(role);
+                              setPreviewFailed((current) => ({
+                                ...current,
+                                [role]: false,
+                              }));
+                              setPreviewLoading((current) => ({
+                                ...current,
+                                [role]: false,
+                              }));
+                            }, 350)
                           }
                         />
                       </>
+                    ) : previewBooting || previewLoading[role] || loading || initializing || previewStatus === "starting" ? (
+                      <div className="preview-loader">
+                        <div className="preview-loader-spinner" />
+                        <p>Loading runtime…</p>
+                      </div>
+                    ) : previewFailed[role] ? (
+                      <div className="placeholder placeholder-error">
+                        <strong>Failed to load preview.</strong>
+                        <p>This role runtime did not open in time.</p>
+                      </div>
+                    ) : previewStatus === "error" ? (
+                      <div className="placeholder placeholder-error">
+                        <strong>Failed to load preview.</strong>
+                        <p>Open the logs tab to see the runtime startup error.</p>
+                      </div>
                     ) : (
                       <div className="placeholder">Generate a workspace artifact to populate the preview.</div>
                     )}

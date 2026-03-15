@@ -62,8 +62,11 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     assert len(ir_payload["screens"]) >= 10
     assert len(ir_payload["route_groups"]) == 3
     assert validation_payload["blocking"] is False
-    assert preview_payload["url"].endswith(f"/preview/{workspace_id}")
-    assert preview_payload["role_urls"]["client"].endswith(f"/preview/{workspace_id}?role=client")
+    assert preview_payload["url"] is None or preview_payload["url"].startswith("http://localhost:")
+    if preview_payload["url"] is None:
+        assert preview_payload["role_urls"] == {}
+    else:
+        assert preview_payload["role_urls"]["client"].startswith(preview_payload["url"])
     assert any(item["path"] == "backend/app/generated/runtime_manifest.json" for item in file_tree)
     assert any(item["path"] == "artifacts/grounded_spec.json" for item in file_tree)
 

@@ -33,34 +33,24 @@ class PreviewService:
         preview.runtime_mode = runtime_mode
         preview.updated_at = datetime.now(timezone.utc)
         try:
-            if runtime_mode == "docker":
-                proxy_port = preview.proxy_port or self.runtime_manager.allocate_port(workspace_id)
-                project_name, logs = self.runtime_manager.start(workspace_id, source_dir, proxy_port)
-                preview.proxy_port = proxy_port
-                preview.project_name = project_name
-                preview.url = self.runtime_manager.preview_url(proxy_port)
-                preview.frontend_url = preview.url
-                preview.backend_url = self.runtime_manager.backend_url(proxy_port)
-                preview.logs.extend(logs or [f"Docker preview started on port {proxy_port}."])
-            else:
-                preview.url = f"{self.settings.preview_base_url}/preview/{workspace_id}"
-                preview.frontend_url = preview.url
-                preview.backend_url = f"{self.settings.preview_base_url}/api"
-                preview.logs.append("Preview started in inline research mode.")
+            proxy_port = preview.proxy_port or self.runtime_manager.allocate_port(workspace_id)
+            project_name, logs = self.runtime_manager.start(workspace_id, source_dir, proxy_port)
+            preview.proxy_port = proxy_port
+            preview.project_name = project_name
+            preview.url = self.runtime_manager.preview_url(proxy_port)
+            preview.frontend_url = preview.url
+            preview.backend_url = self.runtime_manager.backend_url(proxy_port)
+            preview.logs.extend(logs or [f"Docker preview started on port {proxy_port}."])
             preview.status = "running"
             preview.started_at = preview.started_at or datetime.now(timezone.utc)
         except Exception as exc:
-            if runtime_mode == "docker":
-                preview.runtime_mode = "inline"
-                preview.url = f"{self.settings.preview_base_url}/preview/{workspace_id}"
-                preview.frontend_url = preview.url
-                preview.backend_url = f"{self.settings.preview_base_url}/api"
-                preview.logs.append(f"Docker preview failed, switched to inline mode: {exc}")
-                preview.status = "running"
-                preview.started_at = preview.started_at or datetime.now(timezone.utc)
-            else:
-                preview.status = "error"
-                preview.logs.append(f"Preview start failed: {exc}")
+            preview.url = None
+            preview.frontend_url = None
+            preview.backend_url = None
+            preview.proxy_port = None
+            preview.project_name = None
+            preview.status = "error"
+            preview.logs.append(f"Docker preview failed: {exc}")
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
         return preview
 
@@ -71,34 +61,24 @@ class PreviewService:
         preview.runtime_mode = runtime_mode
         preview.updated_at = datetime.now(timezone.utc)
         try:
-            if runtime_mode == "docker":
-                proxy_port = preview.proxy_port or self.runtime_manager.allocate_port(workspace_id)
-                logs = self.runtime_manager.rebuild(workspace_id, source_dir, proxy_port)
-                preview.proxy_port = proxy_port
-                preview.project_name = self.runtime_manager.project_name(workspace_id)
-                preview.url = self.runtime_manager.preview_url(proxy_port)
-                preview.frontend_url = preview.url
-                preview.backend_url = self.runtime_manager.backend_url(proxy_port)
-                preview.logs.extend(logs or ["Docker preview rebuilt."])
-            else:
-                preview.url = f"{self.settings.preview_base_url}/preview/{workspace_id}"
-                preview.frontend_url = preview.url
-                preview.backend_url = f"{self.settings.preview_base_url}/api"
-                preview.logs.append("Inline preview rebuild requested.")
+            proxy_port = preview.proxy_port or self.runtime_manager.allocate_port(workspace_id)
+            logs = self.runtime_manager.rebuild(workspace_id, source_dir, proxy_port)
+            preview.proxy_port = proxy_port
+            preview.project_name = self.runtime_manager.project_name(workspace_id)
+            preview.url = self.runtime_manager.preview_url(proxy_port)
+            preview.frontend_url = preview.url
+            preview.backend_url = self.runtime_manager.backend_url(proxy_port)
+            preview.logs.extend(logs or ["Docker preview rebuilt."])
             preview.status = "running"
             preview.started_at = preview.started_at or datetime.now(timezone.utc)
         except Exception as exc:
-            if runtime_mode == "docker":
-                preview.runtime_mode = "inline"
-                preview.url = f"{self.settings.preview_base_url}/preview/{workspace_id}"
-                preview.frontend_url = preview.url
-                preview.backend_url = f"{self.settings.preview_base_url}/api"
-                preview.logs.append(f"Docker preview rebuild failed, switched to inline mode: {exc}")
-                preview.status = "running"
-                preview.started_at = preview.started_at or datetime.now(timezone.utc)
-            else:
-                preview.status = "error"
-                preview.logs.append(f"Preview rebuild failed: {exc}")
+            preview.url = None
+            preview.frontend_url = None
+            preview.backend_url = None
+            preview.proxy_port = None
+            preview.project_name = None
+            preview.status = "error"
+            preview.logs.append(f"Docker preview rebuild failed: {exc}")
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
         return preview
 
@@ -115,7 +95,7 @@ class PreviewService:
                 preview.status = "stopped"
         else:
             preview.status = "stopped"
-            preview.logs.append("Inline preview session reset.")
+            preview.logs.append("No external preview session to reset.")
         preview.updated_at = datetime.now(timezone.utc)
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
         return preview
@@ -125,6 +105,15 @@ class PreviewService:
         if not payload:
             return self._get_or_create(workspace_id)
         preview = PreviewRecord.model_validate(payload)
+        if preview.runtime_mode == "inline":
+            preview.runtime_mode = "docker"
+            preview.status = "error"
+            preview.url = None
+            preview.frontend_url = None
+            preview.backend_url = None
+            preview.proxy_port = None
+            preview.project_name = None
+            preview.logs.append("Legacy inline preview was disabled. Start the docker runtime preview.")
         if preview.runtime_mode == "docker" and preview.proxy_port is not None:
             try:
                 preview.logs = self.runtime_manager.collect_logs(
