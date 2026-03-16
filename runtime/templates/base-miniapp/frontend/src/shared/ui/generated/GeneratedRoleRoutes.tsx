@@ -24,11 +24,7 @@ function RoleRouteContent({ role }: GeneratedRoleRoutesProps): JSX.Element {
   }
 
   if (!manifest.routes.length) {
-    return (
-      <div style={{ padding: 20 }}>
-        Runtime manifest is empty.
-      </div>
-    );
+    return <></>;
   }
 
   return (

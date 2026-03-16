@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
-import { ensureWorkspace, openWorkspace, request, SystemConfiguration, Workspace } from "./lib/api";
+import { deleteWorkspace, ensureWorkspace, listWorkspaces, openWorkspace, request, SystemConfiguration, Workspace } from "./lib/api";
 import "./styles/app.css";
 
 type Job = {
@@ -23,13 +23,6 @@ type Job = {
     blocking: boolean;
     issues: Array<{ code: string; message: string; severity?: string }>;
   } | null;
-};
-
-type ChatTurn = {
-  turn_id: string;
-  role: "user" | "assistant";
-  content: string;
-  summary?: string | null;
 };
 
 type FileEntry = {
@@ -56,6 +49,24 @@ const PREVIEW_BOOT_ROLES = {
   specialist: true,
   manager: true,
 } as const;
+type RoleKey = keyof typeof PREVIEW_BOOT_ROLES;
+
+const ROLE_ORDER: RoleKey[] = ["client", "specialist", "manager"];
+const ROLE_LABELS: Record<RoleKey, string> = {
+  client: "Client",
+  specialist: "Specialist",
+  manager: "Manager",
+};
+const ROLE_PLACEHOLDERS: Record<RoleKey, string> = {
+  client: "What should the client be able to do in the app?",
+  specialist: "What workflow should the specialist have?",
+  manager: "What control and analytics should the manager have?",
+};
+const EMPTY_ROLE_REQUIREMENTS: Record<RoleKey, string> = {
+  client: "",
+  specialist: "",
+  manager: "",
+};
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -95,9 +106,6 @@ type WorkspaceLogs = {
     ir_summary?: Record<string, unknown> | null;
   };
 };
-
-const INITIAL_PROMPT =
-  "Build a consultation booking form mini-app with name, phone, preferred date and comment fields.";
 
 function formatLogSection(title: string, lines: string[]): string {
   return [title, ...lines, ""].join("\n");
@@ -188,6 +196,48 @@ function collectExpandedDirectories(nodes: FileTreeNode[]): string[] {
   return expanded;
 }
 
+function buildBusinessPrompt(
+  roleRequirements: Record<RoleKey, string>,
+  previousRoleRequirements: Record<RoleKey, string>,
+  hasExistingBuild: boolean,
+): string {
+  const lines = [
+    "Build a production-ready Telegram mini-app for a real business use case.",
+    "Deliver a complete app flow with robust UX, clear validation, and actionable business value.",
+    "Avoid demo scaffolding and generic placeholders unless explicitly requested.",
+    "",
+    "Role requirements and update policy:",
+  ];
+
+  ROLE_ORDER.forEach((role) => {
+    const current = roleRequirements[role].trim();
+    const previous = previousRoleRequirements[role].trim();
+    if (!current) {
+      lines.push(`- ${ROLE_LABELS[role]}: no new requirement provided; keep this role unchanged.`);
+      return;
+    }
+    lines.push(`- ${ROLE_LABELS[role]} requirement: ${current}`);
+    lines.push(
+      previous
+        ? `- ${ROLE_LABELS[role]}: refine and extend the existing flow based on this updated requirement.`
+        : `- ${ROLE_LABELS[role]}: create this flow from scratch with full business-ready behavior.`,
+    );
+  });
+
+  if (!hasExistingBuild) {
+    lines.push(
+      "- If a role has no requirement and no existing flow yet, keep it minimal and avoid inventing unsupported functionality.",
+    );
+  }
+
+  lines.push("");
+  lines.push("Quality bar:");
+  lines.push("- Real-world forms, status handling, validation, and error states.");
+  lines.push("- Consistent navigation between client, specialist, and manager roles.");
+  lines.push("- Production-oriented structure and maintainable code artifacts.");
+  return lines.join("\n");
+}
+
 type FileTreeProps = {
   nodes: FileTreeNode[];
   expandedPaths: Set<string>;
@@ -240,11 +290,20 @@ function FileTree({
 }
 
 export default function App() {
-  const previewRoles = ["client", "specialist", "manager"] as const;
+  const previewRoles = ROLE_ORDER;
+  const generationMode = "quality" as const;
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
-  const [prompt, setPrompt] = useState(INITIAL_PROMPT);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [workspaceDrawerOpen, setWorkspaceDrawerOpen] = useState(false);
+  const [workspaceSearch, setWorkspaceSearch] = useState("");
+  const [workspaceTransitioning, setWorkspaceTransitioning] = useState(true);
+  const [creatingWorkspace, setCreatingWorkspace] = useState(false);
+  const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string>("");
+  const [roleRequirements, setRoleRequirements] = useState<Record<RoleKey, string>>({ ...EMPTY_ROLE_REQUIREMENTS });
+  const [submittedRoleRequirements, setSubmittedRoleRequirements] = useState<Record<RoleKey, string>>({
+    ...EMPTY_ROLE_REQUIREMENTS,
+  });
   const [job, setJob] = useState<Job | null>(null);
-  const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [fileContent, setFileContent] = useState<string>("");
   const [selectedPath, setSelectedPath] = useState<string>("");
@@ -253,7 +312,6 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "logs">("preview");
   const [previewUrl, setPreviewUrl] = useState<string>("");
   const [rolePreviewUrls, setRolePreviewUrls] = useState<Record<string, string>>({});
-  const [generationMode, setGenerationMode] = useState<"quality" | "balanced" | "basic">("quality");
   const [previewRuntimeMode, setPreviewRuntimeMode] = useState<string>("");
   const [previewStatus, setPreviewStatus] = useState<string>("");
   const [previewBooting, setPreviewBooting] = useState(false);
@@ -283,33 +341,53 @@ export default function App() {
 
   useEffect(() => {
     let isMounted = true;
-    const requestedWorkspaceId = new URLSearchParams(window.location.search).get("workspace_id");
-    const workspacePromise = requestedWorkspaceId ? openWorkspace(requestedWorkspaceId) : ensureWorkspace();
-    Promise.all([workspacePromise, request<SystemConfiguration>("/system/configuration")])
-      .then(([nextWorkspace, config]) => {
+    void (async () => {
+      try {
+        const config = await request<SystemConfiguration>("/system/configuration");
         if (!isMounted) {
           return;
         }
-        setWorkspace(nextWorkspace);
         setSystemConfig(config);
-        setGenerationMode(config.defaults.generation_mode);
+
+        const requestedWorkspaceId = new URLSearchParams(window.location.search).get("workspace_id");
+        const listedWorkspaces = await listWorkspaces();
+
+        let nextWorkspace: Workspace | null = null;
+        if (requestedWorkspaceId) {
+          try {
+            nextWorkspace = await openWorkspace(requestedWorkspaceId);
+          } catch {
+            nextWorkspace = null;
+          }
+        }
+        if (!nextWorkspace && listedWorkspaces.length > 0) {
+          nextWorkspace = await openWorkspace(listedWorkspaces[0].workspace_id);
+        }
+        if (!nextWorkspace) {
+          nextWorkspace = await ensureWorkspace();
+        }
+        if (!isMounted) {
+          return;
+        }
+        const refreshedWorkspaces = await listWorkspaces();
+        setWorkspaces(refreshedWorkspaces);
+        setWorkspace(nextWorkspace);
         const params = new URLSearchParams(window.location.search);
         if (params.get("workspace_id") !== nextWorkspace.workspace_id) {
           params.set("workspace_id", nextWorkspace.workspace_id);
           window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
         }
-      })
-      .catch((err: Error) => {
+      } catch (err) {
         if (!isMounted) {
           return;
         }
-        setError(err.message);
-      })
-      .finally(() => {
+        setError(err instanceof Error ? err.message : "Failed to initialize workspace.");
+      } finally {
         if (isMounted) {
           setInitializing(false);
         }
-      });
+      }
+    })();
     return () => {
       isMounted = false;
     };
@@ -320,20 +398,25 @@ export default function App() {
       return;
     }
     void (async () => {
-      setPreviewBooting(true);
-      setPreviewUrl("");
-      setRolePreviewUrls({});
-      setPreviewStatus("starting");
-      setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
+      setWorkspaceTransitioning(true);
       try {
-        await request(`/workspaces/${workspace.workspace_id}/preview/start`, { method: "POST" });
-        await waitForPreviewResolution(workspace.workspace_id);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to start preview runtime.");
+        setPreviewBooting(true);
+        setPreviewUrl("");
+        setRolePreviewUrls({});
+        setPreviewStatus("starting");
+        setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
+        try {
+          await request(`/workspaces/${workspace.workspace_id}/preview/start`, { method: "POST" });
+          await waitForPreviewResolution(workspace.workspace_id);
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "Failed to start preview runtime.");
+        } finally {
+          setPreviewBooting(false);
+        }
+        await refreshWorkspace(workspace.workspace_id);
       } finally {
-        setPreviewBooting(false);
+        setWorkspaceTransitioning(false);
       }
-      await refreshWorkspace(workspace.workspace_id);
     })();
   }, [workspace]);
 
@@ -363,22 +446,6 @@ export default function App() {
     [files],
   );
   const fileTree = useMemo(() => buildFileTree(files), [files]);
-  const autoNotices = useMemo(() => {
-    return (job?.assumptions_report ?? [])
-      .filter((assumption) => {
-        const text = assumption.text.toLowerCase();
-        return (
-          text.includes("single-role prompts are expanded") ||
-          text.includes("generated backend exposes a default submission api") ||
-          text.includes("preserves the client, specialist, and manager roles") ||
-          text.includes("linked client-specialist-manager workflow")
-        );
-      })
-      .map((assumption) => ({
-        title: assumption.text,
-        message: assumption.rationale,
-      }));
-  }, [job?.assumptions_report]);
   const visibleWarnings = useMemo(() => {
     const issues = (job?.validation_snapshot?.issues ?? []).filter((issue) => {
       const severity = issue.severity ?? "";
@@ -412,6 +479,13 @@ export default function App() {
     }
     return warningItems;
   }, [error, job?.failure_reason, job?.validation_snapshot?.issues]);
+  const filteredWorkspaces = useMemo(() => {
+    const query = workspaceSearch.trim().toLowerCase();
+    if (!query) {
+      return workspaces;
+    }
+    return workspaces.filter((item) => item.workspace_id.toLowerCase().includes(query));
+  }, [workspaceSearch, workspaces]);
   const editorStats = useMemo(() => {
     const lines = fileContent ? fileContent.split("\n").length : 0;
     const characters = fileContent.length;
@@ -466,7 +540,7 @@ export default function App() {
       formatLogSection("# REPORTS", reportLines),
     ];
     return sections.join("\n");
-  }, [generationMode, job, systemConfig, validation, workspaceLogs]);
+  }, [job, systemConfig, validation, workspaceLogs]);
 
   async function refreshWorkspace(workspaceId: string) {
     setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
@@ -475,9 +549,8 @@ export default function App() {
       specialist: false,
       manager: false,
     });
-    const [treeResult, turnsResult, validationResult, previewResult, logsResult] = await Promise.allSettled([
+    const [treeResult, validationResult, previewResult, logsResult] = await Promise.allSettled([
       request<FileEntry[]>(`/workspaces/${workspaceId}/files/tree`),
-      request<ChatTurn[]>(`/workspaces/${workspaceId}/chat/turns`),
       request<Record<string, unknown> | null>(`/workspaces/${workspaceId}/validation/current`),
       request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`),
       request<WorkspaceLogs>(`/workspaces/${workspaceId}/logs`),
@@ -495,12 +568,6 @@ export default function App() {
       });
     } else {
       refreshErrors.push(`files: ${treeResult.reason instanceof Error ? treeResult.reason.message : "failed to load"}`);
-    }
-
-    if (turnsResult.status === "fulfilled") {
-      setTurns(turnsResult.value);
-    } else {
-      refreshErrors.push(`chat: ${turnsResult.reason instanceof Error ? turnsResult.reason.message : "failed to load"}`);
     }
 
     if (validationResult.status === "fulfilled") {
@@ -560,6 +627,18 @@ export default function App() {
     if (!workspace) {
       return;
     }
+    const normalizedRequirements = ROLE_ORDER.reduce(
+      (acc, role) => ({ ...acc, [role]: roleRequirements[role].trim() }),
+      { ...EMPTY_ROLE_REQUIREMENTS },
+    );
+    const hasAnyInput = ROLE_ORDER.some((role) => normalizedRequirements[role].length > 0);
+    if (!hasAnyInput) {
+      setError("Fill at least one role requirement to run generation.");
+      return;
+    }
+    const hasExistingBuild = files.some((entry) => entry.type === "file" && entry.path.startsWith("artifacts/"));
+    const composedPrompt = buildBusinessPrompt(normalizedRequirements, submittedRoleRequirements, hasExistingBuild);
+
     setLoading(true);
     setError("");
     setPreviewBooting(true);
@@ -573,21 +652,17 @@ export default function App() {
       manager: false,
     });
     try {
-      const createdTurn = await request<ChatTurn>(`/workspaces/${workspace.workspace_id}/chat/turns`, {
-        method: "POST",
-        body: JSON.stringify({ role: "user", content: prompt }),
-      });
-      setTurns((current) => [...current, createdTurn]);
       const nextJob = await request<Job>(`/workspaces/${workspace.workspace_id}/generate`, {
         method: "POST",
         body: JSON.stringify({
-          prompt,
+          prompt: composedPrompt,
           target_platform: "telegram_mini_app",
           preview_profile: "telegram_mock",
           generation_mode: generationMode,
         }),
       });
       setJob(nextJob);
+      setSubmittedRoleRequirements(normalizedRequirements);
       if (nextJob.status === "completed") {
         await request(`/workspaces/${workspace.workspace_id}/preview/start`, { method: "POST" });
         await waitForPreviewResolution(workspace.workspace_id);
@@ -684,21 +759,90 @@ export default function App() {
     setActiveTab("diff");
   }
 
-  async function handleShowDiff() {
-    if (!workspace) {
+  async function refreshWorkspaceList(activeWorkspaceId?: string) {
+    const listed = await listWorkspaces();
+    setWorkspaces(listed);
+    if (!activeWorkspaceId) {
       return;
     }
-    const diffPayload = await request<{ diff: string }>(`/workspaces/${workspace.workspace_id}/diff`);
-    setDiff(diffPayload.diff);
-    setActiveTab("diff");
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("workspace_id") !== activeWorkspaceId) {
+      params.set("workspace_id", activeWorkspaceId);
+      window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+    }
   }
 
-  async function handleResetPreview() {
-    if (!workspace) {
+  async function handleSelectWorkspace(workspaceId: string) {
+    if (workspace?.workspace_id === workspaceId) {
+      setWorkspaceDrawerOpen(false);
       return;
     }
-    await request(`/workspaces/${workspace.workspace_id}/preview/reset`, { method: "POST" });
-    await refreshWorkspace(workspace.workspace_id);
+    setError("");
+    setWorkspaceDrawerOpen(false);
+    setWorkspaceTransitioning(true);
+    setInitializing(true);
+    try {
+      const nextWorkspace = await openWorkspace(workspaceId);
+      setWorkspace(nextWorkspace);
+      await refreshWorkspaceList(nextWorkspace.workspace_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to open workspace.");
+    } finally {
+      setInitializing(false);
+    }
+  }
+
+  async function handleCreateWorkspace() {
+    setError("");
+    setWorkspaceDrawerOpen(false);
+    setWorkspaceTransitioning(true);
+    setCreatingWorkspace(true);
+    try {
+      const nextWorkspace = await ensureWorkspace();
+      setWorkspace(nextWorkspace);
+      await refreshWorkspaceList(nextWorkspace.workspace_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create workspace.");
+      setWorkspaceTransitioning(false);
+    } finally {
+      setCreatingWorkspace(false);
+    }
+  }
+
+  async function handleDeleteWorkspace(workspaceId: string) {
+    if (deletingWorkspaceId) {
+      return;
+    }
+    setError("");
+    setDeletingWorkspaceId(workspaceId);
+    try {
+      await deleteWorkspace(workspaceId);
+      const listed = await listWorkspaces();
+      setWorkspaces(listed);
+
+      if (workspace?.workspace_id === workspaceId) {
+        const fallbackWorkspace = listed[0] ? await openWorkspace(listed[0].workspace_id) : await ensureWorkspace();
+        setWorkspace(fallbackWorkspace);
+        await refreshWorkspaceList(fallbackWorkspace.workspace_id);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete workspace.");
+    } finally {
+      setDeletingWorkspaceId("");
+    }
+  }
+
+  function handleDownloadLogs() {
+    const logs = logOutput || "No logs available.";
+    const blob = new Blob([logs], { type: "text/plain;charset=utf-8" });
+    const link = document.createElement("a");
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    link.href = URL.createObjectURL(blob);
+    link.download = `runtime-logs-${timestamp}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(link.href);
   }
 
   function handleRefreshRolePreview(role: "client" | "specialist" | "manager") {
@@ -726,10 +870,31 @@ export default function App() {
 
   return (
     <div className="page">
+      {initializing || workspaceTransitioning || creatingWorkspace ? (
+        <div className="global-loader-overlay" role="status" aria-live="polite">
+          <div className="global-loader-card">
+            <div className="global-loader-spinner" />
+            <strong>{creatingWorkspace ? "Creating application..." : "Preparing workspace..."}</strong>
+            <p>Please wait while the environment is being initialized.</p>
+          </div>
+        </div>
+      ) : null}
       <div className="topbar">
-        <div className="topbar-title">
-          <p className="eyebrow">Grounded Mini-App Platform</p>
-          <h1 className="topbar-heading">AI module for Generating Mini-Applications</h1>
+        <div className="topbar-left">
+          <button
+            type="button"
+            className="workspace-menu-trigger"
+            aria-label="Open workspace menu"
+            onClick={() => setWorkspaceDrawerOpen(true)}
+          >
+            <span />
+            <span />
+            <span />
+          </button>
+          <div className="topbar-title">
+            <p className="eyebrow">Grounded Mini-App Platform</p>
+            <h1 className="topbar-heading">AI module for Generating Mini-Applications</h1>
+          </div>
         </div>
         <div className="topbar-meta">
           <div className="status-pill">{job?.status ?? "idle"}</div>
@@ -831,62 +996,104 @@ export default function App() {
           </div>
         </div>
       </div>
+      <div
+        className={`workspace-drawer-backdrop ${workspaceDrawerOpen ? "is-open" : ""}`}
+        onClick={() => setWorkspaceDrawerOpen(false)}
+      />
+      <aside className={`workspace-drawer ${workspaceDrawerOpen ? "is-open" : ""}`} aria-hidden={!workspaceDrawerOpen}>
+        <div className="workspace-drawer-head">
+          <strong>Applications</strong>
+          <button type="button" className="icon-btn ghost" aria-label="Close drawer" onClick={() => setWorkspaceDrawerOpen(false)}>
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path
+                d="M18.3 5.71a1 1 0 0 0-1.41 0L12 10.59 7.11 5.7A1 1 0 0 0 5.7 7.1L10.59 12 5.7 16.89a1 1 0 1 0 1.41 1.41L12 13.41l4.89 4.89a1 1 0 0 0 1.41-1.41L13.41 12l4.89-4.89a1 1 0 0 0 0-1.4z"
+                fill="currentColor"
+              />
+            </svg>
+          </button>
+        </div>
+        <button type="button" className="workspace-create" onClick={handleCreateWorkspace} disabled={creatingWorkspace}>
+          {creatingWorkspace ? "Creating..." : "Create New"}
+        </button>
+        <label className="workspace-search">
+          <span>Search by workspace id</span>
+          <input
+            type="search"
+            value={workspaceSearch}
+            onChange={(event) => setWorkspaceSearch(event.target.value)}
+            placeholder="ws_980a7566..."
+          />
+        </label>
+        <div className="workspace-list">
+          {filteredWorkspaces.map((item) => (
+            <div key={item.workspace_id} className={`workspace-item ${workspace?.workspace_id === item.workspace_id ? "active" : ""}`}>
+              <button type="button" className="workspace-open" onClick={() => handleSelectWorkspace(item.workspace_id)}>
+                <strong>{item.name}</strong>
+                <span>{item.workspace_id}</span>
+              </button>
+              <button
+                type="button"
+                className="workspace-delete icon-btn"
+                aria-label={`Delete ${item.name}`}
+                onClick={() => handleDeleteWorkspace(item.workspace_id)}
+                disabled={deletingWorkspaceId === item.workspace_id}
+              >
+                {deletingWorkspaceId === item.workspace_id ? (
+                  "..."
+                ) : (
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path
+                      d="M6 7h12l-1 13a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 7zm3-4h6l1 2h4v2H4V5h4l1-2z"
+                      fill="currentColor"
+                    />
+                  </svg>
+                )}
+              </button>
+            </div>
+          ))}
+          {!filteredWorkspaces.length ? <p className="workspace-search-empty">No workspaces found.</p> : null}
+        </div>
+      </aside>
 
       <div className="layout">
         <section className="panel panel-chat">
           <header>
-            <h2>Chat / Prompt</h2>
-            <p>Prompt turns, grounded summary, and manual iteration.</p>
+            <h2>Role Requirements</h2>
+            <p>Describe expected behavior for each role. Empty role fields stay unchanged.</p>
           </header>
           <form onSubmit={handleGenerate} className="prompt-form">
-            <label className="generation-mode-field">
-              <span>Generation mode</span>
-              <select value={generationMode} onChange={(event) => setGenerationMode(event.target.value as typeof generationMode)}>
-                <option value="quality">quality</option>
-                <option value="balanced">balanced</option>
-                <option value="basic">basic</option>
-              </select>
-            </label>
-            <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={8} />
-            <div className="actions">
-              <button type="submit" disabled={initializing || loading || !workspace}>
-                {initializing ? "Preparing..." : loading ? "Generating..." : "Generate"}
-              </button>
-              <button type="button" className="ghost" onClick={handleShowDiff} disabled={!workspace}>
-                Show Diff
-              </button>
-            </div>
-          </form>
-          <div className="turns">
-            {turns.map((turn) => (
-              <article key={turn.turn_id} className={`turn turn-${turn.role}`}>
-                <span>{turn.role}</span>
-                <p>{turn.summary ?? turn.content}</p>
-              </article>
+            {previewRoles.map((role) => (
+              <label key={role} className="role-input-field">
+                <span>{ROLE_LABELS[role]}</span>
+                <textarea
+                  value={roleRequirements[role]}
+                  onChange={(event) =>
+                    setRoleRequirements((current) => ({
+                      ...current,
+                      [role]: event.target.value,
+                    }))
+                  }
+                  rows={6}
+                  placeholder={ROLE_PLACEHOLDERS[role]}
+                />
+              </label>
             ))}
-          </div>
-          {autoNotices.length ? (
-            <div className="auto-notices">
-              <h3>Auto-completed</h3>
-              {autoNotices.map((notice, index) => (
-                <div key={`${notice.title}-${index}`} className="notice-card">
-                  <strong>{notice.title}</strong>
-                  <p>{notice.message}</p>
-                </div>
-              ))}
-            </div>
-          ) : null}
-          <div className="warnings">
-            <h3>Warnings</h3>
+            <button className="generate-full" type="submit" disabled={initializing || loading || !workspace}>
+              {initializing ? "Preparing..." : loading ? "Generating..." : "Generate"}
+            </button>
+          </form>
+          {error ? <p className="error">{error}</p> : null}
+          <div className="suggestions">
+            <h3>Suggestions</h3>
             {visibleWarnings.length ? (
               visibleWarnings.map((warning, index) => (
-                <div key={`${warning.title}-${index}`} className="warning-card">
+                <div key={`${warning.title}-${index}`} className="suggestion-card">
                   <strong>{warning.title}</strong>
                   <p>{warning.message}</p>
                 </div>
               ))
             ) : (
-              <p className="muted">No blocking warnings.</p>
+              <p className="muted">No suggestions right now.</p>
             )}
           </div>
         </section>
@@ -910,9 +1117,13 @@ export default function App() {
                 ))}
               </div>
             </div>
-            <button type="button" className="ghost" onClick={handleResetPreview}>
-              Reset all sessions
-            </button>
+            <div className="preview-toolbar-actions">
+              <button type="button" className="icon-btn ghost" aria-label="Download logs" onClick={handleDownloadLogs}>
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M5 20h14v-2H5v2zm7-18v10.17l3.59-3.58L17 10l-5 5-5-5 1.41-1.41L11 12.17V2h1z" fill="currentColor" />
+                </svg>
+              </button>
+            </div>
           </div>
           {activeTab === "preview" ? (
             <div className="preview-grid">

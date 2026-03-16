@@ -28,6 +28,38 @@ class WorkspaceService:
             raise KeyError(f"Workspace not found: {workspace_id}")
         return WorkspaceRecord.model_validate(payload)
 
+    def list_workspaces(self) -> list[WorkspaceRecord]:
+        workspaces = [WorkspaceRecord.model_validate(item) for item in self.store.list("workspaces")]
+        workspaces.sort(key=lambda workspace: workspace.updated_at, reverse=True)
+        return workspaces
+
+    def delete_workspace(self, workspace_id: str) -> None:
+        self.get_workspace(workspace_id)
+
+        workspace_root = self.workspace_root(workspace_id)
+        if workspace_root.exists():
+            shutil.rmtree(workspace_root, ignore_errors=True)
+
+        self.store.delete("workspaces", workspace_id)
+        self.store.delete("previews", workspace_id)
+
+        for collection in ["documents", "chat_turns", "jobs", "exports"]:
+            for key, payload in self.store.items(collection):
+                if payload.get("workspace_id") != workspace_id:
+                    continue
+                if collection == "exports":
+                    file_path = payload.get("file_path")
+                    if isinstance(file_path, str) and file_path:
+                        try:
+                            Path(file_path).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                self.store.delete(collection, key)
+
+        for report_key, _ in self.store.items("reports"):
+            if report_key.endswith(f":{workspace_id}"):
+                self.store.delete("reports", report_key)
+
     def clone_template(self, workspace_id: str) -> WorkspaceRecord:
         workspace = self.get_workspace(workspace_id)
         workspace_root = self.workspace_root(workspace_id)
@@ -163,4 +195,3 @@ class WorkspaceService:
 
 def json_dumps(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=True, indent=2)
-

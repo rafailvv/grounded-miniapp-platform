@@ -25,6 +25,11 @@ def create_workspace(
     return container.workspace_service.create_workspace(workspace)
 
 
+@router.get("/workspaces", response_model=list[WorkspaceRecord])
+def list_workspaces(container: ServiceContainer = Depends(get_container)) -> list[WorkspaceRecord]:
+    return container.workspace_service.list_workspaces()
+
+
 @router.get("/workspaces/{workspace_id}", response_model=WorkspaceRecord)
 def get_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> WorkspaceRecord:
     try:
@@ -48,3 +53,15 @@ def reset_workspace(workspace_id: str, container: ServiceContainer = Depends(get
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+
+@router.delete("/workspaces/{workspace_id}")
+def delete_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, str]:
+    try:
+        try:
+            container.preview_service.reset(workspace_id)
+        except Exception:
+            pass
+        container.workspace_service.delete_workspace(workspace_id)
+        return {"deleted": workspace_id}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

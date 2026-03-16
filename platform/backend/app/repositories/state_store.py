@@ -37,6 +37,11 @@ class StateStore:
             state = self._read()
             return list(state[collection].values())
 
+    def items(self, collection: str) -> list[tuple[str, dict[str, Any]]]:
+        with self.lock:
+            state = self._read()
+            return [(key, value) for key, value in state[collection].items()]
+
     def get(self, collection: str, key: str) -> dict[str, Any] | None:
         with self.lock:
             state = self._read()
@@ -53,4 +58,3 @@ class StateStore:
             state = self._read()
             state[collection].pop(key, None)
             self._write(state)
-

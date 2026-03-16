@@ -31,6 +31,10 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export async function listWorkspaces(): Promise<Workspace[]> {
+  return request<Workspace[]>("/workspaces");
+}
+
 export async function ensureWorkspace(): Promise<Workspace> {
   const workspace = await request<Workspace>("/workspaces", {
     method: "POST",
@@ -53,5 +57,11 @@ export async function openWorkspace(workspaceId: string): Promise<Workspace> {
   }
   return request<Workspace>(`/workspaces/${workspace.workspace_id}/clone-template`, {
     method: "POST",
+  });
+}
+
+export async function deleteWorkspace(workspaceId: string): Promise<void> {
+  await request<{ deleted: string }>(`/workspaces/${workspaceId}`, {
+    method: "DELETE",
   });
 }
