@@ -467,6 +467,44 @@ button.ghost,
     0 28px 60px rgba(34, 32, 73, 0.28);
 }
 
+.preview-refresh {
+  position: absolute;
+  top: 22px;
+  right: 22px;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  line-height: 0;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.32);
+  background: rgba(255, 255, 255, 0.86);
+  color: #000;
+  display: grid;
+  place-items: center;
+  box-shadow: 0 8px 16px rgba(12, 12, 30, 0.18);
+  z-index: 2;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+
+.preview-refresh svg {
+  width: 26px;
+  height: 26px;
+  display: block;
+}
+
+.preview-refresh:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 18px rgba(12, 12, 30, 0.24);
+  background: white;
+}
+
+.preview-refresh:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: 0 8px 16px rgba(12, 12, 30, 0.12);
+}
+
 .phone-shell iframe,
 .placeholder {
   display: block;

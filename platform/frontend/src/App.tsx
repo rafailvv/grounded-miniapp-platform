@@ -264,6 +264,11 @@ export default function App() {
   const [error, setError] = useState<string>("");
   const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(new Set());
   const [previewCycle, setPreviewCycle] = useState(0);
+  const [rolePreviewCycle, setRolePreviewCycle] = useState<Record<string, number>>({
+    client: 0,
+    specialist: 0,
+    manager: 0,
+  });
   const [previewLoading, setPreviewLoading] = useState<Record<string, boolean>>({
     client: false,
     specialist: false,
@@ -696,6 +701,17 @@ export default function App() {
     await refreshWorkspace(workspace.workspace_id);
   }
 
+  function handleRefreshRolePreview(role: "client" | "specialist" | "manager") {
+    if (!previewUrl) {
+      return;
+    }
+    clearPreviewTimeout(role);
+    setPreviewFailed((current) => ({ ...current, [role]: false }));
+    setPreviewLoading((current) => ({ ...current, [role]: true }));
+    setRolePreviewCycle((current) => ({ ...current, [role]: (current[role] ?? 0) + 1 }));
+    armPreviewTimeout(role);
+  }
+
   function toggleDirectory(path: string) {
     setExpandedDirectories((current) => {
       const next = new Set(current);
@@ -910,6 +926,20 @@ export default function App() {
                     </span>
                   </div>
                   <div className="phone-shell">
+                    <button
+                      type="button"
+                      className="preview-refresh"
+                      onClick={() => handleRefreshRolePreview(role)}
+                      aria-label={`Refresh ${role} preview`}
+                      disabled={!previewUrl || previewLoading[role]}
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                        <path
+                          d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4z"
+                          fill="currentColor"
+                        />
+                      </svg>
+                    </button>
                     {previewUrl ? (
                       <>
                         {previewLoading[role] ? (
@@ -919,7 +949,7 @@ export default function App() {
                           </div>
                         ) : null}
                         <iframe
-                          key={`${role}-${previewCycle}-${rolePreviewUrls[role] ?? previewUrl}`}
+                          key={`${role}-${previewCycle}-${rolePreviewCycle[role]}-${rolePreviewUrls[role] ?? previewUrl}`}
                           title={`Live preview ${role}`}
                           src={rolePreviewUrls[role] ?? `${previewUrl}?role=${role}`}
                           className={previewLoading[role] ? "is-loading" : ""}
