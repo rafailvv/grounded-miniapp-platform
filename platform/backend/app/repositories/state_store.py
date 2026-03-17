@@ -18,6 +18,7 @@ class StateStore:
                     "documents": {},
                     "chat_turns": {},
                     "jobs": {},
+                    "runs": {},
                     "previews": {},
                     "exports": {},
                     "reports": {},
@@ -35,26 +36,26 @@ class StateStore:
     def list(self, collection: str) -> list[dict[str, Any]]:
         with self.lock:
             state = self._read()
-            return list(state[collection].values())
+            return list(state.setdefault(collection, {}).values())
 
     def items(self, collection: str) -> list[tuple[str, dict[str, Any]]]:
         with self.lock:
             state = self._read()
-            return [(key, value) for key, value in state[collection].items()]
+            return [(key, value) for key, value in state.setdefault(collection, {}).items()]
 
     def get(self, collection: str, key: str) -> dict[str, Any] | None:
         with self.lock:
             state = self._read()
-            return state[collection].get(key)
+            return state.setdefault(collection, {}).get(key)
 
     def upsert(self, collection: str, key: str, value: dict[str, Any]) -> None:
         with self.lock:
             state = self._read()
-            state[collection][key] = value
+            state.setdefault(collection, {})[key] = value
             self._write(state)
 
     def delete(self, collection: str, key: str) -> None:
         with self.lock:
             state = self._read()
-            state[collection].pop(key, None)
+            state.setdefault(collection, {}).pop(key, None)
             self._write(state)

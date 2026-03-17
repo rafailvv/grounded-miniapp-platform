@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from app.ai.model_registry import MODEL_REGISTRY
+from app.ai.model_registry import MODEL_REGISTRY, TASK_PROFILES
 from app.core.config import Settings
 
 
@@ -27,6 +27,8 @@ class OpenRouterClient:
             "enabled": self.enabled,
             "base_url": self.base_url,
             "models": MODEL_REGISTRY,
+            "task_profiles": TASK_PROFILES,
+            "default_coding_profile": "openai_code_fast",
             "routing": {
                 "allow_fallbacks": True,
                 "require_parameters": True,

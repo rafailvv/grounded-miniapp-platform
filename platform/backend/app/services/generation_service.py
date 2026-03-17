@@ -120,6 +120,8 @@ class GenerationService:
             fidelity=QUALITY_FIDELITY[generation_mode],  # type: ignore[arg-type]
             llm_enabled=bool(llm_config["enabled"]),
             llm_provider="openrouter" if llm_config["enabled"] else None,
+            model_profile=request.model_profile,
+            linked_run_id=request.linked_run_id,
         )
         self._clear_trace(workspace_id)
         self._append_trace(
@@ -183,7 +185,13 @@ class GenerationService:
             {"doc_refs": len(doc_refs)},
         )
 
-        chat_turn = ChatTurnRecord(workspace_id=workspace_id, role="user", content=request.prompt, linked_job_id=job.job_id)
+        chat_turn = ChatTurnRecord(
+            workspace_id=workspace_id,
+            role="user",
+            content=request.prompt,
+            linked_job_id=job.job_id,
+            linked_run_id=request.linked_run_id,
+        )
         self.store.upsert("chat_turns", chat_turn.turn_id, chat_turn.model_dump(mode="json"))
         creative_direction = self._select_creative_direction(request.prompt)
         self._append_trace(
@@ -414,6 +422,7 @@ class GenerationService:
             content=summary,
             summary=summary,
             linked_job_id=job.job_id,
+            linked_run_id=request.linked_run_id,
         )
         self.store.upsert("chat_turns", assistant_turn.turn_id, assistant_turn.model_dump(mode="json"))
 

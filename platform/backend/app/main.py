@@ -13,6 +13,7 @@ from app.api import (
     routes_files,
     routes_generation,
     routes_preview,
+    routes_runs,
     routes_validation,
     routes_workspaces,
 )
@@ -46,10 +47,15 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
                 "enabled": llm["enabled"],
                 "provider": "openrouter" if llm["enabled"] else None,
                 "models": llm["models"],
+                "task_profiles": llm["task_profiles"],
             },
             "defaults": {
                 "generation_mode": "quality",
+                "model_profile": llm["default_coding_profile"],
             },
+            "default_coding_profile": llm["default_coding_profile"],
+            "supports_staged_apply": True,
+            "research_artifacts_enabled": True,
         }
 
     app.include_router(routes_auth.router)
@@ -57,6 +63,7 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
     app.include_router(routes_documents.router)
     app.include_router(routes_chat.router)
     app.include_router(routes_generation.router)
+    app.include_router(routes_runs.router)
     app.include_router(routes_validation.router)
     app.include_router(routes_files.router)
     app.include_router(routes_preview.router)

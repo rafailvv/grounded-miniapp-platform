@@ -128,3 +128,56 @@ def test_quality_mode_blocks_without_openrouter(tmp_path: Path) -> None:
     payload = job_response.json()
     assert payload["status"] == "blocked"
     assert payload["failure_reason"]
+
+
+def test_run_api_exposes_artifacts_and_links_job(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Run Workspace",
+            "description": "Run API smoke test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    clone_response = client.post(f"/workspaces/{workspace_id}/clone-template")
+    assert clone_response.status_code == 200
+
+    run_response = client.post(
+        f"/workspaces/{workspace_id}/runs",
+        json={
+            "prompt": "Refine the existing mini-app with a stronger AI workspace framing and preserved role previews.",
+            "intent": "auto",
+            "apply_strategy": "staged_auto_apply",
+            "target_role_scope": ["client", "specialist", "manager"],
+            "model_profile": "openai_code_fast",
+            "generation_mode": "basic",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    )
+    assert run_response.status_code == 200
+    run_payload = run_response.json()
+    assert run_payload["linked_job_id"]
+    assert run_payload["status"] == "completed"
+    assert run_payload["apply_status"] == "applied"
+
+    list_response = client.get(f"/workspaces/{workspace_id}/runs")
+    assert list_response.status_code == 200
+    listed_runs = list_response.json()
+    assert listed_runs[0]["run_id"] == run_payload["run_id"]
+
+    artifact_response = client.get(f"/runs/{run_payload['run_id']}/artifacts")
+    assert artifact_response.status_code == 200
+    artifacts = artifact_response.json()
+    assert artifacts["run"]["run_id"] == run_payload["run_id"]
+    assert artifacts["job"]["job_id"] == run_payload["linked_job_id"]
+    assert artifacts["code_change_plan"]["summary"]
+    assert isinstance(artifacts["code_change_plan"]["targets"], list)
+    assert "validation" in artifacts
+    assert "trace" in artifacts

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import get_container
-from app.models.domain import GenerateRequest, JobRecord
+from app.models.domain import CreateRunRequest, GenerateRequest, JobRecord
 from app.services.container import ServiceContainer
 
 router = APIRouter(tags=["generation"])
@@ -17,7 +17,22 @@ def generate(
     container: ServiceContainer = Depends(get_container),
 ) -> JobRecord:
     try:
-        return container.generation_service.generate(workspace_id, request)
+        run = container.run_service.create_run(
+            workspace_id,
+            CreateRunRequest(
+                prompt=request.prompt,
+                intent=request.intent,
+                apply_strategy="staged_auto_apply",
+                target_role_scope=[],
+                model_profile=request.model_profile,
+                target_platform=request.target_platform,
+                preview_profile=request.preview_profile,
+                generation_mode=request.generation_mode,
+            ),
+        )
+        if not run.linked_job_id:
+            raise HTTPException(status_code=500, detail="Run did not produce a linked job.")
+        return container.generation_service.get_job(run.linked_job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -50,4 +65,3 @@ def retry_job(job_id: str, container: ServiceContainer = Depends(get_container))
         return container.generation_service.retry(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-

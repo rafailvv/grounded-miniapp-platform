@@ -72,6 +72,7 @@ class ChatTurnRecord(StrictModel):
     content: str
     summary: str | None = None
     linked_job_id: str | None = None
+    linked_run_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -118,6 +119,8 @@ class JobRecord(StrictModel):
     llm_enabled: bool = False
     llm_provider: str | None = None
     llm_model: str | None = None
+    model_profile: str | None = None
+    linked_run_id: str | None = None
     failure_reason: str | None = None
     compile_summary: dict[str, int | str] = Field(default_factory=dict)
     events: list[JobEvent] = Field(default_factory=list)
@@ -179,6 +182,7 @@ class CreateChatTurnRequest(StrictModel):
     content: str
     summary: str | None = None
     linked_job_id: str | None = None
+    linked_run_id: str | None = None
 
 
 class GenerateRequest(StrictModel):
@@ -186,8 +190,73 @@ class GenerateRequest(StrictModel):
     target_platform: TargetPlatform = TargetPlatform.TELEGRAM
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
     generation_mode: GenerationMode = GenerationMode.QUALITY
+    intent: Literal["auto", "create", "edit", "refine", "role_only_change"] = "auto"
+    model_profile: str = "openai_code_fast"
+    linked_run_id: str | None = None
 
 
 class SaveFileRequest(StrictModel):
     relative_path: str
     content: str
+
+
+class CodeChangeTarget(StrictModel):
+    file_path: str
+    operation: Literal["create", "update", "delete"]
+    reason: str
+    risk: Literal["low", "medium", "high"] = "medium"
+
+
+class CodeChangePlan(StrictModel):
+    plan_id: str = Field(default_factory=lambda: new_id("change_plan"))
+    workspace_id: str
+    run_id: str | None = None
+    intent: Literal["create", "edit", "refine", "role_only_change"]
+    summary: str
+    target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
+    targets: list[CodeChangeTarget] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    acceptance_checks: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class RunChecksSummary(StrictModel):
+    validators: Literal["pending", "passed", "failed", "blocked"] = "pending"
+    build: Literal["pending", "passed", "failed", "blocked"] = "pending"
+    preview: Literal["pending", "passed", "failed", "blocked"] = "pending"
+    issues: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class RunRecord(StrictModel):
+    run_id: str = Field(default_factory=lambda: new_id("run"))
+    workspace_id: str
+    prompt: str
+    intent: Literal["create", "edit", "refine", "role_only_change"]
+    apply_strategy: Literal["staged_auto_apply", "manual_approve"] = "staged_auto_apply"
+    target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
+    model_profile: str = "openai_code_fast"
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    linked_job_id: str | None = None
+    source_revision_id: str | None = None
+    result_revision_id: str | None = None
+    status: Literal["pending", "running", "awaiting_approval", "completed", "blocked", "failed"] = "pending"
+    apply_status: Literal["pending", "applied", "awaiting_approval", "blocked", "failed"] = "pending"
+    summary: str | None = None
+    failure_reason: str | None = None
+    checks_summary: RunChecksSummary = Field(default_factory=RunChecksSummary)
+    touched_files: list[str] = Field(default_factory=list)
+    artifacts: dict[str, str] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class CreateRunRequest(StrictModel):
+    prompt: str
+    intent: Literal["auto", "create", "edit", "refine", "role_only_change"] = "auto"
+    apply_strategy: Literal["staged_auto_apply", "manual_approve"] = "staged_auto_apply"
+    target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
+    model_profile: str = "openai_code_fast"
+    target_platform: TargetPlatform = TargetPlatform.TELEGRAM
+    preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
+    generation_mode: GenerationMode = GenerationMode.QUALITY

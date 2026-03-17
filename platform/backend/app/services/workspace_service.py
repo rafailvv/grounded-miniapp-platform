@@ -43,7 +43,7 @@ class WorkspaceService:
         self.store.delete("workspaces", workspace_id)
         self.store.delete("previews", workspace_id)
 
-        for collection in ["documents", "chat_turns", "jobs", "exports"]:
+        for collection in ["documents", "chat_turns", "jobs", "runs", "exports"]:
             for key, payload in self.store.items(collection):
                 if payload.get("workspace_id") != workspace_id:
                     continue

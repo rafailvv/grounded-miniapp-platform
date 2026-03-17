@@ -21,6 +21,7 @@ def create_chat_turn(
         content=request.content,
         summary=request.summary,
         linked_job_id=request.linked_job_id,
+        linked_run_id=request.linked_run_id,
     )
     container.store.upsert("chat_turns", turn.turn_id, turn.model_dump(mode="json"))
     return turn
@@ -42,4 +43,3 @@ def get_turn_summary(turn_id: str, container: ServiceContainer = Depends(get_con
         raise HTTPException(status_code=404, detail=f"Turn not found: {turn_id}")
     turn = ChatTurnRecord.model_validate(payload)
     return {"turn_id": turn.turn_id, "summary": turn.summary or turn.content[:160]}
-
