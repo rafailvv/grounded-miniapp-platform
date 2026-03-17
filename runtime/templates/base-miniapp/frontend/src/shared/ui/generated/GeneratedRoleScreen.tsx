@@ -120,14 +120,14 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
     switch (section.type) {
       case 'hero':
         return (
-          <section key={section.section_id} className={styles.sectionCard}>
-            <h2 className={styles.heroTitle}>{section.title}</h2>
-            <p className={styles.heroBody}>{section.body}</p>
+          <section key={section.section_id} className={styles.sectionBlock}>
+            <h2 className={styles.sectionTitle}>{section.title}</h2>
+            <p className={styles.sectionBody}>{section.body}</p>
           </section>
         );
       case 'stats':
         return (
-          <section key={section.section_id} className={styles.sectionCard}>
+          <section key={section.section_id} className={styles.sectionBlock}>
             <div className={styles.statsGrid}>
               {section.items.map((item) => (
                 <article key={`${section.section_id}-${item.label}`} className={styles.statCard}>
@@ -140,11 +140,11 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
         );
       case 'list':
         return (
-          <section key={section.section_id} className={styles.sectionCard}>
+          <section key={section.section_id} className={styles.sectionBlock}>
             {section.items.map((item) => (
               <article key={item.item_id} className={styles.listCard}>
-                <strong>{item.title}</strong>
-                <p className={styles.heroBody}>{item.subtitle}</p>
+                <strong className={styles.listTitle}>{item.title}</strong>
+                <p className={styles.sectionBody}>{item.subtitle}</p>
                 <div className={styles.listMeta}>
                   <span className={styles.badge}>{item.status}</span>
                   {item.meta ? <span>{item.meta}</span> : null}
@@ -155,9 +155,9 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
         );
       case 'detail':
         return (
-          <section key={section.section_id} className={styles.sectionCard}>
-            <h3 className={styles.heroTitle}>{section.title}</h3>
-            <p className={styles.heroBody}>{section.body}</p>
+          <section key={section.section_id} className={styles.sectionBlock}>
+            <h3 className={styles.sectionTitle}>{section.title}</h3>
+            <p className={styles.sectionBody}>{section.body}</p>
             <div className={styles.fieldGrid}>
               {section.fields.map((field) => (
                 <div key={`${section.section_id}-${field.label}`} className={styles.field}>
@@ -170,12 +170,12 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
         );
       case 'timeline':
         return (
-          <section key={section.section_id} className={styles.sectionCard}>
+          <section key={section.section_id} className={styles.sectionBlock}>
             <div className={styles.timeline}>
               {section.items.map((item, index) => (
                 <div key={`${section.section_id}-${index}`} className={styles.timelineItem}>
                   <strong>{item.label}</strong>
-                  <span className={styles.heroBody}>{item.value}</span>
+                  <span className={styles.sectionBody}>{item.value}</span>
                 </div>
               ))}
             </div>
@@ -183,7 +183,7 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
         );
       case 'form':
         return (
-          <section key={section.section_id} className={styles.sectionCard}>
+          <section key={section.section_id} className={styles.sectionBlock}>
             <div className={styles.fieldGrid}>
               {section.fields.map((field) => (
                 <label key={field.field_id} className={styles.field}>
@@ -208,7 +208,7 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
         );
       case 'profile':
         return (
-          <section key={section.section_id} className={styles.sectionCard}>
+          <section key={section.section_id} className={styles.sectionBlock}>
             <div className={styles.fieldGrid}>
               {section.fields.map((field) => (
                 <label key={field.name} className={styles.field}>
@@ -228,56 +228,19 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
 
   return (
     <section className={`${styles.page} ${variantClass} ${layoutClass}`} style={runtimeStyle}>
-      <header className={styles.screenHeader}>
-        <span className={styles.eyebrow}>
-          {role} · {manifest.app.generation_mode}
-        </span>
-        <h1 className={styles.title}>{screen.title}</h1>
-        {screen.subtitle ? <p className={styles.subtitle}>{screen.subtitle}</p> : null}
-        <div className={styles.runtimeMeta}>
-          <span className={styles.metaPill}>{manifest.app.screen_count} screens</span>
-          <span className={styles.metaPill}>{manifest.app.route_count} routes</span>
-          <span className={styles.metaPill}>{manifest.metrics.length} live metrics</span>
-        </div>
-      </header>
-
-      <nav
-        className={`${styles.navBar} ${uiVariant === 'editorial' ? styles.navBarEditorial : ''} ${
-          layoutVariant === 'stream' ? styles.navBarStream : ''
-        } ${layoutVariant === 'minimal' ? styles.navBarMinimal : ''}`}
-      >
-        {manifest.navigation.map((item) => (
-          <button
-            key={item.path}
-            type="button"
-            className={`${styles.navChip} ${location.pathname === item.path ? styles.navChipActive : ''}`}
-            onClick={() => navigate(item.path)}
-          >
-            {item.label}
-          </button>
-        ))}
-      </nav>
-
       {screen.sections.map(renderSection)}
 
       {message ? <div className={styles.message}>{message}</div> : null}
 
-      <div
-        className={`${styles.actionBar} ${uiVariant === 'atlas' || layoutVariant === 'dashboard' ? styles.actionBarStacked : ''} ${
-          layoutVariant === 'minimal' ? styles.actionBarMinimal : ''
-        }`}
-      >
-        {screen.actions.map((action, index) => (
-          <button
-            key={action.action_id}
-            type="button"
-            className={index === 0 ? styles.primaryButton : styles.secondaryButton}
-            onClick={() => void handleAction(action)}
-          >
-            {action.label}
-          </button>
-        ))}
-      </div>
+      {screen.actions.length ? (
+        <div className={styles.inlineActions}>
+          {screen.actions.map((action) => (
+            <button key={action.action_id} type="button" className={styles.inlineAction} onClick={() => void handleAction(action)}>
+              {action.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
     </section>
   );
 }

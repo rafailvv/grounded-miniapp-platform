@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 from fastapi.testclient import TestClient
 
@@ -163,20 +164,31 @@ def test_run_api_exposes_artifacts_and_links_job(tmp_path: Path) -> None:
     )
     assert run_response.status_code == 200
     run_payload = run_response.json()
-    assert run_payload["linked_job_id"]
-    assert run_payload["status"] == "completed"
-    assert run_payload["apply_status"] == "applied"
+    assert run_payload["status"] in {"pending", "running", "completed"}
+
+    final_run = run_payload
+    for _ in range(30):
+        current = client.get(f"/runs/{run_payload['run_id']}")
+        assert current.status_code == 200
+        final_run = current.json()
+        if final_run["status"] in {"completed", "blocked", "failed"}:
+            break
+        time.sleep(0.2)
+
+    assert final_run["linked_job_id"]
+    assert final_run["status"] == "completed"
+    assert final_run["apply_status"] == "applied"
 
     list_response = client.get(f"/workspaces/{workspace_id}/runs")
     assert list_response.status_code == 200
     listed_runs = list_response.json()
-    assert listed_runs[0]["run_id"] == run_payload["run_id"]
+    assert listed_runs[0]["run_id"] == final_run["run_id"]
 
-    artifact_response = client.get(f"/runs/{run_payload['run_id']}/artifacts")
+    artifact_response = client.get(f"/runs/{final_run['run_id']}/artifacts")
     assert artifact_response.status_code == 200
     artifacts = artifact_response.json()
-    assert artifacts["run"]["run_id"] == run_payload["run_id"]
-    assert artifacts["job"]["job_id"] == run_payload["linked_job_id"]
+    assert artifacts["run"]["run_id"] == final_run["run_id"]
+    assert artifacts["job"]["job_id"] == final_run["linked_job_id"]
     assert artifacts["code_change_plan"]["summary"]
     assert isinstance(artifacts["code_change_plan"]["targets"], list)
     assert "validation" in artifacts

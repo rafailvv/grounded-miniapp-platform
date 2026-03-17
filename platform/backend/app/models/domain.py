@@ -242,6 +242,8 @@ class RunRecord(StrictModel):
     result_revision_id: str | None = None
     status: Literal["pending", "running", "awaiting_approval", "completed", "blocked", "failed"] = "pending"
     apply_status: Literal["pending", "applied", "awaiting_approval", "blocked", "failed"] = "pending"
+    current_stage: str = "queued"
+    progress_percent: int = 0
     summary: str | None = None
     failure_reason: str | None = None
     checks_summary: RunChecksSummary = Field(default_factory=RunChecksSummary)

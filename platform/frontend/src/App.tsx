@@ -3,8 +3,10 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   createRun,
   deleteWorkspace,
+  getRun,
   ensureWorkspace,
   getRunArtifacts,
+  getWorkspaceLogs,
   listRuns,
   listWorkspaces,
   openWorkspace,
@@ -13,6 +15,7 @@ import {
   Run,
   RunArtifacts,
   SystemConfiguration,
+  WorkspaceLogs,
   Workspace,
 } from "./lib/api";
 import "./styles/app.css";
@@ -36,6 +39,10 @@ type PreviewInfo = {
   status?: string;
 };
 
+function formatLogSection(title: string, lines: string[]): string {
+  return [title, ...lines, ""].join("\n");
+}
+
 const ROLE_ORDER = ["client", "specialist", "manager"] as const;
 type RoleKey = (typeof ROLE_ORDER)[number];
 
@@ -51,7 +58,7 @@ const ROLE_LABELS: Record<RoleKey, string> = {
   manager: "Manager",
 };
 
-const DEFAULT_PROMPT = `Build or refine the current mini-app as a real AI-assisted product. Keep client, specialist, and manager distinct, preserve existing code when possible, and produce code changes that pass validators and preview.`;
+const DEFAULT_PROMPT = "";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -201,6 +208,7 @@ export default function App() {
   const [workspaceTransitioning, setWorkspaceTransitioning] = useState(true);
   const [creatingWorkspace, setCreatingWorkspace] = useState(false);
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState("");
+  const [issuesDrawerOpen, setIssuesDrawerOpen] = useState(false);
   const [initializing, setInitializing] = useState(true);
   const [systemConfig, setSystemConfig] = useState<SystemConfiguration | null>(null);
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
@@ -212,7 +220,8 @@ export default function App() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [runArtifacts, setRunArtifacts] = useState<RunArtifacts | null>(null);
-  const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "research">("preview");
+  const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
+  const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "research" | "logs">("preview");
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
   const [fileContent, setFileContent] = useState("");
@@ -302,6 +311,11 @@ export default function App() {
       setRunArtifacts(null);
       return;
     }
+    const activeRun = runs.find((item) => item.run_id === selectedRunId);
+    if (activeRun && !["completed", "blocked", "failed"].includes(activeRun.status)) {
+      setRunArtifacts(null);
+      return;
+    }
     let cancelled = false;
     void (async () => {
       try {
@@ -309,17 +323,16 @@ export default function App() {
         if (!cancelled) {
           setRunArtifacts(nextArtifacts);
         }
-      } catch (err) {
+      } catch {
         if (!cancelled) {
           setRunArtifacts(null);
-          setError(err instanceof Error ? err.message : "Failed to load run artifacts.");
         }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [selectedRunId]);
+  }, [runs, selectedRunId]);
 
   useEffect(() => {
     return () => {
@@ -360,7 +373,25 @@ export default function App() {
     const characters = fileContent.length;
     return { lines, characters };
   }, [fileContent]);
-  const visibleIssues = topbarRun?.checks_summary.issues ?? [];
+  const visibleIssues = useMemo(() => {
+    const items = [...(topbarRun?.checks_summary.issues ?? [])];
+    if (topbarRun?.failure_reason) {
+      items.unshift({
+        code: "run_failure",
+        message: topbarRun.failure_reason,
+        severity: "high",
+      });
+    }
+    const seen = new Set<string>();
+    return items.filter((item) => {
+      const key = `${item.code ?? ""}:${item.message ?? ""}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+  }, [topbarRun]);
   const activeRoleScope = useMemo(
     () => ROLE_ORDER.filter((role) => selectedRoles[role]),
     [selectedRoles],
@@ -372,13 +403,54 @@ export default function App() {
   const appIrScreensCount = Array.isArray((runArtifacts?.app_ir as { screens?: unknown[] } | null | undefined)?.screens)
     ? ((runArtifacts?.app_ir as { screens?: unknown[] }).screens ?? []).length
     : 0;
+  const logOutput = useMemo(() => {
+    const jobLines = [
+      `status: ${workspaceLogs?.job?.status ?? topbarRun?.status ?? "idle"}`,
+      `stage: ${topbarRun?.current_stage ?? "n/a"}`,
+      `progress: ${topbarRun?.progress_percent ?? 0}%`,
+      `model: ${workspaceLogs?.job?.llm_model ?? topbarRun?.llm_model ?? topbarRun?.model_profile ?? "n/a"}`,
+      `provider: ${workspaceLogs?.job?.llm_provider ?? topbarRun?.llm_provider ?? "n/a"}`,
+      `failure_reason: ${workspaceLogs?.job?.failure_reason ?? topbarRun?.failure_reason ?? "none"}`,
+    ];
+    const eventLines =
+      workspaceLogs?.events?.length
+        ? workspaceLogs.events.map((event) => {
+            const details =
+              event.details && Object.keys(event.details).length ? ` | ${JSON.stringify(event.details)}` : "";
+            return `- [${formatTimestamp(event.created_at)}] ${event.event_type}: ${event.message}${details}`;
+          })
+        : ["- no run events yet"];
+    const traceLines =
+      workspaceLogs?.reports?.trace?.entries?.length
+        ? workspaceLogs.reports.trace.entries.map((entry) => {
+            const payload =
+              entry.payload && Object.keys(entry.payload).length ? ` | payload=${JSON.stringify(entry.payload)}` : "";
+            return `- [${formatTimestamp(entry.created_at)}] ${entry.stage}: ${entry.message}${payload}`;
+          })
+        : ["- no trace entries yet"];
+    const previewLines = [
+      `status: ${workspaceLogs?.preview?.status ?? previewStatus ?? "unknown"}`,
+      `runtime_mode: ${workspaceLogs?.preview?.runtime_mode ?? previewRuntimeMode ?? "unknown"}`,
+      `url: ${workspaceLogs?.preview?.url ?? previewUrl ?? "none"}`,
+      ...(workspaceLogs?.preview?.logs?.length
+        ? ["logs:", ...workspaceLogs.preview.logs.map((line) => `- ${line}`)]
+        : ["logs: none"]),
+    ];
+    return [
+      formatLogSection("# RUN", jobLines),
+      formatLogSection("# EVENTS", eventLines),
+      formatLogSection("# TRACE", traceLines),
+      formatLogSection("# PREVIEW", previewLines),
+    ].join("\n");
+  }, [previewRuntimeMode, previewStatus, previewUrl, topbarRun, workspaceLogs]);
 
   async function refreshWorkspaceState(workspaceId: string, preferredRunId?: string) {
     setWorkspaceTransitioning(true);
-    const [treeResult, previewResult, runsResult] = await Promise.allSettled([
+    const [treeResult, previewResult, runsResult, logsResult] = await Promise.allSettled([
       request<FileEntry[]>(`/workspaces/${workspaceId}/files/tree`),
       request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`),
       listRuns(workspaceId),
+      getWorkspaceLogs(workspaceId),
     ]);
 
     const refreshErrors: string[] = [];
@@ -438,6 +510,12 @@ export default function App() {
       refreshErrors.push(`runs: ${runsResult.reason instanceof Error ? runsResult.reason.message : "failed to load"}`);
     }
 
+    if (logsResult.status === "fulfilled") {
+      setWorkspaceLogs(logsResult.value);
+    } else {
+      setWorkspaceLogs(null);
+    }
+
     setWorkspaceTransitioning(false);
     setError(refreshErrors.length ? refreshErrors.join(" | ") : "");
   }
@@ -463,10 +541,12 @@ export default function App() {
         model_profile: systemConfig?.default_coding_profile ?? systemConfig?.defaults.model_profile ?? "openai_code_fast",
         generation_mode: systemConfig?.defaults.generation_mode ?? "quality",
       });
+      setRuns((current) => [run, ...current.filter((item) => item.run_id !== run.run_id)]);
       setSelectedRunId(run.run_id);
+      setRunArtifacts(null);
       await refreshWorkspaceState(workspace.workspace_id, run.run_id);
-      setRunArtifacts(await getRunArtifacts(run.run_id));
       setActiveTab("preview");
+      void pollRunUntilSettled(workspace.workspace_id, run.run_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to execute run.");
     } finally {
@@ -485,6 +565,31 @@ export default function App() {
     );
     setFileContent(payload.content);
     setActiveTab("code");
+  }
+
+  async function pollRunUntilSettled(workspaceId: string, runId: string) {
+    for (let attempt = 0; attempt < 240; attempt += 1) {
+      try {
+        const [currentRun, nextLogs] = await Promise.all([getRun(runId), getWorkspaceLogs(workspaceId)]);
+        setRuns((current) => {
+          const existing = current.filter((item) => item.run_id !== runId);
+          return [currentRun, ...existing];
+        });
+        setWorkspaceLogs(nextLogs);
+        if (["completed", "blocked", "failed"].includes(currentRun.status)) {
+          await refreshWorkspaceState(workspaceId, runId);
+          try {
+            setRunArtifacts(await getRunArtifacts(runId));
+          } catch {
+            setRunArtifacts(null);
+          }
+          return;
+        }
+      } catch {
+        return;
+      }
+      await sleep(1000);
+    }
   }
 
   async function handleSaveFile() {
@@ -692,35 +797,22 @@ export default function App() {
           </div>
         </div>
         <div className="topbar-meta">
-          <div className="status-pill">{topbarRun?.status ?? "idle"}</div>
-          <div className="artifact-strip">
-            <div className="artifact-chip">
-              <span>Model profile</span>
-              <strong>{topbarRun?.model_profile ?? systemConfig?.default_coding_profile ?? "pending"}</strong>
-            </div>
-            <div className="artifact-chip">
-              <span>Touched files</span>
-              <strong>{touchedFilesCount}</strong>
-            </div>
-            <div className="artifact-chip">
-              <span>Validators</span>
-              <strong>{topbarRun?.checks_summary.validators ?? "pending"}</strong>
-            </div>
-            <div className="artifact-chip">
-              <span>Build</span>
-              <strong>{topbarRun?.checks_summary.build ?? "pending"}</strong>
-            </div>
-            <div className="artifact-chip">
-              <span>Preview</span>
-              <strong>{topbarRun?.checks_summary.preview ?? (previewStatus || "pending")}</strong>
-            </div>
-          </div>
+          <div className="status-pill">run {topbarRun?.status ?? "idle"}</div>
+          {visibleIssues.length ? (
+            <button type="button" className="issues-pill" onClick={() => setIssuesDrawerOpen(true)}>
+              issues {visibleIssues.length}
+            </button>
+          ) : null}
         </div>
       </div>
 
       <div
         className={`workspace-drawer-backdrop ${workspaceDrawerOpen ? "is-open" : ""}`}
         onClick={() => setWorkspaceDrawerOpen(false)}
+      />
+      <div
+        className={`issues-drawer-backdrop ${issuesDrawerOpen ? "is-open" : ""}`}
+        onClick={() => setIssuesDrawerOpen(false)}
       />
       <aside className={`workspace-drawer ${workspaceDrawerOpen ? "is-open" : ""}`} aria-hidden={!workspaceDrawerOpen}>
         <div className="workspace-drawer-head">
@@ -762,6 +854,22 @@ export default function App() {
           {!filteredWorkspaces.length ? <p className="workspace-search-empty">No workspaces found.</p> : null}
         </div>
       </aside>
+      <aside className={`issues-drawer ${issuesDrawerOpen ? "is-open" : ""}`} aria-hidden={!issuesDrawerOpen}>
+        <div className="issues-drawer-head">
+          <strong>Run Issues</strong>
+          <button type="button" className="icon-btn ghost" aria-label="Close issues drawer" onClick={() => setIssuesDrawerOpen(false)}>
+            ×
+          </button>
+        </div>
+        <div className="issues-drawer-body">
+          {visibleIssues.map((issue, index) => (
+            <div key={`${issue.code ?? "issue"}-${index}`} className="issue-sheet">
+              <strong>{issue.code ?? issue.severity ?? "issue"}</strong>
+              <p>{issue.message ?? "Validator issue"}</p>
+            </div>
+          ))}
+        </div>
+      </aside>
 
       <div className="layout">
         <section className="panel panel-chat">
@@ -789,9 +897,13 @@ export default function App() {
                     key={role}
                     type="button"
                     className={`role-pill ${selectedRoles[role] ? "is-active" : ""}`}
+                    aria-pressed={selectedRoles[role]}
                     onClick={() => toggleRole(role)}
                   >
-                    {ROLE_LABELS[role]}
+                    <span className={`role-pill-check ${selectedRoles[role] ? "is-active" : ""}`} aria-hidden="true">
+                      {selectedRoles[role] ? "✓" : ""}
+                    </span>
+                    <span className="role-pill-label">{ROLE_LABELS[role]}</span>
                   </button>
                 ))}
               </div>
@@ -823,6 +935,15 @@ export default function App() {
                       <span className={`run-status ${run.status}`}>{run.status}</span>
                     </div>
                     <p>{run.prompt}</p>
+                    <div className="run-progress">
+                      <div className="run-progress-bar">
+                        <div className="run-progress-fill" style={{ width: `${Math.max(4, run.progress_percent)}%` }} />
+                      </div>
+                      <div className="run-progress-meta">
+                        <span>{run.current_stage}</span>
+                        <span>{run.progress_percent}%</span>
+                      </div>
+                    </div>
                     <div className="run-card-meta">
                       <span>{formatTimestamp(run.created_at)}</span>
                       <span>{run.touched_files.length} files</span>
@@ -833,20 +954,6 @@ export default function App() {
                 <p className="muted">No runs yet. Start with a prompt to create the first research trace.</p>
               )}
             </div>
-          </div>
-
-          <div className="suggestions">
-            <h3>Run Issues</h3>
-            {visibleIssues.length ? (
-              visibleIssues.map((issue, index) => (
-                <div key={`${issue.code ?? "issue"}-${index}`} className="suggestion-card">
-                  <strong>{issue.code ?? issue.severity ?? "issue"}</strong>
-                  <p>{issue.message ?? "Validator issue"}</p>
-                </div>
-              ))
-            ) : (
-              <p className="muted">No blocking issues in the selected run.</p>
-            )}
           </div>
         </section>
 
@@ -860,7 +967,7 @@ export default function App() {
                 </p>
               </header>
               <div className="tabs">
-                {(["preview", "code", "diff", "research"] as const).map((tab) => (
+                {(["preview", "code", "diff", "research", "logs"] as const).map((tab) => (
                   <button key={tab} type="button" className={tab === activeTab ? "active" : ""} onClick={() => setActiveTab(tab)}>
                     {tab}
                   </button>
@@ -1071,6 +1178,12 @@ export default function App() {
                   </div>
                 </div>
               ))}
+            </div>
+          ) : null}
+
+          {activeTab === "logs" ? (
+            <div className="terminal">
+              <pre>{logOutput || "No logs yet."}</pre>
             </div>
           ) : null}
         </section>

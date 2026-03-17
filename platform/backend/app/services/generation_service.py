@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
+import logging
 import os
 import re
 from typing import Any
@@ -76,6 +77,7 @@ from app.validators.suite import ValidationSuite
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
+logger = logging.getLogger(__name__)
 QUALITY_FIDELITY = {
     GenerationMode.QUALITY: "quality_app",
     GenerationMode.BALANCED: "balanced_app",
@@ -1411,24 +1413,14 @@ class GenerationService:
 
     @staticmethod
     def _select_ui_variant(prompt: str) -> str:
-        variants = ("studio", "atlas", "pulse", "editorial")
-        # Include microseconds so repeated runs with the same prompt can still diverge.
-        seed = f"{prompt}|{datetime.now(timezone.utc).isoformat(timespec='microseconds')}"
-        index = sum(ord(ch) for ch in seed) % len(variants)
-        return variants[index]
+        return "studio"
 
     @staticmethod
     def _select_layout_variant(prompt: str, ui_variant: str) -> str:
-        variant_map = {
-            "studio": ("stacked", "dashboard", "minimal"),
-            "atlas": ("dashboard", "stacked", "magazine"),
-            "pulse": ("stream", "stacked", "dashboard"),
-            "editorial": ("magazine", "minimal", "stream"),
-        }
-        options = variant_map.get(ui_variant, ("stacked", "dashboard", "minimal"))
-        seed = f"{prompt}|{ui_variant}|layout|{datetime.now(timezone.utc).isoformat(timespec='microseconds')}"
-        index = sum(ord(ch) for ch in seed) % len(options)
-        return options[index]
+        lowered = prompt.lower()
+        if any(marker in lowered for marker in ("store", "shop", "catalog", "product", "cart", "order")):
+            return "stream"
+        return "stacked"
 
     @staticmethod
     def _select_theme_palette(prompt: str, ui_variant: str) -> dict[str, str]:
@@ -1640,7 +1632,7 @@ class GenerationService:
             screen(
                 "client_home",
                 "landing",
-                f"{entity_title} workspace",
+                f"{entity_title} home",
                 f"Create, monitor, and manage your {flow_label} lifecycle end-to-end.",
                 [
                     Action(action_id="client_open_form", type="navigate", target_screen_id="client_form"),
@@ -1703,7 +1695,7 @@ class GenerationService:
             screen(
                 "specialist_home",
                 "landing",
-                f"{entity_title} execution center",
+                f"{entity_title} operations",
                 f"Review incoming {flow_label} workload, priorities, and next actions.",
                 [
                     Action(action_id="specialist_open_queue", type="navigate", target_screen_id="specialist_queue"),
@@ -1713,7 +1705,7 @@ class GenerationService:
             screen(
                 "specialist_queue",
                 "list",
-                f"{entity_title} queue",
+                f"{entity_title} worklist",
                 f"Claim {flow_label} items, execute processing steps, and update lifecycle status.",
                 [
                     Action(action_id="specialist_claim_next", type="call_api", integration_id="integration_runtime_action"),
@@ -1723,7 +1715,7 @@ class GenerationService:
             screen(
                 "specialist_detail",
                 "details",
-                f"{entity_title} execution detail",
+                f"{entity_title} details",
                 f"Review full {flow_label} context and apply controlled status transitions.",
                 [
                     Action(action_id="specialist_mark_in_progress", type="call_api", integration_id="integration_runtime_action"),
@@ -1740,7 +1732,7 @@ class GenerationService:
             screen(
                 "manager_home",
                 "landing",
-                f"{entity_title} control tower",
+                f"{entity_title} overview",
                 f"Inspect {flow_label} throughput, bottlenecks, and control actions across the full pipeline.",
                 [
                     Action(action_id="manager_open_dashboard", type="navigate", target_screen_id="manager_dashboard"),
@@ -1750,7 +1742,7 @@ class GenerationService:
             screen(
                 "manager_dashboard",
                 "list",
-                f"{entity_title} dashboard",
+                f"{entity_title} operations board",
                 f"Review aggregate {flow_label} metrics, SLA risks, and control decisions.",
                 [
                     Action(action_id="manager_rebalance", type="call_api", integration_id="integration_runtime_action"),
@@ -2013,12 +2005,6 @@ class GenerationService:
             ]
 
         if screen_id.endswith("home"):
-            hero = {
-                "section_id": f"{screen_id}_hero",
-                "type": "hero",
-                "title": self._title_for_role(role, flow_label, ui_variant),
-                "body": self._role_body(role, flow_label, ui_variant),
-            }
             stats = {
                 "section_id": f"{screen_id}_stats",
                 "type": "stats",
@@ -2029,21 +2015,40 @@ class GenerationService:
                 "type": "list",
                 "items": list_items(3),
             }
+            summary = {
+                "section_id": f"{screen_id}_summary",
+                "type": "detail",
+                "title": self._title_for_role(role, flow_label, ui_variant),
+                "body": self._role_body(role, flow_label, ui_variant),
+                "fields": self._role_summary_fields(role, flow_label, records),
+            }
+            activity = {
+                "section_id": f"{screen_id}_activity",
+                "type": "timeline",
+                "items": self._role_timeline(role, flow_label, records),
+            }
+            if "order" in flow_label:
+                commerce_layouts = {
+                    "client": [preview_list, summary],
+                    "specialist": [stats, preview_list, activity],
+                    "manager": [stats, activity, summary],
+                }
+                return commerce_layouts[role]
             if layout_variant == "minimal":
-                return [hero]
+                return [summary]
             if layout_variant == "stream":
-                return [hero, preview_list]
+                return [preview_list, summary]
             if layout_variant == "dashboard":
-                return [stats, hero, preview_list]
+                return [stats, preview_list, summary]
             if layout_variant == "magazine":
-                return [preview_list, hero, stats]
+                return [preview_list, summary, stats]
             if ui_variant == "atlas":
-                return [hero, preview_list, stats]
+                return [summary, preview_list, stats]
             if ui_variant == "pulse":
-                return [stats, hero]
+                return [stats, summary]
             if ui_variant == "editorial":
-                return [hero]
-            return [hero, stats]
+                return [summary]
+            return [summary, stats]
 
         if screen_id == "client_form":
             intro_body = (
@@ -2320,7 +2325,64 @@ class GenerationService:
             {"label": manager_labels[1], "value": str(sum(1 for record in records if record.get("owner") == "unassigned"))},
         ]
 
+    def _role_summary_fields(self, role: str, flow_label: str, records: list[dict[str, Any]]) -> list[dict[str, str]]:
+        counts = Counter(record["status"] for record in records)
+        if "order" in flow_label:
+            summaries = {
+                "client": [
+                    {"label": "What you can do", "value": "Browse products, review past orders, and follow delivery or packing updates."},
+                    {"label": "Current focus", "value": f"{counts.get('new', 0) + counts.get('in_progress', 0)} orders still moving through the store workflow."},
+                ],
+                "specialist": [
+                    {"label": "What you can do", "value": "Pick incoming orders, update fulfillment state, and flag stock or delivery issues."},
+                    {"label": "Current focus", "value": f"{counts.get('new', 0)} new orders are waiting for action right now."},
+                ],
+                "manager": [
+                    {"label": "What you can do", "value": "See throughput, delays, ownership gaps, and operational pressure across the store."},
+                    {"label": "Current focus", "value": f"{counts.get('completed', 0)} orders are already closed and {counts.get('in_progress', 0)} are still active."},
+                ],
+            }
+            return summaries[role]
+        return [
+            {"label": "Role scope", "value": self._title_for_role(role, flow_label, "studio")},
+            {"label": "Open items", "value": str(counts.get("new", 0) + counts.get("in_progress", 0))},
+        ]
+
+    def _role_timeline(self, role: str, flow_label: str, records: list[dict[str, Any]]) -> list[dict[str, str]]:
+        if records:
+            base = records[0]
+            timeline = base.get("timeline")
+            if isinstance(timeline, list) and timeline:
+                return timeline
+        if "order" in flow_label:
+            fallbacks = {
+                "client": [
+                    {"label": "Cart", "value": "Customer has selected items and is close to checkout."},
+                    {"label": "Order", "value": "Payment and confirmation are waiting to be finalized."},
+                ],
+                "specialist": [
+                    {"label": "Queue", "value": "New orders are waiting to be picked and packed."},
+                    {"label": "Fulfillment", "value": "Problematic orders should be marked before handoff."},
+                ],
+                "manager": [
+                    {"label": "Monitoring", "value": "Track slowdowns and handoff quality across the store."},
+                    {"label": "Decision", "value": "Reassign work when the queue becomes uneven."},
+                ],
+            }
+            return fallbacks[role]
+        return [
+            {"label": "Stage 1", "value": f"{flow_label.title()} was created."},
+            {"label": "Stage 2", "value": f"{flow_label.title()} is moving through the workflow."},
+        ]
+
     def _title_for_role(self, role: str, flow_label: str, ui_variant: str) -> str:
+        if "order" in flow_label:
+            commerce_titles = {
+                "client": "Orders and recent activity",
+                "specialist": "Fulfillment and handoff",
+                "manager": "Operations snapshot",
+            }
+            return commerce_titles[role]
         presets = {
             "studio": {
                 "client": f"Plan and track {flow_label}",
@@ -2346,6 +2408,13 @@ class GenerationService:
         return presets.get(ui_variant, presets["studio"])[role]
 
     def _role_body(self, role: str, flow_label: str, ui_variant: str) -> str:
+        if "order" in flow_label:
+            commerce_bodies = {
+                "client": "Browse products, place orders, and follow status changes without extra template noise.",
+                "specialist": "Review new orders, assemble them, update statuses, and resolve delivery or stock issues.",
+                "manager": "Monitor order flow, workload, bottlenecks, and everything that needs attention across the store.",
+            }
+            return commerce_bodies[role]
         presets = {
             "studio": {
                 "client": f"Create new {flow_label} entries, monitor progress, and keep core details accurate.",
@@ -2373,25 +2442,25 @@ class GenerationService:
     @staticmethod
     def _action_label(action_id: str, ui_variant: str, flow_label: str) -> str:
         labels = {
-            "client_open_form": "Create new request",
-            "client_open_requests": "Open my requests",
+            "client_open_form": "New order",
+            "client_open_requests": "Orders",
             "client_submit_request": "Submit request",
-            "client_open_request_detail": "Open request details",
-            "client_open_form_inline": "Create another request",
-            "client_success_to_requests": "View my requests",
-            "client_success_to_home": "Back to overview",
-            "client_profile_save": "Save client profile",
-            "specialist_open_queue": "Open work queue",
-            "specialist_claim_next": "Claim next item",
-            "specialist_open_detail": "Open work item details",
-            "specialist_mark_in_progress": "Start processing",
-            "specialist_complete_request": "Mark request complete",
-            "specialist_profile_save": "Save specialist profile",
-            "manager_open_dashboard": "Open operations dashboard",
-            "manager_open_records": "Open all records",
-            "manager_rebalance": "Rebalance assignments",
-            "manager_refresh_records": "Refresh records",
-            "manager_profile_save": "Save manager profile",
+            "client_open_request_detail": "Order details",
+            "client_open_form_inline": "Another order",
+            "client_success_to_requests": "View orders",
+            "client_success_to_home": "Back",
+            "client_profile_save": "Save",
+            "specialist_open_queue": "Queue",
+            "specialist_claim_next": "Claim next",
+            "specialist_open_detail": "Details",
+            "specialist_mark_in_progress": "Start",
+            "specialist_complete_request": "Complete",
+            "specialist_profile_save": "Save",
+            "manager_open_dashboard": "Dashboard",
+            "manager_open_records": "Records",
+            "manager_rebalance": "Rebalance",
+            "manager_refresh_records": "Refresh",
+            "manager_profile_save": "Save",
         }
         if ui_variant == "atlas":
             labels.update(
@@ -2423,6 +2492,8 @@ class GenerationService:
 
     def _flow_label(self, prompt: str, entity: DomainEntity) -> str:
         lowered = prompt.lower()
+        if any(marker in lowered for marker in ("store", "shop", "catalog", "product", "cart", "order")):
+            return "order management"
         if "consultation" in lowered and "booking" in lowered:
             return "consultation booking"
         if "booking" in lowered:
@@ -2651,6 +2722,8 @@ class GenerationService:
         job.events.append(JobEvent(event_type=event_type, message=message, details=details or {}))
         job.updated_at = datetime.now(timezone.utc)
         self._save_job(job)
+        self._sync_run_progress(job, event_type, message)
+        logger.info("job_event workspace_id=%s job_id=%s event=%s message=%s", job.workspace_id, job.job_id, event_type, message)
 
     def _save_job(self, job: JobRecord) -> None:
         self.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
@@ -2675,6 +2748,42 @@ class GenerationService:
         )
         current["entries"] = entries
         self._store_report(report_key, current)
+        logger.info("trace workspace_id=%s stage=%s message=%s", workspace_id, stage, message)
+
+    def _sync_run_progress(self, job: JobRecord, event_type: str, message: str) -> None:
+        if not job.linked_run_id:
+            return
+        run_payload = self.store.get("runs", job.linked_run_id)
+        if not run_payload:
+            return
+        stage, progress = self._run_progress_for_event(event_type)
+        run_payload["linked_job_id"] = job.job_id
+        run_payload["current_stage"] = stage
+        run_payload["progress_percent"] = max(int(run_payload.get("progress_percent", 0)), progress)
+        if job.llm_provider:
+            run_payload["llm_provider"] = job.llm_provider
+        if job.llm_model:
+            run_payload["llm_model"] = job.llm_model
+        run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.store.upsert("runs", job.linked_run_id, run_payload)
+
+    @staticmethod
+    def _run_progress_for_event(event_type: str) -> tuple[str, int]:
+        progress_map = {
+            "retrieval_started": ("retrieving context", 10),
+            "spec_ready": ("building grounded spec", 28),
+            "ir_ready": ("building app ir", 48),
+            "repair_iteration": ("repairing app ir", 58),
+            "artifact_plan_ready": ("planning code changes", 68),
+            "patch_applied": ("applying patch", 80),
+            "build_started": ("running validation and build", 86),
+            "preview_ready": ("refreshing preview", 94),
+            "job_completed": ("completed", 100),
+            "spec_blocked": ("blocked on spec", 100),
+            "validation_failed": ("validation failed", 100),
+            "job_failed": ("failed", 100),
+        }
+        return progress_map.get(event_type, ("processing", 12))
 
     def _grounded_spec_system_prompt(self) -> str:
         return (
@@ -2866,17 +2975,27 @@ class GenerationService:
     @staticmethod
     def _infer_entity_name(prompt: str) -> str:
         lowered = prompt.lower()
+        if any(marker in lowered for marker in ("store", "shop", "catalog", "product", "cart", "order")):
+            return "Order"
         if "consultation" in lowered:
             return "ConsultationRequest"
         if "booking" in lowered:
             return "BookingRequest"
-        if "order" in lowered:
-            return "OrderRequest"
         return "WorkflowRequest"
 
     @staticmethod
     def _infer_entity_attributes(prompt: str) -> list[EntityAttribute]:
         fields: list[EntityAttribute] = []
+        lowered = prompt.lower()
+        if any(marker in lowered for marker in ("store", "shop", "catalog", "product", "cart", "order")):
+            return [
+                EntityAttribute(name="customer_name", type="string", required=True, description="Customer full name", pii=True),
+                EntityAttribute(name="phone", type="phone", required=True, description="Customer phone number", pii=True),
+                EntityAttribute(name="product_name", type="string", required=True, description="Selected product name", pii=False),
+                EntityAttribute(name="quantity", type="string", required=True, description="Requested quantity", pii=False),
+                EntityAttribute(name="delivery_address", type="text", required=False, description="Delivery address", pii=True),
+                EntityAttribute(name="comment", type="text", required=False, description="Order comment", pii=False),
+            ]
         mappings = [
             ("name", "string", "Requester name", True, True),
             ("phone", "phone", "Contact phone number", True, True),
@@ -2886,7 +3005,6 @@ class GenerationService:
             ("service", "string", "Requested service type", False, False),
             ("time", "string", "Preferred time window", False, False),
         ]
-        lowered = prompt.lower()
         for field_name, field_type, description, required, pii in mappings:
             if field_name in lowered:
                 fields.append(

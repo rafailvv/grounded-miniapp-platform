@@ -17,7 +17,7 @@ def generate(
     container: ServiceContainer = Depends(get_container),
 ) -> JobRecord:
     try:
-        run = container.run_service.create_run(
+        run = container.run_service.create_run_sync(
             workspace_id,
             CreateRunRequest(
                 prompt=request.prompt,

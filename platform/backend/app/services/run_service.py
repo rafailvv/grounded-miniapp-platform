@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import threading
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,6 +22,7 @@ from app.services.preview_service import PreviewService
 from app.services.workspace_service import WorkspaceService
 
 ROLE_SCOPE = {"client", "specialist", "manager"}
+logger = logging.getLogger(__name__)
 
 
 class RunService:
@@ -38,6 +41,12 @@ class RunService:
         self.openrouter_client = openrouter_client
 
     def create_run(self, workspace_id: str, request: CreateRunRequest) -> RunRecord:
+        return self._start_run(workspace_id, request, wait=False)
+
+    def create_run_sync(self, workspace_id: str, request: CreateRunRequest) -> RunRecord:
+        return self._start_run(workspace_id, request, wait=True)
+
+    def _start_run(self, workspace_id: str, request: CreateRunRequest, *, wait: bool) -> RunRecord:
         workspace = self.workspace_service.get_workspace(workspace_id)
         resolved_intent = self._resolve_intent(workspace, request)
         run = RunRecord(
@@ -49,64 +58,22 @@ class RunService:
             model_profile=request.model_profile,
             llm_provider="openrouter" if self.openrouter_client.enabled else None,
             source_revision_id=workspace.current_revision_id,
-            status="running",
+            status="pending",
             apply_status="pending",
+            current_stage="queued",
+            progress_percent=2,
         )
         self._save_run(run)
-
-        job = self.generation_service.generate(
-            workspace_id,
-            GenerateRequest(
-                prompt=request.prompt,
-                target_platform=request.target_platform,
-                preview_profile=request.preview_profile,
-                generation_mode=request.generation_mode,
-                intent=resolved_intent,
-                model_profile=request.model_profile,
-                linked_run_id=run.run_id,
-            ),
+        if wait:
+            self._execute_run(run.run_id, request.model_dump(mode="python"))
+            return self.get_run(run.run_id)
+        worker = threading.Thread(
+            target=self._execute_run,
+            args=(run.run_id, request.model_dump(mode="python")),
+            daemon=True,
         )
-
-        current_workspace = self.workspace_service.get_workspace(workspace_id)
-        preview = self.preview_service.get(workspace_id)
-        change_plan = self._build_change_plan(
-            workspace_id=workspace_id,
-            run=run,
-            artifact_plan=self.generation_service.current_report(workspace_id, "artifact_plan"),
-            diff_text=self.workspace_service.diff(workspace_id),
-            prompt=request.prompt,
-        )
-
-        run.linked_job_id = job.job_id
-        run.llm_provider = job.llm_provider
-        run.llm_model = job.llm_model
-        run.summary = job.summary
-        run.failure_reason = job.failure_reason
-        run.result_revision_id = current_workspace.current_revision_id
-        run.checks_summary = self._build_checks_summary(job.validation_snapshot, preview.status)
-        run.touched_files = [target.file_path for target in change_plan.targets]
-        run.artifacts = {
-            "grounded_spec": f"/workspaces/{workspace_id}/spec/current",
-            "app_ir": f"/workspaces/{workspace_id}/ir/current",
-            "run_artifacts": f"/runs/{run.run_id}/artifacts",
-            "preview_url": preview.url or "",
-            "traceability": f"/workspaces/{workspace_id}/traceability/current",
-        }
-        run.updated_at = datetime.now(timezone.utc)
-
-        if job.status == "completed":
-            run.status = "completed"
-            run.apply_status = "applied"
-        elif job.status == "blocked":
-            run.status = "blocked"
-            run.apply_status = "blocked"
-        else:
-            run.status = "failed"
-            run.apply_status = "failed"
-
-        self._save_run(run)
-        self._store_run_artifacts(run, change_plan, job, preview)
-        return run
+        worker.start()
+        return self.get_run(run.run_id)
 
     def list_runs(self, workspace_id: str) -> list[RunRecord]:
         runs = [
@@ -140,6 +107,91 @@ class RunService:
 
     def _save_run(self, run: RunRecord) -> None:
         self.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+
+    def _execute_run(self, run_id: str, request_payload: dict[str, Any]) -> None:
+        request = CreateRunRequest.model_validate(request_payload)
+        run = self.get_run(run_id)
+        run.status = "running"
+        run.current_stage = "starting"
+        run.progress_percent = max(run.progress_percent, 5)
+        run.updated_at = datetime.now(timezone.utc)
+        self._save_run(run)
+        logger.info("run_started run_id=%s workspace_id=%s intent=%s", run.run_id, run.workspace_id, run.intent)
+        try:
+            job = self.generation_service.generate(
+                run.workspace_id,
+                GenerateRequest(
+                    prompt=request.prompt,
+                    target_platform=request.target_platform,
+                    preview_profile=request.preview_profile,
+                    generation_mode=request.generation_mode,
+                    intent=run.intent,
+                    model_profile=request.model_profile,
+                    linked_run_id=run.run_id,
+                ),
+            )
+
+            current_workspace = self.workspace_service.get_workspace(run.workspace_id)
+            preview = self.preview_service.get(run.workspace_id)
+            change_plan = self._build_change_plan(
+                workspace_id=run.workspace_id,
+                run=run,
+                artifact_plan=self.generation_service.current_report(run.workspace_id, "artifact_plan"),
+                diff_text=self.workspace_service.diff(run.workspace_id),
+                prompt=request.prompt,
+            )
+
+            run.linked_job_id = job.job_id
+            run.llm_provider = job.llm_provider
+            run.llm_model = job.llm_model
+            run.summary = job.summary
+            run.failure_reason = job.failure_reason
+            run.result_revision_id = current_workspace.current_revision_id
+            run.checks_summary = self._build_checks_summary(job.validation_snapshot, preview.status)
+            run.touched_files = [target.file_path for target in change_plan.targets]
+            run.artifacts = {
+                "grounded_spec": f"/workspaces/{run.workspace_id}/spec/current",
+                "app_ir": f"/workspaces/{run.workspace_id}/ir/current",
+                "run_artifacts": f"/runs/{run.run_id}/artifacts",
+                "preview_url": preview.url or "",
+                "traceability": f"/workspaces/{run.workspace_id}/traceability/current",
+            }
+            run.updated_at = datetime.now(timezone.utc)
+
+            if job.status == "completed":
+                run.status = "completed"
+                run.apply_status = "applied"
+                run.current_stage = "completed"
+                run.progress_percent = 100
+            elif job.status == "blocked":
+                run.status = "blocked"
+                run.apply_status = "blocked"
+                run.current_stage = "blocked"
+                run.progress_percent = max(run.progress_percent, 100)
+            else:
+                run.status = "failed"
+                run.apply_status = "failed"
+                run.current_stage = "failed"
+                run.progress_percent = max(run.progress_percent, 100)
+
+            self._save_run(run)
+            self._store_run_artifacts(run, change_plan, job, preview)
+            logger.info(
+                "run_finished run_id=%s workspace_id=%s status=%s progress=%s",
+                run.run_id,
+                run.workspace_id,
+                run.status,
+                run.progress_percent,
+            )
+        except Exception as exc:
+            run.status = "failed"
+            run.apply_status = "failed"
+            run.failure_reason = str(exc)
+            run.current_stage = "failed"
+            run.progress_percent = max(run.progress_percent, 100)
+            run.updated_at = datetime.now(timezone.utc)
+            self._save_run(run)
+            logger.exception("run_failed run_id=%s workspace_id=%s", run.run_id, run.workspace_id)
 
     def _store_run_artifacts(self, run: RunRecord, change_plan: CodeChangePlan, job: Any, preview: Any) -> None:
         workspace_id = run.workspace_id

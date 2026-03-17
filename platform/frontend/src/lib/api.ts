@@ -21,6 +21,8 @@ export type Run = {
   result_revision_id?: string | null;
   status: "pending" | "running" | "awaiting_approval" | "completed" | "blocked" | "failed";
   apply_status: "pending" | "applied" | "awaiting_approval" | "blocked" | "failed";
+  current_stage: string;
+  progress_percent: number;
   summary?: string | null;
   failure_reason?: string | null;
   checks_summary: {
@@ -71,6 +73,49 @@ export type RunArtifacts = {
     url?: string | null;
     role_urls?: Record<string, string>;
     logs?: string[];
+  };
+};
+
+export type WorkspaceLogs = {
+  workspace_id: string;
+  job: {
+    job_id: string;
+    status: string;
+    generation_mode?: string;
+    fidelity?: string;
+    llm_model?: string | null;
+    llm_provider?: string | null;
+    failure_reason?: string | null;
+  } | null;
+  events: Array<{
+    event_id: string;
+    event_type: string;
+    message: string;
+    created_at: string;
+    details?: Record<string, unknown>;
+  }>;
+  preview: {
+    status: string;
+    runtime_mode: string;
+    url: string | null;
+    logs: string[];
+  };
+  reports: {
+    trace?: {
+      workspace_id: string;
+      entries: Array<{
+        stage: string;
+        message: string;
+        created_at: string;
+        payload?: Record<string, unknown>;
+      }>;
+    } | null;
+    validation?: Record<string, unknown> | null;
+    assumptions?: Record<string, unknown> | null;
+    traceability?: Record<string, unknown> | null;
+    artifact_plan?: Record<string, unknown> | null;
+    spec_summary?: Record<string, unknown> | null;
+    ir_summary?: Record<string, unknown> | null;
   };
 };
 
@@ -174,8 +219,16 @@ export async function getRunArtifacts(runId: string): Promise<RunArtifacts> {
   return request<RunArtifacts>(`/runs/${runId}/artifacts`);
 }
 
+export async function getRun(runId: string): Promise<Run> {
+  return request<Run>(`/runs/${runId}`);
+}
+
 export async function rebuildPreview(workspaceId: string): Promise<void> {
   await request(`/workspaces/${workspaceId}/preview/rebuild`, {
     method: "POST",
   });
+}
+
+export async function getWorkspaceLogs(workspaceId: string): Promise<WorkspaceLogs> {
+  return request<WorkspaceLogs>(`/workspaces/${workspaceId}/logs`);
 }
