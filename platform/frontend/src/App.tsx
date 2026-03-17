@@ -201,40 +201,50 @@ function buildBusinessPrompt(
   previousRoleRequirements: Record<RoleKey, string>,
   hasExistingBuild: boolean,
 ): string {
+  const variationToken = Math.random().toString(36).slice(2, 10);
   const lines = [
-    "Build a production-ready Telegram mini-app for a real business use case.",
-    "Deliver a complete app flow with robust UX, clear validation, and actionable business value.",
-    "Avoid demo scaffolding and generic placeholders unless explicitly requested.",
+    "Design and build a production-grade Telegram mini-app.",
+    "Creative freedom for this run is intentionally maximal; avoid default scaffold repetition.",
+    `Variation run id: ${variationToken}.`,
     "",
-    "Role requirements and update policy:",
+    "Hard constraints (minimal):",
+    "- Keep the product business-realistic and complete end-to-end.",
+    "- Keep role boundaries and handoffs explicit: client -> specialist -> manager.",
+    "- Implement robust validation, status lifecycle, and recoverable error handling.",
+    "- Do not output toy/demo placeholder content.",
+    "",
+    "Everything else is open by design:",
+    "- Freely choose navigation model, information architecture, and screen hierarchy.",
+    "- Freely choose visual language, component composition, and interaction style.",
+    "- Avoid mirrored role screens; each role should have different responsibilities.",
+    "",
+    "Role capability requirements:",
   ];
 
   ROLE_ORDER.forEach((role) => {
     const current = roleRequirements[role].trim();
     const previous = previousRoleRequirements[role].trim();
     if (!current) {
-      lines.push(`- ${ROLE_LABELS[role]}: no new requirement provided; keep this role unchanged.`);
+      lines.push(
+        hasExistingBuild
+          ? `- ${ROLE_LABELS[role]}: no new capability requirement; keep current behavior unless needed for cross-role consistency.`
+          : `- ${ROLE_LABELS[role]}: no explicit requirement; infer a lightweight but coherent supporting role.`,
+      );
       return;
     }
-    lines.push(`- ${ROLE_LABELS[role]} requirement: ${current}`);
+    lines.push(`- ${ROLE_LABELS[role]} capability brief: ${current}`);
     lines.push(
       previous
-        ? `- ${ROLE_LABELS[role]}: refine and extend the existing flow based on this updated requirement.`
-        : `- ${ROLE_LABELS[role]}: create this flow from scratch with full business-ready behavior.`,
+        ? `- ${ROLE_LABELS[role]}: evolve existing behavior instead of reusing rigid template structure.`
+        : `- ${ROLE_LABELS[role]}: build from scratch with full production-oriented behavior.`,
     );
   });
 
-  if (!hasExistingBuild) {
-    lines.push(
-      "- If a role has no requirement and no existing flow yet, keep it minimal and avoid inventing unsupported functionality.",
-    );
-  }
-
   lines.push("");
-  lines.push("Quality bar:");
-  lines.push("- Real-world forms, status handling, validation, and error states.");
-  lines.push("- Consistent navigation between client, specialist, and manager roles.");
-  lines.push("- Production-oriented structure and maintainable code artifacts.");
+  lines.push("Generation policy:");
+  lines.push("- Treat this as an open design space, not a fixed template recreation.");
+  lines.push("- You may invent additional modules/screens when they improve product viability.");
+  lines.push("- The final output must feel like a complete real application project.");
   return lines.join("\n");
 }
 

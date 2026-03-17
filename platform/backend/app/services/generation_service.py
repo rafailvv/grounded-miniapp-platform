@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
+import os
 import re
 from typing import Any
 
@@ -184,6 +185,13 @@ class GenerationService:
 
         chat_turn = ChatTurnRecord(workspace_id=workspace_id, role="user", content=request.prompt, linked_job_id=job.job_id)
         self.store.upsert("chat_turns", chat_turn.turn_id, chat_turn.model_dump(mode="json"))
+        creative_direction = self._select_creative_direction(request.prompt)
+        self._append_trace(
+            workspace_id,
+            "creative_direction_selected",
+            "Creative direction selected for this run.",
+            creative_direction,
+        )
 
         spec_result = self._resolve_grounded_spec(
             workspace_id=workspace_id,
@@ -194,6 +202,7 @@ class GenerationService:
             template_revision_id=workspace.current_revision_id or "template-unknown",
             prompt_turn_id=chat_turn.turn_id,
             generation_mode=generation_mode,
+            creative_direction=creative_direction,
         )
         if "error" in spec_result:
             self._append_trace(
@@ -211,6 +220,13 @@ class GenerationService:
             )
         grounded_spec: GroundedSpecModel = spec_result["spec"]
         grounded_spec = self._stabilize_grounded_spec(grounded_spec)
+        if spec_result.get("warning"):
+            self._append_trace(
+                workspace_id,
+                "spec_fallback_used",
+                "GroundedSpec switched to compiler fallback due to LLM/schema error.",
+                {"warning": spec_result["warning"]},
+            )
         if spec_result.get("model"):
             job.llm_model = str(spec_result["model"])
         self._append_trace(
@@ -259,6 +275,7 @@ class GenerationService:
             spec=grounded_spec,
             scenario_graph=scenario_graph,
             generation_mode=generation_mode,
+            creative_direction=creative_direction,
         )
         if "error" in app_ir_result:
             self._append_trace(
@@ -275,6 +292,13 @@ class GenerationService:
                 failure_reason=app_ir_result["error"],
             )
         app_ir: AppIRModel = app_ir_result["ir"]
+        if app_ir_result.get("warning"):
+            self._append_trace(
+                workspace_id,
+                "ir_fallback_used",
+                "AppIR switched to compiler fallback due to LLM/schema error.",
+                {"warning": app_ir_result["warning"]},
+            )
         if app_ir_result.get("model"):
             job.llm_model = str(app_ir_result["model"])
         self._append_trace(
@@ -287,6 +311,8 @@ class GenerationService:
                 "integrations": len(app_ir.integrations),
                 "actions": sum(len(screen.actions) for screen in app_ir.screens),
                 "model": app_ir_result.get("model"),
+                "model_sequence": app_ir_result.get("model_sequence", []),
+                "refinement_rounds": app_ir_result.get("refinement_rounds", 0),
             },
         )
 
@@ -467,7 +493,23 @@ class GenerationService:
         template_revision_id: str,
         prompt_turn_id: str,
         generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
+        fast_spec_mode = os.getenv("FAST_GENERATION_SPEC_ONLY", "0") == "1"
+        if fast_spec_mode:
+            return {
+                "spec": self._build_grounded_spec(
+                    workspace_id=workspace_id,
+                    prompt=prompt,
+                    target_platform=target_platform,
+                    preview_profile=preview_profile,
+                    doc_refs=doc_refs,
+                    template_revision_id=template_revision_id,
+                    prompt_turn_id=prompt_turn_id,
+                    generation_mode=generation_mode,
+                ),
+                "model": None,
+            }
         if generation_mode == GenerationMode.BASIC or not self.openrouter_client.enabled:
             return {
                 "spec": self._build_grounded_spec(
@@ -487,13 +529,19 @@ class GenerationService:
                 schema_name="grounded_spec_v1",
                 schema=GroundedSpecModel.model_json_schema(),
                 system_prompt=self._grounded_spec_system_prompt(),
-                user_prompt=self._grounded_spec_user_prompt(prompt, doc_refs, target_platform, preview_profile, template_revision_id, prompt_turn_id),
+                user_prompt=self._grounded_spec_user_prompt(
+                    prompt,
+                    doc_refs,
+                    target_platform,
+                    preview_profile,
+                    template_revision_id,
+                    prompt_turn_id,
+                    creative_direction,
+                ),
             )
             spec = GroundedSpecModel.model_validate(self._normalize_model_payload(payload["payload"]))
             return {"spec": spec, "model": payload["model"]}
         except Exception as exc:
-            if generation_mode == GenerationMode.QUALITY:
-                return {"error": f"Quality mode could not build GroundedSpec through OpenRouter: {exc}"}
             return {
                 "spec": self._build_grounded_spec(
                     workspace_id=workspace_id,
@@ -506,6 +554,7 @@ class GenerationService:
                     generation_mode=generation_mode,
                 ),
                 "model": None,
+                "warning": f"GroundedSpec LLM step failed, fallback compiler spec was used: {exc}",
             }
 
     def _resolve_app_ir(
@@ -514,6 +563,7 @@ class GenerationService:
         spec: GroundedSpecModel,
         scenario_graph: dict[str, Any],
         generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
         if generation_mode == GenerationMode.BASIC or not self.openrouter_client.enabled:
             return {"ir": self._build_app_ir(spec, scenario_graph, generation_mode)}
@@ -523,16 +573,96 @@ class GenerationService:
                 schema_name="app_ir_v1",
                 schema=AppIRModel.model_json_schema(),
                 system_prompt=self._app_ir_system_prompt(),
-                user_prompt=self._app_ir_user_prompt(spec, scenario_graph),
+                user_prompt=self._app_ir_user_prompt(spec, scenario_graph, creative_direction),
             )
             llm_ir = AppIRModel.model_validate(self._normalize_model_payload(payload["payload"]))
             llm_ir = self._stabilize_app_ir(llm_ir, spec, scenario_graph, generation_mode)
-            enriched_ir = self._enrich_app_ir(llm_ir, spec, scenario_graph, generation_mode)
-            return {"ir": enriched_ir, "model": payload["model"]}
+            current_ir = self._enrich_app_ir(llm_ir, spec, scenario_graph, generation_mode)
+            used_models = [str(payload["model"])]
+
+            rounds = self._refinement_rounds_for_mode(generation_mode)
+            for iteration in range(rounds):
+                critique = self._critique_app_ir(spec, scenario_graph, current_ir, creative_direction)
+                issues = critique.get("issues", [])
+                should_repair = bool(critique.get("should_repair"))
+                has_major_issues = any(
+                    str(issue.get("severity", "")).lower() in {"critical", "high"}
+                    for issue in issues
+                    if isinstance(issue, dict)
+                )
+                if not should_repair and not has_major_issues:
+                    break
+
+                repair_payload = self.openrouter_client.generate_structured(
+                    role="repair",
+                    schema_name=f"app_ir_repair_v{iteration + 1}",
+                    schema=AppIRModel.model_json_schema(),
+                    system_prompt=self._app_ir_repair_system_prompt(),
+                    user_prompt=self._app_ir_repair_user_prompt(spec, scenario_graph, current_ir, critique, creative_direction),
+                )
+                used_models.append(str(repair_payload["model"]))
+                repaired_ir = AppIRModel.model_validate(self._normalize_model_payload(repair_payload["payload"]))
+                repaired_ir = self._stabilize_app_ir(repaired_ir, spec, scenario_graph, generation_mode)
+                current_ir = self._enrich_app_ir(repaired_ir, spec, scenario_graph, generation_mode)
+
+                validation = self.validation_suite.validate_app_ir(current_ir)
+                if not validation.blocking and not has_major_issues:
+                    break
+
+            return {
+                "ir": current_ir,
+                "model": used_models[-1],
+                "model_sequence": used_models,
+                "refinement_rounds": max(0, len(used_models) - 1),
+            }
         except Exception as exc:
-            if generation_mode == GenerationMode.QUALITY:
-                return {"error": f"Quality mode could not build AppIR through OpenRouter: {exc}"}
-            return {"ir": self._build_app_ir(spec, scenario_graph, generation_mode)}
+            return {
+                "ir": self._build_app_ir(spec, scenario_graph, generation_mode),
+                "model": None,
+                "model_sequence": [],
+                "refinement_rounds": 0,
+                "warning": f"AppIR LLM step failed, fallback compiler IR was used: {exc}",
+            }
+
+    def _critique_app_ir(
+        self,
+        spec: GroundedSpecModel,
+        scenario_graph: dict[str, Any],
+        ir: AppIRModel,
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            payload = self.openrouter_client.generate_structured(
+                role="cheap_task",
+                schema_name="app_ir_critique_v1",
+                schema=self._app_ir_critique_schema(),
+                system_prompt=self._app_ir_critique_system_prompt(),
+                user_prompt=self._app_ir_critique_user_prompt(spec, scenario_graph, ir, creative_direction),
+            )
+            normalized = self._normalize_model_payload(payload["payload"])
+            if isinstance(normalized, dict):
+                issues = normalized.get("issues")
+                if not isinstance(issues, list):
+                    normalized["issues"] = []
+                normalized["should_repair"] = bool(normalized.get("should_repair"))
+                normalized["repair_instructions"] = normalized.get("repair_instructions") or []
+                return normalized
+        except Exception:
+            pass
+        return {
+            "should_repair": False,
+            "issues": [],
+            "repair_instructions": [],
+            "summary": "Critique was skipped due to provider/runtime limits.",
+        }
+
+    @staticmethod
+    def _refinement_rounds_for_mode(generation_mode: GenerationMode) -> int:
+        if generation_mode == GenerationMode.QUALITY:
+            return max(1, int(os.getenv("QUALITY_REFINEMENT_ROUNDS", "3")))
+        if generation_mode == GenerationMode.BALANCED:
+            return max(0, int(os.getenv("BALANCED_REFINEMENT_ROUNDS", "1")))
+        return 0
 
     def _stabilize_grounded_spec(self, spec: GroundedSpecModel) -> GroundedSpecModel:
         assumptions = list(spec.assumptions)
@@ -1064,13 +1194,7 @@ class GenerationService:
         generation_mode: GenerationMode,
     ) -> AppIRModel:
         fallback = self._build_app_ir(spec, scenario_graph, generation_mode)
-        fallback_screens = {screen.screen_id: screen for screen in fallback.screens}
-        screens = [
-            fallback_screens.get(screen.screen_id, screen)
-            if self._screen_is_generic(screen.title, screen.subtitle)
-            else screen
-            for screen in llm_ir.screens
-        ]
+        screens = llm_ir.screens or fallback.screens
         route_groups = llm_ir.route_groups or fallback.route_groups
         screen_data_sources = llm_ir.screen_data_sources or fallback.screen_data_sources
         role_action_groups = llm_ir.role_action_groups or fallback.role_action_groups
@@ -1177,6 +1301,44 @@ class GenerationService:
             operations=operations,
         )
 
+    @staticmethod
+    def _select_creative_direction(prompt: str) -> dict[str, Any]:
+        strategies = [
+            {
+                "name": "workflow-command-center",
+                "focus": "Operations-first control surface with strong status visibility.",
+                "layout_bias": "dashboard",
+                "interaction_bias": "bulk operations and quick triage actions",
+                "tone": "decisive",
+            },
+            {
+                "name": "guided-service-journey",
+                "focus": "Step-based journey that emphasizes clarity and completion confidence.",
+                "layout_bias": "stream",
+                "interaction_bias": "guided progression with contextual details",
+                "tone": "supportive",
+            },
+            {
+                "name": "workspace-knowledge-hub",
+                "focus": "Entity-centric workspace with dense detail and history views.",
+                "layout_bias": "magazine",
+                "interaction_bias": "exploration and drill-down",
+                "tone": "analytical",
+            },
+            {
+                "name": "lean-minimal-ops",
+                "focus": "Minimal but complete flows with reduced chrome and direct actions.",
+                "layout_bias": "minimal",
+                "interaction_bias": "direct action with low navigation overhead",
+                "tone": "concise",
+            },
+        ]
+        seed = f"{prompt}|creative|{datetime.now(timezone.utc).isoformat(timespec='microseconds')}"
+        index = sum(ord(ch) for ch in seed) % len(strategies)
+        selected = dict(strategies[index])
+        selected["seed"] = seed[-16:]
+        return selected
+
     def _build_runtime_manifest(
         self,
         spec: GroundedSpecModel,
@@ -1185,6 +1347,10 @@ class GenerationService:
     ) -> dict[str, Any]:
         entity = spec.domain_entities[0]
         records = self._sample_records(entity, spec.product_goal)
+        flow_label = self._flow_label(spec.product_goal, entity)
+        ui_variant = self._select_ui_variant(spec.product_goal)
+        layout_variant = self._select_layout_variant(spec.product_goal, ui_variant)
+        theme_palette = self._select_theme_palette(spec.product_goal, ui_variant)
         route_lookup = {route.screen_id: route for group in ir.route_groups for route in group.routes}
         screens_by_id = {screen.screen_id: screen for screen in ir.screens}
         roles: dict[str, Any] = {}
@@ -1200,20 +1366,32 @@ class GenerationService:
                     "subtitle": screen.subtitle,
                     "kind": screen.kind,
                     "components": [component.model_dump(mode="json") for component in screen.components],
-                    "actions": [self._manifest_action(action, route_lookup) for action in screen.actions],
-                    "sections": self._screen_sections(group.role, screen.screen_id, screen.kind, entity, role_records, spec.product_goal),
+                    "actions": [self._manifest_action(action, route_lookup, ui_variant, flow_label) for action in screen.actions],
+                    "sections": self._screen_sections(
+                        group.role,
+                        screen.screen_id,
+                        screen.kind,
+                        entity,
+                        role_records,
+                        spec.product_goal,
+                        ui_variant,
+                        layout_variant,
+                    ),
                 }
             roles[group.role] = {
                 "entry_path": group.entry_path,
                 "routes": [route.model_dump(mode="json") for route in group.routes],
                 "screens": role_screens,
-                "navigation": self._navigation_items(group.role),
+                "navigation": self._navigation_items(group.role, flow_label, ui_variant, layout_variant),
             }
         return {
             "app": {
                 "title": spec.product_goal[:80],
                 "goal": spec.product_goal,
                 "generation_mode": generation_mode.value,
+                "ui_variant": ui_variant,
+                "layout_variant": layout_variant,
+                "theme": theme_palette,
                 "platform": spec.target_platform,
                 "preview_profile": spec.preview_profile,
                 "route_count": sum(len(group.routes) for group in ir.route_groups),
@@ -1221,6 +1399,41 @@ class GenerationService:
             },
             "roles": roles,
         }
+
+    @staticmethod
+    def _select_ui_variant(prompt: str) -> str:
+        variants = ("studio", "atlas", "pulse", "editorial")
+        # Include microseconds so repeated runs with the same prompt can still diverge.
+        seed = f"{prompt}|{datetime.now(timezone.utc).isoformat(timespec='microseconds')}"
+        index = sum(ord(ch) for ch in seed) % len(variants)
+        return variants[index]
+
+    @staticmethod
+    def _select_layout_variant(prompt: str, ui_variant: str) -> str:
+        variant_map = {
+            "studio": ("stacked", "dashboard", "minimal"),
+            "atlas": ("dashboard", "stacked", "magazine"),
+            "pulse": ("stream", "stacked", "dashboard"),
+            "editorial": ("magazine", "minimal", "stream"),
+        }
+        options = variant_map.get(ui_variant, ("stacked", "dashboard", "minimal"))
+        seed = f"{prompt}|{ui_variant}|layout|{datetime.now(timezone.utc).isoformat(timespec='microseconds')}"
+        index = sum(ord(ch) for ch in seed) % len(options)
+        return options[index]
+
+    @staticmethod
+    def _select_theme_palette(prompt: str, ui_variant: str) -> dict[str, str]:
+        palettes = [
+            {"accent": "#2d7ff9", "accent_soft": "#e8f1ff", "surface": "#ffffff", "card": "#f8fbff", "border": "#d8e4f7"},
+            {"accent": "#0f8f6a", "accent_soft": "#e6fbf3", "surface": "#fcfffd", "card": "#f1fbf7", "border": "#cdeedd"},
+            {"accent": "#c24a2f", "accent_soft": "#fff1ea", "surface": "#fffdfc", "card": "#fff7f2", "border": "#f1d5ca"},
+            {"accent": "#6b46d4", "accent_soft": "#f0eaff", "surface": "#fefcff", "card": "#f7f2ff", "border": "#dfd2fb"},
+            {"accent": "#0c7a91", "accent_soft": "#e6f8fd", "surface": "#fbfeff", "card": "#f0fbff", "border": "#c9eaf3"},
+            {"accent": "#9a3412", "accent_soft": "#fff0ea", "surface": "#fffefd", "card": "#fff7f4", "border": "#f2d9ce"},
+        ]
+        seed = f"{prompt}|{ui_variant}|{datetime.now(timezone.utc).isoformat(timespec='microseconds')}"
+        index = sum(ord(ch) for ch in seed) % len(palettes)
+        return palettes[index]
 
     def _build_runtime_state(
         self,
@@ -1292,13 +1505,29 @@ class GenerationService:
             role_seed["roles"][role] = {
                 "title": home_screen["title"],
                 "description": home_screen["subtitle"] or runtime_manifest["app"]["goal"],
-                "feature_text": home_screen["sections"][0]["body"] if home_screen["sections"] else runtime_manifest["app"]["goal"],
+                "feature_text": self._seed_feature_text(home_screen, runtime_manifest["app"]["goal"]),
                 "primary_action_label": home_screen["actions"][0]["label"] if home_screen["actions"] else "Open",
                 "secondary_action_label": "Profile",
                 "metrics": role_state["metrics"],
                 "profile": role_state["profile"],
             }
         return role_seed
+
+    @staticmethod
+    def _seed_feature_text(screen: dict[str, Any], fallback: str) -> str:
+        sections = screen.get("sections", [])
+        if not isinstance(sections, list):
+            return fallback
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            body = section.get("body")
+            if isinstance(body, str) and body.strip():
+                return body
+            title = section.get("title")
+            if isinstance(title, str) and title.strip():
+                return title
+        return fallback
 
     def _build_traceability_report(self, workspace_id: str, ir: AppIRModel) -> TraceabilityReportModel:
         return TraceabilityReportModel(
@@ -1402,8 +1631,8 @@ class GenerationService:
             screen(
                 "client_home",
                 "landing",
-                f"{entity_title} hub",
-                f"Create and track your {flow_label} requests.",
+                f"{entity_title} workspace",
+                f"Create, monitor, and manage your {flow_label} lifecycle end-to-end.",
                 [
                     Action(action_id="client_open_form", type="navigate", target_screen_id="client_form"),
                     Action(action_id="client_open_requests", type="navigate", target_screen_id="client_requests"),
@@ -1413,8 +1642,8 @@ class GenerationService:
             screen(
                 "client_form",
                 "form",
-                f"Book {flow_label}",
-                f"Complete the {flow_label} form and submit it into the shared workflow.",
+                f"Create {flow_label}",
+                f"Provide complete details, validate inputs, and submit into the shared operational workflow.",
                 [
                     Action(
                         action_id="client_submit_request",
@@ -1432,7 +1661,7 @@ class GenerationService:
                 "client_requests",
                 "list",
                 f"My {entity_plural}",
-                f"Browse current and historical {flow_label} submissions.",
+                f"Browse active, pending, and completed {flow_label} records.",
                 [
                     Action(action_id="client_open_request_detail", type="navigate", target_screen_id="client_detail"),
                     Action(action_id="client_open_form_inline", type="navigate", target_screen_id="client_form"),
@@ -1442,14 +1671,14 @@ class GenerationService:
                 "client_detail",
                 "details",
                 f"{entity_title} detail",
-                f"Inspect status, timeline, and next steps for this {flow_label}.",
+                f"Inspect status history, ownership, timeline, and next actions for this {flow_label}.",
                 [Action(action_id="client_back_to_requests", type="navigate", target_screen_id="client_requests")],
             ),
             screen(
                 "client_success",
                 "success",
                 f"{entity_title} submitted",
-                f"The {flow_label} has been stored and routed to operations.",
+                f"The {flow_label} was persisted and routed to downstream processing.",
                 [
                     Action(action_id="client_success_to_requests", type="navigate", target_screen_id="client_requests"),
                     Action(action_id="client_success_to_home", type="navigate", target_screen_id="client_home"),
@@ -1459,14 +1688,14 @@ class GenerationService:
                 "client_profile",
                 "info",
                 "Client profile",
-                f"Manage contact details used for {flow_label}.",
+                f"Manage contact and preference details used throughout {flow_label} execution.",
                 [Action(action_id="client_profile_save", type="call_api", integration_id="integration_save_profile")],
             ),
             screen(
                 "specialist_home",
                 "landing",
-                f"{entity_title} operations",
-                f"Review incoming {flow_label} requests and next actions.",
+                f"{entity_title} execution center",
+                f"Review incoming {flow_label} workload, priorities, and next actions.",
                 [
                     Action(action_id="specialist_open_queue", type="navigate", target_screen_id="specialist_queue"),
                     Action(action_id="specialist_open_profile", type="navigate", target_screen_id="specialist_profile"),
@@ -1476,7 +1705,7 @@ class GenerationService:
                 "specialist_queue",
                 "list",
                 f"{entity_title} queue",
-                f"Claim {flow_label} items, update status, and open details.",
+                f"Claim {flow_label} items, execute processing steps, and update lifecycle status.",
                 [
                     Action(action_id="specialist_claim_next", type="call_api", integration_id="integration_runtime_action"),
                     Action(action_id="specialist_open_detail", type="navigate", target_screen_id="specialist_detail"),
@@ -1485,8 +1714,8 @@ class GenerationService:
             screen(
                 "specialist_detail",
                 "details",
-                f"{entity_title} processing",
-                f"Review the {flow_label} context and change workflow status.",
+                f"{entity_title} execution detail",
+                f"Review full {flow_label} context and apply controlled status transitions.",
                 [
                     Action(action_id="specialist_mark_in_progress", type="call_api", integration_id="integration_runtime_action"),
                     Action(action_id="specialist_complete_request", type="call_api", integration_id="integration_runtime_action"),
@@ -1496,14 +1725,14 @@ class GenerationService:
                 "specialist_profile",
                 "info",
                 "Specialist profile",
-                f"Adjust specialist data used during {flow_label} handling.",
+                f"Adjust specialist data and operational preferences used in {flow_label} handling.",
                 [Action(action_id="specialist_profile_save", type="call_api", integration_id="integration_save_profile")],
             ),
             screen(
                 "manager_home",
                 "landing",
-                f"{entity_title} oversight",
-                f"Open control dashboards and inspect {flow_label} throughput across the whole flow.",
+                f"{entity_title} control tower",
+                f"Inspect {flow_label} throughput, bottlenecks, and control actions across the full pipeline.",
                 [
                     Action(action_id="manager_open_dashboard", type="navigate", target_screen_id="manager_dashboard"),
                     Action(action_id="manager_open_profile", type="navigate", target_screen_id="manager_profile"),
@@ -1513,7 +1742,7 @@ class GenerationService:
                 "manager_dashboard",
                 "list",
                 f"{entity_title} dashboard",
-                f"Review aggregate {flow_label} metrics, alerts, and control actions.",
+                f"Review aggregate {flow_label} metrics, SLA risks, and control decisions.",
                 [
                     Action(action_id="manager_rebalance", type="call_api", integration_id="integration_runtime_action"),
                     Action(action_id="manager_open_records", type="navigate", target_screen_id="manager_records"),
@@ -1523,14 +1752,14 @@ class GenerationService:
                 "manager_records",
                 "details",
                 f"All {entity_plural}",
-                f"Inspect {flow_label} records by status and ownership.",
+                f"Inspect {flow_label} records by status, ownership, and escalation state.",
                 [Action(action_id="manager_refresh_records", type="call_api", integration_id="integration_runtime_action")],
             ),
             screen(
                 "manager_profile",
                 "info",
                 "Manager profile",
-                f"Manage profile data and notification preferences for {flow_label}.",
+                f"Manage governance and notification preferences for {flow_label} operations.",
                 [Action(action_id="manager_profile_save", type="call_api", integration_id="integration_save_profile")],
             ),
         ]
@@ -1755,80 +1984,135 @@ class GenerationService:
         entity: DomainEntity,
         records: list[dict[str, Any]],
         prompt_goal: str,
+        ui_variant: str,
+        layout_variant: str,
     ) -> list[dict[str, Any]]:
         flow_label = self._flow_label(prompt_goal, entity)
         entity_title = self._entity_title(entity)
-        if screen_id.endswith("home"):
+
+        def list_items(limit: int | None = None) -> list[dict[str, Any]]:
+            source = records[:limit] if limit is not None else records
             return [
                 {
-                    "section_id": f"{screen_id}_hero",
-                    "type": "hero",
-                    "title": self._title_for_role(role, flow_label),
-                    "body": self._role_body(role, flow_label),
-                },
-                {
-                    "section_id": f"{screen_id}_stats",
-                    "type": "stats",
-                    "items": self._role_stats(role, records),
-                },
-            ]
-        if screen_id == "client_form":
-            return [
-                {
-                    "section_id": "client_form_intro",
-                    "type": "hero",
-                    "title": f"{entity_title} form",
-                    "body": f"Complete the {flow_label} form and send it into the shared workflow.",
-                },
-                {
-                    "section_id": "client_form_fields",
-                    "type": "form",
-                    "fields": [
-                        {
-                            "field_id": attribute.name,
-                            "name": attribute.name,
-                            "label": attribute.name.replace("_", " ").title(),
-                            "field_type": attribute.type,
-                            "required": attribute.required,
-                            "placeholder": f"Enter {attribute.name.replace('_', ' ')}",
-                        }
-                        for attribute in entity.attributes
-                    ],
-                },
-            ]
-        if kind == "list":
-            return [
-                {
-                    "section_id": f"{screen_id}_list",
-                    "type": "list",
-                    "items": [
-                        {
-                            "item_id": record["record_id"],
-                            "title": record["title"],
-                            "subtitle": record["summary"],
-                            "status": record["status"],
-                            "meta": record["priority"],
-                        }
-                        for record in records
-                    ],
+                    "item_id": record["record_id"],
+                    "title": record["title"],
+                    "subtitle": record["summary"],
+                    "status": record["status"],
+                    "meta": record["priority"],
                 }
+                for record in source
             ]
+
+        if screen_id.endswith("home"):
+            hero = {
+                "section_id": f"{screen_id}_hero",
+                "type": "hero",
+                "title": self._title_for_role(role, flow_label, ui_variant),
+                "body": self._role_body(role, flow_label, ui_variant),
+            }
+            stats = {
+                "section_id": f"{screen_id}_stats",
+                "type": "stats",
+                "items": self._role_stats(role, records, ui_variant),
+            }
+            preview_list = {
+                "section_id": f"{screen_id}_list_preview",
+                "type": "list",
+                "items": list_items(3),
+            }
+            if layout_variant == "minimal":
+                return [hero]
+            if layout_variant == "stream":
+                return [hero, preview_list]
+            if layout_variant == "dashboard":
+                return [stats, hero, preview_list]
+            if layout_variant == "magazine":
+                return [preview_list, hero, stats]
+            if ui_variant == "atlas":
+                return [hero, preview_list, stats]
+            if ui_variant == "pulse":
+                return [stats, hero]
+            if ui_variant == "editorial":
+                return [hero]
+            return [hero, stats]
+
+        if screen_id == "client_form":
+            intro_body = (
+                f"Complete the {flow_label} form with validated inputs and route it into the shared workflow."
+                if ui_variant != "editorial"
+                else f"Capture the core {flow_label} details and submit for operational processing."
+            )
+            intro_section = {
+                "section_id": "client_form_intro",
+                "type": "hero",
+                "title": f"{entity_title} form",
+                "body": intro_body,
+            }
+            form_section = {
+                "section_id": "client_form_fields",
+                "type": "form",
+                "fields": [
+                    {
+                        "field_id": attribute.name,
+                        "name": attribute.name,
+                        "label": attribute.name.replace("_", " ").title(),
+                        "field_type": attribute.type,
+                        "required": attribute.required,
+                        "placeholder": f"Enter {attribute.name.replace('_', ' ')}",
+                    }
+                    for attribute in entity.attributes
+                ],
+            }
+            if layout_variant == "minimal":
+                return [form_section]
+            if layout_variant == "stream":
+                return [form_section, intro_section]
+            return [
+                intro_section,
+                form_section,
+            ]
+
+        if kind == "list":
+            list_section = {
+                "section_id": f"{screen_id}_list",
+                "type": "list",
+                "items": list_items(),
+            }
+            stats_section = {
+                "section_id": f"{screen_id}_stats",
+                "type": "stats",
+                "items": self._role_stats(role, records, ui_variant),
+            }
+            if layout_variant == "minimal":
+                return [list_section]
+            if layout_variant == "stream":
+                return [list_section, stats_section]
+            if layout_variant == "dashboard" or ui_variant == "pulse":
+                return [stats_section, list_section]
+            return [list_section]
+
         if kind == "details":
             record = records[0] if records else {"title": entity.name, "summary": prompt_goal, "payload": {}, "timeline": []}
-            return [
-                {
-                    "section_id": f"{screen_id}_detail",
-                    "type": "detail",
-                    "title": record["title"],
-                    "body": record["summary"],
-                    "fields": [{"label": key.replace("_", " ").title(), "value": value} for key, value in record["payload"].items()],
-                },
-                {
-                    "section_id": f"{screen_id}_timeline",
-                    "type": "timeline",
-                    "items": record["timeline"],
-                },
-            ]
+            detail_section = {
+                "section_id": f"{screen_id}_detail",
+                "type": "detail",
+                "title": record["title"],
+                "body": record["summary"],
+                "fields": [{"label": key.replace("_", " ").title(), "value": value} for key, value in record["payload"].items()],
+            }
+            timeline_section = {
+                "section_id": f"{screen_id}_timeline",
+                "type": "timeline",
+                "items": record["timeline"],
+            }
+            if layout_variant == "minimal":
+                return [detail_section]
+            if layout_variant in {"stream", "magazine"}:
+                return [timeline_section, detail_section]
+            if ui_variant == "editorial":
+                return [timeline_section, detail_section]
+            return [detail_section, timeline_section]
+
         if screen_id.endswith("profile"):
             return [
                 {
@@ -1837,29 +2121,45 @@ class GenerationService:
                     "body": f"Update profile data and keep it consistent across {flow_label} runtime actions.",
                 }
             ]
+
         if kind == "success":
             return [
                 {
                     "section_id": "client_success_message",
                     "type": "hero",
                     "title": f"{entity_title} created",
-                    "body": f"The {flow_label} is now visible to the specialist queue and manager dashboard.",
+                    "body": (
+                        f"The {flow_label} is now visible in specialist and manager workflows."
+                        if layout_variant != "magazine" and ui_variant != "atlas"
+                        else f"Your {flow_label} has been registered and routed through the pipeline."
+                    ),
                 }
             ]
+
         return []
 
-    def _manifest_action(self, action: Action, route_lookup: dict[str, RouteDefinition]) -> dict[str, Any]:
+    def _manifest_action(
+        self,
+        action: Action,
+        route_lookup: dict[str, RouteDefinition],
+        ui_variant: str,
+        flow_label: str,
+    ) -> dict[str, Any]:
         payload = action.model_dump(mode="json")
-        payload["label"] = self._action_label(action.action_id)
+        payload["label"] = self._action_label(action.action_id, ui_variant, flow_label)
         if action.target_screen_id and action.target_screen_id in route_lookup:
             payload["target_path"] = route_lookup[action.target_screen_id].path
         return payload
 
-    def _navigation_items(self, role: str) -> list[dict[str, str]]:
-        items = {
+    def _navigation_items(self, role: str, flow_label: str, ui_variant: str, layout_variant: str) -> list[dict[str, str]]:
+        def reorder(items: list[dict[str, str]], order: list[str]) -> list[dict[str, str]]:
+            item_map = {item["path"]: item for item in items}
+            return [item_map[path] for path in order if path in item_map]
+
+        base_items = {
             "client": [
                 {"label": "Home", "path": "/"},
-                {"label": "Book", "path": "/book"},
+                {"label": "Create", "path": "/book"},
                 {"label": "Requests", "path": "/requests"},
                 {"label": "Profile", "path": "/profile"},
             ],
@@ -1875,62 +2175,241 @@ class GenerationService:
                 {"label": "Profile", "path": "/profile"},
             ],
         }
-        return items[role]
+        selected: list[dict[str, str]]
+        if ui_variant == "atlas":
+            atlas = {
+                "client": [
+                    {"label": "Overview", "path": "/"},
+                    {"label": "Intake", "path": "/book"},
+                    {"label": "Pipeline", "path": "/requests"},
+                    {"label": "Profile", "path": "/profile"},
+                ],
+                "specialist": [
+                    {"label": "Ops", "path": "/"},
+                    {"label": "Backlog", "path": "/queue"},
+                    {"label": "Profile", "path": "/profile"},
+                ],
+                "manager": [
+                    {"label": "Command", "path": "/"},
+                    {"label": "Insights", "path": "/dashboard"},
+                    {"label": "Records", "path": "/records"},
+                    {"label": "Profile", "path": "/profile"},
+                ],
+            }
+            selected = atlas[role]
+        elif ui_variant == "editorial":
+            editorial = {
+                "client": [
+                    {"label": "Start", "path": "/"},
+                    {"label": "New", "path": "/book"},
+                    {"label": "History", "path": "/requests"},
+                    {"label": "Me", "path": "/profile"},
+                ],
+                "specialist": [
+                    {"label": "Start", "path": "/"},
+                    {"label": "Work", "path": "/queue"},
+                    {"label": "Me", "path": "/profile"},
+                ],
+                "manager": [
+                    {"label": "Start", "path": "/"},
+                    {"label": "Control", "path": "/dashboard"},
+                    {"label": "Audit", "path": "/records"},
+                    {"label": "Me", "path": "/profile"},
+                ],
+            }
+            selected = editorial[role]
+        elif ui_variant == "pulse":
+            main_token = flow_label.split()[0].title() if flow_label else "Flow"
+            pulse = {
+                "client": [
+                    {"label": "Now", "path": "/"},
+                    {"label": f"New {main_token}", "path": "/book"},
+                    {"label": "Track", "path": "/requests"},
+                    {"label": "Profile", "path": "/profile"},
+                ],
+                "specialist": [
+                    {"label": "Now", "path": "/"},
+                    {"label": "Queue", "path": "/queue"},
+                    {"label": "Profile", "path": "/profile"},
+                ],
+                "manager": [
+                    {"label": "Now", "path": "/"},
+                    {"label": "Board", "path": "/dashboard"},
+                    {"label": "Records", "path": "/records"},
+                    {"label": "Profile", "path": "/profile"},
+                ],
+            }
+            selected = pulse[role]
+        else:
+            selected = base_items[role]
 
-    def _role_stats(self, role: str, records: list[dict[str, Any]]) -> list[dict[str, str]]:
+        if layout_variant == "dashboard":
+            order = {
+                "client": ["/requests", "/book", "/", "/profile"],
+                "specialist": ["/queue", "/", "/profile"],
+                "manager": ["/dashboard", "/records", "/", "/profile"],
+            }
+            return reorder(selected, order[role])
+
+        if layout_variant == "stream":
+            order = {
+                "client": ["/book", "/requests", "/", "/profile"],
+                "specialist": ["/queue", "/", "/profile"],
+                "manager": ["/records", "/dashboard", "/", "/profile"],
+            }
+            return reorder(selected, order[role])
+
+        if layout_variant == "minimal":
+            order = {
+                "client": ["/", "/book", "/profile"],
+                "specialist": ["/", "/queue"],
+                "manager": ["/", "/dashboard"],
+            }
+            return reorder(selected, order[role])
+
+        if layout_variant == "magazine":
+            order = {
+                "client": ["/", "/requests", "/book", "/profile"],
+                "specialist": ["/", "/profile", "/queue"],
+                "manager": ["/", "/records", "/dashboard", "/profile"],
+            }
+            return reorder(selected, order[role])
+
+        return selected
+
+    def _role_stats(self, role: str, records: list[dict[str, Any]], ui_variant: str) -> list[dict[str, str]]:
         counts = Counter(record["status"] for record in records)
+        if ui_variant == "editorial":
+            client_labels = ("Cases", "Pending")
+            specialist_labels = ("Intake", "In motion")
+            manager_labels = ("Closed", "Unassigned")
+        elif ui_variant == "atlas":
+            client_labels = ("Requests", "Open")
+            specialist_labels = ("Backlog", "Active")
+            manager_labels = ("Delivered", "Unowned")
+        elif ui_variant == "pulse":
+            client_labels = ("Flow", "Hot")
+            specialist_labels = ("Queue", "Running")
+            manager_labels = ("Done", "Unassigned")
+        else:
+            client_labels = ("Requests", "Awaiting response")
+            specialist_labels = ("New requests", "In review")
+            manager_labels = ("Completed", "Unassigned")
+
         if role == "client":
             return [
-                {"label": "Bookings", "value": str(len(records))},
-                {"label": "Awaiting response", "value": str(counts.get("new", 0) + counts.get("in_progress", 0))},
+                {"label": client_labels[0], "value": str(len(records))},
+                {"label": client_labels[1], "value": str(counts.get("new", 0) + counts.get("in_progress", 0))},
             ]
         if role == "specialist":
             return [
-                {"label": "New bookings", "value": str(counts.get("new", 0))},
-                {"label": "In review", "value": str(counts.get("in_progress", 0))},
+                {"label": specialist_labels[0], "value": str(counts.get("new", 0))},
+                {"label": specialist_labels[1], "value": str(counts.get("in_progress", 0))},
             ]
         return [
-            {"label": "Completed", "value": str(counts.get("completed", 0))},
-            {"label": "Unassigned", "value": str(sum(1 for record in records if record.get("owner") == "unassigned"))},
+            {"label": manager_labels[0], "value": str(counts.get("completed", 0))},
+            {"label": manager_labels[1], "value": str(sum(1 for record in records if record.get("owner") == "unassigned"))},
         ]
 
-    def _title_for_role(self, role: str, flow_label: str) -> str:
-        return {
-            "client": f"Book and track {flow_label}",
-            "specialist": f"Process {flow_label} requests",
-            "manager": f"Monitor {flow_label} operations",
-        }[role]
+    def _title_for_role(self, role: str, flow_label: str, ui_variant: str) -> str:
+        presets = {
+            "studio": {
+                "client": f"Plan and track {flow_label}",
+                "specialist": f"Execute {flow_label} workload",
+                "manager": f"Control {flow_label} pipeline",
+            },
+            "atlas": {
+                "client": f"{flow_label.title()} intake desk",
+                "specialist": f"{flow_label.title()} execution board",
+                "manager": f"{flow_label.title()} command view",
+            },
+            "pulse": {
+                "client": f"{flow_label.title()} live feed",
+                "specialist": f"{flow_label.title()} active queue",
+                "manager": f"{flow_label.title()} health monitor",
+            },
+            "editorial": {
+                "client": f"Your {flow_label} journal",
+                "specialist": f"{flow_label.title()} work journal",
+                "manager": f"{flow_label.title()} executive journal",
+            },
+        }
+        return presets.get(ui_variant, presets["studio"])[role]
 
-    def _role_body(self, role: str, flow_label: str) -> str:
-        return {
-            "client": f"Create a new {flow_label}, review status updates, and keep contact details current.",
-            "specialist": f"Claim incoming {flow_label} requests, review details, and move them through the workflow.",
-            "manager": f"See the whole {flow_label} pipeline, workload distribution, and completion status.",
-        }[role]
+    def _role_body(self, role: str, flow_label: str, ui_variant: str) -> str:
+        presets = {
+            "studio": {
+                "client": f"Create new {flow_label} entries, monitor progress, and keep core details accurate.",
+                "specialist": f"Claim incoming {flow_label} work items, execute processing, and progress lifecycle states.",
+                "manager": f"Observe the full {flow_label} pipeline, manage workload distribution, and resolve bottlenecks.",
+            },
+            "atlas": {
+                "client": f"Start {flow_label} cases with full context and follow each step through completion.",
+                "specialist": f"Prioritize queue items and process {flow_label} operations with clear ownership.",
+                "manager": f"Track throughput, find bottlenecks, and steer {flow_label} execution across teams.",
+            },
+            "pulse": {
+                "client": f"Create and track {flow_label} in a fast live workflow.",
+                "specialist": f"Process incoming {flow_label} tasks and keep momentum.",
+                "manager": f"Watch {flow_label} pulse, SLA pressure, and assignment load in real time.",
+            },
+            "editorial": {
+                "client": f"Capture requests, context, and progress notes for each {flow_label}.",
+                "specialist": f"Maintain a clear working narrative while processing {flow_label} records.",
+                "manager": f"Review the operational story of {flow_label} and intervene where needed.",
+            },
+        }
+        return presets.get(ui_variant, presets["studio"])[role]
 
     @staticmethod
-    def _action_label(action_id: str) -> str:
+    def _action_label(action_id: str, ui_variant: str, flow_label: str) -> str:
         labels = {
-            "client_open_form": "Open booking form",
-            "client_open_requests": "Open my bookings",
-            "client_submit_request": "Submit booking",
-            "client_open_request_detail": "Open booking details",
-            "client_open_form_inline": "Create another booking",
-            "client_success_to_requests": "View my bookings",
+            "client_open_form": "Create new request",
+            "client_open_requests": "Open my requests",
+            "client_submit_request": "Submit request",
+            "client_open_request_detail": "Open request details",
+            "client_open_form_inline": "Create another request",
+            "client_success_to_requests": "View my requests",
             "client_success_to_home": "Back to overview",
             "client_profile_save": "Save client profile",
-            "specialist_open_queue": "Open booking queue",
-            "specialist_claim_next": "Claim next booking",
-            "specialist_open_detail": "Open booking details",
+            "specialist_open_queue": "Open work queue",
+            "specialist_claim_next": "Claim next item",
+            "specialist_open_detail": "Open work item details",
             "specialist_mark_in_progress": "Start processing",
-            "specialist_complete_request": "Mark booking complete",
+            "specialist_complete_request": "Mark request complete",
             "specialist_profile_save": "Save specialist profile",
-            "manager_open_dashboard": "Open booking dashboard",
-            "manager_open_records": "Open all bookings",
+            "manager_open_dashboard": "Open operations dashboard",
+            "manager_open_records": "Open all records",
             "manager_rebalance": "Rebalance assignments",
-            "manager_refresh_records": "Refresh booking records",
+            "manager_refresh_records": "Refresh records",
             "manager_profile_save": "Save manager profile",
         }
+        if ui_variant == "atlas":
+            labels.update(
+                {
+                    "client_open_form": "Open intake",
+                    "client_open_requests": "Open pipeline",
+                    "specialist_open_queue": "Open backlog",
+                    "manager_open_dashboard": "Open insights",
+                }
+            )
+        if ui_variant == "editorial":
+            labels.update(
+                {
+                    "client_open_form": f"Write new {flow_label}",
+                    "client_open_requests": "Open history",
+                    "specialist_open_queue": "Open worklist",
+                    "manager_open_records": "Open audit trail",
+                }
+            )
+        if ui_variant == "pulse":
+            labels.update(
+                {
+                    "client_open_form": "Start now",
+                    "specialist_claim_next": "Claim next live",
+                    "manager_rebalance": "Balance live load",
+                }
+            )
         return labels.get(action_id, action_id.replace("_", " ").replace("api", "API").title())
 
     def _flow_label(self, prompt: str, entity: DomainEntity) -> str:
@@ -2191,10 +2670,15 @@ class GenerationService:
     def _grounded_spec_system_prompt(self) -> str:
         return (
             "You are generating a documentation-grounded multi-role mini-app specification. "
+            "Prioritize architectural depth, domain modeling, and end-to-end workflow integrity. "
+            "Allow creative variation in information architecture and product composition when multiple valid solutions exist. "
             "Use only information grounded in the supplied docs and prompt. "
             "Do not collapse the app into a single form if multi-role workflows are implied. "
+            "Require explicit state lifecycle, role handoffs, operational control flow, and recoverable error paths. "
             "Prefer explicit assumptions and canonical template defaults over blocking unknowns for ordinary implementation details. "
             "Only emit high-impact unknowns when generation truly cannot proceed without user clarification. "
+            "Avoid toy/demo framing and avoid repeating rigid template wording across runs. "
+            "Honor the provided creative_direction while preserving schema validity and business realism. "
             "Keep the output strictly valid against the schema."
         )
 
@@ -2206,6 +2690,7 @@ class GenerationService:
         preview_profile: PreviewProfile,
         template_revision_id: str,
         prompt_turn_id: str,
+        creative_direction: dict[str, Any],
     ) -> str:
         return json_dumps(
             {
@@ -2215,6 +2700,19 @@ class GenerationService:
                 "preview_profile": preview_profile.value,
                 "template_revision_id": template_revision_id,
                 "prompt_turn_id": prompt_turn_id,
+                "architecture_contract": [
+                    "Model a concrete business domain with realistic entities and statuses.",
+                    "Define clear role boundaries and cross-role handoff points.",
+                    "Specify complete role flows; screen count and depth are flexible.",
+                    "Include failure handling, validation rules, and operational monitoring expectations.",
+                    "Avoid generic placeholders and repeated template wording.",
+                ],
+                "creative_direction": creative_direction,
+                "variability_policy": [
+                    "Use role requirements as capability constraints, not layout constraints.",
+                    "You may pick any navigation and screen composition pattern that remains coherent.",
+                    "Do not mirror the same information hierarchy across all roles.",
+                ],
                 "docs": [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in doc_refs],
             }
         )
@@ -2223,15 +2721,116 @@ class GenerationService:
         return (
             "You are generating a quality-first AppIR for a multi-page, role-aware mini-app. "
             "Prefer explicit route groups, multiple screens per role, real navigation, and stateful actions. "
+            "Ensure architecture coherence: domain lifecycle, role transitions, actionable dashboards, and resilient error handling. "
+            "When possible, vary structure and composition between equally valid solutions instead of repeating one rigid pattern. "
+            "Do not emit shallow mirrored role screens; each role must have distinct operational value. "
+            "Honor the provided creative_direction and variability_policy while preserving schema validity. "
             "Keep the output strictly valid against the schema."
         )
 
-    def _app_ir_user_prompt(self, spec: GroundedSpecModel, scenario_graph: dict[str, Any]) -> str:
+    def _app_ir_user_prompt(self, spec: GroundedSpecModel, scenario_graph: dict[str, Any], creative_direction: dict[str, Any]) -> str:
         return json_dumps(
             {
                 "task": "Build AppIR",
                 "grounded_spec": spec.model_dump(mode="json"),
                 "scenario_graph": scenario_graph,
+                "creative_direction": creative_direction,
+                "delivery_contract": [
+                    "Generate role-differentiated flows with meaningful actions and state transitions.",
+                    "Include realistic list/detail/form/dashboard patterns where appropriate.",
+                    "Preserve traceability between prompt intent, routes, actions, and integrations.",
+                    "Avoid generic labels and placeholder-only screens.",
+                    "Do not force fixed route/screen patterns when alternative architectures are equally valid.",
+                ],
+            }
+        )
+
+    @staticmethod
+    def _app_ir_critique_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "should_repair": {"type": "boolean"},
+                "issues": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "string"},
+                            "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+                            "message": {"type": "string"},
+                            "scope": {"type": "string", "enum": ["global", "route", "screen", "action", "integration"]},
+                        },
+                        "required": ["code", "severity", "message", "scope"],
+                        "additionalProperties": False,
+                    },
+                },
+                "repair_instructions": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["summary", "should_repair", "issues", "repair_instructions"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _app_ir_critique_system_prompt() -> str:
+        return (
+            "You are a strict AppIR reviewer. "
+            "Evaluate the candidate IR for business completeness, role differentiation, navigation coherence, "
+            "action validity, and resilience states (loading/empty/error/success). "
+            "Return concise structured findings only."
+        )
+
+    def _app_ir_critique_user_prompt(
+        self,
+        spec: GroundedSpecModel,
+        scenario_graph: dict[str, Any],
+        ir: AppIRModel,
+        creative_direction: dict[str, Any],
+    ) -> str:
+        return json_dumps(
+            {
+                "task": "Critique AppIR",
+                "grounded_spec": spec.model_dump(mode="json"),
+                "scenario_graph": scenario_graph,
+                "candidate_ir": ir.model_dump(mode="json"),
+                "creative_direction": creative_direction,
+                "acceptance_policy": [
+                    "Roles must not be mirrored clones.",
+                    "Flows must be end-to-end and actionable.",
+                    "Critical/high issues imply should_repair=true.",
+                ],
+            }
+        )
+
+    @staticmethod
+    def _app_ir_repair_system_prompt() -> str:
+        return (
+            "You repair AppIR based on structured critique findings. "
+            "Keep valid parts, fix only what is needed, preserve coherence, and output strict schema-valid AppIR."
+        )
+
+    def _app_ir_repair_user_prompt(
+        self,
+        spec: GroundedSpecModel,
+        scenario_graph: dict[str, Any],
+        current_ir: AppIRModel,
+        critique: dict[str, Any],
+        creative_direction: dict[str, Any],
+    ) -> str:
+        return json_dumps(
+            {
+                "task": "Repair AppIR",
+                "grounded_spec": spec.model_dump(mode="json"),
+                "scenario_graph": scenario_graph,
+                "current_ir": current_ir.model_dump(mode="json"),
+                "critique": critique,
+                "creative_direction": creative_direction,
+                "repair_contract": [
+                    "Address critical/high issues first.",
+                    "Preserve existing valid routes/screens/actions where possible.",
+                    "Do not reduce role coverage.",
+                ],
             }
         )
 
@@ -2334,7 +2933,31 @@ class GenerationService:
     @staticmethod
     def _normalize_model_payload(payload: Any) -> Any:
         if isinstance(payload, dict):
-            normalized = {key: GenerationService._normalize_model_payload(value) for key, value in payload.items()}
+            def normalize_key(key: Any) -> Any:
+                if not isinstance(key, str):
+                    return key
+                candidate = key.strip().strip("`'\"")
+                candidate = re.sub(r"^[\(\[\{]+", "", candidate)
+                candidate = re.sub(r"[\)\]\}:;,]+$", "", candidate)
+                candidate = candidate.strip()
+                aliases = {
+                    "(trigger": "trigger",
+                    "trigger)": "trigger",
+                    ".trigger": "trigger",
+                }
+                candidate = aliases.get(candidate, candidate)
+                return candidate or key
+
+            normalized: dict[Any, Any] = {}
+            for raw_key, raw_value in payload.items():
+                fixed_key = normalize_key(raw_key)
+                fixed_value = GenerationService._normalize_model_payload(raw_value)
+                if fixed_key in normalized:
+                    existing = normalized[fixed_key]
+                    if existing not in (None, "", [], {}):
+                        continue
+                normalized[fixed_key] = fixed_value
+
             list_default_keys = {
                 "input_data",
                 "output_data",
@@ -2353,6 +2976,7 @@ class GenerationService:
                 "on_enter_actions",
                 "action_ids",
                 "routes",
+                "route_groups",
                 "screen_data_sources",
                 "role_action_groups",
                 "input_variable_ids",
@@ -2411,4 +3035,8 @@ class GenerationService:
             return normalized
         if isinstance(payload, list):
             return [GenerationService._normalize_model_payload(item) for item in payload]
+        if isinstance(payload, str):
+            normalized_scalar = payload.strip().lower()
+            if normalized_scalar == "implicit":
+                return "derived"
         return payload

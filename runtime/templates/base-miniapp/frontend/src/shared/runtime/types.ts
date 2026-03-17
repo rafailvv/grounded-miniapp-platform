@@ -99,6 +99,15 @@ export type RuntimeRoleManifest = {
     title: string;
     goal: string;
     generation_mode: string;
+    ui_variant?: string;
+    layout_variant?: string;
+    theme?: {
+      accent?: string;
+      accent_soft?: string;
+      surface?: string;
+      card?: string;
+      border?: string;
+    };
     route_count: number;
     screen_count: number;
   };

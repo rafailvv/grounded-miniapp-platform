@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { CSSProperties, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { persistRoleProfile } from '@/shared/profile/profileApi';
 import type { AppRole } from '@/shared/roles/role';
@@ -19,6 +19,8 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
   const [message, setMessage] = useState<string>('');
 
   const screen = manifest?.screens[screenId];
+  const uiVariant = manifest?.app.ui_variant ?? 'studio';
+  const layoutVariant = manifest?.app.layout_variant ?? 'stacked';
 
   const editableFields = useMemo(() => {
     if (!screen) return [];
@@ -55,6 +57,33 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
   if (!manifest || !screen) {
     return <div className={styles.page}>Runtime screen is not available.</div>;
   }
+
+  const variantClass =
+    uiVariant === 'atlas'
+      ? styles.variantAtlas
+      : uiVariant === 'pulse'
+        ? styles.variantPulse
+        : uiVariant === 'editorial'
+          ? styles.variantEditorial
+          : styles.variantStudio;
+  const layoutClass =
+    layoutVariant === 'dashboard'
+      ? styles.layoutDashboard
+      : layoutVariant === 'stream'
+        ? styles.layoutStream
+        : layoutVariant === 'minimal'
+          ? styles.layoutMinimal
+          : layoutVariant === 'magazine'
+            ? styles.layoutMagazine
+            : styles.layoutStacked;
+
+  const runtimeStyle: CSSProperties = {
+    ['--runtime-accent' as string]: manifest.app.theme?.accent ?? undefined,
+    ['--runtime-accent-soft' as string]: manifest.app.theme?.accent_soft ?? undefined,
+    ['--runtime-surface' as string]: manifest.app.theme?.surface ?? undefined,
+    ['--runtime-card' as string]: manifest.app.theme?.card ?? undefined,
+    ['--runtime-border' as string]: manifest.app.theme?.border ?? undefined,
+  };
 
   async function handleAction(action: RuntimeAction) {
     if (action.type === 'navigate' && action.target_path) {
@@ -198,7 +227,7 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
   }
 
   return (
-    <section className={styles.page}>
+    <section className={`${styles.page} ${variantClass} ${layoutClass}`} style={runtimeStyle}>
       <header className={styles.screenHeader}>
         <span className={styles.eyebrow}>
           {role} · {manifest.app.generation_mode}
@@ -212,7 +241,11 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
         </div>
       </header>
 
-      <nav className={styles.navBar}>
+      <nav
+        className={`${styles.navBar} ${uiVariant === 'editorial' ? styles.navBarEditorial : ''} ${
+          layoutVariant === 'stream' ? styles.navBarStream : ''
+        } ${layoutVariant === 'minimal' ? styles.navBarMinimal : ''}`}
+      >
         {manifest.navigation.map((item) => (
           <button
             key={item.path}
@@ -229,7 +262,11 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
 
       {message ? <div className={styles.message}>{message}</div> : null}
 
-      <div className={styles.actionBar}>
+      <div
+        className={`${styles.actionBar} ${uiVariant === 'atlas' || layoutVariant === 'dashboard' ? styles.actionBarStacked : ''} ${
+          layoutVariant === 'minimal' ? styles.actionBarMinimal : ''
+        }`}
+      >
         {screen.actions.map((action, index) => (
           <button
             key={action.action_id}

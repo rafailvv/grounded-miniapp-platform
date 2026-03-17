@@ -21,6 +21,8 @@ DEFAULT_RUNTIME_MANIFEST = {
         "title": "",
         "goal": "",
         "generation_mode": "basic",
+        "ui_variant": "studio",
+        "layout_variant": "stacked",
         "platform": "telegram_mini_app",
         "preview_profile": "telegram_mock",
         "route_count": 0,
@@ -290,6 +292,11 @@ def _records_for_role(role: AppRole, state: dict[str, Any]) -> list[dict[str, An
 def _hydrate_screen(role: AppRole, screen: dict[str, Any], state: dict[str, Any], metrics: dict[str, list[dict[str, str]]]) -> dict[str, Any]:
     hydrated = deepcopy(screen)
     records = _records_for_role(role, state)
+    sections = hydrated.get("sections")
+    if isinstance(sections, list) and sections:
+        hydrated["sections"] = [_hydrate_existing_section(role, section, records, state, metrics) for section in sections]
+        return hydrated
+
     kind = hydrated.get("kind")
     screen_id = hydrated.get("screen_id", "")
     if screen_id.endswith("home"):
@@ -367,4 +374,73 @@ def _hydrate_screen(role: AppRole, screen: dict[str, Any], state: dict[str, Any]
                 ],
             }
         ]
+    return hydrated
+
+
+def _hydrate_existing_section(
+    role: AppRole,
+    section: dict[str, Any],
+    records: list[dict[str, Any]],
+    state: dict[str, Any],
+    metrics: dict[str, list[dict[str, str]]],
+) -> dict[str, Any]:
+    hydrated = deepcopy(section)
+    section_type = hydrated.get("type")
+
+    if section_type == "stats":
+        hydrated["items"] = metrics[role]
+        return hydrated
+
+    if section_type == "list":
+        hydrated["items"] = [
+            {
+                "item_id": record["record_id"],
+                "title": record["title"],
+                "subtitle": record["summary"],
+                "status": record["status"],
+                "meta": record.get("priority"),
+            }
+            for record in records
+        ]
+        return hydrated
+
+    if section_type == "detail":
+        record = records[0] if records else None
+        if record:
+            hydrated["title"] = hydrated.get("title") or record.get("title")
+            hydrated["body"] = hydrated.get("body") or record.get("summary")
+            hydrated["fields"] = [
+                {"label": key.replace("_", " ").title(), "value": value}
+                for key, value in record.get("payload", {}).items()
+            ]
+        return hydrated
+
+    if section_type == "timeline":
+        record = records[0] if records else None
+        if record and not hydrated.get("items"):
+            hydrated["items"] = record.get("timeline", [])
+        return hydrated
+
+    if section_type == "form":
+        sample_payload = records[0]["payload"] if records else {}
+        fields = hydrated.get("fields", [])
+        hydrated["fields"] = [
+            {
+                **field,
+                "placeholder": field.get("placeholder") or (sample_payload.get(field.get("name", ""), "") if sample_payload else ""),
+            }
+            for field in fields
+        ]
+        return hydrated
+
+    if section_type == "profile":
+        profile = state["roles"][role]["profile"]
+        hydrated["fields"] = [
+            {"name": "first_name", "label": "First name", "value": profile.get("first_name", "")},
+            {"name": "last_name", "label": "Last name", "value": profile.get("last_name", "")},
+            {"name": "email", "label": "Email", "value": profile.get("email", "")},
+            {"name": "phone", "label": "Phone", "value": profile.get("phone", "")},
+        ]
+        return hydrated
+
     return hydrated

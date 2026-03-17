@@ -274,6 +274,7 @@ button:disabled {
 .workspace-item {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
   gap: 8px;
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -315,6 +316,9 @@ button:disabled {
   color: #a03728;
   border: 1px solid rgba(160, 55, 40, 0.2);
   box-shadow: none;
+  display: grid;
+  place-items: center;
+  align-self: center;
 }
 
 .workspace-search-empty {
