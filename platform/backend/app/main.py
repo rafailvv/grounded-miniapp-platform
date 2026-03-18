@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -20,7 +22,19 @@ from app.api import (
 from app.services.container import build_container
 
 
+def configure_logging() -> None:
+    level_name = os.getenv("PLATFORM_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        force=True,
+    )
+    logging.getLogger("httpx").setLevel(max(logging.WARNING, level))
+
+
 def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -> FastAPI:
+    configure_logging()
     app = FastAPI(
         title="Grounded Mini-App Platform",
         version="0.1.0",

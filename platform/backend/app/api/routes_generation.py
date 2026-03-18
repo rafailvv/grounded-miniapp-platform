@@ -23,7 +23,7 @@ def generate(
                 prompt=request.prompt,
                 intent=request.intent,
                 apply_strategy="staged_auto_apply",
-                target_role_scope=[],
+                target_role_scope=request.target_role_scope,
                 model_profile=request.model_profile,
                 target_platform=request.target_platform,
                 preview_profile=request.preview_profile,

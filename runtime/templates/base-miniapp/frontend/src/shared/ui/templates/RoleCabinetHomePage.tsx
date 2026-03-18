@@ -40,7 +40,7 @@ export function RoleCabinetHomePage({ role, featureText }: RoleCabinetHomePagePr
 
       <div className={styles.featureBlock}>
         <div className={styles.featureContent}>
-          <span className={styles.featureTitle}>{dashboard?.title ?? profile.roleLabel}</span>
+          {dashboard?.title ? <span className={styles.featureTitle}>{dashboard.title}</span> : null}
           <span className={styles.featureText}>{resolvedFeatureText}</span>
           {dashboard?.metrics?.length ? (
             <div className={styles.metricsGrid}>

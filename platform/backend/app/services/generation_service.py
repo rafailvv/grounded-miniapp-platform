@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from datetime import datetime, timezone
+import json
 import logging
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Callable
 
 from app.ai.openrouter_client import OpenRouterClient
 from app.models.app_ir import (
@@ -47,7 +49,19 @@ from app.models.artifacts import (
     ValidationIssue,
 )
 from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
-from app.models.domain import ChatTurnRecord, GenerateRequest, JobEvent, JobRecord, ValidationSnapshot, new_id, utc_now
+from app.models.domain import (
+    ChatTurnRecord,
+    DraftFileOperation,
+    GenerateRequest,
+    JobEvent,
+    JobRecord,
+    RunCheckResult,
+    RunIterationOperation,
+    RunIterationRecord,
+    ValidationSnapshot,
+    new_id,
+    utc_now,
+)
 from app.models.grounded_spec import (
     APIField,
     APIRequirement,
@@ -78,6 +92,22 @@ from app.validators.suite import ValidationSuite
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
+ROLE_COMPONENT_PREFIX = {
+    "client": "Client",
+    "specialist": "Specialist",
+    "manager": "Manager",
+}
+DESIGN_REFERENCE_FILES = (
+    "frontend/src/shared/ui/templates/RoleProfileEditorPage.tsx",
+    "frontend/src/shared/ui/templates/RoleProfileEditorPage.module.css",
+    "frontend/src/shared/ui/ProfileCabinetCard/ProfileCabinetCard.tsx",
+    "frontend/src/shared/ui/ProfileCabinetCard/ProfileCabinetCard.module.css",
+    "frontend/src/shared/ui/generated/GeneratedRoleScreen.module.css",
+)
+SHARED_GENERATED_FILES = (
+    "frontend/src/shared/generated/appChrome.tsx",
+    "frontend/src/shared/generated/appState.tsx",
+)
 logger = logging.getLogger(__name__)
 QUALITY_FIDELITY = {
     GenerationMode.QUALITY: "quality_app",
@@ -105,11 +135,12 @@ class GenerationService:
         self.validation_suite = validation_suite
         self.openrouter_client = openrouter_client
 
-    def generate(self, workspace_id: str, request: GenerateRequest) -> JobRecord:
+    def generate(self, workspace_id: str, request: GenerateRequest, *, should_stop: Callable[[], bool] | None = None) -> JobRecord:
         target_platform = self._target_platform(request.target_platform)
         preview_profile = self._preview_profile(request.preview_profile)
         generation_mode = self._generation_mode(request.generation_mode)
         workspace = self.workspace_service.get_workspace(workspace_id)
+        role_scope = [role for role in request.target_role_scope if role in ROLE_ORDER] or list(ROLE_ORDER)
         llm_config = self.openrouter_client.configuration()
 
         job = JobRecord(
@@ -126,6 +157,10 @@ class GenerationService:
             model_profile=request.model_profile,
             linked_run_id=request.linked_run_id,
         )
+        if request.linked_run_id:
+            draft_run_id = request.linked_run_id
+        else:
+            draft_run_id = job.job_id
         self._clear_trace(workspace_id)
         self._append_trace(
             workspace_id,
@@ -139,6 +174,9 @@ class GenerationService:
             },
         )
         self._append_event(job, "retrieval_started", "Grounded retrieval started.", {"stage": "retrieval"})
+        stopped = self._stop_if_requested(job, workspace_id, should_stop)
+        if stopped is not None:
+            return stopped
 
         missing_corpora = self.document_service.ensure_required_corpora(target_platform.value)
         if not workspace.template_cloned:
@@ -158,22 +196,22 @@ class GenerationService:
                 failure_reason="Required corpora or template clone is missing.",
             )
 
-        if generation_mode == GenerationMode.QUALITY and not self.openrouter_client.enabled:
+        if not self.openrouter_client.enabled:
             self._append_trace(
                 workspace_id,
                 "llm_blocked",
-                "Quality mode blocked because no LLM provider is configured.",
-                {"required_mode": generation_mode.value},
+                "Generation was blocked because no LLM provider is configured.",
+                {"required_mode": generation_mode.value, "pipeline": "llm_first_agentic_workspace"},
             )
             return self._block_with_messages(
                 job,
                 [
-                    "Quality mode requires OpenRouter configuration.",
-                    "Set OPENROUTER_API_KEY or choose balanced/basic mode explicitly.",
+                    "Agentic app generation now requires OpenRouter configuration for every run.",
+                    "Set OPENROUTER_API_KEY before creating or editing a mini-app workspace.",
                 ],
-                code="generation.quality_requires_llm",
+                code="generation.llm_required",
                 event_type="job_failed",
-                failure_reason="Quality mode blocked because OpenRouter is not configured.",
+                failure_reason="Generation requires OpenRouter because the workspace now uses an LLM-first page planning and code editing pipeline.",
             )
 
         doc_refs = self.document_service.retrieve(
@@ -187,6 +225,9 @@ class GenerationService:
             "Relevant documents and platform rules retrieved.",
             {"doc_refs": len(doc_refs)},
         )
+        stopped = self._stop_if_requested(job, workspace_id, should_stop)
+        if stopped is not None:
+            return stopped
 
         chat_turn = ChatTurnRecord(
             workspace_id=workspace_id,
@@ -203,6 +244,9 @@ class GenerationService:
             "Creative direction selected for this run.",
             creative_direction,
         )
+        stopped = self._stop_if_requested(job, workspace_id, should_stop)
+        if stopped is not None:
+            return stopped
 
         spec_result = self._resolve_grounded_spec(
             workspace_id=workspace_id,
@@ -260,6 +304,9 @@ class GenerationService:
             {"workspace_id": workspace_id, "assumptions": [item.model_dump(mode="json") for item in grounded_spec.assumptions]},
         )
         self._append_event(job, "spec_ready", "GroundedSpec created.")
+        stopped = self._stop_if_requested(job, workspace_id, should_stop)
+        if stopped is not None:
+            return stopped
         if spec_validation.blocking:
             self._block_job(job, spec_validation, grounded_spec.assumptions, failure_reason="GroundedSpec validation blocked generation.")
             self._append_trace(
@@ -271,154 +318,389 @@ class GenerationService:
             self._append_event(job, "spec_blocked", "GroundedSpec validation blocked generation.")
             return job
 
-        scenario_graph = self._build_scenario_graph(grounded_spec)
+        draft_source = self.workspace_service.prepare_draft(workspace_id, draft_run_id)
         self._append_trace(
             workspace_id,
-            "scenario_graph_built",
-            "Scenario graph expanded from grounded flows.",
+            "draft_prepared",
+            "Draft workspace prepared from the current revision.",
             {
-                "nodes": len(scenario_graph.get("nodes", [])),
-                "edges": len(scenario_graph.get("edges", [])),
-                "roles": scenario_graph.get("roles", []),
+                "draft_run_id": draft_run_id,
+                "role_scope": role_scope,
             },
         )
-        app_ir_result = self._resolve_app_ir(
-            spec=grounded_spec,
-            scenario_graph=scenario_graph,
-            generation_mode=generation_mode,
+        role_contract_result = self._resolve_role_contract(
+            prompt=request.prompt,
+            grounded_spec=grounded_spec,
+            doc_refs=doc_refs,
+            role_scope=role_scope,
+            intent=request.intent,
             creative_direction=creative_direction,
         )
-        if "error" in app_ir_result:
+        if "error" in role_contract_result:
             self._append_trace(
                 workspace_id,
-                "ir_failed",
-                "AppIR generation failed.",
-                {"error": app_ir_result["error"]},
+                "role_contract_failed",
+                "Role architecture analysis failed.",
+                {"error": role_contract_result["error"]},
             )
             return self._block_with_messages(
                 job,
-                [app_ir_result["error"]],
-                code="generation.ir.llm_failure",
+                [role_contract_result["error"]],
+                code="generation.role_contract.llm_failure",
                 event_type="validation_failed",
-                failure_reason=app_ir_result["error"],
+                failure_reason=role_contract_result["error"],
             )
-        app_ir: AppIRModel = app_ir_result["ir"]
-        if app_ir_result.get("warning"):
+        role_contract = role_contract_result["role_contract"]
+        role_contract_issues = self._role_contract_gate_issues(role_contract, role_scope, scope_mode=self._scope_mode(request.intent, request.prompt, role_scope))
+        if role_contract_issues:
             self._append_trace(
                 workspace_id,
-                "ir_fallback_used",
-                "AppIR switched to compiler fallback due to LLM/schema error.",
-                {"warning": app_ir_result["warning"]},
+                "role_contract_blocked",
+                "Role architecture analysis did not separate the selected roles clearly enough.",
+                {"issues": role_contract_issues},
             )
-        if app_ir_result.get("model"):
-            job.llm_model = str(app_ir_result["model"])
+            return self._block_with_messages(
+                job,
+                role_contract_issues,
+                code="generation.role_contract.invalid",
+                event_type="validation_failed",
+                failure_reason="Role architecture analysis did not produce sufficiently distinct responsibilities.",
+            )
         self._append_trace(
             workspace_id,
-            "ir_built",
-            "AppIR created.",
+            "role_contract_ready",
+            "Role responsibilities and boundaries were analyzed before page planning.",
             {
-                "screens": len(app_ir.screens),
-                "route_groups": len(app_ir.route_groups),
-                "integrations": len(app_ir.integrations),
-                "actions": sum(len(screen.actions) for screen in app_ir.screens),
-                "model": app_ir_result.get("model"),
-                "model_sequence": app_ir_result.get("model_sequence", []),
-                "refinement_rounds": app_ir_result.get("refinement_rounds", 0),
+                "model": role_contract_result.get("model"),
+                "roles": {
+                    role: role_contract["roles"][role]["responsibility"]
+                    for role in role_scope
+                    if role in role_contract["roles"]
+                },
             },
         )
+        stopped = self._stop_if_requested(job, workspace_id, should_stop)
+        if stopped is not None:
+            return stopped
+        plan_result = self._resolve_code_plan(
+            workspace_id=workspace_id,
+            prompt=request.prompt,
+            grounded_spec=grounded_spec,
+            doc_refs=doc_refs,
+            role_scope=role_scope,
+            role_contract=role_contract,
+            intent=request.intent,
+            generation_mode=generation_mode,
+            creative_direction=creative_direction,
+        )
+        if "error" in plan_result:
+            self._append_trace(
+                workspace_id,
+                "planning_failed",
+                "Code planning failed.",
+                {"error": plan_result["error"]},
+            )
+            return self._block_with_messages(
+                job,
+                [plan_result["error"]],
+                code="generation.plan.llm_failure",
+                event_type="validation_failed",
+                failure_reason=plan_result["error"],
+            )
+        if plan_result.get("model"):
+            job.llm_model = str(plan_result["model"])
+        self._append_trace(
+            workspace_id,
+            "planning_ready",
+            "Code plan was built from grounded spec and workspace context.",
+            {
+                "files_to_read": len(plan_result["files_to_read"]),
+                "target_files": len(plan_result["target_files"]),
+                "model": plan_result.get("model"),
+                "role_scope": role_scope,
+                "active_role_scope": plan_result.get("active_role_scope"),
+                "flow_mode": plan_result.get("flow_mode"),
+                "scope_mode": plan_result.get("scope_mode"),
+                "execution_plan": plan_result.get("execution_plan"),
+            },
+        )
+        self._append_event(job, "planning_ready", "Code plan created.")
+        stopped = self._stop_if_requested(job, workspace_id, should_stop)
+        if stopped is not None:
+            return stopped
+        plan_gate_issues = self._page_graph_gate_issues(
+            plan_result["page_graph"],
+            role_scope,
+            scope_mode=plan_result["scope_mode"],
+            require_multi_page=bool(plan_result["require_multi_page"]),
+        )
+        if plan_gate_issues:
+            self._append_trace(
+                workspace_id,
+                "planning_blocked",
+                "Code planning was blocked because it did not produce a real page-based app structure.",
+                {"issues": plan_gate_issues},
+            )
+            return self._block_with_messages(
+                job,
+                plan_gate_issues,
+                code="generation.plan.placeholder_output",
+                event_type="validation_failed",
+                failure_reason="Code planning did not produce a valid multi-page app structure.",
+            )
 
-        ir_validation = self.validation_suite.validate_app_ir(app_ir)
-        self._store_report(f"ir:{workspace_id}", app_ir.model_dump(mode="json"))
-        self._append_event(job, "ir_ready", "AppIR created.")
-        if ir_validation.blocking:
-            repaired_ir = self._build_app_ir(grounded_spec, scenario_graph, generation_mode)
-            repaired_validation = self.validation_suite.validate_app_ir(repaired_ir)
-            if repaired_validation.blocking:
-                self._block_job(job, ir_validation, grounded_spec.assumptions, failure_reason="AppIR validation blocked compilation.")
+        files_read: list[str] = []
+        file_contexts: dict[str, str] = {}
+        for file_path in plan_result["files_to_read"]:
+            try:
+                file_contexts[file_path] = self.workspace_service.read_file(workspace_id, file_path, run_id=draft_run_id)
+                files_read.append(file_path)
+            except FileNotFoundError:
+                continue
+
+        edit_result = self._resolve_code_edits(
+            prompt=request.prompt,
+            grounded_spec=grounded_spec,
+            role_scope=role_scope,
+            file_contexts=file_contexts,
+            target_files=plan_result["target_files"],
+            role_contract=role_contract,
+            page_graph=plan_result["page_graph"],
+            intent=request.intent,
+            scope_mode=plan_result["scope_mode"],
+            generation_mode=generation_mode,
+            creative_direction=creative_direction,
+        )
+        stopped = self._stop_if_requested(job, workspace_id, should_stop)
+        if stopped is not None:
+            return stopped
+        if "error" in edit_result:
+            self._append_trace(
+                workspace_id,
+                "editing_failed",
+                "Code editing failed.",
+                {"error": edit_result["error"]},
+            )
+            return self._block_with_messages(
+                job,
+                [edit_result["error"]],
+                code="generation.edit.llm_failure",
+                event_type="validation_failed",
+                failure_reason=edit_result["error"],
+            )
+        edit_gate_issues = self._edit_gate_issues(
+            plan_result["page_graph"],
+            edit_result["operations"],
+            role_scope,
+            scope_mode=plan_result["scope_mode"],
+            target_files=plan_result["target_files"],
+        )
+        if edit_gate_issues:
+            self._append_trace(
+                workspace_id,
+                "editing_blocked",
+                "Code editing was blocked because the draft still collapses into placeholder surfaces.",
+                {"issues": edit_gate_issues},
+            )
+            return self._block_with_messages(
+                job,
+                edit_gate_issues,
+                code="generation.edit.placeholder_output",
+                event_type="validation_failed",
+                failure_reason="Code editing did not produce the required page-based app structure.",
+            )
+        operations = [
+            DraftFileOperation(
+                file_path="artifacts/grounded_spec.json",
+                operation="replace",
+                content=json_dumps(grounded_spec.model_dump(mode="json")),
+                reason="Persist the grounded planning artifact inside the draft workspace.",
+            ),
+            *edit_result["operations"],
+        ]
+        self.workspace_service.apply_draft_operations(workspace_id, draft_run_id, operations)
+        latest_operations = list(operations)
+        all_operations = list(operations)
+        iterations: list[RunIterationRecord] = []
+        latest_check_results: list[RunCheckResult] = []
+        latest_candidate_diff = ""
+        latest_preview = self.preview_service.get(workspace_id)
+        latest_assistant_message = edit_result["assistant_message"]
+        repair_attempt_limit = self._repair_attempt_limit(generation_mode, request.intent)
+        repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, plan_result["target_files"])
+
+        self._store_report(
+            f"role_contract:{workspace_id}",
+            {"run_id": draft_run_id, "role_contract": role_contract},
+        )
+        self._store_report(
+            f"page_graph:{workspace_id}",
+            {"run_id": draft_run_id, "page_graph": plan_result["page_graph"]},
+        )
+        self._store_report(
+            f"execution_plan:{workspace_id}",
+            {"run_id": draft_run_id, "execution_plan": plan_result.get("execution_plan", {})},
+        )
+
+        for attempt in range(repair_attempt_limit + 1):
+            stopped = self._stop_if_requested(job, workspace_id, should_stop)
+            if stopped is not None:
+                return stopped
+            latest_candidate_diff = self.workspace_service.diff(workspace_id, run_id=draft_run_id)
+            if attempt == 0:
+                self._append_event(job, "iteration_ready", f"Prepared {len(latest_operations)} draft file operations.")
+            else:
+                self._append_event(job, "repair_iteration", f"Applied repair iteration {attempt}.")
+            self._append_event(job, "build_started", "Build validation started.")
+
+            build_issues = self._filter_non_blocking_build_issues(
+                self.validation_suite.validate_build(draft_source),
+                scope_mode=plan_result["scope_mode"],
+            )
+            preview_issue: ValidationIssue | None = None
+            if build_issues:
                 self._append_trace(
                     workspace_id,
-                    "ir_validation_failed",
-                    "AppIR validation blocked compilation.",
-                    {"issues": [issue.model_dump(mode="json") for issue in ir_validation.issues]},
+                    "build_failed",
+                    "Build validation failed for the draft workspace.",
+                    {"attempt": attempt, "issues": [issue.model_dump(mode="json") for issue in build_issues]},
                 )
-                self._append_event(job, "validation_failed", "AppIR validation blocked compilation.")
+            else:
+                self._append_trace(
+                    workspace_id,
+                    "build_succeeded",
+                    "Build validation completed successfully.",
+                    {"source_dir": str(draft_source), "attempt": attempt},
+                )
+                latest_preview = self.preview_service.rebuild(workspace_id, source_dir=draft_source, draft_run_id=draft_run_id)
+                self._append_trace(
+                    workspace_id,
+                    "preview_rebuilt",
+                    "Preview runtime rebuilt against the draft workspace.",
+                    {
+                        "attempt": attempt,
+                        "status": latest_preview.status,
+                        "runtime_mode": latest_preview.runtime_mode,
+                        "url": latest_preview.url,
+                        "logs": latest_preview.logs[-10:],
+                    },
+                )
+                if latest_preview.status == "error":
+                    preview_issue = self._preview_failure_issue(latest_preview)
+
+            latest_check_results = self._build_check_results(build_issues, preview_issue)
+            iteration = RunIterationRecord(
+                run_id=draft_run_id,
+                assistant_message=latest_assistant_message,
+                files_read=files_read if attempt == 0 else sorted(repair_contexts.keys()),
+                operations=[
+                    RunIterationOperation(
+                        file_path=operation.file_path,
+                        operation=operation.operation,
+                        reason=operation.reason,
+                    )
+                    for operation in latest_operations
+                ],
+                check_results=latest_check_results,
+                diff_summary=self._diff_summary(latest_candidate_diff),
+                role_scope=role_scope,
+            )
+            iterations.append(iteration)
+            self._store_report(
+                f"iterations:{workspace_id}",
+                {"run_id": draft_run_id, "items": [item.model_dump(mode="json") for item in iterations]},
+            )
+            self._store_report(f"candidate_diff:{workspace_id}", {"run_id": draft_run_id, "diff": latest_candidate_diff})
+            self._store_report(
+                f"check_results:{workspace_id}",
+                {"run_id": draft_run_id, "items": [item.model_dump(mode="json") for item in latest_check_results]},
+            )
+
+            if not build_issues and (preview_issue is None or self._is_non_blocking_preview_issue(preview_issue)):
+                break
+
+            if attempt >= repair_attempt_limit:
+                final_issues = [issue.model_dump(mode="json") for issue in build_issues]
+                if preview_issue is not None:
+                    final_issues.append(preview_issue.model_dump(mode="json"))
+                job.status = "failed"
+                job.failure_reason = (
+                    "Build validation failed after automatic repair attempts."
+                    if build_issues
+                    else "Preview rebuild failed after automatic repair attempts."
+                )
+                job.validation_snapshot = ValidationSnapshot(
+                    grounded_spec_valid=True,
+                    app_ir_valid=True,
+                    build_valid=not bool(build_issues),
+                    blocking=True,
+                    issues=final_issues,
+                )
+                self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
+                self._append_event(job, "job_failed", job.failure_reason)
                 return job
-            app_ir = repaired_ir
-            ir_validation = repaired_validation
-            self._store_report(f"ir:{workspace_id}", app_ir.model_dump(mode="json"))
-            self._append_event(job, "repair_iteration", "AppIR validation failed; switched to deterministic compiler IR.")
-            self._append_trace(
-                workspace_id,
-                "ir_repaired",
-                "Blocking AppIR issues were repaired via deterministic compiler IR.",
-                {"strategy": "fallback_compiler_ir"},
-            )
 
-        artifact_plan = self._build_artifact_plan(workspace_id, grounded_spec, app_ir, generation_mode)
-        self._store_report(f"artifact_plan:{workspace_id}", artifact_plan.model_dump(mode="json"))
-        self._append_event(job, "artifact_plan_ready", f"{len(artifact_plan.operations)} patch operations planned.")
-        self._append_trace(
-            workspace_id,
-            "artifact_plan_built",
-            "Artifact plan prepared for template patching.",
-            {
-                "operations": len(artifact_plan.operations),
-                "targets": [operation.file_path for operation in artifact_plan.operations[:12]],
-            },
-        )
-        self.patch_service.apply(workspace_id=workspace_id, operations=artifact_plan.operations)
-        self._append_event(job, "patch_applied", "Artifact plan applied to canonical template.")
-        self._append_trace(
-            workspace_id,
-            "patch_applied",
-            "Template workspace updated with generated artifacts.",
-            {"revision_id": self.workspace_service.get_workspace(workspace_id).current_revision_id},
-        )
-        self._append_event(job, "build_started", "Build validation started.")
-
-        build_issues = self.validation_suite.validate_build(self.workspace_service.source_dir(workspace_id))
-        if build_issues:
-            job.status = "failed"
-            job.failure_reason = "Build validation failed after patch application."
-            job.validation_snapshot = ValidationSnapshot(
-                grounded_spec_valid=True,
-                app_ir_valid=True,
-                build_valid=False,
-                blocking=True,
-                issues=[issue.model_dump(mode="json") for issue in build_issues],
+            repair_result = self._repair_draft_after_failure(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                prompt=request.prompt,
+                grounded_spec=grounded_spec,
+                role_scope=role_scope,
+                role_contract=role_contract,
+                page_graph=plan_result["page_graph"],
+                scope_mode=plan_result["scope_mode"],
+                target_files=plan_result["target_files"],
+                file_contexts=repair_contexts,
+                build_issues=build_issues,
+                preview_issue=preview_issue,
+                preview_logs=latest_preview.logs if preview_issue is not None else [],
+                attempt=attempt + 1,
             )
-            self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
-            self._append_trace(
-                workspace_id,
-                "build_failed",
-                "Build validation failed after patch application.",
-                {"issues": [issue.model_dump(mode="json") for issue in build_issues]},
-            )
-            self._append_event(job, "job_failed", job.failure_reason)
-            return job
-        self._append_trace(
-            workspace_id,
-            "build_succeeded",
-            "Build validation completed successfully.",
-            {"source_dir": str(self.workspace_service.source_dir(workspace_id))},
-        )
+            if "error" in repair_result:
+                issues = [issue.model_dump(mode="json") for issue in build_issues]
+                if preview_issue is not None:
+                    issues.append(preview_issue.model_dump(mode="json"))
+                issues.append(
+                    ValidationIssue(
+                        code="repair.generation_failed",
+                        message=str(repair_result["error"]),
+                        severity="high",
+                        location="repair",
+                        blocking=True,
+                    ).model_dump(mode="json")
+                )
+                job.status = "failed"
+                job.failure_reason = str(repair_result["error"])
+                job.validation_snapshot = ValidationSnapshot(
+                    grounded_spec_valid=True,
+                    app_ir_valid=True,
+                    build_valid=not bool(build_issues),
+                    blocking=True,
+                    issues=issues,
+                )
+                self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
+                self._append_event(job, "job_failed", job.failure_reason)
+                return job
 
-        traceability = self._build_traceability_report(workspace_id, app_ir)
+            latest_operations = repair_result["operations"]
+            latest_assistant_message = repair_result["assistant_message"] or latest_assistant_message
+            all_operations.extend(latest_operations)
+            self.workspace_service.apply_draft_operations(workspace_id, draft_run_id, latest_operations)
+            repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, plan_result["target_files"])
+            stopped = self._stop_if_requested(job, workspace_id, should_stop)
+            if stopped is not None:
+                return stopped
+
+        traceability = self._build_agent_traceability_report(workspace_id, grounded_spec, all_operations)
         self._store_report(f"traceability:{workspace_id}", traceability.model_dump(mode="json"))
-        preview = self.preview_service.rebuild(workspace_id)
-        self._append_trace(
-            workspace_id,
-            "preview_rebuilt",
-            "Preview runtime rebuilt and refreshed.",
-            {
-                "status": preview.status,
-                "runtime_mode": preview.runtime_mode,
-                "url": preview.url,
-                "logs": preview.logs[-10:],
-            },
-        )
 
-        summary = self._build_summary(grounded_spec, app_ir, artifact_plan, generation_mode)
+        summary = self._build_agent_summary(
+            grounded_spec=grounded_spec,
+            role_scope=role_scope,
+            operations=all_operations,
+            generation_mode=generation_mode,
+            assistant_message=latest_assistant_message,
+        )
         assistant_turn = ChatTurnRecord(
             workspace_id=workspace_id,
             role="assistant",
@@ -441,16 +723,21 @@ class GenerationService:
             blocking=False,
             issues=[],
         )
-        job.compile_summary = self._compile_summary(app_ir)
+        job.compile_summary = self._compile_code_summary(all_operations, role_scope)
         job.artifacts = {
-            "preview_url": preview.url or "",
+            "preview_url": latest_preview.url or "",
             "grounded_spec": "reports/spec",
-            "app_ir": "reports/ir",
             "traceability": "reports/traceability",
+            "candidate_diff": "reports/candidate_diff",
+            "iterations": "reports/iterations",
+            "check_results": "reports/check_results",
+            "role_contract": "reports/role_contract",
+            "page_graph": "reports/page_graph",
             "fidelity": job.fidelity,
         }
         self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
         self._append_event(job, "preview_ready", "Preview is ready.")
+        self._append_event(job, "draft_ready", "Draft is ready for review.")
         self._append_event(job, "job_completed", "Generation completed successfully.")
         self._append_trace(
             workspace_id,
@@ -494,6 +781,1469 @@ class GenerationService:
         jobs.sort(key=lambda item: item.created_at)
         return jobs[-1]
 
+    def _resolve_role_contract(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        doc_refs: list[Any],
+        role_scope: list[str],
+        intent: str,
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            payload = self._generate_structured_with_retry(
+                role="code_plan",
+                schema_name="role_contract_v1",
+                schema=self._role_contract_schema(),
+                system_prompt=self._role_contract_system_prompt(),
+                user_prompt=self._role_contract_user_prompt(
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    doc_refs=doc_refs,
+                    role_scope=role_scope,
+                    intent=intent,
+                    creative_direction=creative_direction,
+                ),
+            )
+            normalized = self._normalize_model_payload(payload["payload"])
+            role_contract = self._normalize_role_contract(normalized, role_scope)
+            return {"role_contract": role_contract, "model": payload["model"]}
+        except Exception as exc:
+            return {"error": f"Role architecture analysis failed: {exc}"}
+
+    def _resolve_code_plan(
+        self,
+        *,
+        workspace_id: str,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        doc_refs: list[Any],
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        intent: str,
+        generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        del generation_mode
+        scope_mode = self._scope_mode(intent, prompt, role_scope)
+        require_multi_page = self._requires_multi_page(prompt, grounded_spec, role_scope, intent)
+        try:
+            payload = self._generate_structured_with_retry(
+                role="code_plan",
+                schema_name="page_graph_v2",
+                schema=self._code_plan_schema(),
+                system_prompt=self._code_plan_system_prompt(),
+                user_prompt=self._code_plan_user_prompt(
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    doc_refs=doc_refs,
+                    role_scope=role_scope,
+                    role_contract=role_contract,
+                    scope_mode=scope_mode,
+                    require_multi_page=require_multi_page,
+                    workspace_tree=self.workspace_service.file_tree(workspace_id),
+                    creative_direction=creative_direction,
+                ),
+            )
+            normalized = self._normalize_model_payload(payload["payload"])
+            planned = self._normalize_page_plan(
+                normalized,
+                role_scope=role_scope,
+                scope_mode=scope_mode,
+                require_multi_page=require_multi_page,
+                workspace_tree=self.workspace_service.file_tree(workspace_id),
+            )
+            planned["model"] = payload["model"]
+            return planned
+        except Exception as exc:
+            return {"error": f"Page graph planning failed: {exc}"}
+
+    def _resolve_code_edits(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        file_contexts: dict[str, str],
+        target_files: list[str],
+        role_contract: dict[str, Any],
+        page_graph: dict[str, Any],
+        intent: str,
+        scope_mode: str,
+        generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        del generation_mode
+        target_set = set(target_files)
+        page_operations: list[DraftFileOperation] = []
+        page_messages: list[str] = []
+        generated_page_sources: dict[str, str] = {}
+        generated_backend_sources: dict[str, str] = {}
+        selected_pages = self._selected_pages_for_edit(page_graph, target_set)
+
+        if len(selected_pages) <= 1:
+            ordered_page_results = [
+                self._resolve_page_file_edit(
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    role=role,
+                    page=page,
+                    page_graph=page_graph,
+                    role_contract=role_contract,
+                    scope_mode=scope_mode,
+                    intent=intent,
+                    file_contexts=file_contexts,
+                    creative_direction=creative_direction,
+                )
+                for role, page in selected_pages
+            ]
+        else:
+            ordered_page_results = asyncio.run(
+                self._resolve_page_file_edits_async(
+                    selected_pages=selected_pages,
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    page_graph=page_graph,
+                    role_contract=role_contract,
+                    scope_mode=scope_mode,
+                    intent=intent,
+                    file_contexts=file_contexts,
+                    creative_direction=creative_direction,
+                )
+            )
+
+        for page_result in ordered_page_results:
+            assert page_result is not None
+            if "error" in page_result:
+                return page_result
+            operation = page_result["operation"]
+            page_operations.append(operation)
+            if operation.content is not None:
+                generated_page_sources[operation.file_path] = operation.content
+            page_messages.append(page_result["assistant_message"])
+
+        backend_targets = self._backend_target_files(page_graph, target_set)
+        backend_result = self._resolve_composition_edit(
+            prompt=prompt,
+            grounded_spec=grounded_spec,
+            role_scope=role_scope,
+            role_contract=role_contract,
+            page_graph=page_graph,
+            scope_mode=scope_mode,
+            intent=intent,
+            stage_name="backend",
+            target_files=backend_targets,
+            file_contexts=file_contexts,
+            generated_page_sources=generated_page_sources,
+            generated_support_sources={},
+            creative_direction=creative_direction,
+        )
+        if "error" in backend_result:
+            return backend_result
+        for operation in backend_result["operations"]:
+            if operation.content is not None:
+                generated_backend_sources[operation.file_path] = operation.content
+
+        frontend_targets = self._frontend_target_files(page_graph, target_set)
+        frontend_result = self._resolve_composition_edit(
+            prompt=prompt,
+            grounded_spec=grounded_spec,
+            role_scope=role_scope,
+            role_contract=role_contract,
+            page_graph=page_graph,
+            scope_mode=scope_mode,
+            intent=intent,
+            stage_name="frontend",
+            target_files=frontend_targets,
+            file_contexts=file_contexts,
+            generated_page_sources=generated_page_sources,
+            generated_support_sources=generated_backend_sources,
+            creative_direction=creative_direction,
+        )
+        if "error" in frontend_result:
+            return frontend_result
+
+        operations = self._dedupe_operations(
+            [
+                DraftFileOperation(
+                    file_path="artifacts/generated_app_graph.json",
+                    operation="replace",
+                    content=json_dumps(page_graph),
+                    reason="Persist the LLM-generated page graph for validation, preview, and run artifacts.",
+                ),
+                *page_operations,
+                *backend_result["operations"],
+                *frontend_result["operations"],
+            ]
+        )
+        assistant_parts = [message for message in page_messages if message]
+        if backend_result["assistant_message"]:
+            assistant_parts.append(backend_result["assistant_message"])
+        if frontend_result["assistant_message"]:
+            assistant_parts.append(frontend_result["assistant_message"])
+        assistant_message = " ".join(assistant_parts).strip() or (
+            f"Generated {len(page_operations)} page files and composed backend then frontend wiring for a {scope_mode} run."
+        )
+        return {"assistant_message": assistant_message, "operations": operations}
+
+    @staticmethod
+    def _normalize_path_list(value: Any, fallback: list[str] | None = None) -> list[str]:
+        if not isinstance(value, list):
+            return list(fallback or [])
+        normalized: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            candidate = item.strip().lstrip("/")
+            if not candidate or ".." in candidate:
+                continue
+            normalized.append(candidate)
+        return list(dict.fromkeys(normalized))
+
+    @staticmethod
+    def _normalize_string_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        values: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            candidate = item.strip()
+            if candidate:
+                values.append(candidate)
+        return list(dict.fromkeys(values))
+
+    def _normalize_role_contract(self, payload: dict[str, Any], role_scope: list[str]) -> dict[str, Any]:
+        roles_raw = payload.get("roles")
+        if not isinstance(roles_raw, list):
+            raise ValueError("Role contract is missing the roles array.")
+        roles: dict[str, dict[str, Any]] = {}
+        for item in roles_raw:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            if role not in role_scope:
+                continue
+            roles[role] = {
+                "role": role,
+                "responsibility": str(item.get("responsibility") or "").strip(),
+                "entry_goal": str(item.get("entry_goal") or "").strip(),
+                "primary_jobs": self._normalize_string_list(item.get("primary_jobs")),
+                "key_entities": self._normalize_string_list(item.get("key_entities")),
+                "ui_style_notes": self._normalize_string_list(item.get("ui_style_notes")),
+                "success_states": self._normalize_string_list(item.get("success_states")),
+                "must_differ_from": [
+                    value for value in self._normalize_string_list(item.get("must_differ_from")) if value in ROLE_ORDER and value != role
+                ],
+            }
+        return {
+            "app_title": str(payload.get("app_title") or "").strip(),
+            "app_summary": str(payload.get("app_summary") or "").strip(),
+            "shared_entities": self._normalize_string_list(payload.get("shared_entities")),
+            "shared_logic": self._normalize_string_list(payload.get("shared_logic")),
+            "roles": roles,
+        }
+
+    def _normalize_page_plan(
+        self,
+        payload: dict[str, Any],
+        *,
+        role_scope: list[str],
+        scope_mode: str,
+        require_multi_page: bool,
+        workspace_tree: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        raw_graph = payload.get("page_graph")
+        if not isinstance(raw_graph, dict):
+            raise ValueError("Page graph payload is missing.")
+
+        raw_roles = raw_graph.get("roles")
+        roles_source: dict[str, dict[str, Any]] = {}
+        if isinstance(raw_roles, list):
+            for item in raw_roles:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").strip().lower()
+                if role in role_scope:
+                    roles_source[role] = item
+        elif isinstance(raw_roles, dict):
+            for role, item in raw_roles.items():
+                if role in role_scope and isinstance(item, dict):
+                    roles_source[role] = item
+
+        shared_files = self._normalize_path_list(raw_graph.get("shared_files") or payload.get("shared_files"), list(SHARED_GENERATED_FILES))
+        backend_targets = self._normalize_path_list(raw_graph.get("backend_targets") or payload.get("backend_targets"), [])
+        roles: dict[str, dict[str, Any]] = {}
+        graph_page_targets: list[str] = []
+
+        for role in role_scope:
+            role_payload = roles_source.get(role)
+            if not role_payload:
+                raise ValueError(f"Page graph is missing the {role} role.")
+            pages_raw = role_payload.get("pages")
+            if not isinstance(pages_raw, list) or not pages_raw:
+                raise ValueError(f"Page graph is missing page definitions for {role}.")
+            pages = [self._normalize_page_definition(role, page, index) for index, page in enumerate(pages_raw)]
+            route_candidates = self._normalize_path_list([role_payload.get("routes_file")], [])
+            routes_file = route_candidates[0] if route_candidates else self._default_routes_file(role)
+            roles[role] = {
+                "entry_path": str(role_payload.get("entry_path") or "/").strip() or "/",
+                "landing_page_id": str(role_payload.get("landing_page_id") or pages[0]["page_id"]).strip() or pages[0]["page_id"],
+                "routes_file": routes_file,
+                "pages": pages,
+            }
+            graph_page_targets.extend(page["file_path"] for page in pages)
+
+        computed_targets = list(
+            dict.fromkeys(
+                [
+                    *shared_files,
+                    *backend_targets,
+                    *(role_payload["routes_file"] for role_payload in roles.values()),
+                    *graph_page_targets,
+                ]
+            )
+        )
+        raw_target_files = self._normalize_path_list(payload.get("target_files"), [])
+        if scope_mode == "minimal_patch" and raw_target_files:
+            target_files = raw_target_files
+        else:
+            target_files = list(dict.fromkeys([*raw_target_files, *computed_targets]))
+
+        raw_files_to_read = self._normalize_path_list(payload.get("files_to_read"), [])
+        files_to_read = self._collect_files_to_read(raw_files_to_read, target_files, workspace_tree)
+        flow_mode = str(raw_graph.get("flow_mode") or payload.get("flow_mode") or ("multi_page" if require_multi_page else "single_page"))
+        execution_plan = self._build_execution_plan(
+            role_scope=role_scope,
+            roles=roles,
+            shared_files=shared_files,
+            backend_targets=backend_targets,
+            target_files=target_files,
+        )
+
+        return {
+            "summary": str(payload.get("summary") or raw_graph.get("summary") or "").strip(),
+            "flow_mode": flow_mode,
+            "files_to_read": files_to_read,
+            "target_files": target_files,
+            "shared_files": shared_files,
+            "backend_targets": backend_targets,
+            "active_role_scope": execution_plan["active_role_scope"],
+            "execution_plan": execution_plan,
+            "page_graph": {
+                "app_title": str(raw_graph.get("app_title") or "").strip(),
+                "summary": str(raw_graph.get("summary") or payload.get("summary") or "").strip(),
+                "flow_mode": flow_mode,
+                "scope_mode": scope_mode,
+                "role_scope": role_scope,
+                "shared_files": shared_files,
+                "backend_targets": backend_targets,
+                "roles": roles,
+            },
+            "scope_mode": scope_mode,
+            "require_multi_page": require_multi_page,
+        }
+
+    def _normalize_page_definition(self, role: str, payload: Any, index: int) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError(f"Page definition #{index + 1} for {role} is invalid.")
+        component_name = self._component_name(role, payload, index)
+        route_path = str(payload.get("route_path") or "").strip() or ("/" if index == 0 else f"/page-{index + 1}")
+        if not route_path.startswith("/"):
+            route_path = f"/{route_path}"
+        file_path_candidates = self._normalize_path_list([payload.get("file_path")], [])
+        return {
+            "page_id": str(payload.get("page_id") or f"{role}_{index + 1}").strip() or f"{role}_{index + 1}",
+            "route_path": route_path,
+            "navigation_label": str(payload.get("navigation_label") or payload.get("title") or component_name).strip(),
+            "component_name": component_name,
+            "file_path": file_path_candidates[0] if file_path_candidates else self._default_page_file(role, component_name),
+            "title": str(payload.get("title") or component_name).strip(),
+            "description": str(payload.get("description") or payload.get("purpose") or "").strip(),
+            "purpose": str(payload.get("purpose") or payload.get("description") or "").strip(),
+            "page_kind": str(payload.get("page_kind") or "workspace").strip(),
+            "primary_actions": self._normalize_string_list(payload.get("primary_actions")),
+            "data_dependencies": self._normalize_string_list(payload.get("data_dependencies")),
+            "loading_state": str(payload.get("loading_state") or "").strip(),
+            "empty_state": str(payload.get("empty_state") or "").strip(),
+            "error_state": str(payload.get("error_state") or "").strip(),
+        }
+
+    @staticmethod
+    def _default_routes_file(role: str) -> str:
+        return f"frontend/src/roles/{role}/{ROLE_COMPONENT_PREFIX[role]}Routes.tsx"
+
+    @staticmethod
+    def _default_page_file(role: str, component_name: str) -> str:
+        return f"frontend/src/roles/{role}/pages/generated/{component_name}.tsx"
+
+    def _component_name(self, role: str, payload: dict[str, Any], index: int) -> str:
+        raw_value = str(payload.get("component_name") or payload.get("title") or payload.get("page_id") or f"{role}_page_{index + 1}").strip()
+        cleaned = re.sub(r"[^0-9A-Za-z]+", " ", raw_value)
+        pascal = "".join(part[:1].upper() + part[1:] for part in cleaned.split() if part)
+        prefix = ROLE_COMPONENT_PREFIX[role]
+        if not pascal:
+            return f"{prefix}GeneratedPage{index + 1}"
+        if not pascal.startswith(prefix):
+            pascal = f"{prefix}{pascal}"
+        if not pascal.endswith("Page"):
+            pascal = f"{pascal}Page"
+        return pascal
+
+    @staticmethod
+    def _build_execution_plan(
+        *,
+        role_scope: list[str],
+        roles: dict[str, dict[str, Any]],
+        shared_files: list[str],
+        backend_targets: list[str],
+        target_files: list[str],
+    ) -> dict[str, Any]:
+        target_set = set(target_files)
+        role_steps: list[dict[str, Any]] = []
+        active_role_scope: list[str] = []
+        for role in role_scope:
+            pages = roles.get(role, {}).get("pages") or []
+            selected_files = [
+                str(page.get("file_path"))
+                for page in pages
+                if isinstance(page, dict) and isinstance(page.get("file_path"), str) and page.get("file_path") in target_set
+            ]
+            routes_file = roles.get(role, {}).get("routes_file")
+            if isinstance(routes_file, str) and routes_file in target_set:
+                selected_files.append(routes_file)
+            selected_files = list(dict.fromkeys(selected_files))
+            if selected_files:
+                active_role_scope.append(role)
+            role_steps.append(
+                {
+                    "role": role,
+                    "status": "complete" if selected_files else "complete",
+                    "target_files": selected_files,
+                    "skipped": not bool(selected_files),
+                }
+            )
+
+        backend_files = [path for path in backend_targets if path in target_set]
+        frontend_files = [
+            path
+            for path in list(dict.fromkeys(shared_files))
+            if path in target_set and path not in backend_files
+        ]
+        return {
+            "role_steps": role_steps,
+            "backend": {
+                "status": "complete" if not backend_files else "pending",
+                "target_files": backend_files,
+                "skipped": not bool(backend_files),
+            },
+            "frontend": {
+                "status": "complete" if not frontend_files else "pending",
+                "target_files": frontend_files,
+                "skipped": not bool(frontend_files),
+            },
+            "active_role_scope": active_role_scope,
+        }
+
+    def _collect_files_to_read(
+        self,
+        files_to_read: list[str],
+        target_files: list[str],
+        workspace_tree: list[dict[str, str]],
+    ) -> list[str]:
+        existing_files = {
+            str(item.get("path"))
+            for item in workspace_tree
+            if isinstance(item, dict) and item.get("type") == "file" and isinstance(item.get("path"), str)
+        }
+        ordered = list(
+            dict.fromkeys(
+                [
+                    *[path for path in DESIGN_REFERENCE_FILES if path in existing_files],
+                    *files_to_read,
+                    *[path for path in target_files if path in existing_files],
+                ]
+            )
+        )
+        return ordered
+
+    @staticmethod
+    def _page_edit_parallelism(*, scope_mode: str) -> int:
+        default = "2" if scope_mode == "minimal_patch" else "4"
+        configured = max(1, int(os.getenv("PAGE_EDIT_MAX_PARALLELISM", default)))
+        return configured
+
+    async def _resolve_page_file_edits_async(
+        self,
+        *,
+        selected_pages: list[tuple[str, dict[str, Any]]],
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        page_graph: dict[str, Any],
+        role_contract: dict[str, Any],
+        scope_mode: str,
+        intent: str,
+        file_contexts: dict[str, str],
+        creative_direction: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        semaphore = asyncio.Semaphore(min(self._page_edit_parallelism(scope_mode=scope_mode), len(selected_pages)))
+
+        async def run_one(role: str, page: dict[str, Any]) -> dict[str, Any]:
+            async with semaphore:
+                return await asyncio.to_thread(
+                    self._resolve_page_file_edit,
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    role=role,
+                    page=page,
+                    page_graph=page_graph,
+                    role_contract=role_contract,
+                    scope_mode=scope_mode,
+                    intent=intent,
+                    file_contexts=file_contexts,
+                    creative_direction=creative_direction,
+                )
+
+        tasks = [run_one(role, page) for role, page in selected_pages]
+        return list(await asyncio.gather(*tasks))
+
+    @staticmethod
+    def _scope_mode(intent: str, prompt: str, role_scope: list[str]) -> str:
+        lowered = prompt.lower()
+        if GenerationService._looks_like_fix_request(lowered):
+            return "minimal_patch"
+        if intent in {"edit", "refine", "role_only_change"}:
+            return "minimal_patch"
+        if any(marker in lowered for marker in ("only ", "just ", "точечно", "только ", "without touching", "do not touch anything else")):
+            return "minimal_patch"
+        if len(role_scope) == 1 and any(marker in lowered for marker in ("change", "update", "fix", "refine", "polish")):
+            return "minimal_patch"
+        return "app_surface_build"
+
+    @staticmethod
+    def _requires_multi_page(prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str], intent: str) -> bool:
+        if intent == "create":
+            return True
+        lowered = prompt.lower()
+        if GenerationService._looks_like_fix_request(lowered):
+            return False
+        if intent in {"edit", "refine", "role_only_change"}:
+            return any(
+                marker in lowered
+                for marker in (
+                    "new page",
+                    "new pages",
+                    "add page",
+                    "add pages",
+                    "multi-page",
+                    "catalog",
+                    "checkout",
+                    "dashboard",
+                    "workflow",
+                    "workspace",
+                )
+            )
+        if len(role_scope) > 1:
+            return True
+        if len(grounded_spec.user_flows) > 1 or len(grounded_spec.domain_entities) > 1:
+            return True
+        multi_markers = (
+            "page",
+            "pages",
+            "browse",
+            "detail",
+            "cart",
+            "checkout",
+            "track",
+            "queue",
+            "dashboard",
+            "management",
+            "workspace",
+            "catalog",
+        )
+        return any(marker in lowered for marker in multi_markers)
+
+    @staticmethod
+    def _looks_like_fix_request(prompt: str) -> bool:
+        fix_markers = (
+            "fix",
+            "bug",
+            "error",
+            "failed",
+            "failure",
+            "exception",
+            "traceback",
+            "stacktrace",
+            "stack trace",
+            "build failed",
+            "preview failed",
+            "docker",
+            "npm run build",
+            "exit code",
+            "исправ",
+            "ошиб",
+            "не работает",
+            "слом",
+            "падает",
+            "сбой",
+        )
+        return any(marker in prompt for marker in fix_markers)
+
+    @staticmethod
+    def _role_contract_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "app_title": {"type": "string"},
+                "app_summary": {"type": "string"},
+                "shared_entities": {"type": "array", "items": {"type": "string"}},
+                "shared_logic": {"type": "array", "items": {"type": "string"}},
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string", "enum": list(ROLE_ORDER)},
+                            "responsibility": {"type": "string"},
+                            "entry_goal": {"type": "string"},
+                            "primary_jobs": {"type": "array", "items": {"type": "string"}},
+                            "key_entities": {"type": "array", "items": {"type": "string"}},
+                            "ui_style_notes": {"type": "array", "items": {"type": "string"}},
+                            "success_states": {"type": "array", "items": {"type": "string"}},
+                            "must_differ_from": {"type": "array", "items": {"type": "string", "enum": list(ROLE_ORDER)}},
+                        },
+                        "required": [
+                            "role",
+                            "responsibility",
+                            "entry_goal",
+                            "primary_jobs",
+                            "key_entities",
+                            "ui_style_notes",
+                            "success_states",
+                            "must_differ_from",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["app_title", "app_summary", "shared_entities", "shared_logic", "roles"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _code_plan_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "flow_mode": {"type": "string", "enum": ["single_page", "multi_page"]},
+                "files_to_read": {"type": "array", "items": {"type": "string"}},
+                "target_files": {"type": "array", "items": {"type": "string"}},
+                "shared_files": {"type": "array", "items": {"type": "string"}},
+                "backend_targets": {"type": "array", "items": {"type": "string"}},
+                "page_graph": {
+                    "type": "object",
+                    "properties": {
+                        "app_title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "flow_mode": {"type": "string", "enum": ["single_page", "multi_page"]},
+                        "shared_files": {"type": "array", "items": {"type": "string"}},
+                        "backend_targets": {"type": "array", "items": {"type": "string"}},
+                        "roles": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "role": {"type": "string", "enum": list(ROLE_ORDER)},
+                                    "entry_path": {"type": "string"},
+                                    "landing_page_id": {"type": "string"},
+                                    "routes_file": {"type": "string"},
+                                    "pages": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "page_id": {"type": "string"},
+                                                "route_path": {"type": "string"},
+                                                "navigation_label": {"type": "string"},
+                                                "component_name": {"type": "string"},
+                                                "file_path": {"type": "string"},
+                                                "title": {"type": "string"},
+                                                "description": {"type": "string"},
+                                                "purpose": {"type": "string"},
+                                                "page_kind": {"type": "string"},
+                                                "primary_actions": {"type": "array", "items": {"type": "string"}},
+                                                "data_dependencies": {"type": "array", "items": {"type": "string"}},
+                                                "loading_state": {"type": "string"},
+                                                "empty_state": {"type": "string"},
+                                                "error_state": {"type": "string"},
+                                            },
+                                            "required": [
+                                                "page_id",
+                                                "route_path",
+                                                "navigation_label",
+                                                "component_name",
+                                                "file_path",
+                                                "title",
+                                                "description",
+                                                "purpose",
+                                                "page_kind",
+                                                "primary_actions",
+                                                "data_dependencies",
+                                                "loading_state",
+                                                "empty_state",
+                                                "error_state",
+                                            ],
+                                            "additionalProperties": False,
+                                        },
+                                    },
+                                },
+                                "required": ["role", "entry_path", "landing_page_id", "routes_file", "pages"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["app_title", "summary", "flow_mode", "roles"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["summary", "flow_mode", "files_to_read", "target_files", "shared_files", "backend_targets", "page_graph"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _code_edit_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "assistant_message": {"type": "string"},
+                "operations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "operation": {"type": "string", "enum": ["create", "replace", "delete"]},
+                            "content": {"type": ["string", "null"]},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["file_path", "operation", "reason"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["assistant_message", "operations"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _role_contract_system_prompt() -> str:
+        return (
+            "You are the role analyst for a real mini-app coding workspace. "
+            "Before planning files, separate what client, specialist, and manager each truly own. "
+            "Do not collapse roles into relabeled versions of the same surface."
+        )
+
+    def _role_contract_user_prompt(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        doc_refs: list[Any],
+        role_scope: list[str],
+        intent: str,
+        creative_direction: dict[str, Any],
+    ) -> str:
+        return json_dumps(
+            {
+                "task": "Analyze role boundaries before page planning",
+                "prompt": prompt,
+                "intent": intent,
+                "role_scope": role_scope,
+                "grounded_spec": grounded_spec.model_dump(mode="json"),
+                "doc_refs": [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in doc_refs],
+                "creative_direction": creative_direction,
+                "rules": [
+                    "Explain what the client does, what the specialist does, and what the manager does before thinking about files.",
+                    "Separate responsibilities, actions, and success states across roles.",
+                    "If the prompt is a targeted edit, keep the role analysis narrow and avoid redefining unrelated areas.",
+                ],
+            }
+        )
+
+    @staticmethod
+    def _code_plan_system_prompt() -> str:
+        return (
+            "Plan a real file-level multi-page mini-app. "
+            "Use the role contract first, then infer the page graph, route tree, shared app files, and backend touch points. "
+            "Do not output placeholders, metrics-only dashboards, or one-screen role wrappers."
+        )
+
+    def _code_plan_user_prompt(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        doc_refs: list[Any],
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        scope_mode: str,
+        require_multi_page: bool,
+        workspace_tree: list[dict[str, str]],
+        creative_direction: dict[str, Any],
+    ) -> str:
+        return json_dumps(
+            {
+                "task": "Plan a route/page graph for real code generation",
+                "prompt": prompt,
+                "role_scope": role_scope,
+                "scope_mode": scope_mode,
+                "require_multi_page": require_multi_page,
+                "grounded_spec": grounded_spec.model_dump(mode="json"),
+                "role_contract": role_contract,
+                "doc_refs": [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in doc_refs],
+                "workspace_tree": workspace_tree,
+                "design_reference_files": list(DESIGN_REFERENCE_FILES),
+                "creative_direction": creative_direction,
+                "constraints": [
+                    "Keep Telegram/MAX mini-app compatibility.",
+                    "Keep three-role preview compatibility.",
+                    "Use the existing profile design language as a style anchor instead of inventing a generic dashboard shell.",
+                    "If the prompt implies several flows, entities, or jobs, return a multi-page app with distinct page files and routes.",
+                    "For targeted edits, keep target_files minimal and touch only the files required by the request.",
+                    "Do not output role copies with changed titles only.",
+                ],
+            }
+        )
+
+    @staticmethod
+    def _page_edit_system_prompt() -> str:
+        return (
+            "Generate one real React page file for a Telegram/MAX mini-app workspace. "
+            "The page must feel custom, role-specific, and grounded in the existing profile design language. "
+            "Return a single create/replace operation for the requested page file only."
+        )
+
+    def _page_edit_user_prompt(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role: str,
+        page: dict[str, Any],
+        page_graph: dict[str, Any],
+        role_contract: dict[str, Any],
+        scope_mode: str,
+        intent: str,
+        file_contexts: dict[str, str],
+        creative_direction: dict[str, Any],
+    ) -> str:
+        sibling_pages = [
+            item
+            for item in (page_graph.get("roles", {}).get(role, {}) or {}).get("pages", [])
+            if item.get("file_path") != page.get("file_path")
+        ]
+        return json_dumps(
+            {
+                "task": "Generate one page file",
+                "prompt": prompt,
+                "intent": intent,
+                "scope_mode": scope_mode,
+                "role": role,
+                "page": page,
+                "sibling_pages": sibling_pages,
+                "role_contract": role_contract.get("roles", {}).get(role),
+                "grounded_spec": grounded_spec.model_dump(mode="json"),
+                "shared_contract": {
+                    "preferred_imports": [
+                        "@/shared/generated/appChrome",
+                        "@/shared/generated/appState",
+                    ],
+                    "design_reference_files": {
+                        path: file_contexts.get(path, "")
+                        for path in DESIGN_REFERENCE_FILES
+                        if path in file_contexts
+                    },
+                },
+                "current_file": file_contexts.get(page["file_path"], ""),
+                "creative_direction": creative_direction,
+                "rules": [
+                    "Create a real page, not a generic stats card screen.",
+                    "Respect the requested role and make the actions specific to that role.",
+                    "Add loading, empty, and error states when the page needs data.",
+                    "If scope_mode is minimal_patch, preserve unrelated behavior and keep the diff minimal.",
+                    "Return exactly one operation for the requested page file path.",
+                ],
+            }
+        )
+
+    @staticmethod
+    def _composition_system_prompt(stage_name: str) -> str:
+        if stage_name == "backend":
+            return (
+                "Compose the backend/runtime pieces after planning. "
+                "Generate only backend, API, schema, store, or contract files needed by the requested change. "
+                "Do not rewrite frontend page files."
+            )
+        return (
+            "Compose the shared frontend/runtime pieces after the individual pages and backend are written. "
+            "Generate route files, shared UI helpers, state modules, and frontend glue that connect the generated pages to the backend. "
+            "Do not rewrite page files unless they are explicitly targeted."
+        )
+
+    def _composition_user_prompt(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        page_graph: dict[str, Any],
+        scope_mode: str,
+        intent: str,
+        stage_name: str,
+        target_files: list[str],
+        file_contexts: dict[str, str],
+        generated_page_sources: dict[str, str],
+        generated_support_sources: dict[str, str],
+        creative_direction: dict[str, Any],
+    ) -> str:
+        return json_dumps(
+            {
+                "task": f"Compose {stage_name} files for the planned app change",
+                "prompt": prompt,
+                "intent": intent,
+                "stage_name": stage_name,
+                "scope_mode": scope_mode,
+                "role_scope": role_scope,
+                "role_contract": role_contract,
+                "page_graph": page_graph,
+                "target_files": target_files,
+                "grounded_spec": grounded_spec.model_dump(mode="json"),
+                "file_contexts": {path: file_contexts.get(path, "") for path in target_files},
+                "generated_page_sources": generated_page_sources,
+                "generated_support_sources": generated_support_sources,
+                "creative_direction": creative_direction,
+                "rules": [
+                    "Only touch files listed in target_files.",
+                    "If stage_name is backend, generate only backend/server/shared contract files required by the request.",
+                    "If stage_name is frontend, wire pages, routes, and shared UI/state to the already planned backend surface.",
+                    "Generate role routes that expose the page graph as real separate pages when routes are targeted.",
+                    "Generate shared app chrome/state files that support the pages instead of rendering placeholder dashboards.",
+                    "For minimal_patch, preserve unrelated behavior and keep the diff minimal.",
+                    "Do not touch page files unless they are included in target_files.",
+                ],
+            }
+        )
+
+    def _resolve_page_file_edit(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role: str,
+        page: dict[str, Any],
+        page_graph: dict[str, Any],
+        role_contract: dict[str, Any],
+        scope_mode: str,
+        intent: str,
+        file_contexts: dict[str, str],
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            payload = self._generate_structured_with_retry(
+                role="code_edit",
+                schema_name=f"page_file_v1_{page['page_id']}",
+                schema=self._code_edit_schema(),
+                system_prompt=self._page_edit_system_prompt(),
+                user_prompt=self._page_edit_user_prompt(
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    role=role,
+                    page=page,
+                    page_graph=page_graph,
+                    role_contract=role_contract,
+                    scope_mode=scope_mode,
+                    intent=intent,
+                    file_contexts=file_contexts,
+                    creative_direction=creative_direction,
+                ),
+            )
+            normalized = self._normalize_model_payload(payload["payload"])
+            raw_operations = normalized.get("operations")
+            if not isinstance(raw_operations, list):
+                raise ValueError(f"{page['file_path']} did not return operations.")
+            operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
+            valid_operations = [
+                operation
+                for operation in operations
+                if operation.file_path == page["file_path"] and operation.operation in {"create", "replace"} and operation.content is not None
+            ]
+            if len(valid_operations) != 1:
+                raise ValueError(f"{page['file_path']} must be generated as a single create/replace operation.")
+            return {
+                "assistant_message": str(normalized.get("assistant_message") or "").strip(),
+                "operation": valid_operations[0],
+                "model": payload["model"],
+            }
+        except Exception as exc:
+            return {"error": f"Page generation failed for {page['file_path']}: {exc}"}
+
+    def _resolve_composition_edit(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        page_graph: dict[str, Any],
+        scope_mode: str,
+        intent: str,
+        stage_name: str,
+        target_files: list[str],
+        file_contexts: dict[str, str],
+        generated_page_sources: dict[str, str],
+        generated_support_sources: dict[str, str],
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not target_files:
+            return {"assistant_message": f"{stage_name.capitalize()} stage complete: no changes were required.", "operations": []}
+        allowed_targets = set(target_files)
+        try:
+            payload = self._generate_structured_with_retry(
+                role="code_edit",
+                schema_name="composition_bundle_v1",
+                schema=self._code_edit_schema(),
+                system_prompt=self._composition_system_prompt(stage_name),
+                user_prompt=self._composition_user_prompt(
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    role_scope=role_scope,
+                    role_contract=role_contract,
+                    page_graph=page_graph,
+                    scope_mode=scope_mode,
+                    intent=intent,
+                    stage_name=stage_name,
+                    target_files=target_files,
+                    file_contexts=file_contexts,
+                    generated_page_sources=generated_page_sources,
+                    generated_support_sources=generated_support_sources,
+                    creative_direction=creative_direction,
+                ),
+            )
+            normalized = self._normalize_model_payload(payload["payload"])
+            raw_operations = normalized.get("operations")
+            if not isinstance(raw_operations, list):
+                raise ValueError("Composition did not return operations.")
+            operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
+            invalid = [
+                operation.file_path
+                for operation in operations
+                if operation.file_path not in allowed_targets or (operation.operation in {"create", "replace"} and operation.content is None)
+            ]
+            if invalid:
+                raise ValueError(f"Composition touched files outside the planned scope: {', '.join(invalid[:5])}")
+            return {
+                "assistant_message": str(normalized.get("assistant_message") or "").strip(),
+                "operations": operations,
+                "model": payload["model"],
+            }
+        except Exception as exc:
+            return {"error": f"Composition step failed: {exc}"}
+
+    @staticmethod
+    def _selected_pages_for_edit(page_graph: dict[str, Any], target_files: set[str]) -> list[tuple[str, dict[str, Any]]]:
+        selected: list[tuple[str, dict[str, Any]]] = []
+        for role, role_payload in (page_graph.get("roles") or {}).items():
+            for page in role_payload.get("pages") or []:
+                file_path = page.get("file_path")
+                if not isinstance(file_path, str):
+                    continue
+                if target_files and file_path not in target_files:
+                    continue
+                selected.append((role, page))
+        return selected
+
+    @staticmethod
+    def _backend_target_files(page_graph: dict[str, Any], target_files: set[str]) -> list[str]:
+        ordered = [path for path in (page_graph.get("backend_targets") or []) if isinstance(path, str)]
+        if not target_files:
+            return list(dict.fromkeys(ordered))
+        return [path for path in dict.fromkeys(ordered) if path in target_files]
+
+    @staticmethod
+    def _frontend_target_files(page_graph: dict[str, Any], target_files: set[str]) -> list[str]:
+        structural_targets = list(page_graph.get("shared_files") or [])
+        structural_targets.extend(
+            role_payload.get("routes_file")
+            for role_payload in (page_graph.get("roles") or {}).values()
+            if isinstance(role_payload, dict)
+        )
+        ordered = [path for path in structural_targets if isinstance(path, str)]
+        if not target_files:
+            return list(dict.fromkeys(ordered))
+        return [path for path in dict.fromkeys(ordered) if path in target_files]
+
+    @staticmethod
+    def _dedupe_operations(operations: list[DraftFileOperation]) -> list[DraftFileOperation]:
+        deduped: dict[str, DraftFileOperation] = {}
+        for operation in operations:
+            deduped[operation.file_path] = operation
+        return list(deduped.values())
+
+    @staticmethod
+    def _role_contract_gate_issues(role_contract: dict[str, Any], role_scope: list[str], *, scope_mode: str) -> list[str]:
+        issues: list[str] = []
+        roles = role_contract.get("roles") or {}
+        normalized_responsibilities: list[str] = []
+        for role in role_scope:
+            payload = roles.get(role)
+            if not isinstance(payload, dict):
+                issues.append(f"{role} is missing from the role contract.")
+                continue
+            responsibility = str(payload.get("responsibility") or "").strip()
+            jobs = payload.get("primary_jobs") or []
+            if not responsibility:
+                issues.append(f"{role} is missing a concrete responsibility.")
+            if not jobs:
+                issues.append(f"{role} is missing primary jobs.")
+            normalized_responsibilities.append(re.sub(r"\s+", " ", responsibility.lower()))
+        if scope_mode == "minimal_patch":
+            return issues
+        if len(normalized_responsibilities) > 1 and len(set(normalized_responsibilities)) == 1:
+            issues.append("All selected roles still have the same responsibility in the role contract.")
+        return issues
+
+    @staticmethod
+    def _page_graph_gate_issues(page_graph: dict[str, Any], role_scope: list[str], *, scope_mode: str, require_multi_page: bool) -> list[str]:
+        issues: list[str] = []
+        roles = page_graph.get("roles") or {}
+        total_pages = 0
+        normalized_role_routes: list[tuple[str, tuple[str, ...]]] = []
+        for role in role_scope:
+            role_payload = roles.get(role) or {}
+            pages = role_payload.get("pages") or []
+            routes_file = role_payload.get("routes_file")
+            if not isinstance(routes_file, str) or not routes_file:
+                issues.append(f"{role} is missing a routes file.")
+            if not isinstance(pages, list) or not pages:
+                issues.append(f"{role} is missing page definitions.")
+                continue
+            total_pages += len(pages)
+            if scope_mode != "minimal_patch" and require_multi_page and len(pages) < 2:
+                issues.append(f"{role} did not receive enough distinct pages for a multi-page app.")
+            normalized_role_routes.append(
+                (
+                    role,
+                    tuple(sorted(str(page.get("route_path") or "") for page in pages)),
+                )
+            )
+        if scope_mode != "minimal_patch" and require_multi_page and page_graph.get("flow_mode") != "multi_page":
+            issues.append("The generated plan did not stay in multi-page mode.")
+        if scope_mode != "minimal_patch" and require_multi_page and total_pages <= len(role_scope):
+            issues.append("The generated plan still collapses the app into one screen per selected role.")
+        if scope_mode != "minimal_patch" and len(normalized_role_routes) > 1:
+            route_sets = [routes for _, routes in normalized_role_routes]
+            if len(set(route_sets)) == 1:
+                issues.append("Selected roles still share the same route tree.")
+        return issues
+
+    @staticmethod
+    def _edit_gate_issues(
+        page_graph: dict[str, Any],
+        operations: list[DraftFileOperation],
+        role_scope: list[str],
+        *,
+        scope_mode: str,
+        target_files: list[str],
+    ) -> list[str]:
+        issues: list[str] = []
+        operation_paths = {operation.file_path for operation in operations}
+        allowed_target_paths = set(target_files) | {"artifacts/generated_app_graph.json"}
+        unexpected_paths = [path for path in operation_paths if path not in allowed_target_paths]
+        if unexpected_paths:
+            issues.append(f"Generated draft touched files outside the planned target scope: {', '.join(unexpected_paths[:5])}")
+        if scope_mode == "minimal_patch":
+            if len(operation_paths) > max(1, len(target_files) + 1):
+                issues.append("Minimal patch mode touched too many files.")
+            return issues
+
+        route_hits = 0
+        page_hits = 0
+        for role in role_scope:
+            role_payload = page_graph.get("roles", {}).get(role) or {}
+            routes_file = role_payload.get("routes_file")
+            if isinstance(routes_file, str) and routes_file in operation_paths:
+                route_hits += 1
+            for page in role_payload.get("pages") or []:
+                file_path = page.get("file_path")
+                if isinstance(file_path, str) and file_path in operation_paths:
+                    page_hits += 1
+        if route_hits < len(role_scope):
+            issues.append("Generated draft does not update the role route files for every selected role.")
+        if page_hits <= len(role_scope):
+            issues.append("Generated draft still collapses the app into too few real page files.")
+        return issues
+
+    @staticmethod
+    def _build_check_results(build_issues: list[ValidationIssue], preview_issue: ValidationIssue | None = None) -> list[RunCheckResult]:
+        results: list[RunCheckResult] = []
+        if build_issues:
+            results.append(
+                RunCheckResult(
+                    name="draft-build",
+                    status="failed",
+                    details="; ".join(issue.message for issue in build_issues[:5]),
+                )
+            )
+        else:
+            results.append(RunCheckResult(name="draft-build", status="passed", details="Scaffold entrypoints are present in the draft."))
+        if preview_issue is not None:
+            results.append(RunCheckResult(name="draft-preview", status="failed", details=preview_issue.message))
+        elif build_issues:
+            results.append(
+                RunCheckResult(
+                    name="draft-preview",
+                    status="skipped",
+                    details="Preview rebuild was skipped because build validation failed.",
+                )
+            )
+        elif not build_issues:
+            results.append(RunCheckResult(name="draft-preview", status="passed", details="Preview runtime rebuilt successfully."))
+        return results
+
+    @staticmethod
+    def _filter_non_blocking_build_issues(build_issues: list[ValidationIssue], *, scope_mode: str) -> list[ValidationIssue]:
+        if scope_mode != "minimal_patch":
+            return build_issues
+        ignored_codes = {
+            "build.invalid_generated_app_graph",
+            "build.missing_role_routes",
+            "build.placeholder_role_surface",
+            "build.insufficient_routes",
+            "build.insufficient_pages",
+        }
+        return [issue for issue in build_issues if issue.code not in ignored_codes]
+
+    @staticmethod
+    def _repair_attempt_limit(generation_mode: GenerationMode, intent: str) -> int:
+        if intent in {"edit", "refine", "role_only_change"}:
+            return max(1, int(os.getenv("EDIT_AUTO_REPAIR_ATTEMPTS", "2")))
+        if generation_mode == GenerationMode.QUALITY:
+            return max(1, int(os.getenv("QUALITY_AUTO_REPAIR_ATTEMPTS", "2")))
+        if generation_mode == GenerationMode.BALANCED:
+            return max(1, int(os.getenv("BALANCED_AUTO_REPAIR_ATTEMPTS", "2")))
+        return max(0, int(os.getenv("BASIC_AUTO_REPAIR_ATTEMPTS", "1")))
+
+    def _collect_existing_file_contexts(self, workspace_id: str, run_id: str, target_files: list[str]) -> dict[str, str]:
+        file_contexts: dict[str, str] = {}
+        for file_path in target_files:
+            try:
+                file_contexts[file_path] = self.workspace_service.read_file(workspace_id, file_path, run_id=run_id)
+            except FileNotFoundError:
+                continue
+        return file_contexts
+
+    @staticmethod
+    def _preview_failure_issue(preview: Any) -> ValidationIssue:
+        message = next((str(line).strip() for line in reversed(preview.logs or []) if str(line).strip()), "Preview runtime failed to rebuild.")
+        return ValidationIssue(
+            code="preview.rebuild_failed",
+            message=message,
+            severity="high",
+            location="preview",
+            blocking=True,
+        )
+
+    @staticmethod
+    def _is_non_blocking_preview_issue(issue: ValidationIssue) -> bool:
+        message = issue.message.lower()
+        infra_markers = (
+            "docker daemon socket",
+            "operation not permitted",
+            "permission denied",
+            "connect to the docker daemon",
+            "dial unix",
+        )
+        return any(marker in message for marker in infra_markers)
+
+    def _repair_draft_after_failure(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        page_graph: dict[str, Any],
+        scope_mode: str,
+        target_files: list[str],
+        file_contexts: dict[str, str],
+        build_issues: list[ValidationIssue],
+        preview_issue: ValidationIssue | None,
+        preview_logs: list[str],
+        attempt: int,
+    ) -> dict[str, Any]:
+        allowed_targets = set(target_files)
+        try:
+            payload = self._generate_structured_with_retry(
+                role="repair",
+                schema_name="composition_bundle_v1",
+                schema=self._code_edit_schema(),
+                system_prompt=self._repair_system_prompt(),
+                user_prompt=self._repair_user_prompt(
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    role_scope=role_scope,
+                    role_contract=role_contract,
+                    page_graph=page_graph,
+                    scope_mode=scope_mode,
+                    target_files=target_files,
+                    file_contexts=file_contexts,
+                    build_issues=build_issues,
+                    preview_issue=preview_issue,
+                    preview_logs=preview_logs,
+                    attempt=attempt,
+                ),
+            )
+            normalized = self._normalize_model_payload(payload["payload"])
+            raw_operations = normalized.get("operations")
+            if not isinstance(raw_operations, list):
+                raise ValueError("Repair step did not return operations.")
+            operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
+            invalid = [
+                operation.file_path
+                for operation in operations
+                if operation.file_path not in allowed_targets or (operation.operation in {"create", "replace"} and operation.content is None)
+            ]
+            if invalid:
+                raise ValueError(f"Repair touched files outside the planned scope: {', '.join(invalid[:5])}")
+            return {
+                "assistant_message": str(normalized.get("assistant_message") or "").strip(),
+                "operations": operations,
+                "model": payload["model"],
+            }
+        except Exception as exc:
+            return {"error": f"Automatic repair step failed: {exc}"}
+
+    @staticmethod
+    def _repair_system_prompt() -> str:
+        return (
+            "You repair an existing draft workspace after build or preview failure. "
+            "Return only the smallest safe set of file operations needed to make the draft compile and boot. "
+            "Do not expand scope, do not redesign the app, and do not touch files outside the provided target list."
+        )
+
+    def _repair_user_prompt(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        page_graph: dict[str, Any],
+        scope_mode: str,
+        target_files: list[str],
+        file_contexts: dict[str, str],
+        build_issues: list[ValidationIssue],
+        preview_issue: ValidationIssue | None,
+        preview_logs: list[str],
+        attempt: int,
+    ) -> str:
+        return json_dumps(
+            {
+                "task": "Repair build or preview failures in the generated draft",
+                "attempt": attempt,
+                "prompt": prompt,
+                "role_scope": role_scope,
+                "scope_mode": scope_mode,
+                "target_files": target_files,
+                "grounded_spec": grounded_spec.model_dump(mode="json"),
+                "role_contract": role_contract,
+                "page_graph": page_graph,
+                "file_contexts": file_contexts,
+                "build_issues": [issue.model_dump(mode="json") for issue in build_issues],
+                "preview_issue": preview_issue.model_dump(mode="json") if preview_issue is not None else None,
+                "preview_logs": preview_logs[-10:],
+                "rules": [
+                    "Fix only the concrete build/preview failures.",
+                    "Prefer editing the existing generated files instead of creating new architecture.",
+                    "Keep the diff minimal and preserve unrelated behavior.",
+                    "Return operations only for files listed in target_files.",
+                ],
+            }
+        )
+
+    @staticmethod
+    def _diff_summary(diff_text: str) -> str:
+        paths: list[str] = []
+        for match in re.finditer(r"^diff --git a/.+ b/(.+)$", diff_text, flags=re.MULTILINE):
+            candidate = match.group(1).strip()
+            if candidate.startswith("draft/"):
+                candidate = candidate.split("draft/", 1)[-1]
+            if candidate.startswith("source/"):
+                candidate = candidate.split("source/", 1)[-1]
+            paths.append(candidate)
+        if not paths:
+            return "No draft diff was produced."
+        unique_paths = list(dict.fromkeys(paths))
+        return f"Changed files: {', '.join(unique_paths[:6])}"
+
+    def _build_agent_traceability_report(
+        self,
+        workspace_id: str,
+        grounded_spec: GroundedSpecModel,
+        operations: list[DraftFileOperation],
+    ) -> TraceabilityReportModel:
+        entries = [
+            TraceabilityReportEntry(
+                trace_id=new_id("trace"),
+                source_ref="prompt-source",
+                source_kind="user_prompt",
+                target_id=operation.file_path,
+                target_type="file",
+                mapping_note=f"Prompt-grounded edit for {operation.file_path}.",
+            )
+            for operation in operations
+        ]
+        for doc_ref in grounded_spec.doc_refs[:3]:
+            entries.append(
+                TraceabilityReportEntry(
+                    trace_id=new_id("trace"),
+                    source_ref=doc_ref.doc_ref_id,
+                    source_kind=doc_ref.source_type,
+                    target_id="grounded_spec",
+                    target_type="planning_artifact",
+                    mapping_note="Source material kept for planning/debug traceability.",
+                )
+            )
+        return TraceabilityReportModel(report_id=new_id("trace"), workspace_id=workspace_id, entries=entries)
+
+    @staticmethod
+    def _build_agent_summary(
+        *,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        operations: list[DraftFileOperation],
+        generation_mode: GenerationMode,
+        assistant_message: str,
+    ) -> str:
+        return (
+            f"{assistant_message} Built a {generation_mode.value} draft for {grounded_spec.target_platform} "
+            f"with {len(operations)} file operations across {len(role_scope)} role views."
+        )
+
+    @staticmethod
+    def _compile_code_summary(operations: list[DraftFileOperation], role_scope: list[str]) -> dict[str, int | str]:
+        return {
+            "file_count": len({operation.file_path for operation in operations}),
+            "operation_count": len(operations),
+            "role_count": len(role_scope),
+            "iteration_count": 1,
+        }
+
     @staticmethod
     def _is_retryable_llm_error(error: Exception) -> bool:
         text = str(error).lower()
@@ -526,6 +2276,20 @@ class GenerationService:
         assert last_error is not None
         raise last_error
 
+    def _generate_json_object_with_retry(self, **kwargs: Any) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                return self.openrouter_client.generate_json_object(**kwargs)
+            except Exception as exc:
+                last_error = exc
+                if attempt == 1 or not self._is_retryable_llm_error(exc):
+                    raise
+                logger.warning("Retrying relaxed JSON generation after transient provider failure: %s", exc)
+                time.sleep(0.8)
+        assert last_error is not None
+        raise last_error
+
     def _resolve_grounded_spec(
         self,
         *,
@@ -539,67 +2303,119 @@ class GenerationService:
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
-        fast_spec_mode = os.getenv("FAST_GENERATION_SPEC_ONLY", "0") == "1"
-        if fast_spec_mode:
-            return {
-                "spec": self._build_grounded_spec(
-                    workspace_id=workspace_id,
-                    prompt=prompt,
-                    target_platform=target_platform,
-                    preview_profile=preview_profile,
-                    doc_refs=doc_refs,
-                    template_revision_id=template_revision_id,
-                    prompt_turn_id=prompt_turn_id,
-                    generation_mode=generation_mode,
-                ),
-                "model": None,
-            }
-        if generation_mode == GenerationMode.BASIC or not self.openrouter_client.enabled:
-            return {
-                "spec": self._build_grounded_spec(
-                    workspace_id=workspace_id,
-                    prompt=prompt,
-                    target_platform=target_platform,
-                    preview_profile=preview_profile,
-                    doc_refs=doc_refs,
-                    template_revision_id=template_revision_id,
-                    prompt_turn_id=prompt_turn_id,
-                    generation_mode=generation_mode,
-                )
-            }
+        del workspace_id, generation_mode
+        if not self.openrouter_client.enabled:
+            return {"error": "GroundedSpec generation requires OpenRouter configuration."}
         try:
+            outline_payload, payload, outline = self._generate_grounded_spec_pair(
+                prompt=prompt,
+                doc_refs=doc_refs,
+                target_platform=target_platform,
+                preview_profile=preview_profile,
+                template_revision_id=template_revision_id,
+                prompt_turn_id=prompt_turn_id,
+                creative_direction=creative_direction,
+                relaxed=False,
+            )
+            spec = GroundedSpecModel.model_validate(self._normalize_model_payload(payload["payload"]))
+            model_path = [str(outline_payload["model"]), str(payload["model"])]
+            return {"spec": spec, "model": payload["model"], "model_sequence": model_path}
+        except Exception as strict_exc:
+            try:
+                outline_payload, payload, outline = self._generate_grounded_spec_pair(
+                    prompt=prompt,
+                    doc_refs=doc_refs,
+                    target_platform=target_platform,
+                    preview_profile=preview_profile,
+                    template_revision_id=template_revision_id,
+                    prompt_turn_id=prompt_turn_id,
+                    creative_direction=creative_direction,
+                    relaxed=True,
+                )
+                spec = GroundedSpecModel.model_validate(self._normalize_model_payload(payload["payload"]))
+                model_path = [str(outline_payload["model"]), str(payload["model"])]
+                return {
+                    "spec": spec,
+                    "model": payload["model"],
+                    "model_sequence": model_path,
+                    "warning": f"GroundedSpec strict mode failed and relaxed JSON mode was used: {strict_exc}",
+                }
+            except Exception as relaxed_exc:
+                return {
+                    "error": (
+                        "GroundedSpec generation failed: "
+                        f"strict mode error: {strict_exc}; relaxed mode error: {relaxed_exc}"
+                    )
+                }
+
+    def _generate_grounded_spec_pair(
+        self,
+        *,
+        prompt: str,
+        doc_refs: list[Any],
+        target_platform: TargetPlatform,
+        preview_profile: PreviewProfile,
+        template_revision_id: str,
+        prompt_turn_id: str,
+        creative_direction: dict[str, Any],
+        relaxed: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        outline_schema = self._grounded_spec_outline_schema()
+        outline_user_prompt = self._grounded_spec_outline_user_prompt(
+            prompt=prompt,
+            doc_refs=doc_refs,
+            target_platform=target_platform,
+            preview_profile=preview_profile,
+            template_revision_id=template_revision_id,
+            prompt_turn_id=prompt_turn_id,
+            creative_direction=creative_direction,
+        )
+        if relaxed:
+            outline_payload = self._generate_json_object_with_retry(
+                role="spec_analysis",
+                schema_name="grounded_spec_outline_v1",
+                schema=outline_schema,
+                system_prompt=self._grounded_spec_outline_system_prompt(),
+                user_prompt=outline_user_prompt,
+            )
+        else:
+            outline_payload = self._generate_structured_with_retry(
+                role="spec_analysis",
+                schema_name="grounded_spec_outline_v1",
+                schema=outline_schema,
+                system_prompt=self._grounded_spec_outline_system_prompt(),
+                user_prompt=outline_user_prompt,
+            )
+        outline = self._normalize_model_payload(outline_payload["payload"])
+
+        grounded_spec_schema = GroundedSpecModel.model_json_schema()
+        grounded_spec_user_prompt = self._grounded_spec_user_prompt(
+            prompt=prompt,
+            doc_refs=doc_refs,
+            target_platform=target_platform,
+            preview_profile=preview_profile,
+            template_revision_id=template_revision_id,
+            prompt_turn_id=prompt_turn_id,
+            creative_direction=creative_direction,
+            outline=outline,
+        )
+        if relaxed:
+            payload = self._generate_json_object_with_retry(
+                role="spec_analysis",
+                schema_name="grounded_spec_v1",
+                schema=grounded_spec_schema,
+                system_prompt=self._grounded_spec_system_prompt(),
+                user_prompt=grounded_spec_user_prompt,
+            )
+        else:
             payload = self._generate_structured_with_retry(
                 role="spec_analysis",
                 schema_name="grounded_spec_v1",
-                schema=GroundedSpecModel.model_json_schema(),
+                schema=grounded_spec_schema,
                 system_prompt=self._grounded_spec_system_prompt(),
-                user_prompt=self._grounded_spec_user_prompt(
-                    prompt,
-                    doc_refs,
-                    target_platform,
-                    preview_profile,
-                    template_revision_id,
-                    prompt_turn_id,
-                    creative_direction,
-                ),
+                user_prompt=grounded_spec_user_prompt,
             )
-            spec = GroundedSpecModel.model_validate(self._normalize_model_payload(payload["payload"]))
-            return {"spec": spec, "model": payload["model"]}
-        except Exception as exc:
-            return {
-                "spec": self._build_grounded_spec(
-                    workspace_id=workspace_id,
-                    prompt=prompt,
-                    target_platform=target_platform,
-                    preview_profile=preview_profile,
-                    doc_refs=doc_refs,
-                    template_revision_id=template_revision_id,
-                    prompt_turn_id=prompt_turn_id,
-                    generation_mode=generation_mode,
-                ),
-                "model": None,
-                "warning": f"GroundedSpec LLM step failed, fallback compiler spec was used: {exc}",
-            }
+        return outline_payload, payload, outline
 
     def _resolve_app_ir(
         self,
@@ -3014,6 +4830,29 @@ class GenerationService:
         )
         return job
 
+    def _stop_if_requested(
+        self,
+        job: JobRecord,
+        workspace_id: str,
+        should_stop: Callable[[], bool] | None,
+    ) -> JobRecord | None:
+        if not should_stop or not should_stop():
+            return None
+        job.status = "blocked"
+        job.fidelity = "blocked"
+        job.failure_reason = "Run stopped by user."
+        job.validation_snapshot = ValidationSnapshot(
+            grounded_spec_valid=True,
+            app_ir_valid=True,
+            build_valid=False,
+            blocking=False,
+            issues=[],
+        )
+        self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
+        self._append_event(job, "job_failed", "Run stopped by user.")
+        self._append_trace(workspace_id, "job_stopped", "Run stopped by user.", {})
+        return job
+
     def _append_event(self, job: JobRecord, event_type: str, message: str, details: dict[str, Any] | None = None) -> None:
         job.events.append(JobEvent(event_type=event_type, message=message, details=details or {}))
         job.updated_at = datetime.now(timezone.utc)
@@ -3066,14 +4905,14 @@ class GenerationService:
     @staticmethod
     def _run_progress_for_event(event_type: str) -> tuple[str, int]:
         progress_map = {
-            "retrieval_started": ("retrieving context", 10),
-            "spec_ready": ("building grounded spec", 28),
-            "ir_ready": ("building app ir", 48),
-            "repair_iteration": ("repairing app ir", 58),
-            "artifact_plan_ready": ("planning code changes", 68),
-            "patch_applied": ("applying patch", 80),
-            "build_started": ("running validation and build", 86),
-            "preview_ready": ("refreshing preview", 94),
+            "retrieval_started": ("retrieving context", 12),
+            "spec_ready": ("building grounded spec", 30),
+            "planning_ready": ("planning code changes", 50),
+            "iteration_ready": ("editing draft files", 70),
+            "repair_iteration": ("repairing draft", 82),
+            "build_started": ("running validation and build", 90),
+            "preview_ready": ("refreshing preview", 96),
+            "draft_ready": ("awaiting review", 100),
             "job_completed": ("completed", 100),
             "spec_blocked": ("blocked on spec", 100),
             "validation_failed": ("validation failed", 100),
@@ -3096,8 +4935,56 @@ class GenerationService:
             "Keep the output strictly valid against the schema."
         )
 
-    def _grounded_spec_user_prompt(
+    @staticmethod
+    def _grounded_spec_outline_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "product_goal": {"type": "string"},
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string"},
+                            "responsibility": {"type": "string"},
+                            "primary_actions": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["role", "responsibility", "primary_actions"],
+                        "additionalProperties": False,
+                    },
+                },
+                "entities": {"type": "array", "items": {"type": "string"}},
+                "flows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "goal": {"type": "string"},
+                            "roles": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["name", "goal", "roles"],
+                        "additionalProperties": False,
+                    },
+                },
+                "api_needs": {"type": "array", "items": {"type": "string"}},
+                "risks": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["product_goal", "roles", "entities", "flows", "api_needs", "risks"],
+            "additionalProperties": False,
+        }
+
+    def _grounded_spec_outline_system_prompt(self) -> str:
+        return (
+            "You are doing the first pass for a grounded mini-app specification. "
+            "Return only a compact outline: product goal, roles, entities, flows, API needs, and risks. "
+            "Do not emit the full final schema yet. Keep it short, concrete, and implementation-oriented."
+        )
+
+    def _grounded_spec_outline_user_prompt(
         self,
+        *,
         prompt: str,
         doc_refs: list[Any],
         target_platform: TargetPlatform,
@@ -3105,6 +4992,36 @@ class GenerationService:
         template_revision_id: str,
         prompt_turn_id: str,
         creative_direction: dict[str, Any],
+    ) -> str:
+        return json_dumps(
+            {
+                "task": "Build GroundedSpec outline",
+                "prompt": prompt,
+                "target_platform": target_platform.value,
+                "preview_profile": preview_profile.value,
+                "template_revision_id": template_revision_id,
+                "prompt_turn_id": prompt_turn_id,
+                "creative_direction": creative_direction,
+                "architecture_contract": [
+                    "Identify the real business domain and the selected roles.",
+                    "Extract entities, user flows, and any obvious API needs.",
+                    "Keep the output compact; this is only the outline pass.",
+                ],
+                "docs": self._compact_doc_refs(doc_refs, limit=4),
+            }
+        )
+
+    def _grounded_spec_user_prompt(
+        self,
+        *,
+        prompt: str,
+        doc_refs: list[Any],
+        target_platform: TargetPlatform,
+        preview_profile: PreviewProfile,
+        template_revision_id: str,
+        prompt_turn_id: str,
+        creative_direction: dict[str, Any],
+        outline: dict[str, Any],
     ) -> str:
         return json_dumps(
             {
@@ -3121,13 +5038,14 @@ class GenerationService:
                     "Include failure handling, validation rules, and operational monitoring expectations.",
                     "Avoid generic placeholders and repeated template wording.",
                 ],
+                "outline": outline,
                 "creative_direction": creative_direction,
                 "variability_policy": [
                     "Use role requirements as capability constraints, not layout constraints.",
                     "You may pick any navigation and screen composition pattern that remains coherent.",
                     "Do not mirror the same information hierarchy across all roles.",
                 ],
-                "docs": [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in doc_refs],
+                "docs": self._compact_doc_refs(doc_refs, limit=6),
             }
         )
 
@@ -3158,6 +5076,25 @@ class GenerationService:
                 ],
             }
         )
+
+    @staticmethod
+    def _compact_doc_refs(doc_refs: list[Any], limit: int = 6) -> list[dict[str, Any]]:
+        compact_refs: list[dict[str, Any]] = []
+        for item in doc_refs[:limit]:
+            raw = item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+            if not isinstance(raw, dict):
+                continue
+            compact_refs.append(
+                {
+                    "doc_ref_id": raw.get("doc_ref_id"),
+                    "source_type": raw.get("source_type"),
+                    "file_path": raw.get("file_path"),
+                    "section_title": raw.get("section_title"),
+                    "relevance": raw.get("relevance"),
+                    "snippet": str(raw.get("snippet") or "")[:180],
+                }
+            )
+        return compact_refs
 
     @staticmethod
     def _app_ir_critique_schema() -> dict[str, Any]:

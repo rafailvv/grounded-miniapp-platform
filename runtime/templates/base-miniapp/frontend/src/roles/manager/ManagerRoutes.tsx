@@ -1,5 +1,16 @@
-import { GeneratedRoleRoutes } from '@/shared/ui/generated/GeneratedRoleRoutes';
+import { Navigate, Route, Routes } from 'react-router-dom';
+import { AppShell } from '@/app/layout/AppShell';
+import { ManagerHomePage } from '@/roles/manager/pages/ManagerHomePage';
+import { ManagerProfilePage } from '@/roles/manager/pages/ManagerProfile/ManagerProfilePage';
 
 export function ManagerRoutes(): JSX.Element {
-  return <GeneratedRoleRoutes role="manager" />;
+  return (
+    <Routes>
+      <Route element={<AppShell />}>
+        <Route index element={<ManagerHomePage />} />
+        <Route path="profile" element={<ManagerProfilePage />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Route>
+    </Routes>
+  );
 }

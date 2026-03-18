@@ -4,6 +4,13 @@ export type Workspace = {
   description?: string | null;
   template_cloned: boolean;
   current_revision_id?: string | null;
+  revisions?: Array<{
+    revision_id: string;
+    commit_sha: string;
+    message: string;
+    source: string;
+    created_at: string;
+  }>;
 };
 
 export type Run = {
@@ -19,20 +26,27 @@ export type Run = {
   linked_job_id?: string | null;
   source_revision_id?: string | null;
   result_revision_id?: string | null;
+  candidate_revision_id?: string | null;
   status: "pending" | "running" | "awaiting_approval" | "completed" | "blocked" | "failed";
-  apply_status: "pending" | "applied" | "awaiting_approval" | "blocked" | "failed";
+  apply_status: "pending" | "applied" | "awaiting_approval" | "blocked" | "failed" | "rolled_back";
+  draft_status: "none" | "ready" | "approved" | "discarded" | "failed";
+  draft_ready: boolean;
+  approval_required: boolean;
+  iteration_count: number;
   current_stage: string;
   progress_percent: number;
   summary?: string | null;
   failure_reason?: string | null;
   checks_summary: {
-    validators: "pending" | "passed" | "failed" | "blocked";
-    build: "pending" | "passed" | "failed" | "blocked";
-    preview: "pending" | "passed" | "failed" | "blocked";
+    validators: "pending" | "passed" | "failed" | "blocked" | "skipped";
+    build: "pending" | "passed" | "failed" | "blocked" | "skipped";
+    preview: "pending" | "passed" | "failed" | "blocked" | "skipped";
     issues: Array<{ code?: string; message?: string; severity?: string }>;
   };
   touched_files: string[];
   artifacts: Record<string, string>;
+  rolled_back: boolean;
+  rolled_back_at?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -54,18 +68,35 @@ export type RunArtifacts = {
     } | null;
   };
   grounded_spec?: Record<string, unknown> | null;
-  app_ir?: Record<string, unknown> | null;
   validation?: Record<string, unknown> | null;
   assumptions?: Record<string, unknown> | null;
   traceability?: Record<string, unknown> | null;
-  artifact_plan?: Record<string, unknown> | null;
   trace?: { entries?: Array<{ stage: string; message: string; created_at?: string }> } | null;
   code_change_plan?: {
     summary?: string;
-    targets?: Array<{ file_path: string; operation: string; reason: string; risk: string }>;
+    targets?: Array<{ file_path: string; operation: "create" | "replace" | "delete"; reason: string; risk: string }>;
     risks?: string[];
     acceptance_checks?: string[];
   } | null;
+  iterations?: Array<{
+    iteration_id: string;
+    assistant_message: string;
+    files_read: string[];
+    operations: Array<{ file_path: string; operation: "create" | "replace" | "delete"; reason: string }>;
+    check_results: Array<{ name: string; status: string; details?: string | null }>;
+    diff_summary?: string | null;
+    role_scope: Array<"client" | "specialist" | "manager">;
+    created_at: string;
+  }>;
+  candidate_diff?: string;
+  check_results?: Array<{ name: string; status: string; details?: string | null }>;
+  draft_preview?: {
+    status: string;
+    runtime_mode: string;
+    url?: string | null;
+    role_urls?: Record<string, string>;
+  };
+  final_summary?: string | null;
   diff?: string;
   preview?: {
     status: string;
@@ -73,6 +104,7 @@ export type RunArtifacts = {
     url?: string | null;
     role_urls?: Record<string, string>;
     logs?: string[];
+    draft_run_id?: string | null;
   };
 };
 
@@ -99,6 +131,7 @@ export type WorkspaceLogs = {
     runtime_mode: string;
     url: string | null;
     logs: string[];
+    draft_run_id?: string | null;
   };
   reports: {
     trace?: {
@@ -113,9 +146,10 @@ export type WorkspaceLogs = {
     validation?: Record<string, unknown> | null;
     assumptions?: Record<string, unknown> | null;
     traceability?: Record<string, unknown> | null;
-    artifact_plan?: Record<string, unknown> | null;
+    iterations?: Record<string, unknown> | null;
+    candidate_diff?: Record<string, unknown> | null;
+    check_results?: Record<string, unknown> | null;
     spec_summary?: Record<string, unknown> | null;
-    ir_summary?: Record<string, unknown> | null;
   };
 };
 
@@ -223,8 +257,36 @@ export async function getRun(runId: string): Promise<Run> {
   return request<Run>(`/runs/${runId}`);
 }
 
+export async function stopRun(runId: string): Promise<Run> {
+  return request<Run>(`/runs/${runId}/stop`, {
+    method: "POST",
+  });
+}
+
+export async function getRunIterations(runId: string): Promise<Array<Record<string, unknown>>> {
+  return request<Array<Record<string, unknown>>>(`/runs/${runId}/iterations`);
+}
+
+export async function approveRun(runId: string): Promise<Run> {
+  return request<Run>(`/runs/${runId}/approve`, {
+    method: "POST",
+  });
+}
+
+export async function discardRun(runId: string): Promise<Run> {
+  return request<Run>(`/runs/${runId}/discard`, {
+    method: "POST",
+  });
+}
+
 export async function rebuildPreview(workspaceId: string): Promise<void> {
   await request(`/workspaces/${workspaceId}/preview/rebuild`, {
+    method: "POST",
+  });
+}
+
+export async function rollbackRun(runId: string): Promise<Run> {
+  return request<Run>(`/runs/${runId}/rollback`, {
     method: "POST",
   });
 }

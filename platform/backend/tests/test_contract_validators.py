@@ -46,6 +46,7 @@ from app.models.grounded_spec import (
     FlowStep,
 )
 from app.validators.app_ir_validator import AppIRValidator
+from app.validators.build_validator import BuildValidator
 from app.validators.grounded_spec_validator import GroundedSpecValidator
 
 
@@ -339,6 +340,51 @@ def make_valid_ir() -> AppIRModel:
     )
 
 
+def _write_workspace_file(workspace_root: Path, relative_path: str, content: str) -> None:
+    destination = workspace_root / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(content, encoding="utf-8")
+
+
+def _create_workspace_scaffold(workspace_root: Path) -> None:
+    _write_workspace_file(workspace_root, "backend/app/main.py", "app = object()\n")
+    _write_workspace_file(workspace_root, "backend/requirements.txt", "fastapi\n")
+    _write_workspace_file(workspace_root, "frontend/package.json", '{ "name": "test-app" }\n')
+    _write_workspace_file(workspace_root, "frontend/src/main.tsx", "export {};\n")
+    _write_workspace_file(workspace_root, "frontend/src/app/App.tsx", "export function App(): JSX.Element { return <div />; }\n")
+    _write_workspace_file(workspace_root, "docker/docker-compose.yml", "services: {}\n")
+    _write_workspace_file(workspace_root, "artifacts/grounded_spec.json", "{}\n")
+
+
+def _multi_page_graph() -> dict:
+    return {
+        "flow_mode": "multi_page",
+        "roles": {
+            "client": {
+                "routes_file": "frontend/src/roles/client/ClientRoutes.tsx",
+                "pages": [
+                    {"route_path": "/", "file_path": "frontend/src/roles/client/pages/generated/ClientHomePage.tsx"},
+                    {"route_path": "/catalog", "file_path": "frontend/src/roles/client/pages/generated/ClientCatalogPage.tsx"},
+                ],
+            },
+            "specialist": {
+                "routes_file": "frontend/src/roles/specialist/SpecialistRoutes.tsx",
+                "pages": [
+                    {"route_path": "/", "file_path": "frontend/src/roles/specialist/pages/generated/SpecialistHomePage.tsx"},
+                    {"route_path": "/queue", "file_path": "frontend/src/roles/specialist/pages/generated/SpecialistQueuePage.tsx"},
+                ],
+            },
+            "manager": {
+                "routes_file": "frontend/src/roles/manager/ManagerRoutes.tsx",
+                "pages": [
+                    {"route_path": "/", "file_path": "frontend/src/roles/manager/pages/generated/ManagerHomePage.tsx"},
+                    {"route_path": "/dashboard", "file_path": "frontend/src/roles/manager/pages/generated/ManagerDashboardPage.tsx"},
+                ],
+            },
+        },
+    }
+
+
 def test_contract_files_exist_and_expose_required_keys() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     spec_contract = json.loads((repo_root / "contracts" / "grounded-spec.v1.json").read_text(encoding="utf-8"))
@@ -385,3 +431,64 @@ def test_app_ir_validator_blocks_trusted_user_input() -> None:
     result = AppIRValidator().validate(ir)
     assert result.valid is False
     assert any(issue.code == "ir.trusted_user_input" for issue in result.issues)
+
+
+def test_build_validator_accepts_distinct_multi_page_role_graph(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    graph = _multi_page_graph()
+    _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
+
+    _write_workspace_file(
+        workspace_root,
+        "frontend/src/roles/client/ClientRoutes.tsx",
+        "<Route index element={<ClientHomePage />} />\n<Route path=\"catalog\" element={<ClientCatalogPage />} />\n<Route path=\"*\" element={<Navigate to=\"/\" replace />} />\n",
+    )
+    _write_workspace_file(
+        workspace_root,
+        "frontend/src/roles/specialist/SpecialistRoutes.tsx",
+        "<Route index element={<SpecialistHomePage />} />\n<Route path=\"queue\" element={<SpecialistQueuePage />} />\n<Route path=\"*\" element={<Navigate to=\"/\" replace />} />\n",
+    )
+    _write_workspace_file(
+        workspace_root,
+        "frontend/src/roles/manager/ManagerRoutes.tsx",
+        "<Route index element={<ManagerHomePage />} />\n<Route path=\"dashboard\" element={<ManagerDashboardPage />} />\n<Route path=\"*\" element={<Navigate to=\"/\" replace />} />\n",
+    )
+
+    _write_workspace_file(workspace_root, "frontend/src/roles/client/pages/generated/ClientHomePage.tsx", "export function ClientHomePage(): JSX.Element { return <div>book a new consultation</div>; }\n")
+    _write_workspace_file(workspace_root, "frontend/src/roles/client/pages/generated/ClientCatalogPage.tsx", "export function ClientCatalogPage(): JSX.Element { return <div>client catalog</div>; }\n")
+    _write_workspace_file(workspace_root, "frontend/src/roles/specialist/pages/generated/SpecialistHomePage.tsx", "export function SpecialistHomePage(): JSX.Element { return <div>process the live queue</div>; }\n")
+    _write_workspace_file(workspace_root, "frontend/src/roles/specialist/pages/generated/SpecialistQueuePage.tsx", "export function SpecialistQueuePage(): JSX.Element { return <div>specialist queue</div>; }\n")
+    _write_workspace_file(workspace_root, "frontend/src/roles/manager/pages/generated/ManagerHomePage.tsx", "export function ManagerHomePage(): JSX.Element { return <div>supervise operational health</div>; }\n")
+    _write_workspace_file(workspace_root, "frontend/src/roles/manager/pages/generated/ManagerDashboardPage.tsx", "export function ManagerDashboardPage(): JSX.Element { return <div>manager dashboard</div>; }\n")
+
+    issues = BuildValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+    assert "build.placeholder_role_surface" not in issue_codes
+    assert "build.placeholder_page" not in issue_codes
+    assert "build.identical_role_pages" not in issue_codes
+
+
+def test_build_validator_flags_placeholder_and_identical_role_pages(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    graph = _multi_page_graph()
+    _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
+
+    placeholder_routes = "import { RoleCabinetHomePage } from '@/shared/ui/templates/RoleCabinetHomePage';\n<Route index element={<RoleCabinetHomePage role=\"client\" />} />\n"
+    _write_workspace_file(workspace_root, "frontend/src/roles/client/ClientRoutes.tsx", placeholder_routes)
+    _write_workspace_file(workspace_root, "frontend/src/roles/specialist/SpecialistRoutes.tsx", placeholder_routes)
+    _write_workspace_file(workspace_root, "frontend/src/roles/manager/ManagerRoutes.tsx", placeholder_routes)
+
+    identical_root = "export function SharedHome(): JSX.Element { return <div>Role dashboard</div>; }\n"
+    _write_workspace_file(workspace_root, "frontend/src/roles/client/pages/generated/ClientHomePage.tsx", identical_root)
+    _write_workspace_file(workspace_root, "frontend/src/roles/client/pages/generated/ClientCatalogPage.tsx", "export function ClientCatalogPage(): JSX.Element { return <div>catalog</div>; }\n")
+    _write_workspace_file(workspace_root, "frontend/src/roles/specialist/pages/generated/SpecialistHomePage.tsx", identical_root)
+    _write_workspace_file(workspace_root, "frontend/src/roles/specialist/pages/generated/SpecialistQueuePage.tsx", "export function SpecialistQueuePage(): JSX.Element { return <div>queue</div>; }\n")
+    _write_workspace_file(workspace_root, "frontend/src/roles/manager/pages/generated/ManagerHomePage.tsx", identical_root)
+    _write_workspace_file(workspace_root, "frontend/src/roles/manager/pages/generated/ManagerDashboardPage.tsx", "export function ManagerDashboardPage(): JSX.Element { return <div>dashboard</div>; }\n")
+
+    issues = BuildValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+    assert "build.placeholder_role_surface" in issue_codes
+    assert "build.identical_role_pages" in issue_codes

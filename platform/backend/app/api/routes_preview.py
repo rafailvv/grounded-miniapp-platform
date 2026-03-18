@@ -32,6 +32,7 @@ def get_preview_url(workspace_id: str, container: ServiceContainer = Depends(get
         "role_urls": container.preview_service.role_urls(workspace_id),
         "runtime_mode": preview.runtime_mode,
         "status": preview.status,
+        "draft_run_id": preview.draft_run_id,
     }
 
 
@@ -47,9 +48,10 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
     validation = container.generation_service.current_report(workspace_id, "validation")
     assumptions = container.generation_service.current_report(workspace_id, "assumptions")
     traceability = container.generation_service.current_report(workspace_id, "traceability")
-    artifact_plan = container.generation_service.current_report(workspace_id, "artifact_plan")
     spec = container.generation_service.current_report(workspace_id, "spec")
-    ir = container.generation_service.current_report(workspace_id, "ir")
+    iterations = container.generation_service.current_report(workspace_id, "iterations")
+    candidate_diff = container.generation_service.current_report(workspace_id, "candidate_diff")
+    check_results = container.generation_service.current_report(workspace_id, "check_results")
     trace = container.generation_service.current_report(workspace_id, "trace")
 
     return {
@@ -61,24 +63,21 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
             "runtime_mode": preview.runtime_mode,
             "url": preview.url,
             "logs": preview.logs,
+            "draft_run_id": preview.draft_run_id,
         },
         "reports": {
             "trace": trace,
             "validation": validation,
             "assumptions": assumptions,
             "traceability": traceability,
-            "artifact_plan": artifact_plan,
+            "iterations": iterations,
+            "candidate_diff": candidate_diff,
+            "check_results": check_results,
             "spec_summary": {
                 "product_goal": spec.get("product_goal") if spec else None,
                 "actors": len(spec.get("actors", [])) if spec else 0,
                 "flows": len(spec.get("user_flows", [])) if spec else 0,
                 "api_requirements": len(spec.get("api_requirements", [])) if spec else 0,
-            },
-            "ir_summary": {
-                "screens": len(ir.get("screens", [])) if ir else 0,
-                "route_groups": len(ir.get("route_groups", [])) if ir else 0,
-                "integrations": len(ir.get("integrations", [])) if ir else 0,
-                "actions": sum(len(screen.get("actions", [])) for screen in ir.get("screens", [])) if ir else 0,
             },
         },
     }
@@ -88,10 +87,16 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
 def render_preview(
     workspace_id: str,
     role: str = "client",
+    run_id: str | None = None,
     container: ServiceContainer = Depends(get_container),
 ) -> HTMLResponse:
     try:
-        html = container.preview_service.render_html(workspace_id, container.workspace_service.source_dir(workspace_id), role)
-    except KeyError as exc:
+        source_dir = (
+            container.workspace_service.draft_source_dir(workspace_id, run_id)
+            if run_id and container.workspace_service.draft_exists(workspace_id, run_id)
+            else container.workspace_service.source_dir(workspace_id)
+        )
+        html = container.preview_service.render_html(workspace_id, source_dir, role)
+    except (KeyError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return HTMLResponse(html)

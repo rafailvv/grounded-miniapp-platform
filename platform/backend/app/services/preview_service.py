@@ -26,11 +26,12 @@ class PreviewService:
         self.workspace_service = workspace_service
         self.runtime_manager = runtime_manager
 
-    def start(self, workspace_id: str) -> PreviewRecord:
+    def start(self, workspace_id: str, source_dir: Path | None = None, draft_run_id: str | None = None) -> PreviewRecord:
         preview = self._get_or_create(workspace_id)
-        source_dir = self.workspace_service.source_dir(workspace_id)
+        source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
         runtime_mode = self.runtime_manager.preferred_mode()
         preview.runtime_mode = runtime_mode
+        preview.draft_run_id = draft_run_id
         preview.updated_at = datetime.now(timezone.utc)
         try:
             proxy_port = preview.proxy_port or self.runtime_manager.allocate_port(workspace_id)
@@ -54,11 +55,12 @@ class PreviewService:
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
         return preview
 
-    def rebuild(self, workspace_id: str) -> PreviewRecord:
+    def rebuild(self, workspace_id: str, source_dir: Path | None = None, draft_run_id: str | None = None) -> PreviewRecord:
         preview = self._get_or_create(workspace_id)
-        source_dir = self.workspace_service.source_dir(workspace_id)
+        source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
         runtime_mode = self.runtime_manager.preferred_mode()
         preview.runtime_mode = runtime_mode
+        preview.draft_run_id = draft_run_id
         preview.updated_at = datetime.now(timezone.utc)
         try:
             proxy_port = preview.proxy_port or self.runtime_manager.allocate_port(workspace_id)
@@ -96,6 +98,7 @@ class PreviewService:
         else:
             preview.status = "stopped"
             preview.logs.append("No external preview session to reset.")
+        preview.draft_run_id = None
         preview.updated_at = datetime.now(timezone.utc)
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
         return preview
@@ -115,10 +118,15 @@ class PreviewService:
             preview.project_name = None
             preview.logs.append("Legacy inline preview was disabled. Start the docker runtime preview.")
         if preview.runtime_mode == "docker" and preview.proxy_port is not None:
+            log_source_dir = (
+                self.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
+                if preview.draft_run_id and self.workspace_service.draft_exists(workspace_id, preview.draft_run_id)
+                else self.workspace_service.source_dir(workspace_id)
+            )
             try:
                 preview.logs = self.runtime_manager.collect_logs(
                     workspace_id,
-                    self.workspace_service.source_dir(workspace_id),
+                    log_source_dir,
                     preview.proxy_port,
                 )
             except Exception as exc:
@@ -133,16 +141,14 @@ class PreviewService:
         return {role: f"{preview.url}?role={role}" for role in ROLE_ORDER}
 
     def render_html(self, workspace_id: str, source_dir: Path, role: str = "client") -> str:
-        role_seed_path = source_dir / "backend" / "app" / "generated" / "role_seed.json"
-        payload = {"roles": {}}
-        if role_seed_path.exists():
-            payload = json.loads(role_seed_path.read_text(encoding="utf-8"))
+        payload = self._preview_payload_from_source(source_dir)
         selected_role = role if role in ROLE_ORDER else "client"
         role_payload = payload.get("roles", {}).get(selected_role, {})
         title = role_payload.get("title", f"{selected_role.title()} preview")
         description = role_payload.get("description", "Preview not generated yet")
         feature_text = role_payload.get("feature_text", "Role experience is not generated yet.")
         metrics = role_payload.get("metrics", [])
+        pages = role_payload.get("pages", [])
         primary_action = role_payload.get("primary_action_label", "Open role")
         secondary_action = role_payload.get("secondary_action_label", "Open profile")
         return f"""<!doctype html>
@@ -238,16 +244,35 @@ class PreviewService:
           const role = {json.dumps(selected_role)};
           const rolePayload = (config.roles || {{}})[role] || {{}};
           const app = document.getElementById("app");
-          const state = {{ profileOpen: false }};
+          const state = {{ profileOpen: false, selectedPageId: ((rolePayload.pages || [])[0] || {{}}).page_id || '' }};
           const metrics = rolePayload.metrics || [];
+          const pages = rolePayload.pages || [];
 
           function render() {{
+            const selectedPage = pages.find((page) => page.page_id === state.selectedPageId) || pages[0] || null;
             const metricsHtml = metrics.map((metric) => `
               <div style="border:1px solid var(--border); border-radius:16px; padding:12px;">
                 <div class="helper">${{metric.label}}</div>
                 <strong style="font-size:24px;">${{metric.value}}</strong>
               </div>
             `).join("");
+            const pageTabs = pages.map((page) => `
+              <button
+                data-page-id="${{page.page_id}}"
+                style="background:${{selectedPage && selectedPage.page_id === page.page_id ? 'linear-gradient(135deg, var(--accent), #0a9396)' : 'white'}}; color:${{selectedPage && selectedPage.page_id === page.page_id ? 'white' : 'var(--ink)'}}; border:1px solid var(--border); margin:0 8px 8px 0;"
+              >
+                ${{page.title}}
+              </button>
+            `).join("");
+            const pageDetails = selectedPage ? `
+              <div style="display:grid; gap:12px; margin-top:16px;">
+                <div style="border:1px solid var(--border); border-radius:16px; padding:14px;">
+                  <strong>${{selectedPage.title}}</strong>
+                  <p class="helper" style="margin:8px 0 0;">${{selectedPage.description || ''}}</p>
+                  <div class="helper" style="margin-top:8px;">Route: ${{selectedPage.route_path}}</div>
+                </div>
+              </div>
+            ` : '';
             const profile = rolePayload.profile || {{}};
             const profileHtml = state.profileOpen ? `
               <div style="display:grid; gap:10px; margin-top:16px;">
@@ -259,9 +284,11 @@ class PreviewService:
             app.innerHTML = `
               <h2 style="margin-top:0;">${{rolePayload.title || role}}</h2>
               <p class="helper">{feature_text}</p>
+              ${{pages.length ? `<div style="margin:14px 0 6px;">${{pageTabs}}</div>` : ''}}
               <div style="display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:10px; margin:16px 0;">
                 ${{metricsHtml}}
               </div>
+              ${{pageDetails}}
               <button data-action="primary">{primary_action}</button>
               <button data-action="secondary" style="margin-left:8px; background: linear-gradient(135deg, var(--accent-2), #f4a261);">{secondary_action}</button>
               ${{profileHtml}}
@@ -277,11 +304,75 @@ class PreviewService:
                 render();
               }});
             }}
+            app.querySelectorAll('[data-page-id]').forEach((button) => {{
+              button.addEventListener('click', () => {{
+                state.selectedPageId = button.getAttribute('data-page-id') || '';
+                render();
+              }});
+            }});
           }}
           render();
         </script>
       </body>
 </html>"""
+
+    @staticmethod
+    def _preview_payload_from_source(source_dir: Path) -> dict[str, object]:
+        generated_graph_path = source_dir / "artifacts" / "generated_app_graph.json"
+        if generated_graph_path.exists():
+            graph = json.loads(generated_graph_path.read_text(encoding="utf-8"))
+            roles: dict[str, dict[str, object]] = {}
+            for role in ROLE_ORDER:
+                role_payload = (graph.get("roles") or {}).get(role) or {}
+                pages = role_payload.get("pages") or []
+                roles[role] = {
+                    "title": str(graph.get("app_title") or role.title()),
+                    "description": str(graph.get("summary") or ""),
+                    "feature_text": str(graph.get("summary") or ""),
+                    "primary_action_label": pages[1]["title"] if len(pages) > 1 else "Open role",
+                    "secondary_action_label": "Profile",
+                    "metrics": [
+                        {"metric_id": "pages", "label": "Pages", "value": str(len(pages))},
+                        {"metric_id": "routes", "label": "Routes", "value": str(len(pages))},
+                    ],
+                    "pages": pages,
+                    "profile": {
+                        "first_name": "Иван",
+                        "email": "",
+                        "phone": "",
+                    },
+                }
+            return {"roles": roles}
+
+        role_seed_path = source_dir / "backend" / "app" / "generated" / "role_seed.json"
+        if role_seed_path.exists():
+            return json.loads(role_seed_path.read_text(encoding="utf-8"))
+
+        grounded_spec_path = source_dir / "artifacts" / "grounded_spec.json"
+        if grounded_spec_path.exists():
+            spec = json.loads(grounded_spec_path.read_text(encoding="utf-8"))
+            goal = str(spec.get("product_goal") or "Generated mini-app preview")
+            roles = {}
+            for role in ROLE_ORDER:
+                roles[role] = {
+                    "title": f"{role.title()} workspace",
+                    "description": goal,
+                    "feature_text": goal,
+                    "primary_action_label": "Open role",
+                    "secondary_action_label": "Profile",
+                    "metrics": [
+                        {"metric_id": "scope", "label": "Flows", "value": str(len(spec.get("user_flows", [])))},
+                        {"metric_id": "docs", "label": "Sources", "value": str(len(spec.get("doc_refs", [])))},
+                    ],
+                    "profile": {
+                        "first_name": "Иван",
+                        "email": "",
+                        "phone": "",
+                    },
+                }
+            return {"roles": roles}
+
+        return {"roles": {}}
 
     def _get_or_create(self, workspace_id: str) -> PreviewRecord:
         payload = self.store.get("previews", workspace_id)

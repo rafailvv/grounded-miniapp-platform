@@ -11,6 +11,8 @@ import {
   listWorkspaces,
   openWorkspace,
   rebuildPreview,
+  rollbackRun,
+  stopRun,
   request,
   Run,
   RunArtifacts,
@@ -37,6 +39,7 @@ type PreviewInfo = {
   role_urls?: Record<string, string>;
   runtime_mode?: string;
   status?: string;
+  draft_run_id?: string | null;
 };
 
 function formatLogSection(title: string, lines: string[]): string {
@@ -97,6 +100,57 @@ function formatTimestamp(value?: string): string {
     return value;
   }
   return date.toLocaleString();
+}
+
+function clampText(value: string, maxLength = 180): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function formatRoleScope(scope: RoleKey[]): string {
+  if (!scope.length) {
+    return "all roles";
+  }
+  return scope.map((role) => ROLE_LABELS[role]).join(", ");
+}
+
+function extractPreviewErrorMessage(logs?: string[] | null): string {
+  if (!logs?.length) {
+    return "Preview runtime failed to start.";
+  }
+  const lastMeaningful = [...logs].reverse().find((line) => line.trim());
+  return lastMeaningful ?? "Preview runtime failed to start.";
+}
+
+function displayRunStatus(run: Run | null): string {
+  if (!run) {
+    return "idle";
+  }
+  if (run.rolled_back) {
+    return "rolled_back";
+  }
+  if (run.apply_status === "rolled_back") {
+    return "rolled_back";
+  }
+  if (run.status === "running" && run.current_stage === "stopping") {
+    return "stopping";
+  }
+  if (run.status === "failed" || run.current_stage === "failed") {
+    return "failed";
+  }
+  if (run.status === "blocked" || run.current_stage === "blocked") {
+    return "blocked";
+  }
+  if (run.status === "awaiting_approval") {
+    return "awaiting_approval";
+  }
+  if (run.status === "completed") {
+    return "completed";
+  }
+  return run.status;
 }
 
 function ensureChildrenMap(node: FileTreeNode): Map<string, FileTreeNode> {
@@ -236,6 +290,7 @@ export default function App() {
   const [initializing, setInitializing] = useState(true);
   const [systemConfig, setSystemConfig] = useState<SystemConfiguration | null>(null);
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
+  const [selectedGenerationMode, setSelectedGenerationMode] = useState<"quality" | "balanced">("quality");
   const [selectedRoles, setSelectedRoles] = useState<Record<RoleKey, boolean>>({
     client: true,
     specialist: true,
@@ -243,9 +298,10 @@ export default function App() {
   });
   const [runs, setRuns] = useState<Run[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
+  const [runDetailsOpen, setRunDetailsOpen] = useState(false);
   const [runArtifacts, setRunArtifacts] = useState<RunArtifacts | null>(null);
   const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
-  const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "research" | "logs">("preview");
+  const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "logs">("preview");
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
   const [fileContent, setFileContent] = useState("");
@@ -277,6 +333,7 @@ export default function App() {
     manager: ROOT_PREVIEW_PATH,
   });
   const [previewBooting, setPreviewBooting] = useState(false);
+  const [stoppingRunId, setStoppingRunId] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const previewTimeoutsRef = useRef<Record<string, number | undefined>>({});
@@ -372,7 +429,7 @@ export default function App() {
       return;
     }
     const activeRun = runs.find((item) => item.run_id === selectedRunId);
-    if (activeRun && !["completed", "blocked", "failed"].includes(activeRun.status)) {
+    if (activeRun && !["awaiting_approval", "completed", "blocked", "failed"].includes(activeRun.status)) {
       setRunArtifacts(null);
       return;
     }
@@ -395,6 +452,30 @@ export default function App() {
   }, [runs, selectedRunId]);
 
   useEffect(() => {
+    if (!workspace) {
+      return;
+    }
+    const activeRun = runs.find((item) => item.run_id === selectedRunId);
+    const runId = activeRun?.draft_ready || activeRun?.status === "awaiting_approval" ? activeRun.run_id : "";
+    let cancelled = false;
+    void (async () => {
+      try {
+        const nextFiles = await request<FileEntry[]>(
+          `/workspaces/${workspace.workspace_id}/files/tree${runId ? `?run_id=${encodeURIComponent(runId)}` : ""}`,
+        );
+        if (!cancelled) {
+          setFiles(nextFiles);
+        }
+      } catch {
+        // Keep the last file tree if the selected run has no draft.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [runs, selectedRunId, workspace]);
+
+  useEffect(() => {
     return () => {
       Object.values(previewTimeoutsRef.current).forEach((timeoutId) => {
         if (timeoutId) {
@@ -403,6 +484,19 @@ export default function App() {
       });
     };
   }, []);
+
+  useEffect(() => {
+    if (!runDetailsOpen) {
+      return;
+    }
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setRunDetailsOpen(false);
+      }
+    }
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [runDetailsOpen]);
 
   useEffect(() => {
     if (!previewUrl) {
@@ -427,6 +521,7 @@ export default function App() {
   }, [workspaceSearch, workspaces]);
   const selectedRun = useMemo(() => runs.find((item) => item.run_id === selectedRunId) ?? runs[0] ?? null, [runs, selectedRunId]);
   const topbarRun = selectedRun ?? null;
+  const topbarStatus = displayRunStatus(topbarRun);
   const touchedFilesCount = topbarRun?.touched_files.length ?? 0;
   const editorStats = useMemo(() => {
     const lines = fileContent ? fileContent.split("\n").length : 0;
@@ -456,14 +551,19 @@ export default function App() {
     () => ROLE_ORDER.filter((role) => selectedRoles[role]),
     [selectedRoles],
   );
-  const diffText = runArtifacts?.diff ?? "";
+  const draftContextRunId = selectedRun?.draft_ready || selectedRun?.status === "awaiting_approval" ? selectedRun.run_id : "";
+  const diffText = runArtifacts?.candidate_diff ?? runArtifacts?.diff ?? "";
   const showGlobalLoader = initializing || creatingWorkspace || (workspaceTransitioning && !workspace);
-  const groundedActorsCount = Array.isArray((runArtifacts?.grounded_spec as { actors?: unknown[] } | null | undefined)?.actors)
-    ? ((runArtifacts?.grounded_spec as { actors?: unknown[] }).actors ?? []).length
-    : 0;
-  const appIrScreensCount = Array.isArray((runArtifacts?.app_ir as { screens?: unknown[] } | null | undefined)?.screens)
-    ? ((runArtifacts?.app_ir as { screens?: unknown[] }).screens ?? []).length
-    : 0;
+  const runDetailSummary =
+    runArtifacts?.final_summary ??
+    runArtifacts?.job?.summary ??
+    selectedRun?.summary ??
+    selectedRun?.failure_reason ??
+    "";
+  const previewErrorMessage = useMemo(
+    () => extractPreviewErrorMessage(workspaceLogs?.preview?.logs ?? runArtifacts?.preview?.logs ?? []),
+    [runArtifacts?.preview?.logs, workspaceLogs?.preview?.logs],
+  );
   const logOutput = useMemo(() => {
     const jobLines = [
       `status: ${workspaceLogs?.job?.status ?? topbarRun?.status ?? "idle"}`,
@@ -517,8 +617,42 @@ export default function App() {
 
       const refreshErrors: string[] = [];
       let nextRuns: Run[] = [];
+      let nextSelectedRunId = "";
 
-      if (treeResult.status === "fulfilled") {
+      if (runsResult.status === "fulfilled") {
+        nextRuns = runsResult.value;
+        setRuns(nextRuns);
+        nextSelectedRunId =
+          preferredRunId && nextRuns.some((run) => run.run_id === preferredRunId)
+            ? preferredRunId
+            : selectedRunId && nextRuns.some((run) => run.run_id === selectedRunId)
+              ? selectedRunId
+              : nextRuns[0]?.run_id ?? "";
+        setSelectedRunId(nextSelectedRunId);
+      } else {
+        refreshErrors.push(`runs: ${runsResult.reason instanceof Error ? runsResult.reason.message : "failed to load"}`);
+      }
+
+      const selectedRunForTree = nextRuns.find((run) => run.run_id === nextSelectedRunId);
+      const draftTreeRunId = selectedRunForTree?.draft_ready || selectedRunForTree?.status === "awaiting_approval" ? selectedRunForTree.run_id : "";
+      if (draftTreeRunId) {
+        try {
+          const draftTree = await withTimeout(
+            request<FileEntry[]>(`/workspaces/${workspaceId}/files/tree?run_id=${encodeURIComponent(draftTreeRunId)}`),
+            WORKSPACE_REQUEST_TIMEOUT_MS,
+            "draft files",
+          );
+          setFiles(draftTree);
+          setExpandedDirectories((current) => {
+            if (current.size > 0) {
+              return current;
+            }
+            return new Set(collectExpandedDirectories(buildFileTree(draftTree)).slice(0, 10));
+          });
+        } catch (err) {
+          refreshErrors.push(`files: ${err instanceof Error ? err.message : "failed to load draft files"}`);
+        }
+      } else if (treeResult.status === "fulfilled") {
         setFiles(treeResult.value);
         setExpandedDirectories((current) => {
           if (current.size > 0) {
@@ -528,20 +662,6 @@ export default function App() {
         });
       } else {
         refreshErrors.push(`files: ${treeResult.reason instanceof Error ? treeResult.reason.message : "failed to load"}`);
-      }
-
-      if (runsResult.status === "fulfilled") {
-        nextRuns = runsResult.value;
-        setRuns(nextRuns);
-        const nextSelectedRunId =
-          preferredRunId && nextRuns.some((run) => run.run_id === preferredRunId)
-            ? preferredRunId
-            : selectedRunId && nextRuns.some((run) => run.run_id === selectedRunId)
-              ? selectedRunId
-              : nextRuns[0]?.run_id ?? "";
-        setSelectedRunId(nextSelectedRunId);
-      } else {
-        refreshErrors.push(`runs: ${runsResult.reason instanceof Error ? runsResult.reason.message : "failed to load"}`);
       }
 
       if (logsResult.status === "fulfilled") {
@@ -642,7 +762,7 @@ export default function App() {
         apply_strategy: "staged_auto_apply",
         target_role_scope: activeRoleScope,
         model_profile: systemConfig?.default_coding_profile ?? systemConfig?.defaults.model_profile ?? "openai_code_fast",
-        generation_mode: systemConfig?.defaults.generation_mode ?? "quality",
+        generation_mode: selectedGenerationMode,
       });
       setRuns((current) => [run, ...current.filter((item) => item.run_id !== run.run_id)]);
       setSelectedRunId(run.run_id);
@@ -664,7 +784,9 @@ export default function App() {
     }
     setSelectedPath(path);
     const payload = await request<{ path: string; content: string }>(
-      `/workspaces/${workspace.workspace_id}/files/content?path=${encodeURIComponent(path)}`,
+      `/workspaces/${workspace.workspace_id}/files/content?path=${encodeURIComponent(path)}${
+        draftContextRunId ? `&run_id=${encodeURIComponent(draftContextRunId)}` : ""
+      }`,
     );
     setFileContent(payload.content);
     setActiveTab("code");
@@ -700,7 +822,7 @@ export default function App() {
           setWorkspaceLogs(logsResult.value);
         }
 
-        if (["completed", "blocked", "failed"].includes(currentRun.status)) {
+        if (["awaiting_approval", "completed", "blocked", "failed"].includes(currentRun.status)) {
           await refreshWorkspaceState(workspaceId, runId);
           try {
             setRunArtifacts(await getRunArtifacts(runId));
@@ -730,6 +852,7 @@ export default function App() {
         body: JSON.stringify({
           relative_path: selectedPath,
           content: fileContent,
+          run_id: draftContextRunId || undefined,
         }),
       });
       await refreshWorkspaceState(workspace.workspace_id, selectedRunId);
@@ -936,6 +1059,44 @@ export default function App() {
     await rebuildWorkspacePreview(workspace.workspace_id);
   }
 
+  async function handleRollbackRun(runId: string) {
+    if (!workspace) {
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const rolledBackRun = await rollbackRun(runId);
+      const rolledBackWorkspace = await openWorkspace(workspace.workspace_id);
+      setWorkspace(rolledBackWorkspace);
+      setWorkspaces((current) =>
+        current.map((item) => (item.workspace_id === rolledBackWorkspace.workspace_id ? rolledBackWorkspace : item)),
+      );
+      setRuns((current) => current.map((item) => (item.run_id === rolledBackRun.run_id ? rolledBackRun : item)));
+      setSelectedRunId(rolledBackRun.run_id);
+      await refreshWorkspaceState(rolledBackWorkspace.workspace_id);
+      setRunArtifacts(await getRunArtifacts(rolledBackRun.run_id));
+      await rebuildWorkspacePreview(rolledBackWorkspace.workspace_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to roll back run.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleStopRun(runId: string) {
+    setError("");
+    setStoppingRunId(runId);
+    try {
+      const stoppedRun = await stopRun(runId);
+      setRuns((current) => current.map((run) => (run.run_id === stoppedRun.run_id ? stoppedRun : run)));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to stop run.");
+    } finally {
+      setStoppingRunId("");
+    }
+  }
+
   function handleRefreshRolePreview(role: RoleKey) {
     if (!previewUrl) {
       return;
@@ -963,6 +1124,11 @@ export default function App() {
     setSelectedRoles((current) => ({ ...current, [role]: !current[role] }));
   }
 
+  function openRunDetails(runId: string) {
+    setSelectedRunId(runId);
+    setRunDetailsOpen(true);
+  }
+
   return (
     <div className="page">
       {showGlobalLoader ? (
@@ -982,6 +1148,10 @@ export default function App() {
       <div
         className={`issues-drawer-backdrop ${issuesDrawerOpen ? "is-open" : ""}`}
         onClick={() => setIssuesDrawerOpen(false)}
+      />
+      <div
+        className={`run-details-backdrop ${runDetailsOpen ? "is-open" : ""}`}
+        onClick={() => setRunDetailsOpen(false)}
       />
       <aside className={`workspace-drawer ${workspaceDrawerOpen ? "is-open" : ""}`} aria-hidden={!workspaceDrawerOpen}>
         <div className="workspace-drawer-head">
@@ -1039,6 +1209,139 @@ export default function App() {
           ))}
         </div>
       </aside>
+      <aside className={`run-details-modal ${runDetailsOpen ? "is-open" : ""}`} aria-hidden={!runDetailsOpen}>
+        <div className="run-details-head">
+          <div className="run-details-head-copy">
+            <strong>Run Details</strong>
+            <span>{selectedRun ? formatTimestamp(selectedRun.created_at) : "No run selected"}</span>
+          </div>
+          <button type="button" className="icon-btn ghost" aria-label="Close run details" onClick={() => setRunDetailsOpen(false)}>
+            ×
+          </button>
+        </div>
+        {selectedRun ? (
+          <div className="run-details-body">
+            <div className="run-details-grid">
+              <div className="run-detail-card">
+                <span>Status</span>
+                <strong>{displayRunStatus(selectedRun)}</strong>
+              </div>
+              <div className="run-detail-card">
+                <span>Stage</span>
+                <strong>{selectedRun.current_stage || "n/a"}</strong>
+              </div>
+              <div className="run-detail-card">
+                <span>Role scope</span>
+                <strong>{formatRoleScope(selectedRun.target_role_scope)}</strong>
+              </div>
+              <div className="run-detail-card">
+                <span>Files touched</span>
+                <strong>{selectedRun.touched_files.length}</strong>
+              </div>
+              <div className="run-detail-card">
+                <span>Iterations</span>
+                <strong>{selectedRun.iteration_count}</strong>
+              </div>
+              <div className="run-detail-card">
+                <span>Apply status</span>
+                <strong>{selectedRun.apply_status}</strong>
+              </div>
+            </div>
+
+            <section className="run-detail-section">
+              <h4>Prompt</h4>
+              <pre className="json-block">{selectedRun.prompt}</pre>
+            </section>
+
+            {runDetailSummary ? (
+              <section className="run-detail-section">
+                <h4>Summary</h4>
+                <p>{runDetailSummary}</p>
+              </section>
+            ) : null}
+
+            {selectedRun.failure_reason ? (
+              <section className="run-detail-section">
+                <h4>Failure reason</h4>
+                <p>{selectedRun.failure_reason}</p>
+              </section>
+            ) : null}
+
+            <section className="run-detail-section">
+              <h4>Checks</h4>
+              <div className="run-details-grid">
+                <div className="run-detail-card">
+                  <span>Validators</span>
+                  <strong>{selectedRun.checks_summary.validators}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>Build</span>
+                  <strong>{selectedRun.checks_summary.build}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>Preview</span>
+                  <strong>{selectedRun.checks_summary.preview}</strong>
+                </div>
+              </div>
+              {selectedRun.checks_summary.issues.length ? (
+                <div className="run-detail-list">
+                  {selectedRun.checks_summary.issues.map((issue, index) => (
+                    <div key={`${issue.code ?? "issue"}-${index}`} className="run-detail-item">
+                      <strong>{issue.code ?? issue.severity ?? "issue"}</strong>
+                      <p>{issue.message ?? "Validator issue"}</p>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">No validator issues recorded.</p>
+              )}
+            </section>
+
+            <section className="run-detail-section">
+              <h4>Files</h4>
+              {selectedRun.touched_files.length ? (
+                <div className="run-detail-list">
+                  {selectedRun.touched_files.map((filePath) => (
+                    <div key={filePath} className="run-detail-item">
+                      <strong>{filePath}</strong>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">No files were changed.</p>
+              )}
+            </section>
+
+            <section className="run-detail-section">
+              <h4>Iterations</h4>
+              {runArtifacts?.iterations?.length ? (
+                <div className="run-detail-list">
+                  {runArtifacts.iterations.map((iteration) => (
+                    <div key={iteration.iteration_id} className="run-detail-item">
+                      <div className="run-detail-item-top">
+                        <strong>{formatTimestamp(iteration.created_at)}</strong>
+                        <span>{formatRoleScope(iteration.role_scope)}</span>
+                      </div>
+                      <p>{iteration.assistant_message}</p>
+                      {iteration.operations.length ? (
+                        <p>
+                          {iteration.operations.map((operation) => `${operation.operation} ${operation.file_path}`).join(", ")}
+                        </p>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">No iteration details recorded yet.</p>
+              )}
+            </section>
+          </div>
+        ) : (
+          <div className="run-details-body">
+            <p className="muted">Select a run to inspect its details.</p>
+          </div>
+        )}
+      </aside>
 
       <div className="page-scale">
         <div className="topbar">
@@ -1054,12 +1357,12 @@ export default function App() {
               <span />
             </button>
             <div className="topbar-title">
-              <p className="eyebrow">Grounded Research Workspace</p>
-              <h1 className="topbar-heading">AI code workspace for grounded mini-app generation</h1>
+              <p className="eyebrow">Agentic Mini-App Workspace</p>
+              <h1 className="topbar-heading">AI draft workspace for grounded mini-app code</h1>
             </div>
           </div>
           <div className="topbar-meta">
-            <div className="status-pill">run {topbarRun?.status ?? "idle"}</div>
+            <div className="status-pill">run {topbarStatus}</div>
             {visibleIssues.length ? (
               <button type="button" className="issues-pill" onClick={() => setIssuesDrawerOpen(true)}>
                 issues {visibleIssues.length}
@@ -1071,8 +1374,17 @@ export default function App() {
         <div className="layout">
         <section className="panel panel-chat">
           <header className="panel-header">
-            <h2>Task Composer</h2>
-            <p>Describe what to create or change. The platform plans code edits, applies them to the current workspace, then validates and previews the result.</p>
+            <div className="panel-header-row">
+              <h2>Task Input</h2>
+              <div className="panel-help">
+                <button type="button" className="panel-help-trigger" aria-label="Task input help">
+                  ?
+                </button>
+                <div className="panel-help-tooltip" role="tooltip">
+                  Describe what to build, change, or fix. You can paste build errors, preview failures, and stack traces for a minimal patch instead of a full rebuild.
+                </div>
+              </div>
+            </div>
           </header>
 
           <form onSubmit={handleRun} className="composer-form">
@@ -1082,7 +1394,7 @@ export default function App() {
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
                 rows={9}
-                placeholder="Describe the product change, workflow shift, or role-specific refinement."
+                placeholder="Describe the change, or paste an error like: Docker preview rebuild failed... Fix only this issue without rebuilding the whole app."
               />
             </label>
 
@@ -1106,8 +1418,16 @@ export default function App() {
               </div>
             </div>
 
+            <label className="composer-field">
+              <span>Generation mode</span>
+              <select value={selectedGenerationMode} onChange={(event) => setSelectedGenerationMode(event.target.value as "quality" | "balanced")}>
+                <option value="quality">Quality</option>
+                <option value="balanced">Balanced</option>
+              </select>
+            </label>
+
             <button className="generate-full" type="submit" disabled={!workspace || loading}>
-              {loading ? "Running..." : "Plan + Apply"}
+              {loading ? "Running..." : "Generate and apply"}
             </button>
           </form>
 
@@ -1120,35 +1440,79 @@ export default function App() {
             </div>
             <div className="run-list">
               {runs.length ? (
-                runs.map((run) => (
-                  <button
-                    key={run.run_id}
-                    type="button"
-                    className={`run-card ${selectedRunId === run.run_id ? "is-active" : ""}`}
-                    onClick={() => setSelectedRunId(run.run_id)}
-                  >
-                    <div className="run-card-top">
-                      <strong>{run.intent.replaceAll("_", " ")}</strong>
-                      <span className={`run-status ${run.status}`}>{run.status}</span>
+                runs.map((run) => {
+                  const runStatus = displayRunStatus(run);
+                  const canRollbackRun =
+                    Boolean(run.result_revision_id) &&
+                    run.status === "completed" &&
+                    run.apply_status === "applied" &&
+                    !run.rolled_back &&
+                    workspace?.current_revision_id === run.result_revision_id;
+                  const canStopRun = run.status === "running";
+                  const isStoppingRun = stoppingRunId === run.run_id || run.current_stage === "stopping";
+
+                  return (
+                    <div
+                      key={run.run_id}
+                      className={`run-card ${selectedRunId === run.run_id ? "is-active" : ""} ${run.rolled_back ? "is-muted" : ""}`}
+                    >
+                      <button
+                        type="button"
+                        className="run-card-select"
+                        onClick={() => openRunDetails(run.run_id)}
+                      >
+                        <div className="run-card-top">
+                          <strong>{run.intent.replaceAll("_", " ")}</strong>
+                          <span className={`run-status ${runStatus === "rolled_back" ? "rolled-back" : runStatus}`}>
+                            {runStatus}
+                          </span>
+                        </div>
+                        <p className="run-card-copy">{clampText(run.prompt, 120)}</p>
+                        <div className="run-progress">
+                          <div className="run-progress-bar">
+                            <div className="run-progress-fill" style={{ width: `${Math.max(4, run.progress_percent)}%` }} />
+                          </div>
+                          <div className="run-progress-meta">
+                            <span>{run.current_stage}</span>
+                            <span>{run.progress_percent}%</span>
+                          </div>
+                        </div>
+                        <div className="run-card-meta">
+                          <span>{formatTimestamp(run.created_at)}</span>
+                          <span>{run.touched_files.length} files</span>
+                        </div>
+                      </button>
+                      {run.status === "completed" || canStopRun ? (
+                        <div className="run-card-actions">
+                          {canStopRun ? (
+                            <button
+                              type="button"
+                              className="ghost-action run-card-action run-card-stop"
+                              onClick={() => {
+                                void handleStopRun(run.run_id);
+                              }}
+                              disabled={isStoppingRun}
+                            >
+                              {isStoppingRun ? "Stopping..." : "Stop"}
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            className="ghost-action run-card-action"
+                            onClick={() => {
+                              void handleRollbackRun(run.run_id);
+                            }}
+                            disabled={!canRollbackRun || loading}
+                          >
+                            {run.rolled_back ? "Rolled back" : "Rollback"}
+                          </button>
+                        </div>
+                      ) : null}
                     </div>
-                    <p>{run.prompt}</p>
-                    <div className="run-progress">
-                      <div className="run-progress-bar">
-                        <div className="run-progress-fill" style={{ width: `${Math.max(4, run.progress_percent)}%` }} />
-                      </div>
-                      <div className="run-progress-meta">
-                        <span>{run.current_stage}</span>
-                        <span>{run.progress_percent}%</span>
-                      </div>
-                    </div>
-                    <div className="run-card-meta">
-                      <span>{formatTimestamp(run.created_at)}</span>
-                      <span>{run.touched_files.length} files</span>
-                    </div>
-                  </button>
-                ))
+                  );
+                })
               ) : (
-                <p className="muted">No runs yet. Start with a prompt to create the first research trace.</p>
+                <p className="muted">No runs yet. Start with a prompt to create the first draft.</p>
               )}
             </div>
           </div>
@@ -1160,11 +1524,11 @@ export default function App() {
               <header>
                 <h2>Workspace Orchestrator</h2>
                 <p className="toolbar-subtitle">
-                  Preview stays live, but code, diff, and research artifacts are now first-class outputs of each run.
+                  Preview stays live while each run exposes a draft diff, editable files, and logs.
                 </p>
               </header>
               <div className="tabs">
-                {(["preview", "code", "diff", "research", "logs"] as const).map((tab) => (
+                {(["preview", "code", "diff", "logs"] as const).map((tab) => (
                   <button key={tab} type="button" className={tab === activeTab ? "active" : ""} onClick={() => setActiveTab(tab)}>
                     {tab}
                   </button>
@@ -1177,104 +1541,6 @@ export default function App() {
               </button>
             </div>
           </div>
-
-          {activeTab === "research" ? (
-            <div className="research-layout">
-              <div className="research-card">
-                <h3>Run Snapshot</h3>
-                {selectedRun ? (
-                  <div className="research-grid">
-                    <div>
-                      <span>Status</span>
-                      <strong>{selectedRun.status}</strong>
-                    </div>
-                    <div>
-                      <span>Intent</span>
-                      <strong>{selectedRun.intent}</strong>
-                    </div>
-                    <div>
-                      <span>Apply</span>
-                      <strong>{selectedRun.apply_status}</strong>
-                    </div>
-                    <div>
-                      <span>Model</span>
-                      <strong>{selectedRun.llm_model ?? selectedRun.model_profile}</strong>
-                    </div>
-                  </div>
-                ) : (
-                  <p className="muted">Select a run to inspect its research artifacts.</p>
-                )}
-              </div>
-
-              <div className="research-card">
-                <h3>Code Change Plan</h3>
-                {runArtifacts?.code_change_plan ? (
-                  <>
-                    <p>{runArtifacts.code_change_plan.summary}</p>
-                    <div className="tag-list">
-                      {(runArtifacts.code_change_plan.targets ?? []).map((target) => (
-                        <span key={`${target.file_path}-${target.operation}`} className="tag">
-                          {target.operation}: {target.file_path}
-                        </span>
-                      ))}
-                    </div>
-                    <div className="research-columns">
-                      <div>
-                        <h4>Risks</h4>
-                        {(runArtifacts.code_change_plan.risks ?? []).length ? (
-                          <ul className="plain-list">
-                            {(runArtifacts.code_change_plan.risks ?? []).map((risk) => (
-                              <li key={risk}>{risk}</li>
-                            ))}
-                          </ul>
-                        ) : (
-                          <p className="muted">No explicit risks recorded.</p>
-                        )}
-                      </div>
-                      <div>
-                        <h4>Acceptance Checks</h4>
-                        {(runArtifacts.code_change_plan.acceptance_checks ?? []).length ? (
-                          <ul className="plain-list">
-                            {(runArtifacts.code_change_plan.acceptance_checks ?? []).map((check) => (
-                              <li key={check}>{check}</li>
-                            ))}
-                          </ul>
-                        ) : (
-                          <p className="muted">No checks recorded.</p>
-                        )}
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <p className="muted">Code change plan will appear after the first run.</p>
-                )}
-              </div>
-
-              <div className="research-card">
-                <h3>Artifact Summary</h3>
-                <div className="research-grid">
-                  <div>
-                    <span>Grounded spec actors</span>
-                    <strong>{groundedActorsCount}</strong>
-                  </div>
-                  <div>
-                    <span>AppIR screens</span>
-                    <strong>{appIrScreensCount}</strong>
-                  </div>
-                  <div>
-                    <span>Trace entries</span>
-                    <strong>{runArtifacts?.trace?.entries?.length ?? 0}</strong>
-                  </div>
-                  <div>
-                    <span>Changed files</span>
-                    <strong>{selectedRun?.touched_files.length ?? 0}</strong>
-                  </div>
-                </div>
-                <pre className="json-block">{JSON.stringify(runArtifacts?.validation ?? {}, null, 2)}</pre>
-              </div>
-            </div>
-          ) : null}
-
           {activeTab === "code" ? (
             <div className="code-layout">
               <div className="code-files">
@@ -1392,7 +1658,14 @@ export default function App() {
                         ) : null}
                       </div>
                     </div>
-                    {previewUrl ? (
+                    {previewStatus === "error" ? (
+                      <div className="preview-loader preview-error" role="status" aria-live="polite">
+                        <div className="preview-loader-card preview-error-card">
+                          <strong>Preview failed</strong>
+                          <p>{previewErrorMessage}</p>
+                        </div>
+                      </div>
+                    ) : previewUrl ? (
                       <>
                         {previewLoading[role] ? (
                           <div className="preview-loader">
@@ -1419,6 +1692,14 @@ export default function App() {
                             }, 350)
                           }
                         />
+                        {previewFailed[role] ? (
+                          <div className="preview-loader preview-error" role="status" aria-live="polite">
+                            <div className="preview-loader-card preview-error-card">
+                              <strong>Preview did not load</strong>
+                              <p>{previewErrorMessage || "The runtime started, but this screen did not finish loading."}</p>
+                            </div>
+                          </div>
+                        ) : null}
                       </>
                     ) : (
                       <div className="preview-loader">

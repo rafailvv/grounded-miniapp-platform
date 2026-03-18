@@ -60,6 +60,18 @@ def reset_workspace(workspace_id: str, container: ServiceContainer = Depends(get
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/workspaces/{workspace_id}/rollback", response_model=WorkspaceRecord)
+def rollback_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> WorkspaceRecord:
+    try:
+        workspace = container.workspace_service.rollback_last_revision(workspace_id)
+        container.preview_service.rebuild(workspace_id)
+        return workspace
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.delete("/workspaces/{workspace_id}")
 def delete_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, str]:
     try:

@@ -21,7 +21,7 @@ class RevisionRecord(StrictModel):
     revision_id: str = Field(default_factory=lambda: new_id("rev"))
     commit_sha: str
     message: str
-    source: Literal["template_clone", "manual_edit", "ai_patch", "reset"]
+    source: Literal["template_clone", "manual_edit", "ai_patch", "reset", "rollback"]
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -82,13 +82,13 @@ class JobEvent(StrictModel):
         "retrieval_started",
         "spec_ready",
         "spec_blocked",
-        "ir_ready",
+        "planning_ready",
+        "iteration_ready",
         "validation_failed",
-        "artifact_plan_ready",
-        "patch_applied",
         "build_started",
         "repair_iteration",
         "preview_ready",
+        "draft_ready",
         "job_failed",
         "job_completed",
     ]
@@ -143,6 +143,7 @@ class PreviewRecord(StrictModel):
     proxy_port: int | None = None
     runtime_mode: Literal["inline", "docker"] = "docker"
     project_name: str | None = None
+    draft_run_id: str | None = None
     logs: list[str] = Field(default_factory=list)
     started_at: datetime | None = None
     updated_at: datetime = Field(default_factory=utc_now)
@@ -191,6 +192,7 @@ class GenerateRequest(StrictModel):
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
     generation_mode: GenerationMode = GenerationMode.QUALITY
     intent: Literal["auto", "create", "edit", "refine", "role_only_change"] = "auto"
+    target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
     model_profile: str = "openai_code_fast"
     linked_run_id: str | None = None
 
@@ -198,11 +200,45 @@ class GenerateRequest(StrictModel):
 class SaveFileRequest(StrictModel):
     relative_path: str
     content: str
+    run_id: str | None = None
+
+
+class DraftFileOperation(StrictModel):
+    operation_id: str = Field(default_factory=lambda: new_id("draft_op"))
+    file_path: str
+    operation: Literal["create", "replace", "delete"]
+    content: str | None = None
+    reason: str
+
+
+class RunCheckResult(StrictModel):
+    check_id: str = Field(default_factory=lambda: new_id("check"))
+    name: str
+    status: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
+    details: str | None = None
+
+
+class RunIterationOperation(StrictModel):
+    file_path: str
+    operation: Literal["create", "replace", "delete"]
+    reason: str
+
+
+class RunIterationRecord(StrictModel):
+    iteration_id: str = Field(default_factory=lambda: new_id("iter"))
+    run_id: str
+    assistant_message: str
+    files_read: list[str] = Field(default_factory=list)
+    operations: list[RunIterationOperation] = Field(default_factory=list)
+    check_results: list[RunCheckResult] = Field(default_factory=list)
+    diff_summary: str | None = None
+    role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class CodeChangeTarget(StrictModel):
     file_path: str
-    operation: Literal["create", "update", "delete"]
+    operation: Literal["create", "replace", "delete"]
     reason: str
     risk: Literal["low", "medium", "high"] = "medium"
 
@@ -221,9 +257,9 @@ class CodeChangePlan(StrictModel):
 
 
 class RunChecksSummary(StrictModel):
-    validators: Literal["pending", "passed", "failed", "blocked"] = "pending"
-    build: Literal["pending", "passed", "failed", "blocked"] = "pending"
-    preview: Literal["pending", "passed", "failed", "blocked"] = "pending"
+    validators: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
+    build: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
+    preview: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
     issues: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -240,8 +276,13 @@ class RunRecord(StrictModel):
     linked_job_id: str | None = None
     source_revision_id: str | None = None
     result_revision_id: str | None = None
+    candidate_revision_id: str | None = None
     status: Literal["pending", "running", "awaiting_approval", "completed", "blocked", "failed"] = "pending"
-    apply_status: Literal["pending", "applied", "awaiting_approval", "blocked", "failed"] = "pending"
+    apply_status: Literal["pending", "applied", "awaiting_approval", "blocked", "failed", "rolled_back"] = "pending"
+    draft_status: Literal["none", "ready", "approved", "discarded", "failed"] = "none"
+    draft_ready: bool = False
+    approval_required: bool = False
+    iteration_count: int = 0
     current_stage: str = "queued"
     progress_percent: int = 0
     summary: str | None = None
@@ -249,6 +290,8 @@ class RunRecord(StrictModel):
     checks_summary: RunChecksSummary = Field(default_factory=RunChecksSummary)
     touched_files: list[str] = Field(default_factory=list)
     artifacts: dict[str, str] = Field(default_factory=dict)
+    rolled_back: bool = False
+    rolled_back_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

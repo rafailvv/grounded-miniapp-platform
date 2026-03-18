@@ -10,10 +10,12 @@ from app.schemas import AppRole, RoleDashboardResponse, RoleProfile, RuntimeActi
 
 
 BASE_DIR = Path(__file__).resolve().parent
+WORKSPACE_ROOT = BASE_DIR.parent.parent.parent
 GENERATED_DIR = BASE_DIR / "generated"
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 STATE_PATH = GENERATED_DIR / "runtime_state.json"
 MANIFEST_PATH = GENERATED_DIR / "runtime_manifest.json"
+GROUNDED_SPEC_PATH = WORKSPACE_ROOT / "artifacts" / "grounded_spec.json"
 
 
 DEFAULT_RUNTIME_MANIFEST = {
@@ -94,14 +96,13 @@ DEFAULT_RUNTIME_STATE = {
 }
 
 def ensure_state() -> None:
-    if not MANIFEST_PATH.exists():
-        MANIFEST_PATH.write_text(json.dumps(DEFAULT_RUNTIME_MANIFEST, ensure_ascii=False, indent=2), encoding="utf-8")
     if not STATE_PATH.exists():
         STATE_PATH.write_text(json.dumps(DEFAULT_RUNTIME_STATE, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_manifest() -> dict[str, Any]:
-    ensure_state()
+    if not MANIFEST_PATH.exists():
+        return deepcopy(DEFAULT_RUNTIME_MANIFEST)
     return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
 
 
@@ -110,20 +111,28 @@ def load_state() -> dict[str, Any]:
     return json.loads(STATE_PATH.read_text(encoding="utf-8"))
 
 
+def load_grounded_spec() -> dict[str, Any]:
+    if not GROUNDED_SPEC_PATH.exists():
+        return {}
+    return json.loads(GROUNDED_SPEC_PATH.read_text(encoding="utf-8"))
+
+
 def save_state(state: dict[str, Any]) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
 
 def get_role_dashboard(role: AppRole) -> RoleDashboardResponse:
-    manifest = get_role_manifest(role)
-    first_screen = next(iter(manifest.screens.values()), None)
+    state = load_state()
+    spec = load_grounded_spec()
+    metrics = _compute_metrics(state)
+    description = str(spec.get("product_goal") or "")
     return RoleDashboardResponse(
         role=role,
-        title=first_screen["title"] if first_screen else "",
-        description=(first_screen.get("subtitle") if first_screen else "") or manifest.app.get("goal", ""),
-        feature_text=manifest.app.get("goal", ""),
-        metrics=manifest.metrics,
-        primary_action_label=(first_screen.get("actions", [{}])[0].get("label", "") if first_screen else ""),
+        title="",
+        description=description,
+        feature_text=description,
+        metrics=metrics[role],
+        primary_action_label="Open role",
         secondary_action_label="Profile",
     )
 
@@ -170,26 +179,45 @@ def register_submission(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_role_manifest(role: AppRole) -> RuntimeManifestResponse:
-    manifest = deepcopy(load_manifest())
+    spec = load_grounded_spec()
     state = load_state()
     metrics = _compute_metrics(state)
-    role_manifest = manifest["roles"][role]
-    hydrated_screens = {
-        screen_id: _hydrate_screen(role, screen, state, metrics)
-        for screen_id, screen in role_manifest["screens"].items()
-    }
+    manifest = deepcopy(load_manifest()) if MANIFEST_PATH.exists() else deepcopy(DEFAULT_RUNTIME_MANIFEST)
+    role_manifest = manifest["roles"].get(role) or {"entry_path": "/", "routes": [], "navigation": [], "screens": {}}
+    hydrated_screens = {}
+    if role_manifest.get("screens"):
+        hydrated_screens = {
+            screen_id: _hydrate_screen(role, screen, state, metrics)
+            for screen_id, screen in role_manifest["screens"].items()
+        }
+    if not hydrated_screens:
+        hydrated_screens = {
+            f"{role}_workspace": {
+                "screen_id": f"{role}_workspace",
+                "path": "/",
+                "title": "",
+                "subtitle": str(spec.get("product_goal") or ""),
+                "kind": "workspace",
+                "actions": [{"action_id": "open_profile", "label": "Profile"}],
+                "sections": [],
+            }
+        }
     alerts = state["roles"].get("manager", {}).get("alerts", []) if role == "manager" else []
     return RuntimeManifestResponse(
         role=role,
-        entry_path=role_manifest["entry_path"],
-        routes=role_manifest["routes"],
-        navigation=role_manifest["navigation"],
+        entry_path=cast(str, role_manifest.get("entry_path") or "/"),
+        routes=cast(list[dict[str, Any]], role_manifest.get("routes") or []),
+        navigation=cast(list[dict[str, str]], role_manifest.get("navigation") or []),
         screens=hydrated_screens,
         metrics=[item for item in metrics[role]],
         profile=RoleProfile.model_validate(state["roles"][role]["profile"]),
         alerts=alerts,
         activity=state.get("activity", []),
-        app=manifest["app"],
+        app={
+            **manifest.get("app", {}),
+            "goal": str(spec.get("product_goal") or manifest.get("app", {}).get("goal", "")),
+            "title": str(spec.get("product_goal") or manifest.get("app", {}).get("title", "")),
+        },
     )
 
 
@@ -262,23 +290,10 @@ def _resolve_record(state: dict[str, Any], item_id: str | None) -> dict[str, Any
 
 
 def _compute_metrics(state: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
-    records = state.get("records", [])
-    new_count = sum(1 for record in records if record["status"] == "new")
-    in_progress_count = sum(1 for record in records if record["status"] == "in_progress")
-    completed_count = sum(1 for record in records if record["status"] == "completed")
     return {
-        "client": [
-            {"metric_id": "client_total", "label": "Requests", "value": str(len(records))},
-            {"metric_id": "client_active", "label": "Active", "value": str(new_count + in_progress_count)},
-        ],
-        "specialist": [
-            {"metric_id": "specialist_queue", "label": "Queue", "value": str(new_count)},
-            {"metric_id": "specialist_progress", "label": "In progress", "value": str(in_progress_count)},
-        ],
-        "manager": [
-            {"metric_id": "manager_completed", "label": "Completed", "value": str(completed_count)},
-            {"metric_id": "manager_sla", "label": "SLA", "value": "96%"},
-        ],
+        "client": [],
+        "specialist": [],
+        "manager": [],
     }
 
 

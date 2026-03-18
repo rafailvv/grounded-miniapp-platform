@@ -34,7 +34,7 @@ export function ProfileCabinetCard({ displayName, roleLabel, photoUrl, onClick }
       <div className={styles.info}>
         <span className={styles.caption}>Личный кабинет</span>
         <strong className={styles.name}>{displayName}</strong>
-        <span className={styles.role}>{roleLabel}</span>
+        {roleLabel ? <span className={styles.role}>{roleLabel}</span> : null}
       </div>
 
       <span className={styles.chevron} aria-hidden="true">

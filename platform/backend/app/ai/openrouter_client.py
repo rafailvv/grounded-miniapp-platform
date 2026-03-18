@@ -59,6 +59,7 @@ class OpenRouterClient:
         for model in models:
             try:
                 payload = self._request_structured(
+                    role=role,
                     model=model,
                     schema_name=schema_name,
                     schema=normalized_schema,
@@ -70,6 +71,7 @@ class OpenRouterClient:
                 last_error = exc
                 if self._is_invalid_schema_error(exc):
                     payload = self._request_json_mode(
+                        role=role,
                         model=model,
                         schema_name=schema_name,
                         schema=normalized_schema,
@@ -80,9 +82,79 @@ class OpenRouterClient:
         assert last_error is not None
         raise last_error
 
+    def generate_code_plan(self, *, schema_name: str, schema: dict[str, Any], system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        return self.generate_structured(
+            role="code_plan",
+            schema_name=schema_name,
+            schema=schema,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+
+    def generate_code_edit(self, *, schema_name: str, schema: dict[str, Any], system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        return self.generate_structured(
+            role="code_edit",
+            schema_name=schema_name,
+            schema=schema,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+
+    def generate_repair(self, *, schema_name: str, schema: dict[str, Any], system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        return self.generate_structured(
+            role="repair",
+            schema_name=schema_name,
+            schema=schema,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+
+    def generate_summary(self, *, schema_name: str, schema: dict[str, Any], system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        return self.generate_structured(
+            role="summarize",
+            schema_name=schema_name,
+            schema=schema,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+
+    def generate_json_object(
+        self,
+        *,
+        role: str,
+        schema_name: str,
+        schema: dict[str, Any],
+        system_prompt: str,
+        user_prompt: str,
+    ) -> dict[str, Any]:
+        if not self.enabled:
+            raise RuntimeError("OpenRouter is not configured.")
+        normalized_schema = self._normalize_schema(schema)
+        model_config = MODEL_REGISTRY[role]
+        primary_model = model_config["primary"]
+        fallback_model = model_config["fallback"]
+        models = [primary_model] if fallback_model == primary_model else [primary_model, fallback_model]
+        last_error: Exception | None = None
+        for model in models:
+            try:
+                payload = self._request_json_mode(
+                    role=role,
+                    model=model,
+                    schema_name=schema_name,
+                    schema=normalized_schema,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                )
+                return {"model": model, "payload": payload, "response_mode": "json_object"}
+            except Exception as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
     def _request_structured(
         self,
         *,
+        role: str,
         model: str,
         schema_name: str,
         schema: dict[str, Any],
@@ -91,6 +163,7 @@ class OpenRouterClient:
     ) -> dict[str, Any]:
         if model.startswith("openai/gpt-5."):
             return self._responses_structured(
+                role=role,
                 model=model,
                 schema_name=schema_name,
                 schema=schema,
@@ -98,6 +171,7 @@ class OpenRouterClient:
                 user_prompt=user_prompt,
             )
         return self._chat_structured(
+            role=role,
             model=model,
             schema_name=schema_name,
             schema=schema,
@@ -108,6 +182,7 @@ class OpenRouterClient:
     def _request_json_mode(
         self,
         *,
+        role: str,
         model: str,
         schema_name: str,
         schema: dict[str, Any],
@@ -123,11 +198,15 @@ class OpenRouterClient:
         augmented_user_prompt = f"{user_prompt}\n\n{schema_hint}"
         if model.startswith("openai/gpt-5."):
             return self._responses_json_object(
+                role=role,
+                schema_name=schema_name,
                 model=model,
                 system_prompt=augmented_system_prompt,
                 user_prompt=augmented_user_prompt,
             )
         return self._chat_json_object(
+            role=role,
+            schema_name=schema_name,
             model=model,
             system_prompt=augmented_system_prompt,
             user_prompt=augmented_user_prompt,
@@ -157,6 +236,26 @@ class OpenRouterClient:
             self._dump_for_log(payload),
         )
 
+    def _log_prompt_bundle(
+        self,
+        *,
+        role: str,
+        schema_name: str,
+        endpoint: str,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> None:
+        logger.info(
+            "LLM prompt role=%s schema=%s endpoint=%s model=%s\nSYSTEM PROMPT:\n%s\nUSER PROMPT:\n%s",
+            role,
+            schema_name,
+            endpoint,
+            model,
+            system_prompt,
+            user_prompt,
+        )
+
     def _log_response(self, *, endpoint: str, model: str, response: httpx.Response) -> None:
         logger.info(
             "LLM response endpoint=%s model=%s status=%s body=%s",
@@ -177,6 +276,7 @@ class OpenRouterClient:
     def _chat_structured(
         self,
         *,
+        role: str,
         model: str,
         schema_name: str,
         schema: dict[str, Any],
@@ -203,6 +303,14 @@ class OpenRouterClient:
                 "data_collection": "deny",
             },
         }
+        self._log_prompt_bundle(
+            role=role,
+            schema_name=schema_name,
+            endpoint="chat/completions",
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
         self._log_request(endpoint="chat/completions", model=model, payload=payload)
         with httpx.Client(timeout=120) as client:
             response = client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=payload)
@@ -216,6 +324,7 @@ class OpenRouterClient:
     def _responses_structured(
         self,
         *,
+        role: str,
         model: str,
         schema_name: str,
         schema: dict[str, Any],
@@ -242,6 +351,14 @@ class OpenRouterClient:
                 "data_collection": "deny",
             },
         }
+        self._log_prompt_bundle(
+            role=role,
+            schema_name=schema_name,
+            endpoint="responses",
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
         self._log_request(endpoint="responses", model=model, payload=payload)
         with httpx.Client(timeout=120) as client:
             response = client.post(f"{self.base_url}/responses", headers=self._headers(), json=payload)
@@ -255,6 +372,8 @@ class OpenRouterClient:
     def _chat_json_object(
         self,
         *,
+        role: str,
+        schema_name: str,
         model: str,
         system_prompt: str,
         user_prompt: str,
@@ -274,6 +393,14 @@ class OpenRouterClient:
                 "data_collection": "deny",
             },
         }
+        self._log_prompt_bundle(
+            role=role,
+            schema_name=schema_name,
+            endpoint="chat/completions",
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
         self._log_request(endpoint="chat/completions", model=model, payload=payload)
         with httpx.Client(timeout=120) as client:
             response = client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=payload)
@@ -287,6 +414,8 @@ class OpenRouterClient:
     def _responses_json_object(
         self,
         *,
+        role: str,
+        schema_name: str,
         model: str,
         system_prompt: str,
         user_prompt: str,
@@ -308,6 +437,14 @@ class OpenRouterClient:
                 "data_collection": "deny",
             },
         }
+        self._log_prompt_bundle(
+            role=role,
+            schema_name=schema_name,
+            endpoint="responses",
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
         self._log_request(endpoint="responses", model=model, payload=payload)
         with httpx.Client(timeout=120) as client:
             response = client.post(f"{self.base_url}/responses", headers=self._headers(), json=payload)
