@@ -34,7 +34,7 @@ function normalizeAuthResponse(payload: unknown): TelegramAuthResult {
 export async function authenticateTelegram(payload: TelegramAuthPayload, signal?: AbortSignal): Promise<TelegramAuthResult | null> {
   const endpoint = import.meta.env.VITE_AUTH_ENDPOINT?.trim();
 
-  if (!endpoint || !payload.initData) {
+  if (!endpoint) {
     return null;
   }
 
