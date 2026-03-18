@@ -35,7 +35,7 @@ export function RoleCabinetHomePage({ role, featureText }: RoleCabinetHomePagePr
         displayName={getClientProfileDisplayName(profile)}
         roleLabel={profile.roleLabel}
         photoUrl={profile.photoUrl}
-        onClick={() => navigate('/profile')}
+        onClick={() => navigate(`/${role}/profile`)}
       />
 
       <div className={styles.featureBlock}>

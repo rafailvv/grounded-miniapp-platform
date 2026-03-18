@@ -96,7 +96,7 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
             displayName={getClientProfileDisplayName(profileView)}
             roleLabel={profileView.roleLabel}
             photoUrl={profileView.photoUrl}
-            onClick={() => navigate('/profile')}
+            onClick={() => navigate(`/${role}/profile`)}
           />
         </div>
       </section>
@@ -272,7 +272,7 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
             displayName={getClientProfileDisplayName(profileView)}
             roleLabel={profileView.roleLabel}
             photoUrl={profileView.photoUrl}
-            onClick={() => navigate('/profile')}
+            onClick={() => navigate(`/${role}/profile`)}
           />
         </div>
       ) : null}

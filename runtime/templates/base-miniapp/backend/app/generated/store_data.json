@@ -1,0 +1,14 @@
+{
+  "sessions": {
+    "specialist-e040dcde5b01": {
+      "access_token": "specialist-e040dcde5b01",
+      "refresh_token": "refresh-6c3f64e2b710",
+      "role": "specialist",
+      "user_id": "7",
+      "display_name": "spec",
+      "created_at": "2026-03-18T11:43:54.274612+00:00",
+      "expires_at": "2026-03-18T23:43:54.274617+00:00",
+      "cart_id": null
+    }
+  }
+}

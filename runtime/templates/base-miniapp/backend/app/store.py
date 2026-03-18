@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import uuid
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,6 +17,7 @@ GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 STATE_PATH = GENERATED_DIR / "runtime_state.json"
 MANIFEST_PATH = GENERATED_DIR / "runtime_manifest.json"
 GROUNDED_SPEC_PATH = WORKSPACE_ROOT / "artifacts" / "grounded_spec.json"
+STORE_DATA_PATH = GENERATED_DIR / "store_data.json"
 
 
 DEFAULT_RUNTIME_MANIFEST = {
@@ -95,9 +97,26 @@ DEFAULT_RUNTIME_STATE = {
     "activity": [],
 }
 
+DEFAULT_STORE_DATA = {
+    "sessions": {},
+}
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def current_iso() -> str:
+    return utcnow().isoformat()
+
 def ensure_state() -> None:
     if not STATE_PATH.exists():
         STATE_PATH.write_text(json.dumps(DEFAULT_RUNTIME_STATE, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ensure_store_data() -> None:
+    if not STORE_DATA_PATH.exists():
+        STORE_DATA_PATH.write_text(json.dumps(DEFAULT_STORE_DATA, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_manifest() -> dict[str, Any]:
@@ -111,6 +130,11 @@ def load_state() -> dict[str, Any]:
     return json.loads(STATE_PATH.read_text(encoding="utf-8"))
 
 
+def load_store_data() -> dict[str, Any]:
+    ensure_store_data()
+    return json.loads(STORE_DATA_PATH.read_text(encoding="utf-8"))
+
+
 def load_grounded_spec() -> dict[str, Any]:
     if not GROUNDED_SPEC_PATH.exists():
         return {}
@@ -119,6 +143,46 @@ def load_grounded_spec() -> dict[str, Any]:
 
 def save_state(state: dict[str, Any]) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def save_store_data(state: dict[str, Any]) -> None:
+    STORE_DATA_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def create_session(role: AppRole, user: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
+    store = load_store_data()
+    token = f"{role}-{uuid.uuid4().hex[:12]}"
+    refresh = f"refresh-{uuid.uuid4().hex[:12]}"
+    session_payload = {
+        "access_token": token,
+        "refresh_token": refresh,
+        "role": role,
+        "user_id": str(user.get("user_id") if user else token),
+        "display_name": user.get("display_name") if user else f"{role.title()} user",
+        "created_at": current_iso(),
+        "expires_at": (utcnow() + timedelta(hours=12)).isoformat(),
+        "cart_id": None,
+    }
+    store.setdefault("sessions", {})[token] = session_payload
+    save_store_data(store)
+    return token, session_payload
+
+
+def get_session(token: str | None) -> dict[str, Any] | None:
+    if not token:
+        return {
+            "access_token": "preview-browser-session",
+            "refresh_token": None,
+            "role": "manager",
+            "user_id": "preview-browser-user",
+            "display_name": "Preview Browser User",
+            "created_at": current_iso(),
+            "expires_at": (utcnow() + timedelta(hours=12)).isoformat(),
+            "cart_id": None,
+            "is_preview_bypass": True,
+        }
+    store = load_store_data()
+    return store.setdefault("sessions", {}).get(token)
 
 
 def get_role_dashboard(role: AppRole) -> RoleDashboardResponse:

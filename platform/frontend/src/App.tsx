@@ -63,6 +63,15 @@ const ROLE_LABELS: Record<RoleKey, string> = {
 
 const DEFAULT_PROMPT = "";
 const ROOT_PREVIEW_PATH = "/";
+
+function getRoleRootPreviewPath(role: RoleKey): string {
+  return `/${role}`;
+}
+
+function isRoleAtRootPreviewPath(role: RoleKey, path: string | undefined): boolean {
+  const normalized = path || ROOT_PREVIEW_PATH;
+  return normalized === ROOT_PREVIEW_PATH || normalized === getRoleRootPreviewPath(role);
+}
 const WORKSPACE_REQUEST_TIMEOUT_MS = 5000;
 const PREVIEW_REQUEST_TIMEOUT_MS = 2500;
 const PREVIEW_BOOT_POLL_ATTEMPTS = 45;
@@ -117,12 +126,74 @@ function formatRoleScope(scope: RoleKey[]): string {
   return scope.map((role) => ROLE_LABELS[role]).join(", ");
 }
 
-function extractPreviewErrorMessage(logs?: string[] | null): string {
-  if (!logs?.length) {
-    return "Preview runtime failed to start.";
+function stripAnsi(value: string): string {
+  return value.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "");
+}
+
+function isBenignPreviewLogLine(value: string): boolean {
+  const normalized = stripAnsi(value).trim().toLowerCase();
+  if (!normalized) {
+    return true;
   }
-  const lastMeaningful = [...logs].reverse().find((line) => line.trim());
-  return lastMeaningful ?? "Preview runtime failed to start.";
+  if (/\"\s(200|201|202|204|304)\s/.test(normalized)) {
+    return true;
+  }
+  if (/^\d{1,3}(\.\d{1,3}){3}\s-\s-\s\[\d{2}\/[a-z]{3}\/\d{4}:/.test(normalized)) {
+    return true;
+  }
+  return [
+    "uvicorn running on http://",
+    "application startup complete",
+    "started server process",
+    "waiting for application startup",
+    "press ctrl+c to quit",
+    "info:",
+    "started",
+    "waiting",
+    "running",
+    "recreate",
+    "recreated",
+    "container ",
+    "get /",
+    "post /",
+    "put /",
+    "patch /",
+    "delete /",
+  ].some((token) => normalized.includes(token));
+}
+
+function isExplicitPreviewErrorLine(value: string): boolean {
+  const normalized = stripAnsi(value).trim().toLowerCase();
+  if (!normalized || isBenignPreviewLogLine(normalized)) {
+    return false;
+  }
+  return [
+    "error",
+    "failed",
+    "exception",
+    "traceback",
+    "permission denied",
+    "did not complete successfully",
+    "exited (1)",
+    "dependency failed to start",
+    "cannot find",
+    "module not found",
+    "eaddrinuse",
+    "syntaxerror",
+    "typeerror",
+    "referenceerror",
+  ].some((token) => normalized.includes(token));
+}
+
+function extractPreviewErrorMessage(logs?: string[] | null): string | null {
+  if (!logs?.length) {
+    return null;
+  }
+  const lastMeaningful = [...logs]
+    .map((line) => stripAnsi(line).trim())
+    .reverse()
+    .find((line) => isExplicitPreviewErrorLine(line));
+  return lastMeaningful ?? null;
 }
 
 function displayRunStatus(run: Run | null): string {
@@ -1010,7 +1081,7 @@ export default function App() {
   }
 
   function handleMockupPrimaryAction(role: RoleKey) {
-    if ((rolePreviewPath[role] || ROOT_PREVIEW_PATH) === ROOT_PREVIEW_PATH) {
+    if (isRoleAtRootPreviewPath(role, rolePreviewPath[role])) {
       sendPreviewCommand(role, "close");
       return;
     }
@@ -1601,8 +1672,11 @@ export default function App() {
                         onClick={() => handleMockupPrimaryAction(role)}
                         disabled={!previewUrl}
                       >
-                        <span className={`mockup-icon ${rolePreviewPath[role] === ROOT_PREVIEW_PATH ? "is-close" : "is-back"}`} aria-hidden="true" />
-                        <span>{rolePreviewPath[role] === ROOT_PREVIEW_PATH ? "Close" : "Back"}</span>
+                        <span
+                          className={`mockup-icon ${isRoleAtRootPreviewPath(role, rolePreviewPath[role]) ? "is-close" : "is-back"}`}
+                          aria-hidden="true"
+                        />
+                        <span>{isRoleAtRootPreviewPath(role, rolePreviewPath[role]) ? "Close" : "Back"}</span>
                       </button>
                       <div className="mockup-menu-wrap">
                         <button
@@ -1658,7 +1732,7 @@ export default function App() {
                         ) : null}
                       </div>
                     </div>
-                    {previewStatus === "error" ? (
+                    {previewStatus === "error" && previewErrorMessage ? (
                       <div className="preview-loader preview-error" role="status" aria-live="polite">
                         <div className="preview-loader-card preview-error-card">
                           <strong>Preview failed</strong>
@@ -1692,11 +1766,19 @@ export default function App() {
                             }, 350)
                           }
                         />
-                        {previewFailed[role] ? (
+                        {previewFailed[role] && previewErrorMessage ? (
                           <div className="preview-loader preview-error" role="status" aria-live="polite">
                             <div className="preview-loader-card preview-error-card">
                               <strong>Preview did not load</strong>
-                              <p>{previewErrorMessage || "The runtime started, but this screen did not finish loading."}</p>
+                              <p>{previewErrorMessage}</p>
+                            </div>
+                          </div>
+                        ) : previewFailed[role] ? (
+                          <div className="preview-loader" role="status" aria-live="polite">
+                            <div className="preview-loader-card">
+                              <div className="preview-loader-spinner" aria-hidden="true" />
+                              <strong>Loading preview</strong>
+                              <p>Runtime is still starting. Waiting for this screen to become available.</p>
                             </div>
                           </div>
                         ) : null}

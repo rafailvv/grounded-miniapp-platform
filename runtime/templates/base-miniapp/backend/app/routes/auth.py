@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from typing import cast
 
 from fastapi import APIRouter
 
 from app.schemas import AppRole, AuthResponse, TelegramAuthRequest
+from app.store import create_session
 
 router = APIRouter()
 
@@ -46,13 +46,18 @@ def resolve_role(payload: TelegramAuthRequest) -> AppRole:
 def auth_telegram(payload: TelegramAuthRequest) -> AuthResponse:
     role = resolve_role(payload)
     user = payload.init_data_unsafe.get("user") if isinstance(payload.init_data_unsafe, dict) else None
-    now = datetime.now(timezone.utc)
-    access_suffix = str(int(now.timestamp()))
+    token, session = create_session(
+        role,
+        {
+            "user_id": payload.user_id or 0,
+            "display_name": user.get("username") if isinstance(user, dict) and user.get("username") else f"{role.title()} user",
+        },
+    )
     return AuthResponse(
-        access_token=f"runtime-access-{role}-{access_suffix}",
-        refresh_token=f"runtime-refresh-{role}-{access_suffix}",
+        access_token=token,
+        refresh_token=session["refresh_token"],
         token_type="Bearer",
-        expires_at=(now + timedelta(hours=12)).isoformat(),
+        expires_at=session["expires_at"],
         role=role,
         user={
             "id": payload.user_id,

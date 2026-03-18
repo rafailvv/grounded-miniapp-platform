@@ -8,7 +8,9 @@ export function AppShell(): JSX.Element {
   const location = useLocation();
   const navigate = useNavigate();
 
-  const isRootPage = location.pathname === '/';
+  const pathParts = location.pathname.split('/').filter(Boolean);
+  const roleRootPath = pathParts.length > 0 ? `/${pathParts[0]}` : '/';
+  const isRootPage = location.pathname === '/' || location.pathname === roleRootPath;
 
   const showNavigate = useCallback(
     (step: number) => {
@@ -51,12 +53,12 @@ export function AppShell(): JSX.Element {
         return;
       }
       if (payload.command === 'close') {
-        navigate('/');
+        navigate(roleRootPath);
         return;
       }
       if (payload.command === 'back') {
-        if (location.pathname === '/') {
-          navigate('/');
+        if (location.pathname === '/' || location.pathname === roleRootPath) {
+          navigate(roleRootPath);
           return;
         }
         navigate(-1);
@@ -65,7 +67,7 @@ export function AppShell(): JSX.Element {
 
     window.addEventListener('message', handlePreviewCommand);
     return () => window.removeEventListener('message', handlePreviewCommand);
-  }, [location.pathname, navigate]);
+  }, [location.pathname, navigate, roleRootPath]);
 
   return (
     <main className={styles.content}>
