@@ -42,8 +42,8 @@ function parseStoredProfile(raw: string | null): StoredProfile | null {
 
 function normalizeStoredProfile(stored: StoredProfile | null, telegramUser: ReturnType<typeof getTelegramUser>): ClientProfileDraft {
   return {
-    firstName: stored?.firstName?.trim() || telegramUser?.first_name?.trim() || 'Пользователь',
-    lastName: stored?.lastName?.trim() || telegramUser?.last_name?.trim() || '',
+    firstName: stored?.firstName?.trim() || telegramUser?.first_name?.trim() || 'Иван',
+    lastName: stored?.lastName?.trim() || telegramUser?.last_name?.trim() || 'Иванов',
     email: stored?.email?.trim() || '',
     phone: stored?.phone?.trim() || '',
     photoUrl: stored?.photoUrl || telegramUser?.photo_url || null,

@@ -3,6 +3,7 @@ import { AppShell } from '@/app/layout/AppShell';
 import { RuntimeManifestProvider, useRuntimeManifest } from '@/shared/runtime/RuntimeManifestProvider';
 import type { AppRole } from '@/shared/roles/role';
 import { GeneratedRoleScreen } from '@/shared/ui/generated/GeneratedRoleScreen';
+import { RoleProfileEditorPage } from '@/shared/ui/templates/RoleProfileEditorPage';
 
 type GeneratedRoleRoutesProps = {
   role: AppRole;
@@ -23,25 +24,14 @@ function RoleRouteContent({ role }: GeneratedRoleRoutesProps): JSX.Element {
     return <div style={{ padding: 20 }}>{error ?? 'Runtime manifest is unavailable.'}</div>;
   }
 
-  if (!manifest.routes.length) {
-    return <></>;
-  }
+  const entryScreen = manifest.routes.find((route) => route.is_entry)?.screen_id ?? Object.keys(manifest.screens)[0] ?? '__fallback__';
 
   return (
     <Routes>
       <Route element={<AppShell />}>
-        {manifest.routes.map((route) =>
-          route.path === '/' ? (
-            <Route key={route.route_id} index element={<GeneratedRoleScreen role={role} screenId={route.screen_id} />} />
-          ) : (
-            <Route
-              key={route.route_id}
-              path={toNestedPath(route.path)}
-              element={<GeneratedRoleScreen role={role} screenId={route.screen_id} />}
-            />
-          ),
-        )}
-        <Route path="*" element={<Navigate replace to={manifest.entry_path} />} />
+        <Route index element={<GeneratedRoleScreen role={role} screenId={entryScreen} />} />
+        <Route path="profile" element={<RoleProfileEditorPage role={role} />} />
+        <Route path="*" element={<Navigate replace to="/" />} />
       </Route>
     </Routes>
   );

@@ -11,6 +11,10 @@
   padding-bottom: 28px;
 }
 
+.profileEntry {
+  margin-bottom: 2px;
+}
+
 .variantStudio {
   --accent-local: var(--accent);
 }
@@ -48,6 +52,14 @@
   line-height: 1.08;
   font-weight: 800;
   letter-spacing: -0.03em;
+}
+
+.pageTitle {
+  margin: 0;
+  font-size: 30px;
+  line-height: 1;
+  font-weight: 900;
+  letter-spacing: -0.04em;
 }
 
 .sectionBody {

@@ -1,9 +1,11 @@
 import { CSSProperties, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
+import { getClientProfileDisplayName, loadRoleProfileView } from '@/shared/profile/clientProfile';
 import { persistRoleProfile } from '@/shared/profile/profileApi';
 import type { AppRole } from '@/shared/roles/role';
 import { useRuntimeManifest } from '@/shared/runtime/RuntimeManifestProvider';
 import type { RuntimeAction, RuntimeSection } from '@/shared/runtime/types';
+import { ProfileCabinetCard } from '@/shared/ui/ProfileCabinetCard/ProfileCabinetCard';
 import styles from '@/shared/ui/generated/GeneratedRoleScreen.module.css';
 
 type GeneratedRoleScreenProps = {
@@ -17,6 +19,7 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
   const { manifest, runAction, refresh } = useRuntimeManifest();
   const [formState, setFormState] = useState<Record<string, string>>({});
   const [message, setMessage] = useState<string>('');
+  const profileView = loadRoleProfileView(role);
 
   const screen = manifest?.screens[screenId];
   const uiVariant = manifest?.app.ui_variant ?? 'studio';
@@ -54,7 +57,7 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
     setMessage('');
   }, [editableFields, screenId]);
 
-  if (!manifest || !screen) {
+  if (!manifest) {
     return <div className={styles.page}>Runtime screen is not available.</div>;
   }
 
@@ -84,6 +87,21 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
     ['--runtime-card' as string]: manifest.app.theme?.card ?? undefined,
     ['--runtime-border' as string]: manifest.app.theme?.border ?? undefined,
   };
+
+  if (!screen) {
+    return (
+      <section className={`${styles.page} ${styles.variantStudio} ${styles.layoutStacked}`} style={runtimeStyle}>
+        <div className={styles.profileEntry}>
+          <ProfileCabinetCard
+            displayName={getClientProfileDisplayName(profileView)}
+            roleLabel={profileView.roleLabel}
+            photoUrl={profileView.photoUrl}
+            onClick={() => navigate('/profile')}
+          />
+        </div>
+      </section>
+    );
+  }
 
   async function handleAction(action: RuntimeAction) {
     if (action.type === 'navigate' && action.target_path) {
@@ -118,6 +136,13 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
 
   function renderSection(section: RuntimeSection) {
     switch (section.type) {
+      case 'heading':
+        return (
+          <section key={section.section_id} className={styles.sectionBlock}>
+            <h1 className={styles.pageTitle}>{section.title}</h1>
+            {section.body ? <p className={styles.sectionBody}>{section.body}</p> : null}
+          </section>
+        );
       case 'hero':
         return (
           <section key={section.section_id} className={styles.sectionBlock}>
@@ -223,24 +248,38 @@ export function GeneratedRoleScreen({ role, screenId }: GeneratedRoleScreenProps
             </div>
           </section>
         );
+      case 'actions':
+        return (
+          <section key={section.section_id} className={styles.sectionBlock}>
+            {section.title ? <h3 className={styles.sectionTitle}>{section.title}</h3> : null}
+            <div className={styles.inlineActions}>
+              {section.actions.map((action) => (
+                <button key={action.action_id} type="button" className={styles.inlineAction} onClick={() => void handleAction(action)}>
+                  {action.label}
+                </button>
+              ))}
+            </div>
+          </section>
+        );
     }
   }
 
   return (
     <section className={`${styles.page} ${variantClass} ${layoutClass}`} style={runtimeStyle}>
+      {location.pathname === '/' ? (
+        <div className={styles.profileEntry}>
+          <ProfileCabinetCard
+            displayName={getClientProfileDisplayName(profileView)}
+            roleLabel={profileView.roleLabel}
+            photoUrl={profileView.photoUrl}
+            onClick={() => navigate('/profile')}
+          />
+        </div>
+      ) : null}
+
       {screen.sections.map(renderSection)}
 
       {message ? <div className={styles.message}>{message}</div> : null}
-
-      {screen.actions.length ? (
-        <div className={styles.inlineActions}>
-          {screen.actions.map((action) => (
-            <button key={action.action_id} type="button" className={styles.inlineAction} onClick={() => void handleAction(action)}>
-              {action.label}
-            </button>
-          ))}
-        </div>
-      ) : null}
     </section>
   );
 }

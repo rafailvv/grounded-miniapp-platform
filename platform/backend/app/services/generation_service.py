@@ -1362,38 +1362,37 @@ class GenerationService:
         ui_variant = self._select_ui_variant(spec.product_goal)
         layout_variant = self._select_layout_variant(spec.product_goal, ui_variant)
         theme_palette = self._select_theme_palette(spec.product_goal, ui_variant)
-        route_lookup = {route.screen_id: route for group in ir.route_groups for route in group.routes}
-        screens_by_id = {screen.screen_id: screen for screen in ir.screens}
         roles: dict[str, Any] = {}
-        for group in ir.route_groups:
-            role_records = self._records_for_role(group.role, records)
-            role_screens = {}
-            for route in group.routes:
-                screen = screens_by_id[route.screen_id]
-                role_screens[screen.screen_id] = {
-                    "screen_id": screen.screen_id,
-                    "path": route.path,
-                    "title": screen.title,
-                    "subtitle": screen.subtitle,
-                    "kind": screen.kind,
-                    "components": [component.model_dump(mode="json") for component in screen.components],
-                    "actions": [self._manifest_action(action, route_lookup, ui_variant, flow_label) for action in screen.actions],
-                    "sections": self._screen_sections(
-                        group.role,
-                        screen.screen_id,
-                        screen.kind,
-                        entity,
-                        role_records,
-                        spec.product_goal,
-                        ui_variant,
-                        layout_variant,
-                    ),
+        for role in ROLE_ORDER:
+            role_records = self._records_for_role(role, records)
+            screen_id = f"{role}_workspace"
+            route_id = f"route_{role}_workspace"
+            role_screens = {
+                screen_id: {
+                    "screen_id": screen_id,
+                    "path": "/",
+                    "title": self._title_for_role(role, flow_label, ui_variant),
+                    "subtitle": self._role_body(role, flow_label, ui_variant),
+                    "kind": "workspace",
+                    "components": [],
+                    "actions": [],
+                    "sections": self._freeform_role_sections(role, entity, role_records, spec.product_goal, ui_variant, layout_variant),
                 }
-            roles[group.role] = {
-                "entry_path": group.entry_path,
-                "routes": [route.model_dump(mode="json") for route in group.routes],
+            }
+            roles[role] = {
+                "entry_path": "/",
+                "routes": [
+                    {
+                        "route_id": route_id,
+                        "role": role,
+                        "path": "/",
+                        "screen_id": screen_id,
+                        "label": "Workspace",
+                        "is_entry": True,
+                    }
+                ],
                 "screens": role_screens,
-                "navigation": self._navigation_items(group.role, flow_label, ui_variant, layout_variant),
+                "navigation": [],
             }
         return {
             "app": {
@@ -1405,8 +1404,8 @@ class GenerationService:
                 "theme": theme_palette,
                 "platform": spec.target_platform,
                 "preview_profile": spec.preview_profile,
-                "route_count": sum(len(group.routes) for group in ir.route_groups),
-                "screen_count": len(ir.screens),
+                "route_count": len(ROLE_ORDER),
+                "screen_count": len(ROLE_ORDER),
             },
             "roles": roles,
         }
@@ -1455,8 +1454,8 @@ class GenerationService:
             "roles": {
                 "client": {
                     "profile": {
-                        "first_name": "",
-                        "last_name": "",
+                        "first_name": "Иван",
+                        "last_name": "Иванов",
                         "email": "",
                         "phone": "",
                         "photo_url": None,
@@ -1468,8 +1467,8 @@ class GenerationService:
                 },
                 "specialist": {
                     "profile": {
-                        "first_name": "",
-                        "last_name": "",
+                        "first_name": "Иван",
+                        "last_name": "Иванов",
                         "email": "",
                         "phone": "",
                         "photo_url": None,
@@ -1481,8 +1480,8 @@ class GenerationService:
                 },
                 "manager": {
                     "profile": {
-                        "first_name": "",
-                        "last_name": "",
+                        "first_name": "Иван",
+                        "last_name": "Иванов",
                         "email": "",
                         "phone": "",
                         "photo_url": None,
@@ -2151,6 +2150,124 @@ class GenerationService:
             ]
 
         return []
+
+    def _freeform_role_sections(
+        self,
+        role: str,
+        entity: DomainEntity,
+        records: list[dict[str, Any]],
+        prompt_goal: str,
+        ui_variant: str,
+        layout_variant: str,
+    ) -> list[dict[str, Any]]:
+        flow_label = self._flow_label(prompt_goal, entity)
+        entity_title = self._entity_title(entity)
+        intro = {
+            "section_id": f"{role}_intro",
+            "type": "heading",
+            "title": self._title_for_role(role, flow_label, ui_variant),
+            "body": self._role_body(role, flow_label, ui_variant),
+        }
+        stats = {
+            "section_id": f"{role}_stats",
+            "type": "stats",
+            "items": self._role_stats(role, records, ui_variant),
+        }
+        recent_items = [
+            {
+                "item_id": record["record_id"],
+                "title": record["title"],
+                "subtitle": record["summary"],
+                "status": record["status"],
+                "meta": record.get("priority"),
+            }
+            for record in records[:4]
+        ]
+        recent_list = {
+            "section_id": f"{role}_recent",
+            "type": "list",
+            "items": recent_items,
+        }
+        timeline = {
+            "section_id": f"{role}_timeline",
+            "type": "timeline",
+            "items": self._role_timeline(role, flow_label, records),
+        }
+        summary = {
+            "section_id": f"{role}_summary",
+            "type": "detail",
+            "title": "What this role handles",
+            "body": f"This workspace is generated from the current prompt and adapts to {role} responsibilities.",
+            "fields": self._role_summary_fields(role, flow_label, records),
+        }
+
+        if role == "client":
+            form_fields = [
+                {
+                    "field_id": attribute.name,
+                    "name": attribute.name,
+                    "label": attribute.name.replace("_", " ").title(),
+                    "field_type": "textarea" if attribute.type == "textarea" else "text",
+                    "required": attribute.required,
+                    "placeholder": f"Enter {attribute.name.replace('_', ' ')}",
+                }
+                for attribute in entity.attributes
+            ]
+            if not form_fields:
+                form_fields = [
+                    {"field_id": "order_name", "name": "order_name", "label": f"{entity_title} name", "field_type": "text", "required": True, "placeholder": f"Enter {entity_title.lower()} name"},
+                    {"field_id": "details", "name": "details", "label": "Details", "field_type": "textarea", "required": False, "placeholder": "Add important details"},
+                ]
+            return [
+                intro,
+                {
+                    "section_id": "client_order_form",
+                    "type": "form",
+                    "fields": form_fields,
+                },
+                {
+                    "section_id": "client_actions",
+                    "type": "actions",
+                    "actions": [
+                        {"action_id": "client_submit_request", "label": "Submit order", "type": "submit_form"},
+                    ],
+                },
+                recent_list,
+                summary,
+            ]
+
+        if role == "specialist":
+            return [
+                intro,
+                stats,
+                recent_list,
+                timeline,
+                {
+                    "section_id": "specialist_actions",
+                    "type": "actions",
+                    "actions": [
+                        {"action_id": "specialist_claim_next", "label": "Claim next", "type": "call_api"},
+                        {"action_id": "specialist_mark_in_progress", "label": "Start processing", "type": "call_api"},
+                        {"action_id": "specialist_complete_request", "label": "Mark complete", "type": "call_api"},
+                    ],
+                },
+            ]
+
+        return [
+            intro,
+            stats,
+            timeline,
+            summary,
+            {
+                "section_id": "manager_actions",
+                "type": "actions",
+                "actions": [
+                    {"action_id": "manager_rebalance", "label": "Rebalance workload", "type": "call_api"},
+                    {"action_id": "manager_refresh_records", "label": "Refresh records", "type": "call_api"},
+                ],
+            },
+            recent_list,
+        ]
 
     def _manifest_action(
         self,

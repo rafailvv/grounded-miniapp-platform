@@ -59,6 +59,7 @@ const ROLE_LABELS: Record<RoleKey, string> = {
 };
 
 const DEFAULT_PROMPT = "";
+const ROOT_PREVIEW_PATH = "/";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -246,10 +247,41 @@ export default function App() {
     specialist: false,
     manager: false,
   });
+  const [previewMenuRole, setPreviewMenuRole] = useState<RoleKey | null>(null);
+  const [rolePreviewPath, setRolePreviewPath] = useState<Record<RoleKey, string>>({
+    client: ROOT_PREVIEW_PATH,
+    specialist: ROOT_PREVIEW_PATH,
+    manager: ROOT_PREVIEW_PATH,
+  });
   const [previewBooting, setPreviewBooting] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const previewTimeoutsRef = useRef<Record<string, number | undefined>>({});
+  const previewFrameRefs = useRef<Record<RoleKey, HTMLIFrameElement | null>>({
+    client: null,
+    specialist: null,
+    manager: null,
+  });
+
+  useEffect(() => {
+    function handlePreviewMessage(event: MessageEvent) {
+      const payload = event.data;
+      if (!payload || typeof payload !== "object" || payload.type !== "runtime-preview-route") {
+        return;
+      }
+      const role = ROLE_ORDER.find((candidate) => previewFrameRefs.current[candidate]?.contentWindow === event.source);
+      if (!role) {
+        return;
+      }
+      setRolePreviewPath((current) => ({
+        ...current,
+        [role]: typeof payload.path === "string" && payload.path ? payload.path : ROOT_PREVIEW_PATH,
+      }));
+    }
+
+    window.addEventListener("message", handlePreviewMessage);
+    return () => window.removeEventListener("message", handlePreviewMessage);
+  }, []);
 
   useEffect(() => {
     let isMounted = true;
@@ -583,6 +615,9 @@ export default function App() {
           } catch {
             setRunArtifacts(null);
           }
+          if (currentRun.status === "completed") {
+            await rebuildWorkspacePreview(workspaceId);
+          }
           return;
         }
       } catch {
@@ -708,16 +743,37 @@ export default function App() {
     }
   }
 
-  async function handleRefreshPreview() {
-    if (!workspace) {
+  function sendPreviewCommand(role: RoleKey, command: "back" | "close" | "refresh") {
+    previewFrameRefs.current[role]?.contentWindow?.postMessage(
+      {
+        type: "runtime-preview-command",
+        command,
+      },
+      "*",
+    );
+  }
+
+  function handleMockupPrimaryAction(role: RoleKey) {
+    if ((rolePreviewPath[role] || ROOT_PREVIEW_PATH) === ROOT_PREVIEW_PATH) {
+      sendPreviewCommand(role, "close");
       return;
     }
+    sendPreviewCommand(role, "back");
+  }
+
+  function handleMockupRefresh(role: RoleKey) {
+    setPreviewMenuRole(null);
+    sendPreviewCommand(role, "refresh");
+    handleRefreshRolePreview(role);
+  }
+
+  async function rebuildWorkspacePreview(workspaceId: string) {
     setPreviewBooting(true);
     setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
     try {
-      await rebuildPreview(workspace.workspace_id);
+      await rebuildPreview(workspaceId);
       for (let attempt = 0; attempt < 20; attempt += 1) {
-        const preview = await request<PreviewInfo>(`/workspaces/${workspace.workspace_id}/preview/url`);
+        const preview = await request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`);
         setPreviewRuntimeMode(preview.runtime_mode ?? "");
         setPreviewStatus(preview.status ?? "");
         if (preview.status === "running") {
@@ -738,6 +794,13 @@ export default function App() {
     } finally {
       setPreviewBooting(false);
     }
+  }
+
+  async function handleRefreshPreview() {
+    if (!workspace) {
+      return;
+    }
+    await rebuildWorkspacePreview(workspace.workspace_id);
   }
 
   function handleRefreshRolePreview(role: RoleKey) {
@@ -1131,15 +1194,70 @@ export default function App() {
                     <span>{previewRuntimeMode || "runtime"} preview</span>
                   </div>
                   <div className="phone-shell">
-                    <button
-                      type="button"
-                      className="preview-refresh"
-                      onClick={() => handleRefreshRolePreview(role)}
-                      aria-label={`Refresh ${role} preview`}
-                      disabled={!previewUrl || previewLoading[role]}
-                    >
-                      ↻
-                    </button>
+                    <div className="mockup-topbar">
+                      <button
+                        type="button"
+                        className="mockup-pill mockup-pill-primary"
+                        onClick={() => handleMockupPrimaryAction(role)}
+                        disabled={!previewUrl}
+                      >
+                        <span className={`mockup-icon ${rolePreviewPath[role] === ROOT_PREVIEW_PATH ? "is-close" : "is-back"}`} aria-hidden="true" />
+                        <span>{rolePreviewPath[role] === ROOT_PREVIEW_PATH ? "Close" : "Back"}</span>
+                      </button>
+                      <div className="mockup-menu-wrap">
+                        <button
+                          type="button"
+                          className="mockup-pill mockup-pill-menu"
+                          onClick={() => setPreviewMenuRole((current) => (current === role ? null : role))}
+                          aria-label={`Open ${role} preview menu`}
+                          disabled={!previewUrl}
+                        >
+                          <span className="mockup-chevron-icon" aria-hidden="true">
+                            <svg viewBox="0 0 20 20" focusable="false" aria-hidden="true">
+                              <path
+                                d="M4.5 7.5 10 13l5.5-5.5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="3.2"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                              />
+                            </svg>
+                          </span>
+                          <span className="mockup-dots" aria-hidden="true">
+                            <i />
+                            <i />
+                            <i />
+                          </span>
+                        </button>
+                        {previewMenuRole === role ? (
+                          <div className="mockup-menu">
+                            <button type="button" onClick={() => handleMockupRefresh(role)} disabled={!previewUrl || previewLoading[role]}>
+                              <span className="mockup-refresh-icon" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                                  <path
+                                    d="M12 5a7 7 0 1 1-6.6 9.3"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                  />
+                                  <path
+                                    d="M5 4.5v5h5"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                </svg>
+                              </span>
+                              <span>Refresh page</span>
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
                     {previewUrl ? (
                       <>
                         {previewLoading[role] ? (
@@ -1152,6 +1270,9 @@ export default function App() {
                           key={`${role}-${previewCycle}-${rolePreviewCycle[role]}-${rolePreviewUrls[role] ?? previewUrl}`}
                           title={`Live preview ${role}`}
                           src={rolePreviewUrls[role] ?? `${previewUrl}?role=${role}`}
+                          ref={(node) => {
+                            previewFrameRefs.current[role] = node;
+                          }}
                           className={previewLoading[role] ? "is-loading" : ""}
                           onLoad={() =>
                             window.setTimeout(() => {
@@ -1162,18 +1283,11 @@ export default function App() {
                           }
                         />
                       </>
-                    ) : previewBooting || previewLoading[role] || loading || previewStatus === "starting" ? (
+                    ) : (
                       <div className="preview-loader">
                         <div className="preview-loader-spinner" />
                         <p>Loading runtime…</p>
                       </div>
-                    ) : previewFailed[role] ? (
-                      <div className="placeholder placeholder-error">
-                        <strong>Failed to load preview.</strong>
-                        <p>This role runtime did not open in time.</p>
-                      </div>
-                    ) : (
-                      <div className="placeholder">Run the workspace to populate the preview.</div>
                     )}
                   </div>
                 </div>

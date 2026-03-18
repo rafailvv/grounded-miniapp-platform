@@ -165,7 +165,7 @@ button:disabled {
   min-height: 0;
   flex: 1;
   display: grid;
-  grid-template-columns: minmax(320px, 400px) minmax(0, 1fr);
+  grid-template-columns: minmax(360px, 460px) minmax(0, 1fr);
   gap: 16px;
   overflow: hidden;
 }
@@ -222,9 +222,9 @@ button:disabled {
   gap: 8px;
 }
 
-.composer-field span,
-.workspace-search span,
-.role-scope span {
+.composer-field > span,
+.workspace-search > span,
+.role-scope > span {
   font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -699,7 +699,7 @@ button:disabled {
 }
 
 .preview-heading strong {
-  color: #fff;
+  color: var(--ink);
 }
 
 .phone-shell {
@@ -714,22 +714,179 @@ button:disabled {
   box-shadow: 0 20px 42px rgba(23, 27, 54, 0.2);
 }
 
+.mockup-topbar {
+  position: absolute;
+  top: 18px;
+  left: 18px;
+  right: 18px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  pointer-events: none;
+}
+
+.mockup-pill,
+.mockup-menu {
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  background: linear-gradient(180deg, rgba(209, 209, 214, 0.88), rgba(201, 201, 206, 0.82));
+  border: 1px solid rgba(255, 255, 255, 0.44);
+  box-shadow: 0 8px 22px rgba(40, 44, 52, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+
+.mockup-pill {
+  pointer-events: auto;
+  min-height: 42px;
+  padding: 0 12px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: rgba(255, 255, 255, 0.98);
+}
+
+.mockup-pill-primary {
+  min-width: 124px;
+  justify-content: flex-start;
+}
+
+.mockup-pill-primary span:last-child,
+.mockup-menu button {
+  font-weight: 700;
+}
+
+.mockup-menu-wrap {
+  position: relative;
+  pointer-events: auto;
+}
+
+.mockup-pill-menu {
+  min-width: 92px;
+  justify-content: space-between;
+}
+
+.mockup-icon {
+  position: relative;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+}
+
+.mockup-icon.is-back::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 3px;
+  width: 9px;
+  height: 9px;
+  border-left: 4px solid currentColor;
+  border-bottom: 4px solid currentColor;
+  transform: rotate(45deg);
+  border-radius: 2px;
+}
+
+.mockup-icon.is-close::before,
+.mockup-icon.is-close::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 7px;
+  width: 4px;
+  height: 16px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.mockup-icon.is-close::before {
+  transform: rotate(45deg);
+}
+
+.mockup-icon.is-close::after {
+  transform: rotate(-45deg);
+}
+
+.mockup-chevron-icon {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mockup-chevron-icon svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+
+.mockup-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.mockup-dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.96;
+}
+
+.mockup-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 164px;
+  padding: 6px;
+  border-radius: 18px;
+}
+
+.mockup-menu button {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.96);
+  text-align: left;
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.mockup-menu button:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.mockup-menu button:disabled {
+  color: rgba(255, 255, 255, 0.48);
+}
+
+.mockup-refresh-icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mockup-refresh-icon svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
 .phone-shell iframe {
   width: 100%;
   height: 100%;
   min-height: 100%;
   border: 0;
   background: white;
-}
-
-.preview-refresh {
-  position: absolute;
-  top: 14px;
-  right: 14px;
-  z-index: 2;
-  width: 38px;
-  height: 38px;
-  border-radius: 999px;
 }
 
 .preview-loader,

@@ -54,11 +54,14 @@ export function useAppBootstrap(): BootstrapState {
         if ((error as Error).name === 'AbortError') {
           return;
         }
-
-        setState({
-          status: 'error',
-          message: 'Не удалось пройти инициализацию mini app. Проверьте auth endpoint и Telegram initData.',
+        const role = resolveRole({
+          queryRole: getRoleFromQuery(),
+          startParamRole: roleFromStartParam(getTelegramStartParam()),
+          authRole: null,
+          fallbackRole: import.meta.env.VITE_DEFAULT_ROLE,
         });
+
+        setState({ status: 'ready', role });
       }
     };
 

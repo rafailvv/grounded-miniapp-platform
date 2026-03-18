@@ -60,8 +60,8 @@ DEFAULT_RUNTIME_STATE = {
     "roles": {
         "client": {
             "profile": {
-                "first_name": "",
-                "last_name": "",
+                "first_name": "Иван",
+                "last_name": "Иванов",
                 "email": "",
                 "phone": "",
                 "photo_url": None,
@@ -70,8 +70,8 @@ DEFAULT_RUNTIME_STATE = {
         },
         "specialist": {
             "profile": {
-                "first_name": "",
-                "last_name": "",
+                "first_name": "Иван",
+                "last_name": "Иванов",
                 "email": "",
                 "phone": "",
                 "photo_url": None,
@@ -80,8 +80,8 @@ DEFAULT_RUNTIME_STATE = {
         },
         "manager": {
             "profile": {
-                "first_name": "",
-                "last_name": "",
+                "first_name": "Иван",
+                "last_name": "Иванов",
                 "email": "",
                 "phone": "",
                 "photo_url": None,
@@ -198,18 +198,18 @@ def execute_action(role: AppRole, action_id: str, *, payload: dict[str, Any] | N
     state = load_state()
     if action_id == "client_submit_request":
         response = register_submission(payload)
-        return RuntimeActionResponse(message="Request submitted.", next_path="/requests", record_id=response["submission_id"])
+        return RuntimeActionResponse(message="Request submitted.", next_path="/", record_id=response["submission_id"])
 
     if action_id == "specialist_claim_next":
         record = next((item for item in state["records"] if item["status"] == "new"), None)
         if not record:
-            return RuntimeActionResponse(message="Queue is already empty.", next_path="/queue")
+            return RuntimeActionResponse(message="Queue is already empty.", next_path="/")
         record["status"] = "in_progress"
         record["owner"] = "specialist"
         record.setdefault("timeline", []).append({"label": "Claimed", "value": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")})
         state["activity"].insert(0, {"event_id": f"evt_{int(datetime.now(timezone.utc).timestamp())}", "label": f"Specialist claimed {record['title']}", "role": "specialist"})
         save_state(state)
-        return RuntimeActionResponse(message="Next request claimed.", next_path="/queue/detail", record_id=record["record_id"])
+        return RuntimeActionResponse(message="Next request claimed.", next_path="/", record_id=record["record_id"])
 
     if action_id == "specialist_mark_in_progress":
         record = _resolve_record(state, item_id)
@@ -217,7 +217,7 @@ def execute_action(role: AppRole, action_id: str, *, payload: dict[str, Any] | N
             record["status"] = "in_progress"
             record.setdefault("timeline", []).append({"label": "In progress", "value": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")})
             save_state(state)
-        return RuntimeActionResponse(message="Request marked in progress.", next_path="/queue/detail", record_id=record["record_id"] if record else None)
+        return RuntimeActionResponse(message="Request marked in progress.", next_path="/", record_id=record["record_id"] if record else None)
 
     if action_id == "specialist_complete_request":
         record = _resolve_record(state, item_id)
@@ -225,7 +225,7 @@ def execute_action(role: AppRole, action_id: str, *, payload: dict[str, Any] | N
             record["status"] = "completed"
             record.setdefault("timeline", []).append({"label": "Completed", "value": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")})
             save_state(state)
-        return RuntimeActionResponse(message="Request completed.", next_path="/queue", record_id=record["record_id"] if record else None)
+        return RuntimeActionResponse(message="Request completed.", next_path="/", record_id=record["record_id"] if record else None)
 
     if action_id == "manager_rebalance":
         state["roles"]["manager"]["alerts"] = [
@@ -234,10 +234,10 @@ def execute_action(role: AppRole, action_id: str, *, payload: dict[str, Any] | N
         ]
         state["activity"].insert(0, {"event_id": f"evt_{int(datetime.now(timezone.utc).timestamp())}", "label": "Manager rebalanced workload", "role": "manager"})
         save_state(state)
-        return RuntimeActionResponse(message="Load rebalance simulated.", next_path="/dashboard")
+        return RuntimeActionResponse(message="Load rebalance simulated.", next_path="/")
 
     if action_id == "manager_refresh_records":
-        return RuntimeActionResponse(message="Records refreshed.", next_path="/records")
+        return RuntimeActionResponse(message="Records refreshed.", next_path="/")
 
     next_path = _find_action_target(role, action_id)
     return RuntimeActionResponse(message="Action executed.", next_path=next_path)
@@ -441,6 +441,9 @@ def _hydrate_existing_section(
             {"name": "email", "label": "Email", "value": profile.get("email", "")},
             {"name": "phone", "label": "Phone", "value": profile.get("phone", "")},
         ]
+        return hydrated
+
+    if section_type == "actions":
         return hydrated
 
     return hydrated

@@ -9,6 +9,12 @@ export type RuntimeMetric = {
 export type RuntimeSection =
   | {
       section_id: string;
+      type: 'heading';
+      title: string;
+      body?: string;
+    }
+  | {
+      section_id: string;
       type: 'hero';
       title: string;
       body: string;
@@ -52,6 +58,12 @@ export type RuntimeSection =
       section_id: string;
       type: 'profile';
       fields: Array<{ name: string; label: string; value: string }>;
+    }
+  | {
+      section_id: string;
+      type: 'actions';
+      title?: string;
+      actions: RuntimeAction[];
     };
 
 export type RuntimeAction = {
