@@ -12,6 +12,7 @@ import {
   openWorkspace,
   rebuildPreview,
   rollbackRun,
+  ensurePreview,
   stopRun,
   request,
   Run,
@@ -42,6 +43,14 @@ type PreviewInfo = {
   draft_run_id?: string | null;
 };
 
+type RunComposerMode = "generate" | "fix";
+
+type FixErrorContext = {
+  raw_error: string;
+  source?: "build" | "preview" | "backend" | "frontend" | "runtime";
+  failing_target?: string;
+};
+
 function formatLogSection(title: string, lines: string[]): string {
   return [title, ...lines, ""].join("\n");
 }
@@ -63,6 +72,36 @@ const ROLE_LABELS: Record<RoleKey, string> = {
 
 const DEFAULT_PROMPT = "";
 const ROOT_PREVIEW_PATH = "/";
+
+function inferFixSource(rawError: string): FixErrorContext["source"] {
+  const lowered = rawError.toLowerCase();
+  if (lowered.includes("docker preview") || lowered.includes("runtime did not start") || lowered.includes("preview failed")) {
+    return "preview";
+  }
+  if (lowered.includes("traceback") || lowered.includes("modulenotfounderror") || lowered.includes("importerror")) {
+    return "backend";
+  }
+  if (lowered.includes("npm run build") || lowered.includes("vite") || lowered.includes("ts230") || lowered.includes("typescript")) {
+    return "frontend";
+  }
+  if (lowered.includes("permission denied") || lowered.includes("403") || lowered.includes("401")) {
+    return "runtime";
+  }
+  return "build";
+}
+
+function buildFixPrefill(run: Run): { prompt: string; context: FixErrorContext } {
+  const handoff = run.handoff_from_failed_generate;
+  const rawError = handoff?.error_context?.raw_error ?? run.error_context?.raw_error ?? run.failure_reason ?? run.root_cause_summary ?? "Run failed.";
+  return {
+    prompt: rawError,
+    context: {
+      raw_error: rawError,
+      source: handoff?.error_context?.source ?? run.error_context?.source ?? inferFixSource(rawError),
+      failing_target: handoff?.error_context?.failing_target ?? run.error_context?.failing_target ?? run.fix_targets?.[0],
+    },
+  };
+}
 
 function getRoleRootPreviewPath(role: RoleKey): string {
   return `/${role}`;
@@ -361,6 +400,8 @@ export default function App() {
   const [initializing, setInitializing] = useState(true);
   const [systemConfig, setSystemConfig] = useState<SystemConfiguration | null>(null);
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
+  const [selectedRunMode, setSelectedRunMode] = useState<RunComposerMode>("generate");
+  const [fixErrorContext, setFixErrorContext] = useState<FixErrorContext | null>(null);
   const [selectedGenerationMode, setSelectedGenerationMode] = useState<"quality" | "balanced">("quality");
   const [selectedRoles, setSelectedRoles] = useState<Record<RoleKey, boolean>>({
     client: true,
@@ -439,14 +480,14 @@ export default function App() {
     let isMounted = true;
     void (async () => {
       try {
-        const config = await request<SystemConfiguration>("/system/configuration");
+        const config = await withTimeout(request<SystemConfiguration>("/system/configuration"), WORKSPACE_REQUEST_TIMEOUT_MS, "system configuration");
         if (!isMounted) {
           return;
         }
         setSystemConfig(config);
 
         const requestedWorkspaceId = new URLSearchParams(window.location.search).get("workspace_id");
-        const listedWorkspaces = await listWorkspaces();
+        const listedWorkspaces = await withTimeout(listWorkspaces(), WORKSPACE_REQUEST_TIMEOUT_MS, "workspaces");
 
         let nextWorkspace: Workspace | null = null;
         if (requestedWorkspaceId) {
@@ -466,7 +507,7 @@ export default function App() {
           return;
         }
         setWorkspace(nextWorkspace);
-        setWorkspaces(await listWorkspaces());
+        void refreshWorkspaceList(nextWorkspace.workspace_id);
       } catch (err) {
         if (!isMounted) {
           return;
@@ -490,6 +531,11 @@ export default function App() {
     activeWorkspaceIdRef.current = workspace.workspace_id;
     void (async () => {
       await refreshWorkspaceState(workspace.workspace_id);
+      try {
+        await ensurePreview(workspace.workspace_id);
+      } catch {
+        // Preview bootstrap is best-effort; polling and rebuild fallback will handle late startup.
+      }
       void pollPreviewUntilReady(workspace.workspace_id);
     })();
   }, [workspace]);
@@ -622,6 +668,13 @@ export default function App() {
     () => ROLE_ORDER.filter((role) => selectedRoles[role]),
     [selectedRoles],
   );
+  const activeRunIds = useMemo(
+    () =>
+      runs
+        .filter((run) => ["pending", "running"].includes(run.status))
+        .map((run) => run.run_id),
+    [runs],
+  );
   const draftContextRunId = selectedRun?.draft_ready || selectedRun?.status === "awaiting_approval" ? selectedRun.run_id : "";
   const diffText = runArtifacts?.candidate_diff ?? runArtifacts?.diff ?? "";
   const showGlobalLoader = initializing || creatingWorkspace || (workspaceTransitioning && !workspace);
@@ -631,6 +684,25 @@ export default function App() {
     selectedRun?.summary ??
     selectedRun?.failure_reason ??
     "";
+  const failureAnalysis = runArtifacts?.failure_analysis ?? (selectedRun
+    ? {
+        mode: selectedRun.mode,
+        failure_class: selectedRun.failure_class,
+        root_cause_summary: selectedRun.root_cause_summary,
+        fix_targets: selectedRun.fix_targets,
+        handoff_from_failed_generate: selectedRun.handoff_from_failed_generate,
+        error_context: selectedRun.error_context,
+      }
+    : null);
+  const composerTitle = selectedRunMode === "fix" ? "Fix Input" : "Task Input";
+  const composerHelp =
+    selectedRunMode === "fix"
+      ? "Paste the failing build log, preview error, stack trace, or API mismatch. The system will analyze the error and apply the smallest safe fix."
+      : "Describe what to build or change. Use Fix mode when you want targeted error repair instead of broad generation.";
+  const composerPlaceholder =
+    selectedRunMode === "fix"
+      ? "Paste the exact error or log, for example: Docker preview rebuild failed... or a TypeScript traceback."
+      : "Describe the change you want to build. Switch to Fix mode for build failures, preview issues, or stack traces.";
   const previewErrorMessage = useMemo(
     () => extractPreviewErrorMessage(workspaceLogs?.preview?.logs ?? runArtifacts?.preview?.logs ?? []),
     [runArtifacts?.preview?.logs, workspaceLogs?.preview?.logs],
@@ -675,6 +747,61 @@ export default function App() {
       formatLogSection("# PREVIEW", previewLines),
     ].join("\n");
   }, [previewRuntimeMode, previewStatus, previewUrl, topbarRun, workspaceLogs]);
+
+  useEffect(() => {
+    if (!workspace || activeRunIds.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+    let inFlight = false;
+
+    const syncActiveRuns = async () => {
+      if (cancelled || inFlight || activeWorkspaceIdRef.current !== workspace.workspace_id) {
+        return;
+      }
+      inFlight = true;
+      try {
+        const [runsResult, logsResult] = await Promise.allSettled([
+          listRuns(workspace.workspace_id),
+          withTimeout(getWorkspaceLogs(workspace.workspace_id), WORKSPACE_REQUEST_TIMEOUT_MS, "logs"),
+        ]);
+
+        if (cancelled || activeWorkspaceIdRef.current !== workspace.workspace_id) {
+          return;
+        }
+
+        if (runsResult.status === "fulfilled") {
+          setRuns(runsResult.value);
+        }
+
+        if (logsResult.status === "fulfilled") {
+          setWorkspaceLogs(logsResult.value);
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void syncActiveRuns();
+    const intervalId = window.setInterval(() => {
+      void syncActiveRuns();
+    }, document.visibilityState === "visible" ? 1000 : 1500);
+
+    const handleVisibilityOrFocus = () => {
+      void syncActiveRuns();
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityOrFocus);
+    window.addEventListener("focus", handleVisibilityOrFocus);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityOrFocus);
+      window.removeEventListener("focus", handleVisibilityOrFocus);
+    };
+  }, [activeRunIds, workspace]);
 
   async function refreshWorkspaceState(workspaceId: string, preferredRunId?: string) {
     setWorkspaceTransitioning(true);
@@ -743,11 +870,12 @@ export default function App() {
 
       if (previewResult.status === "fulfilled") {
         const previewPayload = previewResult.value;
-        setPreviewUrl(previewPayload.url ?? "");
-        setRolePreviewUrls(previewPayload.role_urls ?? {});
+        const previewIsReady = previewPayload.status === "running" && Boolean(previewPayload.url);
+        setPreviewUrl(previewIsReady ? (previewPayload.url ?? "") : "");
+        setRolePreviewUrls(previewIsReady ? (previewPayload.role_urls ?? {}) : {});
         setPreviewRuntimeMode(previewPayload.runtime_mode ?? "");
         setPreviewStatus(previewPayload.status ?? "");
-        if (previewPayload.url) {
+        if (previewIsReady) {
           setPreviewCycle((current) => current + 1);
           setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
           setPreviewFailed({
@@ -756,7 +884,11 @@ export default function App() {
             manager: false,
           });
         } else {
-          setPreviewLoading({
+          if (previewPayload.status === "stopped" || previewPayload.status === "error" || !previewPayload.status) {
+            void ensurePreview(workspaceId).catch(() => undefined);
+          }
+          setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
+          setPreviewFailed({
             client: false,
             specialist: false,
             manager: false,
@@ -801,6 +933,11 @@ export default function App() {
         }
 
         if (preview.status === "error") {
+          try {
+            await ensurePreview(workspaceId);
+          } catch {
+            // If ensure also fails, keep current error state and surface logs.
+          }
           setPreviewLoading({
             client: false,
             specialist: false,
@@ -847,8 +984,27 @@ export default function App() {
     setError("");
     setPreviewBooting(true);
     try {
+      const trimmedPrompt = prompt.trim();
+      const fixPayload =
+        selectedRunMode === "fix"
+          ? {
+              mode: "fix" as const,
+              prompt:
+                trimmedPrompt.length > 180
+                  ? "Analyze the reported failure and apply the smallest safe fix."
+                  : trimmedPrompt,
+              error_context: {
+                raw_error: fixErrorContext?.raw_error?.trim() || trimmedPrompt,
+                source: fixErrorContext?.source ?? inferFixSource(trimmedPrompt),
+                ...(fixErrorContext?.failing_target ? { failing_target: fixErrorContext.failing_target } : {}),
+              },
+            }
+          : {
+              mode: "generate" as const,
+              prompt: trimmedPrompt,
+            };
       const run = await createRun(workspace.workspace_id, {
-        prompt: prompt.trim(),
+        ...fixPayload,
         intent: "auto",
         apply_strategy: "staged_auto_apply",
         target_role_scope: activeRoleScope,
@@ -867,6 +1023,13 @@ export default function App() {
       setPreviewBooting(false);
       setLoading(false);
     }
+  }
+
+  function handoffRunToFix(run: Run) {
+    const handoff = buildFixPrefill(run);
+    setSelectedRunMode("fix");
+    setPrompt(handoff.prompt);
+    setFixErrorContext(handoff.context);
   }
 
   async function handleSelectFile(path: string) {
@@ -997,7 +1160,7 @@ export default function App() {
       setRuns([]);
       setSelectedRunId("");
       setRunArtifacts(null);
-      await refreshWorkspaceList(nextWorkspace.workspace_id);
+      void refreshWorkspaceList(nextWorkspace.workspace_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create workspace.");
     } finally {
@@ -1355,6 +1518,41 @@ export default function App() {
               <section className="run-detail-section">
                 <h4>Failure reason</h4>
                 <p>{selectedRun.failure_reason}</p>
+                {selectedRun.status !== "completed" ? (
+                  <button type="button" className="ghost-action" onClick={() => handoffRunToFix(selectedRun)}>
+                    Open In Fix Mode
+                  </button>
+                ) : null}
+              </section>
+            ) : null}
+
+            {failureAnalysis?.failure_class || failureAnalysis?.root_cause_summary || failureAnalysis?.fix_targets?.length ? (
+              <section className="run-detail-section">
+                <h4>Error analysis</h4>
+                <div className="run-details-grid">
+                  <div className="run-detail-card">
+                    <span>Run mode</span>
+                    <strong>{failureAnalysis.mode ?? selectedRun.mode ?? "generate"}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>Failure class</span>
+                    <strong>{failureAnalysis.failure_class ?? "n/a"}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>Repair attempts</span>
+                    <strong>{selectedRun.repair_iterations?.length ?? 0}</strong>
+                  </div>
+                </div>
+                {failureAnalysis.root_cause_summary ? <p>{failureAnalysis.root_cause_summary}</p> : null}
+                {failureAnalysis.fix_targets?.length ? (
+                  <div className="run-detail-list">
+                    {failureAnalysis.fix_targets.map((target) => (
+                      <div key={target} className="run-detail-item">
+                        <strong>{target}</strong>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
               </section>
             ) : null}
 
@@ -1466,26 +1664,55 @@ export default function App() {
         <section className="panel panel-chat">
           <header className="panel-header">
             <div className="panel-header-row">
-              <h2>Task Input</h2>
+              <h2>{composerTitle}</h2>
               <div className="panel-help">
                 <button type="button" className="panel-help-trigger" aria-label="Task input help">
                   ?
                 </button>
                 <div className="panel-help-tooltip" role="tooltip">
-                  Describe what to build, change, or fix. You can paste build errors, preview failures, and stack traces for a minimal patch instead of a full rebuild.
+                  {composerHelp}
                 </div>
               </div>
             </div>
           </header>
 
           <form onSubmit={handleRun} className="composer-form">
+            <div className="composer-mode-switch" role="tablist" aria-label="Run mode">
+              <button
+                type="button"
+                className={`composer-mode-pill ${selectedRunMode === "generate" ? "is-active" : ""}`}
+                onClick={() => {
+                  setSelectedRunMode("generate");
+                  setFixErrorContext(null);
+                }}
+              >
+                Generate
+              </button>
+              <button
+                type="button"
+                className={`composer-mode-pill ${selectedRunMode === "fix" ? "is-active" : ""}`}
+                onClick={() => setSelectedRunMode("fix")}
+              >
+                Fix
+              </button>
+            </div>
             <label className="composer-field">
-              <span>Prompt</span>
+              <span>{selectedRunMode === "fix" ? "Error or failure context" : "Prompt"}</span>
               <textarea
                 value={prompt}
-                onChange={(event) => setPrompt(event.target.value)}
+                onChange={(event) => {
+                  const nextValue = event.target.value;
+                  setPrompt(nextValue);
+                  if (selectedRunMode === "fix") {
+                    setFixErrorContext((current) => ({
+                      raw_error: nextValue,
+                      source: current?.source ?? inferFixSource(nextValue),
+                      failing_target: current?.failing_target,
+                    }));
+                  }
+                }}
                 rows={9}
-                placeholder="Describe the change, or paste an error like: Docker preview rebuild failed... Fix only this issue without rebuilding the whole app."
+                placeholder={composerPlaceholder}
               />
             </label>
 
@@ -1518,7 +1745,7 @@ export default function App() {
             </label>
 
             <button className="generate-full" type="submit" disabled={!workspace || loading}>
-              {loading ? "Running..." : "Generate and apply"}
+              {loading ? "Running..." : selectedRunMode === "fix" ? "Analyze and fix" : "Generate and apply"}
             </button>
           </form>
 
@@ -1573,7 +1800,7 @@ export default function App() {
                           <span>{run.touched_files.length} files</span>
                         </div>
                       </button>
-                      {run.status === "completed" || canStopRun ? (
+                      {run.status === "completed" || canStopRun || run.status === "failed" || run.status === "blocked" ? (
                         <div className="run-card-actions">
                           {canStopRun ? (
                             <button
@@ -1585,6 +1812,15 @@ export default function App() {
                               disabled={isStoppingRun}
                             >
                               {isStoppingRun ? "Stopping..." : "Stop"}
+                            </button>
+                          ) : null}
+                          {(run.status === "failed" || run.status === "blocked") ? (
+                            <button
+                              type="button"
+                              className="ghost-action run-card-action"
+                              onClick={() => handoffRunToFix(run)}
+                            >
+                              Fix
                             </button>
                           ) : null}
                           <button
@@ -1757,6 +1993,14 @@ export default function App() {
                         <div className="preview-loader-card preview-error-card">
                           <strong>Preview failed</strong>
                           <p>{previewErrorMessage ?? "Runtime did not start successfully. Try Rebuild preview."}</p>
+                        </div>
+                      </div>
+                    ) : previewStatus !== "running" ? (
+                      <div className="preview-loader" role="status" aria-live="polite">
+                        <div className="preview-loader-card">
+                          <div className="preview-loader-spinner" aria-hidden="true" />
+                          <strong>Loading preview</strong>
+                          <p>Starting the workspace container and waiting for a healthy response.</p>
                         </div>
                       </div>
                     ) : !previewUrl && previewFailed[role] ? (

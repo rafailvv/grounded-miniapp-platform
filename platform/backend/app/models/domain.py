@@ -108,11 +108,21 @@ class ValidationSnapshot(StrictModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+RunMode = Literal["generate", "fix"]
+
+
+class ErrorContext(StrictModel):
+    raw_error: str
+    source: Literal["build", "preview", "backend", "frontend", "runtime"] | None = None
+    failing_target: str | None = None
+
+
 class JobRecord(StrictModel):
     job_id: str = Field(default_factory=lambda: new_id("job"))
     workspace_id: str
     prompt: str
     status: Literal["pending", "running", "blocked", "completed", "failed"] = "pending"
+    mode: RunMode = "generate"
     generation_mode: GenerationMode = GenerationMode.QUALITY
     target_platform: TargetPlatform
     preview_profile: PreviewProfile
@@ -123,7 +133,12 @@ class JobRecord(StrictModel):
     llm_model: str | None = None
     model_profile: str | None = None
     linked_run_id: str | None = None
+    error_context: ErrorContext | None = None
     failure_reason: str | None = None
+    failure_class: str | None = None
+    root_cause_summary: str | None = None
+    fix_targets: list[str] = Field(default_factory=list)
+    handoff_from_failed_generate: dict[str, Any] | None = None
     compile_summary: dict[str, int | str] = Field(default_factory=dict)
     events: list[JobEvent] = Field(default_factory=list)
     summary: str | None = None
@@ -143,7 +158,7 @@ class JobRecord(StrictModel):
 class PreviewRecord(StrictModel):
     preview_id: str = Field(default_factory=lambda: new_id("preview"))
     workspace_id: str
-    status: Literal["stopped", "running", "error"] = "stopped"
+    status: Literal["stopped", "starting", "running", "error"] = "stopped"
     url: str | None = None
     frontend_url: str | None = None
     backend_url: str | None = None
@@ -195,6 +210,7 @@ class CreateChatTurnRequest(StrictModel):
 
 class GenerateRequest(StrictModel):
     prompt: str
+    mode: RunMode = "generate"
     target_platform: TargetPlatform = TargetPlatform.TELEGRAM
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
     generation_mode: GenerationMode = GenerationMode.QUALITY
@@ -202,6 +218,7 @@ class GenerateRequest(StrictModel):
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
     model_profile: str = "openai_code_fast"
     linked_run_id: str | None = None
+    error_context: ErrorContext | None = None
 
 
 class SaveFileRequest(StrictModel):
@@ -354,6 +371,7 @@ class RunRecord(StrictModel):
     run_id: str = Field(default_factory=lambda: new_id("run"))
     workspace_id: str
     prompt: str
+    mode: RunMode = "generate"
     intent: Literal["create", "edit", "refine", "role_only_change"]
     apply_strategy: Literal["staged_auto_apply", "manual_approve"] = "staged_auto_apply"
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
@@ -374,6 +392,11 @@ class RunRecord(StrictModel):
     progress_percent: int = 0
     summary: str | None = None
     failure_reason: str | None = None
+    failure_class: str | None = None
+    root_cause_summary: str | None = None
+    fix_targets: list[str] = Field(default_factory=list)
+    handoff_from_failed_generate: dict[str, Any] | None = None
+    error_context: ErrorContext | None = None
     checks_summary: RunChecksSummary = Field(default_factory=RunChecksSummary)
     touched_files: list[str] = Field(default_factory=list)
     artifacts: dict[str, str] = Field(default_factory=dict)
@@ -390,6 +413,7 @@ class RunRecord(StrictModel):
 
 class CreateRunRequest(StrictModel):
     prompt: str
+    mode: RunMode = "generate"
     intent: Literal["auto", "create", "edit", "refine", "role_only_change"] = "auto"
     apply_strategy: Literal["staged_auto_apply", "manual_approve"] = "staged_auto_apply"
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
@@ -397,3 +421,4 @@ class CreateRunRequest(StrictModel):
     target_platform: TargetPlatform = TargetPlatform.TELEGRAM
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
     generation_mode: GenerationMode = GenerationMode.QUALITY
+    error_context: ErrorContext | None = None

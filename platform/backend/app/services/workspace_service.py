@@ -82,7 +82,6 @@ class WorkspaceService:
         workspace.revisions.append(revision)
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
-        self._refresh_indexes(workspace)
         return workspace
 
     def reset_workspace(self, workspace_id: str) -> WorkspaceRecord:
@@ -91,7 +90,6 @@ class WorkspaceService:
         latest.source = "reset"
         latest.message = "Reset workspace to canonical template"
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
-        self._refresh_indexes(workspace)
         return workspace
 
     def rollback_last_revision(self, workspace_id: str) -> WorkspaceRecord:
@@ -441,7 +439,18 @@ class WorkspaceService:
 
     @staticmethod
     def _copy_tree(source_dir: Path, destination_dir: Path) -> None:
-        shutil.copytree(source_dir, destination_dir, ignore=shutil.ignore_patterns(".git"), symlinks=True)
+        shutil.copytree(
+            source_dir,
+            destination_dir,
+            ignore=shutil.ignore_patterns(
+                ".git",
+                "node_modules",
+                "dist",
+                "__pycache__",
+                ".pytest_cache",
+            ),
+            symlinks=True,
+        )
 
     @staticmethod
     def _replace_workspace_contents_from_draft(source_dir: Path, draft_source_dir: Path) -> None:

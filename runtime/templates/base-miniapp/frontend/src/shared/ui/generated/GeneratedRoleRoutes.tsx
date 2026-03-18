@@ -30,7 +30,9 @@ function RoleRouteContent({ role }: GeneratedRoleRoutesProps): JSX.Element {
     <Routes>
       <Route element={<AppShell />}>
         <Route index element={<GeneratedRoleScreen role={role} screenId={entryScreen} />} />
+        <Route path={role} element={<GeneratedRoleScreen role={role} screenId={entryScreen} />} />
         <Route path="profile" element={<RoleProfileEditorPage role={role} />} />
+        <Route path={`${role}/profile`} element={<RoleProfileEditorPage role={role} />} />
         <Route path="*" element={<Navigate replace to="/" />} />
       </Route>
     </Routes>

@@ -21,6 +21,7 @@ def generate(
             workspace_id,
             CreateRunRequest(
                 prompt=request.prompt,
+                mode=request.mode,
                 intent=request.intent,
                 apply_strategy="staged_auto_apply",
                 target_role_scope=request.target_role_scope,
@@ -28,6 +29,7 @@ def generate(
                 target_platform=request.target_platform,
                 preview_profile=request.preview_profile,
                 generation_mode=request.generation_mode,
+                error_context=request.error_context,
             ),
         )
         if not run.linked_job_id:

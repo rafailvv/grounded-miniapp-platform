@@ -72,6 +72,7 @@ class RunService:
         run = RunRecord(
             workspace_id=workspace_id,
             prompt=request.prompt,
+            mode=request.mode,
             intent=resolved_intent,
             apply_strategy=request.apply_strategy,
             approval_required=request.apply_strategy == "manual_approve",
@@ -79,6 +80,7 @@ class RunService:
             model_profile=request.model_profile,
             llm_provider="openrouter" if self.openrouter_client.enabled else None,
             source_revision_id=workspace.current_revision_id,
+            error_context=request.error_context,
             status="pending",
             apply_status="pending",
             current_stage="queued",
@@ -223,13 +225,15 @@ class RunService:
                 run.workspace_id,
                 GenerateRequest(
                     prompt=request.prompt,
+                    mode=request.mode,
                     target_platform=request.target_platform,
                     preview_profile=request.preview_profile,
                     generation_mode=effective_generation_mode,
-                intent=run.intent,
-                target_role_scope=run.target_role_scope,
-                model_profile=request.model_profile,
-                linked_run_id=run.run_id,
+                    intent=run.intent,
+                    target_role_scope=run.target_role_scope,
+                    model_profile=request.model_profile,
+                    linked_run_id=run.run_id,
+                    error_context=request.error_context,
                 ),
                 should_stop=lambda: self._is_stop_requested(run.run_id),
             )
@@ -247,6 +251,10 @@ class RunService:
             run.llm_model = job.llm_model
             run.summary = job.summary
             run.failure_reason = job.failure_reason
+            run.failure_class = job.failure_class
+            run.root_cause_summary = job.root_cause_summary
+            run.fix_targets = list(job.fix_targets)
+            run.handoff_from_failed_generate = dict(job.handoff_from_failed_generate or {}) or None
             run.checks_summary = self._build_checks_summary(job.validation_snapshot, preview.status)
             run.touched_files = self._resolve_touched_files(change_plan)
             run.candidate_revision_id = f"draft:{run.run_id}"
@@ -366,12 +374,22 @@ class RunService:
             "cache_stats": job.cache_stats,
             "apply_result": job.apply_result,
             "repair_iterations": job.repair_iterations,
+            "failure_analysis": {
+                "mode": run.mode,
+                "failure_class": job.failure_class,
+                "root_cause_summary": job.root_cause_summary,
+                "fix_targets": job.fix_targets,
+                "handoff_from_failed_generate": job.handoff_from_failed_generate,
+                "error_context": job.error_context.model_dump(mode="json") if job.error_context else None,
+            },
         }
         self.store.upsert("reports", f"run_artifacts:{run.run_id}", payload)
 
     def _resolve_intent(self, workspace: WorkspaceRecord, request: CreateRunRequest) -> str:
         if request.intent != "auto":
             return request.intent
+        if request.mode == "fix":
+            return "edit"
         prompt = request.prompt.lower()
         if self._looks_like_fix_request(prompt):
             return "edit"
@@ -390,6 +408,8 @@ class RunService:
         request: CreateRunRequest,
         resolved_intent: str,
     ) -> GenerationMode:
+        if request.mode == "fix":
+            return GenerationMode.BALANCED if request.generation_mode == GenerationMode.QUALITY else request.generation_mode
         if request.generation_mode != GenerationMode.QUALITY:
             return request.generation_mode
         prompt = request.prompt.lower()

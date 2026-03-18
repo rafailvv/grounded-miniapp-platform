@@ -22,7 +22,7 @@ type FormErrors = {
 type SaveState = 'idle' | 'saving' | 'saved';
 
 const EMAIL_REGEXP = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i;
-const REQUIRED_ERROR_PREFIX = 'Введите';
+const REQUIRED_ERROR_PREFIX = 'Enter';
 const PHONE_TEMPLATE = '+7 (___) ___-__-__';
 const PHONE_EDITABLE_POSITIONS = [4, 5, 6, 9, 10, 11, 13, 14, 16, 17] as const;
 const PHONE_LOCAL_DIGITS_COUNT = PHONE_EDITABLE_POSITIONS.length;
@@ -72,21 +72,21 @@ function getCaretByLocalDigitIndex(localDigitIndex: number): number {
 
 function validateEmail(value: string): string | undefined {
   const trimmed = value.trim();
-  if (!trimmed) return 'Введите email';
-  if (!EMAIL_REGEXP.test(trimmed)) return 'Некорректный email';
+  if (!trimmed) return 'Enter an email address';
+  if (!EMAIL_REGEXP.test(trimmed)) return 'Enter a valid email address';
   return undefined;
 }
 
 function validatePhone(value: string): string | undefined {
   const trimmed = value.trim();
-  if (!trimmed) return 'Введите телефон';
+  if (!trimmed) return 'Enter a phone number';
 
   const localDigits = extractPhoneLocalDigits(trimmed);
   if (localDigits.length === 0) {
-    return 'Введите телефон';
+    return 'Enter a phone number';
   }
   if (localDigits.length !== PHONE_LOCAL_DIGITS_COUNT) {
-    return 'Телефон должен быть в формате +7 (999) 123-45-67';
+    return 'Phone number must match the format +7 (999) 123-45-67';
   }
 
   return undefined;
@@ -295,12 +295,12 @@ export function RoleProfileEditorPage({ role }: RoleProfileEditorPageProps): JSX
   };
 
   const saveButtonLabel =
-    saveState === 'saving' ? 'Сохранение...' : saveState === 'saved' ? 'Сохранено' : 'Сохранить';
+    saveState === 'saving' ? 'Saving...' : saveState === 'saved' ? 'Saved' : 'Save';
 
   return (
     <section className={styles.page}>
       <header className={styles.header}>
-        <h2 className={styles.title}>Редактирование профиля</h2>
+        <h2 className={styles.title}>Edit profile</h2>
       </header>
 
       <div className={styles.previewCard}>
@@ -325,41 +325,41 @@ export function RoleProfileEditorPage({ role }: RoleProfileEditorPageProps): JSX
         </div>
 
         <div className={styles.previewInfo}>
-          <strong className={styles.previewName}>{getClientProfileDisplayName({ firstName, lastName }) || 'Пользователь'}</strong>
+          <strong className={styles.previewName}>{getClientProfileDisplayName({ firstName, lastName }) || 'User'}</strong>
         </div>
       </div>
 
       <div className={styles.formCard}>
         <label className={styles.inputWrapper}>
           <span className={styles.inputLabel}>
-            Имя<span className={styles.requiredIndicator}> *</span>
+            First name<span className={styles.requiredIndicator}> *</span>
           </span>
           <input
             className={styles.textInput}
             value={firstName}
             onChange={(event) => setFirstName(event.target.value)}
-            placeholder={firstName ? '' : 'Введите имя'}
+            placeholder={firstName ? '' : 'Enter first name'}
           />
         </label>
 
         <label className={styles.inputWrapper}>
-          <span className={styles.inputLabel}>Фамилия</span>
+          <span className={styles.inputLabel}>Last name</span>
           <input
             className={styles.textInput}
             value={lastName}
             onChange={(event) => setLastName(event.target.value)}
-            placeholder={lastName ? '' : 'Введите фамилию'}
+            placeholder={lastName ? '' : 'Enter last name'}
           />
         </label>
 
         <label className={styles.inputWrapper}>
-          <span className={styles.inputLabel}>Никнейм в Telegram</span>
+          <span className={styles.inputLabel}>Telegram username</span>
           <input className={styles.textInput} value={initialView.username} disabled />
         </label>
 
         <label className={styles.inputWrapper}>
           <span className={styles.inputLabel}>
-            Почта<span className={styles.requiredIndicator}> *</span>
+            Email<span className={styles.requiredIndicator}> *</span>
           </span>
           <input
             className={styles.textInput}
@@ -373,7 +373,7 @@ export function RoleProfileEditorPage({ role }: RoleProfileEditorPageProps): JSX
 
         <label className={styles.inputWrapper}>
           <span className={styles.inputLabel}>
-            Телефон<span className={styles.requiredIndicator}> *</span>
+            Phone<span className={styles.requiredIndicator}> *</span>
           </span>
           <input
             ref={phoneInputRef}

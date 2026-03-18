@@ -8,7 +8,9 @@ export function ManagerRoutes(): JSX.Element {
     <Routes>
       <Route element={<AppShell />}>
         <Route index element={<ManagerHomePage />} />
+        <Route path="manager" element={<ManagerHomePage />} />
         <Route path="profile" element={<ManagerProfilePage />} />
+        <Route path="manager/profile" element={<ManagerProfilePage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

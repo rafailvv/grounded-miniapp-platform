@@ -151,11 +151,11 @@ class GenerationService:
 
     def generate(self, workspace_id: str, request: GenerateRequest, *, should_stop: Callable[[], bool] | None = None) -> JobRecord:
         started_at = time.perf_counter()
+        effective_prompt = self._effective_prompt(request)
         target_platform = self._target_platform(request.target_platform)
         preview_profile = self._preview_profile(request.preview_profile)
         generation_mode = self._generation_mode(request.generation_mode)
         workspace = self.workspace_service.get_workspace(workspace_id)
-        self.code_index_service.index_workspace(workspace, self.workspace_service.source_dir(workspace_id))
         role_scope = [role for role in request.target_role_scope if role in ROLE_ORDER] or list(ROLE_ORDER)
         llm_config = self.openrouter_client.configuration()
 
@@ -163,6 +163,7 @@ class GenerationService:
             workspace_id=workspace_id,
             prompt=request.prompt,
             status="running",
+            mode=request.mode,
             generation_mode=generation_mode,
             target_platform=target_platform,
             preview_profile=preview_profile,
@@ -172,24 +173,29 @@ class GenerationService:
             llm_provider="openrouter" if llm_config["enabled"] else None,
             model_profile=request.model_profile,
             linked_run_id=request.linked_run_id,
+            error_context=request.error_context,
+            failure_class=self._failure_class_from_error_context(request.error_context),
+            root_cause_summary=self._root_cause_summary(request.error_context),
         )
         if request.linked_run_id:
             draft_run_id = request.linked_run_id
         else:
             draft_run_id = job.job_id
         self._clear_trace(workspace_id)
+        self._append_event(job, "retrieval_started", "Preparing workspace index and grounded retrieval.")
         self._append_trace(
             workspace_id,
             "job_started",
             "Generation request accepted.",
             {
                 "mode": generation_mode.value,
+                "run_mode": request.mode,
                 "target_platform": target_platform.value,
                 "preview_profile": preview_profile.value,
                 "llm_enabled": bool(llm_config["enabled"]),
             },
         )
-        self._append_event(job, "retrieval_started", "Grounded retrieval started.", {"stage": "retrieval"})
+        self.code_index_service.index_workspace(workspace, self.workspace_service.source_dir(workspace_id))
         stopped = self._stop_if_requested(job, workspace_id, should_stop)
         if stopped is not None:
             return stopped
@@ -232,7 +238,7 @@ class GenerationService:
 
         doc_refs = self.document_service.retrieve(
             workspace_id=workspace_id,
-            prompt=request.prompt,
+            prompt=effective_prompt,
             target_platform=target_platform.value,
         )
         retrieval_ms = int((time.perf_counter() - started_at) * 1000)
@@ -260,7 +266,7 @@ class GenerationService:
             linked_run_id=request.linked_run_id,
         )
         self.store.upsert("chat_turns", chat_turn.turn_id, chat_turn.model_dump(mode="json"))
-        creative_direction = self._select_creative_direction(request.prompt)
+        creative_direction = self._select_creative_direction(effective_prompt)
         self._append_trace(
             workspace_id,
             "creative_direction_selected",
@@ -273,7 +279,7 @@ class GenerationService:
 
         spec_result = self._resolve_grounded_spec(
             workspace_id=workspace_id,
-            prompt=request.prompt,
+            prompt=effective_prompt,
             target_platform=target_platform,
             preview_profile=preview_profile,
             doc_refs=doc_refs,
@@ -352,7 +358,7 @@ class GenerationService:
             },
         )
         role_contract_result = self._resolve_role_contract(
-            prompt=request.prompt,
+            prompt=effective_prompt,
             grounded_spec=grounded_spec,
             doc_refs=doc_refs,
             role_scope=role_scope,
@@ -374,7 +380,7 @@ class GenerationService:
                 failure_reason=role_contract_result["error"],
             )
         role_contract = role_contract_result["role_contract"]
-        role_contract_issues = self._role_contract_gate_issues(role_contract, role_scope, scope_mode=self._scope_mode(request.intent, request.prompt, role_scope))
+        role_contract_issues = self._role_contract_gate_issues(role_contract, role_scope, scope_mode=self._scope_mode(request.intent, effective_prompt, role_scope))
         if role_contract_issues:
             self._append_trace(
                 workspace_id,
@@ -407,7 +413,7 @@ class GenerationService:
             return stopped
         plan_result = self._resolve_code_plan(
             workspace_id=workspace_id,
-            prompt=request.prompt,
+            prompt=effective_prompt,
             grounded_spec=grounded_spec,
             doc_refs=doc_refs,
             role_scope=role_scope,
@@ -474,7 +480,7 @@ class GenerationService:
 
         context_pack = self.context_pack_builder.build(
             workspace=workspace,
-            prompt=request.prompt,
+            prompt=effective_prompt,
             model_profile=request.model_profile,
             active_paths=plan_result["files_to_read"],
             target_files=plan_result["target_files"],
@@ -496,7 +502,7 @@ class GenerationService:
         job.latency_breakdown["context_pack_ms"] = int((time.perf_counter() - started_at) * 1000) - retrieval_ms
 
         edit_result = self._resolve_code_edits(
-            prompt=request.prompt,
+            prompt=effective_prompt,
             grounded_spec=grounded_spec,
             role_scope=role_scope,
             file_contexts=file_contexts,
@@ -693,6 +699,18 @@ class GenerationService:
                     if build_issues
                     else "Preview rebuild failed after automatic repair attempts."
                 )
+                job.failure_class = check_failure or self._failure_class_from_error_context(request.error_context)
+                job.root_cause_summary = self._summarize_failed_checks(build_issues, preview_issue) or job.root_cause_summary
+                if job.root_cause_summary:
+                    job.failure_reason = f"{job.failure_reason} Root cause: {job.root_cause_summary}"
+                job.fix_targets = sorted({issue.location for issue in check_issues if issue.location and issue.location not in {"generation", "preview"}})
+                job.handoff_from_failed_generate = self._build_fix_handoff(
+                    prompt=request.prompt,
+                    failure_reason=job.failure_reason,
+                    failure_class=job.failure_class,
+                    issues=check_issues,
+                    mode=request.mode,
+                )
                 job.validation_snapshot = ValidationSnapshot(
                     grounded_spec_valid=True,
                     app_ir_valid=True,
@@ -708,7 +726,7 @@ class GenerationService:
             repair_result = self._repair_draft_after_failure(
                 workspace_id=workspace_id,
                 draft_run_id=draft_run_id,
-                prompt=request.prompt,
+                prompt=effective_prompt,
                 grounded_spec=grounded_spec,
                 role_scope=role_scope,
                 role_contract=role_contract,
@@ -736,6 +754,18 @@ class GenerationService:
                 )
                 job.status = "failed"
                 job.failure_reason = str(repair_result["error"])
+                job.failure_class = check_failure or self._failure_class_from_error_context(request.error_context)
+                job.root_cause_summary = self._summarize_failed_checks(build_issues, preview_issue) or job.root_cause_summary
+                if job.root_cause_summary and job.root_cause_summary not in job.failure_reason:
+                    job.failure_reason = f"{job.failure_reason} Root cause: {job.root_cause_summary}"
+                job.fix_targets = sorted({issue.location for issue in check_issues if issue.location and issue.location not in {"generation", "preview"}})
+                job.handoff_from_failed_generate = self._build_fix_handoff(
+                    prompt=request.prompt,
+                    failure_reason=job.failure_reason,
+                    failure_class=job.failure_class,
+                    issues=check_issues,
+                    mode=request.mode,
+                )
                 job.validation_snapshot = ValidationSnapshot(
                     grounded_spec_valid=True,
                     app_ir_valid=True,
@@ -766,6 +796,16 @@ class GenerationService:
                 )
                 job.status = "failed"
                 job.failure_reason = apply_result.conflict_reason or "Repair patch could not be applied safely."
+                job.failure_class = "patch_conflict"
+                job.root_cause_summary = job.failure_reason
+                job.fix_targets = sorted({issue.location for issue in build_issues if issue.location and issue.location not in {"generation", "preview"}})
+                job.handoff_from_failed_generate = self._build_fix_handoff(
+                    prompt=request.prompt,
+                    failure_reason=job.failure_reason,
+                    failure_class=job.failure_class,
+                    issues=build_issues,
+                    mode=request.mode,
+                )
                 job.validation_snapshot = ValidationSnapshot(
                     grounded_spec_valid=True,
                     app_ir_valid=True,
@@ -807,6 +847,7 @@ class GenerationService:
         job.summary = summary
         job.traceability_report_id = traceability.report_id
         job.assumptions_report = [item.model_dump(mode="json") for item in grounded_spec.assumptions]
+        job.fix_targets = sorted({operation.file_path for operation in all_operations})
         job.validation_snapshot = ValidationSnapshot(
             grounded_spec_valid=True,
             app_ir_valid=True,
@@ -850,9 +891,11 @@ class GenerationService:
         job = self.get_job(job_id)
         request = GenerateRequest(
             prompt=job.prompt,
+            mode=job.mode,
             target_platform=self._target_platform(job.target_platform),
             preview_profile=self._preview_profile(job.preview_profile),
             generation_mode=self._generation_mode(job.generation_mode),
+            error_context=job.error_context,
         )
         return self.generate(job.workspace_id, request)
 
@@ -1484,6 +1527,85 @@ class GenerationService:
             "сбой",
         )
         return any(marker in prompt for marker in fix_markers)
+
+    @staticmethod
+    def _effective_prompt(request: GenerateRequest) -> str:
+        if request.mode != "fix" or request.error_context is None:
+            return request.prompt
+        segments = [
+            request.prompt.strip(),
+            "Repair only the reported error. Keep the diff minimal and preserve existing behavior.",
+            f"Error source: {request.error_context.source or 'unknown'}",
+            f"Failing target: {request.error_context.failing_target or 'unknown'}",
+            request.error_context.raw_error.strip(),
+        ]
+        return "\n\n".join(segment for segment in segments if segment)
+
+    @staticmethod
+    def _failure_class_from_error_context(error_context: Any) -> str | None:
+        if not error_context:
+            return None
+        source = str(getattr(error_context, "source", "") or "").lower()
+        raw_error = str(getattr(error_context, "raw_error", "") or "").lower()
+        text = f"{source}\n{raw_error}"
+        if any(marker in text for marker in ("preview failed", "docker preview", "permission denied", "docker daemon")):
+            return "preview_startup"
+        if any(marker in text for marker in ("traceback", "importerror", "modulenotfounderror", "literal is not defined")):
+            return "backend_startup"
+        if any(marker in text for marker in ("npm run build", "ts230", "vite", "typescript", "jsx", "next/link")):
+            return "frontend_build"
+        if any(marker in text for marker in ("401", "403", "authorization", "permissions denied")):
+            return "runtime_permission"
+        if any(marker in text for marker in ("payload", "schema", "validationerror", "does not return", "unexpected key")):
+            return "api_contract_mismatch"
+        if source:
+            return source
+        return "runtime_failure"
+
+    @staticmethod
+    def _root_cause_summary(error_context: Any) -> str | None:
+        if not error_context:
+            return None
+        source = str(getattr(error_context, "source", "") or "runtime")
+        failing_target = str(getattr(error_context, "failing_target", "") or "current build")
+        raw_error = str(getattr(error_context, "raw_error", "") or "").strip()
+        first_line = raw_error.splitlines()[0].strip() if raw_error else ""
+        if not first_line:
+            return f"Fix run requested for {source} issue in {failing_target}."
+        return f"{source} issue in {failing_target}: {first_line[:220]}"
+
+    @staticmethod
+    def _summarize_failed_checks(build_issues: list[ValidationIssue], preview_issue: ValidationIssue | None) -> str | None:
+        primary_issue = build_issues[0] if build_issues else preview_issue
+        if primary_issue is None:
+            return None
+        location = primary_issue.location or "workspace"
+        return f"{primary_issue.message} ({location})"
+
+    @staticmethod
+    def _build_fix_handoff(
+        *,
+        prompt: str,
+        failure_reason: str | None,
+        failure_class: str | None,
+        issues: list[ValidationIssue],
+        mode: str,
+    ) -> dict[str, Any] | None:
+        if mode == "fix":
+            return None
+        error_lines = [failure_reason or "Run failed."]
+        for issue in issues[:6]:
+            error_lines.append(f"[{issue.code}] {issue.message}")
+        return {
+            "mode": "fix",
+            "prompt": "Analyze this failure and apply the smallest safe fix.",
+            "error_context": {
+                "source": "runtime",
+                "failing_target": issues[0].location if issues else None,
+                "raw_error": "\n".join(line for line in error_lines if line),
+            },
+            "failure_class": failure_class,
+        }
 
     @staticmethod
     def _role_contract_schema() -> dict[str, Any]:
@@ -4967,6 +5089,24 @@ class GenerationService:
         job.status = "blocked"
         job.fidelity = "blocked"
         job.failure_reason = failure_reason
+        if validation_result.issues:
+            primary_issue = validation_result.issues[0]
+            job.failure_class = job.failure_class or primary_issue.code
+            job.root_cause_summary = job.root_cause_summary or primary_issue.message
+            job.fix_targets = sorted(
+                {
+                    issue.location
+                    for issue in validation_result.issues
+                    if issue.location and issue.location not in {"generation", "preview"}
+                }
+            )
+            job.handoff_from_failed_generate = job.handoff_from_failed_generate or self._build_fix_handoff(
+                prompt=job.prompt,
+                failure_reason=failure_reason,
+                failure_class=job.failure_class,
+                issues=validation_result.issues,
+                mode=job.mode,
+            )
         job.assumptions_report = [item.model_dump(mode="json") for item in assumptions]
         job.validation_snapshot = ValidationSnapshot(
             grounded_spec_valid=isinstance(validation_result, GroundedSpecValidatorResult) and validation_result.valid,
@@ -4989,6 +5129,8 @@ class GenerationService:
         job.status = "blocked"
         job.fidelity = "blocked"
         job.failure_reason = failure_reason
+        job.failure_class = job.failure_class or code
+        job.root_cause_summary = job.root_cause_summary or (messages[0] if messages else failure_reason)
         job.validation_snapshot = ValidationSnapshot(
             build_valid=False,
             blocking=True,
@@ -5001,6 +5143,22 @@ class GenerationService:
                 ).model_dump(mode="json")
                 for message in messages
             ],
+        )
+        issues = [
+            ValidationIssue(
+                code=code,
+                message=message,
+                severity="critical",
+                location="generation",
+            )
+            for message in messages
+        ]
+        job.handoff_from_failed_generate = job.handoff_from_failed_generate or self._build_fix_handoff(
+            prompt=job.prompt,
+            failure_reason=failure_reason,
+            failure_class=job.failure_class,
+            issues=issues,
+            mode=job.mode,
         )
         self._store_report(f"validation:{job.workspace_id}", job.validation_snapshot.model_dump(mode="json"))
         self._append_event(job, event_type, failure_reason)
@@ -5023,6 +5181,8 @@ class GenerationService:
         job.status = "blocked"
         job.fidelity = "blocked"
         job.failure_reason = "Run stopped by user."
+        job.failure_class = "stopped_by_user"
+        job.root_cause_summary = "Run stopped by user."
         job.validation_snapshot = ValidationSnapshot(
             grounded_spec_valid=True,
             app_ir_valid=True,

@@ -17,6 +17,7 @@ export type Run = {
   run_id: string;
   workspace_id: string;
   prompt: string;
+  mode?: "generate" | "fix";
   intent: "create" | "edit" | "refine" | "role_only_change";
   apply_strategy: "staged_auto_apply" | "manual_approve";
   target_role_scope: Array<"client" | "specialist" | "manager">;
@@ -37,6 +38,24 @@ export type Run = {
   progress_percent: number;
   summary?: string | null;
   failure_reason?: string | null;
+  failure_class?: string | null;
+  root_cause_summary?: string | null;
+  fix_targets?: string[];
+  handoff_from_failed_generate?: {
+    mode?: "generate" | "fix";
+    prompt?: string;
+    error_context?: {
+      raw_error: string;
+      source?: "build" | "preview" | "backend" | "frontend" | "runtime" | null;
+      failing_target?: string | null;
+    } | null;
+    failure_class?: string | null;
+  } | null;
+  error_context?: {
+    raw_error: string;
+    source?: "build" | "preview" | "backend" | "frontend" | "runtime" | null;
+    failing_target?: string | null;
+  } | null;
   checks_summary: {
     validators: "pending" | "passed" | "failed" | "blocked" | "skipped";
     build: "pending" | "passed" | "failed" | "blocked" | "skipped";
@@ -45,6 +64,7 @@ export type Run = {
   };
   touched_files: string[];
   artifacts: Record<string, string>;
+  repair_iterations?: Array<Record<string, unknown>>;
   rolled_back: boolean;
   rolled_back_at?: string | null;
   created_at: string;
@@ -98,6 +118,14 @@ export type RunArtifacts = {
   };
   final_summary?: string | null;
   diff?: string;
+  failure_analysis?: {
+    mode?: "generate" | "fix";
+    failure_class?: string | null;
+    root_cause_summary?: string | null;
+    fix_targets?: string[];
+    handoff_from_failed_generate?: Run["handoff_from_failed_generate"] | null;
+    error_context?: Run["error_context"] | null;
+  } | null;
   preview?: {
     status: string;
     runtime_mode: string;
@@ -226,6 +254,7 @@ export async function createRun(
   workspaceId: string,
   payload: {
     prompt: string;
+    mode?: "generate" | "fix";
     intent?: "auto" | "create" | "edit" | "refine" | "role_only_change";
     apply_strategy?: "staged_auto_apply" | "manual_approve";
     target_role_scope?: Array<"client" | "specialist" | "manager">;
@@ -233,11 +262,17 @@ export async function createRun(
     generation_mode?: "quality" | "balanced" | "basic";
     target_platform?: "telegram_mini_app" | "max_mini_app";
     preview_profile?: "telegram_mock" | "max_mock" | "web_preview";
+    error_context?: {
+      raw_error: string;
+      source?: "build" | "preview" | "backend" | "frontend" | "runtime";
+      failing_target?: string;
+    };
   },
 ): Promise<Run> {
   return request<Run>(`/workspaces/${workspaceId}/runs`, {
     method: "POST",
     body: JSON.stringify({
+      mode: "generate",
       intent: "auto",
       apply_strategy: "staged_auto_apply",
       target_role_scope: [],
@@ -281,6 +316,18 @@ export async function discardRun(runId: string): Promise<Run> {
 
 export async function rebuildPreview(workspaceId: string): Promise<void> {
   await request(`/workspaces/${workspaceId}/preview/rebuild`, {
+    method: "POST",
+  });
+}
+
+export async function startPreview(workspaceId: string): Promise<void> {
+  await request(`/workspaces/${workspaceId}/preview/start`, {
+    method: "POST",
+  });
+}
+
+export async function ensurePreview(workspaceId: string): Promise<void> {
+  await request(`/workspaces/${workspaceId}/preview/ensure`, {
     method: "POST",
   });
 }

@@ -78,6 +78,8 @@ class CheckRunner:
             location = result.name
             code = f"check.{result.name}"
             message = result.details or f"{result.name} failed."
+            if result.name == "schema_validators":
+                message = next((line for line in result.logs if line.strip()), message)
             if result.name == "preview_boot_smoke":
                 location = "preview"
                 code = "preview.rebuild_failed"

@@ -11,7 +11,12 @@ router = APIRouter(tags=["preview"])
 
 @router.post("/workspaces/{workspace_id}/preview/start")
 def start_preview(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict:
-    return container.preview_service.start(workspace_id).model_dump(mode="json")
+    return container.preview_service.ensure_started(workspace_id).model_dump(mode="json")
+
+
+@router.post("/workspaces/{workspace_id}/preview/ensure")
+def ensure_preview(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict:
+    return container.preview_service.ensure_started(workspace_id).model_dump(mode="json")
 
 
 @router.post("/workspaces/{workspace_id}/preview/rebuild")

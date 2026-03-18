@@ -64,8 +64,8 @@ DEFAULT_RUNTIME_STATE = {
     "roles": {
         "client": {
             "profile": {
-                "first_name": "Иван",
-                "last_name": "Иванов",
+                "first_name": "John",
+                "last_name": "Doe",
                 "email": "",
                 "phone": "",
                 "photo_url": None,
@@ -74,8 +74,8 @@ DEFAULT_RUNTIME_STATE = {
         },
         "specialist": {
             "profile": {
-                "first_name": "Иван",
-                "last_name": "Иванов",
+                "first_name": "John",
+                "last_name": "Doe",
                 "email": "",
                 "phone": "",
                 "photo_url": None,
@@ -84,8 +84,8 @@ DEFAULT_RUNTIME_STATE = {
         },
         "manager": {
             "profile": {
-                "first_name": "Иван",
-                "last_name": "Иванов",
+                "first_name": "John",
+                "last_name": "Doe",
                 "email": "",
                 "phone": "",
                 "photo_url": None,
@@ -99,6 +99,45 @@ DEFAULT_RUNTIME_STATE = {
 
 DEFAULT_STORE_DATA = {
     "sessions": {},
+    "products": [
+        {
+            "product_id": "prod_starter_kit",
+            "name": "Starter Kit",
+            "sku": "KIT-001",
+            "price": 49.0,
+            "currency": "EUR",
+            "availability": "available",
+            "stock": 12,
+            "description": "Demo-ready starter bundle for preview-safe catalog pages.",
+        },
+        {
+            "product_id": "prod_daily_case",
+            "name": "Daily Case",
+            "sku": "CASE-014",
+            "price": 19.0,
+            "currency": "EUR",
+            "availability": "available",
+            "stock": 5,
+            "description": "Accessory item used to seed manager and client role views.",
+        },
+    ],
+    "orders": [
+        {
+            "order_id": "ord_demo_001",
+            "status": "submitted",
+            "specialist_status": "submitted",
+            "client_name": "Preview Shopper",
+            "phone": "+43 660 000 0000",
+            "items": [{"product_id": "prod_starter_kit", "quantity": 1}],
+            "notes": "Demo order seeded from the base template.",
+        }
+    ],
+    "carts": {
+        "preview-browser-user": {
+            "cart_id": "cart_preview_browser",
+            "items": [{"product_id": "prod_daily_case", "quantity": 1}],
+        }
+    },
 }
 
 
@@ -132,7 +171,11 @@ def load_state() -> dict[str, Any]:
 
 def load_store_data() -> dict[str, Any]:
     ensure_store_data()
-    return json.loads(STORE_DATA_PATH.read_text(encoding="utf-8"))
+    state = json.loads(STORE_DATA_PATH.read_text(encoding="utf-8"))
+    merged = _merge_defaults(DEFAULT_STORE_DATA, state)
+    if merged != state:
+        save_store_data(merged)
+    return merged
 
 
 def load_grounded_spec() -> dict[str, Any]:
@@ -147,6 +190,17 @@ def save_state(state: dict[str, Any]) -> None:
 
 def save_store_data(state: dict[str, Any]) -> None:
     STORE_DATA_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _merge_defaults(defaults: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(defaults)
+    for key, value in current.items():
+        default_value = merged.get(key)
+        if isinstance(default_value, dict) and isinstance(value, dict):
+            merged[key] = _merge_defaults(default_value, value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def create_session(role: AppRole, user: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:

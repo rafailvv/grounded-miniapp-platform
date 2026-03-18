@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,6 +56,29 @@ class PreviewService:
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
         return preview
 
+    def ensure_started(self, workspace_id: str, *, force_rebuild: bool = False) -> PreviewRecord:
+        preview = self._get_or_create(workspace_id)
+        if preview.status == "running" and preview.url and not force_rebuild:
+            return preview
+        if preview.status == "starting":
+            return preview
+
+        preview.status = "starting"
+        preview.url = None
+        preview.frontend_url = None
+        preview.backend_url = None
+        preview.updated_at = datetime.now(timezone.utc)
+        preview.logs.append("Preview ensure requested.")
+        self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
+
+        worker = threading.Thread(
+            target=self._ensure_worker,
+            args=(workspace_id, force_rebuild),
+            daemon=True,
+        )
+        worker.start()
+        return preview
+
     def rebuild(self, workspace_id: str, source_dir: Path | None = None, draft_run_id: str | None = None) -> PreviewRecord:
         preview = self._get_or_create(workspace_id)
         source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
@@ -90,6 +114,14 @@ class PreviewService:
             return existing_port
         return self.runtime_manager.allocate_port(workspace_id)
 
+    def _ensure_worker(self, workspace_id: str, force_rebuild: bool) -> None:
+        preview = self._get_or_create(workspace_id)
+        should_rebuild = force_rebuild or bool(preview.project_name or preview.proxy_port)
+        if should_rebuild:
+            self.rebuild(workspace_id)
+            return
+        self.start(workspace_id)
+
     def reset(self, workspace_id: str) -> PreviewRecord:
         preview = self._get_or_create(workspace_id)
         if preview.runtime_mode == "docker":
@@ -101,8 +133,14 @@ class PreviewService:
                 preview.status = "error"
             else:
                 preview.status = "stopped"
+                preview.url = None
+                preview.frontend_url = None
+                preview.backend_url = None
         else:
             preview.status = "stopped"
+            preview.url = None
+            preview.frontend_url = None
+            preview.backend_url = None
             preview.logs.append("No external preview session to reset.")
         preview.draft_run_id = None
         preview.updated_at = datetime.now(timezone.utc)

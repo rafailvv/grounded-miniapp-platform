@@ -8,7 +8,9 @@ export function SpecialistRoutes(): JSX.Element {
     <Routes>
       <Route element={<AppShell />}>
         <Route index element={<SpecialistHomePage />} />
+        <Route path="specialist" element={<SpecialistHomePage />} />
         <Route path="profile" element={<SpecialistProfilePage />} />
+        <Route path="specialist/profile" element={<SpecialistProfilePage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

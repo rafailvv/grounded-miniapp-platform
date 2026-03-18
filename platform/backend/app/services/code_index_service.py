@@ -31,8 +31,12 @@ class CodeIndexService:
         self.store = store
 
     def index_workspace(self, workspace: WorkspaceRecord, source_dir: Path) -> IndexStatusRecord:
-        chunks: list[CodeChunkRecord] = []
         revision_id = workspace.current_revision_id or "unversioned"
+        existing = self.get_workspace_status(workspace.workspace_id)
+        if existing.status == "ready" and existing.revision_id == revision_id and existing.chunk_count > 0:
+            return existing
+
+        chunks: list[CodeChunkRecord] = []
         for file_path in sorted(source_dir.rglob("*")):
             if not file_path.is_file() or ".git" in file_path.parts or "node_modules" in file_path.parts:
                 continue
@@ -57,6 +61,10 @@ class CodeIndexService:
 
     def index_documents(self, workspace_id: str, documents: list[DocumentRecord]) -> IndexStatusRecord:
         revision_id = self._doc_revision_id(documents)
+        existing = self.get_document_status(workspace_id)
+        if existing.status == "ready" and existing.revision_id == revision_id and existing.chunk_count > 0:
+            return existing
+
         chunks: list[CodeChunkRecord] = []
         for document in documents:
             source_chunks = document.chunks or []

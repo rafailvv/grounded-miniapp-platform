@@ -293,6 +293,29 @@ button:disabled {
   gap: 8px;
 }
 
+.composer-mode-switch {
+  display: inline-flex;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--panel-muted);
+}
+
+.composer-mode-pill {
+  border: 0;
+  border-radius: 12px;
+  padding: 10px 14px;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.composer-mode-pill.is-active {
+  background: linear-gradient(135deg, var(--accent), #5f58e8);
+  color: #fff;
+}
+
 .composer-field > span,
 .workspace-search > span,
 .role-scope > span {

@@ -32,7 +32,7 @@ export function ProfileCabinetCard({ displayName, roleLabel, photoUrl, onClick }
       </div>
 
       <div className={styles.info}>
-        <span className={styles.caption}>Личный кабинет</span>
+        <span className={styles.caption}>Personal workspace</span>
         <strong className={styles.name}>{displayName}</strong>
         {roleLabel ? <span className={styles.role}>{roleLabel}</span> : null}
       </div>

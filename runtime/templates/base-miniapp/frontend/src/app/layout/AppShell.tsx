@@ -9,7 +9,11 @@ export function AppShell(): JSX.Element {
   const navigate = useNavigate();
 
   const pathParts = location.pathname.split('/').filter(Boolean);
-  const roleRootPath = pathParts.length > 0 ? `/${pathParts[0]}` : '/';
+  const roleSlug = pathParts[0];
+  const roleRootPath =
+    roleSlug === 'client' || roleSlug === 'specialist' || roleSlug === 'manager'
+      ? `/${roleSlug}`
+      : '/';
   const isRootPage = location.pathname === '/' || location.pathname === roleRootPath;
 
   const showNavigate = useCallback(

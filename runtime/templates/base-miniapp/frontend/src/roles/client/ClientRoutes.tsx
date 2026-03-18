@@ -8,7 +8,9 @@ export function ClientRoutes(): JSX.Element {
     <Routes>
       <Route element={<AppShell />}>
         <Route index element={<ClientHomePage />} />
+        <Route path="client" element={<ClientHomePage />} />
         <Route path="profile" element={<ClientProfilePage />} />
+        <Route path="client/profile" element={<ClientProfilePage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

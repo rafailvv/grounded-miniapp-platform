@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+import threading
+
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.deps import get_container
 from app.models.domain import CreateWorkspaceRequest, WorkspaceRecord
@@ -41,17 +43,20 @@ def get_workspace(workspace_id: str, container: ServiceContainer = Depends(get_c
 @router.post("/workspaces/{workspace_id}/clone-template", response_model=WorkspaceRecord)
 def clone_template(
     workspace_id: str,
-    background_tasks: BackgroundTasks,
     container: ServiceContainer = Depends(get_container),
 ) -> WorkspaceRecord:
     try:
         workspace = container.workspace_service.clone_template(workspace_id)
-        background_tasks.add_task(
-            container.code_index_service.index_workspace,
-            workspace,
-            container.workspace_service.source_dir(workspace_id),
-        )
-        background_tasks.add_task(container.preview_service.start, workspace_id)
+        threading.Thread(
+            target=container.code_index_service.index_workspace,
+            args=(workspace, container.workspace_service.source_dir(workspace_id)),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=container.preview_service.ensure_started,
+            args=(workspace_id,),
+            daemon=True,
+        ).start()
         return workspace
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -60,7 +65,18 @@ def clone_template(
 @router.post("/workspaces/{workspace_id}/reset", response_model=WorkspaceRecord)
 def reset_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> WorkspaceRecord:
     try:
-        return container.workspace_service.reset_workspace(workspace_id)
+        workspace = container.workspace_service.reset_workspace(workspace_id)
+        threading.Thread(
+            target=container.code_index_service.index_workspace,
+            args=(workspace, container.workspace_service.source_dir(workspace_id)),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=container.preview_service.ensure_started,
+            args=(workspace_id,),
+            daemon=True,
+        ).start()
+        return workspace
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

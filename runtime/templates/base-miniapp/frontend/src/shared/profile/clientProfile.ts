@@ -3,11 +3,11 @@ import type { AppRole } from '@/shared/roles/role';
 import { fetchRoleProfile, persistRoleProfile, type RemoteProfilePayload } from '@/shared/profile/profileApi';
 
 const ROLE_LABELS: Record<AppRole, string> = {
-  client: 'Клиент',
-  specialist: 'Специалист',
-  manager: 'Менеджер',
+  client: 'Client',
+  specialist: 'Specialist',
+  manager: 'Manager',
 };
-export const CLIENT_ROLE_LABEL = 'Клиент';
+export const CLIENT_ROLE_LABEL = 'Client';
 
 export type ClientProfileDraft = {
   firstName: string;
@@ -42,8 +42,8 @@ function parseStoredProfile(raw: string | null): StoredProfile | null {
 
 function normalizeStoredProfile(stored: StoredProfile | null, telegramUser: ReturnType<typeof getTelegramUser>): ClientProfileDraft {
   return {
-    firstName: stored?.firstName?.trim() || telegramUser?.first_name?.trim() || 'Иван',
-    lastName: stored?.lastName?.trim() || telegramUser?.last_name?.trim() || 'Иванов',
+    firstName: stored?.firstName?.trim() || telegramUser?.first_name?.trim() || 'John',
+    lastName: stored?.lastName?.trim() || telegramUser?.last_name?.trim() || 'Doe',
     email: stored?.email?.trim() || '',
     phone: stored?.phone?.trim() || '',
     photoUrl: stored?.photoUrl || telegramUser?.photo_url || null,
@@ -55,7 +55,7 @@ function getTelegramUser() {
 }
 
 export function getTelegramUsernameLabel(username: string | undefined): string {
-  if (!username) return 'Без никнейма';
+  if (!username) return 'No username';
   return username.startsWith('@') ? username : `@${username}`;
 }
 
