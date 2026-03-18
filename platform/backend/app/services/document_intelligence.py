@@ -7,13 +7,15 @@ from app.core.config import Settings
 from app.models.domain import DocumentChunkRecord, DocumentRecord
 from app.models.grounded_spec import DocRef
 from app.repositories.state_store import StateStore
+from app.services.code_index_service import CodeIndexService
 from app.services.platform_adapters import get_platform_adapter
 
 
 class DocumentIntelligenceService:
-    def __init__(self, settings: Settings, store: StateStore) -> None:
+    def __init__(self, settings: Settings, store: StateStore, code_index_service: CodeIndexService) -> None:
         self.settings = settings
         self.store = store
+        self.code_index_service = code_index_service
 
     def save_document(self, document: DocumentRecord) -> DocumentRecord:
         self.store.upsert("documents", document.document_id, document.model_dump(mode="json"))
@@ -37,6 +39,7 @@ class DocumentIntelligenceService:
         document.chunks = self._chunk_document(document.content)
         document.indexed = True
         self.store.upsert("documents", document.document_id, document.model_dump(mode="json"))
+        self.code_index_service.index_documents(document.workspace_id, self.list_documents(document.workspace_id))
         return document
 
     def get_chunks(self, document_id: str) -> list[DocumentChunkRecord]:
@@ -52,19 +55,37 @@ class DocumentIntelligenceService:
     ) -> list[DocRef]:
         query_terms = self._tokenize(prompt)
         refs: list[DocRef] = []
-        for document in self.list_documents(workspace_id):
-            if not document.indexed:
-                continue
-            refs.extend(self._refs_from_document(document, query_terms))
+        workspace_documents = self.list_documents(workspace_id)
+        if workspace_documents:
+            self.code_index_service.index_documents(workspace_id, workspace_documents)
+        retrieval = self.code_index_service.retrieve(workspace_id=workspace_id, prompt=prompt, code_limit=max(limit // 2, 1), doc_limit=limit)
+        for item in retrieval["docs"]:  # type: ignore[index]
+            refs.append(
+                DocRef(
+                    doc_ref_id=f"{item['chunk_id']}",
+                    source_type=str(item.get("source_type") or "project_doc"),
+                    file_path=str(item["path"]),
+                    chunk_id=str(item["chunk_id"]),
+                    section_title=str(item.get("summary") or item["path"]),
+                    snippet=str(item["text"])[:280],
+                    relevance=float(item.get("score") or 0.0),
+                )
+            )
+        for item in retrieval["code"][: max(2, limit // 3)]:  # type: ignore[index]
+            refs.append(
+                DocRef(
+                    doc_ref_id=f"{item['chunk_id']}",
+                    source_type="codebase",
+                    file_path=str(item["path"]),
+                    chunk_id=str(item["chunk_id"]),
+                    section_title=str(item.get("summary") or item["path"]),
+                    snippet=str(item["text"])[:280],
+                    relevance=float(item.get("score") or 0.0),
+                )
+            )
         refs.extend(self._refs_from_bundled_dir(self.settings.template_dir / "docs", "project_doc", query_terms))
         adapter = get_platform_adapter(target_platform)
-        refs.extend(
-            self._refs_from_bundled_dir(
-                self.settings.runtime_dir / "platform-docs" / adapter.doc_dir_name,
-                "platform_doc",
-                query_terms,
-            )
-        )
+        refs.extend(self._refs_from_bundled_dir(self.settings.runtime_dir / "platform-docs" / adapter.doc_dir_name, "platform_doc", query_terms))
         refs.append(
             DocRef(
                 doc_ref_id="prompt-source",
@@ -139,14 +160,21 @@ class DocumentIntelligenceService:
 
     def _chunk_document(self, content: str) -> list[DocumentChunkRecord]:
         sections = [section.strip() for section in content.split("\n\n") if section.strip()]
-        return [
-            DocumentChunkRecord(
-                section_title=self._section_title(section),
-                content=section,
-                semantic_role="section",
+        chunks: list[DocumentChunkRecord] = []
+        cursor = 1
+        for section in sections:
+            line_count = max(1, section.count("\n") + 1)
+            chunks.append(
+                DocumentChunkRecord(
+                    section_title=self._section_title(section),
+                    content=section,
+                    semantic_role="section",
+                    start_line=cursor,
+                    end_line=cursor + line_count - 1,
+                )
             )
-            for section in sections
-        ]
+            cursor += line_count + 1
+        return chunks
 
     @staticmethod
     def _section_title(section: str) -> str:
@@ -163,4 +191,3 @@ class DocumentIntelligenceService:
             return 0.0
         overlap = len(content_terms & query_terms)
         return overlap / max(len(query_terms), 1)
-

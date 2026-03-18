@@ -46,6 +46,11 @@ def clone_template(
 ) -> WorkspaceRecord:
     try:
         workspace = container.workspace_service.clone_template(workspace_id)
+        background_tasks.add_task(
+            container.code_index_service.index_workspace,
+            workspace,
+            container.workspace_service.source_dir(workspace_id),
+        )
         background_tasks.add_task(container.preview_service.start, workspace_id)
         return workspace
     except KeyError as exc:
@@ -70,6 +75,31 @@ def rollback_workspace(workspace_id: str, container: ServiceContainer = Depends(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/workspaces/{workspace_id}/index")
+def index_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
+    try:
+        workspace = container.workspace_service.get_workspace(workspace_id)
+        status = container.code_index_service.index_workspace(workspace, container.workspace_service.source_dir(workspace_id))
+        documents = container.document_service.list_documents(workspace_id)
+        if documents:
+            container.code_index_service.index_documents(workspace_id, documents)
+        return status.model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/workspaces/{workspace_id}/index/status")
+def index_status(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
+    try:
+        container.workspace_service.get_workspace(workspace_id)
+        return {
+            "workspace": container.code_index_service.get_workspace_status(workspace_id).model_dump(mode="json"),
+            "documents": container.code_index_service.get_document_status(workspace_id).model_dump(mode="json"),
+        }
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.delete("/workspaces/{workspace_id}")

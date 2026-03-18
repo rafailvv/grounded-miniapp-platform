@@ -44,6 +44,8 @@ class DocumentChunkRecord(StrictModel):
     section_title: str | None = None
     content: str
     semantic_role: str = "general"
+    start_line: int | None = None
+    end_line: int | None = None
 
 
 class DocumentRecord(StrictModel):
@@ -129,6 +131,11 @@ class JobRecord(StrictModel):
     traceability_report_id: str | None = None
     validation_snapshot: ValidationSnapshot | None = None
     artifacts: dict[str, str] = Field(default_factory=dict)
+    latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
+    retrieval_stats: dict[str, Any] = Field(default_factory=dict)
+    cache_stats: dict[str, Any] = Field(default_factory=dict)
+    repair_iterations: list[dict[str, Any]] = Field(default_factory=list)
+    apply_result: dict[str, Any] | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -211,11 +218,75 @@ class DraftFileOperation(StrictModel):
     reason: str
 
 
+class CodeChunkRecord(StrictModel):
+    chunk_id: str = Field(default_factory=lambda: new_id("code_chunk"))
+    workspace_id: str
+    revision_id: str
+    path: str
+    language: str
+    kind: Literal["code", "doc"] = "code"
+    start_line: int
+    end_line: int
+    text: str
+    symbols: list[str] = Field(default_factory=list)
+    imports: list[str] = Field(default_factory=list)
+    chunk_hash: str
+    summary: str | None = None
+    embedding: list[float] = Field(default_factory=list)
+    source_type: str | None = None
+    score: float | None = None
+
+
+class CodeEmbeddingRecord(StrictModel):
+    embedding_id: str = Field(default_factory=lambda: new_id("embedding"))
+    chunk_id: str
+    model: str = "local-hash-v1"
+    vector: list[float] = Field(default_factory=list)
+
+
+class IndexStatusRecord(StrictModel):
+    workspace_id: str
+    revision_id: str | None = None
+    status: Literal["missing", "indexing", "ready", "error"] = "missing"
+    chunk_count: int = 0
+    indexed_at: datetime | None = None
+    error: str | None = None
+
+
+class ContextPack(StrictModel):
+    workspace_id: str
+    revision_id: str | None = None
+    prompt: str
+    system_prefix: str
+    workspace_summary: str
+    current_task: str
+    recent_diff: str = ""
+    code_chunks: list[CodeChunkRecord] = Field(default_factory=list)
+    doc_chunks: list[CodeChunkRecord] = Field(default_factory=list)
+    targeted_files: dict[str, str] = Field(default_factory=dict)
+    prompt_cache_key: str
+    retrieval_stats: dict[str, Any] = Field(default_factory=dict)
+
+
 class RunCheckResult(StrictModel):
     check_id: str = Field(default_factory=lambda: new_id("check"))
     name: str
     status: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
     details: str | None = None
+    duration_ms: int | None = None
+    logs: list[str] = Field(default_factory=list)
+
+
+class CheckExecutionRecord(StrictModel):
+    execution_id: str = Field(default_factory=lambda: new_id("check_exec"))
+    workspace_id: str
+    run_id: str
+    revision_id: str | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    results: list[RunCheckResult] = Field(default_factory=list)
+    started_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+    duration_ms: int | None = None
 
 
 class RunIterationOperation(StrictModel):
@@ -233,6 +304,22 @@ class RunIterationRecord(StrictModel):
     check_results: list[RunCheckResult] = Field(default_factory=list)
     diff_summary: str | None = None
     role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
+    latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
+    token_usage: dict[str, Any] = Field(default_factory=dict)
+    failure_class: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class RepairIterationRecord(StrictModel):
+    repair_iteration_id: str = Field(default_factory=lambda: new_id("repair_iter"))
+    run_id: str
+    attempt: int
+    files_read: list[str] = Field(default_factory=list)
+    files_changed: list[str] = Field(default_factory=list)
+    failure_class: str | None = None
+    check_results: list[RunCheckResult] = Field(default_factory=list)
+    latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
+    token_usage: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -290,6 +377,11 @@ class RunRecord(StrictModel):
     checks_summary: RunChecksSummary = Field(default_factory=RunChecksSummary)
     touched_files: list[str] = Field(default_factory=list)
     artifacts: dict[str, str] = Field(default_factory=dict)
+    latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
+    repair_iterations: list[dict[str, Any]] = Field(default_factory=list)
+    apply_result: dict[str, Any] | None = None
+    retrieval_stats: dict[str, Any] = Field(default_factory=dict)
+    cache_stats: dict[str, Any] = Field(default_factory=dict)
     rolled_back: bool = False
     rolled_back_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)

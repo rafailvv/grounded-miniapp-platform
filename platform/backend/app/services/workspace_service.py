@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import difflib
+import hashlib
 import json
 import shutil
 import subprocess
@@ -7,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 from app.core.config import Settings
-from app.models.artifacts import PatchOperationModel
+from app.models.artifacts import ApplyPatchResult, PatchEnvelope, PatchOperationModel
 from app.models.domain import DraftFileOperation, RevisionRecord, SaveFileRequest, WorkspaceRecord
 from app.repositories.state_store import StateStore
 
@@ -16,6 +18,10 @@ class WorkspaceService:
     def __init__(self, settings: Settings, store: StateStore) -> None:
         self.settings = settings
         self.store = store
+        self.code_index_service = None
+
+    def attach_code_index_service(self, code_index_service) -> None:
+        self.code_index_service = code_index_service
 
     def create_workspace(self, workspace: WorkspaceRecord) -> WorkspaceRecord:
         workspace_dir = self.settings.workspaces_dir / workspace.workspace_id
@@ -76,6 +82,7 @@ class WorkspaceService:
         workspace.revisions.append(revision)
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self._refresh_indexes(workspace)
         return workspace
 
     def reset_workspace(self, workspace_id: str) -> WorkspaceRecord:
@@ -84,6 +91,7 @@ class WorkspaceService:
         latest.source = "reset"
         latest.message = "Reset workspace to canonical template"
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self._refresh_indexes(workspace)
         return workspace
 
     def rollback_last_revision(self, workspace_id: str) -> WorkspaceRecord:
@@ -100,6 +108,7 @@ class WorkspaceService:
         workspace.revisions.append(revision)
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self._refresh_indexes(workspace)
         return workspace
 
     def revert_revision(self, workspace_id: str, revision_id: str, message: str) -> RevisionRecord:
@@ -133,27 +142,23 @@ class WorkspaceService:
         workspace.revisions.append(revision)
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self._refresh_indexes(workspace)
         return revision
 
     def apply_patch_operations(self, workspace_id: str, operations: list[PatchOperationModel], message: str) -> RevisionRecord:
-        source_dir = self.source_dir(workspace_id)
-        for operation in operations:
-            target_path = source_dir / operation.file_path
-            if operation.op == "delete":
-                if target_path.exists():
-                    target_path.unlink()
-                continue
-            if operation.content is None:
-                raise ValueError(f"Patch operation {operation.operation_id} is missing content.")
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text(operation.content, encoding="utf-8")
-        commit_sha = self._git_commit(source_dir, message)
-        revision = RevisionRecord(commit_sha=commit_sha, message=message, source="ai_patch")
         workspace = self.get_workspace(workspace_id)
-        workspace.current_revision_id = revision.revision_id
-        workspace.revisions.append(revision)
-        workspace.updated_at = revision.created_at
-        self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        envelope = PatchEnvelope(
+            workspace_id=workspace_id,
+            base_revision_id=workspace.current_revision_id,
+            summary=message,
+            risk_level="medium",
+            ops=operations,
+        )
+        result = self.apply_patch_envelope(workspace_id, envelope, message=message)
+        if result.status != "applied" or not result.revision_id:
+            raise ValueError(result.conflict_reason or "Patch operations could not be applied.")
+        workspace = self.get_workspace(workspace_id)
+        revision = next(rev for rev in workspace.revisions if rev.revision_id == result.revision_id)
         return revision
 
     def prepare_draft(self, workspace_id: str, run_id: str) -> Path:
@@ -168,19 +173,10 @@ class WorkspaceService:
         draft_source = self.draft_source_dir(workspace_id, run_id)
         if not draft_source.exists():
             self.prepare_draft(workspace_id, run_id)
-        for operation in operations:
-            target_path = draft_source / self._safe_relative_path(operation.file_path)
-            if operation.operation == "delete":
-                if target_path.exists():
-                    if target_path.is_dir():
-                        shutil.rmtree(target_path)
-                    else:
-                        target_path.unlink()
-                continue
-            if operation.content is None:
-                raise ValueError(f"Draft operation {operation.operation_id} is missing content.")
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text(operation.content, encoding="utf-8")
+        envelope = self.build_patch_envelope_for_draft(workspace_id, run_id, operations)
+        result = self.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
+        if result.status != "applied":
+            raise ValueError(result.conflict_reason or "Draft patch could not be applied.")
         return draft_source
 
     def approve_draft(self, workspace_id: str, run_id: str, message: str) -> RevisionRecord:
@@ -196,6 +192,7 @@ class WorkspaceService:
         workspace.revisions.append(revision)
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self._refresh_indexes(workspace)
         return revision
 
     def discard_draft(self, workspace_id: str, run_id: str) -> None:
@@ -218,7 +215,67 @@ class WorkspaceService:
         workspace.revisions.append(revision)
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self._refresh_indexes(workspace)
         return revision
+
+    def build_patch_envelope_for_draft(self, workspace_id: str, run_id: str, operations: list[DraftFileOperation]) -> PatchEnvelope:
+        workspace = self.get_workspace(workspace_id)
+        draft_source = self.draft_source_dir(workspace_id, run_id)
+        prepared_ops: list[PatchOperationModel] = []
+        for operation in operations:
+            target_path = draft_source / self._safe_relative_path(operation.file_path)
+            current_content = target_path.read_text(encoding="utf-8") if target_path.exists() and target_path.is_file() else ""
+            file_hash = self._file_hash(current_content) if target_path.exists() and target_path.is_file() else None
+            diff = self._unified_diff(current_content, operation.content or "", operation.file_path)
+            prepared_ops.append(
+                PatchOperationModel(
+                    operation_id=operation.operation_id,
+                    op="delete" if operation.operation == "delete" else ("create" if not target_path.exists() else "update"),
+                    file_path=operation.file_path,
+                    content=operation.content,
+                    diff=diff,
+                    explanation=operation.reason,
+                    trace_refs=[],
+                    precondition={"file_hash": file_hash, "max_fuzz": 0},
+                )
+            )
+        return PatchEnvelope(
+            workspace_id=workspace_id,
+            base_revision_id=workspace.current_revision_id,
+            summary=f"Draft patch for run {run_id}",
+            risk_level="medium",
+            ops=prepared_ops,
+            post_actions={"run": ["validators", "preview_smoke"]},
+            ui={"title": "Draft patch", "summary": f"{len(prepared_ops)} file operations"},
+        )
+
+    def apply_patch_envelope(self, workspace_id: str, envelope: PatchEnvelope, *, message: str) -> ApplyPatchResult:
+        workspace = self.get_workspace(workspace_id)
+        source_dir = self.source_dir(workspace_id)
+        if envelope.base_revision_id and workspace.current_revision_id and envelope.base_revision_id != workspace.current_revision_id:
+            return ApplyPatchResult(
+                workspace_id=workspace_id,
+                base_revision_id=envelope.base_revision_id,
+                status="conflict",
+                conflict_reason="Patch base revision is stale.",
+            )
+        result = self._apply_envelope_to_target(source_dir, workspace_id, None, envelope)
+        if result.status != "applied":
+            return result
+        commit_sha = self._git_commit(source_dir, message)
+        revision = RevisionRecord(commit_sha=commit_sha, message=message, source="ai_patch")
+        workspace.current_revision_id = revision.revision_id
+        workspace.revisions.append(revision)
+        workspace.updated_at = revision.created_at
+        self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self._refresh_indexes(workspace)
+        return result.model_copy(update={"revision_id": revision.revision_id})
+
+    def apply_patch_envelope_to_draft(self, workspace_id: str, run_id: str, envelope: PatchEnvelope) -> ApplyPatchResult:
+        draft_source = self.draft_source_dir(workspace_id, run_id)
+        if not draft_source.exists():
+            self.prepare_draft(workspace_id, run_id)
+        return self._apply_envelope_to_target(draft_source, workspace_id, run_id, envelope)
 
     def read_file(self, workspace_id: str, relative_path: str, run_id: str | None = None) -> str:
         file_path = self._target_dir(workspace_id, run_id) / self._safe_relative_path(relative_path)
@@ -277,6 +334,61 @@ class WorkspaceService:
         if candidate.is_absolute() or ".." in candidate.parts:
             raise ValueError("File paths must stay within the workspace.")
         return candidate
+
+    def _apply_envelope_to_target(
+        self,
+        target_root: Path,
+        workspace_id: str,
+        run_id: str | None,
+        envelope: PatchEnvelope,
+    ) -> ApplyPatchResult:
+        changed_files: list[str] = []
+        for operation in envelope.ops:
+            target_path = target_root / self._safe_relative_path(operation.file_path)
+            existing_content = target_path.read_text(encoding="utf-8") if target_path.exists() and target_path.is_file() else ""
+            precondition_hash = (operation.precondition or {}).get("file_hash") if operation.precondition else None
+            if precondition_hash is not None and self._file_hash(existing_content) != precondition_hash:
+                return ApplyPatchResult(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    base_revision_id=envelope.base_revision_id,
+                    status="conflict",
+                    conflict_reason=f"Precondition hash mismatch for {operation.file_path}.",
+                    changed_files=changed_files,
+                )
+            if operation.op == "delete":
+                if target_path.exists():
+                    if target_path.is_dir():
+                        shutil.rmtree(target_path)
+                    else:
+                        target_path.unlink()
+                    changed_files.append(operation.file_path)
+                continue
+            if operation.content is None:
+                return ApplyPatchResult(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    base_revision_id=envelope.base_revision_id,
+                    status="failed",
+                    conflict_reason=f"Patch operation {operation.operation_id} is missing content.",
+                    changed_files=changed_files,
+                )
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(operation.content, encoding="utf-8")
+            changed_files.append(operation.file_path)
+        result = ApplyPatchResult(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            base_revision_id=envelope.base_revision_id,
+            status="applied",
+            changed_files=changed_files,
+        )
+        self.store.upsert(
+            "patch_applies",
+            result.apply_id,
+            result.model_dump(mode="json"),
+        )
+        return result
 
     def _git_init(self, source_dir: Path) -> None:
         if (source_dir / ".git").exists():
@@ -365,6 +477,26 @@ class WorkspaceService:
                 capture_output=True,
             )
             self._replace_workspace_contents_from_draft(source_dir, temp_path)
+
+    def _refresh_indexes(self, workspace: WorkspaceRecord) -> None:
+        if self.code_index_service is None or not workspace.template_cloned:
+            return
+        self.code_index_service.index_workspace(workspace, self.source_dir(workspace.workspace_id))
+
+    @staticmethod
+    def _file_hash(content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _unified_diff(previous: str, current: str, relative_path: str) -> str:
+        return "".join(
+            difflib.unified_diff(
+                previous.splitlines(keepends=True),
+                current.splitlines(keepends=True),
+                fromfile=f"a/{relative_path}",
+                tofile=f"b/{relative_path}",
+            )
+        )
 
 
 def json_dumps(payload: object) -> str:

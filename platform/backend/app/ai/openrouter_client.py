@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 from copy import deepcopy
 from typing import Any
 
@@ -36,7 +37,9 @@ class OpenRouterClient:
                 "allow_fallbacks": True,
                 "require_parameters": True,
                 "data_collection": "deny",
+                "sticky_routing": True,
             },
+            "supports_prompt_cache_key": True,
         }
 
     def generate_structured(
@@ -301,6 +304,7 @@ class OpenRouterClient:
                 "allow_fallbacks": True,
                 "require_parameters": True,
                 "data_collection": "deny",
+                "sort": "latency",
             },
         }
         self._log_prompt_bundle(
@@ -312,11 +316,7 @@ class OpenRouterClient:
             user_prompt=user_prompt,
         )
         self._log_request(endpoint="chat/completions", model=model, payload=payload)
-        with httpx.Client(timeout=120) as client:
-            response = client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=payload)
-            self._log_response(endpoint="chat/completions", model=model, response=response)
-            self._raise_for_status(response, "chat/completions")
-            data = response.json()
+        data = self._post_json_with_retries(endpoint="chat/completions", model=model, payload=payload)
         content = self._extract_chat_text(data)
         self._log_parsed_text(endpoint="chat/completions", model=model, text=content)
         return self._parse_json_payload(content, "chat/completions")
@@ -349,6 +349,7 @@ class OpenRouterClient:
                 "allow_fallbacks": True,
                 "require_parameters": True,
                 "data_collection": "deny",
+                "sort": "latency",
             },
         }
         self._log_prompt_bundle(
@@ -360,11 +361,7 @@ class OpenRouterClient:
             user_prompt=user_prompt,
         )
         self._log_request(endpoint="responses", model=model, payload=payload)
-        with httpx.Client(timeout=120) as client:
-            response = client.post(f"{self.base_url}/responses", headers=self._headers(), json=payload)
-            self._log_response(endpoint="responses", model=model, response=response)
-            self._raise_for_status(response, "responses")
-            data = response.json()
+        data = self._post_json_with_retries(endpoint="responses", model=model, payload=payload)
         text = self._extract_response_text(data)
         self._log_parsed_text(endpoint="responses", model=model, text=text)
         return self._parse_json_payload(text, "responses")
@@ -391,6 +388,7 @@ class OpenRouterClient:
                 "allow_fallbacks": True,
                 "require_parameters": True,
                 "data_collection": "deny",
+                "sort": "latency",
             },
         }
         self._log_prompt_bundle(
@@ -402,11 +400,7 @@ class OpenRouterClient:
             user_prompt=user_prompt,
         )
         self._log_request(endpoint="chat/completions", model=model, payload=payload)
-        with httpx.Client(timeout=120) as client:
-            response = client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=payload)
-            self._log_response(endpoint="chat/completions", model=model, response=response)
-            self._raise_for_status(response, "chat/completions")
-            data = response.json()
+        data = self._post_json_with_retries(endpoint="chat/completions", model=model, payload=payload)
         content = self._extract_chat_text(data)
         self._log_parsed_text(endpoint="chat/completions", model=model, text=content)
         return self._parse_json_payload(content, "chat/completions")
@@ -435,6 +429,7 @@ class OpenRouterClient:
                 "allow_fallbacks": True,
                 "require_parameters": True,
                 "data_collection": "deny",
+                "sort": "latency",
             },
         }
         self._log_prompt_bundle(
@@ -446,14 +441,28 @@ class OpenRouterClient:
             user_prompt=user_prompt,
         )
         self._log_request(endpoint="responses", model=model, payload=payload)
-        with httpx.Client(timeout=120) as client:
-            response = client.post(f"{self.base_url}/responses", headers=self._headers(), json=payload)
-            self._log_response(endpoint="responses", model=model, response=response)
-            self._raise_for_status(response, "responses")
-            data = response.json()
+        data = self._post_json_with_retries(endpoint="responses", model=model, payload=payload)
         text = self._extract_response_text(data)
         self._log_parsed_text(endpoint="responses", model=model, text=text)
         return self._parse_json_payload(text, "responses")
+
+    def _post_json_with_retries(self, *, endpoint: str, model: str, payload: dict[str, Any]) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                with httpx.Client(timeout=120) as client:
+                    response = client.post(f"{self.base_url}/{endpoint}", headers=self._headers(), json=payload)
+                    self._log_response(endpoint=endpoint, model=model, response=response)
+                    self._raise_for_status(response, endpoint)
+                    return response.json()
+            except Exception as exc:
+                last_error = exc
+                if attempt == 2 or not self._is_retryable_request_error(exc):
+                    raise
+                logger.warning("Retrying OpenRouter request endpoint=%s model=%s after transient failure: %s", endpoint, model, exc)
+                time.sleep(0.8 * (attempt + 1))
+        assert last_error is not None
+        raise last_error
 
     @staticmethod
     def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -537,6 +546,23 @@ class OpenRouterClient:
             "not supported. Please set 'additionalProperties' to false",
             "compiled grammar is too large",
             "Simplify your tool schemas or reduce the number of strict tools",
+        )
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _is_retryable_request_error(error: Exception) -> bool:
+        text = str(error).lower()
+        markers = (
+            " returned 429",
+            " returned 500",
+            " returned 502",
+            " returned 503",
+            " returned 504",
+            "internal_server_error",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "provider returned error",
         )
         return any(marker in text for marker in markers)
 

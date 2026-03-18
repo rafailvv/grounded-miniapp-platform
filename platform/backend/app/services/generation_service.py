@@ -40,9 +40,11 @@ from app.models.app_ir import (
     Variable,
 )
 from app.models.artifacts import (
+    ApplyPatchResult,
     AppIRValidatorResult,
     ArtifactPlanModel,
     GroundedSpecValidatorResult,
+    PatchEnvelope,
     PatchOperationModel,
     TraceabilityReportEntry,
     TraceabilityReportModel,
@@ -51,10 +53,13 @@ from app.models.artifacts import (
 from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
 from app.models.domain import (
     ChatTurnRecord,
+    CheckExecutionRecord,
+    ContextPack,
     DraftFileOperation,
     GenerateRequest,
     JobEvent,
     JobRecord,
+    RepairIterationRecord,
     RunCheckResult,
     RunIterationOperation,
     RunIterationRecord,
@@ -84,6 +89,9 @@ from app.models.grounded_spec import (
     UserFlow,
 )
 from app.repositories.state_store import StateStore
+from app.services.check_runner import CheckRunner
+from app.services.code_index_service import CodeIndexService
+from app.services.context_pack_builder import ContextPackBuilder
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.patch_service import PatchService
 from app.services.preview_service import PreviewService
@@ -122,24 +130,32 @@ class GenerationService:
         store: StateStore,
         workspace_service: WorkspaceService,
         document_service: DocumentIntelligenceService,
+        code_index_service: CodeIndexService,
+        context_pack_builder: ContextPackBuilder,
         patch_service: PatchService,
         preview_service: PreviewService,
+        check_runner: CheckRunner,
         validation_suite: ValidationSuite,
         openrouter_client: OpenRouterClient,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
         self.document_service = document_service
+        self.code_index_service = code_index_service
+        self.context_pack_builder = context_pack_builder
         self.patch_service = patch_service
         self.preview_service = preview_service
+        self.check_runner = check_runner
         self.validation_suite = validation_suite
         self.openrouter_client = openrouter_client
 
     def generate(self, workspace_id: str, request: GenerateRequest, *, should_stop: Callable[[], bool] | None = None) -> JobRecord:
+        started_at = time.perf_counter()
         target_platform = self._target_platform(request.target_platform)
         preview_profile = self._preview_profile(request.preview_profile)
         generation_mode = self._generation_mode(request.generation_mode)
         workspace = self.workspace_service.get_workspace(workspace_id)
+        self.code_index_service.index_workspace(workspace, self.workspace_service.source_dir(workspace_id))
         role_scope = [role for role in request.target_role_scope if role in ROLE_ORDER] or list(ROLE_ORDER)
         llm_config = self.openrouter_client.configuration()
 
@@ -219,11 +235,18 @@ class GenerationService:
             prompt=request.prompt,
             target_platform=target_platform.value,
         )
+        retrieval_ms = int((time.perf_counter() - started_at) * 1000)
+        job.latency_breakdown["retrieval_ms"] = retrieval_ms
+        job.retrieval_stats = {
+            "doc_refs": len(doc_refs),
+            "workspace_index": self.code_index_service.get_workspace_status(workspace_id).model_dump(mode="json"),
+            "document_index": self.code_index_service.get_document_status(workspace_id).model_dump(mode="json"),
+        }
         self._append_trace(
             workspace_id,
             "retrieval_completed",
             "Relevant documents and platform rules retrieved.",
-            {"doc_refs": len(doc_refs)},
+            {"doc_refs": len(doc_refs), "retrieval_ms": retrieval_ms},
         )
         stopped = self._stop_if_requested(job, workspace_id, should_stop)
         if stopped is not None:
@@ -278,9 +301,9 @@ class GenerationService:
         if spec_result.get("warning"):
             self._append_trace(
                 workspace_id,
-                "spec_fallback_used",
-                "GroundedSpec switched to compiler fallback due to LLM/schema error.",
-                {"warning": spec_result["warning"]},
+                str(spec_result.get("warning_stage") or "spec_recovery_used"),
+                str(spec_result.get("warning_title") or "GroundedSpec used a recovery path before validation."),
+                {"warning": spec_result["warning"], "warning_kind": spec_result.get("warning_kind")},
             )
         if spec_result.get("model"):
             job.llm_model = str(spec_result["model"])
@@ -449,14 +472,28 @@ class GenerationService:
                 failure_reason="Code planning did not produce a valid multi-page app structure.",
             )
 
-        files_read: list[str] = []
-        file_contexts: dict[str, str] = {}
+        context_pack = self.context_pack_builder.build(
+            workspace=workspace,
+            prompt=request.prompt,
+            model_profile=request.model_profile,
+            active_paths=plan_result["files_to_read"],
+            target_files=plan_result["target_files"],
+            run_id=draft_run_id,
+        )
+        files_read = sorted(set(plan_result["files_to_read"]) | set(context_pack.targeted_files.keys()) | {chunk.path for chunk in context_pack.code_chunks})
+        file_contexts: dict[str, str] = dict(context_pack.targeted_files)
         for file_path in plan_result["files_to_read"]:
+            if file_path in file_contexts:
+                continue
             try:
                 file_contexts[file_path] = self.workspace_service.read_file(workspace_id, file_path, run_id=draft_run_id)
-                files_read.append(file_path)
             except FileNotFoundError:
                 continue
+        job.cache_stats = {
+            "prompt_cache_key": context_pack.prompt_cache_key,
+            "stable_prefix_chars": len(context_pack.system_prefix),
+        }
+        job.latency_breakdown["context_pack_ms"] = int((time.perf_counter() - started_at) * 1000) - retrieval_ms
 
         edit_result = self._resolve_code_edits(
             prompt=request.prompt,
@@ -518,11 +555,23 @@ class GenerationService:
             ),
             *edit_result["operations"],
         ]
-        self.workspace_service.apply_draft_operations(workspace_id, draft_run_id, operations)
+        patch_envelope = self.workspace_service.build_patch_envelope_for_draft(workspace_id, draft_run_id, operations)
+        apply_result = self.workspace_service.apply_patch_envelope_to_draft(workspace_id, draft_run_id, patch_envelope)
+        if apply_result.status != "applied":
+            return self._block_with_messages(
+                job,
+                [apply_result.conflict_reason or "Draft patch could not be applied safely."],
+                code="generation.patch.conflict",
+                event_type="job_failed",
+                failure_reason=apply_result.conflict_reason or "Draft patch could not be applied safely.",
+            )
+        job.apply_result = apply_result.model_dump(mode="json")
+        job.latency_breakdown["patch_apply_ms"] = max(0, int((time.perf_counter() - started_at) * 1000) - retrieval_ms)
         latest_operations = list(operations)
         all_operations = list(operations)
         iterations: list[RunIterationRecord] = []
         latest_check_results: list[RunCheckResult] = []
+        repair_iterations: list[RepairIterationRecord] = []
         latest_candidate_diff = ""
         latest_preview = self.preview_service.get(workspace_id)
         latest_assistant_message = edit_result["assistant_message"]
@@ -552,43 +601,31 @@ class GenerationService:
             else:
                 self._append_event(job, "repair_iteration", f"Applied repair iteration {attempt}.")
             self._append_event(job, "build_started", "Build validation started.")
-
-            build_issues = self._filter_non_blocking_build_issues(
-                self.validation_suite.validate_build(draft_source),
+            check_execution = self.check_runner.run(
+                workspace_id=workspace_id,
+                run_id=draft_run_id,
+                source_dir=draft_source,
+                changed_files=sorted({operation.file_path for operation in latest_operations}),
+                preview_run_id=draft_run_id,
                 scope_mode=plan_result["scope_mode"],
             )
-            preview_issue: ValidationIssue | None = None
-            if build_issues:
-                self._append_trace(
-                    workspace_id,
-                    "build_failed",
-                    "Build validation failed for the draft workspace.",
-                    {"attempt": attempt, "issues": [issue.model_dump(mode="json") for issue in build_issues]},
-                )
-            else:
-                self._append_trace(
-                    workspace_id,
-                    "build_succeeded",
-                    "Build validation completed successfully.",
-                    {"source_dir": str(draft_source), "attempt": attempt},
-                )
-                latest_preview = self.preview_service.rebuild(workspace_id, source_dir=draft_source, draft_run_id=draft_run_id)
-                self._append_trace(
-                    workspace_id,
-                    "preview_rebuilt",
-                    "Preview runtime rebuilt against the draft workspace.",
-                    {
-                        "attempt": attempt,
-                        "status": latest_preview.status,
-                        "runtime_mode": latest_preview.runtime_mode,
-                        "url": latest_preview.url,
-                        "logs": latest_preview.logs[-10:],
-                    },
-                )
-                if latest_preview.status == "error":
-                    preview_issue = self._preview_failure_issue(latest_preview)
-
-            latest_check_results = self._build_check_results(build_issues, preview_issue)
+            latest_preview = self.preview_service.get(workspace_id)
+            latest_check_results = check_execution.results
+            check_failure = self.check_runner.classify_failure(latest_check_results)
+            check_issues = self.check_runner.failing_issues(latest_check_results)
+            build_issues = [issue for issue in check_issues if issue.location != "preview"]
+            preview_issue = next((issue for issue in check_issues if issue.location == "preview"), None)
+            job.latency_breakdown["checks_ms"] = (job.latency_breakdown.get("checks_ms", 0) or 0) + (check_execution.duration_ms or 0)
+            self._append_trace(
+                workspace_id,
+                "checks_completed",
+                "Structured check pipeline finished for the current draft iteration.",
+                {
+                    "attempt": attempt,
+                    "failure_class": check_failure,
+                    "results": [item.model_dump(mode="json") for item in latest_check_results],
+                },
+            )
             iteration = RunIterationRecord(
                 run_id=draft_run_id,
                 assistant_message=latest_assistant_message,
@@ -604,8 +641,22 @@ class GenerationService:
                 check_results=latest_check_results,
                 diff_summary=self._diff_summary(latest_candidate_diff),
                 role_scope=role_scope,
+                latency_breakdown={"checks_ms": check_execution.duration_ms or 0},
+                failure_class=check_failure,
             )
             iterations.append(iteration)
+            if attempt > 0:
+                repair_iterations.append(
+                    RepairIterationRecord(
+                        run_id=draft_run_id,
+                        attempt=attempt,
+                        files_read=sorted(repair_contexts.keys()),
+                        files_changed=sorted({operation.file_path for operation in latest_operations}),
+                        failure_class=check_failure,
+                        check_results=latest_check_results,
+                        latency_breakdown={"checks_ms": check_execution.duration_ms or 0},
+                    )
+                )
             self._store_report(
                 f"iterations:{workspace_id}",
                 {"run_id": draft_run_id, "items": [item.model_dump(mode="json") for item in iterations]},
@@ -613,7 +664,20 @@ class GenerationService:
             self._store_report(f"candidate_diff:{workspace_id}", {"run_id": draft_run_id, "diff": latest_candidate_diff})
             self._store_report(
                 f"check_results:{workspace_id}",
-                {"run_id": draft_run_id, "items": [item.model_dump(mode="json") for item in latest_check_results]},
+                {
+                    "run_id": draft_run_id,
+                    "items": [item.model_dump(mode="json") for item in latest_check_results],
+                    "execution": check_execution.model_dump(mode="json"),
+                },
+            )
+            self._store_report(
+                f"patch:{workspace_id}",
+                {
+                    "run_id": draft_run_id,
+                    "envelope": patch_envelope.model_dump(mode="json"),
+                    "apply_result": job.apply_result,
+                    "conflict_reason": apply_result.conflict_reason,
+                },
             )
 
             if not build_issues and (preview_issue is None or self._is_non_blocking_preview_issue(preview_issue)):
@@ -638,6 +702,7 @@ class GenerationService:
                 )
                 self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
                 self._append_event(job, "job_failed", job.failure_reason)
+                job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
                 return job
 
             repair_result = self._repair_draft_after_failure(
@@ -685,7 +750,33 @@ class GenerationService:
             latest_operations = repair_result["operations"]
             latest_assistant_message = repair_result["assistant_message"] or latest_assistant_message
             all_operations.extend(latest_operations)
-            self.workspace_service.apply_draft_operations(workspace_id, draft_run_id, latest_operations)
+            patch_envelope = self.workspace_service.build_patch_envelope_for_draft(workspace_id, draft_run_id, latest_operations)
+            apply_result = self.workspace_service.apply_patch_envelope_to_draft(workspace_id, draft_run_id, patch_envelope)
+            job.apply_result = apply_result.model_dump(mode="json")
+            if apply_result.status != "applied":
+                issues = [issue.model_dump(mode="json") for issue in build_issues]
+                issues.append(
+                    ValidationIssue(
+                        code="repair.patch.conflict",
+                        message=apply_result.conflict_reason or "Repair patch could not be applied safely.",
+                        severity="high",
+                        location="repair",
+                        blocking=True,
+                    ).model_dump(mode="json")
+                )
+                job.status = "failed"
+                job.failure_reason = apply_result.conflict_reason or "Repair patch could not be applied safely."
+                job.validation_snapshot = ValidationSnapshot(
+                    grounded_spec_valid=True,
+                    app_ir_valid=True,
+                    build_valid=False,
+                    blocking=True,
+                    issues=issues,
+                )
+                self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
+                self._append_event(job, "job_failed", job.failure_reason)
+                job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
+                return job
             repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, plan_result["target_files"])
             stopped = self._stop_if_requested(job, workspace_id, should_stop)
             if stopped is not None:
@@ -723,6 +814,9 @@ class GenerationService:
             blocking=False,
             issues=[],
         )
+        job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
+        job.latency_breakdown["ttft_ms"] = retrieval_ms
+        job.latency_breakdown["total_ms"] = int((time.perf_counter() - started_at) * 1000)
         job.compile_summary = self._compile_code_summary(all_operations, role_scope)
         job.artifacts = {
             "preview_url": latest_preview.url or "",
@@ -731,6 +825,7 @@ class GenerationService:
             "candidate_diff": "reports/candidate_diff",
             "iterations": "reports/iterations",
             "check_results": "reports/check_results",
+            "patch": "reports/patch",
             "role_contract": "reports/role_contract",
             "page_graph": "reports/page_graph",
             "fidelity": job.fidelity,
@@ -1644,6 +1739,15 @@ class GenerationService:
             for item in (page_graph.get("roles", {}).get(role, {}) or {}).get("pages", [])
             if item.get("file_path") != page.get("file_path")
         ]
+        design_reference_files = self._bounded_file_contexts(
+            {
+                path: file_contexts.get(path, "")
+                for path in DESIGN_REFERENCE_FILES
+                if path in file_contexts
+            },
+            max_file_chars=4000,
+            max_total_chars=12000,
+        )
         return json_dumps(
             {
                 "task": "Generate one page file",
@@ -1652,21 +1756,17 @@ class GenerationService:
                 "scope_mode": scope_mode,
                 "role": role,
                 "page": page,
-                "sibling_pages": sibling_pages,
+                "sibling_pages": sibling_pages[:4],
                 "role_contract": role_contract.get("roles", {}).get(role),
-                "grounded_spec": grounded_spec.model_dump(mode="json"),
+                "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
                 "shared_contract": {
                     "preferred_imports": [
                         "@/shared/generated/appChrome",
                         "@/shared/generated/appState",
                     ],
-                    "design_reference_files": {
-                        path: file_contexts.get(path, "")
-                        for path in DESIGN_REFERENCE_FILES
-                        if path in file_contexts
-                    },
+                    "design_reference_files": design_reference_files,
                 },
-                "current_file": file_contexts.get(page["file_path"], ""),
+                "current_file": self._limit_text(file_contexts.get(page["file_path"], ""), 12000),
                 "creative_direction": creative_direction,
                 "rules": [
                     "Create a real page, not a generic stats card screen.",
@@ -1709,6 +1809,11 @@ class GenerationService:
         generated_support_sources: dict[str, str],
         creative_direction: dict[str, Any],
     ) -> str:
+        trimmed_targets = self._bounded_file_contexts(
+            {path: file_contexts.get(path, "") for path in target_files},
+            max_file_chars=9000,
+            max_total_chars=26000,
+        )
         return json_dumps(
             {
                 "task": f"Compose {stage_name} files for the planned app change",
@@ -1720,10 +1825,10 @@ class GenerationService:
                 "role_contract": role_contract,
                 "page_graph": page_graph,
                 "target_files": target_files,
-                "grounded_spec": grounded_spec.model_dump(mode="json"),
-                "file_contexts": {path: file_contexts.get(path, "") for path in target_files},
-                "generated_page_sources": generated_page_sources,
-                "generated_support_sources": generated_support_sources,
+                "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
+                "file_contexts": trimmed_targets,
+                "generated_page_sources": self._bounded_file_contexts(generated_page_sources, max_file_chars=7000, max_total_chars=18000),
+                "generated_support_sources": self._bounded_file_contexts(generated_support_sources, max_file_chars=5000, max_total_chars=12000),
                 "creative_direction": creative_direction,
                 "rules": [
                     "Only touch files listed in target_files.",
@@ -2245,6 +2350,47 @@ class GenerationService:
         }
 
     @staticmethod
+    def _limit_text(text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        head = max_chars // 2
+        tail = max_chars - head
+        return f"{text[:head]}\n/* ... truncated ... */\n{text[-tail:]}"
+
+    def _bounded_file_contexts(
+        self,
+        file_contexts: dict[str, str],
+        *,
+        max_file_chars: int,
+        max_total_chars: int,
+    ) -> dict[str, str]:
+        trimmed: dict[str, str] = {}
+        total = 0
+        for path, content in file_contexts.items():
+            bounded = self._limit_text(content or "", max_file_chars)
+            next_total = total + len(bounded)
+            if trimmed and next_total > max_total_chars:
+                break
+            trimmed[path] = bounded
+            total = next_total
+        return trimmed
+
+    @staticmethod
+    def _compact_grounded_spec_for_codegen(grounded_spec: GroundedSpecModel) -> dict[str, Any]:
+        return {
+            "product_goal": grounded_spec.product_goal,
+            "actors": [actor.model_dump(mode="json") for actor in grounded_spec.actors[:4]],
+            "domain_entities": [entity.model_dump(mode="json") for entity in grounded_spec.domain_entities[:6]],
+            "user_flows": [flow.model_dump(mode="json") for flow in grounded_spec.user_flows[:4]],
+            "ui_requirements": [item.model_dump(mode="json") for item in grounded_spec.ui_requirements[:8]],
+            "api_requirements": [item.model_dump(mode="json") for item in grounded_spec.api_requirements[:8]],
+            "security_requirements": [item.model_dump(mode="json") for item in grounded_spec.security_requirements[:6]],
+            "non_functional_requirements": [item.model_dump(mode="json") for item in grounded_spec.non_functional_requirements[:6]],
+            "platform_constraints": [item.model_dump(mode="json") for item in grounded_spec.platform_constraints[:6]],
+            "assumptions": [item.model_dump(mode="json") for item in grounded_spec.assumptions[:6]],
+        }
+
+    @staticmethod
     def _is_retryable_llm_error(error: Exception) -> bool:
         text = str(error).lower()
         retry_markers = (
@@ -2264,29 +2410,29 @@ class GenerationService:
 
     def _generate_structured_with_retry(self, **kwargs: Any) -> dict[str, Any]:
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 return self.openrouter_client.generate_structured(**kwargs)
             except Exception as exc:
                 last_error = exc
-                if attempt == 1 or not self._is_retryable_llm_error(exc):
+                if attempt == 2 or not self._is_retryable_llm_error(exc):
                     raise
                 logger.warning("Retrying structured generation after transient provider failure: %s", exc)
-                time.sleep(0.8)
+                time.sleep(0.8 * (attempt + 1))
         assert last_error is not None
         raise last_error
 
     def _generate_json_object_with_retry(self, **kwargs: Any) -> dict[str, Any]:
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 return self.openrouter_client.generate_json_object(**kwargs)
             except Exception as exc:
                 last_error = exc
-                if attempt == 1 or not self._is_retryable_llm_error(exc):
+                if attempt == 2 or not self._is_retryable_llm_error(exc):
                     raise
                 logger.warning("Retrying relaxed JSON generation after transient provider failure: %s", exc)
-                time.sleep(0.8)
+                time.sleep(0.8 * (attempt + 1))
         assert last_error is not None
         raise last_error
 
@@ -2321,6 +2467,35 @@ class GenerationService:
             model_path = [str(outline_payload["model"]), str(payload["model"])]
             return {"spec": spec, "model": payload["model"], "model_sequence": model_path}
         except Exception as strict_exc:
+            if self._is_retryable_llm_error(strict_exc):
+                try:
+                    outline_payload, payload, outline = self._generate_grounded_spec_pair(
+                        prompt=prompt,
+                        doc_refs=doc_refs,
+                        target_platform=target_platform,
+                        preview_profile=preview_profile,
+                        template_revision_id=template_revision_id,
+                        prompt_turn_id=prompt_turn_id,
+                        creative_direction=creative_direction,
+                        relaxed=False,
+                        compact=True,
+                    )
+                    spec = GroundedSpecModel.model_validate(self._normalize_model_payload(payload["payload"]))
+                    model_path = [str(outline_payload["model"]), str(payload["model"])]
+                    return {
+                        "spec": spec,
+                        "model": payload["model"],
+                        "model_sequence": model_path,
+                        "warning_kind": "provider_retry_recovery",
+                        "warning_stage": "spec_provider_retry_recovered",
+                        "warning_title": "GroundedSpec recovered after transient provider failure.",
+                        "warning": f"GroundedSpec recovered after transient provider failure: {strict_exc}",
+                    }
+                except Exception as provider_recovery_exc:
+                    strict_exc = RuntimeError(
+                        "GroundedSpec strict mode failed after transient-provider recovery attempts: "
+                        f"{strict_exc}; compact retry error: {provider_recovery_exc}"
+                    )
             try:
                 outline_payload, payload, outline = self._generate_grounded_spec_pair(
                     prompt=prompt,
@@ -2331,6 +2506,7 @@ class GenerationService:
                     prompt_turn_id=prompt_turn_id,
                     creative_direction=creative_direction,
                     relaxed=True,
+                    compact=True,
                 )
                 spec = GroundedSpecModel.model_validate(self._normalize_model_payload(payload["payload"]))
                 model_path = [str(outline_payload["model"]), str(payload["model"])]
@@ -2338,6 +2514,9 @@ class GenerationService:
                     "spec": spec,
                     "model": payload["model"],
                     "model_sequence": model_path,
+                    "warning_kind": "relaxed_json_recovery",
+                    "warning_stage": "spec_relaxed_mode_used",
+                    "warning_title": "GroundedSpec used relaxed JSON recovery after strict-mode failure.",
                     "warning": f"GroundedSpec strict mode failed and relaxed JSON mode was used: {strict_exc}",
                 }
             except Exception as relaxed_exc:
@@ -2359,6 +2538,7 @@ class GenerationService:
         prompt_turn_id: str,
         creative_direction: dict[str, Any],
         relaxed: bool,
+        compact: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         outline_schema = self._grounded_spec_outline_schema()
         outline_user_prompt = self._grounded_spec_outline_user_prompt(
@@ -2369,6 +2549,7 @@ class GenerationService:
             template_revision_id=template_revision_id,
             prompt_turn_id=prompt_turn_id,
             creative_direction=creative_direction,
+            compact=compact,
         )
         if relaxed:
             outline_payload = self._generate_json_object_with_retry(
@@ -2398,6 +2579,7 @@ class GenerationService:
             prompt_turn_id=prompt_turn_id,
             creative_direction=creative_direction,
             outline=outline,
+            compact=compact,
         )
         if relaxed:
             payload = self._generate_json_object_with_retry(
@@ -4992,6 +5174,7 @@ class GenerationService:
         template_revision_id: str,
         prompt_turn_id: str,
         creative_direction: dict[str, Any],
+        compact: bool = False,
     ) -> str:
         return json_dumps(
             {
@@ -5007,7 +5190,8 @@ class GenerationService:
                     "Extract entities, user flows, and any obvious API needs.",
                     "Keep the output compact; this is only the outline pass.",
                 ],
-                "docs": self._compact_doc_refs(doc_refs, limit=4),
+                "docs": self._compact_doc_refs(doc_refs, limit=2 if compact else 4),
+                "creative_direction_summary": self._compact_creative_direction(creative_direction, compact=compact),
             }
         )
 
@@ -5022,6 +5206,7 @@ class GenerationService:
         prompt_turn_id: str,
         creative_direction: dict[str, Any],
         outline: dict[str, Any],
+        compact: bool = False,
     ) -> str:
         return json_dumps(
             {
@@ -5039,13 +5224,13 @@ class GenerationService:
                     "Avoid generic placeholders and repeated template wording.",
                 ],
                 "outline": outline,
-                "creative_direction": creative_direction,
+                "creative_direction": self._compact_creative_direction(creative_direction, compact=compact),
                 "variability_policy": [
                     "Use role requirements as capability constraints, not layout constraints.",
                     "You may pick any navigation and screen composition pattern that remains coherent.",
                     "Do not mirror the same information hierarchy across all roles.",
                 ],
-                "docs": self._compact_doc_refs(doc_refs, limit=6),
+                "docs": self._compact_doc_refs(doc_refs, limit=3 if compact else 6),
             }
         )
 
@@ -5095,6 +5280,17 @@ class GenerationService:
                 }
             )
         return compact_refs
+
+    @staticmethod
+    def _compact_creative_direction(creative_direction: dict[str, Any], *, compact: bool) -> dict[str, Any]:
+        if not compact:
+            return creative_direction
+        return {
+            "name": creative_direction.get("name"),
+            "focus": creative_direction.get("focus"),
+            "layout_bias": creative_direction.get("layout_bias"),
+            "interaction_bias": creative_direction.get("interaction_bias"),
+        }
 
     @staticmethod
     def _app_ir_critique_schema() -> dict[str, Any]:

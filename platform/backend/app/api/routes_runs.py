@@ -52,6 +52,24 @@ def get_run_iterations(run_id: str, container: ServiceContainer = Depends(get_co
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/checks")
+def get_run_checks(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict:
+    try:
+        artifacts = container.run_service.get_run_artifacts(run_id)
+        return artifacts.get("checks") or {"items": []}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/patch")
+def get_run_patch(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict:
+    try:
+        artifacts = container.run_service.get_run_artifacts(run_id)
+        return artifacts.get("patch") or {}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/runs/{run_id}/apply", response_model=RunRecord)
 @router.post("/runs/{run_id}/approve", response_model=RunRecord)
 def apply_run(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunRecord:

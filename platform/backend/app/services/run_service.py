@@ -251,12 +251,19 @@ class RunService:
             run.touched_files = self._resolve_touched_files(change_plan)
             run.candidate_revision_id = f"draft:{run.run_id}"
             run.iteration_count = len((self.generation_service.current_report(run.workspace_id, "iterations") or {}).get("items", []))
+            run.latency_breakdown = dict(job.latency_breakdown)
+            run.repair_iterations = list(job.repair_iterations)
+            run.apply_result = dict(job.apply_result or {})
+            run.retrieval_stats = dict(job.retrieval_stats)
+            run.cache_stats = dict(job.cache_stats)
             run.artifacts = {
                 "grounded_spec": f"/workspaces/{run.workspace_id}/spec/current",
                 "run_artifacts": f"/runs/{run.run_id}/artifacts",
                 "preview_url": preview.url or "",
                 "traceability": f"/workspaces/{run.workspace_id}/traceability/current",
                 "iterations": f"/runs/{run.run_id}/iterations",
+                "checks": f"/runs/{run.run_id}/checks",
+                "patch": f"/runs/{run.run_id}/patch",
             }
             run.updated_at = datetime.now(timezone.utc)
 
@@ -336,6 +343,8 @@ class RunService:
             "iterations": iterations,
             "candidate_diff": candidate_diff,
             "check_results": (self.generation_service.current_report(workspace_id, "check_results") or {}).get("items", []),
+            "checks": self.generation_service.current_report(workspace_id, "check_results"),
+            "patch": self.generation_service.current_report(workspace_id, "patch"),
             "diff": self.workspace_service.diff(workspace_id, run_id=run.run_id),
             "preview": {
                 "status": preview.status,
@@ -352,6 +361,11 @@ class RunService:
                 "role_urls": self.preview_service.role_urls(workspace_id),
             },
             "final_summary": job.summary,
+            "latency_breakdown": job.latency_breakdown,
+            "retrieval_stats": job.retrieval_stats,
+            "cache_stats": job.cache_stats,
+            "apply_result": job.apply_result,
+            "repair_iterations": job.repair_iterations,
         }
         self.store.upsert("reports", f"run_artifacts:{run.run_id}", payload)
 

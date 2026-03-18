@@ -774,6 +774,7 @@ export default function App() {
   }
 
   async function pollPreviewUntilReady(workspaceId: string) {
+    let rebuildTriggered = false;
     for (let attempt = 0; attempt < PREVIEW_BOOT_POLL_ATTEMPTS; attempt += 1) {
       if (activeWorkspaceIdRef.current !== workspaceId) {
         return;
@@ -807,11 +808,30 @@ export default function App() {
           });
           return;
         }
+
+        if (!rebuildTriggered && attempt >= 2 && (preview.status === "stopped" || !preview.status)) {
+          rebuildTriggered = true;
+          try {
+            await rebuildPreview(workspaceId);
+          } catch {
+            // Keep polling and let the regular error path surface if rebuild also fails.
+          }
+        }
       } catch {
         // Keep polling while the runtime is still booting.
       }
       await sleep(PREVIEW_BOOT_POLL_INTERVAL_MS);
     }
+    setPreviewLoading({
+      client: false,
+      specialist: false,
+      manager: false,
+    });
+    setPreviewFailed({
+      client: true,
+      specialist: true,
+      manager: true,
+    });
   }
 
   async function handleRun(event: FormEvent) {
@@ -1732,11 +1752,18 @@ export default function App() {
                         ) : null}
                       </div>
                     </div>
-                    {previewStatus === "error" && previewErrorMessage ? (
+                    {previewStatus === "error" ? (
                       <div className="preview-loader preview-error" role="status" aria-live="polite">
                         <div className="preview-loader-card preview-error-card">
                           <strong>Preview failed</strong>
-                          <p>{previewErrorMessage}</p>
+                          <p>{previewErrorMessage ?? "Runtime did not start successfully. Try Rebuild preview."}</p>
+                        </div>
+                      </div>
+                    ) : !previewUrl && previewFailed[role] ? (
+                      <div className="preview-loader preview-error" role="status" aria-live="polite">
+                        <div className="preview-loader-card preview-error-card">
+                          <strong>Preview did not start</strong>
+                          <p>Runtime was not detected automatically. Try Rebuild preview.</p>
                         </div>
                       </div>
                     ) : previewUrl ? (

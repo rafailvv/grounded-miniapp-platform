@@ -34,7 +34,7 @@ class PreviewService:
         preview.draft_run_id = draft_run_id
         preview.updated_at = datetime.now(timezone.utc)
         try:
-            proxy_port = preview.proxy_port or self.runtime_manager.allocate_port(workspace_id)
+            proxy_port = self._select_proxy_port(workspace_id, preview)
             project_name, logs = self.runtime_manager.start(workspace_id, source_dir, proxy_port)
             preview.proxy_port = proxy_port
             preview.project_name = project_name
@@ -63,7 +63,7 @@ class PreviewService:
         preview.draft_run_id = draft_run_id
         preview.updated_at = datetime.now(timezone.utc)
         try:
-            proxy_port = preview.proxy_port or self.runtime_manager.allocate_port(workspace_id)
+            proxy_port = self._select_proxy_port(workspace_id, preview)
             logs = self.runtime_manager.rebuild(workspace_id, source_dir, proxy_port)
             preview.proxy_port = proxy_port
             preview.project_name = self.runtime_manager.project_name(workspace_id)
@@ -83,6 +83,12 @@ class PreviewService:
             preview.logs.append(f"Docker preview rebuild failed: {exc}")
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
         return preview
+
+    def _select_proxy_port(self, workspace_id: str, preview: PreviewRecord) -> int:
+        existing_port = preview.proxy_port
+        if existing_port is not None and self.runtime_manager.port_free(existing_port):
+            return existing_port
+        return self.runtime_manager.allocate_port(workspace_id)
 
     def reset(self, workspace_id: str) -> PreviewRecord:
         preview = self._get_or_create(workspace_id)

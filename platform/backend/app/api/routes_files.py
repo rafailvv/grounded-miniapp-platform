@@ -44,6 +44,8 @@ def save_file(
         revision = container.workspace_service.save_file(workspace_id, request)
         if revision is None:
             return {"revision_id": "", "commit_sha": ""}
+        workspace = container.workspace_service.get_workspace(workspace_id)
+        container.code_index_service.index_workspace(workspace, container.workspace_service.source_dir(workspace_id))
         return {"revision_id": revision.revision_id, "commit_sha": revision.commit_sha}
     except (KeyError, FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

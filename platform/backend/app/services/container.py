@@ -4,6 +4,9 @@ from pathlib import Path
 
 from app.core.config import Settings, get_settings
 from app.repositories.state_store import StateStore
+from app.services.check_runner import CheckRunner
+from app.services.code_index_service import CodeIndexService
+from app.services.context_pack_builder import ContextPackBuilder
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.export_service import ExportService
 from app.services.generation_service import GenerationService
@@ -21,18 +24,25 @@ class ServiceContainer:
         self.settings = settings or get_settings()
         self.store = StateStore(self.settings.data_dir / "platform-state.json")
         self.workspace_service = WorkspaceService(self.settings, self.store)
-        self.document_service = DocumentIntelligenceService(self.settings, self.store)
+        self.code_index_service = CodeIndexService(self.settings, self.store)
+        self.workspace_service.attach_code_index_service(self.code_index_service)
+        self.document_service = DocumentIntelligenceService(self.settings, self.store, self.code_index_service)
         self.patch_service = PatchService(self.workspace_service)
         self.runtime_manager = PreviewRuntimeManager(self.settings)
         self.preview_service = PreviewService(self.settings, self.store, self.workspace_service, self.runtime_manager)
         self.validation_suite = ValidationSuite()
+        self.check_runner = CheckRunner(self.validation_suite, self.preview_service)
         self.openrouter_client = OpenRouterClient(self.settings)
+        self.context_pack_builder = ContextPackBuilder(self.code_index_service, self.workspace_service)
         self.generation_service = GenerationService(
             self.store,
             self.workspace_service,
             self.document_service,
+            self.code_index_service,
+            self.context_pack_builder,
             self.patch_service,
             self.preview_service,
+            self.check_runner,
             self.validation_suite,
             self.openrouter_client,
         )

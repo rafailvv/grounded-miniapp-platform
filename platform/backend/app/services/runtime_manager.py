@@ -28,6 +28,9 @@ class PreviewRuntimeManager:
                 return port
         raise RuntimeError("No free preview port available.")
 
+    def port_free(self, port: int) -> bool:
+        return self._port_free(port)
+
     def start(self, workspace_id: str, source_dir: Path, proxy_port: int) -> tuple[str, list[str]]:
         project_name = self.project_name(workspace_id)
         compose_file = source_dir / "docker" / "docker-compose.yml"
