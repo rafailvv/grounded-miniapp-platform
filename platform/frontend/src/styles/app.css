@@ -14,6 +14,7 @@
   --success: #1c8a60;
   --danger: #bc4b4b;
   --warning: #b06d16;
+  --platform-scale: 0.8;
 }
 
 * {
@@ -57,13 +58,24 @@ button:disabled {
 }
 
 .page {
+  position: relative;
+  width: 100%;
   height: 100dvh;
   min-height: 100dvh;
+  overflow: hidden;
+}
+
+.page-scale {
+  width: calc(100% / var(--platform-scale));
+  height: calc(100dvh / var(--platform-scale));
+  min-height: calc(100dvh / var(--platform-scale));
   display: flex;
   flex-direction: column;
   padding: 16px;
   gap: 14px;
   overflow: hidden;
+  transform: scale(var(--platform-scale));
+  transform-origin: top left;
 }
 
 .topbar {
@@ -164,6 +176,7 @@ button:disabled {
 .layout {
   min-height: 0;
   flex: 1;
+  height: 100%;
   display: grid;
   grid-template-columns: minmax(360px, 460px) minmax(0, 1fr);
   gap: 16px;
@@ -172,6 +185,7 @@ button:disabled {
 
 .panel {
   min-height: 0;
+  height: 100%;
   border: 1px solid var(--border);
   border-radius: 26px;
   background: var(--panel);
@@ -706,7 +720,7 @@ button:disabled {
   position: relative;
   min-height: 0;
   height: 100%;
-  max-height: min(100%, 78dvh);
+  max-height: 100%;
   overflow: hidden;
   border-radius: 34px;
   border: 10px solid #1c1f2b;

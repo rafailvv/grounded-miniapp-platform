@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
 from app.api.deps import get_container
 from app.models.domain import CreateWorkspaceRequest, WorkspaceRecord
@@ -39,9 +39,15 @@ def get_workspace(workspace_id: str, container: ServiceContainer = Depends(get_c
 
 
 @router.post("/workspaces/{workspace_id}/clone-template", response_model=WorkspaceRecord)
-def clone_template(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> WorkspaceRecord:
+def clone_template(
+    workspace_id: str,
+    background_tasks: BackgroundTasks,
+    container: ServiceContainer = Depends(get_container),
+) -> WorkspaceRecord:
     try:
-        return container.workspace_service.clone_template(workspace_id)
+        workspace = container.workspace_service.clone_template(workspace_id)
+        background_tasks.add_task(container.preview_service.start, workspace_id)
+        return workspace
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

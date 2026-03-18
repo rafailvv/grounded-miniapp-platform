@@ -60,9 +60,32 @@ const ROLE_LABELS: Record<RoleKey, string> = {
 
 const DEFAULT_PROMPT = "";
 const ROOT_PREVIEW_PATH = "/";
+const WORKSPACE_REQUEST_TIMEOUT_MS = 5000;
+const PREVIEW_REQUEST_TIMEOUT_MS = 2500;
+const PREVIEW_BOOT_POLL_ATTEMPTS = 45;
+const PREVIEW_BOOT_POLL_INTERVAL_MS = 1000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        window.clearTimeout(timeoutId);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timeoutId);
+        reject(error);
+      },
+    );
+  });
 }
 
 function formatTimestamp(value?: string): string {
@@ -262,6 +285,7 @@ export default function App() {
     specialist: null,
     manager: null,
   });
+  const activeWorkspaceIdRef = useRef("");
 
   useEffect(() => {
     function handlePreviewMessage(event: MessageEvent) {
@@ -335,7 +359,11 @@ export default function App() {
     if (!workspace) {
       return;
     }
-    void refreshWorkspaceState(workspace.workspace_id);
+    activeWorkspaceIdRef.current = workspace.workspace_id;
+    void (async () => {
+      await refreshWorkspaceState(workspace.workspace_id);
+      void pollPreviewUntilReady(workspace.workspace_id);
+    })();
   }, [workspace]);
 
   useEffect(() => {
@@ -478,78 +506,120 @@ export default function App() {
 
   async function refreshWorkspaceState(workspaceId: string, preferredRunId?: string) {
     setWorkspaceTransitioning(true);
-    const [treeResult, previewResult, runsResult, logsResult] = await Promise.allSettled([
-      request<FileEntry[]>(`/workspaces/${workspaceId}/files/tree`),
-      request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`),
-      listRuns(workspaceId),
-      getWorkspaceLogs(workspaceId),
-    ]);
+    try {
+      const [treeResult, runsResult, logsResult, previewResult] = await Promise.allSettled([
+        withTimeout(request<FileEntry[]>(`/workspaces/${workspaceId}/files/tree`), WORKSPACE_REQUEST_TIMEOUT_MS, "files"),
+        withTimeout(listRuns(workspaceId), WORKSPACE_REQUEST_TIMEOUT_MS, "runs"),
+        withTimeout(getWorkspaceLogs(workspaceId), WORKSPACE_REQUEST_TIMEOUT_MS, "logs"),
+        withTimeout(request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`), PREVIEW_REQUEST_TIMEOUT_MS, "preview"),
+      ]);
 
-    const refreshErrors: string[] = [];
-    let nextRuns: Run[] = [];
+      const refreshErrors: string[] = [];
+      let nextRuns: Run[] = [];
 
-    if (treeResult.status === "fulfilled") {
-      setFiles(treeResult.value);
-      setExpandedDirectories((current) => {
-        if (current.size > 0) {
-          return current;
-        }
-        return new Set(collectExpandedDirectories(buildFileTree(treeResult.value)).slice(0, 10));
-      });
-    } else {
-      refreshErrors.push(`files: ${treeResult.reason instanceof Error ? treeResult.reason.message : "failed to load"}`);
-    }
-
-    if (previewResult.status === "fulfilled") {
-      const previewPayload = previewResult.value;
-      setPreviewUrl(previewPayload.url ?? "");
-      setRolePreviewUrls(previewPayload.role_urls ?? {});
-      setPreviewRuntimeMode(previewPayload.runtime_mode ?? "");
-      setPreviewStatus(previewPayload.status ?? "");
-      if (previewPayload.url) {
-        setPreviewCycle((current) => current + 1);
-        setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
-        setPreviewFailed({
-          client: false,
-          specialist: false,
-          manager: false,
+      if (treeResult.status === "fulfilled") {
+        setFiles(treeResult.value);
+        setExpandedDirectories((current) => {
+          if (current.size > 0) {
+            return current;
+          }
+          return new Set(collectExpandedDirectories(buildFileTree(treeResult.value)).slice(0, 10));
         });
       } else {
-        setPreviewLoading({
-          client: false,
-          specialist: false,
-          manager: false,
-        });
+        refreshErrors.push(`files: ${treeResult.reason instanceof Error ? treeResult.reason.message : "failed to load"}`);
       }
-    } else {
-      setPreviewUrl("");
-      setRolePreviewUrls({});
-      setPreviewStatus("error");
-      refreshErrors.push(`preview: ${previewResult.reason instanceof Error ? previewResult.reason.message : "failed to load"}`);
-    }
 
-    if (runsResult.status === "fulfilled") {
-      nextRuns = runsResult.value;
-      setRuns(nextRuns);
-      const nextSelectedRunId =
-        preferredRunId && nextRuns.some((run) => run.run_id === preferredRunId)
-          ? preferredRunId
-          : selectedRunId && nextRuns.some((run) => run.run_id === selectedRunId)
-            ? selectedRunId
-            : nextRuns[0]?.run_id ?? "";
-      setSelectedRunId(nextSelectedRunId);
-    } else {
-      refreshErrors.push(`runs: ${runsResult.reason instanceof Error ? runsResult.reason.message : "failed to load"}`);
-    }
+      if (runsResult.status === "fulfilled") {
+        nextRuns = runsResult.value;
+        setRuns(nextRuns);
+        const nextSelectedRunId =
+          preferredRunId && nextRuns.some((run) => run.run_id === preferredRunId)
+            ? preferredRunId
+            : selectedRunId && nextRuns.some((run) => run.run_id === selectedRunId)
+              ? selectedRunId
+              : nextRuns[0]?.run_id ?? "";
+        setSelectedRunId(nextSelectedRunId);
+      } else {
+        refreshErrors.push(`runs: ${runsResult.reason instanceof Error ? runsResult.reason.message : "failed to load"}`);
+      }
 
-    if (logsResult.status === "fulfilled") {
-      setWorkspaceLogs(logsResult.value);
-    } else {
-      setWorkspaceLogs(null);
-    }
+      if (logsResult.status === "fulfilled") {
+        setWorkspaceLogs(logsResult.value);
+      } else {
+        setWorkspaceLogs(null);
+      }
 
-    setWorkspaceTransitioning(false);
-    setError(refreshErrors.length ? refreshErrors.join(" | ") : "");
+      if (previewResult.status === "fulfilled") {
+        const previewPayload = previewResult.value;
+        setPreviewUrl(previewPayload.url ?? "");
+        setRolePreviewUrls(previewPayload.role_urls ?? {});
+        setPreviewRuntimeMode(previewPayload.runtime_mode ?? "");
+        setPreviewStatus(previewPayload.status ?? "");
+        if (previewPayload.url) {
+          setPreviewCycle((current) => current + 1);
+          setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
+          setPreviewFailed({
+            client: false,
+            specialist: false,
+            manager: false,
+          });
+        } else {
+          setPreviewLoading({
+            client: false,
+            specialist: false,
+            manager: false,
+          });
+        }
+      } else {
+        setPreviewStatus("starting");
+        setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
+      }
+
+      setError(refreshErrors.length ? refreshErrors.join(" | ") : "");
+    } finally {
+      setWorkspaceTransitioning(false);
+    }
+  }
+
+  async function pollPreviewUntilReady(workspaceId: string) {
+    for (let attempt = 0; attempt < PREVIEW_BOOT_POLL_ATTEMPTS; attempt += 1) {
+      if (activeWorkspaceIdRef.current !== workspaceId) {
+        return;
+      }
+      try {
+        const preview = await request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`);
+        if (activeWorkspaceIdRef.current !== workspaceId) {
+          return;
+        }
+        setPreviewRuntimeMode(preview.runtime_mode ?? "");
+        setPreviewStatus(preview.status ?? "");
+
+        if (preview.url) {
+          setPreviewUrl(preview.url);
+          setRolePreviewUrls(preview.role_urls ?? {});
+          setPreviewCycle((current) => current + 1);
+          setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
+          setPreviewFailed({
+            client: false,
+            specialist: false,
+            manager: false,
+          });
+          return;
+        }
+
+        if (preview.status === "error") {
+          setPreviewLoading({
+            client: false,
+            specialist: false,
+            manager: false,
+          });
+          return;
+        }
+      } catch {
+        // Keep polling while the runtime is still booting.
+      }
+      await sleep(PREVIEW_BOOT_POLL_INTERVAL_MS);
+    }
   }
 
   async function handleRun(event: FormEvent) {
@@ -699,6 +769,50 @@ export default function App() {
     }
   }
 
+  function resetWorkspaceSurface() {
+    activeWorkspaceIdRef.current = "";
+    setWorkspace(null);
+    setRuns([]);
+    setSelectedRunId("");
+    setRunArtifacts(null);
+    setWorkspaceLogs(null);
+    setFiles([]);
+    setSelectedPath("");
+    setFileContent("");
+    setExpandedDirectories(new Set<string>());
+    setPreviewUrl("");
+    setRolePreviewUrls({});
+    setPreviewRuntimeMode("");
+    setPreviewStatus("");
+    setPreviewLoading({
+      client: false,
+      specialist: false,
+      manager: false,
+    });
+    setPreviewFailed({
+      client: false,
+      specialist: false,
+      manager: false,
+    });
+    setRolePreviewPath({
+      client: ROOT_PREVIEW_PATH,
+      specialist: ROOT_PREVIEW_PATH,
+      manager: ROOT_PREVIEW_PATH,
+    });
+  }
+
+  function bootstrapWorkspaceAfterDelete(nextWorkspaces: Workspace[]) {
+    void (async () => {
+      try {
+        const nextWorkspace = nextWorkspaces[0] ? await openWorkspace(nextWorkspaces[0].workspace_id) : await ensureWorkspace();
+        setWorkspace(nextWorkspace);
+        await refreshWorkspaceList(nextWorkspace.workspace_id);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to bootstrap the next workspace.");
+      }
+    })();
+  }
+
   async function handleDeleteWorkspace(workspaceId: string) {
     if (deletingWorkspaceId) {
       return;
@@ -706,16 +820,13 @@ export default function App() {
     setDeletingWorkspaceId(workspaceId);
     setError("");
     try {
+      const deletingActiveWorkspace = workspace?.workspace_id === workspaceId;
       await deleteWorkspace(workspaceId);
       const listed = await listWorkspaces();
       setWorkspaces(listed);
-      if (workspace?.workspace_id === workspaceId) {
-        const fallback = listed[0] ? await openWorkspace(listed[0].workspace_id) : await ensureWorkspace();
-        setWorkspace(fallback);
-        setRuns([]);
-        setSelectedRunId("");
-        setRunArtifacts(null);
-        await refreshWorkspaceList(fallback.workspace_id);
+      if (deletingActiveWorkspace) {
+        resetWorkspaceSurface();
+        bootstrapWorkspaceAfterDelete(listed);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete workspace.");
@@ -842,33 +953,6 @@ export default function App() {
         </div>
       ) : null}
 
-      <div className="topbar">
-        <div className="topbar-left">
-          <button
-            type="button"
-            className="workspace-menu-trigger"
-            aria-label="Open workspace menu"
-            onClick={() => setWorkspaceDrawerOpen(true)}
-          >
-            <span />
-            <span />
-            <span />
-          </button>
-          <div className="topbar-title">
-            <p className="eyebrow">Grounded Research Workspace</p>
-            <h1 className="topbar-heading">AI code workspace for grounded mini-app generation</h1>
-          </div>
-        </div>
-        <div className="topbar-meta">
-          <div className="status-pill">run {topbarRun?.status ?? "idle"}</div>
-          {visibleIssues.length ? (
-            <button type="button" className="issues-pill" onClick={() => setIssuesDrawerOpen(true)}>
-              issues {visibleIssues.length}
-            </button>
-          ) : null}
-        </div>
-      </div>
-
       <div
         className={`workspace-drawer-backdrop ${workspaceDrawerOpen ? "is-open" : ""}`}
         onClick={() => setWorkspaceDrawerOpen(false)}
@@ -934,7 +1018,35 @@ export default function App() {
         </div>
       </aside>
 
-      <div className="layout">
+      <div className="page-scale">
+        <div className="topbar">
+          <div className="topbar-left">
+            <button
+              type="button"
+              className="workspace-menu-trigger"
+              aria-label="Open workspace menu"
+              onClick={() => setWorkspaceDrawerOpen(true)}
+            >
+              <span />
+              <span />
+              <span />
+            </button>
+            <div className="topbar-title">
+              <p className="eyebrow">Grounded Research Workspace</p>
+              <h1 className="topbar-heading">AI code workspace for grounded mini-app generation</h1>
+            </div>
+          </div>
+          <div className="topbar-meta">
+            <div className="status-pill">run {topbarRun?.status ?? "idle"}</div>
+            {visibleIssues.length ? (
+              <button type="button" className="issues-pill" onClick={() => setIssuesDrawerOpen(true)}>
+                issues {visibleIssues.length}
+              </button>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="layout">
         <section className="panel panel-chat">
           <header className="panel-header">
             <h2>Task Composer</h2>
@@ -1301,6 +1413,7 @@ export default function App() {
             </div>
           ) : null}
         </section>
+        </div>
       </div>
     </div>
   );

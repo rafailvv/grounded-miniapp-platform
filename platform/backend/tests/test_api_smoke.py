@@ -193,3 +193,35 @@ def test_run_api_exposes_artifacts_and_links_job(tmp_path: Path) -> None:
     assert isinstance(artifacts["code_change_plan"]["targets"], list)
     assert "validation" in artifacts
     assert "trace" in artifacts
+
+
+def test_clone_template_boots_preview_automatically(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Preview Workspace",
+            "description": "Preview should boot after cloning",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+
+    clone_response = client.post(f"/workspaces/{workspace_id}/clone-template")
+    assert clone_response.status_code == 200
+
+    preview_payload = None
+    for _ in range(20):
+        response = client.get(f"/workspaces/{workspace_id}/preview/url")
+        assert response.status_code == 200
+        preview_payload = response.json()
+        if preview_payload["status"] in {"running", "error"}:
+            break
+        time.sleep(0.1)
+
+    assert preview_payload is not None
+    assert preview_payload["status"] in {"running", "error"}
