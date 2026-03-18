@@ -457,6 +457,7 @@ export default function App() {
     [selectedRoles],
   );
   const diffText = runArtifacts?.diff ?? "";
+  const showGlobalLoader = initializing || creatingWorkspace || (workspaceTransitioning && !workspace);
   const groundedActorsCount = Array.isArray((runArtifacts?.grounded_spec as { actors?: unknown[] } | null | undefined)?.actors)
     ? ((runArtifacts?.grounded_spec as { actors?: unknown[] }).actors ?? []).length
     : 0;
@@ -671,13 +672,34 @@ export default function App() {
 
   async function pollRunUntilSettled(workspaceId: string, runId: string) {
     for (let attempt = 0; attempt < 240; attempt += 1) {
+      if (activeWorkspaceIdRef.current !== workspaceId) {
+        return;
+      }
       try {
-        const [currentRun, nextLogs] = await Promise.all([getRun(runId), getWorkspaceLogs(workspaceId)]);
+        const [runResult, logsResult] = await Promise.allSettled([
+          getRun(runId),
+          withTimeout(getWorkspaceLogs(workspaceId), WORKSPACE_REQUEST_TIMEOUT_MS, "logs"),
+        ]);
+
+        if (runResult.status !== "fulfilled") {
+          await sleep(1000);
+          continue;
+        }
+
+        const currentRun = runResult.value;
+        if (activeWorkspaceIdRef.current !== workspaceId) {
+          return;
+        }
+
         setRuns((current) => {
           const existing = current.filter((item) => item.run_id !== runId);
           return [currentRun, ...existing];
         });
-        setWorkspaceLogs(nextLogs);
+
+        if (logsResult.status === "fulfilled") {
+          setWorkspaceLogs(logsResult.value);
+        }
+
         if (["completed", "blocked", "failed"].includes(currentRun.status)) {
           await refreshWorkspaceState(workspaceId, runId);
           try {
@@ -691,7 +713,7 @@ export default function App() {
           return;
         }
       } catch {
-        return;
+        // Keep polling on transient client/network errors instead of freezing the UI.
       }
       await sleep(1000);
     }
@@ -943,7 +965,7 @@ export default function App() {
 
   return (
     <div className="page">
-      {initializing || workspaceTransitioning || creatingWorkspace ? (
+      {showGlobalLoader ? (
         <div className="global-loader-overlay" role="status" aria-live="polite">
           <div className="global-loader-card">
             <div className="global-loader-spinner" />
@@ -1374,8 +1396,11 @@ export default function App() {
                       <>
                         {previewLoading[role] ? (
                           <div className="preview-loader">
-                            <div className="preview-loader-spinner" />
-                            <p>Loading runtime…</p>
+                            <div className="preview-loader-card">
+                              <div className="preview-loader-spinner" aria-hidden="true" />
+                              <strong>Loading preview</strong>
+                              <p>Starting runtime and connecting this screen.</p>
+                            </div>
                           </div>
                         ) : null}
                         <iframe
@@ -1397,8 +1422,11 @@ export default function App() {
                       </>
                     ) : (
                       <div className="preview-loader">
-                        <div className="preview-loader-spinner" />
-                        <p>Loading runtime…</p>
+                        <div className="preview-loader-card">
+                          <div className="preview-loader-spinner" aria-hidden="true" />
+                          <strong>Loading preview</strong>
+                          <p>Starting runtime and connecting this screen.</p>
+                        </div>
                       </div>
                     )}
                   </div>

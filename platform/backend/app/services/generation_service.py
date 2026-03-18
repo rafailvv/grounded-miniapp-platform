@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import logging
 import os
 import re
+import time
 from typing import Any
 
 from app.ai.openrouter_client import OpenRouterClient
@@ -493,6 +494,38 @@ class GenerationService:
         jobs.sort(key=lambda item: item.created_at)
         return jobs[-1]
 
+    @staticmethod
+    def _is_retryable_llm_error(error: Exception) -> bool:
+        text = str(error).lower()
+        retry_markers = (
+            " returned 429",
+            " returned 500",
+            " returned 502",
+            " returned 503",
+            " returned 504",
+            "internal_server_error",
+            "rate limit",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "temporarily unavailable",
+        )
+        return any(marker in text for marker in retry_markers)
+
+    def _generate_structured_with_retry(self, **kwargs: Any) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                return self.openrouter_client.generate_structured(**kwargs)
+            except Exception as exc:
+                last_error = exc
+                if attempt == 1 or not self._is_retryable_llm_error(exc):
+                    raise
+                logger.warning("Retrying structured generation after transient provider failure: %s", exc)
+                time.sleep(0.8)
+        assert last_error is not None
+        raise last_error
+
     def _resolve_grounded_spec(
         self,
         *,
@@ -535,7 +568,7 @@ class GenerationService:
                 )
             }
         try:
-            payload = self.openrouter_client.generate_structured(
+            payload = self._generate_structured_with_retry(
                 role="spec_analysis",
                 schema_name="grounded_spec_v1",
                 schema=GroundedSpecModel.model_json_schema(),
@@ -579,7 +612,7 @@ class GenerationService:
         if generation_mode == GenerationMode.BASIC or not self.openrouter_client.enabled:
             return {"ir": self._build_app_ir(spec, scenario_graph, generation_mode)}
         try:
-            payload = self.openrouter_client.generate_structured(
+            payload = self._generate_structured_with_retry(
                 role="ir_codegen",
                 schema_name="app_ir_v1",
                 schema=AppIRModel.model_json_schema(),
@@ -604,7 +637,7 @@ class GenerationService:
                 if not should_repair and not has_major_issues:
                     break
 
-                repair_payload = self.openrouter_client.generate_structured(
+                repair_payload = self._generate_structured_with_retry(
                     role="repair",
                     schema_name=f"app_ir_repair_v{iteration + 1}",
                     schema=AppIRModel.model_json_schema(),
@@ -643,7 +676,7 @@ class GenerationService:
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
         try:
-            payload = self.openrouter_client.generate_structured(
+            payload = self._generate_structured_with_retry(
                 role="cheap_task",
                 schema_name="app_ir_critique_v1",
                 schema=self._app_ir_critique_schema(),
@@ -1083,22 +1116,28 @@ class GenerationService:
         )
 
     def _build_scenario_graph(self, spec: GroundedSpecModel) -> dict[str, Any]:
+        roles = {
+            "client": ["client_home", "client_form", "client_requests", "client_detail", "client_success", "client_profile"],
+            "specialist": ["specialist_home", "specialist_queue", "specialist_detail", "specialist_profile"],
+            "manager": ["manager_home", "manager_dashboard", "manager_records", "manager_profile"],
+        }
+        transitions = [
+            ("client_home", "client_form"),
+            ("client_home", "client_requests"),
+            ("client_form", "client_success"),
+            ("client_requests", "client_detail"),
+            ("specialist_home", "specialist_queue"),
+            ("specialist_queue", "specialist_detail"),
+            ("manager_home", "manager_dashboard"),
+            ("manager_dashboard", "manager_records"),
+        ]
+        nodes = sorted({screen_id for role_nodes in roles.values() for screen_id in role_nodes})
+        edges = [{"from": source, "to": target} for source, target in transitions]
         return {
-            "roles": {
-                "client": ["client_home", "client_form", "client_requests", "client_detail", "client_success", "client_profile"],
-                "specialist": ["specialist_home", "specialist_queue", "specialist_detail", "specialist_profile"],
-                "manager": ["manager_home", "manager_dashboard", "manager_records", "manager_profile"],
-            },
-            "transitions": [
-                ("client_home", "client_form"),
-                ("client_home", "client_requests"),
-                ("client_form", "client_success"),
-                ("client_requests", "client_detail"),
-                ("specialist_home", "specialist_queue"),
-                ("specialist_queue", "specialist_detail"),
-                ("manager_home", "manager_dashboard"),
-                ("manager_dashboard", "manager_records"),
-            ],
+            "roles": roles,
+            "nodes": nodes,
+            "edges": edges,
+            "transitions": transitions,
         }
 
     def _build_app_ir(
@@ -1416,8 +1455,7 @@ class GenerationService:
 
     @staticmethod
     def _select_layout_variant(prompt: str, ui_variant: str) -> str:
-        lowered = prompt.lower()
-        if any(marker in lowered for marker in ("store", "shop", "catalog", "product", "cart", "order")):
+        if GenerationService._is_commerce_prompt(prompt):
             return "stream"
         return "stacked"
 
@@ -1442,7 +1480,7 @@ class GenerationService:
         generation_mode: GenerationMode,
     ) -> dict[str, Any]:
         entity = spec.domain_entities[0]
-        records: list[dict[str, Any]] = []
+        records = self._sample_records(entity, spec.product_goal)
         counts = Counter(record["status"] for record in records)
         return {
             "metadata": {
@@ -2162,6 +2200,8 @@ class GenerationService:
     ) -> list[dict[str, Any]]:
         flow_label = self._flow_label(prompt_goal, entity)
         entity_title = self._entity_title(entity)
+        if self._is_commerce_prompt(prompt_goal) or "order" in flow_label:
+            return self._commerce_role_sections(role, records)
         intro = {
             "section_id": f"{role}_intro",
             "type": "heading",
@@ -2267,6 +2307,145 @@ class GenerationService:
                 ],
             },
             recent_list,
+        ]
+
+    def _commerce_role_sections(self, role: str, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        counts = Counter(record["status"] for record in records)
+        product_cards = [
+            {
+                "item_id": "product_1",
+                "title": "Essential Hoodie",
+                "subtitle": "Soft everyday hoodie with neutral fit and quick shipping.",
+                "status": "in_stock",
+                "meta": "$64",
+            },
+            {
+                "item_id": "product_2",
+                "title": "Canvas Backpack",
+                "subtitle": "Compact daily backpack for office and short travel.",
+                "status": "popular",
+                "meta": "$79",
+            },
+            {
+                "item_id": "product_3",
+                "title": "Minimal Sneakers",
+                "subtitle": "Low-profile sneakers with lightweight sole and clean finish.",
+                "status": "new",
+                "meta": "$118",
+            },
+        ]
+        order_items = [
+            {
+                "item_id": record["record_id"],
+                "title": record["title"],
+                "subtitle": record["summary"],
+                "status": record["status"],
+                "meta": record.get("priority"),
+            }
+            for record in records[:4]
+        ]
+
+        if role == "client":
+            return [
+                {
+                    "section_id": "client_catalog",
+                    "type": "list",
+                    "title": "Popular products",
+                    "items": product_cards,
+                },
+                {
+                    "section_id": "client_checkout",
+                    "type": "form",
+                    "title": "Quick checkout",
+                    "fields": [
+                        {"field_id": "customer_name", "name": "customer_name", "label": "Full name", "field_type": "text", "required": True, "placeholder": "Ivan Ivanov"},
+                        {"field_id": "phone", "name": "phone", "label": "Phone", "field_type": "text", "required": True, "placeholder": "+43 660 123 4567"},
+                        {"field_id": "product_name", "name": "product_name", "label": "Product", "field_type": "text", "required": True, "placeholder": "Essential Hoodie"},
+                        {"field_id": "quantity", "name": "quantity", "label": "Quantity", "field_type": "text", "required": True, "placeholder": "1"},
+                        {"field_id": "delivery_address", "name": "delivery_address", "label": "Delivery address", "field_type": "textarea", "required": False, "placeholder": "Street, city, ZIP"},
+                        {"field_id": "comment", "name": "comment", "label": "Comment", "field_type": "textarea", "required": False, "placeholder": "Delivery note or question"},
+                    ],
+                },
+                {
+                    "section_id": "client_checkout_actions",
+                    "type": "actions",
+                    "actions": [
+                        {"action_id": "client_submit_request", "label": "Place order", "type": "submit_form"},
+                    ],
+                },
+                {
+                    "section_id": "client_recent_orders",
+                    "type": "list",
+                    "title": "My orders",
+                    "items": order_items,
+                },
+            ]
+
+        if role == "specialist":
+            return [
+                {
+                    "section_id": "specialist_queue_stats",
+                    "type": "stats",
+                    "items": [
+                        {"label": "New orders", "value": str(counts.get("new", 0))},
+                        {"label": "Packing", "value": str(counts.get("in_progress", 0))},
+                    ],
+                },
+                {
+                    "section_id": "specialist_orders",
+                    "type": "list",
+                    "title": "Orders to process",
+                    "items": order_items,
+                },
+                {
+                    "section_id": "specialist_actions",
+                    "type": "actions",
+                    "actions": [
+                        {"action_id": "specialist_claim_next", "label": "Take next order", "type": "call_api"},
+                        {"action_id": "specialist_mark_in_progress", "label": "Mark packing", "type": "call_api"},
+                        {"action_id": "specialist_complete_request", "label": "Ready for pickup", "type": "call_api"},
+                    ],
+                },
+                {
+                    "section_id": "specialist_timeline",
+                    "type": "timeline",
+                    "items": self._role_timeline(role, "order management", records),
+                },
+            ]
+
+        return [
+            {
+                "section_id": "manager_store_stats",
+                "type": "stats",
+                "items": [
+                    {"label": "Created", "value": str(counts.get("new", 0) + counts.get("in_progress", 0) + counts.get("completed", 0))},
+                    {"label": "Completed", "value": str(counts.get("completed", 0))},
+                ],
+            },
+            {
+                "section_id": "manager_problem_orders",
+                "type": "detail",
+                "title": "Store overview",
+                "body": "Track live order flow, staff workload, and the cases that need intervention.",
+                "fields": [
+                    {"label": "In progress", "value": str(counts.get("in_progress", 0))},
+                    {"label": "Need attention", "value": str(sum(1 for record in records if record.get("owner") == "unassigned"))},
+                ],
+            },
+            {
+                "section_id": "manager_orders",
+                "type": "list",
+                "title": "Recent orders",
+                "items": order_items,
+            },
+            {
+                "section_id": "manager_actions",
+                "type": "actions",
+                "actions": [
+                    {"action_id": "manager_rebalance", "label": "Reassign workload", "type": "call_api"},
+                    {"action_id": "manager_refresh_records", "label": "Refresh orders", "type": "call_api"},
+                ],
+            },
         ]
 
     def _manifest_action(
@@ -2609,7 +2788,7 @@ class GenerationService:
 
     def _flow_label(self, prompt: str, entity: DomainEntity) -> str:
         lowered = prompt.lower()
-        if any(marker in lowered for marker in ("store", "shop", "catalog", "product", "cart", "order")):
+        if self._is_commerce_prompt(prompt):
             return "order management"
         if "consultation" in lowered and "booking" in lowered:
             return "consultation booking"
@@ -3092,7 +3271,7 @@ class GenerationService:
     @staticmethod
     def _infer_entity_name(prompt: str) -> str:
         lowered = prompt.lower()
-        if any(marker in lowered for marker in ("store", "shop", "catalog", "product", "cart", "order")):
+        if GenerationService._is_commerce_prompt(prompt):
             return "Order"
         if "consultation" in lowered:
             return "ConsultationRequest"
@@ -3104,7 +3283,7 @@ class GenerationService:
     def _infer_entity_attributes(prompt: str) -> list[EntityAttribute]:
         fields: list[EntityAttribute] = []
         lowered = prompt.lower()
-        if any(marker in lowered for marker in ("store", "shop", "catalog", "product", "cart", "order")):
+        if GenerationService._is_commerce_prompt(prompt):
             return [
                 EntityAttribute(name="customer_name", type="string", required=True, description="Customer full name", pii=True),
                 EntityAttribute(name="phone", type="phone", required=True, description="Customer phone number", pii=True),
@@ -3155,6 +3334,29 @@ class GenerationService:
                 )
             ]
         return []
+
+    @staticmethod
+    def _is_commerce_prompt(prompt: str) -> bool:
+        lowered = prompt.lower()
+        markers = (
+            "store",
+            "shop",
+            "catalog",
+            "product",
+            "cart",
+            "order",
+            "магазин",
+            "интернет-магазин",
+            "товар",
+            "товары",
+            "карточк",
+            "корзин",
+            "заказ",
+            "доставк",
+            "покуп",
+            "покупател",
+        )
+        return any(marker in lowered for marker in markers)
 
     @staticmethod
     def _target_platform(target_platform: TargetPlatform | str) -> TargetPlatform:

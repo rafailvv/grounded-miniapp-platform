@@ -200,7 +200,7 @@ button:disabled {
   align-content: flex-start;
   min-height: 0;
   height: 100%;
-  padding: 18px;
+  padding: 18px 18px 24px;
   gap: 16px;
   overflow: auto;
 }
@@ -912,9 +912,43 @@ button:disabled {
 
 .preview-loader,
 .placeholder {
-  height: 100%;
+  position: absolute;
+  inset: 0;
+  z-index: 2;
   padding: 24px;
   text-align: center;
+}
+
+.preview-loader {
+  background: linear-gradient(180deg, rgba(248, 250, 255, 0.78), rgba(242, 245, 255, 0.84));
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.preview-loader-card {
+  width: min(232px, calc(100% - 40px));
+  padding: 22px 18px 18px;
+  border-radius: 24px;
+  border: 1px solid rgba(116, 130, 196, 0.12);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 18px 34px rgba(39, 53, 105, 0.12);
+  display: grid;
+  justify-items: center;
+  gap: 9px;
+}
+
+.preview-loader-card strong {
+  font-size: 17px;
+  line-height: 1.1;
+  color: #1d2340;
+}
+
+.preview-loader-card p {
+  margin: 0;
+  max-width: 172px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #6b7592;
 }
 
 .placeholder strong {
@@ -934,6 +968,15 @@ button:disabled {
   border: 3px solid rgba(45, 103, 246, 0.18);
   border-top-color: var(--accent);
   animation: preview-spin 0.75s linear infinite;
+}
+
+.preview-loader-spinner {
+  width: 36px;
+  height: 36px;
+  border-width: 3px;
+  border-color: rgba(78, 107, 255, 0.16);
+  border-top-color: #4e6bff;
+  border-right-color: rgba(78, 107, 255, 0.42);
 }
 
 .global-loader-overlay {
@@ -956,6 +999,7 @@ button:disabled {
   gap: 10px;
   text-align: center;
 }
+
 
 .workspace-drawer-backdrop {
   position: fixed;

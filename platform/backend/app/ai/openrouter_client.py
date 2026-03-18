@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from copy import deepcopy
@@ -10,6 +11,8 @@ import httpx
 
 from app.ai.model_registry import MODEL_REGISTRY, TASK_PROFILES
 from app.core.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class OpenRouterClient:
@@ -139,6 +142,38 @@ class OpenRouterClient:
         }
         return headers
 
+    @staticmethod
+    def _dump_for_log(payload: Any) -> str:
+        try:
+            return json.dumps(payload, ensure_ascii=False, default=str)
+        except Exception:
+            return str(payload)
+
+    def _log_request(self, *, endpoint: str, model: str, payload: dict[str, Any]) -> None:
+        logger.info(
+            "LLM request endpoint=%s model=%s payload=%s",
+            endpoint,
+            model,
+            self._dump_for_log(payload),
+        )
+
+    def _log_response(self, *, endpoint: str, model: str, response: httpx.Response) -> None:
+        logger.info(
+            "LLM response endpoint=%s model=%s status=%s body=%s",
+            endpoint,
+            model,
+            response.status_code,
+            response.text,
+        )
+
+    def _log_parsed_text(self, *, endpoint: str, model: str, text: str) -> None:
+        logger.info(
+            "LLM parsed-text endpoint=%s model=%s text=%s",
+            endpoint,
+            model,
+            text,
+        )
+
     def _chat_structured(
         self,
         *,
@@ -168,11 +203,14 @@ class OpenRouterClient:
                 "data_collection": "deny",
             },
         }
+        self._log_request(endpoint="chat/completions", model=model, payload=payload)
         with httpx.Client(timeout=120) as client:
             response = client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=payload)
+            self._log_response(endpoint="chat/completions", model=model, response=response)
             self._raise_for_status(response, "chat/completions")
             data = response.json()
         content = self._extract_chat_text(data)
+        self._log_parsed_text(endpoint="chat/completions", model=model, text=content)
         return self._parse_json_payload(content, "chat/completions")
 
     def _responses_structured(
@@ -204,11 +242,14 @@ class OpenRouterClient:
                 "data_collection": "deny",
             },
         }
+        self._log_request(endpoint="responses", model=model, payload=payload)
         with httpx.Client(timeout=120) as client:
             response = client.post(f"{self.base_url}/responses", headers=self._headers(), json=payload)
+            self._log_response(endpoint="responses", model=model, response=response)
             self._raise_for_status(response, "responses")
             data = response.json()
         text = self._extract_response_text(data)
+        self._log_parsed_text(endpoint="responses", model=model, text=text)
         return self._parse_json_payload(text, "responses")
 
     def _chat_json_object(
@@ -233,11 +274,14 @@ class OpenRouterClient:
                 "data_collection": "deny",
             },
         }
+        self._log_request(endpoint="chat/completions", model=model, payload=payload)
         with httpx.Client(timeout=120) as client:
             response = client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=payload)
+            self._log_response(endpoint="chat/completions", model=model, response=response)
             self._raise_for_status(response, "chat/completions")
             data = response.json()
         content = self._extract_chat_text(data)
+        self._log_parsed_text(endpoint="chat/completions", model=model, text=content)
         return self._parse_json_payload(content, "chat/completions")
 
     def _responses_json_object(
@@ -264,11 +308,14 @@ class OpenRouterClient:
                 "data_collection": "deny",
             },
         }
+        self._log_request(endpoint="responses", model=model, payload=payload)
         with httpx.Client(timeout=120) as client:
             response = client.post(f"{self.base_url}/responses", headers=self._headers(), json=payload)
+            self._log_response(endpoint="responses", model=model, response=response)
             self._raise_for_status(response, "responses")
             data = response.json()
         text = self._extract_response_text(data)
+        self._log_parsed_text(endpoint="responses", model=model, text=text)
         return self._parse_json_payload(text, "responses")
 
     @staticmethod

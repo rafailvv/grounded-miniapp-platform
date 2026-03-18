@@ -322,8 +322,10 @@ def _hydrate_screen(role: AppRole, screen: dict[str, Any], state: dict[str, Any]
                     }
                     for key, value in sample_payload.items()
                 ] or [
-                    {"field_id": "title", "name": "title", "label": "Title", "field_type": "text", "required": True, "placeholder": "Describe the request"},
-                    {"field_id": "details", "name": "details", "label": "Details", "field_type": "text", "required": False, "placeholder": "Add details"},
+                    {"field_id": "customer_name", "name": "customer_name", "label": "Full name", "field_type": "text", "required": True, "placeholder": "Ivan Ivanov"},
+                    {"field_id": "phone", "name": "phone", "label": "Phone", "field_type": "text", "required": True, "placeholder": "+43 660 123 4567"},
+                    {"field_id": "product_name", "name": "product_name", "label": "Product", "field_type": "text", "required": True, "placeholder": "Essential Hoodie"},
+                    {"field_id": "delivery_address", "name": "delivery_address", "label": "Delivery address", "field_type": "text", "required": False, "placeholder": "Street, city, ZIP"},
                 ],
             },
         ]
