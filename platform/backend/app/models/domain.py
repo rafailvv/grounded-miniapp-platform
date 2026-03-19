@@ -475,7 +475,7 @@ class RunRecord(StrictModel):
     result_revision_id: str | None = None
     candidate_revision_id: str | None = None
     status: Literal["pending", "running", "awaiting_approval", "completed", "blocked", "failed"] = "pending"
-    apply_status: Literal["pending", "applied", "awaiting_approval", "blocked", "failed", "rolled_back"] = "pending"
+    apply_status: Literal["pending", "applied", "awaiting_approval", "blocked", "failed", "rolled_back", "noop"] = "pending"
     draft_status: Literal["none", "ready", "approved", "discarded", "failed"] = "none"
     draft_ready: bool = False
     approval_required: bool = False

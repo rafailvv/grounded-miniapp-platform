@@ -1110,23 +1110,18 @@ class GenerationService:
         scope_mode = self._scope_mode(intent, prompt, role_scope)
         require_multi_page = self._requires_multi_page(prompt, grounded_spec, role_scope, intent)
         try:
-            payload = self._generate_structured_with_retry(
-                role="code_plan",
-                schema_name="page_graph_v2",
-                schema=self._code_plan_schema(),
-                system_prompt=self._code_plan_system_prompt(),
-                user_prompt=self._code_plan_user_prompt(
-                    prompt=prompt,
-                    grounded_spec=grounded_spec,
-                    doc_refs=doc_refs,
-                    role_scope=role_scope,
-                    role_contract=role_contract,
-                    scope_mode=scope_mode,
-                    require_multi_page=require_multi_page,
-                    workspace_tree=self.workspace_service.file_tree(workspace_id),
-                    generation_mode=generation_mode,
-                    creative_direction=creative_direction,
-                ),
+            workspace_tree = self.workspace_service.file_tree(workspace_id)
+            payload = self._generate_code_plan_sections(
+                prompt=prompt,
+                grounded_spec=grounded_spec,
+                doc_refs=doc_refs,
+                role_scope=role_scope,
+                role_contract=role_contract,
+                scope_mode=scope_mode,
+                require_multi_page=require_multi_page,
+                workspace_tree=workspace_tree,
+                generation_mode=generation_mode,
+                creative_direction=creative_direction,
             )
             normalized = self._normalize_model_payload(payload["payload"])
             planned = self._normalize_page_plan(
@@ -1134,12 +1129,86 @@ class GenerationService:
                 role_scope=role_scope,
                 scope_mode=scope_mode,
                 require_multi_page=require_multi_page,
-                workspace_tree=self.workspace_service.file_tree(workspace_id),
+                workspace_tree=workspace_tree,
             )
             planned["model"] = payload["model"]
             return planned
         except Exception as exc:
             return {"error": f"Page graph planning failed: {exc}"}
+
+    def _generate_code_plan_sections(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        doc_refs: list[Any],
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        scope_mode: str,
+        require_multi_page: bool,
+        workspace_tree: list[dict[str, str]],
+        generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        graph_payload = self._generate_structured_with_retry(
+            role="code_plan",
+            schema_name="page_graph_structure_v1",
+            schema=self._code_plan_partial_schema(["summary", "flow_mode", "page_graph"]),
+            system_prompt=self._code_plan_section_system_prompt("Page graph and route structure"),
+            user_prompt=self._code_plan_section_user_prompt(
+                section_id="graph",
+                section_title="Page graph and route structure",
+                section_contract=[
+                    "Return the real page graph, role routes, and page definitions.",
+                    "Keep role surfaces distinct and multi-page when required.",
+                    "Do not decide final file-read lists in this section.",
+                ],
+                prompt=prompt,
+                grounded_spec=grounded_spec,
+                doc_refs=doc_refs,
+                role_scope=role_scope,
+                role_contract=role_contract,
+                scope_mode=scope_mode,
+                require_multi_page=require_multi_page,
+                workspace_tree=workspace_tree,
+                generation_mode=generation_mode,
+                creative_direction=creative_direction,
+            ),
+        )
+        targeting_payload = self._generate_structured_with_retry(
+            role="code_plan",
+            schema_name="page_graph_targeting_v1",
+            schema=self._code_plan_partial_schema(["files_to_read", "target_files", "shared_files", "backend_targets"]),
+            system_prompt=self._code_plan_section_system_prompt("File targeting and read set"),
+            user_prompt=self._code_plan_section_user_prompt(
+                section_id="targeting",
+                section_title="File targeting and read set",
+                section_contract=[
+                    "Return only read-set and file-target lists.",
+                    "Target files must stay minimal for minimal_patch requests.",
+                    "Use the page graph implied by the request and role contract, but do not re-emit full page definitions.",
+                ],
+                prompt=prompt,
+                grounded_spec=grounded_spec,
+                doc_refs=doc_refs,
+                role_scope=role_scope,
+                role_contract=role_contract,
+                scope_mode=scope_mode,
+                require_multi_page=require_multi_page,
+                workspace_tree=workspace_tree,
+                generation_mode=generation_mode,
+                creative_direction=creative_direction,
+            ),
+        )
+        merged_payload = {
+            **self._normalize_model_payload(graph_payload["payload"]),
+            **self._normalize_model_payload(targeting_payload["payload"]),
+        }
+        return {
+            "model": targeting_payload["model"],
+            "payload": merged_payload,
+            "response_mode": "code_plan_sections",
+        }
 
     def _resolve_code_edits(
         self,
@@ -2007,6 +2076,14 @@ class GenerationService:
             "Do not output placeholders, metrics-only dashboards, or one-screen role wrappers."
         )
 
+    @staticmethod
+    def _code_plan_section_system_prompt(section_title: str) -> str:
+        return (
+            "Plan one section of a real file-level multi-page mini-app. "
+            f"Return only the requested section: {section_title}. "
+            "Keep it concrete, schema-valid, and consistent with the role contract."
+        )
+
     def _code_plan_user_prompt(
         self,
         *,
@@ -2048,6 +2125,62 @@ class GenerationService:
                 ],
             }
         )
+
+    def _code_plan_section_user_prompt(
+        self,
+        *,
+        section_id: str,
+        section_title: str,
+        section_contract: list[str],
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        doc_refs: list[Any],
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        scope_mode: str,
+        require_multi_page: bool,
+        workspace_tree: list[dict[str, str]],
+        generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
+    ) -> str:
+        compact = generation_mode == GenerationMode.FAST
+        return json_dumps(
+            {
+                "task": "Plan one route/page graph section for real code generation",
+                "section_id": section_id,
+                "section_title": section_title,
+                "prompt": prompt,
+                "role_scope": role_scope,
+                "scope_mode": scope_mode,
+                "require_multi_page": require_multi_page,
+                "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec) if compact else grounded_spec.model_dump(mode="json"),
+                "role_contract": role_contract,
+                "doc_refs": [
+                    item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+                    for item in (doc_refs[:3] if compact else doc_refs[:5])
+                ],
+                "workspace_tree": workspace_tree[:28] if compact else workspace_tree[:40],
+                "design_reference_files": list(DESIGN_REFERENCE_FILES),
+                "creative_direction": creative_direction,
+                "constraints": [
+                    "Keep Telegram/MAX mini-app compatibility.",
+                    "Keep three-role preview compatibility.",
+                    "Use the existing profile design language as a style anchor.",
+                    "Do not output role copies with changed titles only.",
+                ],
+                "section_contract": section_contract,
+            }
+        )
+
+    def _code_plan_partial_schema(self, field_names: list[str]) -> dict[str, Any]:
+        full_schema = self._code_plan_schema()
+        properties = full_schema.get("properties", {})
+        return {
+            "type": "object",
+            "properties": {name: properties[name] for name in field_names if name in properties},
+            "required": [name for name in field_names if name in properties],
+            "additionalProperties": False,
+        }
 
     @staticmethod
     def _page_edit_system_prompt() -> str:
@@ -2124,12 +2257,14 @@ class GenerationService:
             return (
                 "Compose the backend/runtime pieces after planning. "
                 "Generate only backend, API, schema, store, or contract files needed by the requested change. "
-                "Do not rewrite frontend page files."
+                "Do not rewrite frontend page files. "
+                "Return executable file operations, not an implementation plan."
             )
         return (
             "Compose the shared frontend/runtime pieces after the individual pages and backend are written. "
             "Generate route files, shared UI helpers, state modules, and frontend glue that connect the generated pages to the backend. "
-            "Do not rewrite page files unless they are explicitly targeted."
+            "Do not rewrite page files unless they are explicitly targeted. "
+            "Return executable file operations, not an implementation plan."
         )
 
     def _composition_user_prompt(
@@ -2188,6 +2323,10 @@ class GenerationService:
                     "Generate shared app chrome/state files that support the pages instead of rendering placeholder dashboards.",
                     "For minimal_patch, preserve unrelated behavior and keep the diff minimal.",
                     "Do not touch page files unless they are included in target_files.",
+                    "If target_files is non-empty, operations must include at least one create/replace/delete for one of those files.",
+                    "Do not return a prose plan, checklist, or explanation instead of file operations.",
+                    "Do not leave operations empty when target_files is non-empty.",
+                    "assistant_message must briefly summarize the patch that was generated, not propose future work.",
                 ],
             }
         )
@@ -2352,6 +2491,11 @@ class GenerationService:
                 ]
                 if invalid:
                     raise ValueError(f"Composition touched files outside the planned scope: {', '.join(invalid[:5])}")
+                self._validate_targeted_operations(
+                    stage_name=stage_name,
+                    target_files=target_files,
+                    operations=operations,
+                )
                 return {
                     "assistant_message": str(normalized.get("assistant_message") or "").strip(),
                     "operations": operations,
@@ -2640,6 +2784,11 @@ class GenerationService:
             ]
             if invalid:
                 raise ValueError(f"Repair touched files outside the planned scope: {', '.join(invalid[:5])}")
+            self._validate_targeted_operations(
+                stage_name="repair",
+                target_files=target_files,
+                operations=operations,
+            )
             return {
                 "assistant_message": str(normalized.get("assistant_message") or "").strip(),
                 "operations": operations,
@@ -2649,11 +2798,31 @@ class GenerationService:
             return {"error": f"Automatic repair step failed: {exc}"}
 
     @staticmethod
+    def _validate_targeted_operations(
+        *,
+        stage_name: str,
+        target_files: list[str],
+        operations: list[DraftFileOperation],
+    ) -> None:
+        if not target_files:
+            return
+        targeted_hits = [
+            operation
+            for operation in operations
+            if operation.file_path in set(target_files)
+        ]
+        if not targeted_hits:
+            raise RuntimeError(
+                f"{stage_name.capitalize()} returned no file operations for the requested target_files."
+            )
+
+    @staticmethod
     def _repair_system_prompt() -> str:
         return (
             "You repair an existing draft workspace after build or preview failure. "
             "Return only the smallest safe set of file operations needed to make the draft compile and boot. "
-            "Do not expand scope, do not redesign the app, and do not touch files outside the provided target list."
+            "Do not expand scope, do not redesign the app, and do not touch files outside the provided target list. "
+            "Return executable file operations, not a repair plan."
         )
 
     def _repair_user_prompt(
@@ -2692,6 +2861,9 @@ class GenerationService:
                     "Prefer editing the existing generated files instead of creating new architecture.",
                     "Keep the diff minimal and preserve unrelated behavior.",
                     "Return operations only for files listed in target_files.",
+                    "If target_files is non-empty, operations must include at least one create/replace/delete for one of those files.",
+                    "Do not return a prose repair plan instead of file operations.",
+                    "Do not leave operations empty when target_files is non-empty.",
                 ],
             }
         )
@@ -2823,6 +2995,8 @@ class GenerationService:
             "returned non-json text",
             "returned empty text instead of json",
             "instead of json",
+            "returned no file operations",
+            "no file operations for the requested target_files",
         )
         return any(marker in text for marker in retry_markers)
 
@@ -2878,7 +3052,8 @@ class GenerationService:
                 last_error = exc
                 if attempt == 2 or not self._is_retryable_llm_error(exc):
                     raise
-                request_kwargs = self._tighten_json_retry_kwargs(request_kwargs, exc, attempt)
+                if self._should_tighten_json_retry(exc):
+                    request_kwargs = self._tighten_json_retry_kwargs(request_kwargs, exc, attempt)
                 logger.warning("Retrying structured generation after transient provider failure: %s", exc)
                 time.sleep(0.8 * (attempt + 1))
         assert last_error is not None
@@ -2896,11 +3071,24 @@ class GenerationService:
                 last_error = exc
                 if attempt == 2 or not self._is_retryable_llm_error(exc):
                     raise
-                request_kwargs = self._tighten_json_retry_kwargs(request_kwargs, exc, attempt)
+                if self._should_tighten_json_retry(exc):
+                    request_kwargs = self._tighten_json_retry_kwargs(request_kwargs, exc, attempt)
                 logger.warning("Retrying relaxed JSON generation after transient provider failure: %s", exc)
                 time.sleep(0.8 * (attempt + 1))
         assert last_error is not None
         raise last_error
+
+    @staticmethod
+    def _should_tighten_json_retry(error: Exception) -> bool:
+        text = str(error).lower()
+        json_markers = (
+            "invalid json",
+            "returned non-json text",
+            "returned empty text instead of json",
+            "instead of json",
+            "jsondecodeerror",
+        )
+        return any(marker in text for marker in json_markers)
 
     def _resolve_grounded_spec(
         self,
@@ -2915,7 +3103,6 @@ class GenerationService:
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
-        del workspace_id
         if not self.openrouter_client.enabled:
             return {"error": "GroundedSpec generation requires OpenAI configuration."}
         if generation_mode == GenerationMode.FAST:
@@ -2930,6 +3117,7 @@ class GenerationService:
             )
         try:
             outline_payload, payload, outline = self._generate_grounded_spec_pair(
+                workspace_id=workspace_id,
                 prompt=prompt,
                 doc_refs=doc_refs,
                 target_platform=target_platform,
@@ -2946,6 +3134,7 @@ class GenerationService:
             if self._is_retryable_llm_error(strict_exc):
                 try:
                     outline_payload, payload, outline = self._generate_grounded_spec_pair(
+                        workspace_id=workspace_id,
                         prompt=prompt,
                         doc_refs=doc_refs,
                         target_platform=target_platform,
@@ -2974,6 +3163,7 @@ class GenerationService:
                     )
             try:
                 outline_payload, payload, outline = self._generate_grounded_spec_pair(
+                    workspace_id=workspace_id,
                     prompt=prompt,
                     doc_refs=doc_refs,
                     target_platform=target_platform,
@@ -3074,6 +3264,7 @@ class GenerationService:
     def _generate_grounded_spec_pair(
         self,
         *,
+        workspace_id: str,
         prompt: str,
         doc_refs: list[Any],
         target_platform: TargetPlatform,
@@ -3112,9 +3303,113 @@ class GenerationService:
                 user_prompt=outline_user_prompt,
             )
         outline = self._normalize_model_payload(outline_payload["payload"])
+        core_fields = ["product_goal", "actors", "domain_entities", "user_flows"]
+        requirements_fields = [
+            "ui_requirements",
+            "api_requirements",
+            "persistence_requirements",
+            "integration_requirements",
+            "security_requirements",
+            "platform_constraints",
+            "non_functional_requirements",
+        ]
+        governance_fields = ["assumptions", "unknowns", "contradictions"]
 
-        grounded_spec_schema = GroundedSpecModel.model_json_schema()
-        grounded_spec_user_prompt = self._grounded_spec_user_prompt(
+        core_payload = self._generate_grounded_spec_section(
+            section_id="core",
+            section_title="Core domain and workflow",
+            field_names=core_fields,
+            prompt=prompt,
+            doc_refs=doc_refs,
+            target_platform=target_platform,
+            preview_profile=preview_profile,
+            template_revision_id=template_revision_id,
+            prompt_turn_id=prompt_turn_id,
+            creative_direction=creative_direction,
+            outline=outline,
+            relaxed=relaxed,
+            compact=compact,
+        )
+        requirements_payload = self._generate_grounded_spec_section(
+            section_id="requirements",
+            section_title="Runtime requirements",
+            field_names=requirements_fields,
+            prompt=prompt,
+            doc_refs=doc_refs,
+            target_platform=target_platform,
+            preview_profile=preview_profile,
+            template_revision_id=template_revision_id,
+            prompt_turn_id=prompt_turn_id,
+            creative_direction=creative_direction,
+            outline=outline,
+            relaxed=relaxed,
+            compact=compact,
+        )
+        governance_payload = self._generate_grounded_spec_section(
+            section_id="governance",
+            section_title="Assumptions and gaps",
+            field_names=governance_fields,
+            prompt=prompt,
+            doc_refs=doc_refs,
+            target_platform=target_platform,
+            preview_profile=preview_profile,
+            template_revision_id=template_revision_id,
+            prompt_turn_id=prompt_turn_id,
+            creative_direction=creative_direction,
+            outline=outline,
+            relaxed=relaxed,
+            compact=compact,
+        )
+
+        merged_payload = {
+            "schema_version": "1.0.0",
+            "metadata": {
+                "workspace_id": workspace_id,
+                "conversation_id": f"conv_{workspace_id}",
+                "prompt_turn_id": prompt_turn_id,
+                "template_revision_id": template_revision_id,
+                "language": "en",
+                "created_at": utc_now().isoformat(),
+            },
+            "target_platform": target_platform.value,
+            "preview_profile": preview_profile.value,
+            "doc_refs": [
+                item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+                for item in doc_refs
+            ],
+            **self._normalize_model_payload(core_payload["payload"]),
+            **self._normalize_model_payload(requirements_payload["payload"]),
+            **self._normalize_model_payload(governance_payload["payload"]),
+        }
+        payload = {
+            "model": governance_payload["model"],
+            "payload": merged_payload,
+            "response_mode": "grounded_spec_sections",
+        }
+        return outline_payload, payload, outline
+
+    def _generate_grounded_spec_section(
+        self,
+        *,
+        section_id: str,
+        section_title: str,
+        field_names: list[str],
+        prompt: str,
+        doc_refs: list[Any],
+        target_platform: TargetPlatform,
+        preview_profile: PreviewProfile,
+        template_revision_id: str,
+        prompt_turn_id: str,
+        creative_direction: dict[str, Any],
+        outline: dict[str, Any],
+        relaxed: bool,
+        compact: bool,
+    ) -> dict[str, Any]:
+        schema = self._grounded_spec_partial_schema(field_names)
+        user_prompt = self._grounded_spec_section_user_prompt(
+            section_id=section_id,
+            section_title=section_title,
+            field_names=field_names,
             prompt=prompt,
             doc_refs=doc_refs,
             target_platform=target_platform,
@@ -3126,22 +3421,20 @@ class GenerationService:
             compact=compact,
         )
         if relaxed:
-            payload = self._generate_json_object_with_retry(
+            return self._generate_json_object_with_retry(
                 role="spec_analysis",
-                schema_name="grounded_spec_v1",
-                schema=grounded_spec_schema,
-                system_prompt=self._grounded_spec_system_prompt(),
-                user_prompt=grounded_spec_user_prompt,
+                schema_name=f"grounded_spec_{section_id}_v1",
+                schema=schema,
+                system_prompt=self._grounded_spec_section_system_prompt(section_title),
+                user_prompt=user_prompt,
             )
-        else:
-            payload = self._generate_structured_with_retry(
-                role="spec_analysis",
-                schema_name="grounded_spec_v1",
-                schema=grounded_spec_schema,
-                system_prompt=self._grounded_spec_system_prompt(),
-                user_prompt=grounded_spec_user_prompt,
-            )
-        return outline_payload, payload, outline
+        return self._generate_structured_with_retry(
+            role="spec_analysis",
+            schema_name=f"grounded_spec_{section_id}_v1",
+            schema=schema,
+            system_prompt=self._grounded_spec_section_system_prompt(section_title),
+            user_prompt=user_prompt,
+        )
 
     def _resolve_app_ir(
         self,
@@ -3154,12 +3447,10 @@ class GenerationService:
         if generation_mode == GenerationMode.BASIC or not self.openrouter_client.enabled:
             return {"ir": self._build_app_ir(spec, scenario_graph, generation_mode)}
         try:
-            payload = self._generate_structured_with_retry(
-                role="ir_codegen",
-                schema_name="app_ir_v1",
-                schema=AppIRModel.model_json_schema(),
-                system_prompt=self._app_ir_system_prompt(),
-                user_prompt=self._app_ir_user_prompt(spec, scenario_graph, creative_direction),
+            payload = self._generate_app_ir_sections(
+                spec=spec,
+                scenario_graph=scenario_graph,
+                creative_direction=creative_direction,
             )
             llm_ir = AppIRModel.model_validate(self._normalize_model_payload(payload["payload"]))
             llm_ir = self._stabilize_app_ir(llm_ir, spec, scenario_graph, generation_mode)
@@ -3209,6 +3500,104 @@ class GenerationService:
                 "refinement_rounds": 0,
                 "warning": f"AppIR LLM step failed, fallback compiler IR was used: {exc}",
             }
+
+    def _generate_app_ir_sections(
+        self,
+        *,
+        spec: GroundedSpecModel,
+        scenario_graph: dict[str, Any],
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        structure_fields = [
+            "app_id",
+            "title",
+            "platform",
+            "preview_profile",
+            "entry_screen_id",
+            "screens",
+            "transitions",
+            "route_groups",
+            "screen_data_sources",
+            "role_action_groups",
+            "terminal_screen_ids",
+        ]
+        domain_fields = ["variables", "entities", "integrations", "storage_bindings"]
+        operations_fields = [
+            "auth_model",
+            "permissions",
+            "security",
+            "telemetry_hooks",
+            "assumptions",
+            "open_questions",
+            "traceability",
+        ]
+
+        structure_payload = self._generate_app_ir_section(
+            section_id="structure",
+            section_title="Application structure and routes",
+            field_names=structure_fields,
+            spec=spec,
+            scenario_graph=scenario_graph,
+            creative_direction=creative_direction,
+        )
+        domain_payload = self._generate_app_ir_section(
+            section_id="domain",
+            section_title="State, entities, integrations, and storage",
+            field_names=domain_fields,
+            spec=spec,
+            scenario_graph=scenario_graph,
+            creative_direction=creative_direction,
+        )
+        operations_payload = self._generate_app_ir_section(
+            section_id="operations",
+            section_title="Auth, security, telemetry, and traceability",
+            field_names=operations_fields,
+            spec=spec,
+            scenario_graph=scenario_graph,
+            creative_direction=creative_direction,
+        )
+        merged_payload = {
+            "schema_version": "1.0.0",
+            "metadata": {
+                "workspace_id": spec.metadata.workspace_id,
+                "grounded_spec_version": spec.schema_version,
+                "template_revision_id": spec.metadata.template_revision_id,
+                "generated_at": utc_now().isoformat(),
+            },
+            **self._normalize_model_payload(structure_payload["payload"]),
+            **self._normalize_model_payload(domain_payload["payload"]),
+            **self._normalize_model_payload(operations_payload["payload"]),
+        }
+        return {
+            "model": operations_payload["model"],
+            "payload": merged_payload,
+            "response_mode": "app_ir_sections",
+        }
+
+    def _generate_app_ir_section(
+        self,
+        *,
+        section_id: str,
+        section_title: str,
+        field_names: list[str],
+        spec: GroundedSpecModel,
+        scenario_graph: dict[str, Any],
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._generate_structured_with_retry(
+            role="ir_codegen",
+            schema_name=f"app_ir_{section_id}_v1",
+            schema=self._app_ir_partial_schema(field_names),
+            system_prompt=self._app_ir_section_system_prompt(section_title),
+            user_prompt=self._app_ir_section_user_prompt(
+                section_id=section_id,
+                section_title=section_title,
+                field_names=field_names,
+                spec=spec,
+                scenario_graph=scenario_graph,
+                creative_direction=creative_direction,
+            ),
+        )
 
     def _critique_app_ir(
         self,
@@ -5718,6 +6107,15 @@ class GenerationService:
         )
 
     @staticmethod
+    def _grounded_spec_section_system_prompt(section_title: str) -> str:
+        return (
+            "You are generating one section of a documentation-grounded multi-role mini-app specification. "
+            f"Produce only the requested section: {section_title}. "
+            "Keep the section concrete, implementation-oriented, and strictly valid against the schema. "
+            "Do not repeat unrelated sections."
+        )
+
+    @staticmethod
     def _grounded_spec_outline_schema() -> dict[str, Any]:
         return {
             "type": "object",
@@ -5834,6 +6232,57 @@ class GenerationService:
             }
         )
 
+    @staticmethod
+    def _grounded_spec_partial_schema(field_names: list[str]) -> dict[str, Any]:
+        full_schema = GroundedSpecModel.model_json_schema()
+        properties = full_schema.get("properties", {})
+        return {
+            "type": "object",
+            "properties": {name: properties[name] for name in field_names if name in properties},
+            "required": [name for name in field_names if name in properties],
+            "additionalProperties": False,
+            "$defs": full_schema.get("$defs", {}),
+        }
+
+    def _grounded_spec_section_user_prompt(
+        self,
+        *,
+        section_id: str,
+        section_title: str,
+        field_names: list[str],
+        prompt: str,
+        doc_refs: list[Any],
+        target_platform: TargetPlatform,
+        preview_profile: PreviewProfile,
+        template_revision_id: str,
+        prompt_turn_id: str,
+        creative_direction: dict[str, Any],
+        outline: dict[str, Any],
+        compact: bool = False,
+    ) -> str:
+        return json_dumps(
+            {
+                "task": "Build GroundedSpec section",
+                "section_id": section_id,
+                "section_title": section_title,
+                "required_fields": field_names,
+                "prompt": prompt,
+                "target_platform": target_platform.value,
+                "preview_profile": preview_profile.value,
+                "template_revision_id": template_revision_id,
+                "prompt_turn_id": prompt_turn_id,
+                "outline": outline,
+                "creative_direction": self._compact_creative_direction(creative_direction, compact=compact),
+                "section_contract": [
+                    "Return only the requested fields.",
+                    "Keep entity, role, and API naming consistent with the outline.",
+                    "Prefer concrete business details over placeholders.",
+                    "Do not duplicate top-level fields that were not requested.",
+                ],
+                "docs": self._compact_doc_refs(doc_refs, limit=2 if compact else 4),
+            }
+        )
+
     def _app_ir_system_prompt(self) -> str:
         return (
             "You are generating a quality-first AppIR for a multi-page, role-aware mini-app. "
@@ -5843,6 +6292,14 @@ class GenerationService:
             "Do not emit shallow mirrored role screens; each role must have distinct operational value. "
             "Honor the provided creative_direction and variability_policy while preserving schema validity. "
             "Keep the output strictly valid against the schema."
+        )
+
+    @staticmethod
+    def _app_ir_section_system_prompt(section_title: str) -> str:
+        return (
+            "You are generating one section of a quality-first AppIR for a role-aware mini-app. "
+            f"Return only the requested section: {section_title}. "
+            "Keep the output strictly valid against the schema and consistent with the grounded spec and scenario graph."
         )
 
     def _app_ir_user_prompt(self, spec: GroundedSpecModel, scenario_graph: dict[str, Any], creative_direction: dict[str, Any]) -> str:
@@ -5858,6 +6315,46 @@ class GenerationService:
                     "Preserve traceability between prompt intent, routes, actions, and integrations.",
                     "Avoid generic labels and placeholder-only screens.",
                     "Do not force fixed route/screen patterns when alternative architectures are equally valid.",
+                ],
+            }
+        )
+
+    @staticmethod
+    def _app_ir_partial_schema(field_names: list[str]) -> dict[str, Any]:
+        full_schema = AppIRModel.model_json_schema()
+        properties = full_schema.get("properties", {})
+        return {
+            "type": "object",
+            "properties": {name: properties[name] for name in field_names if name in properties},
+            "required": [name for name in field_names if name in properties],
+            "additionalProperties": False,
+            "$defs": full_schema.get("$defs", {}),
+        }
+
+    def _app_ir_section_user_prompt(
+        self,
+        *,
+        section_id: str,
+        section_title: str,
+        field_names: list[str],
+        spec: GroundedSpecModel,
+        scenario_graph: dict[str, Any],
+        creative_direction: dict[str, Any],
+    ) -> str:
+        return json_dumps(
+            {
+                "task": "Build AppIR section",
+                "section_id": section_id,
+                "section_title": section_title,
+                "required_fields": field_names,
+                "grounded_spec": spec.model_dump(mode="json"),
+                "scenario_graph": scenario_graph,
+                "creative_direction": creative_direction,
+                "delivery_contract": [
+                    "Return only the requested fields.",
+                    "Keep ids, routes, screen references, and integration names internally consistent.",
+                    "Prefer realistic multi-screen role behavior over mirrored placeholders.",
+                    "Do not emit unrelated top-level AppIR fields.",
                 ],
             }
         )

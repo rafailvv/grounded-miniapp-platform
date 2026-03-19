@@ -842,22 +842,21 @@ class RunService:
         return [target.file_path for target in change_plan.targets if target.file_path]
 
     def _mark_run_without_meaningful_diff(self, run: RunRecord, job: Any) -> None:
-        message = "Draft produced no meaningful source changes to apply."
+        message = "Generation completed without meaningful source changes to apply."
         run.summary = message
-        run.failure_reason = message
-        run.status = "failed"
-        run.apply_status = "failed"
-        run.draft_status = "failed"
-        run.draft_ready = self.workspace_service.draft_exists(run.workspace_id, run.run_id)
-        run.current_stage = "failed"
+        run.failure_reason = None
+        run.status = "completed"
+        run.apply_status = "noop"
+        run.draft_status = "none"
+        run.draft_ready = False
+        run.current_stage = "completed"
         run.progress_percent = max(run.progress_percent, 100)
-        if run.current_fix_phase == "completed":
-            run.current_fix_phase = "failed"
+        run.current_fix_phase = job.current_fix_phase
 
-        job.status = "failed"
+        job.status = "completed"
         job.summary = message
-        job.failure_reason = message
-        self.generation_service._append_event(job, "job_failed", message, {"reason": "no_meaningful_diff"})
+        job.failure_reason = None
+        self.generation_service._append_event(job, "job_completed", message, {"reason": "no_meaningful_diff"})
 
     def _meaningful_paths_for_run(
         self,
