@@ -4,6 +4,7 @@ services:
       context: ../backend
       dockerfile: Dockerfile
     environment:
+      DATABASE_URL: postgresql+psycopg://miniapp:miniapp@preview-db:5432/miniapp
       UVICORN_HOST: 0.0.0.0
       UVICORN_PORT: 8000
     expose:
@@ -22,7 +23,6 @@ services:
       context: ../frontend
       dockerfile: Dockerfile
       args:
-        VITE_AUTH_ENDPOINT: ${PREVIEW_AUTH_ENDPOINT:-/api/auth/telegram}
         VITE_API_BASE_URL: ${PREVIEW_API_BASE_URL:-}
         VITE_DEFAULT_ROLE: ${PREVIEW_DEFAULT_ROLE:-client}
     expose:

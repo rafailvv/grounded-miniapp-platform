@@ -1,8 +1,6 @@
-import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { AppRole } from '@/shared/roles/role';
 import { getClientProfileDisplayName, loadRoleProfileView } from '@/shared/profile/clientProfile';
-import { fetchRoleDashboard, type RemoteDashboard } from '@/shared/profile/profileApi';
 import { ProfileCabinetCard } from '@/shared/ui/ProfileCabinetCard/ProfileCabinetCard';
 import styles from '@/shared/ui/templates/RoleCabinetHomePage.module.css';
 
@@ -14,20 +12,6 @@ type RoleCabinetHomePageProps = {
 export function RoleCabinetHomePage({ role, featureText }: RoleCabinetHomePageProps): JSX.Element {
   const navigate = useNavigate();
   const profile = loadRoleProfileView(role);
-  const [dashboard, setDashboard] = useState<RemoteDashboard | null>(null);
-
-  useEffect(() => {
-    let isMounted = true;
-    void fetchRoleDashboard(role).then((payload) => {
-      if (!isMounted) return;
-      setDashboard(payload);
-    });
-    return () => {
-      isMounted = false;
-    };
-  }, [role]);
-
-  const resolvedFeatureText = dashboard?.feature_text ?? featureText;
 
   return (
     <section className={styles.page}>
@@ -40,18 +24,8 @@ export function RoleCabinetHomePage({ role, featureText }: RoleCabinetHomePagePr
 
       <div className={styles.featureBlock}>
         <div className={styles.featureContent}>
-          {dashboard?.title ? <span className={styles.featureTitle}>{dashboard.title}</span> : null}
-          <span className={styles.featureText}>{resolvedFeatureText}</span>
-          {dashboard?.metrics?.length ? (
-            <div className={styles.metricsGrid}>
-              {dashboard.metrics.map((metric) => (
-                <div key={metric.metric_id} className={styles.metricCard}>
-                  <span className={styles.metricLabel}>{metric.label}</span>
-                  <strong className={styles.metricValue}>{metric.value}</strong>
-                </div>
-              ))}
-            </div>
-          ) : null}
+          <span className={styles.featureTitle}>{profile.roleLabel} workspace</span>
+          <span className={styles.featureText}>{featureText}</span>
         </div>
       </div>
     </section>

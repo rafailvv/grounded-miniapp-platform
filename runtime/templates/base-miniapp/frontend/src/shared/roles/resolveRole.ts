@@ -3,16 +3,9 @@ import { DEFAULT_APP_ROLE, normalizeRole, type AppRole } from '@/shared/roles/ro
 type ResolveRoleInput = {
   queryRole: string | null;
   startParamRole: string | null;
-  authRole: string | null;
   fallbackRole?: string;
 };
 
-export function resolveRole({ queryRole, startParamRole, authRole, fallbackRole }: ResolveRoleInput): AppRole {
-  return (
-    normalizeRole(queryRole) ||
-    normalizeRole(startParamRole) ||
-    normalizeRole(authRole) ||
-    normalizeRole(fallbackRole) ||
-    DEFAULT_APP_ROLE
-  );
+export function resolveRole({ queryRole, startParamRole, fallbackRole }: ResolveRoleInput): AppRole {
+  return normalizeRole(queryRole) || normalizeRole(startParamRole) || normalizeRole(fallbackRole) || DEFAULT_APP_ROLE;
 }

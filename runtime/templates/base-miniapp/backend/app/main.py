@@ -3,19 +3,23 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from app.routes import register_routes
-from app.store import ensure_state, ensure_store_data
-
-app = FastAPI(title="Base Mini-App Backend", version="2.0.0")
-register_routes(app)
+from app.api.router import api_router
+from app.api.dependencies import get_profile_service
 
 
-@app.on_event("startup")
-def startup() -> None:
-    ensure_state()
-    ensure_store_data()
+def create_app() -> FastAPI:
+    app = FastAPI(title="Base Mini-App Backend", version="2.0.0")
+    app.include_router(api_router)
+
+    @app.on_event("startup")
+    def startup() -> None:
+        get_profile_service().init_storage()
+
+    @app.exception_handler(KeyError)
+    def key_error_handler(_, exc: KeyError):
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    return app
 
 
-@app.exception_handler(KeyError)
-def key_error_handler(_, exc: KeyError):
-    return JSONResponse(status_code=404, content={"detail": str(exc)})
+app = create_app()

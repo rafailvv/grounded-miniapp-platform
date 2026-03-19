@@ -12,5 +12,8 @@ backend/**/*.pyo
 backend/.pytest_cache/
 backend/.mypy_cache/
 backend/.ruff_cache/
+backend/app/generated/*.db
+backend/app/generated/*.sqlite
+backend/app/generated/*.sqlite3
 
 .DS_Store

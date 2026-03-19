@@ -12,20 +12,15 @@ The current baseline is a tri-role mini-app:
 
 ## Backend contract
 
-- `POST /api/auth/telegram` resolves the active role and returns auth tokens.
-- `GET /api/roles` returns the supported role catalog.
-- `GET /api/dashboard/{role}` returns role-specific dashboard data.
 - `GET /api/profiles/{role}` loads the persisted role profile.
 - `PUT /api/profiles/{role}` saves the role profile.
-- `POST /api/submissions` accepts the generated form payload.
 - `GET /health` reports backend readiness.
 
 ## Frontend contract
 
-- The frontend bootstraps the role via Telegram auth or `?role=`.
-- The frontend consumes runtime manifests from `/api/runtime/{role}/manifest` and uses an inline placeholder when runtime data is absent.
+- The frontend bootstraps the role via `?role=` or the Telegram start parameter.
 - Profile pages sync with backend if `VITE_API_BASE_URL` is set.
-- Role home pages query backend dashboard data if the API is reachable.
+- Role home pages are static starter screens that can be extended by generation.
 
 ## Workspace rules
 
