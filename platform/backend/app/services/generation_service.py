@@ -1191,6 +1191,25 @@ class GenerationService:
                     creative_direction=creative_direction,
                 )
             )
+            if any("error" in result and result.get("retryable") for result in ordered_page_results):
+                for index, page_result in enumerate(ordered_page_results):
+                    if "error" not in page_result or not page_result.get("retryable"):
+                        continue
+                    role, page = selected_pages[index]
+                    ordered_page_results[index] = self._resolve_page_file_edit(
+                        prompt=prompt,
+                        grounded_spec=grounded_spec,
+                        role=role,
+                        page=page,
+                        page_graph=page_graph,
+                        role_contract=role_contract,
+                        scope_mode=scope_mode,
+                        intent=intent,
+                        file_contexts=file_contexts,
+                        generation_mode=GenerationMode.FAST,
+                        creative_direction=creative_direction,
+                        recovery_mode="serial_compact_retry",
+                    )
 
         for page_result in ordered_page_results:
             assert page_result is not None
@@ -1593,7 +1612,7 @@ class GenerationService:
         if generation_mode == GenerationMode.FAST:
             default = "2"
         else:
-            default = "2" if scope_mode == "minimal_patch" else "4"
+            default = "2" if scope_mode == "minimal_patch" else "3"
         configured = max(1, int(os.getenv("PAGE_EDIT_MAX_PARALLELISM", default)))
         return configured
 
@@ -2182,14 +2201,16 @@ class GenerationService:
         file_contexts: dict[str, str],
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
+        recovery_mode: str = "default",
     ) -> dict[str, Any]:
-        try:
-            payload = self._generate_structured_with_retry(
-                role="code_edit",
-                schema_name=f"page_file_v1_{page['page_id']}",
-                schema=self._code_edit_schema(),
-                system_prompt=self._page_edit_system_prompt(),
-                user_prompt=self._page_edit_user_prompt(
+        retry_modes = [generation_mode]
+        if generation_mode != GenerationMode.FAST:
+            retry_modes.append(GenerationMode.FAST)
+        last_error: Exception | None = None
+        for mode_attempt, prompt_mode in enumerate(retry_modes):
+            try:
+                system_prompt = self._page_edit_system_prompt()
+                user_prompt = self._page_edit_user_prompt(
                     prompt=prompt,
                     grounded_spec=grounded_spec,
                     role=role,
@@ -2199,29 +2220,59 @@ class GenerationService:
                     scope_mode=scope_mode,
                     intent=intent,
                     file_contexts=file_contexts,
-                    generation_mode=generation_mode,
+                    generation_mode=prompt_mode,
                     creative_direction=creative_direction,
-                ),
-            )
-            normalized = self._normalize_model_payload(payload["payload"])
-            raw_operations = normalized.get("operations")
-            if not isinstance(raw_operations, list):
-                raise ValueError(f"{page['file_path']} did not return operations.")
-            operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
-            valid_operations = [
-                operation
-                for operation in operations
-                if operation.file_path == page["file_path"] and operation.operation in {"create", "replace"} and operation.content is not None
-            ]
-            if len(valid_operations) != 1:
-                raise ValueError(f"{page['file_path']} must be generated as a single create/replace operation.")
-            return {
-                "assistant_message": str(normalized.get("assistant_message") or "").strip(),
-                "operation": valid_operations[0],
-                "model": payload["model"],
-            }
-        except Exception as exc:
-            return {"error": f"Page generation failed for {page['file_path']}: {exc}"}
+                )
+                if mode_attempt > 0 or recovery_mode != "default":
+                    recovery_note = (
+                        "Provider recovery mode:\n"
+                        "- Previous attempt failed with a transient provider or transport issue.\n"
+                        "- Keep the page implementation concise and stable.\n"
+                        "- Return only the single requested page file operation.\n"
+                        "- Prefer the smallest valid page implementation over extra polish."
+                    )
+                    system_prompt = f"{system_prompt.rstrip()}\n\n{recovery_note}".strip()
+                    user_prompt = f"{user_prompt.rstrip()}\n\n{recovery_note}".strip()
+                payload = self._generate_structured_with_retry(
+                    role="code_edit",
+                    schema_name=f"page_file_v1_{page['page_id']}",
+                    schema=self._code_edit_schema(),
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                )
+                normalized = self._normalize_model_payload(payload["payload"])
+                raw_operations = normalized.get("operations")
+                if not isinstance(raw_operations, list):
+                    raise ValueError(f"{page['file_path']} did not return operations.")
+                operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
+                valid_operations = [
+                    operation
+                    for operation in operations
+                    if operation.file_path == page["file_path"] and operation.operation in {"create", "replace"} and operation.content is not None
+                ]
+                if len(valid_operations) != 1:
+                    raise ValueError(f"{page['file_path']} must be generated as a single create/replace operation.")
+                return {
+                    "assistant_message": str(normalized.get("assistant_message") or "").strip(),
+                    "operation": valid_operations[0],
+                    "model": payload["model"],
+                }
+            except Exception as exc:
+                last_error = exc
+                if mode_attempt + 1 < len(retry_modes) and self._is_retryable_llm_error(exc):
+                    logger.warning(
+                        "Retrying page generation for %s with compact recovery context after transient provider failure: %s",
+                        page["file_path"],
+                        exc,
+                    )
+                    continue
+                break
+        assert last_error is not None
+        return {
+            "error": f"Page generation failed for {page['file_path']}: {last_error}",
+            "retryable": self._is_retryable_llm_error(last_error),
+            "file_path": page["file_path"],
+        }
 
     def _resolve_composition_edit(
         self,
@@ -2244,13 +2295,14 @@ class GenerationService:
         if not target_files:
             return {"assistant_message": f"{stage_name.capitalize()} stage complete: no changes were required.", "operations": []}
         allowed_targets = set(target_files)
-        try:
-            payload = self._generate_structured_with_retry(
-                role="code_edit",
-                schema_name="composition_bundle_v1",
-                schema=self._code_edit_schema(),
-                system_prompt=self._composition_system_prompt(stage_name),
-                user_prompt=self._composition_user_prompt(
+        retry_modes = [generation_mode]
+        if generation_mode != GenerationMode.FAST:
+            retry_modes.append(GenerationMode.FAST)
+        last_error: Exception | None = None
+        for mode_attempt, prompt_mode in enumerate(retry_modes):
+            try:
+                system_prompt = self._composition_system_prompt(stage_name)
+                user_prompt = self._composition_user_prompt(
                     prompt=prompt,
                     grounded_spec=grounded_spec,
                     role_scope=role_scope,
@@ -2263,29 +2315,55 @@ class GenerationService:
                     file_contexts=file_contexts,
                     generated_page_sources=generated_page_sources,
                     generated_support_sources=generated_support_sources,
-                    generation_mode=generation_mode,
+                    generation_mode=prompt_mode,
                     creative_direction=creative_direction,
-                ),
-            )
-            normalized = self._normalize_model_payload(payload["payload"])
-            raw_operations = normalized.get("operations")
-            if not isinstance(raw_operations, list):
-                raise ValueError("Composition did not return operations.")
-            operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
-            invalid = [
-                operation.file_path
-                for operation in operations
-                if operation.file_path not in allowed_targets or (operation.operation in {"create", "replace"} and operation.content is None)
-            ]
-            if invalid:
-                raise ValueError(f"Composition touched files outside the planned scope: {', '.join(invalid[:5])}")
-            return {
-                "assistant_message": str(normalized.get("assistant_message") or "").strip(),
-                "operations": operations,
-                "model": payload["model"],
-            }
-        except Exception as exc:
-            return {"error": f"Composition step failed: {exc}"}
+                )
+                if mode_attempt > 0:
+                    recovery_note = (
+                        "Provider recovery mode:\n"
+                        "- Previous attempt failed with a transient provider or transport issue.\n"
+                        "- Keep the composition patch concise.\n"
+                        "- Only return operations for target_files.\n"
+                        "- Prefer stable wiring over extra polish."
+                    )
+                    system_prompt = f"{system_prompt.rstrip()}\n\n{recovery_note}".strip()
+                    user_prompt = f"{user_prompt.rstrip()}\n\n{recovery_note}".strip()
+                payload = self._generate_structured_with_retry(
+                    role="code_edit",
+                    schema_name="composition_bundle_v1",
+                    schema=self._code_edit_schema(),
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                )
+                normalized = self._normalize_model_payload(payload["payload"])
+                raw_operations = normalized.get("operations")
+                if not isinstance(raw_operations, list):
+                    raise ValueError("Composition did not return operations.")
+                operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
+                invalid = [
+                    operation.file_path
+                    for operation in operations
+                    if operation.file_path not in allowed_targets or (operation.operation in {"create", "replace"} and operation.content is None)
+                ]
+                if invalid:
+                    raise ValueError(f"Composition touched files outside the planned scope: {', '.join(invalid[:5])}")
+                return {
+                    "assistant_message": str(normalized.get("assistant_message") or "").strip(),
+                    "operations": operations,
+                    "model": payload["model"],
+                }
+            except Exception as exc:
+                last_error = exc
+                if mode_attempt + 1 < len(retry_modes) and self._is_retryable_llm_error(exc):
+                    logger.warning(
+                        "Retrying %s composition with compact recovery context after transient provider failure: %s",
+                        stage_name,
+                        exc,
+                    )
+                    continue
+                break
+        assert last_error is not None
+        return {"error": f"Composition step failed: {last_error}"}
 
     @staticmethod
     def _selected_pages_for_edit(page_graph: dict[str, Any], target_files: set[str]) -> list[tuple[str, dict[str, Any]]]:

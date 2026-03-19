@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.ai.openrouter_client import OpenRouterClient
 from app.main import create_app
-from app.models.domain import CreateRunRequest, GenerateRequest, JobRecord, ValidationSnapshot
+from app.models.domain import CreateRunRequest, GenerateRequest, GenerationMode, JobRecord, ValidationSnapshot
 from app.services.code_index_service import CodeIndexService
 from app.validators.build_validator import BuildValidator
 
@@ -850,6 +850,81 @@ def test_clone_template_skips_heavy_frontend_artifacts(tmp_path: Path) -> None:
     source_root = tmp_path / "data" / "workspaces" / workspace_id / "source"
     assert not (source_root / "frontend" / "node_modules").exists()
     assert not (source_root / "frontend" / "dist").exists()
+    assert (source_root / ".gitignore").exists()
+
+
+def test_approve_draft_does_not_block_on_index_refresh(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Async Index Workspace",
+            "description": "Approve draft should not wait for reindex",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    service = app.state.container.workspace_service
+    service.clone_template(workspace_id)
+    service.prepare_draft(workspace_id, "run_async_index")
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def fake_refresh_indexes(workspace):
+        del workspace
+        started.set()
+        time.sleep(0.5)
+        finished.set()
+
+    monkeypatch.setattr(service, "_refresh_indexes", fake_refresh_indexes)
+
+    started_at = time.perf_counter()
+    service.approve_draft(workspace_id, "run_async_index", "Approve draft asynchronously")
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 0.4
+    assert started.wait(1.0)
+    assert finished.wait(1.0)
+
+
+def test_file_tree_hides_temporary_build_artifacts(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Hidden Artifact Workspace",
+            "description": "Temporary artifacts should stay out of file tree",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    service = app.state.container.workspace_service
+    service.clone_template(workspace_id)
+
+    source_root = tmp_path / "data" / "workspaces" / workspace_id / "source"
+    (source_root / "frontend" / "node_modules" / "demo").mkdir(parents=True)
+    (source_root / "frontend" / "node_modules" / "demo" / "index.js").write_text("export {};\n", encoding="utf-8")
+    (source_root / "frontend" / "dist").mkdir(parents=True)
+    (source_root / "frontend" / "dist" / "index.html").write_text("<html></html>\n", encoding="utf-8")
+    (source_root / "backend" / "__pycache__").mkdir(parents=True)
+    (source_root / "backend" / "__pycache__" / "store.cpython-312.pyc").write_bytes(b"pyc")
+    (source_root / "frontend" / "tsconfig.tsbuildinfo").write_text("{}", encoding="utf-8")
+
+    paths = {item["path"] for item in service.file_tree(workspace_id)}
+
+    assert "frontend/node_modules" not in paths
+    assert "frontend/dist" not in paths
+    assert "backend/__pycache__" not in paths
+    assert "frontend/tsconfig.tsbuildinfo" not in paths
 
 
 def test_frontend_build_tooling_failure_is_classified_as_platform_issue(tmp_path: Path, monkeypatch) -> None:
@@ -879,6 +954,114 @@ def test_openrouter_json_parser_recovers_first_object_from_concatenated_json() -
         "responses",
     )
     assert parsed == {"assistant_message": "first", "operations": []}
+
+
+def test_page_generation_retries_with_compact_recovery_after_retryable_provider_error(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    prompts: list[tuple[str, str]] = []
+
+    def fake_generate_structured_with_retry(**kwargs):
+        prompts.append((kwargs["system_prompt"], kwargs["user_prompt"]))
+        if len(prompts) == 1:
+            raise RuntimeError("OpenRouter chat/completions returned 502: provider returned error")
+        return {
+            "payload": {
+                "assistant_message": "Recovered.",
+                "operations": [
+                    {
+                        "file_path": "frontend/src/roles/client/pages/ProductDetailPage.tsx",
+                        "operation": "replace",
+                        "content": "export default function ProductDetailPage(){return null;}\n",
+                        "reason": "recover",
+                    }
+                ],
+            },
+            "model": "stub-model",
+        }
+
+    service._page_edit_system_prompt = lambda: "page-system"  # type: ignore[method-assign]
+    service._page_edit_user_prompt = lambda **kwargs: f"mode={kwargs['generation_mode']}"  # type: ignore[method-assign]
+    service._generate_structured_with_retry = fake_generate_structured_with_retry  # type: ignore[method-assign]
+
+    result = service._resolve_page_file_edit(
+        prompt="Build the product detail page.",
+        grounded_spec=None,  # type: ignore[arg-type]
+        role="client",
+        page={"page_id": "product-detail", "file_path": "frontend/src/roles/client/pages/ProductDetailPage.tsx"},
+        page_graph={"roles": {}},
+        role_contract={},
+        scope_mode="app_surface_build",
+        intent="create",
+        file_contexts={},
+        generation_mode=GenerationMode.BALANCED,
+        creative_direction={},
+    )
+
+    assert "error" not in result
+    assert len(prompts) == 2
+    assert "Provider recovery mode" in prompts[1][0]
+    assert "mode=GenerationMode.FAST" in prompts[1][1]
+
+
+def test_parallel_page_generation_falls_back_to_serial_compact_retry(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    page_one = "frontend/src/roles/client/pages/ProductListPage.tsx"
+    page_two = "frontend/src/roles/client/pages/ProductDetailPage.tsx"
+    retried: list[tuple[str, str]] = []
+
+    from app.models.domain import DraftFileOperation
+
+    second_page_operation = DraftFileOperation(
+        file_path=page_two,
+        operation="replace",
+        content="export default function ProductDetailPage(){return null;}\n",
+        reason="page2",
+    )
+    recovered_operation = DraftFileOperation(
+        file_path=page_one,
+        operation="replace",
+        content="export default function ProductListPage(){return null;}\n",
+        reason="page1",
+    )
+
+    async def fake_async_page_results(**kwargs):
+        del kwargs
+        return [
+            {"error": f"Page generation failed for {page_one}: OpenRouter chat/completions returned 502", "retryable": True, "file_path": page_one},
+            {"assistant_message": "Second page ok.", "operation": second_page_operation, "model": "stub"},
+        ]
+
+    def fake_page_edit(**kwargs):
+        retried.append((kwargs["page"]["file_path"], kwargs.get("recovery_mode", "default")))
+        return {"assistant_message": "Recovered page.", "operation": recovered_operation, "model": "stub"}
+
+    service._resolve_page_file_edits_async = fake_async_page_results  # type: ignore[method-assign]
+    service._resolve_page_file_edit = fake_page_edit  # type: ignore[method-assign]
+
+    result = service._resolve_code_edits(
+        prompt="Create the client shopping flow.",
+        grounded_spec=None,  # type: ignore[arg-type]
+        role_scope=["client"],
+        file_contexts={},
+        target_files=[page_one, page_two],
+        role_contract={},
+        page_graph={"roles": {"client": {"pages": [{"page_id": "list", "file_path": page_one}, {"page_id": "detail", "file_path": page_two}]}}},
+        intent="create",
+        scope_mode="app_surface_build",
+        generation_mode=GenerationMode.BALANCED,
+        creative_direction={},
+    )
+
+    assert "error" not in result
+    assert retried == [(page_one, "serial_compact_retry")]
+    assert any(item.file_path == page_one for item in result["operations"])
+    assert any(item.file_path == page_two for item in result["operations"])
 
 
 def test_generate_run_auto_switches_to_fix_on_frontend_build_failure(tmp_path: Path) -> None:

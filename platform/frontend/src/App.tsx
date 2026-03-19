@@ -2450,26 +2450,6 @@ export default function App() {
                       : eventLogLines.join("\n")}
                   </pre>
                 </div>
-                {selectedRunMode === "fix" || topbarRun?.mode === "fix" || workspaceLogs?.job?.current_fix_phase ? (
-                  <div className="run-details-grid">
-                    <div className="run-detail-card">
-                      <span>fixbug phase</span>
-                      <strong>{workspaceLogs?.job?.current_fix_phase ?? topbarRun?.current_fix_phase ?? "n/a"}</strong>
-                    </div>
-                    <div className="run-detail-card">
-                      <span>Failure signature</span>
-                      <strong>{workspaceLogs?.job?.failure_signature ?? topbarRun?.failure_signature ?? "n/a"}</strong>
-                    </div>
-                    <div className="run-detail-card">
-                      <span>Failing command</span>
-                      <strong>{workspaceLogs?.job?.current_failing_command ?? topbarRun?.current_failing_command ?? "n/a"}</strong>
-                    </div>
-                    <div className="run-detail-card">
-                      <span>Exit code</span>
-                      <strong>{workspaceLogs?.job?.current_exit_code ?? topbarRun?.current_exit_code ?? "n/a"}</strong>
-                    </div>
-                  </div>
-                ) : null}
               </div>
             </div>
           ) : null}

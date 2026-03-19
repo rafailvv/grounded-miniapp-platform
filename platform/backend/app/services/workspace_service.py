@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 from app.core.config import Settings
@@ -15,6 +16,21 @@ from app.repositories.state_store import StateStore
 
 
 class WorkspaceService:
+    IGNORED_TREE_PARTS = {
+        ".git",
+        "node_modules",
+        "dist",
+        "build",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".next",
+        ".vite",
+        ".cache",
+    }
+    IGNORED_TREE_SUFFIXES = (".pyc", ".pyo", ".tsbuildinfo")
+
     def __init__(self, settings: Settings, store: StateStore) -> None:
         self.settings = settings
         self.store = store
@@ -106,7 +122,7 @@ class WorkspaceService:
         workspace.revisions.append(revision)
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
-        self._refresh_indexes(workspace)
+        self._refresh_indexes_async(workspace)
         return workspace
 
     def revert_revision(self, workspace_id: str, revision_id: str, message: str) -> RevisionRecord:
@@ -140,7 +156,7 @@ class WorkspaceService:
         workspace.revisions.append(revision)
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
-        self._refresh_indexes(workspace)
+        self._refresh_indexes_async(workspace)
         return revision
 
     def apply_patch_operations(self, workspace_id: str, operations: list[PatchOperationModel], message: str) -> RevisionRecord:
@@ -190,7 +206,7 @@ class WorkspaceService:
         workspace.revisions.append(revision)
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
-        self._refresh_indexes(workspace)
+        self._refresh_indexes_async(workspace)
         return revision
 
     def discard_draft(self, workspace_id: str, run_id: str) -> None:
@@ -213,7 +229,7 @@ class WorkspaceService:
         workspace.revisions.append(revision)
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
-        self._refresh_indexes(workspace)
+        self._refresh_indexes_async(workspace)
         return revision
 
     def build_patch_envelope_for_draft(self, workspace_id: str, run_id: str, operations: list[DraftFileOperation]) -> PatchEnvelope:
@@ -283,11 +299,12 @@ class WorkspaceService:
         source_dir = self._target_dir(workspace_id, run_id)
         tree: list[dict[str, str]] = []
         for path in sorted(source_dir.rglob("*")):
-            if ".git" in path.parts:
+            relative_path = path.relative_to(source_dir)
+            if self._is_ignored_workspace_path(relative_path):
                 continue
             tree.append(
                 {
-                    "path": str(path.relative_to(source_dir)),
+                    "path": str(relative_path),
                     "type": "directory" if path.is_dir() else "file",
                 }
             )
@@ -446,14 +463,23 @@ class WorkspaceService:
                 ".git",
                 "node_modules",
                 "dist",
+                "build",
                 "__pycache__",
                 ".pytest_cache",
+                ".mypy_cache",
+                ".ruff_cache",
+                ".next",
+                ".vite",
+                ".cache",
+                "*.pyc",
+                "*.pyo",
+                "*.tsbuildinfo",
             ),
             symlinks=True,
         )
 
-    @staticmethod
-    def _replace_workspace_contents_from_draft(source_dir: Path, draft_source_dir: Path) -> None:
+    @classmethod
+    def _replace_workspace_contents_from_draft(cls, source_dir: Path, draft_source_dir: Path) -> None:
         for child in source_dir.iterdir():
             if child.name == ".git":
                 continue
@@ -462,11 +488,32 @@ class WorkspaceService:
             else:
                 child.unlink()
         for child in draft_source_dir.iterdir():
+            if cls._is_ignored_workspace_path(Path(child.name)):
+                continue
             destination = source_dir / child.name
             if child.is_symlink():
                 destination.symlink_to(child.readlink(), target_is_directory=child.is_dir())
             elif child.is_dir():
-                shutil.copytree(child, destination, symlinks=True)
+                shutil.copytree(
+                    child,
+                    destination,
+                    symlinks=True,
+                    ignore=shutil.ignore_patterns(
+                        "node_modules",
+                        "dist",
+                        "build",
+                        "__pycache__",
+                        ".pytest_cache",
+                        ".mypy_cache",
+                        ".ruff_cache",
+                        ".next",
+                        ".vite",
+                        ".cache",
+                        "*.pyc",
+                        "*.pyo",
+                        "*.tsbuildinfo",
+                    ),
+                )
             else:
                 shutil.copy2(child, destination)
 
@@ -491,6 +538,16 @@ class WorkspaceService:
         if self.code_index_service is None or not workspace.template_cloned:
             return
         self.code_index_service.index_workspace(workspace, self.source_dir(workspace.workspace_id))
+
+    def _refresh_indexes_async(self, workspace: WorkspaceRecord) -> None:
+        thread = threading.Thread(target=self._refresh_indexes, args=(workspace,), daemon=True)
+        thread.start()
+
+    @classmethod
+    def _is_ignored_workspace_path(cls, relative_path: Path) -> bool:
+        if any(part in cls.IGNORED_TREE_PARTS for part in relative_path.parts):
+            return True
+        return relative_path.name.endswith(cls.IGNORED_TREE_SUFFIXES)
 
     @staticmethod
     def _file_hash(content: str) -> str:
