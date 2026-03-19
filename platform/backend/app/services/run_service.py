@@ -375,6 +375,7 @@ class RunService:
             self._save_run(run)
             if job.status == "completed" and run.apply_status == "applied":
                 self._queue_preview_refresh(run, reason="run completion")
+                self._queue_resume_generation_from_checkpoint_if_needed(run, request)
                 preview = self.preview_service.get(run.workspace_id)
             self._store_run_artifacts(run, change_plan, job, preview)
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
@@ -536,6 +537,41 @@ class RunService:
                 if key in {"status", "stage", "progress_percent", "runtime_mode", "url", "role_urls", "draft_run_id"}
             }
             self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
+
+    def _queue_resume_generation_from_checkpoint_if_needed(self, run: RunRecord, request: CreateRunRequest) -> None:
+        if request.mode != "fix":
+            return
+        checkpoint = self.store.get("reports", f"resume_checkpoint:{run.workspace_id}")
+        if not checkpoint or checkpoint.get("status") != "pending":
+            return
+        if checkpoint.get("mode") == "fix":
+            return
+        if request.apply_strategy != "staged_auto_apply" or run.apply_status != "applied":
+            return
+
+        resume_request = CreateRunRequest(
+            prompt=str(checkpoint.get("prompt") or run.prompt),
+            mode="generate",
+            intent=str(checkpoint.get("intent") or "auto"),
+            apply_strategy="staged_auto_apply",
+            target_role_scope=list(checkpoint.get("target_role_scope") or run.target_role_scope),
+            model_profile=str(checkpoint.get("model_profile") or run.model_profile),
+            target_platform=str(checkpoint.get("target_platform") or "telegram_mini_app"),
+            preview_profile=str(checkpoint.get("preview_profile") or "telegram_mock"),
+            generation_mode=str(checkpoint.get("generation_mode") or run.generation_mode.value),
+        )
+        resumed_run = self.create_run(run.workspace_id, resume_request)
+        checkpoint["status"] = "resumed"
+        checkpoint["resumed_run_id"] = resumed_run.run_id
+        checkpoint["resumed_from_fix_run_id"] = run.run_id
+        checkpoint["resumed_at"] = datetime.now(timezone.utc).isoformat()
+        self.store.upsert("reports", f"resume_checkpoint:{run.workspace_id}", checkpoint)
+        self._append_job_event(
+            run.linked_job_id,
+            "job_completed",
+            f"Fix applied. Continuing generation in run {resumed_run.run_id}.",
+            {"resumed_run_id": resumed_run.run_id, "source_run_id": checkpoint.get("source_run_id")},
+        )
 
     def _preview_snapshot(self, workspace_id: str, preview: Any | None = None) -> dict[str, Any]:
         current = preview or self.preview_service.get(workspace_id)

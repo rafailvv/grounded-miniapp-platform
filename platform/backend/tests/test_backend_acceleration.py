@@ -8,6 +8,7 @@ import time
 import app.services.check_runner as check_runner_module
 from fastapi.testclient import TestClient
 
+from app.ai.openrouter_client import OpenRouterClient
 from app.main import create_app
 from app.models.domain import CreateRunRequest, GenerateRequest, JobRecord, ValidationSnapshot
 from app.services.code_index_service import CodeIndexService
@@ -872,6 +873,14 @@ def test_frontend_build_tooling_failure_is_classified_as_platform_issue(tmp_path
     assert runner.classify_failure([result]) == "tooling/runtime_misconfiguration"
 
 
+def test_openrouter_json_parser_recovers_first_object_from_concatenated_json() -> None:
+    parsed = OpenRouterClient._parse_json_payload(
+        '{"assistant_message":"first","operations":[]}{"assistant_message":"second","operations":[]}',
+        "responses",
+    )
+    assert parsed == {"assistant_message": "first", "operations": []}
+
+
 def test_generate_run_auto_switches_to_fix_on_frontend_build_failure(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -984,3 +993,130 @@ def test_generate_run_auto_switches_to_fix_on_frontend_build_failure(tmp_path: P
     assert run.status == "awaiting_approval"
     assert run.current_fix_phase == "completed"
     assert run.generation_mode == "balanced"
+
+
+def test_successful_fix_run_queues_resume_generation_from_checkpoint(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Resume Workspace",
+            "description": "Fix should continue generation from checkpoint",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    app.state.container.workspace_service.clone_template(workspace_id)
+
+    workspace_service = app.state.container.workspace_service
+    preview_service = app.state.container.preview_service
+    resumed_generation = threading.Event()
+
+    def fake_rebuild_async(workspace_id: str, source_dir=None, draft_run_id=None, on_complete=None):
+        del source_dir, draft_run_id
+        preview = preview_service._get_or_create(workspace_id)
+        preview.status = "running"
+        preview.stage = "running"
+        preview.progress_percent = 100
+        preview.url = "http://localhost:18181"
+        preview.frontend_url = preview.url
+        preview.backend_url = f"{preview.url}/api"
+        preview_service.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
+        if on_complete is not None:
+            on_complete(preview)
+        return preview
+
+    def fake_fix_generate(workspace_id: str, request: GenerateRequest, *, should_stop=None):
+        del should_stop
+        workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_test")
+        return JobRecord(
+            workspace_id=workspace_id,
+            prompt=request.prompt,
+            status="completed",
+            mode="fix",
+            generation_mode=request.generation_mode,
+            target_platform=request.target_platform,
+            preview_profile=request.preview_profile,
+            current_revision_id=workspace_service.get_workspace(workspace_id).current_revision_id,
+            fidelity="balanced_app",
+            linked_run_id=request.linked_run_id,
+            summary="Fix completed successfully.",
+            validation_snapshot=ValidationSnapshot(
+                grounded_spec_valid=True,
+                app_ir_valid=True,
+                build_valid=True,
+                blocking=False,
+                issues=[],
+            ),
+        )
+
+    def fake_generate(workspace_id: str, request: GenerateRequest, *, should_stop=None):
+        del should_stop
+        resumed_generation.set()
+        workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_test")
+        return JobRecord(
+            workspace_id=workspace_id,
+            prompt=request.prompt,
+            status="completed",
+            mode="generate",
+            generation_mode=request.generation_mode,
+            target_platform=request.target_platform,
+            preview_profile=request.preview_profile,
+            current_revision_id=workspace_service.get_workspace(workspace_id).current_revision_id,
+            fidelity="balanced_app",
+            linked_run_id=request.linked_run_id,
+            summary="Resumed generation completed.",
+            validation_snapshot=ValidationSnapshot(
+                grounded_spec_valid=True,
+                app_ir_valid=True,
+                build_valid=True,
+                blocking=False,
+                issues=[],
+            ),
+        )
+
+    preview_service.rebuild_async = fake_rebuild_async  # type: ignore[method-assign]
+    app.state.container.fix_orchestrator.generate = fake_fix_generate  # type: ignore[method-assign]
+    app.state.container.generation_service.generate = fake_generate  # type: ignore[method-assign]
+    app.state.container.store.upsert(
+        "reports",
+        f"resume_checkpoint:{workspace_id}",
+        {
+            "workspace_id": workspace_id,
+            "source_run_id": "run_source_failed",
+            "draft_run_id": "run_source_failed",
+            "status": "pending",
+            "prompt": "Build the flower shop mini app.",
+            "intent": "create",
+            "mode": "generate",
+            "generation_mode": "balanced",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+            "target_role_scope": ["client", "specialist", "manager"],
+            "model_profile": "openai_code_fast",
+        },
+    )
+
+    run = app.state.container.run_service.create_run_sync(
+        workspace_id,
+        CreateRunRequest(
+            prompt="Analyze the reported failure and apply the smallest safe fix.",
+            mode="fix",
+            apply_strategy="staged_auto_apply",
+            model_profile="openai_code_fast",
+            generation_mode="balanced",
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+        ),
+    )
+
+    assert run.status == "completed"
+    assert resumed_generation.wait(1.0)
+    checkpoint = app.state.container.store.get("reports", f"resume_checkpoint:{workspace_id}")
+    assert checkpoint is not None
+    assert checkpoint["status"] == "resumed"
+    assert checkpoint["resumed_from_fix_run_id"] == run.run_id

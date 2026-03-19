@@ -932,12 +932,7 @@ class FixOrchestrator:
 
     def _clear_reports(self, workspace_id: str) -> None:
         for key in (
-            "spec",
             "validation",
-            "assumptions",
-            "role_contract",
-            "traceability",
-            "page_graph",
             "iterations",
             "candidate_diff",
             "check_results",

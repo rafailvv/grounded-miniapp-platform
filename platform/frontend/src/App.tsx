@@ -287,28 +287,39 @@ function progressCeilingForRun(run: Run): number {
 function nextVisualProgress(current: number, run: Run): number {
   const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
   const status = displayRunStatus(run);
+  const stage = (run.current_stage || "").toLowerCase();
   if (["completed", "failed", "blocked", "rolled_back", "awaiting_approval"].includes(status)) {
     return actual;
   }
 
   const floor = Math.max(actual, 4);
   const ceiling = Math.max(floor, progressCeilingForRun(run));
+  const isEarlyPhase =
+    stage.includes("retrieving context") ||
+    stage.includes("building grounded spec") ||
+    stage.includes("spec") ||
+    stage.includes("starting");
   if (current < actual) {
-    const catchUpStep = Math.max(2.25, (actual - current) * 0.55);
+    const catchUpStep = isEarlyPhase
+      ? Math.max(0.55, (actual - current) * 0.18)
+      : Math.max(1.1, (actual - current) * 0.28);
     return Math.min(actual, current + catchUpStep);
   }
   if (current >= ceiling) {
     return current;
   }
 
-  const stage = (run.current_stage || "").toLowerCase();
-  let driftStep = 0.32;
-  if (stage.includes("planning")) {
-    driftStep = 0.38;
+  let driftStep = 0.18;
+  if (stage.includes("retrieving context")) {
+    driftStep = 0.08;
+  } else if (stage.includes("building grounded spec") || stage.includes("spec")) {
+    driftStep = 0.1;
+  } else if (stage.includes("planning")) {
+    driftStep = 0.16;
   } else if (stage.includes("editing")) {
-    driftStep = 0.46;
+    driftStep = 0.2;
   } else if (stage.includes("validation") || stage.includes("preview")) {
-    driftStep = 0.24;
+    driftStep = 0.12;
   }
   return Math.min(ceiling, current + driftStep);
 }
@@ -1246,6 +1257,44 @@ export default function App() {
     setFixErrorContext(handoff.context);
   }
 
+  async function handleRunFix(run: Run) {
+    if (!workspace || loading) {
+      return;
+    }
+    const handoff = buildFixPrefill(run);
+    setLoading(true);
+    setError("");
+    setPreviewBooting(true);
+    try {
+      const nextRun = await createRun(workspace.workspace_id, {
+        prompt: handoff.prompt.length > 180 ? "Analyze the reported failure and apply the smallest safe fix." : handoff.prompt,
+        mode: "fix",
+        intent: "auto",
+        apply_strategy: "staged_auto_apply",
+        target_role_scope: run.target_role_scope.length ? run.target_role_scope : activeRoleScope,
+        model_profile: run.model_profile || systemConfig?.default_coding_profile || systemConfig?.defaults.model_profile || "openai_code_fast",
+        generation_mode: "balanced",
+        target_platform: "telegram_mini_app",
+        preview_profile: "telegram_mock",
+        error_context: handoff.context,
+      });
+      setSelectedRunMode("fix");
+      setPrompt(handoff.prompt);
+      setFixErrorContext(handoff.context);
+      setRuns((current) => [nextRun, ...current.filter((item) => item.run_id !== nextRun.run_id)]);
+      setSelectedRunId(nextRun.run_id);
+      setRunArtifacts(null);
+      await refreshWorkspaceState(workspace.workspace_id, nextRun.run_id);
+      setActiveTab("preview");
+      void pollRunUntilSettled(workspace.workspace_id, nextRun.run_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start fixbug run.");
+    } finally {
+      setPreviewBooting(false);
+      setLoading(false);
+    }
+  }
+
   async function handleSelectFile(path: string) {
     if (!workspace) {
       return;
@@ -1737,7 +1786,7 @@ export default function App() {
                 <h4>Failure reason</h4>
                 <p>{selectedRun.failure_reason}</p>
                 {selectedRun.status !== "completed" ? (
-                  <button type="button" className="ghost-action" onClick={() => handoffRunToFix(selectedRun)}>
+                  <button type="button" className="ghost-action" onClick={() => void handleRunFix(selectedRun)}>
                     Open In fixbug Mode
                   </button>
                 ) : null}
@@ -2101,7 +2150,7 @@ export default function App() {
                             <button
                               type="button"
                               className="ghost-action run-card-action"
-                              onClick={() => handoffRunToFix(run)}
+                              onClick={() => void handleRunFix(run)}
                             >
                               Fix
                             </button>

@@ -198,6 +198,7 @@ class GenerationService:
             draft_run_id = request.linked_run_id
         else:
             draft_run_id = job.job_id
+        self.store.delete("reports", f"resume_checkpoint:{workspace_id}")
         self._clear_trace(workspace_id)
         self._append_event(job, "job_started", "Generation request accepted.")
         self._append_event(job, "indexing_started", "Refreshing workspace index.")
@@ -480,6 +481,26 @@ class GenerationService:
             },
         )
         self._append_event(job, "planning_ready", "Code plan created.")
+        self._store_report(
+            f"role_contract:{workspace_id}",
+            {"run_id": draft_run_id, "role_contract": role_contract},
+        )
+        self._store_report(
+            f"page_graph:{workspace_id}",
+            {"run_id": draft_run_id, "page_graph": plan_result["page_graph"]},
+        )
+        self._store_report(
+            f"execution_plan:{workspace_id}",
+            {"run_id": draft_run_id, "execution_plan": plan_result.get("execution_plan", {})},
+        )
+        self._store_resume_checkpoint(
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
+            request=request,
+            role_scope=role_scope,
+            role_contract=role_contract,
+            plan_result=plan_result,
+        )
         stopped = self._stop_if_requested(job, workspace_id, should_stop)
         if stopped is not None:
             return stopped
@@ -621,19 +642,6 @@ class GenerationService:
         latest_assistant_message = edit_result["assistant_message"]
         repair_attempt_limit = self._repair_attempt_limit(generation_mode, request.intent)
         repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, plan_result["target_files"])
-
-        self._store_report(
-            f"role_contract:{workspace_id}",
-            {"run_id": draft_run_id, "role_contract": role_contract},
-        )
-        self._store_report(
-            f"page_graph:{workspace_id}",
-            {"run_id": draft_run_id, "page_graph": plan_result["page_graph"]},
-        )
-        self._store_report(
-            f"execution_plan:{workspace_id}",
-            {"run_id": draft_run_id, "execution_plan": plan_result.get("execution_plan", {})},
-        )
 
         for attempt in range(repair_attempt_limit + 1):
             stopped = self._stop_if_requested(job, workspace_id, should_stop)
@@ -941,6 +949,7 @@ class GenerationService:
             "page_graph": "reports/page_graph",
             "fidelity": job.fidelity,
         }
+        self.store.delete("reports", f"resume_checkpoint:{workspace_id}")
         self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
         self._append_event(job, "draft_ready", "Draft is ready for review.")
         self._append_event(job, "job_completed", "Generation completed successfully.")
@@ -955,6 +964,42 @@ class GenerationService:
             },
         )
         return job
+
+    def _store_resume_checkpoint(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        request: GenerateRequest,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        plan_result: dict[str, Any],
+    ) -> None:
+        payload = {
+            "workspace_id": workspace_id,
+            "source_run_id": request.linked_run_id,
+            "draft_run_id": draft_run_id,
+            "status": "pending",
+            "prompt": request.prompt,
+            "intent": request.intent,
+            "mode": request.mode,
+            "generation_mode": request.generation_mode.value if isinstance(request.generation_mode, GenerationMode) else str(request.generation_mode),
+            "target_platform": request.target_platform.value if hasattr(request.target_platform, "value") else str(request.target_platform),
+            "preview_profile": request.preview_profile.value if hasattr(request.preview_profile, "value") else str(request.preview_profile),
+            "target_role_scope": role_scope,
+            "model_profile": request.model_profile,
+            "page_graph": plan_result.get("page_graph"),
+            "role_contract": role_contract,
+            "scope_mode": plan_result.get("scope_mode"),
+            "flow_mode": plan_result.get("flow_mode"),
+            "files_to_read": list(plan_result.get("files_to_read") or []),
+            "target_files": list(plan_result.get("target_files") or []),
+            "shared_files": list(plan_result.get("shared_files") or []),
+            "backend_targets": list(plan_result.get("backend_targets") or []),
+            "execution_plan": plan_result.get("execution_plan") or {},
+            "created_at": utc_now().isoformat(),
+        }
+        self._store_report(f"resume_checkpoint:{workspace_id}", payload)
 
     def retry(self, job_id: str) -> JobRecord:
         job = self.get_job(job_id)
@@ -2692,8 +2737,27 @@ class GenerationService:
             "timeout",
             "connection reset",
             "temporarily unavailable",
+            "returned non-json text",
+            "returned empty text instead of json",
+            "instead of json",
         )
         return any(marker in text for marker in retry_markers)
+
+    @staticmethod
+    def _tighten_json_retry_kwargs(request_kwargs: dict[str, Any], error: Exception, attempt: int) -> dict[str, Any]:
+        retry_note = (
+            "JSON retry instruction:\n"
+            f"- Previous attempt #{attempt + 1} returned invalid JSON.\n"
+            f"- Error: {str(error)[:400]}\n"
+            "- Return exactly one JSON object.\n"
+            "- Do not return two objects.\n"
+            "- Do not include analysis, commentary, markdown fences, or any text before or after the JSON.\n"
+            "- If no file operations are needed, still return one valid JSON object with the required keys."
+        )
+        tightened = dict(request_kwargs)
+        tightened["system_prompt"] = f"{str(request_kwargs.get('system_prompt') or '').rstrip()}\n\n{retry_note}".strip()
+        tightened["user_prompt"] = f"{str(request_kwargs.get('user_prompt') or '').rstrip()}\n\n{retry_note}".strip()
+        return tightened
 
     @staticmethod
     def _llm_cache_kwargs() -> dict[str, str]:
@@ -2731,6 +2795,7 @@ class GenerationService:
                 last_error = exc
                 if attempt == 2 or not self._is_retryable_llm_error(exc):
                     raise
+                request_kwargs = self._tighten_json_retry_kwargs(request_kwargs, exc, attempt)
                 logger.warning("Retrying structured generation after transient provider failure: %s", exc)
                 time.sleep(0.8 * (attempt + 1))
         assert last_error is not None
@@ -2748,6 +2813,7 @@ class GenerationService:
                 last_error = exc
                 if attempt == 2 or not self._is_retryable_llm_error(exc):
                     raise
+                request_kwargs = self._tighten_json_retry_kwargs(request_kwargs, exc, attempt)
                 logger.warning("Retrying relaxed JSON generation after transient provider failure: %s", exc)
                 time.sleep(0.8 * (attempt + 1))
         assert last_error is not None

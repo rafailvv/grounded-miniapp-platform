@@ -768,6 +768,17 @@ class OpenRouterClient:
             raise RuntimeError(f"OpenRouter {endpoint} returned empty text instead of JSON.")
 
         candidates = [text]
+        decoder = json.JSONDecoder()
+        try:
+            parsed_prefix, end_index = decoder.raw_decode(text)
+        except json.JSONDecodeError:
+            parsed_prefix = None
+            end_index = -1
+        if isinstance(parsed_prefix, dict):
+            trailing = text[end_index:].strip()
+            if not trailing:
+                return parsed_prefix
+            candidates.append(text[:end_index].strip())
 
         fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
         candidates.extend(item.strip() for item in fenced if item.strip())
