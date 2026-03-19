@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import json
 import logging
@@ -117,6 +118,8 @@ SHARED_GENERATED_FILES = (
     "frontend/src/shared/generated/appState.tsx",
 )
 logger = logging.getLogger(__name__)
+ACTIVE_LLM_CACHE_CONTEXT: ContextVar[dict[str, str] | None] = ContextVar("active_llm_cache_context", default=None)
+ACTIVE_LLM_CACHE_STATS: ContextVar[dict[str, Any] | None] = ContextVar("active_llm_cache_stats", default=None)
 QUALITY_FIDELITY = {
     GenerationMode.FAST: "fast_app",
     GenerationMode.QUALITY: "quality_app",
@@ -159,6 +162,19 @@ class GenerationService:
         workspace = self.workspace_service.get_workspace(workspace_id)
         role_scope = [role for role in request.target_role_scope if role in ROLE_ORDER] or list(ROLE_ORDER)
         llm_config = self.openrouter_client.configuration()
+        cache_context = {
+            "prompt_cache_key": self.context_pack_builder.prompt_cache_key(workspace, request.model_profile),
+            "stable_prefix": self.context_pack_builder.stable_prefix(workspace, request.model_profile),
+        }
+        cache_stats_sink = {
+            "prompt_cache_key": cache_context["prompt_cache_key"],
+            "stable_prefix_chars": len(cache_context["stable_prefix"]),
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "llm_requests": 0,
+        }
+        ACTIVE_LLM_CACHE_CONTEXT.set(cache_context)
+        ACTIVE_LLM_CACHE_STATS.set(cache_stats_sink)
 
         job = JobRecord(
             workspace_id=workspace_id,
@@ -488,6 +504,11 @@ class GenerationService:
                 failure_reason="Code planning did not produce a valid multi-page app structure.",
             )
 
+        self._append_event(
+            job,
+            "context_pack_started",
+            f"Collecting targeted file context for {len(plan_result['target_files'])} planned files.",
+        )
         context_pack = self.context_pack_builder.build(
             workspace=workspace,
             prompt=effective_prompt,
@@ -496,11 +517,6 @@ class GenerationService:
             active_paths=plan_result["files_to_read"],
             target_files=plan_result["target_files"],
             run_id=draft_run_id,
-        )
-        self._append_event(
-            job,
-            "context_pack_started",
-            f"Collecting targeted file context for {len(plan_result['target_files'])} planned files.",
         )
         files_read = sorted(set(plan_result["files_to_read"]) | set(context_pack.targeted_files.keys()) | {chunk.path for chunk in context_pack.code_chunks})
         file_contexts: dict[str, str] = dict(context_pack.targeted_files)
@@ -511,10 +527,10 @@ class GenerationService:
                 file_contexts[file_path] = self.workspace_service.read_file(workspace_id, file_path, run_id=draft_run_id)
             except FileNotFoundError:
                 continue
-        job.cache_stats = {
-            "prompt_cache_key": context_pack.prompt_cache_key,
-            "stable_prefix_chars": len(context_pack.system_prefix),
-        }
+        current_cache_stats = ACTIVE_LLM_CACHE_STATS.get() or {}
+        current_cache_stats["prompt_cache_key"] = context_pack.prompt_cache_key
+        current_cache_stats["stable_prefix_chars"] = len(context_pack.system_prefix)
+        job.cache_stats = dict(current_cache_stats)
         job.latency_breakdown["context_pack_ms"] = int((time.perf_counter() - started_at) * 1000) - retrieval_ms
         self._append_event(
             job,
@@ -643,6 +659,7 @@ class GenerationService:
             check_issues = self.check_runner.failing_issues(latest_check_results)
             build_issues = [issue for issue in check_issues if issue.location != "preview"]
             preview_issue = next((issue for issue in check_issues if issue.location == "preview"), None)
+            tooling_failure = self.check_runner.has_tooling_failure(latest_check_results)
             job.latency_breakdown["checks_ms"] = (job.latency_breakdown.get("checks_ms", 0) or 0) + (check_execution.duration_ms or 0)
             self._append_trace(
                 workspace_id,
@@ -717,6 +734,28 @@ class GenerationService:
 
             if not build_issues and (preview_issue is None or self._is_non_blocking_preview_issue(preview_issue)):
                 break
+
+            if tooling_failure:
+                final_issues = [issue.model_dump(mode="json") for issue in build_issues]
+                if preview_issue is not None:
+                    final_issues.append(preview_issue.model_dump(mode="json"))
+                job.status = "failed"
+                job.failure_class = check_failure or "tooling/runtime_misconfiguration"
+                job.root_cause_summary = self._summarize_failed_checks(build_issues, preview_issue) or "Frontend build tooling is unavailable in the backend runtime."
+                job.failure_reason = f"Build validation could not run because the platform runtime is missing required tooling. Root cause: {job.root_cause_summary}"
+                job.fix_targets = []
+                job.handoff_from_failed_generate = None
+                job.validation_snapshot = ValidationSnapshot(
+                    grounded_spec_valid=True,
+                    app_ir_valid=True,
+                    build_valid=False,
+                    blocking=True,
+                    issues=final_issues,
+                )
+                self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
+                self._append_event(job, "job_failed", job.failure_reason)
+                job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
+                return job
 
             if attempt >= repair_attempt_limit:
                 final_issues = [issue.model_dump(mode="json") for issue in build_issues]
@@ -888,6 +927,7 @@ class GenerationService:
         job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
         job.latency_breakdown["ttft_ms"] = retrieval_ms
         job.latency_breakdown["total_ms"] = int((time.perf_counter() - started_at) * 1000)
+        job.cache_stats = dict(ACTIVE_LLM_CACHE_STATS.get() or job.cache_stats)
         job.compile_summary = self._compile_code_summary(all_operations, role_scope)
         job.artifacts = {
             "preview_url": latest_preview.url or "",
@@ -902,8 +942,6 @@ class GenerationService:
             "fidelity": job.fidelity,
         }
         self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
-        self._append_event(job, "preview_rebuild_started", "Draft passed checks. Refreshing preview runtime.")
-        self._append_event(job, "preview_ready", "Preview is ready.")
         self._append_event(job, "draft_ready", "Draft is ready for review.")
         self._append_event(job, "job_completed", "Generation completed successfully.")
         self._append_trace(
@@ -961,7 +999,12 @@ class GenerationService:
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
-        if generation_mode == GenerationMode.FAST:
+        if generation_mode == GenerationMode.FAST or self._should_use_compiled_role_contract(
+            prompt=prompt,
+            role_scope=role_scope,
+            intent=intent,
+            generation_mode=generation_mode,
+        ):
             return {"role_contract": self._compiled_role_contract(grounded_spec, role_scope)}
         try:
             payload = self._generate_structured_with_retry(
@@ -983,6 +1026,24 @@ class GenerationService:
             return {"role_contract": role_contract, "model": payload["model"]}
         except Exception as exc:
             return {"error": f"Role architecture analysis failed: {exc}"}
+
+    def _should_use_compiled_role_contract(
+        self,
+        *,
+        prompt: str,
+        role_scope: list[str],
+        intent: str,
+        generation_mode: GenerationMode,
+    ) -> bool:
+        if generation_mode != GenerationMode.BALANCED:
+            return False
+        if self._scope_mode(intent, prompt, role_scope) == "minimal_patch":
+            return True
+        lowered = prompt.lower()
+        if len(role_scope) == len(ROLE_ORDER) and intent in {"create", "refine"}:
+            simple_markers = ("simple", "basic", "minimal", "fast", "quick draft", "template-safe")
+            return any(marker in lowered for marker in simple_markers)
+        return False
 
     def _resolve_code_plan(
         self,
@@ -2634,11 +2695,38 @@ class GenerationService:
         )
         return any(marker in text for marker in retry_markers)
 
+    @staticmethod
+    def _llm_cache_kwargs() -> dict[str, str]:
+        context = ACTIVE_LLM_CACHE_CONTEXT.get() or {}
+        prompt_cache_key = str(context.get("prompt_cache_key") or "").strip()
+        stable_prefix = str(context.get("stable_prefix") or "").strip()
+        payload: dict[str, str] = {}
+        if prompt_cache_key:
+            payload["prompt_cache_key"] = prompt_cache_key
+        if stable_prefix:
+            payload["stable_prefix"] = stable_prefix
+        return payload
+
+    @staticmethod
+    def _record_llm_cache_stats(result: dict[str, Any]) -> None:
+        sink = ACTIVE_LLM_CACHE_STATS.get()
+        if sink is None:
+            return
+        sink["llm_requests"] = int(sink.get("llm_requests", 0)) + 1
+        response_stats = result.get("cache_stats")
+        if not isinstance(response_stats, dict):
+            return
+        sink["cached_tokens"] = int(sink.get("cached_tokens", 0)) + int(response_stats.get("cached_tokens", 0) or 0)
+        sink["cache_write_tokens"] = int(sink.get("cache_write_tokens", 0)) + int(response_stats.get("cache_write_tokens", 0) or 0)
+
     def _generate_structured_with_retry(self, **kwargs: Any) -> dict[str, Any]:
+        request_kwargs = {**self._llm_cache_kwargs(), **kwargs}
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                return self.openrouter_client.generate_structured(**kwargs)
+                result = self.openrouter_client.generate_structured(**request_kwargs)
+                self._record_llm_cache_stats(result)
+                return result
             except Exception as exc:
                 last_error = exc
                 if attempt == 2 or not self._is_retryable_llm_error(exc):
@@ -2649,10 +2737,13 @@ class GenerationService:
         raise last_error
 
     def _generate_json_object_with_retry(self, **kwargs: Any) -> dict[str, Any]:
+        request_kwargs = {**self._llm_cache_kwargs(), **kwargs}
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                return self.openrouter_client.generate_json_object(**kwargs)
+                result = self.openrouter_client.generate_json_object(**request_kwargs)
+                self._record_llm_cache_stats(result)
+                return result
             except Exception as exc:
                 last_error = exc
                 if attempt == 2 or not self._is_retryable_llm_error(exc):

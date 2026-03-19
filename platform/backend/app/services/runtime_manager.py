@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -13,6 +14,8 @@ from app.core.config import Settings
 
 
 class PreviewRuntimeManager:
+    PREVIEW_SERVICES = ("preview-backend", "preview-frontend", "preview-proxy", "preview-db")
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
@@ -117,10 +120,7 @@ class PreviewRuntimeManager:
     def collect_logs(self, workspace_id: str, source_dir: Path, proxy_port: int | None) -> list[str]:
         if proxy_port is None:
             return []
-        project_name = self.project_name(workspace_id)
-        compose_file = source_dir / "docker" / "docker-compose.yml"
-        env = self._compose_env(proxy_port)
-        compose_cmd = self._compose_command()
+        compose_cmd, compose_file, project_name, env = self._compose_parts(workspace_id, source_dir, proxy_port)
         if compose_cmd is None:
             return ["Docker Compose is not available inside the platform backend container."]
         result = subprocess.run(
@@ -132,6 +132,94 @@ class PreviewRuntimeManager:
         )
         output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
         return [line for line in output.splitlines() if line.strip()]
+
+    def collect_container_logs(self, workspace_id: str, source_dir: Path, proxy_port: int | None) -> dict[str, list[str]]:
+        if proxy_port is None:
+            return {}
+        compose_cmd, compose_file, project_name, env = self._compose_parts(workspace_id, source_dir, proxy_port)
+        if compose_cmd is None:
+            return {"platform": ["Docker Compose is not available inside the platform backend container."]}
+        logs_by_service: dict[str, list[str]] = {}
+        for service in self.PREVIEW_SERVICES:
+            result = subprocess.run(
+                [*compose_cmd, "-f", str(compose_file), "-p", project_name, "logs", "--tail", "120", service],
+                cwd=source_dir,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
+            lines = [line for line in output.splitlines() if line.strip()]
+            logs_by_service[service] = lines or [f"No logs for {service} yet."]
+        return logs_by_service
+
+    def inspect_containers(self, workspace_id: str, source_dir: Path, proxy_port: int | None) -> list[dict[str, str | None]]:
+        if proxy_port is None:
+            return [
+                {
+                    "service": service,
+                    "name": None,
+                    "state": "missing",
+                    "status": "not started",
+                    "health": None,
+                    "exit_code": None,
+                }
+                for service in self.PREVIEW_SERVICES
+            ]
+        compose_cmd, compose_file, project_name, env = self._compose_parts(workspace_id, source_dir, proxy_port)
+        if compose_cmd is None:
+            return []
+        result = subprocess.run(
+            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "ps", "-a", "--format", "json"],
+            cwd=source_dir,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        service_map: dict[str, dict[str, str | None]] = {}
+        payload = result.stdout.strip()
+        if payload:
+            parsed_rows: list[dict[str, object]] = []
+            try:
+                decoded = json.loads(payload)
+                if isinstance(decoded, list):
+                    parsed_rows = [item for item in decoded if isinstance(item, dict)]
+            except json.JSONDecodeError:
+                for line in payload.splitlines():
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(item, dict):
+                        parsed_rows.append(item)
+            for row in parsed_rows:
+                service = str(row.get("Service") or row.get("service") or "").strip()
+                if not service:
+                    continue
+                service_map[service] = {
+                    "service": service,
+                    "name": str(row.get("Name") or row.get("name") or "") or None,
+                    "state": str(row.get("State") or row.get("state") or "") or None,
+                    "status": str(row.get("Status") or row.get("status") or "") or None,
+                    "health": str(row.get("Health") or row.get("health") or "") or None,
+                    "exit_code": str(row.get("ExitCode") or row.get("exitCode") or "") or None,
+                }
+        containers: list[dict[str, str | None]] = []
+        for service in self.PREVIEW_SERVICES:
+            containers.append(
+                service_map.get(
+                    service,
+                    {
+                        "service": service,
+                        "name": None,
+                        "state": "missing",
+                        "status": "not started",
+                        "health": None,
+                        "exit_code": None,
+                    },
+                )
+            )
+        return containers
 
     def preview_url(self, proxy_port: int) -> str:
         return f"http://localhost:{proxy_port}"
@@ -177,6 +265,18 @@ class PreviewRuntimeManager:
         env["PREVIEW_POSTGRES_USER"] = "miniapp"
         env["PREVIEW_POSTGRES_PASSWORD"] = "miniapp"
         return env
+
+    def _compose_parts(
+        self,
+        workspace_id: str,
+        source_dir: Path,
+        proxy_port: int,
+    ) -> tuple[list[str] | None, Path, str, dict[str, str]]:
+        compose_file = source_dir / "docker" / "docker-compose.yml"
+        project_name = self.project_name(workspace_id)
+        env = self._compose_env(proxy_port)
+        compose_cmd = self._compose_command()
+        return compose_cmd, compose_file, project_name, env
 
     @staticmethod
     def _port_free(port: int) -> bool:

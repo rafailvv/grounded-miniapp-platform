@@ -50,6 +50,8 @@ class OpenRouterClient:
         schema: dict[str, Any],
         system_prompt: str,
         user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("OpenRouter is not configured.")
@@ -68,8 +70,15 @@ class OpenRouterClient:
                     schema=normalized_schema,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
+                    prompt_cache_key=prompt_cache_key,
+                    stable_prefix=stable_prefix,
                 )
-                return {"model": model, "payload": payload, "response_mode": "strict_json_schema"}
+                return {
+                    "model": model,
+                    "payload": payload["payload"],
+                    "response_mode": "strict_json_schema",
+                    "cache_stats": payload["cache_stats"],
+                }
             except Exception as exc:
                 last_error = exc
                 if self._is_invalid_schema_error(exc):
@@ -80,45 +89,96 @@ class OpenRouterClient:
                         schema=normalized_schema,
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
+                        prompt_cache_key=prompt_cache_key,
+                        stable_prefix=stable_prefix,
                     )
-                    return {"model": model, "payload": payload, "response_mode": "json_object"}
+                    return {
+                        "model": model,
+                        "payload": payload["payload"],
+                        "response_mode": "json_object",
+                        "cache_stats": payload["cache_stats"],
+                    }
         assert last_error is not None
         raise last_error
 
-    def generate_code_plan(self, *, schema_name: str, schema: dict[str, Any], system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    def generate_code_plan(
+        self,
+        *,
+        schema_name: str,
+        schema: dict[str, Any],
+        system_prompt: str,
+        user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
+    ) -> dict[str, Any]:
         return self.generate_structured(
             role="code_plan",
             schema_name=schema_name,
             schema=schema,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            prompt_cache_key=prompt_cache_key,
+            stable_prefix=stable_prefix,
         )
 
-    def generate_code_edit(self, *, schema_name: str, schema: dict[str, Any], system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    def generate_code_edit(
+        self,
+        *,
+        schema_name: str,
+        schema: dict[str, Any],
+        system_prompt: str,
+        user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
+    ) -> dict[str, Any]:
         return self.generate_structured(
             role="code_edit",
             schema_name=schema_name,
             schema=schema,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            prompt_cache_key=prompt_cache_key,
+            stable_prefix=stable_prefix,
         )
 
-    def generate_repair(self, *, schema_name: str, schema: dict[str, Any], system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    def generate_repair(
+        self,
+        *,
+        schema_name: str,
+        schema: dict[str, Any],
+        system_prompt: str,
+        user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
+    ) -> dict[str, Any]:
         return self.generate_structured(
             role="repair",
             schema_name=schema_name,
             schema=schema,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            prompt_cache_key=prompt_cache_key,
+            stable_prefix=stable_prefix,
         )
 
-    def generate_summary(self, *, schema_name: str, schema: dict[str, Any], system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    def generate_summary(
+        self,
+        *,
+        schema_name: str,
+        schema: dict[str, Any],
+        system_prompt: str,
+        user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
+    ) -> dict[str, Any]:
         return self.generate_structured(
             role="summarize",
             schema_name=schema_name,
             schema=schema,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            prompt_cache_key=prompt_cache_key,
+            stable_prefix=stable_prefix,
         )
 
     def generate_json_object(
@@ -129,6 +189,8 @@ class OpenRouterClient:
         schema: dict[str, Any],
         system_prompt: str,
         user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("OpenRouter is not configured.")
@@ -147,8 +209,15 @@ class OpenRouterClient:
                     schema=normalized_schema,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
+                    prompt_cache_key=prompt_cache_key,
+                    stable_prefix=stable_prefix,
                 )
-                return {"model": model, "payload": payload, "response_mode": "json_object"}
+                return {
+                    "model": model,
+                    "payload": payload["payload"],
+                    "response_mode": "json_object",
+                    "cache_stats": payload["cache_stats"],
+                }
             except Exception as exc:
                 last_error = exc
         assert last_error is not None
@@ -163,6 +232,8 @@ class OpenRouterClient:
         schema: dict[str, Any],
         system_prompt: str,
         user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
     ) -> dict[str, Any]:
         if model.startswith("openai/gpt-5."):
             return self._responses_structured(
@@ -172,6 +243,8 @@ class OpenRouterClient:
                 schema=schema,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
+                prompt_cache_key=prompt_cache_key,
+                stable_prefix=stable_prefix,
             )
         return self._chat_structured(
             role=role,
@@ -180,6 +253,8 @@ class OpenRouterClient:
             schema=schema,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            prompt_cache_key=prompt_cache_key,
+            stable_prefix=stable_prefix,
         )
 
     def _request_json_mode(
@@ -191,6 +266,8 @@ class OpenRouterClient:
         schema: dict[str, Any],
         system_prompt: str,
         user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
     ) -> dict[str, Any]:
         schema_hint = self._schema_hint(schema_name, schema)
         augmented_system_prompt = (
@@ -206,6 +283,8 @@ class OpenRouterClient:
                 model=model,
                 system_prompt=augmented_system_prompt,
                 user_prompt=augmented_user_prompt,
+                prompt_cache_key=prompt_cache_key,
+                stable_prefix=stable_prefix,
             )
         return self._chat_json_object(
             role=role,
@@ -213,6 +292,8 @@ class OpenRouterClient:
             model=model,
             system_prompt=augmented_system_prompt,
             user_prompt=augmented_user_prompt,
+            prompt_cache_key=prompt_cache_key,
+            stable_prefix=stable_prefix,
         )
 
     def _headers(self) -> dict[str, str]:
@@ -276,6 +357,80 @@ class OpenRouterClient:
             text,
         )
 
+    @staticmethod
+    def _stable_prompt_block(prompt_cache_key: str | None, stable_prefix: str | None) -> str | None:
+        parts: list[str] = []
+        if stable_prefix and stable_prefix.strip():
+            parts.append(stable_prefix.strip())
+        if prompt_cache_key and prompt_cache_key.strip():
+            parts.append(f"Prompt cache key: {prompt_cache_key.strip()}")
+        if not parts:
+            return None
+        parts.append("Keep the reusable prefix stable across retries and repeated workspace runs.")
+        return "\n".join(parts)
+
+    def _chat_messages(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_cache_key: str | None,
+        stable_prefix: str | None,
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        stable_block = self._stable_prompt_block(prompt_cache_key, stable_prefix)
+        if stable_block:
+            messages.append({"role": "user", "content": stable_block})
+        messages.append({"role": "user", "content": user_prompt})
+        return messages
+
+    def _responses_input(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_cache_key: str | None,
+        stable_prefix: str | None,
+    ) -> list[dict[str, Any]]:
+        input_items: list[dict[str, Any]] = [{"role": "system", "content": [{"type": "input_text", "text": system_prompt}]}]
+        stable_block = self._stable_prompt_block(prompt_cache_key, stable_prefix)
+        if stable_block:
+            input_items.append({"role": "user", "content": [{"type": "input_text", "text": stable_block}]})
+        input_items.append({"role": "user", "content": [{"type": "input_text", "text": user_prompt}]})
+        return input_items
+
+    @staticmethod
+    def _cache_control(model: str) -> dict[str, str] | None:
+        if model.startswith("anthropic/"):
+            return {"type": "ephemeral"}
+        return None
+
+    @staticmethod
+    def _extract_cache_stats(payload: dict[str, Any], prompt_cache_key: str | None = None) -> dict[str, Any]:
+        usage = payload.get("usage") if isinstance(payload, dict) else {}
+        if not isinstance(usage, dict):
+            usage = {}
+        prompt_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_details, dict):
+            prompt_details = {}
+        cached_tokens = (
+            prompt_details.get("cached_tokens")
+            or usage.get("cached_tokens")
+            or usage.get("cache_read_input_tokens")
+            or 0
+        )
+        cache_write_tokens = (
+            prompt_details.get("cache_write_tokens")
+            or usage.get("cache_write_tokens")
+            or usage.get("cache_creation_input_tokens")
+            or 0
+        )
+        return {
+            "prompt_cache_key": prompt_cache_key,
+            "cached_tokens": int(cached_tokens or 0),
+            "cache_write_tokens": int(cache_write_tokens or 0),
+        }
+
     def _chat_structured(
         self,
         *,
@@ -285,13 +440,17 @@ class OpenRouterClient:
         schema: dict[str, Any],
         system_prompt: str,
         user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": self._chat_messages(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_cache_key=prompt_cache_key,
+                stable_prefix=stable_prefix,
+            ),
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -307,6 +466,9 @@ class OpenRouterClient:
                 "sort": "latency",
             },
         }
+        cache_control = self._cache_control(model)
+        if cache_control is not None:
+            payload["cache_control"] = cache_control
         self._log_prompt_bundle(
             role=role,
             schema_name=schema_name,
@@ -319,7 +481,10 @@ class OpenRouterClient:
         data = self._post_json_with_retries(endpoint="chat/completions", model=model, payload=payload)
         content = self._extract_chat_text(data)
         self._log_parsed_text(endpoint="chat/completions", model=model, text=content)
-        return self._parse_json_payload(content, "chat/completions")
+        return {
+            "payload": self._parse_json_payload(content, "chat/completions"),
+            "cache_stats": self._extract_cache_stats(data, prompt_cache_key),
+        }
 
     def _responses_structured(
         self,
@@ -330,13 +495,17 @@ class OpenRouterClient:
         schema: dict[str, Any],
         system_prompt: str,
         user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "model": model,
-            "input": [
-                {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-                {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-            ],
+            "input": self._responses_input(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_cache_key=prompt_cache_key,
+                stable_prefix=stable_prefix,
+            ),
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -352,6 +521,9 @@ class OpenRouterClient:
                 "sort": "latency",
             },
         }
+        cache_control = self._cache_control(model)
+        if cache_control is not None:
+            payload["cache_control"] = cache_control
         self._log_prompt_bundle(
             role=role,
             schema_name=schema_name,
@@ -364,7 +536,10 @@ class OpenRouterClient:
         data = self._post_json_with_retries(endpoint="responses", model=model, payload=payload)
         text = self._extract_response_text(data)
         self._log_parsed_text(endpoint="responses", model=model, text=text)
-        return self._parse_json_payload(text, "responses")
+        return {
+            "payload": self._parse_json_payload(text, "responses"),
+            "cache_stats": self._extract_cache_stats(data, prompt_cache_key),
+        }
 
     def _chat_json_object(
         self,
@@ -374,13 +549,17 @@ class OpenRouterClient:
         model: str,
         system_prompt: str,
         user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": self._chat_messages(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_cache_key=prompt_cache_key,
+                stable_prefix=stable_prefix,
+            ),
             "response_format": {
                 "type": "json_object",
             },
@@ -391,6 +570,9 @@ class OpenRouterClient:
                 "sort": "latency",
             },
         }
+        cache_control = self._cache_control(model)
+        if cache_control is not None:
+            payload["cache_control"] = cache_control
         self._log_prompt_bundle(
             role=role,
             schema_name=schema_name,
@@ -403,7 +585,10 @@ class OpenRouterClient:
         data = self._post_json_with_retries(endpoint="chat/completions", model=model, payload=payload)
         content = self._extract_chat_text(data)
         self._log_parsed_text(endpoint="chat/completions", model=model, text=content)
-        return self._parse_json_payload(content, "chat/completions")
+        return {
+            "payload": self._parse_json_payload(content, "chat/completions"),
+            "cache_stats": self._extract_cache_stats(data, prompt_cache_key),
+        }
 
     def _responses_json_object(
         self,
@@ -413,13 +598,17 @@ class OpenRouterClient:
         model: str,
         system_prompt: str,
         user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "model": model,
-            "input": [
-                {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-                {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-            ],
+            "input": self._responses_input(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_cache_key=prompt_cache_key,
+                stable_prefix=stable_prefix,
+            ),
             "text": {
                 "format": {
                     "type": "json_object",
@@ -432,6 +621,9 @@ class OpenRouterClient:
                 "sort": "latency",
             },
         }
+        cache_control = self._cache_control(model)
+        if cache_control is not None:
+            payload["cache_control"] = cache_control
         self._log_prompt_bundle(
             role=role,
             schema_name=schema_name,
@@ -444,7 +636,10 @@ class OpenRouterClient:
         data = self._post_json_with_retries(endpoint="responses", model=model, payload=payload)
         text = self._extract_response_text(data)
         self._log_parsed_text(endpoint="responses", model=model, text=text)
-        return self._parse_json_payload(text, "responses")
+        return {
+            "payload": self._parse_json_payload(text, "responses"),
+            "cache_stats": self._extract_cache_stats(data, prompt_cache_key),
+        }
 
     def _post_json_with_retries(self, *, endpoint: str, model: str, payload: dict[str, Any]) -> dict[str, Any]:
         last_error: Exception | None = None

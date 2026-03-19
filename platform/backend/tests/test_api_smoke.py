@@ -20,8 +20,17 @@ def _install_llm_stub(app) -> None:
     openrouter = app.state.container.openrouter_client
     openrouter.api_key = "test-key"
 
-    def fake_generate_structured(*, role: str, schema_name: str, schema: dict, system_prompt: str, user_prompt: str) -> dict:
-        del role, schema, system_prompt
+    def fake_generate_structured(
+        *,
+        role: str,
+        schema_name: str,
+        schema: dict,
+        system_prompt: str,
+        user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
+    ) -> dict:
+        del role, schema, system_prompt, prompt_cache_key, stable_prefix
         payload = json.loads(user_prompt)
         if schema_name == "grounded_spec_outline_v1":
             return {
@@ -62,6 +71,7 @@ def _install_llm_stub(app) -> None:
         raise AssertionError(f"Unexpected schema name: {schema_name}")
 
     openrouter.generate_structured = fake_generate_structured
+    openrouter.generate_json_object = fake_generate_structured
 
     def fake_static_check(*, source_dir, changed_files):
         del source_dir, changed_files

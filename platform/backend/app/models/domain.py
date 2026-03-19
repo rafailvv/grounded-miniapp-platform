@@ -102,7 +102,11 @@ class JobEvent(StrictModel):
         "checks_completed",
         "repair_started",
         "repair_iteration",
+        "apply_started",
+        "apply_completed",
         "preview_rebuild_started",
+        "preview_rebuild_completed",
+        "preview_rebuild_failed",
         "preview_ready",
         "draft_ready",
         "job_failed",
@@ -173,6 +177,8 @@ class PreviewRecord(StrictModel):
     preview_id: str = Field(default_factory=lambda: new_id("preview"))
     workspace_id: str
     status: Literal["stopped", "starting", "running", "error"] = "stopped"
+    stage: Literal["idle", "starting", "rebuilding", "health_check", "running", "error"] = "idle"
+    progress_percent: int = 0
     url: str | None = None
     frontend_url: str | None = None
     backend_url: str | None = None
@@ -181,6 +187,8 @@ class PreviewRecord(StrictModel):
     project_name: str | None = None
     draft_run_id: str | None = None
     logs: list[str] = Field(default_factory=list)
+    last_error: str | None = None
+    latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
     started_at: datetime | None = None
     updated_at: datetime = Field(default_factory=utc_now)
 

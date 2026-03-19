@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import threading
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,6 +14,7 @@ from app.models.domain import (
     CodeChangeTarget,
     CreateRunRequest,
     GenerateRequest,
+    JobEvent,
     RunChecksSummary,
     RunRecord,
     WorkspaceRecord,
@@ -132,6 +134,17 @@ class RunService:
                 payload = self.store.get("reports", f"run_artifacts:{run_id}")
         if not payload:
             raise KeyError(f"Artifacts not found for run: {run_id}")
+        run = self.get_run(run_id)
+        preview = self.preview_service.get(run.workspace_id)
+        preview_payload = self._preview_snapshot(run.workspace_id, preview)
+        payload["run"] = run.model_dump(mode="json")
+        payload["preview"] = preview_payload
+        payload["draft_preview"] = {
+            key: value
+            for key, value in preview_payload.items()
+            if key in {"status", "stage", "progress_percent", "runtime_mode", "url", "role_urls", "draft_run_id"}
+        }
+        self.store.upsert("reports", f"run_artifacts:{run_id}", payload)
         return payload
 
     def get_run_iterations(self, run_id: str) -> list[dict[str, Any]]:
@@ -144,8 +157,13 @@ class RunService:
             return run
         if run.status != "awaiting_approval":
             return run
+        apply_started_at = time.perf_counter()
+        run.current_stage = "finalizing apply"
+        run.progress_percent = 99
+        run.updated_at = datetime.now(timezone.utc)
+        self._save_run(run)
+        self._append_job_event(run.linked_job_id, "apply_started", "Applying the reviewed draft to the source workspace.")
         revision = self.workspace_service.approve_draft(run.workspace_id, run.run_id, f"Approve AI draft for run {run.run_id}")
-        self.preview_service.rebuild(run.workspace_id)
         self.workspace_service.discard_draft(run.workspace_id, run.run_id)
         run.result_revision_id = revision.revision_id
         run.candidate_revision_id = revision.revision_id
@@ -155,8 +173,11 @@ class RunService:
         run.draft_ready = False
         run.current_stage = "completed"
         run.progress_percent = 100
+        run.latency_breakdown["apply_ms"] = int((time.perf_counter() - apply_started_at) * 1000)
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
+        self._append_job_event(run.linked_job_id, "apply_completed", "Draft was applied successfully.")
+        self._queue_preview_refresh(run, reason="manual approval")
         artifacts = self.get_run_artifacts(run_id)
         artifacts["run"] = run.model_dump(mode="json")
         self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts)
@@ -166,7 +187,6 @@ class RunService:
     def discard_run(self, run_id: str) -> RunRecord:
         run = self.get_run(run_id)
         self.workspace_service.discard_draft(run.workspace_id, run.run_id)
-        self.preview_service.rebuild(run.workspace_id)
         run.status = "failed"
         run.apply_status = "failed"
         run.draft_status = "discarded"
@@ -175,6 +195,7 @@ class RunService:
         run.progress_percent = 100
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
+        self._queue_preview_refresh(run, reason="draft discard")
         artifacts = self.get_run_artifacts(run_id)
         artifacts["run"] = run.model_dump(mode="json")
         self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts)
@@ -193,7 +214,6 @@ class RunService:
             run.result_revision_id,
             f"Rollback AI run {run.run_id}",
         )
-        self.preview_service.rebuild(run.workspace_id)
         run.rolled_back = True
         run.rolled_back_at = datetime.now(timezone.utc)
         run.apply_status = "rolled_back"
@@ -202,6 +222,7 @@ class RunService:
         run.candidate_revision_id = revision.revision_id
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
+        self._queue_preview_refresh(run, reason="rollback")
         artifacts = self.get_run_artifacts(run_id)
         artifacts["run"] = run.model_dump(mode="json")
         self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts)
@@ -284,10 +305,15 @@ class RunService:
                     run.draft_status = "ready"
                     run.draft_ready = True
                     run.current_stage = "awaiting review"
-                    run.progress_percent = 100
+                    run.progress_percent = 99
                 else:
+                    apply_started_at = time.perf_counter()
+                    run.current_stage = "finalizing apply"
+                    run.progress_percent = 99
+                    run.updated_at = datetime.now(timezone.utc)
+                    self._save_run(run)
+                    self._append_job_event(run.linked_job_id, "apply_started", "Applying generated draft to the source workspace.")
                     revision = self.workspace_service.approve_draft(run.workspace_id, run.run_id, f"Auto-apply AI draft for run {run.run_id}")
-                    self.preview_service.rebuild(run.workspace_id)
                     self.workspace_service.discard_draft(run.workspace_id, run.run_id)
                     run.result_revision_id = revision.revision_id
                     run.candidate_revision_id = revision.revision_id
@@ -297,6 +323,8 @@ class RunService:
                     run.draft_ready = False
                     run.current_stage = "completed"
                     run.progress_percent = 100
+                    run.latency_breakdown["apply_ms"] = int((time.perf_counter() - apply_started_at) * 1000)
+                    self._append_job_event(run.linked_job_id, "apply_completed", "Generated draft was applied successfully.")
             elif job.status == "blocked":
                 run.status = "blocked"
                 run.apply_status = "blocked"
@@ -311,6 +339,9 @@ class RunService:
                 run.progress_percent = max(run.progress_percent, 100)
 
             self._save_run(run)
+            if job.status == "completed" and run.apply_status == "applied":
+                self._queue_preview_refresh(run, reason="run completion")
+                preview = self.preview_service.get(run.workspace_id)
             self._store_run_artifacts(run, change_plan, job, preview)
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
             logger.info(
@@ -335,10 +366,100 @@ class RunService:
         payload = self.store.get("reports", f"run_stop_request:{run_id}")
         return bool(payload and payload.get("requested"))
 
+    def _append_job_event(
+        self,
+        job_id: str | None,
+        event_type: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if not job_id:
+            return
+        payload = self.store.get("jobs", job_id)
+        if not payload:
+            return
+        events = list(payload.get("events", []))
+        events.append(JobEvent(event_type=event_type, message=message, details=details or {}).model_dump(mode="json"))
+        payload["events"] = events
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.store.upsert("jobs", job_id, payload)
+
+    def _queue_preview_refresh(self, run: RunRecord, *, reason: str) -> None:
+        queue_started_at = time.perf_counter()
+        self._append_job_event(
+            run.linked_job_id,
+            "preview_rebuild_started",
+            f"Queued preview rebuild after {reason}.",
+            {"reason": reason, "run_id": run.run_id},
+        )
+
+        def on_complete(preview: Any) -> None:
+            if preview.status == "running":
+                self._append_job_event(
+                    run.linked_job_id,
+                    "preview_rebuild_completed",
+                    "Preview rebuild finished successfully.",
+                    {
+                        "url": preview.url,
+                        "stage": getattr(preview, "stage", "running"),
+                        "progress_percent": getattr(preview, "progress_percent", 100),
+                    },
+                )
+            else:
+                self._append_job_event(
+                    run.linked_job_id,
+                    "preview_rebuild_failed",
+                    getattr(preview, "last_error", None) or "Preview rebuild failed.",
+                    {
+                        "stage": getattr(preview, "stage", "error"),
+                        "progress_percent": getattr(preview, "progress_percent", 100),
+                    },
+                )
+            artifacts_payload = self.store.get("reports", f"run_artifacts:{run.run_id}")
+            if artifacts_payload:
+                artifacts_payload["preview"] = self._preview_snapshot(run.workspace_id, preview)
+                artifacts_payload["draft_preview"] = {
+                    key: value
+                    for key, value in artifacts_payload["preview"].items()
+                    if key in {"status", "stage", "progress_percent", "runtime_mode", "url", "role_urls", "draft_run_id"}
+                }
+                self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
+
+        preview = self.preview_service.rebuild_async(run.workspace_id, on_complete=on_complete)
+        run.latency_breakdown["preview_enqueue_ms"] = int((time.perf_counter() - queue_started_at) * 1000)
+        run.updated_at = datetime.now(timezone.utc)
+        self._save_run(run)
+        artifacts_payload = self.store.get("reports", f"run_artifacts:{run.run_id}")
+        if artifacts_payload:
+            artifacts_payload["preview"] = self._preview_snapshot(run.workspace_id, preview)
+            artifacts_payload["draft_preview"] = {
+                key: value
+                for key, value in artifacts_payload["preview"].items()
+                if key in {"status", "stage", "progress_percent", "runtime_mode", "url", "role_urls", "draft_run_id"}
+            }
+            self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
+
+    def _preview_snapshot(self, workspace_id: str, preview: Any | None = None) -> dict[str, Any]:
+        current = preview or self.preview_service.get(workspace_id)
+        role_urls = {role: f"{current.url}?role={role}" for role in ("client", "specialist", "manager")} if current.url else {}
+        return {
+            "status": current.status,
+            "stage": getattr(current, "stage", "idle"),
+            "progress_percent": getattr(current, "progress_percent", 0),
+            "runtime_mode": current.runtime_mode,
+            "url": current.url,
+            "role_urls": role_urls,
+            "logs": list(getattr(current, "logs", [])),
+            "draft_run_id": current.draft_run_id,
+            "latency_breakdown": dict(getattr(current, "latency_breakdown", {})),
+            "last_error": getattr(current, "last_error", None),
+        }
+
     def _store_run_artifacts(self, run: RunRecord, change_plan: CodeChangePlan, job: Any, preview: Any) -> None:
         workspace_id = run.workspace_id
         iterations = (self.generation_service.current_report(workspace_id, "iterations") or {}).get("items", [])
         candidate_diff = (self.generation_service.current_report(workspace_id, "candidate_diff") or {}).get("diff", "")
+        preview_payload = self._preview_snapshot(workspace_id, preview)
         payload = {
             "run": run.model_dump(mode="json"),
             "job": job.model_dump(mode="json"),
@@ -356,19 +477,11 @@ class RunService:
             "checks": self.generation_service.current_report(workspace_id, "check_results"),
             "patch": self.generation_service.current_report(workspace_id, "patch"),
             "diff": self.workspace_service.diff(workspace_id, run_id=run.run_id),
-            "preview": {
-                "status": preview.status,
-                "runtime_mode": preview.runtime_mode,
-                "url": preview.url,
-                "role_urls": self.preview_service.role_urls(workspace_id),
-                "logs": preview.logs,
-                "draft_run_id": preview.draft_run_id,
-            },
+            "preview": preview_payload,
             "draft_preview": {
-                "status": preview.status,
-                "runtime_mode": preview.runtime_mode,
-                "url": preview.url,
-                "role_urls": self.preview_service.role_urls(workspace_id),
+                key: value
+                for key, value in preview_payload.items()
+                if key in {"status", "stage", "progress_percent", "runtime_mode", "url", "role_urls", "draft_run_id"}
             },
             "final_summary": job.summary,
             "latency_breakdown": job.latency_breakdown,

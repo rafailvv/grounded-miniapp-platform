@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -102,6 +103,8 @@ class CheckRunner:
 
     @staticmethod
     def classify_failure(results: list[RunCheckResult]) -> str | None:
+        if CheckRunner.has_tooling_failure(results):
+            return "tooling/runtime_misconfiguration"
         failed_names = {result.name for result in results if result.status == "failed"}
         if "schema_validators" in failed_names:
             return "validator/domain_constraint"
@@ -110,6 +113,19 @@ class CheckRunner:
         if "preview_boot_smoke" in failed_names:
             return "runtime_preview_boot"
         return None
+
+    @staticmethod
+    def has_tooling_failure(results: list[RunCheckResult]) -> bool:
+        markers = (
+            "npm is not available in the backend runtime",
+            "frontend build tooling is unavailable",
+            "node.js/npm is missing",
+        )
+        for result in results:
+            haystack = "\n".join([result.details or "", *result.logs]).lower()
+            if any(marker in haystack for marker in markers):
+                return True
+        return False
 
     def _static_check(self, *, source_dir: Path, changed_files: list[str]) -> RunCheckResult:
         frontend_dir = source_dir / "frontend"
@@ -154,7 +170,7 @@ class CheckRunner:
         )
 
     def _run_frontend_build(self, frontend_dir: Path) -> RunCheckResult:
-        npm_binary = "npm"
+        npm_binary = os.getenv("FRONTEND_NPM_BINARY") or shutil.which("npm")
         env = {
             **os.environ,
             "CI": "true",
@@ -165,6 +181,18 @@ class CheckRunner:
 
         install_timeout = int(os.getenv("FRONTEND_INSTALL_TIMEOUT_SEC", "900"))
         build_timeout = int(os.getenv("FRONTEND_BUILD_TIMEOUT_SEC", "900"))
+
+        if not npm_binary:
+            return RunCheckResult(
+                name="changed_files_static",
+                status="failed",
+                details="Frontend build tooling is unavailable in the backend runtime.",
+                logs=[
+                    "Frontend build tooling is unavailable in the backend runtime.",
+                    "npm was not found on PATH.",
+                    "Install Node.js/npm in the platform backend runtime and rebuild the backend container.",
+                ],
+            )
 
         try:
             if not (frontend_dir / "node_modules").exists():

@@ -161,6 +161,15 @@ export type WorkspaceLogs = {
     url: string | null;
     logs: string[];
     draft_run_id?: string | null;
+    containers?: Array<{
+      service: string;
+      name?: string | null;
+      state?: string | null;
+      status?: string | null;
+      health?: string | null;
+      exit_code?: string | null;
+    }>;
+    container_logs?: Record<string, string[]>;
   };
   reports: {
     trace?: {

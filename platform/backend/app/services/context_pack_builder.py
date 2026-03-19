@@ -42,7 +42,7 @@ class ContextPackBuilder:
                 targeted_files[file_path] = self.workspace_service.read_file(workspace.workspace_id, file_path, run_id=run_id)
             except FileNotFoundError:
                 continue
-        stable_prefix = self._stable_prefix(workspace, model_profile)
+        stable_prefix = self.stable_prefix(workspace, model_profile)
         return ContextPack(
             workspace_id=workspace.workspace_id,
             revision_id=workspace.current_revision_id,
@@ -54,7 +54,7 @@ class ContextPackBuilder:
             code_chunks=[CodeChunkRecord.model_validate(item) for item in retrieval["code"]],  # type: ignore[index]
             doc_chunks=[CodeChunkRecord.model_validate(item) for item in retrieval["docs"]],  # type: ignore[index]
             targeted_files=targeted_files,
-            prompt_cache_key=self._prompt_cache_key(workspace, model_profile, stable_prefix),
+            prompt_cache_key=self.prompt_cache_key(workspace, model_profile, stable_prefix),
             retrieval_stats=dict(retrieval["stats"]),  # type: ignore[arg-type]
         )
 
@@ -67,7 +67,7 @@ class ContextPackBuilder:
         )
 
     @staticmethod
-    def _stable_prefix(workspace: WorkspaceRecord, model_profile: str) -> str:
+    def stable_prefix(workspace: WorkspaceRecord, model_profile: str) -> str:
         platform = getattr(workspace.target_platform, "value", workspace.target_platform)
         return (
             "You are editing a grounded mini-app workspace. "
@@ -76,8 +76,9 @@ class ContextPackBuilder:
             "Defer non-essential file reads. Use retrieved chunks before widening context."
         )
 
-    @staticmethod
-    def _prompt_cache_key(workspace: WorkspaceRecord, model_profile: str, stable_prefix: str) -> str:
+    @classmethod
+    def prompt_cache_key(cls, workspace: WorkspaceRecord, model_profile: str, stable_prefix: str | None = None) -> str:
+        stable_prefix = stable_prefix if stable_prefix is not None else cls.stable_prefix(workspace, model_profile)
         platform = getattr(workspace.target_platform, "value", workspace.target_platform)
         material = f"{workspace.workspace_id}:{platform}:{model_profile}:{stable_prefix}"
         return hashlib.sha256(material.encode("utf-8")).hexdigest()

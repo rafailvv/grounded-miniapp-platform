@@ -593,6 +593,7 @@ export default function App() {
   const [runDetailsOpen, setRunDetailsOpen] = useState(false);
   const [runArtifacts, setRunArtifacts] = useState<RunArtifacts | null>(null);
   const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
+  const [selectedLogService, setSelectedLogService] = useState<string>("preview-backend");
   const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "logs">("preview");
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
@@ -888,6 +889,20 @@ export default function App() {
     () => extractPreviewErrorMessage(workspaceLogs?.preview?.logs ?? runArtifacts?.preview?.logs ?? []),
     [runArtifacts?.preview?.logs, workspaceLogs?.preview?.logs],
   );
+  const containerStatuses = workspaceLogs?.preview?.containers ?? [];
+  const containerLogs = workspaceLogs?.preview?.container_logs ?? {};
+  const selectedContainerLogLines = containerLogs[selectedLogService] ?? [];
+  useEffect(() => {
+    const availableServices = Object.keys(containerLogs);
+    if (!availableServices.length) {
+      return;
+    }
+    if (!availableServices.includes(selectedLogService)) {
+      const preferred =
+        containerStatuses.find((item) => item.state && item.state !== "running")?.service ?? availableServices[0];
+      setSelectedLogService(preferred);
+    }
+  }, [containerLogs, containerStatuses, selectedLogService]);
   const logOutput = useMemo(() => {
     const jobLines = [
       `status: ${workspaceLogs?.job?.status ?? topbarRun?.status ?? "idle"}`,
@@ -2309,8 +2324,41 @@ export default function App() {
           ) : null}
 
           {activeTab === "logs" ? (
-            <div className="terminal">
-              <pre>{logOutput || "No logs yet."}</pre>
+            <div className="terminal logs-terminal">
+              <div className="logs-shell">
+                <div className="logs-summary">
+                  <pre>{logOutput || "No logs yet."}</pre>
+                </div>
+                <div className="container-status-grid">
+                  {containerStatuses.length ? (
+                    containerStatuses.map((container) => (
+                      <button
+                        key={container.service}
+                        type="button"
+                        className={`container-status-card${selectedLogService === container.service ? " is-active" : ""}`}
+                        onClick={() => setSelectedLogService(container.service)}
+                      >
+                        <strong>{container.service}</strong>
+                        <span>{container.status ?? "unknown"}</span>
+                        <small>
+                          state: {container.state ?? "unknown"}
+                          {container.health ? ` · health: ${container.health}` : ""}
+                          {container.exit_code ? ` · exit: ${container.exit_code}` : ""}
+                        </small>
+                      </button>
+                    ))
+                  ) : (
+                    <div className="container-status-empty">No container status yet.</div>
+                  )}
+                </div>
+                <div className="container-logs-panel">
+                  <div className="container-logs-header">
+                    <strong>{selectedLogService}</strong>
+                    <span>{selectedContainerLogLines.length ? `${selectedContainerLogLines.length} log lines` : "No logs yet"}</span>
+                  </div>
+                  <pre>{selectedContainerLogLines.length ? selectedContainerLogLines.join("\n") : "No logs for this container yet."}</pre>
+                </div>
+              </div>
             </div>
           ) : null}
         </section>

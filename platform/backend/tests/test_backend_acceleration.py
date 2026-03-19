@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import threading
 import time
 
+import app.services.check_runner as check_runner_module
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.models.domain import CreateRunRequest
 from app.services.code_index_service import CodeIndexService
 from app.validators.build_validator import BuildValidator
 
@@ -242,6 +245,198 @@ def test_fix_mode_run_exposes_failure_analysis_metadata(tmp_path: Path) -> None:
     assert failure_analysis["error_context"]["raw_error"].startswith("Docker preview rebuild failed")
 
 
+def test_run_completes_before_async_preview_rebuild_finishes(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    _install_llm_stub(app)
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Async Preview Workspace",
+            "description": "Run completion should not block on preview rebuild",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    app.state.container.workspace_service.clone_template(workspace_id)
+
+    preview_service = app.state.container.preview_service
+    rebuild_started = threading.Event()
+    release_rebuild = threading.Event()
+
+    def fake_rebuild_async(workspace_id: str, source_dir=None, draft_run_id=None, on_complete=None):
+        del source_dir, draft_run_id
+        preview = preview_service._get_or_create(workspace_id)
+        preview.status = "starting"
+        preview.stage = "rebuilding"
+        preview.progress_percent = 10
+        preview.logs.append("Queued asynchronous preview rebuild.")
+        preview_service.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
+
+        def worker() -> None:
+            rebuild_started.set()
+            release_rebuild.wait(1.0)
+            current = preview_service._get_or_create(workspace_id)
+            current.status = "running"
+            current.stage = "running"
+            current.progress_percent = 100
+            current.url = "http://localhost:18181"
+            current.frontend_url = current.url
+            current.backend_url = f"{current.url}/api"
+            preview_service.store.upsert("previews", workspace_id, current.model_dump(mode="json"))
+            if on_complete is not None:
+                on_complete(current)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return preview
+
+    preview_service.rebuild_async = fake_rebuild_async  # type: ignore[method-assign]
+
+    run = app.state.container.run_service.create_run_sync(
+        workspace_id,
+        CreateRunRequest(
+            prompt="Create a simple role-based booking app.",
+            apply_strategy="staged_auto_apply",
+            model_profile="openai_code_fast",
+            generation_mode="balanced",
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+        ),
+    )
+
+    assert run.status == "completed"
+    assert run.current_stage == "completed"
+    assert rebuild_started.is_set()
+    preview = preview_service.get(workspace_id)
+    assert preview.stage == "rebuilding"
+    release_rebuild.set()
+    time.sleep(0.15)
+    assert preview_service.get(workspace_id).status == "running"
+
+
+def test_preview_rebuild_failure_does_not_revert_completed_run(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    _install_llm_stub(app)
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Preview Failure Workspace",
+            "description": "Completed run should stay completed even if preview rebuild fails",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    app.state.container.workspace_service.clone_template(workspace_id)
+
+    preview_service = app.state.container.preview_service
+
+    def fake_rebuild_async(workspace_id: str, source_dir=None, draft_run_id=None, on_complete=None):
+        del source_dir, draft_run_id
+        preview = preview_service._get_or_create(workspace_id)
+        preview.status = "starting"
+        preview.stage = "rebuilding"
+        preview.progress_percent = 10
+        preview_service.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
+
+        def worker() -> None:
+            current = preview_service._get_or_create(workspace_id)
+            current.status = "error"
+            current.stage = "error"
+            current.progress_percent = 100
+            current.last_error = "Simulated preview rebuild failure."
+            preview_service.store.upsert("previews", workspace_id, current.model_dump(mode="json"))
+            if on_complete is not None:
+                on_complete(current)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return preview
+
+    preview_service.rebuild_async = fake_rebuild_async  # type: ignore[method-assign]
+
+    run = app.state.container.run_service.create_run_sync(
+        workspace_id,
+        CreateRunRequest(
+            prompt="Create a simple role-based booking app.",
+            apply_strategy="staged_auto_apply",
+            model_profile="openai_code_fast",
+            generation_mode="balanced",
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+        ),
+    )
+
+    assert run.status == "completed"
+    time.sleep(0.15)
+    assert app.state.container.run_service.get_run(run.run_id).status == "completed"
+    assert preview_service.get(workspace_id).status == "error"
+    artifacts = app.state.container.run_service.get_run_artifacts(run.run_id)
+    assert artifacts["preview"]["status"] == "error"
+    assert artifacts["preview"]["last_error"] == "Simulated preview rebuild failure."
+
+
+def test_openrouter_payload_uses_stable_cache_prefix_and_reports_cache_stats(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    openrouter = app.state.container.openrouter_client
+    openrouter.api_key = "test-key"
+    captured: dict[str, object] = {}
+
+    def fake_post_json_with_retries(*, endpoint: str, model: str, payload: dict[str, object]) -> dict[str, object]:
+        captured["endpoint"] = endpoint
+        captured["model"] = model
+        captured["payload"] = payload
+        return {
+            "output_text": "{\"ok\":true}",
+            "usage": {
+                "prompt_tokens_details": {
+                    "cached_tokens": 11,
+                    "cache_write_tokens": 3,
+                }
+            },
+        }
+
+    openrouter._post_json_with_retries = fake_post_json_with_retries  # type: ignore[method-assign]
+    result = openrouter.generate_structured(
+        role="code_plan",
+        schema_name="cache_test",
+        schema={
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": False,
+        },
+        system_prompt="System prompt",
+        user_prompt='{"ok": true}',
+        prompt_cache_key="cache-key-123",
+        stable_prefix="Stable workspace prefix",
+    )
+
+    assert result["cache_stats"]["cached_tokens"] == 11
+    assert result["cache_stats"]["cache_write_tokens"] == 3
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert captured["endpoint"] in {"responses", "chat/completions"}
+    if captured["endpoint"] == "responses":
+        input_items = payload["input"]
+        assert isinstance(input_items, list)
+        assert "cache-key-123" in input_items[1]["content"][0]["text"]
+        assert "Stable workspace prefix" in input_items[1]["content"][0]["text"]
+        assert input_items[2]["content"][0]["text"] == '{"ok": true}'
+    else:
+        messages = payload["messages"]
+        assert isinstance(messages, list)
+        assert "cache-key-123" in messages[1]["content"]
+        assert "Stable workspace prefix" in messages[1]["content"]
+        assert messages[2]["content"] == '{"ok": true}'
+
+
 def test_build_validator_flags_contract_drift(tmp_path: Path) -> None:
     workspace_path = tmp_path / "workspace"
     (workspace_path / "backend" / "app").mkdir(parents=True)
@@ -298,3 +493,24 @@ def test_clone_template_skips_heavy_frontend_artifacts(tmp_path: Path) -> None:
     source_root = tmp_path / "data" / "workspaces" / workspace_id / "source"
     assert not (source_root / "frontend" / "node_modules").exists()
     assert not (source_root / "frontend" / "dist").exists()
+
+
+def test_frontend_build_tooling_failure_is_classified_as_platform_issue(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    runner = app.state.container.check_runner
+
+    frontend_dir = tmp_path / "frontend"
+    frontend_dir.mkdir(parents=True)
+    (frontend_dir / "package.json").write_text('{"name":"demo","scripts":{"build":"vite build"}}\n', encoding="utf-8")
+
+    monkeypatch.delenv("FRONTEND_NPM_BINARY", raising=False)
+    monkeypatch.setattr(check_runner_module.shutil, "which", lambda _: None)
+
+    result = runner._run_frontend_build(frontend_dir)
+
+    assert result.status == "failed"
+    assert result.details == "Frontend build tooling is unavailable in the backend runtime."
+    assert "npm was not found on PATH." in result.logs
+    assert runner.has_tooling_failure([result]) is True
+    assert runner.classify_failure([result]) == "tooling/runtime_misconfiguration"

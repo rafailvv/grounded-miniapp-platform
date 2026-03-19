@@ -21,7 +21,7 @@ def ensure_preview(workspace_id: str, container: ServiceContainer = Depends(get_
 
 @router.post("/workspaces/{workspace_id}/preview/rebuild")
 def rebuild_preview(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict:
-    return container.preview_service.rebuild(workspace_id).model_dump(mode="json")
+    return container.preview_service.rebuild_async(workspace_id).model_dump(mode="json")
 
 
 @router.post("/workspaces/{workspace_id}/preview/reset")
@@ -37,19 +37,44 @@ def get_preview_url(workspace_id: str, container: ServiceContainer = Depends(get
         "role_urls": container.preview_service.role_urls(workspace_id),
         "runtime_mode": preview.runtime_mode,
         "status": preview.status,
+        "stage": preview.stage,
+        "progress_percent": preview.progress_percent,
         "draft_run_id": preview.draft_run_id,
+        "latency_breakdown": preview.latency_breakdown,
+        "last_error": preview.last_error,
     }
 
 
 @router.get("/workspaces/{workspace_id}/preview/logs")
-def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, list[str]]:
-    return {"logs": container.preview_service.get(workspace_id).logs}
+def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
+    preview = container.preview_service.get(workspace_id)
+    container_logs: dict[str, list[str]] = {}
+    containers: list[dict[str, object]] = []
+    if preview.runtime_mode == "docker" and preview.proxy_port is not None:
+        source_dir = (
+            container.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
+            if preview.draft_run_id and container.workspace_service.draft_exists(workspace_id, preview.draft_run_id)
+            else container.workspace_service.source_dir(workspace_id)
+        )
+        container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
+        containers = container.runtime_manager.inspect_containers(workspace_id, source_dir, preview.proxy_port)
+    return {"logs": preview.logs, "containers": containers, "container_logs": container_logs}
 
 
 @router.get("/workspaces/{workspace_id}/logs")
 def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
     job = container.generation_service.latest_job_for_workspace(workspace_id)
     preview = container.preview_service.get(workspace_id)
+    container_logs: dict[str, list[str]] = {}
+    containers: list[dict[str, object]] = []
+    if preview.runtime_mode == "docker" and preview.proxy_port is not None:
+        source_dir = (
+            container.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
+            if preview.draft_run_id and container.workspace_service.draft_exists(workspace_id, preview.draft_run_id)
+            else container.workspace_service.source_dir(workspace_id)
+        )
+        container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
+        containers = container.runtime_manager.inspect_containers(workspace_id, source_dir, preview.proxy_port)
     validation = container.generation_service.current_report(workspace_id, "validation")
     assumptions = container.generation_service.current_report(workspace_id, "assumptions")
     traceability = container.generation_service.current_report(workspace_id, "traceability")
@@ -65,10 +90,16 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
         "events": [event.model_dump(mode="json") for event in job.events] if job else [],
         "preview": {
             "status": preview.status,
+            "stage": preview.stage,
+            "progress_percent": preview.progress_percent,
             "runtime_mode": preview.runtime_mode,
             "url": preview.url,
             "logs": preview.logs,
             "draft_run_id": preview.draft_run_id,
+            "latency_breakdown": preview.latency_breakdown,
+            "last_error": preview.last_error,
+            "containers": containers,
+            "container_logs": container_logs,
         },
         "reports": {
             "trace": trace,
