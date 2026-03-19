@@ -9,6 +9,7 @@ from app.services.code_index_service import CodeIndexService
 from app.services.context_pack_builder import ContextPackBuilder
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.export_service import ExportService
+from app.services.fix_orchestrator import FixOrchestrator
 from app.services.generation_service import GenerationService
 from app.services.patch_service import PatchService
 from app.services.preview_service import PreviewService
@@ -46,10 +47,19 @@ class ServiceContainer:
             self.validation_suite,
             self.openrouter_client,
         )
+        self.fix_orchestrator = FixOrchestrator(
+            self.store,
+            self.workspace_service,
+            self.check_runner,
+            self.preview_service,
+            self.runtime_manager,
+            self.openrouter_client,
+        )
         self.run_service = RunService(
             self.store,
             self.workspace_service,
             self.generation_service,
+            self.fix_orchestrator,
             self.preview_service,
             self.openrouter_client,
         )

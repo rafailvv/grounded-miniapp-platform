@@ -54,10 +54,6 @@ type FixErrorContext = {
 
 type RunProgressDisplayMap = Record<string, number>;
 
-function formatLogSection(title: string, lines: string[]): string {
-  return [title, ...lines, ""].join("\n");
-}
-
 const ROLE_ORDER = ["client", "specialist", "manager"] as const;
 type RoleKey = (typeof ROLE_ORDER)[number];
 
@@ -114,32 +110,11 @@ function isRoleAtRootPreviewPath(role: RoleKey, path: string | undefined): boole
   const normalized = path || ROOT_PREVIEW_PATH;
   return normalized === ROOT_PREVIEW_PATH || normalized === getRoleRootPreviewPath(role);
 }
-const WORKSPACE_REQUEST_TIMEOUT_MS = 5000;
-const PREVIEW_REQUEST_TIMEOUT_MS = 2500;
 const PREVIEW_BOOT_POLL_ATTEMPTS = 45;
 const PREVIEW_BOOT_POLL_INTERVAL_MS = 1000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timeoutId = window.setTimeout(() => {
-      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    promise.then(
-      (value) => {
-        window.clearTimeout(timeoutId);
-        resolve(value);
-      },
-      (error) => {
-        window.clearTimeout(timeoutId);
-        reject(error);
-      },
-    );
-  });
 }
 
 function formatTimestamp(value?: string): string {
@@ -159,6 +134,20 @@ function clampText(value: string, maxLength = 180): string {
     return normalized;
   }
   return `${normalized.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function asRecordArray(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === "string");
 }
 
 function formatRoleScope(scope: RoleKey[]): string {
@@ -593,7 +582,7 @@ export default function App() {
   const [runDetailsOpen, setRunDetailsOpen] = useState(false);
   const [runArtifacts, setRunArtifacts] = useState<RunArtifacts | null>(null);
   const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
-  const [selectedLogService, setSelectedLogService] = useState<string>("preview-backend");
+  const [selectedLogService, setSelectedLogService] = useState<string>("");
   const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "logs">("preview");
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
@@ -661,14 +650,14 @@ export default function App() {
     let isMounted = true;
     void (async () => {
       try {
-        const config = await withTimeout(request<SystemConfiguration>("/system/configuration"), WORKSPACE_REQUEST_TIMEOUT_MS, "system configuration");
+        const config = await request<SystemConfiguration>("/system/configuration");
         if (!isMounted) {
           return;
         }
         setSystemConfig(config);
 
         const requestedWorkspaceId = new URLSearchParams(window.location.search).get("workspace_id");
-        const listedWorkspaces = await withTimeout(listWorkspaces(), WORKSPACE_REQUEST_TIMEOUT_MS, "workspaces");
+        const listedWorkspaces = await listWorkspaces();
 
         let nextWorkspace: Workspace | null = null;
         if (requestedWorkspaceId) {
@@ -869,21 +858,28 @@ export default function App() {
     ? {
         mode: selectedRun.mode,
         failure_class: selectedRun.failure_class,
+        failure_signature: selectedRun.failure_signature,
         root_cause_summary: selectedRun.root_cause_summary,
         fix_targets: selectedRun.fix_targets,
         handoff_from_failed_generate: selectedRun.handoff_from_failed_generate,
         error_context: selectedRun.error_context,
+        current_fix_phase: selectedRun.current_fix_phase,
+        current_failing_command: selectedRun.current_failing_command,
+        current_exit_code: selectedRun.current_exit_code,
       }
     : null);
-  const composerTitle = selectedRunMode === "fix" ? "Fix Input" : "Task Input";
+  const fixAttemptItems = asRecordArray(runArtifacts?.fix_attempts?.items ?? selectedRun?.fix_attempts);
+  const scopeExpansionItems = asRecordArray(runArtifacts?.scope_expansions?.items ?? selectedRun?.scope_expansions);
+  const fixCase = runArtifacts?.fix_case ?? workspaceLogs?.reports?.fix_case ?? null;
+  const composerTitle = selectedRunMode === "fix" ? "fixbug Input" : "Task Input";
   const composerHelp =
     selectedRunMode === "fix"
-      ? "Paste the failing build log, preview error, stack trace, or API mismatch. The system will analyze the error and apply the smallest safe fix."
-      : "Describe what to build or change. Use Fix mode when you want targeted error repair instead of broad generation.";
+      ? "Paste the failing build log, preview error, stack trace, or API mismatch. The system will analyze the error and apply the smallest safe fixbug."
+      : "Describe what to build or change. Use fixbug mode when you want targeted error repair instead of broad generation.";
   const composerPlaceholder =
     selectedRunMode === "fix"
       ? "Paste the exact error or log, for example: Docker preview rebuild failed... or a TypeScript traceback."
-      : "Describe the change you want to build. Switch to Fix mode for build failures, preview issues, or stack traces.";
+      : "Describe the change you want to build. Switch to fixbug mode for build failures, preview issues, or stack traces.";
   const effectiveGenerationMode: UserGenerationMode = selectedRunMode === "fix" ? "balanced" : selectedGenerationMode;
   const previewErrorMessage = useMemo(
     () => extractPreviewErrorMessage(workspaceLogs?.preview?.logs ?? runArtifacts?.preview?.logs ?? []),
@@ -892,57 +888,23 @@ export default function App() {
   const containerStatuses = workspaceLogs?.preview?.containers ?? [];
   const containerLogs = workspaceLogs?.preview?.container_logs ?? {};
   const selectedContainerLogLines = containerLogs[selectedLogService] ?? [];
-  useEffect(() => {
-    const availableServices = Object.keys(containerLogs);
-    if (!availableServices.length) {
-      return;
-    }
-    if (!availableServices.includes(selectedLogService)) {
-      const preferred =
-        containerStatuses.find((item) => item.state && item.state !== "running")?.service ?? availableServices[0];
-      setSelectedLogService(preferred);
-    }
-  }, [containerLogs, containerStatuses, selectedLogService]);
-  const logOutput = useMemo(() => {
-    const jobLines = [
-      `status: ${workspaceLogs?.job?.status ?? topbarRun?.status ?? "idle"}`,
-      `stage: ${topbarRun?.current_stage ?? "n/a"}`,
-      `progress: ${topbarRun?.progress_percent ?? 0}%`,
-      `model: ${workspaceLogs?.job?.llm_model ?? topbarRun?.llm_model ?? topbarRun?.model_profile ?? "n/a"}`,
-      `provider: ${workspaceLogs?.job?.llm_provider ?? topbarRun?.llm_provider ?? "n/a"}`,
-      `failure_reason: ${workspaceLogs?.job?.failure_reason ?? topbarRun?.failure_reason ?? "none"}`,
-    ];
-    const eventLines =
+  const eventLogLines = useMemo(
+    () =>
       workspaceLogs?.events?.length
         ? workspaceLogs.events.map((event) => {
             const details =
               event.details && Object.keys(event.details).length ? ` | ${JSON.stringify(event.details)}` : "";
             return `- [${formatTimestamp(event.created_at)}] ${event.event_type}: ${event.message}${details}`;
           })
-        : ["- no run events yet"];
-    const traceLines =
-      workspaceLogs?.reports?.trace?.entries?.length
-        ? workspaceLogs.reports.trace.entries.map((entry) => {
-            const payload =
-              entry.payload && Object.keys(entry.payload).length ? ` | payload=${JSON.stringify(entry.payload)}` : "";
-            return `- [${formatTimestamp(entry.created_at)}] ${entry.stage}: ${entry.message}${payload}`;
-          })
-        : ["- no trace entries yet"];
-    const previewLines = [
-      `status: ${workspaceLogs?.preview?.status ?? previewStatus ?? "unknown"}`,
-      `runtime_mode: ${workspaceLogs?.preview?.runtime_mode ?? previewRuntimeMode ?? "unknown"}`,
-      `url: ${workspaceLogs?.preview?.url ?? previewUrl ?? "none"}`,
-      ...(workspaceLogs?.preview?.logs?.length
-        ? ["logs:", ...workspaceLogs.preview.logs.map((line) => `- ${line}`)]
-        : ["logs: none"]),
-    ];
-    return [
-      formatLogSection("# RUN", jobLines),
-      formatLogSection("# EVENTS", eventLines),
-      formatLogSection("# TRACE", traceLines),
-      formatLogSection("# PREVIEW", previewLines),
-    ].join("\n");
-  }, [previewRuntimeMode, previewStatus, previewUrl, topbarRun, workspaceLogs]);
+        : ["No run events yet."],
+    [workspaceLogs?.events],
+  );
+  useEffect(() => {
+    const availableServices = Object.keys(containerLogs);
+    if (selectedLogService && !availableServices.includes(selectedLogService)) {
+      setSelectedLogService("");
+    }
+  }, [containerLogs, selectedLogService]);
 
   useEffect(() => {
     if (!workspace || activeRunIds.length === 0) {
@@ -960,7 +922,7 @@ export default function App() {
       try {
         const [runsResult, logsResult] = await Promise.allSettled([
           listRuns(workspace.workspace_id),
-          withTimeout(getWorkspaceLogs(workspace.workspace_id), WORKSPACE_REQUEST_TIMEOUT_MS, "logs"),
+          getWorkspaceLogs(workspace.workspace_id),
         ]);
 
         if (cancelled || activeWorkspaceIdRef.current !== workspace.workspace_id) {
@@ -1050,10 +1012,10 @@ export default function App() {
     setWorkspaceTransitioning(true);
     try {
       const [treeResult, runsResult, logsResult, previewResult] = await Promise.allSettled([
-        withTimeout(request<FileEntry[]>(`/workspaces/${workspaceId}/files/tree`), WORKSPACE_REQUEST_TIMEOUT_MS, "files"),
-        withTimeout(listRuns(workspaceId), WORKSPACE_REQUEST_TIMEOUT_MS, "runs"),
-        withTimeout(getWorkspaceLogs(workspaceId), WORKSPACE_REQUEST_TIMEOUT_MS, "logs"),
-        withTimeout(request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`), PREVIEW_REQUEST_TIMEOUT_MS, "preview"),
+        request<FileEntry[]>(`/workspaces/${workspaceId}/files/tree`),
+        listRuns(workspaceId),
+        getWorkspaceLogs(workspaceId),
+        request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`),
       ]);
 
       const refreshErrors: string[] = [];
@@ -1078,10 +1040,8 @@ export default function App() {
       const draftTreeRunId = selectedRunForTree?.draft_ready || selectedRunForTree?.status === "awaiting_approval" ? selectedRunForTree.run_id : "";
       if (draftTreeRunId) {
         try {
-          const draftTree = await withTimeout(
-            request<FileEntry[]>(`/workspaces/${workspaceId}/files/tree?run_id=${encodeURIComponent(draftTreeRunId)}`),
-            WORKSPACE_REQUEST_TIMEOUT_MS,
-            "draft files",
+          const draftTree = await request<FileEntry[]>(
+            `/workspaces/${workspaceId}/files/tree?run_id=${encodeURIComponent(draftTreeRunId)}`,
           );
           setFiles(draftTree);
           setExpandedDirectories((current) => {
@@ -1155,10 +1115,21 @@ export default function App() {
         return;
       }
       try {
-        const preview = await request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`);
+        const [previewResult, logsResult] = await Promise.allSettled([
+          request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`),
+          getWorkspaceLogs(workspaceId),
+        ]);
         if (activeWorkspaceIdRef.current !== workspaceId) {
           return;
         }
+        if (logsResult.status === "fulfilled") {
+          setWorkspaceLogs(logsResult.value);
+        }
+        if (previewResult.status !== "fulfilled") {
+          await sleep(PREVIEW_BOOT_POLL_INTERVAL_MS);
+          continue;
+        }
+        const preview = previewResult.value;
         setPreviewRuntimeMode(preview.runtime_mode ?? "");
         setPreviewStatus(preview.status ?? "");
 
@@ -1297,7 +1268,7 @@ export default function App() {
       try {
         const [runResult, logsResult] = await Promise.allSettled([
           getRun(runId),
-          withTimeout(getWorkspaceLogs(workspaceId), WORKSPACE_REQUEST_TIMEOUT_MS, "logs"),
+          getWorkspaceLogs(workspaceId),
         ]);
 
         if (runResult.status !== "fulfilled") {
@@ -1767,7 +1738,7 @@ export default function App() {
                 <p>{selectedRun.failure_reason}</p>
                 {selectedRun.status !== "completed" ? (
                   <button type="button" className="ghost-action" onClick={() => handoffRunToFix(selectedRun)}>
-                    Open In Fix Mode
+                    Open In fixbug Mode
                   </button>
                 ) : null}
               </section>
@@ -1786,11 +1757,26 @@ export default function App() {
                     <strong>{failureAnalysis.failure_class ?? "n/a"}</strong>
                   </div>
                   <div className="run-detail-card">
+                    <span>Failure signature</span>
+                    <strong>{failureAnalysis.failure_signature ?? selectedRun.failure_signature ?? "n/a"}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>fixbug phase</span>
+                    <strong>{failureAnalysis.current_fix_phase ?? selectedRun.current_fix_phase ?? "n/a"}</strong>
+                  </div>
+                  <div className="run-detail-card">
                     <span>Repair attempts</span>
-                    <strong>{selectedRun.repair_iterations?.length ?? 0}</strong>
+                    <strong>{fixAttemptItems.length || selectedRun.repair_iterations?.length || 0}</strong>
+                  </div>
+                  <div className="run-detail-card">
+                    <span>Exit code</span>
+                    <strong>{failureAnalysis.current_exit_code ?? selectedRun.current_exit_code ?? "n/a"}</strong>
                   </div>
                 </div>
                 {failureAnalysis.root_cause_summary ? <p>{failureAnalysis.root_cause_summary}</p> : null}
+                {failureAnalysis.current_failing_command ? (
+                  <pre className="json-block">{failureAnalysis.current_failing_command}</pre>
+                ) : null}
                 {failureAnalysis.fix_targets?.length ? (
                   <div className="run-detail-list">
                     {failureAnalysis.fix_targets.map((target) => (
@@ -1800,6 +1786,47 @@ export default function App() {
                     ))}
                   </div>
                 ) : null}
+              </section>
+            ) : null}
+
+            {selectedRun.mode === "fix" ? (
+              <section className="run-detail-section">
+                <h4>fixbug attempts</h4>
+                {fixAttemptItems.length ? (
+                  <div className="run-detail-list">
+                    {fixAttemptItems.map((attempt, index) => {
+                      const commands = asStringArray(attempt["commands"]);
+                      const filesChanged = asStringArray(attempt["files_changed"]);
+                      return (
+                        <div key={`${String(attempt["fix_attempt_id"] ?? "attempt")}-${index}`} className="run-detail-item">
+                          <div className="run-detail-item-top">
+                            <strong>Attempt {String(attempt["attempt"] ?? index + 1)}</strong>
+                            <span>{String(attempt["result"] ?? "patched")}</span>
+                          </div>
+                          {attempt["diagnosis"] ? <p>{String(attempt["diagnosis"])}</p> : null}
+                          {attempt["failure_signature"] ? <p>Signature: {String(attempt["failure_signature"])}</p> : null}
+                          {commands.length ? <p>Commands: {commands.join(" · ")}</p> : null}
+                          {filesChanged.length ? <p>Files changed: {filesChanged.join(", ")}</p> : null}
+                          {attempt["expected_verification"] ? <p>Expected verification: {String(attempt["expected_verification"])}</p> : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="muted">No fix attempts recorded yet.</p>
+                )}
+                {scopeExpansionItems.length ? (
+                  <div className="run-detail-list">
+                    {scopeExpansionItems.map((item, index) => (
+                      <div key={`scope-expansion-${index}`} className="run-detail-item">
+                        <strong>Scope expansion {String(item["attempt"] ?? index + 1)}</strong>
+                        <p>{asStringArray(item["files"]).join(", ") || "No files recorded."}</p>
+                        {item["reason"] ? <p>{String(item["reason"])}</p> : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {fixCase ? <pre className="json-block">{JSON.stringify(fixCase, null, 2)}</pre> : null}
               </section>
             ) : null}
 
@@ -1943,7 +1970,7 @@ export default function App() {
                   setSelectedGenerationMode("balanced");
                 }}
               >
-                Fix
+                fixbug
               </button>
             </div>
             <label className="composer-field">
@@ -2326,9 +2353,6 @@ export default function App() {
           {activeTab === "logs" ? (
             <div className="terminal logs-terminal">
               <div className="logs-shell">
-                <div className="logs-summary">
-                  <pre>{logOutput || "No logs yet."}</pre>
-                </div>
                 <div className="container-status-grid">
                   {containerStatuses.length ? (
                     containerStatuses.map((container) => (
@@ -2336,13 +2360,18 @@ export default function App() {
                         key={container.service}
                         type="button"
                         className={`container-status-card${selectedLogService === container.service ? " is-active" : ""}`}
-                        onClick={() => setSelectedLogService(container.service)}
+                        onClick={() =>
+                          setSelectedLogService((current) => (current === container.service ? "" : container.service))
+                        }
                       >
-                        <strong>{container.service}</strong>
-                        <span>{container.status ?? "unknown"}</span>
+                        <div className="container-status-card-head">
+                          <strong>{container.service}</strong>
+                          <span className="container-status-meta">
+                            {container.health ?? container.status ?? container.state ?? "unknown"}
+                          </span>
+                        </div>
                         <small>
-                          state: {container.state ?? "unknown"}
-                          {container.health ? ` · health: ${container.health}` : ""}
+                          {container.state ? `state: ${container.state}` : "state: unknown"}
                           {container.exit_code ? ` · exit: ${container.exit_code}` : ""}
                         </small>
                       </button>
@@ -2353,11 +2382,45 @@ export default function App() {
                 </div>
                 <div className="container-logs-panel">
                   <div className="container-logs-header">
-                    <strong>{selectedLogService}</strong>
-                    <span>{selectedContainerLogLines.length ? `${selectedContainerLogLines.length} log lines` : "No logs yet"}</span>
+                    <strong>{selectedLogService || "events"}</strong>
+                    <span>
+                      {selectedLogService
+                        ? selectedContainerLogLines.length
+                          ? `${selectedContainerLogLines.length} log lines`
+                          : "No logs yet"
+                        : eventLogLines.length
+                          ? `${eventLogLines.length} events`
+                          : "No events yet"}
+                    </span>
                   </div>
-                  <pre>{selectedContainerLogLines.length ? selectedContainerLogLines.join("\n") : "No logs for this container yet."}</pre>
+                  <pre>
+                    {selectedLogService
+                      ? selectedContainerLogLines.length
+                        ? selectedContainerLogLines.join("\n")
+                        : "No logs for this container yet."
+                      : eventLogLines.join("\n")}
+                  </pre>
                 </div>
+                {selectedRunMode === "fix" || topbarRun?.mode === "fix" || workspaceLogs?.job?.current_fix_phase ? (
+                  <div className="run-details-grid">
+                    <div className="run-detail-card">
+                      <span>fixbug phase</span>
+                      <strong>{workspaceLogs?.job?.current_fix_phase ?? topbarRun?.current_fix_phase ?? "n/a"}</strong>
+                    </div>
+                    <div className="run-detail-card">
+                      <span>Failure signature</span>
+                      <strong>{workspaceLogs?.job?.failure_signature ?? topbarRun?.failure_signature ?? "n/a"}</strong>
+                    </div>
+                    <div className="run-detail-card">
+                      <span>Failing command</span>
+                      <strong>{workspaceLogs?.job?.current_failing_command ?? topbarRun?.current_failing_command ?? "n/a"}</strong>
+                    </div>
+                    <div className="run-detail-card">
+                      <span>Exit code</span>
+                      <strong>{workspaceLogs?.job?.current_exit_code ?? topbarRun?.current_exit_code ?? "n/a"}</strong>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </div>
           ) : null}

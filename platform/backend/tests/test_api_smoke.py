@@ -68,6 +68,8 @@ def _install_llm_stub(app) -> None:
             return {"model": "openai/gpt-5.1-codex-mini", "payload": _page_file_payload(payload)}
         if schema_name == "composition_bundle_v1":
             return {"model": "openai/gpt-5.1-codex-mini", "payload": _composition_payload(payload)}
+        if schema_name == "fix_patch_v1":
+            return {"model": "openai/gpt-5.1-codex-mini", "payload": _fix_patch_payload(payload)}
         raise AssertionError(f"Unexpected schema name: {schema_name}")
 
     openrouter.generate_structured = fake_generate_structured
@@ -411,6 +413,78 @@ def _composition_payload(payload: dict) -> dict:
             }
         )
     return {"assistant_message": "Composed shared files and routes.", "operations": operations}
+
+
+def _fix_patch_payload(payload: dict) -> dict:
+    fix_case = payload.get("fix_case") or {}
+    file_contexts = payload.get("file_contexts") or {}
+    operations: list[dict] = []
+    rationale: dict[str, str] = {}
+
+    for file_path, content in file_contexts.items():
+        if file_path.endswith("ClientRoutes.tsx") and "ClientMyBookingsPage" in content:
+            operations.append(
+                {
+                    "file_path": file_path,
+                    "operation": "replace",
+                    "content": content.replace(
+                        "import { ClientMyBookingsPage } from '@/roles/client/pages/MyBookingsPage';",
+                        "import ClientMyBookingsPage from '@/roles/client/pages/MyBookingsPage';",
+                    ),
+                    "reason": "Align the client route import with the page module's default export.",
+                }
+            )
+            rationale[file_path] = "Switch the route import to the page's default export."
+        elif file_path.endswith("ManagerRoutes.tsx") and "ManagerServicesManagementPage" in content:
+            next_content = content.replace(
+                "import { ManagerServicesManagementPage } from '@/roles/manager/pages/ServicesManagementPage';",
+                "import ManagerServicesManagementPage from '@/roles/manager/pages/ServicesManagementPage';",
+            ).replace(
+                "import { ManagerBookingsOverviewPage } from '@/roles/manager/pages/BookingsOverviewPage';",
+                "import ManagerBookingsOverviewPage from '@/roles/manager/pages/BookingsOverviewPage';",
+            )
+            operations.append(
+                {
+                    "file_path": file_path,
+                    "operation": "replace",
+                    "content": next_content,
+                    "reason": "Align manager route imports with the pages' default exports.",
+                }
+            )
+            rationale[file_path] = "Switch the manager route imports to default exports."
+        elif file_path.endswith("BookingFormPage.tsx") and "phone: undefined" in content:
+            operations.append(
+                {
+                    "file_path": file_path,
+                    "operation": "replace",
+                    "content": content.replace(
+                        "setErrors((prev) => ({ ...prev, phone: undefined }));",
+                        "setErrors((prev) => {\n    const next = { ...prev };\n    delete next.phone;\n    return next;\n  });",
+                    ),
+                    "reason": "Delete the error key instead of writing undefined into Record<string, string>.",
+                }
+            )
+            rationale[file_path] = "Keep the updater return type compatible with Record<string, string>."
+
+    if not operations and file_contexts:
+        first_path = next(iter(file_contexts))
+        operations.append(
+            {
+                "file_path": first_path,
+                "operation": "replace",
+                "content": file_contexts[first_path],
+                "reason": "No-op fallback for test stubs.",
+            }
+        )
+        rationale[first_path] = "Fallback test stub patch."
+
+    return {
+        "diagnosis": str(fix_case.get("root_cause_summary") or "Apply the smallest targeted fix."),
+        "planned_targets": list(file_contexts.keys()),
+        "expected_verification": "npm run build should pass and the preview runtime should stay healthy.",
+        "rationale_by_file": rationale,
+        "operations": operations,
+    }
 
 
 def _routes_file_source(role: str, pages: list[dict]) -> str:

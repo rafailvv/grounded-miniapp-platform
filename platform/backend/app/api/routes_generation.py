@@ -64,6 +64,20 @@ def get_job_events(job_id: str, container: ServiceContainer = Depends(get_contai
 @router.post("/jobs/{job_id}/retry", response_model=JobRecord)
 def retry_job(job_id: str, container: ServiceContainer = Depends(get_container)) -> JobRecord:
     try:
+        job = container.generation_service.get_job(job_id)
+        request = GenerateRequest(
+            prompt=job.prompt,
+            mode=job.mode,
+            target_platform=job.target_platform,
+            preview_profile=job.preview_profile,
+            generation_mode=job.generation_mode,
+            intent="edit" if job.mode == "fix" else "auto",
+            model_profile=job.model_profile or "openai_code_fast",
+            linked_run_id=job.linked_run_id,
+            error_context=job.error_context,
+        )
+        if job.mode == "fix":
+            return container.fix_orchestrator.generate(job.workspace_id, request)
         return container.generation_service.retry(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

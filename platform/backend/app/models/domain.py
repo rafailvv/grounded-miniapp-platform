@@ -102,6 +102,16 @@ class JobEvent(StrictModel):
         "checks_completed",
         "repair_started",
         "repair_iteration",
+        "triage_started",
+        "triage_completed",
+        "repair_planned",
+        "patch_apply_started",
+        "patch_apply_completed",
+        "frontend_build_started",
+        "backend_compile_started",
+        "preview_validation_started",
+        "failure_reanalyzed",
+        "scope_expanded",
         "apply_started",
         "apply_completed",
         "preview_rebuild_started",
@@ -154,9 +164,17 @@ class JobRecord(StrictModel):
     error_context: ErrorContext | None = None
     failure_reason: str | None = None
     failure_class: str | None = None
+    failure_signature: str | None = None
     root_cause_summary: str | None = None
+    current_fix_phase: str | None = None
+    current_failing_command: str | None = None
+    current_exit_code: int | None = None
     fix_targets: list[str] = Field(default_factory=list)
     handoff_from_failed_generate: dict[str, Any] | None = None
+    executed_checks: list[dict[str, Any]] = Field(default_factory=list)
+    fix_attempts: list[dict[str, Any]] = Field(default_factory=list)
+    scope_expansions: list[dict[str, Any]] = Field(default_factory=list)
+    container_statuses: list[dict[str, Any]] = Field(default_factory=list)
     compile_summary: dict[str, int | str] = Field(default_factory=dict)
     events: list[JobEvent] = Field(default_factory=list)
     summary: str | None = None
@@ -313,6 +331,8 @@ class RunCheckResult(StrictModel):
     status: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
     details: str | None = None
     duration_ms: int | None = None
+    command: str | None = None
+    exit_code: int | None = None
     logs: list[str] = Field(default_factory=list)
 
 
@@ -359,6 +379,55 @@ class RepairIterationRecord(StrictModel):
     check_results: list[RunCheckResult] = Field(default_factory=list)
     latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
     token_usage: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ContainerStatusRecord(StrictModel):
+    service: str
+    name: str | None = None
+    state: str | None = None
+    status: str | None = None
+    health: str | None = None
+    exit_code: str | None = None
+
+
+class FixScopeEntry(StrictModel):
+    file_path: str
+    reason: str
+
+
+class FixCase(StrictModel):
+    fix_case_id: str = Field(default_factory=lambda: new_id("fix_case"))
+    workspace_id: str
+    run_id: str
+    attempt: int = 1
+    failure_class: str | None = None
+    failure_signature: str | None = None
+    failing_command: str | None = None
+    root_cause_summary: str | None = None
+    exact_error_excerpt: str | None = None
+    implicated_files: list[str] = Field(default_factory=list)
+    container_statuses: list[ContainerStatusRecord] = Field(default_factory=list)
+    container_logs: dict[str, list[str]] = Field(default_factory=dict)
+    write_scope: list[FixScopeEntry] = Field(default_factory=list)
+    attempt_history: list[dict[str, Any]] = Field(default_factory=list)
+    executed_checks: list[RunCheckResult] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class FixAttemptRecord(StrictModel):
+    fix_attempt_id: str = Field(default_factory=lambda: new_id("fix_attempt"))
+    run_id: str
+    attempt: int
+    diagnosis: str
+    commands: list[str] = Field(default_factory=list)
+    exit_codes: dict[str, int | None] = Field(default_factory=dict)
+    files_changed: list[str] = Field(default_factory=list)
+    implicated_files: list[str] = Field(default_factory=list)
+    failure_signature: str | None = None
+    result: Literal["patched", "green", "conflict", "failed", "stopped"] = "patched"
+    rationale_by_file: dict[str, str] = Field(default_factory=dict)
+    expected_verification: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -416,7 +485,11 @@ class RunRecord(StrictModel):
     summary: str | None = None
     failure_reason: str | None = None
     failure_class: str | None = None
+    failure_signature: str | None = None
     root_cause_summary: str | None = None
+    current_fix_phase: str | None = None
+    current_failing_command: str | None = None
+    current_exit_code: int | None = None
     fix_targets: list[str] = Field(default_factory=list)
     handoff_from_failed_generate: dict[str, Any] | None = None
     error_context: ErrorContext | None = None
@@ -425,6 +498,8 @@ class RunRecord(StrictModel):
     artifacts: dict[str, str] = Field(default_factory=dict)
     latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
     repair_iterations: list[dict[str, Any]] = Field(default_factory=list)
+    fix_attempts: list[dict[str, Any]] = Field(default_factory=list)
+    scope_expansions: list[dict[str, Any]] = Field(default_factory=list)
     apply_result: dict[str, Any] | None = None
     retrieval_stats: dict[str, Any] = Field(default_factory=dict)
     cache_stats: dict[str, Any] = Field(default_factory=dict)

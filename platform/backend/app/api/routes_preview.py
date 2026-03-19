@@ -83,6 +83,10 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
     candidate_diff = container.generation_service.current_report(workspace_id, "candidate_diff")
     check_results = container.generation_service.current_report(workspace_id, "check_results")
     trace = container.generation_service.current_report(workspace_id, "trace")
+    fix_case = container.generation_service.current_report(workspace_id, "fix_case")
+    fix_attempts = container.generation_service.current_report(workspace_id, "fix_attempts")
+    scope_expansions = container.generation_service.current_report(workspace_id, "scope_expansions")
+    fix_runtime = container.generation_service.current_report(workspace_id, "fix_runtime")
 
     return {
         "workspace_id": workspace_id,
@@ -109,6 +113,10 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
             "iterations": iterations,
             "candidate_diff": candidate_diff,
             "check_results": check_results,
+            "fix_case": fix_case,
+            "fix_attempts": fix_attempts,
+            "scope_expansions": scope_expansions,
+            "fix_runtime": fix_runtime,
             "spec_summary": {
                 "product_goal": spec.get("product_goal") if spec else None,
                 "actors": len(spec.get("actors", [])) if spec else 0,

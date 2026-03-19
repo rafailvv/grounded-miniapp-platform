@@ -40,7 +40,11 @@ export type Run = {
   summary?: string | null;
   failure_reason?: string | null;
   failure_class?: string | null;
+  failure_signature?: string | null;
   root_cause_summary?: string | null;
+  current_fix_phase?: string | null;
+  current_failing_command?: string | null;
+  current_exit_code?: number | null;
   fix_targets?: string[];
   handoff_from_failed_generate?: {
     mode?: "generate" | "fix";
@@ -66,6 +70,8 @@ export type Run = {
   touched_files: string[];
   artifacts: Record<string, string>;
   repair_iterations?: Array<Record<string, unknown>>;
+  fix_attempts?: Array<Record<string, unknown>>;
+  scope_expansions?: Array<Record<string, unknown>>;
   rolled_back: boolean;
   rolled_back_at?: string | null;
   created_at: string;
@@ -122,11 +128,21 @@ export type RunArtifacts = {
   failure_analysis?: {
     mode?: "generate" | "fix";
     failure_class?: string | null;
+    failure_signature?: string | null;
     root_cause_summary?: string | null;
     fix_targets?: string[];
     handoff_from_failed_generate?: Run["handoff_from_failed_generate"] | null;
     error_context?: Run["error_context"] | null;
+    current_fix_phase?: string | null;
+    current_failing_command?: string | null;
+    current_exit_code?: number | null;
+    executed_checks?: Array<Record<string, unknown>>;
+    container_statuses?: Array<Record<string, unknown>>;
   } | null;
+  fix_case?: Record<string, unknown> | null;
+  fix_attempts?: { items?: Array<Record<string, unknown>> } | null;
+  scope_expansions?: { items?: Array<Record<string, unknown>> } | null;
+  fix_runtime?: Record<string, unknown> | null;
   preview?: {
     status: string;
     runtime_mode: string;
@@ -147,6 +163,11 @@ export type WorkspaceLogs = {
     llm_model?: string | null;
     llm_provider?: string | null;
     failure_reason?: string | null;
+    failure_class?: string | null;
+    failure_signature?: string | null;
+    current_fix_phase?: string | null;
+    current_failing_command?: string | null;
+    current_exit_code?: number | null;
   } | null;
   events: Array<{
     event_id: string;
@@ -187,6 +208,10 @@ export type WorkspaceLogs = {
     iterations?: Record<string, unknown> | null;
     candidate_diff?: Record<string, unknown> | null;
     check_results?: Record<string, unknown> | null;
+    fix_case?: Record<string, unknown> | null;
+    fix_attempts?: Record<string, unknown> | null;
+    scope_expansions?: Record<string, unknown> | null;
+    fix_runtime?: Record<string, unknown> | null;
     spec_summary?: Record<string, unknown> | null;
   };
 };

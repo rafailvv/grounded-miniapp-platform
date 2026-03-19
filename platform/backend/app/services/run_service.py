@@ -20,6 +20,7 @@ from app.models.domain import (
     WorkspaceRecord,
 )
 from app.repositories.state_store import StateStore
+from app.services.fix_orchestrator import FixOrchestrator
 from app.services.generation_service import GenerationService
 from app.services.preview_service import PreviewService
 from app.services.workspace_service import WorkspaceService
@@ -34,12 +35,14 @@ class RunService:
         store: StateStore,
         workspace_service: WorkspaceService,
         generation_service: GenerationService,
+        fix_orchestrator: FixOrchestrator,
         preview_service: PreviewService,
         openrouter_client: OpenRouterClient,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
         self.generation_service = generation_service
+        self.fix_orchestrator = fix_orchestrator
         self.preview_service = preview_service
         self.openrouter_client = openrouter_client
 
@@ -244,22 +247,47 @@ class RunService:
         self._save_run(run)
         logger.info("run_started run_id=%s workspace_id=%s intent=%s", run.run_id, run.workspace_id, run.intent)
         try:
-            job = self.generation_service.generate(
-                run.workspace_id,
-                GenerateRequest(
-                    prompt=request.prompt,
-                    mode=request.mode,
-                    target_platform=request.target_platform,
-                    preview_profile=request.preview_profile,
-                    generation_mode=effective_generation_mode,
-                    intent=run.intent,
-                    target_role_scope=run.target_role_scope,
-                    model_profile=request.model_profile,
-                    linked_run_id=run.run_id,
-                    error_context=request.error_context,
-                ),
-                should_stop=lambda: self._is_stop_requested(run.run_id),
+            generate_request = GenerateRequest(
+                prompt=request.prompt,
+                mode=request.mode,
+                target_platform=request.target_platform,
+                preview_profile=request.preview_profile,
+                generation_mode=effective_generation_mode,
+                intent=run.intent,
+                target_role_scope=run.target_role_scope,
+                model_profile=request.model_profile,
+                linked_run_id=run.run_id,
+                error_context=request.error_context,
             )
+            job = (
+                self.fix_orchestrator.generate(
+                    run.workspace_id,
+                    generate_request,
+                    should_stop=lambda: self._is_stop_requested(run.run_id),
+                )
+                if request.mode == "fix"
+                else self.generation_service.generate(
+                    run.workspace_id,
+                    generate_request,
+                    should_stop=lambda: self._is_stop_requested(run.run_id),
+                )
+            )
+            if self._should_auto_fix_failed_generate(request, job):
+                run.current_stage = "auto-fixing build failure"
+                run.progress_percent = max(run.progress_percent, 82)
+                run.updated_at = datetime.now(timezone.utc)
+                self._save_run(run)
+                self._append_job_event(
+                    job.job_id,
+                    "repair_started",
+                    "Frontend build failed during generate. Switching to fix mode automatically.",
+                    {"run_id": run.run_id},
+                )
+                job = self.fix_orchestrator.generate(
+                    run.workspace_id,
+                    self._build_auto_fix_request(run=run, request=request, failed_job=job),
+                    should_stop=lambda: self._is_stop_requested(run.run_id),
+                )
 
             preview = self.preview_service.get(run.workspace_id)
             change_plan = self._build_change_plan(
@@ -275,7 +303,11 @@ class RunService:
             run.summary = job.summary
             run.failure_reason = job.failure_reason
             run.failure_class = job.failure_class
+            run.failure_signature = job.failure_signature
             run.root_cause_summary = job.root_cause_summary
+            run.current_fix_phase = job.current_fix_phase
+            run.current_failing_command = job.current_failing_command
+            run.current_exit_code = job.current_exit_code
             run.fix_targets = list(job.fix_targets)
             run.handoff_from_failed_generate = dict(job.handoff_from_failed_generate or {}) or None
             run.checks_summary = self._build_checks_summary(job.validation_snapshot, preview.status)
@@ -284,6 +316,8 @@ class RunService:
             run.iteration_count = len((self.generation_service.current_report(run.workspace_id, "iterations") or {}).get("items", []))
             run.latency_breakdown = dict(job.latency_breakdown)
             run.repair_iterations = list(job.repair_iterations)
+            run.fix_attempts = list(job.fix_attempts)
+            run.scope_expansions = list(job.scope_expansions)
             run.apply_result = dict(job.apply_result or {})
             run.retrieval_stats = dict(job.retrieval_stats)
             run.cache_stats = dict(job.cache_stats)
@@ -361,6 +395,70 @@ class RunService:
             self._save_run(run)
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
             logger.exception("run_failed run_id=%s workspace_id=%s", run.run_id, run.workspace_id)
+
+    def _should_auto_fix_failed_generate(self, request: CreateRunRequest, job: Any) -> bool:
+        if request.mode == "fix":
+            return False
+        if getattr(job, "status", None) != "failed":
+            return False
+        if not getattr(job, "handoff_from_failed_generate", None):
+            return False
+        validation_snapshot = getattr(job, "validation_snapshot", None)
+        build_failed = bool(validation_snapshot and not getattr(validation_snapshot, "build_valid", True))
+        haystack_parts = [
+            getattr(job, "failure_reason", None),
+            getattr(job, "root_cause_summary", None),
+            getattr(job, "failure_class", None),
+        ]
+        if validation_snapshot is not None:
+            haystack_parts.extend(
+                str(issue.get("message") or "")
+                for issue in getattr(validation_snapshot, "issues", [])
+                if isinstance(issue, dict)
+            )
+        haystack = " ".join(part for part in haystack_parts if part).lower()
+        frontend_build_markers = (
+            "npm run build",
+            "draft frontend",
+            "vite build",
+            "typescript",
+            "tsc",
+        )
+        return build_failed and any(marker in haystack for marker in frontend_build_markers)
+
+    def _build_auto_fix_request(
+        self,
+        *,
+        run: RunRecord,
+        request: CreateRunRequest,
+        failed_job: Any,
+    ) -> GenerateRequest:
+        handoff = dict(getattr(failed_job, "handoff_from_failed_generate", None) or {})
+        handoff_context = handoff.get("error_context") or {}
+        raw_error = (
+            handoff_context.get("raw_error")
+            or getattr(failed_job, "failure_reason", None)
+            or getattr(failed_job, "root_cause_summary", None)
+            or "Frontend build failed during generation."
+        )
+        error_source = handoff_context.get("source") or "frontend"
+        failing_target = handoff_context.get("failing_target") or "frontend build"
+        return GenerateRequest(
+            prompt=handoff.get("prompt") or "Analyze the reported failure and apply the smallest safe fix.",
+            mode="fix",
+            target_platform=request.target_platform,
+            preview_profile=request.preview_profile,
+            generation_mode=GenerationMode.BALANCED,
+            intent="edit",
+            target_role_scope=run.target_role_scope,
+            model_profile=request.model_profile,
+            linked_run_id=run.run_id,
+            error_context={
+                "raw_error": raw_error,
+                "source": error_source,
+                "failing_target": failing_target,
+            },
+        )
 
     def _is_stop_requested(self, run_id: str) -> bool:
         payload = self.store.get("reports", f"run_stop_request:{run_id}")
@@ -489,13 +587,23 @@ class RunService:
             "cache_stats": job.cache_stats,
             "apply_result": job.apply_result,
             "repair_iterations": job.repair_iterations,
+            "fix_case": self.generation_service.current_report(workspace_id, "fix_case"),
+            "fix_attempts": self.generation_service.current_report(workspace_id, "fix_attempts"),
+            "scope_expansions": self.generation_service.current_report(workspace_id, "scope_expansions"),
+            "fix_runtime": self.generation_service.current_report(workspace_id, "fix_runtime"),
             "failure_analysis": {
                 "mode": run.mode,
                 "failure_class": job.failure_class,
+                "failure_signature": job.failure_signature,
                 "root_cause_summary": job.root_cause_summary,
                 "fix_targets": job.fix_targets,
                 "handoff_from_failed_generate": job.handoff_from_failed_generate,
                 "error_context": job.error_context.model_dump(mode="json") if job.error_context else None,
+                "current_fix_phase": job.current_fix_phase,
+                "current_failing_command": job.current_failing_command,
+                "current_exit_code": job.current_exit_code,
+                "executed_checks": job.executed_checks,
+                "container_statuses": job.container_statuses,
             },
         }
         self.store.upsert("reports", f"run_artifacts:{run.run_id}", payload)

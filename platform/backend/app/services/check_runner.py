@@ -40,6 +40,7 @@ class CheckRunner:
                 status="failed" if filtered_issues else "passed",
                 details="Build validators executed against the draft workspace.",
                 duration_ms=int((time.perf_counter() - validator_started) * 1000),
+                command="validation_suite.validate_build",
                 logs=[issue.message for issue in filtered_issues],
             )
         )
@@ -58,6 +59,7 @@ class CheckRunner:
                 status=preview_status,
                 details="Draft preview smoke recorded using the current preview session.",
                 duration_ms=int((time.perf_counter() - preview_started) * 1000),
+                command="preview smoke (current session)",
                 logs=preview.logs[-12:],
             )
         )
@@ -187,6 +189,7 @@ class CheckRunner:
                 name="changed_files_static",
                 status="failed",
                 details="Frontend build tooling is unavailable in the backend runtime.",
+                command="npm run build",
                 logs=[
                     "Frontend build tooling is unavailable in the backend runtime.",
                     "npm was not found on PATH.",
@@ -210,6 +213,8 @@ class CheckRunner:
                         name="changed_files_static",
                         status="failed",
                         details="Frontend dependency install failed before build.",
+                        command=" ".join(install_cmd),
+                        exit_code=install_result.returncode,
                         logs=self._command_logs(
                             "Frontend dependency install failed before build.",
                             install_result.stdout,
@@ -230,6 +235,8 @@ class CheckRunner:
                     name="changed_files_static",
                     status="failed",
                     details="npm run build failed for the draft frontend.",
+                    command=f"{npm_binary} run build",
+                    exit_code=build_result.returncode,
                     logs=self._command_logs(
                         "npm run build failed for the draft frontend.",
                         build_result.stdout,
@@ -240,6 +247,8 @@ class CheckRunner:
                 name="changed_files_static",
                 status="passed",
                 details="npm run build passed for the draft frontend.",
+                command=f"{npm_binary} run build",
+                exit_code=build_result.returncode,
                 logs=["npm run build passed for the draft frontend."],
             )
         except FileNotFoundError:
@@ -247,6 +256,7 @@ class CheckRunner:
                 name="changed_files_static",
                 status="failed",
                 details="npm is not available in the backend runtime.",
+                command="npm run build",
                 logs=["npm is not available in the backend runtime."],
             )
         except subprocess.TimeoutExpired as exc:
@@ -254,6 +264,7 @@ class CheckRunner:
                 name="changed_files_static",
                 status="failed",
                 details="npm run build timed out for the draft frontend.",
+                command=f"{npm_binary} run build",
                 logs=self._command_logs(
                     "npm run build timed out for the draft frontend.",
                     exc.stdout or "",
@@ -269,11 +280,13 @@ class CheckRunner:
                 name="changed_files_static",
                 status="passed",
                 details="No backend Python files required compilation.",
+                command="python -m py_compile",
                 logs=["No backend Python files required compilation."],
             )
         try:
+            command = [sys.executable, "-m", "py_compile", *py_files]
             result = subprocess.run(
-                [sys.executable, "-m", "py_compile", *py_files],
+                command,
                 cwd=backend_dir,
                 capture_output=True,
                 text=True,
@@ -284,6 +297,7 @@ class CheckRunner:
                 name="changed_files_static",
                 status="failed",
                 details="Backend py_compile timed out.",
+                command=f"{sys.executable} -m py_compile {' '.join(py_files)}",
                 logs=self._command_logs("Backend py_compile timed out.", exc.stdout or "", exc.stderr or ""),
             )
         if result.returncode != 0:
@@ -291,12 +305,16 @@ class CheckRunner:
                 name="changed_files_static",
                 status="failed",
                 details="Backend py_compile failed for the draft backend.",
+                command=f"{sys.executable} -m py_compile {' '.join(py_files)}",
+                exit_code=result.returncode,
                 logs=self._command_logs("Backend py_compile failed for the draft backend.", result.stdout, result.stderr),
             )
         return RunCheckResult(
             name="changed_files_static",
             status="passed",
             details="Backend py_compile passed for the draft backend.",
+            command=f"{sys.executable} -m py_compile {' '.join(py_files)}",
+            exit_code=result.returncode,
             logs=["Backend py_compile passed for the draft backend."],
         )
 
@@ -311,6 +329,12 @@ class CheckRunner:
 
     @staticmethod
     def _filter_build_issues(issues: list[ValidationIssue], scope_mode: str) -> list[ValidationIssue]:
-        if scope_mode != "minimal_patch":
+        if scope_mode not in {"minimal_patch", "fix_agentic"}:
             return issues
-        return [issue for issue in issues if not issue.code.startswith("build.placeholder_")]
+        ignored_prefixes = ("build.placeholder_",)
+        ignored_codes = {"build.missing_entrypoint"}
+        return [
+            issue
+            for issue in issues
+            if not issue.code.startswith(ignored_prefixes) and issue.code not in ignored_codes
+        ]
