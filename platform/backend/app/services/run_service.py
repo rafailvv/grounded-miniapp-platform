@@ -104,7 +104,7 @@ class RunService:
             target_role_scope=[role for role in request.target_role_scope if role in ROLE_SCOPE],
             model_profile=request.model_profile,
             generation_mode=effective_generation_mode,
-            llm_provider="openrouter" if self.openrouter_client.enabled else None,
+            llm_provider="openai" if self.openrouter_client.enabled else None,
             source_revision_id=workspace.current_revision_id,
             error_context=request.error_context,
             status="pending",

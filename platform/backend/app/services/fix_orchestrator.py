@@ -84,7 +84,7 @@ class FixOrchestrator:
             current_revision_id=workspace.current_revision_id,
             fidelity="balanced_app",
             llm_enabled=self.openrouter_client.enabled,
-            llm_provider="openrouter" if self.openrouter_client.enabled else None,
+            llm_provider="openai" if self.openrouter_client.enabled else None,
             model_profile=request.model_profile,
             linked_run_id=run_id,
             error_context=request.error_context,

@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 class OpenRouterClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.api_key = os.getenv("OPENROUTER_API_KEY")
-        self.base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        self.base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
     @property
     def enabled(self) -> bool:
@@ -34,10 +34,7 @@ class OpenRouterClient:
             "task_profiles": TASK_PROFILES,
             "default_coding_profile": "openai_code_fast",
             "routing": {
-                "allow_fallbacks": True,
-                "require_parameters": True,
-                "data_collection": "deny",
-                "sticky_routing": True,
+                "provider": "openai",
             },
             "supports_prompt_cache_key": True,
         }
@@ -54,7 +51,7 @@ class OpenRouterClient:
         stable_prefix: str | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
-            raise RuntimeError("OpenRouter is not configured.")
+            raise RuntimeError("OpenAI is not configured.")
         schema_name = self._sanitize_schema_name(schema_name)
         normalized_schema = self._normalize_schema(schema)
         model_config = MODEL_REGISTRY[role]
@@ -194,7 +191,7 @@ class OpenRouterClient:
         stable_prefix: str | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
-            raise RuntimeError("OpenRouter is not configured.")
+            raise RuntimeError("OpenAI is not configured.")
         normalized_schema = self._normalize_schema(schema)
         model_config = MODEL_REGISTRY[role]
         primary_model = model_config["primary"]
@@ -236,7 +233,7 @@ class OpenRouterClient:
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
     ) -> dict[str, Any]:
-        if model.startswith("openai/gpt-5."):
+        if model.startswith("gpt-5"):
             return self._responses_structured(
                 role=role,
                 model=model,
@@ -277,7 +274,7 @@ class OpenRouterClient:
             "Do not wrap it in markdown."
         )
         augmented_user_prompt = f"{user_prompt}\n\n{schema_hint}"
-        if model.startswith("openai/gpt-5."):
+        if model.startswith("gpt-5"):
             return self._responses_json_object(
                 role=role,
                 schema_name=schema_name,
@@ -301,8 +298,6 @@ class OpenRouterClient:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": self.settings.openrouter_site_url,
-            "X-Title": self.settings.openrouter_app_name,
         }
         return headers
 
@@ -460,12 +455,6 @@ class OpenRouterClient:
                     "schema": schema,
                 },
             },
-            "provider": {
-                "allow_fallbacks": True,
-                "require_parameters": True,
-                "data_collection": "deny",
-                "sort": "latency",
-            },
         }
         cache_control = self._cache_control(model)
         if cache_control is not None:
@@ -515,12 +504,6 @@ class OpenRouterClient:
                     "schema": schema,
                 }
             },
-            "provider": {
-                "allow_fallbacks": True,
-                "require_parameters": True,
-                "data_collection": "deny",
-                "sort": "latency",
-            },
         }
         cache_control = self._cache_control(model)
         if cache_control is not None:
@@ -563,12 +546,6 @@ class OpenRouterClient:
             ),
             "response_format": {
                 "type": "json_object",
-            },
-            "provider": {
-                "allow_fallbacks": True,
-                "require_parameters": True,
-                "data_collection": "deny",
-                "sort": "latency",
             },
         }
         cache_control = self._cache_control(model)
@@ -615,12 +592,6 @@ class OpenRouterClient:
                     "type": "json_object",
                 }
             },
-            "provider": {
-                "allow_fallbacks": True,
-                "require_parameters": True,
-                "data_collection": "deny",
-                "sort": "latency",
-            },
         }
         cache_control = self._cache_control(model)
         if cache_control is not None:
@@ -655,7 +626,7 @@ class OpenRouterClient:
                 last_error = exc
                 if attempt == 2 or not self._is_retryable_request_error(exc):
                     raise
-                logger.warning("Retrying OpenRouter request endpoint=%s model=%s after transient failure: %s", endpoint, model, exc)
+                logger.warning("Retrying OpenAI request endpoint=%s model=%s after transient failure: %s", endpoint, model, exc)
                 time.sleep(0.8 * (attempt + 1))
         assert last_error is not None
         raise last_error
@@ -770,7 +741,7 @@ class OpenRouterClient:
     def _parse_json_payload(raw_text: str, endpoint: str) -> dict[str, Any]:
         text = raw_text.strip()
         if not text:
-            raise RuntimeError(f"OpenRouter {endpoint} returned empty text instead of JSON.")
+            raise RuntimeError(f"OpenAI {endpoint} returned empty text instead of JSON.")
 
         candidates = [text]
         decoder = json.JSONDecoder()
@@ -808,11 +779,11 @@ class OpenRouterClient:
             if isinstance(parsed, dict):
                 return parsed
             raise RuntimeError(
-                f"OpenRouter {endpoint} returned JSON, but it was {type(parsed).__name__} instead of an object."
+                f"OpenAI {endpoint} returned JSON, but it was {type(parsed).__name__} instead of an object."
             )
 
         snippet = text[:1200]
-        raise RuntimeError(f"OpenRouter {endpoint} returned non-JSON text: {snippet}")
+        raise RuntimeError(f"OpenAI {endpoint} returned non-JSON text: {snippet}")
 
     @staticmethod
     def _raise_for_status(response: httpx.Response, endpoint: str) -> None:
@@ -822,10 +793,10 @@ class OpenRouterClient:
             body = response.text.strip()
             if body:
                 raise RuntimeError(
-                    f"OpenRouter {endpoint} returned {response.status_code}: {body[:2000]}"
+                    f"OpenAI {endpoint} returned {response.status_code}: {body[:2000]}"
                 ) from exc
             raise RuntimeError(
-                f"OpenRouter {endpoint} returned {response.status_code} with an empty body."
+                f"OpenAI {endpoint} returned {response.status_code} with an empty body."
             ) from exc
 
     @staticmethod
@@ -834,8 +805,8 @@ class OpenRouterClient:
             error = payload["error"]
             if isinstance(error, dict):
                 message = error.get("message") or error.get("metadata") or error
-                raise RuntimeError(f"OpenRouter chat error: {message}")
-            raise RuntimeError(f"OpenRouter chat error: {error}")
+                raise RuntimeError(f"OpenAI chat error: {message}")
+            raise RuntimeError(f"OpenAI chat error: {error}")
 
         choices = payload.get("choices")
         if isinstance(choices, list) and choices:
@@ -862,7 +833,7 @@ class OpenRouterClient:
             return OpenRouterClient._extract_response_text(payload)
         except RuntimeError:
             snippet = json.dumps(payload)[:1000]
-            raise RuntimeError(f"OpenRouter chat response did not contain structured text output. Payload: {snippet}")
+            raise RuntimeError(f"OpenAI chat response did not contain structured text output. Payload: {snippet}")
 
     @staticmethod
     def _extract_response_text(payload: dict[str, Any]) -> str:
@@ -872,4 +843,4 @@ class OpenRouterClient:
             for content in item.get("content", []):
                 if content.get("type") in {"output_text", "text"} and isinstance(content.get("text"), str):
                     return content["text"]
-        raise RuntimeError("OpenRouter response did not contain structured text output.")
+        raise RuntimeError("OpenAI response did not contain structured text output.")

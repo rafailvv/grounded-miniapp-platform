@@ -59,7 +59,7 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
         return {
             "llm": {
                 "enabled": llm["enabled"],
-                "provider": "openrouter" if llm["enabled"] else None,
+                "provider": "openai" if llm["enabled"] else None,
                 "models": llm["models"],
                 "task_profiles": llm["task_profiles"],
             },

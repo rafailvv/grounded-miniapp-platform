@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-WORKDIR /workspace/platform/backend
+WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1

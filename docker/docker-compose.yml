@@ -3,12 +3,12 @@ name: grounded-miniapp-platform
 services:
   platform-backend:
     image: ${PLATFORM_BACKEND_IMAGE}
-    build:
-      context: ../platform/backend
-      dockerfile: Dockerfile
     working_dir: /workspace/platform/backend
     volumes:
-      - ..:/workspace
+      - ../platform:/workspace/platform
+      - ../runtime:/workspace/runtime
+      - ../contracts:/workspace/contracts
+      - ../data:/workspace/data
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       PREVIEW_BASE_URL: ${PREVIEW_BASE_URL}
@@ -16,10 +16,13 @@ services:
       PREVIEW_PORT_BASE: ${PREVIEW_PORT_BASE}
       PREVIEW_START_TIMEOUT_SEC: ${PREVIEW_START_TIMEOUT_SEC}
       PLATFORM_DATA_DIR: /workspace/data
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
-      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
     command: >
-      sh -c "pip install -e . &&
+      sh -c "apt-get update &&
+             apt-get install -y --no-install-recommends docker.io docker-compose git nodejs npm &&
+             rm -rf /var/lib/apt/lists/* &&
+             pip install -e . &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000"
     ports:
       - "${PLATFORM_BACKEND_PORT}:8000"
@@ -28,7 +31,7 @@ services:
     image: ${PLATFORM_FRONTEND_IMAGE}
     working_dir: /workspace/platform/frontend
     volumes:
-      - ..:/workspace
+      - ../platform/frontend:/workspace/platform/frontend
     environment:
       VITE_PLATFORM_NAME: ${VITE_PLATFORM_NAME}
       VITE_API_PROXY_TARGET: http://platform-backend:8000

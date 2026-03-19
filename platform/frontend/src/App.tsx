@@ -40,7 +40,10 @@ type PreviewInfo = {
   role_urls?: Record<string, string>;
   runtime_mode?: string;
   status?: string;
+  stage?: string;
+  progress_percent?: number;
   draft_run_id?: string | null;
+  last_error?: string | null;
 };
 
 type RunComposerMode = "generate" | "fix";
@@ -719,6 +722,7 @@ export default function App() {
       return;
     }
     activeWorkspaceIdRef.current = workspace.workspace_id;
+    primePreviewSurfaceForBoot();
     void (async () => {
       await refreshWorkspaceState(workspace.workspace_id);
       try {
@@ -728,7 +732,7 @@ export default function App() {
       }
       void pollPreviewUntilReady(workspace.workspace_id);
     })();
-  }, [workspace]);
+  }, [workspace?.workspace_id]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -1094,11 +1098,11 @@ export default function App() {
       if (previewResult.status === "fulfilled") {
         const previewPayload = previewResult.value;
         const previewIsReady = previewPayload.status === "running" && Boolean(previewPayload.url);
-        setPreviewUrl(previewIsReady ? (previewPayload.url ?? "") : "");
-        setRolePreviewUrls(previewIsReady ? (previewPayload.role_urls ?? {}) : {});
         setPreviewRuntimeMode(previewPayload.runtime_mode ?? "");
-        setPreviewStatus(previewPayload.status ?? "");
         if (previewIsReady) {
+          setPreviewUrl(previewPayload.url ?? "");
+          setRolePreviewUrls(previewPayload.role_urls ?? {});
+          setPreviewStatus(previewPayload.status ?? "");
           setPreviewCycle((current) => current + 1);
           setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
           setPreviewFailed({
@@ -1106,8 +1110,13 @@ export default function App() {
             specialist: false,
             manager: false,
           });
+          setPreviewBooting(false);
         } else {
-          if (previewPayload.status === "stopped" || previewPayload.status === "error" || !previewPayload.status) {
+          const previewNeedsBootstrap = previewPayload.status === "stopped" || previewPayload.status === "error" || !previewPayload.status;
+          setPreviewUrl("");
+          setRolePreviewUrls({});
+          setPreviewStatus(previewNeedsBootstrap ? "starting" : (previewPayload.status ?? "starting"));
+          if (previewNeedsBootstrap) {
             void ensurePreview(workspaceId).catch(() => undefined);
           }
           setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
@@ -1118,8 +1127,15 @@ export default function App() {
           });
         }
       } else {
+        setPreviewUrl("");
+        setRolePreviewUrls({});
         setPreviewStatus("starting");
         setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
+        setPreviewFailed({
+          client: false,
+          specialist: false,
+          manager: false,
+        });
       }
 
       setError(refreshErrors.length ? refreshErrors.join(" | ") : "");
@@ -1163,21 +1179,19 @@ export default function App() {
             specialist: false,
             manager: false,
           });
+          setPreviewBooting(false);
           return;
         }
 
         if (preview.status === "error") {
+          setPreviewStatus("starting");
           try {
             await ensurePreview(workspaceId);
           } catch {
             // If ensure also fails, keep current error state and surface logs.
           }
-          setPreviewLoading({
-            client: false,
-            specialist: false,
-            manager: false,
-          });
-          return;
+          await sleep(PREVIEW_BOOT_POLL_INTERVAL_MS);
+          continue;
         }
 
         if (!rebuildTriggered && attempt >= 2 && (preview.status === "stopped" || !preview.status)) {
@@ -1193,6 +1207,7 @@ export default function App() {
       }
       await sleep(PREVIEW_BOOT_POLL_INTERVAL_MS);
     }
+    setPreviewBooting(false);
     setPreviewLoading({
       client: false,
       specialist: false,
@@ -1410,10 +1425,8 @@ export default function App() {
     setError("");
     try {
       const nextWorkspace = await openWorkspace(workspaceId);
+      clearWorkspaceDraftSurface();
       setWorkspace(nextWorkspace);
-      setRuns([]);
-      setSelectedRunId("");
-      setRunArtifacts(null);
       await refreshWorkspaceList(nextWorkspace.workspace_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to open workspace.");
@@ -1428,10 +1441,8 @@ export default function App() {
     setCreatingWorkspace(true);
     try {
       const nextWorkspace = await ensureWorkspace();
+      clearWorkspaceDraftSurface();
       setWorkspace(nextWorkspace);
-      setRuns([]);
-      setSelectedRunId("");
-      setRunArtifacts(null);
       void refreshWorkspaceList(nextWorkspace.workspace_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create workspace.");
@@ -1470,12 +1481,46 @@ export default function App() {
       specialist: ROOT_PREVIEW_PATH,
       manager: ROOT_PREVIEW_PATH,
     });
+    setPreviewBooting(false);
+  }
+
+  function primePreviewSurfaceForBoot() {
+    ROLE_ORDER.forEach((role) => clearPreviewTimeout(role));
+    setPreviewUrl("");
+    setRolePreviewUrls({});
+    setPreviewRuntimeMode("");
+    setPreviewStatus("starting");
+    setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
+    setPreviewFailed({
+      client: false,
+      specialist: false,
+      manager: false,
+    });
+    setRolePreviewPath({
+      client: ROOT_PREVIEW_PATH,
+      specialist: ROOT_PREVIEW_PATH,
+      manager: ROOT_PREVIEW_PATH,
+    });
+    setPreviewBooting(true);
+  }
+
+  function clearWorkspaceDraftSurface() {
+    setRuns([]);
+    setSelectedRunId("");
+    setRunArtifacts(null);
+    setWorkspaceLogs(null);
+    setFiles([]);
+    setSelectedPath("");
+    setFileContent("");
+    setExpandedDirectories(new Set<string>());
+    primePreviewSurfaceForBoot();
   }
 
   function bootstrapWorkspaceAfterDelete(nextWorkspaces: Workspace[]) {
     void (async () => {
       try {
         const nextWorkspace = nextWorkspaces[0] ? await openWorkspace(nextWorkspaces[0].workspace_id) : await ensureWorkspace();
+        clearWorkspaceDraftSurface();
         setWorkspace(nextWorkspace);
         await refreshWorkspaceList(nextWorkspace.workspace_id);
       } catch (err) {

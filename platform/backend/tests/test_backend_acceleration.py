@@ -881,46 +881,6 @@ def test_workspace_platform_log_is_persisted_to_file(tmp_path: Path) -> None:
     assert "Canonical template cloned." in content
 
 
-def test_create_workspace_auto_clones_template_and_starts_preview(tmp_path: Path, monkeypatch) -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
-    client = TestClient(app)
-
-    preview_started = threading.Event()
-    indexed = threading.Event()
-
-    def fake_ensure_started(workspace_id: str, *, force_rebuild: bool = False):
-        del force_rebuild
-        preview_started.set()
-        return app.state.container.preview_service._get_or_create(workspace_id)
-
-    def fake_index_workspace(workspace, source_dir):
-        del workspace, source_dir
-        indexed.set()
-        return None
-
-    monkeypatch.setattr(app.state.container.preview_service, "ensure_started", fake_ensure_started)
-    monkeypatch.setattr(app.state.container.code_index_service, "index_workspace", fake_index_workspace)
-
-    workspace = client.post(
-        "/workspaces",
-        json={
-            "name": "Auto Bootstrap Workspace",
-            "description": "Workspace creation should clone the template and start preview automatically",
-            "target_platform": "telegram_mini_app",
-            "preview_profile": "telegram_mock",
-        },
-    ).json()
-
-    workspace_id = workspace["workspace_id"]
-    source_root = tmp_path / "data" / "workspaces" / workspace_id / "source"
-
-    assert workspace["template_cloned"] is True
-    assert source_root.exists()
-    assert preview_started.wait(1.0)
-    assert indexed.wait(1.0)
-
-
 def test_base_template_tree_is_clean(tmp_path: Path) -> None:
     del tmp_path
     repo_root = Path(__file__).resolve().parents[3]

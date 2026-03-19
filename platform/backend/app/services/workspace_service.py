@@ -97,9 +97,6 @@ class WorkspaceService:
         workspace = self.get_workspace(workspace_id)
         workspace_root = self.workspace_root(workspace_id)
         source_dir = workspace_root / "source"
-        if workspace.template_cloned and source_dir.exists() and workspace.current_revision_id:
-            self.workspace_log_service.append(workspace_id, source="workspace", message="Canonical template clone skipped because workspace is already initialized.")
-            return workspace
         if source_dir.exists():
             shutil.rmtree(source_dir)
         self._copy_tree(self.settings.template_dir, source_dir)

@@ -191,7 +191,7 @@ class GenerationService:
             current_revision_id=workspace.current_revision_id,
             fidelity=QUALITY_FIDELITY[generation_mode],  # type: ignore[arg-type]
             llm_enabled=bool(llm_config["enabled"]),
-            llm_provider="openrouter" if llm_config["enabled"] else None,
+            llm_provider="openai" if llm_config["enabled"] else None,
             model_profile=request.model_profile,
             linked_run_id=request.linked_run_id,
             error_context=request.error_context,
@@ -252,12 +252,12 @@ class GenerationService:
             return self._block_with_messages(
                 job,
                 [
-                    "Agentic app generation now requires OpenRouter configuration for every run.",
-                    "Set OPENROUTER_API_KEY before creating or editing a mini-app workspace.",
+                    "Agentic app generation now requires OpenAI configuration for every run.",
+                    "Set OPENAI_API_KEY before creating or editing a mini-app workspace.",
                 ],
                 code="generation.llm_required",
                 event_type="job_failed",
-                failure_reason="Generation requires OpenRouter because the workspace now uses an LLM-first page planning and code editing pipeline.",
+                failure_reason="Generation requires OpenAI because the workspace now uses an LLM-first page planning and code editing pipeline.",
             )
 
         doc_refs = self.document_service.retrieve(
@@ -2917,7 +2917,7 @@ class GenerationService:
     ) -> dict[str, Any]:
         del workspace_id
         if not self.openrouter_client.enabled:
-            return {"error": "GroundedSpec generation requires OpenRouter configuration."}
+            return {"error": "GroundedSpec generation requires OpenAI configuration."}
         if generation_mode == GenerationMode.FAST:
             return self._resolve_grounded_spec_fast(
                 prompt=prompt,
