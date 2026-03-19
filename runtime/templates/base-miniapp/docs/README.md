@@ -2,9 +2,9 @@
 
 ## Purpose
 
-This canonical template exists to receive controlled compilation outputs from the grounded generation pipeline.
+This canonical template is the smallest supported Telegram-first mini-app baseline for generation.
 
-The current baseline is a tri-role mini-app:
+The current baseline is a tri-role app:
 
 - `client`
 - `specialist`
@@ -19,11 +19,12 @@ The current baseline is a tri-role mini-app:
 ## Frontend contract
 
 - The frontend bootstraps the role via `?role=` or the Telegram start parameter.
-- Profile pages sync with backend if `VITE_API_BASE_URL` is set.
-- Role home pages are static starter screens that can be extended by generation.
+- Home pages are simple role entry screens.
+- Profile pages load and save through the backend profile API.
+- Telegram helpers remain available for viewport, theme, back button, and haptics.
 
 ## Workspace rules
 
-- Prefer patching generated artifacts over rewriting template source files.
+- Extend this template by patching real source files instead of layering parallel runtime systems.
 - Preserve manual edits as separate git revisions.
 - Keep all three roles available in preview simultaneously.

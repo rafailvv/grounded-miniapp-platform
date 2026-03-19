@@ -11,13 +11,12 @@ What is included:
 - role bootstrap from `?role=` or Telegram `start_param`
 - home page for each role
 - profile page for each role
-- local profile storage with backend sync when `VITE_API_BASE_URL` is set
-- Telegram WebApp helpers for viewport, back button, theme, device storage, and haptics
+- backend-backed profile loading and saving
+- Telegram WebApp helpers for viewport, back button, theme, and haptics
+- optional Telegram dev mock behind `?mockTelegram=1`
 
 What is intentionally not included:
 - authentication
-- runtime manifest system
-- generated domain screens
 - domain-specific business logic
 
 ## Environment

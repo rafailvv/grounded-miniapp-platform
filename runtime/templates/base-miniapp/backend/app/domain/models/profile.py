@@ -12,8 +12,8 @@ class RoleProfileRecord(Base):
     __tablename__ = "role_profiles"
 
     role: Mapped[str] = mapped_column(String(32), primary_key=True)
-    first_name: Mapped[str] = mapped_column(String(120), nullable=False, default="John")
-    last_name: Mapped[str] = mapped_column(String(120), nullable=False, default="Doe")
+    first_name: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    last_name: Mapped[str] = mapped_column(String(120), nullable=False, default="")
     email: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     phone: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     photo_url: Mapped[str | None] = mapped_column(Text, nullable=True)

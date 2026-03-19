@@ -5,6 +5,8 @@ frontend/.vite/
 frontend/.cache/
 frontend/*.tsbuildinfo
 frontend/.eslintcache
+frontend/vite.config.js
+frontend/vite.config.d.ts
 
 backend/__pycache__/
 backend/**/*.pyc
@@ -15,5 +17,7 @@ backend/.ruff_cache/
 backend/app/generated/*.db
 backend/app/generated/*.sqlite
 backend/app/generated/*.sqlite3
+backend/.coverage
+backend/coverage/
 
 .DS_Store

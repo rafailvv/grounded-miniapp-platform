@@ -96,6 +96,7 @@ from app.services.context_pack_builder import ContextPackBuilder
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.patch_service import PatchService
 from app.services.preview_service import PreviewService
+from app.services.workspace_log_service import WorkspaceLogService
 from app.services.workspace_service import WorkspaceService, json_dumps
 from app.validators.suite import ValidationSuite
 
@@ -107,15 +108,16 @@ ROLE_COMPONENT_PREFIX = {
     "manager": "Manager",
 }
 DESIGN_REFERENCE_FILES = (
-    "frontend/src/shared/ui/templates/RoleProfileEditorPage.tsx",
-    "frontend/src/shared/ui/templates/RoleProfileEditorPage.module.css",
-    "frontend/src/shared/ui/ProfileCabinetCard/ProfileCabinetCard.tsx",
-    "frontend/src/shared/ui/ProfileCabinetCard/ProfileCabinetCard.module.css",
-    "frontend/src/shared/ui/generated/GeneratedRoleScreen.module.css",
+    "frontend/src/features/profile/ui/RoleProfileEditorPage.tsx",
+    "frontend/src/features/profile/ui/RoleProfileEditorPage.module.css",
+    "frontend/src/entities/profile/ui/ProfileCabinetCard/ProfileCabinetCard.tsx",
+    "frontend/src/entities/profile/ui/ProfileCabinetCard/ProfileCabinetCard.module.css",
+    "frontend/src/widgets/role-home/RoleHomePage.tsx",
+    "frontend/src/widgets/role-home/RoleHomePage.module.css",
 )
 SHARED_GENERATED_FILES = (
-    "frontend/src/shared/generated/appChrome.tsx",
-    "frontend/src/shared/generated/appState.tsx",
+    "frontend/src/app/routing/RoleRouter.tsx",
+    "frontend/src/app/layout/AppShell.tsx",
 )
 logger = logging.getLogger(__name__)
 ACTIVE_LLM_CACHE_CONTEXT: ContextVar[dict[str, str] | None] = ContextVar("active_llm_cache_context", default=None)
@@ -141,6 +143,7 @@ class GenerationService:
         check_runner: CheckRunner,
         validation_suite: ValidationSuite,
         openrouter_client: OpenRouterClient,
+        workspace_log_service: WorkspaceLogService,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -152,6 +155,7 @@ class GenerationService:
         self.check_runner = check_runner
         self.validation_suite = validation_suite
         self.openrouter_client = openrouter_client
+        self.workspace_log_service = workspace_log_service
 
     def generate(self, workspace_id: str, request: GenerateRequest, *, should_stop: Callable[[], bool] | None = None) -> JobRecord:
         started_at = time.perf_counter()
@@ -2096,8 +2100,9 @@ class GenerationService:
                 "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
                 "shared_contract": {
                     "preferred_imports": [
-                        "@/shared/generated/appChrome",
-                        "@/shared/generated/appState",
+                        "@/shared/api/httpClient",
+                        "@/entities/profile/ui/ProfileCabinetCard/ProfileCabinetCard",
+                        "@/features/profile/model/profileStore",
                     ],
                     "design_reference_files": design_reference_files,
                 },
@@ -5619,6 +5624,7 @@ class GenerationService:
         job.updated_at = datetime.now(timezone.utc)
         self._save_job(job)
         self._sync_run_progress(job, event_type, message)
+        self.workspace_log_service.append(job.workspace_id, source=f"generation.{event_type}", message=message, payload=details or {})
         logger.info("job_event workspace_id=%s job_id=%s event=%s message=%s", job.workspace_id, job.job_id, event_type, message)
 
     def _save_job(self, job: JobRecord) -> None:
@@ -5644,6 +5650,7 @@ class GenerationService:
         )
         current["entries"] = entries
         self._store_report(report_key, current)
+        self.workspace_log_service.append(workspace_id, source=f"generation.trace.{stage}", message=message, payload=payload or {})
         logger.info("trace workspace_id=%s stage=%s message=%s", workspace_id, stage, message)
 
     def _sync_run_progress(self, job: JobRecord, event_type: str, message: str) -> None:

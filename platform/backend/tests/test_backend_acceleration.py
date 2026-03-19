@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import subprocess
 import threading
 import time
 
@@ -12,6 +13,7 @@ from app.ai.openrouter_client import OpenRouterClient
 from app.main import create_app
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, GenerateRequest, GenerationMode, JobRecord, RunCheckResult, ValidationSnapshot
 from app.services.code_index_service import CodeIndexService
+from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES
 from app.validators.build_validator import BuildValidator
 
 
@@ -853,6 +855,70 @@ def test_clone_template_skips_heavy_frontend_artifacts(tmp_path: Path) -> None:
     assert (source_root / ".gitignore").exists()
 
 
+def test_workspace_platform_log_is_persisted_to_file(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Workspace Log",
+            "description": "Platform events should be written to a per-workspace log file",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+
+    clone_response = client.post(f"/workspaces/{workspace_id}/clone-template")
+    assert clone_response.status_code == 200
+
+    log_path = tmp_path / "data" / "workspaces" / workspace_id / "logs" / "platform.log"
+    assert log_path.exists()
+    content = log_path.read_text(encoding="utf-8")
+    assert "Workspace created." in content
+    assert "Canonical template cloned." in content
+
+
+def test_base_template_tree_is_clean(tmp_path: Path) -> None:
+    del tmp_path
+    repo_root = Path(__file__).resolve().parents[3]
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", "runtime/templates/base-miniapp"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    junk_paths = [
+        path
+        for path in tracked
+        if (
+            "/node_modules/" in path
+            or "/dist/" in path
+            or "/__pycache__/" in path
+            or path.endswith(".DS_Store")
+            or path.endswith(".tsbuildinfo")
+        )
+    ]
+
+    assert junk_paths == []
+
+
+def test_generation_references_existing_canonical_template_paths(tmp_path: Path) -> None:
+    del tmp_path
+    repo_root = Path(__file__).resolve().parents[3]
+    template_root = repo_root / "runtime/templates/base-miniapp"
+
+    assert DESIGN_REFERENCE_FILES
+    assert SHARED_GENERATED_FILES
+    assert all("shared/ui/templates" not in path for path in DESIGN_REFERENCE_FILES)
+    assert all("shared/ui/generated" not in path for path in DESIGN_REFERENCE_FILES)
+    assert all("shared/generated" not in path for path in SHARED_GENERATED_FILES)
+    assert all((template_root / path).exists() for path in (*DESIGN_REFERENCE_FILES, *SHARED_GENERATED_FILES))
+
+
 def test_approve_draft_does_not_block_on_index_refresh(tmp_path: Path, monkeypatch) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -887,8 +953,9 @@ def test_approve_draft_does_not_block_on_index_refresh(tmp_path: Path, monkeypat
     service.approve_draft(workspace_id, "run_async_index", "Approve draft asynchronously")
     elapsed = time.perf_counter() - started_at
 
-    assert elapsed < 0.4
     assert started.wait(1.0)
+    assert not finished.is_set()
+    assert elapsed < 1.5
     assert finished.wait(1.0)
 
 
@@ -1130,7 +1197,31 @@ def test_generate_run_auto_switches_to_fix_on_frontend_build_failure(tmp_path: P
     def fake_fix_generate(workspace_id: str, request: GenerateRequest, *, should_stop=None):
         del should_stop
         fix_calls.append(request.mode)
-        workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_test")
+        run_id = request.linked_run_id or "run_test"
+        draft_root = workspace_service.prepare_draft(workspace_id, run_id)
+        client_routes = draft_root / "frontend" / "src" / "roles" / "client" / "ClientRoutes.tsx"
+        client_routes.write_text(
+            client_routes.read_text(encoding="utf-8").replace(
+                "export function ClientRoutes(): JSX.Element {",
+                "export function ClientRoutes(): JSX.Element {\n  // repaired automatically during auto-fix\n",
+            ),
+            encoding="utf-8",
+        )
+        app.state.container.store.upsert(
+            "reports",
+            f"candidate_diff:{workspace_id}",
+            {
+                "diff": "\n".join(
+                    [
+                        "diff --git a/source/frontend/src/roles/client/ClientRoutes.tsx b/draft/frontend/src/roles/client/ClientRoutes.tsx",
+                        "--- a/source/frontend/src/roles/client/ClientRoutes.tsx",
+                        "+++ b/draft/frontend/src/roles/client/ClientRoutes.tsx",
+                        "@@",
+                        "+  // repaired automatically during auto-fix",
+                    ]
+                )
+            },
+        )
         return JobRecord(
             workspace_id=workspace_id,
             prompt=request.prompt,
@@ -1381,6 +1472,31 @@ def test_auto_fixed_generate_run_resumes_generation_from_same_run_checkpoint(tmp
         del should_stop
         fix_calls.append(request.mode)
         assert workspace_service.draft_exists(workspace_id, request.linked_run_id or "")
+        run_id = request.linked_run_id or "run_test"
+        draft_root = workspace_service.ensure_draft(workspace_id, run_id)
+        client_routes = draft_root / "frontend" / "src" / "roles" / "client" / "ClientRoutes.tsx"
+        client_routes.write_text(
+            client_routes.read_text(encoding="utf-8").replace(
+                "export function ClientRoutes(): JSX.Element {",
+                "export function ClientRoutes(): JSX.Element {\n  // fixed before resuming generation\n",
+            ),
+            encoding="utf-8",
+        )
+        app.state.container.store.upsert(
+            "reports",
+            f"candidate_diff:{workspace_id}",
+            {
+                "diff": "\n".join(
+                    [
+                        "diff --git a/source/frontend/src/roles/client/ClientRoutes.tsx b/draft/frontend/src/roles/client/ClientRoutes.tsx",
+                        "--- a/source/frontend/src/roles/client/ClientRoutes.tsx",
+                        "+++ b/draft/frontend/src/roles/client/ClientRoutes.tsx",
+                        "@@",
+                        "+  // fixed before resuming generation",
+                    ]
+                )
+            },
+        )
         return JobRecord(
             workspace_id=workspace_id,
             prompt=request.prompt,
@@ -1465,7 +1581,31 @@ def test_successful_fix_run_queues_resume_generation_from_checkpoint(tmp_path: P
 
     def fake_fix_generate(workspace_id: str, request: GenerateRequest, *, should_stop=None):
         del should_stop
-        workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_test")
+        run_id = request.linked_run_id or "run_test"
+        draft_root = workspace_service.prepare_draft(workspace_id, run_id)
+        specialist_routes = draft_root / "frontend" / "src" / "roles" / "specialist" / "SpecialistRoutes.tsx"
+        specialist_routes.write_text(
+            specialist_routes.read_text(encoding="utf-8").replace(
+                "export function SpecialistRoutes(): JSX.Element {",
+                "export function SpecialistRoutes(): JSX.Element {\n  // fix completed before resume\n",
+            ),
+            encoding="utf-8",
+        )
+        app.state.container.store.upsert(
+            "reports",
+            f"candidate_diff:{workspace_id}",
+            {
+                "diff": "\n".join(
+                    [
+                        "diff --git a/source/frontend/src/roles/specialist/SpecialistRoutes.tsx b/draft/frontend/src/roles/specialist/SpecialistRoutes.tsx",
+                        "--- a/source/frontend/src/roles/specialist/SpecialistRoutes.tsx",
+                        "+++ b/draft/frontend/src/roles/specialist/SpecialistRoutes.tsx",
+                        "@@",
+                        "+  // fix completed before resume",
+                    ]
+                )
+            },
+        )
         return JobRecord(
             workspace_id=workspace_id,
             prompt=request.prompt,
@@ -1553,3 +1693,78 @@ def test_successful_fix_run_queues_resume_generation_from_checkpoint(tmp_path: P
     assert checkpoint is not None
     assert checkpoint["status"] == "resumed"
     assert checkpoint["resumed_from_fix_run_id"] == run.run_id
+
+
+def test_run_fails_when_draft_has_only_auxiliary_changes(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Auxiliary Diff Workspace",
+            "description": "No-op drafts must not be marked as applied runs",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    app.state.container.workspace_service.clone_template(workspace_id)
+
+    preview_called = threading.Event()
+
+    def fake_rebuild_async(workspace_id: str, source_dir=None, draft_run_id=None, on_complete=None):
+        del workspace_id, source_dir, draft_run_id, on_complete
+        preview_called.set()
+        raise AssertionError("Preview rebuild should not start for drafts with no meaningful source diff.")
+
+    def fake_generate(workspace_id: str, request: GenerateRequest, *, should_stop=None):
+        del should_stop
+        draft_root = app.state.container.workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_aux")
+        (draft_root / "frontend" / "vite.config.js").write_text("export default {};\n", encoding="utf-8")
+        (draft_root / "frontend" / "vite.config.d.ts").write_text("export {};\n", encoding="utf-8")
+        return JobRecord(
+            workspace_id=workspace_id,
+            prompt=request.prompt,
+            status="completed",
+            mode="generate",
+            generation_mode=request.generation_mode,
+            target_platform=request.target_platform,
+            preview_profile=request.preview_profile,
+            current_revision_id=app.state.container.workspace_service.get_workspace(workspace_id).current_revision_id,
+            fidelity="balanced_app",
+            linked_run_id=request.linked_run_id,
+            summary="Generated only auxiliary files.",
+            validation_snapshot=ValidationSnapshot(
+                grounded_spec_valid=True,
+                app_ir_valid=True,
+                build_valid=True,
+                blocking=False,
+                issues=[],
+            ),
+        )
+
+    app.state.container.preview_service.rebuild_async = fake_rebuild_async  # type: ignore[method-assign]
+    app.state.container.generation_service.generate = fake_generate  # type: ignore[method-assign]
+
+    run = app.state.container.run_service.create_run_sync(
+        workspace_id,
+        CreateRunRequest(
+            prompt="Create a simple role-based mini app.",
+            apply_strategy="staged_auto_apply",
+            model_profile="openai_code_fast",
+            generation_mode="balanced",
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+        ),
+    )
+
+    source_root = tmp_path / "data" / "workspaces" / workspace_id / "source"
+    assert run.status == "failed"
+    assert run.apply_status == "failed"
+    assert run.failure_reason == "Draft produced no meaningful source changes to apply."
+    assert run.touched_files == []
+    assert not preview_called.is_set()
+    assert not (source_root / "frontend" / "vite.config.js").exists()
+    assert not (source_root / "frontend" / "vite.config.d.ts").exists()

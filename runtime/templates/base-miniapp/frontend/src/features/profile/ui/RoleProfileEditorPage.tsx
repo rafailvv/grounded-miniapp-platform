@@ -1,11 +1,10 @@
 import { type ChangeEvent, type ClipboardEvent, type FocusEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
 import type { AppRole } from '@/entities/role/model/role';
 import {
-  getClientProfileDisplayName,
+  createEmptyRoleProfileDraft,
+  createRoleProfileView,
+  getRoleProfileDisplayName,
   loadRoleProfileDraftFromBackend,
-  loadRoleProfileDraft,
-  loadRoleProfileDraftFromDeviceStorage,
-  loadRoleProfileView,
   saveRoleProfileDraft,
 } from '@/features/profile/model/profileStore';
 import { triggerHapticNotification } from '@/shared/telegram/webApp';
@@ -93,8 +92,8 @@ function validatePhone(value: string): string | undefined {
 }
 
 export function RoleProfileEditorPage({ role }: RoleProfileEditorPageProps): JSX.Element {
-  const initialDraft = useMemo(() => loadRoleProfileDraft(role), [role]);
-  const initialView = useMemo(() => loadRoleProfileView(role), [role]);
+  const initialDraft = useMemo(() => createEmptyRoleProfileDraft(), []);
+  const initialView = useMemo(() => createRoleProfileView(role, initialDraft), [initialDraft, role]);
   const phoneInputRef = useRef<HTMLInputElement | null>(null);
 
   const [firstName, setFirstName] = useState(initialDraft.firstName);
@@ -109,16 +108,7 @@ export function RoleProfileEditorPage({ role }: RoleProfileEditorPageProps): JSX
     let isMounted = true;
 
     void loadRoleProfileDraftFromBackend(role).then((storedProfile) => {
-      if (!isMounted || !storedProfile) return;
-      setFirstName(storedProfile.firstName);
-      setLastName(storedProfile.lastName);
-      setEmail(storedProfile.email);
-      setPhone(formatPhoneMask(extractPhoneLocalDigits(storedProfile.phone)));
-      setPhotoUrl(storedProfile.photoUrl);
-    });
-
-    void loadRoleProfileDraftFromDeviceStorage(role).then((storedProfile) => {
-      if (!isMounted || !storedProfile) return;
+      if (!isMounted) return;
       setFirstName(storedProfile.firstName);
       setLastName(storedProfile.lastName);
       setEmail(storedProfile.email);
@@ -160,7 +150,13 @@ export function RoleProfileEditorPage({ role }: RoleProfileEditorPageProps): JSX
 
     try {
       await Promise.all([
-        saveRoleProfileDraft(role, { firstName, lastName, email, phone, photoUrl }),
+        saveRoleProfileDraft(role, {
+          firstName,
+          lastName,
+          email,
+          phone: extractPhoneLocalDigits(phone) ? phone : '',
+          photoUrl,
+        }),
         new Promise((resolve) => window.setTimeout(resolve, 450)),
       ]);
       triggerHapticNotification('success');
@@ -178,7 +174,9 @@ export function RoleProfileEditorPage({ role }: RoleProfileEditorPageProps): JSX
       if (!prev.email) return prev;
       if (!prev.email.startsWith(REQUIRED_ERROR_PREFIX)) return prev;
       if (!value.trim()) return prev;
-      return { ...prev, email: undefined };
+      const next = { ...prev };
+      delete next.email;
+      return next;
     });
   };
 
@@ -187,7 +185,9 @@ export function RoleProfileEditorPage({ role }: RoleProfileEditorPageProps): JSX
       if (!prev.phone) return prev;
       if (!prev.phone.startsWith(REQUIRED_ERROR_PREFIX)) return prev;
       if (extractPhoneLocalDigits(maskedPhone).length === 0) return prev;
-      return { ...prev, phone: undefined };
+      const next = { ...prev };
+      delete next.phone;
+      return next;
     });
   };
 
@@ -308,7 +308,7 @@ export function RoleProfileEditorPage({ role }: RoleProfileEditorPageProps): JSX
           <label className={styles.avatarUpload}>
             {photoUrl ? (
               <img
-                alt={getClientProfileDisplayName({ firstName, lastName })}
+                alt={getRoleProfileDisplayName({ firstName, lastName, roleLabel: initialView.roleLabel })}
                 className={styles.avatar}
                 src={photoUrl}
               />
@@ -325,7 +325,7 @@ export function RoleProfileEditorPage({ role }: RoleProfileEditorPageProps): JSX
         </div>
 
         <div className={styles.previewInfo}>
-          <strong className={styles.previewName}>{getClientProfileDisplayName({ firstName, lastName }) || 'User'}</strong>
+          <strong className={styles.previewName}>{getRoleProfileDisplayName({ firstName, lastName, roleLabel: initialView.roleLabel })}</strong>
         </div>
       </div>
 

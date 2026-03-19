@@ -6,32 +6,14 @@ import { triggerHapticImpact } from '@/shared/telegram/webApp';
 import { useAppTheme } from '@/shared/theme/useAppTheme';
 import { Loader } from '@/shared/ui/loader/Loader';
 
-const MIN_LOADER_TIME_MS = 1500;
-const MOCK_API_LOADING_TIME_MS = 1000;
-const LOADER_FADE_DURATION_MS = 900;
+const LOADER_FADE_DURATION_MS = 240;
 
 export function App(): JSX.Element {
   useTelegramViewport();
   useAppTheme();
   const state = useAppBootstrap();
-  const [isMinLoaderTimePassed, setIsMinLoaderTimePassed] = useState(false);
-  const [isMockApiTimerDone, setIsMockApiTimerDone] = useState(false);
   const [isLoaderFadingOut, setIsLoaderFadingOut] = useState(false);
   const [isLoaderHidden, setIsLoaderHidden] = useState(false);
-
-  useEffect(() => {
-    const minTimer = window.setTimeout(() => {
-      setIsMinLoaderTimePassed(true);
-    }, MIN_LOADER_TIME_MS);
-    const mockApiTimer = window.setTimeout(() => {
-      setIsMockApiTimerDone(true);
-    }, MOCK_API_LOADING_TIME_MS);
-
-    return () => {
-      window.clearTimeout(minTimer);
-      window.clearTimeout(mockApiTimer);
-    };
-  }, []);
 
   useEffect(() => {
     const onDocumentClick = (event: MouseEvent) => {
@@ -57,11 +39,9 @@ export function App(): JSX.Element {
   }, []);
 
   const isBootstrapResolved = state.status !== 'loading';
-  const canStartLoaderFade = isBootstrapResolved && isMinLoaderTimePassed && isMockApiTimerDone;
-  const isHeartbeatActive = isMinLoaderTimePassed && !isMockApiTimerDone && !isLoaderFadingOut;
 
   useEffect(() => {
-    if (!canStartLoaderFade || isLoaderFadingOut || isLoaderHidden) return;
+    if (!isBootstrapResolved || isLoaderFadingOut || isLoaderHidden) return;
 
     setIsLoaderFadingOut(true);
 
@@ -72,7 +52,7 @@ export function App(): JSX.Element {
     return () => {
       window.clearTimeout(timer);
     };
-  }, [canStartLoaderFade, isLoaderFadingOut, isLoaderHidden]);
+  }, [isBootstrapResolved, isLoaderFadingOut, isLoaderHidden]);
 
   const content =
     state.status === 'ready' ? (
@@ -86,7 +66,7 @@ export function App(): JSX.Element {
   return (
     <>
       {content}
-      {shouldShowLoader ? <Loader isFadingOut={isLoaderFadingOut} isHeartbeat={isHeartbeatActive} /> : null}
+      {shouldShowLoader ? <Loader isFadingOut={isLoaderFadingOut} /> : null}
     </>
   );
 }

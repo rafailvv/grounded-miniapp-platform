@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import PurePosixPath
 import re
 import threading
 import logging
@@ -23,9 +24,26 @@ from app.repositories.state_store import StateStore
 from app.services.fix_orchestrator import FixOrchestrator
 from app.services.generation_service import GenerationService
 from app.services.preview_service import PreviewService
+from app.services.workspace_log_service import WorkspaceLogService
 from app.services.workspace_service import WorkspaceService
 
 ROLE_SCOPE = {"client", "specialist", "manager"}
+MEANINGFUL_DIFF_IGNORED_PARTS = {
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".next",
+    ".vite",
+    ".cache",
+    "artifacts",
+}
+MEANINGFUL_DIFF_IGNORED_SUFFIXES = (".pyc", ".pyo", ".tsbuildinfo")
+MEANINGFUL_DIFF_IGNORED_NAMES = {".DS_Store", "vite.config.js", "vite.config.d.ts"}
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +56,7 @@ class RunService:
         fix_orchestrator: FixOrchestrator,
         preview_service: PreviewService,
         openrouter_client: OpenRouterClient,
+        workspace_log_service: WorkspaceLogService,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -45,6 +64,7 @@ class RunService:
         self.fix_orchestrator = fix_orchestrator
         self.preview_service = preview_service
         self.openrouter_client = openrouter_client
+        self.workspace_log_service = workspace_log_service
 
     def stop_run(self, run_id: str) -> RunRecord:
         run = self.get_run(run_id)
@@ -180,6 +200,12 @@ class RunService:
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
         self._append_job_event(run.linked_job_id, "apply_completed", "Draft was applied successfully.")
+        self.workspace_log_service.append(
+            run.workspace_id,
+            source="run",
+            message="Run draft applied manually.",
+            payload={"run_id": run.run_id, "revision_id": revision.revision_id},
+        )
         self._queue_preview_refresh(run, reason="manual approval")
         artifacts = self.get_run_artifacts(run_id)
         artifacts["run"] = run.model_dump(mode="json")
@@ -198,6 +224,12 @@ class RunService:
         run.progress_percent = 100
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
+        self.workspace_log_service.append(
+            run.workspace_id,
+            source="run",
+            message="Run draft discarded.",
+            payload={"run_id": run.run_id},
+        )
         self._queue_preview_refresh(run, reason="draft discard")
         artifacts = self.get_run_artifacts(run_id)
         artifacts["run"] = run.model_dump(mode="json")
@@ -225,6 +257,12 @@ class RunService:
         run.candidate_revision_id = revision.revision_id
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
+        self.workspace_log_service.append(
+            run.workspace_id,
+            source="run",
+            message="Applied run rolled back.",
+            payload={"run_id": run.run_id, "revision_id": revision.revision_id},
+        )
         self._queue_preview_refresh(run, reason="rollback")
         artifacts = self.get_run_artifacts(run_id)
         artifacts["run"] = run.model_dump(mode="json")
@@ -245,6 +283,12 @@ class RunService:
         run.progress_percent = max(run.progress_percent, 5)
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
+        self.workspace_log_service.append(
+            run.workspace_id,
+            source="run",
+            message="Run started.",
+            payload={"run_id": run.run_id, "mode": run.mode, "intent": run.intent},
+        )
         logger.info("run_started run_id=%s workspace_id=%s intent=%s", run.run_id, run.workspace_id, run.intent)
         try:
             generate_request = GenerateRequest(
@@ -333,7 +377,14 @@ class RunService:
             run.updated_at = datetime.now(timezone.utc)
 
             if job.status == "completed":
-                if run.apply_strategy == "manual_approve":
+                meaningful_paths = self._meaningful_paths_for_run(
+                    workspace_id=run.workspace_id,
+                    run=run,
+                    change_plan=change_plan,
+                )
+                if not meaningful_paths:
+                    self._mark_run_without_meaningful_diff(run, job)
+                elif run.apply_strategy == "manual_approve":
                     run.status = "awaiting_approval"
                     run.apply_status = "awaiting_approval"
                     run.draft_status = "ready"
@@ -390,6 +441,12 @@ class RunService:
                 run.status,
                 run.progress_percent,
             )
+            self.workspace_log_service.append(
+                run.workspace_id,
+                source="run",
+                message="Run finished.",
+                payload={"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status},
+            )
         except Exception as exc:
             run.status = "failed"
             run.apply_status = "failed"
@@ -401,6 +458,13 @@ class RunService:
             run.updated_at = datetime.now(timezone.utc)
             self._save_run(run)
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
+            self.workspace_log_service.append(
+                run.workspace_id,
+                source="run",
+                level="ERROR",
+                message="Run failed with an unexpected exception.",
+                payload={"run_id": run.run_id, "error": str(exc)},
+            )
             logger.exception("run_failed run_id=%s workspace_id=%s", run.run_id, run.workspace_id)
 
     def _should_auto_fix_failed_generate(self, request: CreateRunRequest, job: Any) -> bool:
@@ -772,10 +836,61 @@ class RunService:
 
     @classmethod
     def _resolve_touched_files(cls, change_plan: CodeChangePlan) -> list[str]:
-        paths = [target.file_path for target in change_plan.targets if target.file_path and not target.file_path.startswith("artifacts/")]
+        paths = [target.file_path for target in change_plan.targets if target.file_path and cls._is_meaningful_source_path(target.file_path)]
         if paths:
             return list(dict.fromkeys(paths))
         return [target.file_path for target in change_plan.targets if target.file_path]
+
+    def _mark_run_without_meaningful_diff(self, run: RunRecord, job: Any) -> None:
+        message = "Draft produced no meaningful source changes to apply."
+        run.summary = message
+        run.failure_reason = message
+        run.status = "failed"
+        run.apply_status = "failed"
+        run.draft_status = "failed"
+        run.draft_ready = self.workspace_service.draft_exists(run.workspace_id, run.run_id)
+        run.current_stage = "failed"
+        run.progress_percent = max(run.progress_percent, 100)
+        if run.current_fix_phase == "completed":
+            run.current_fix_phase = "failed"
+
+        job.status = "failed"
+        job.summary = message
+        job.failure_reason = message
+        self.generation_service._append_event(job, "job_failed", message, {"reason": "no_meaningful_diff"})
+
+    def _meaningful_paths_for_run(
+        self,
+        *,
+        workspace_id: str,
+        run: RunRecord,
+        change_plan: CodeChangePlan,
+    ) -> list[str]:
+        candidate_diff = (self.generation_service.current_report(workspace_id, "candidate_diff") or {}).get("diff", "")
+        diff_text = candidate_diff
+        if not diff_text and self.workspace_service.draft_exists(workspace_id, run.run_id):
+            diff_text = self.workspace_service.diff(workspace_id, run_id=run.run_id)
+
+        paths = self._paths_from_diff(diff_text)
+        if not paths:
+            paths = [target.file_path for target in change_plan.targets if target.file_path]
+        return [path for path in list(dict.fromkeys(paths)) if self._is_meaningful_source_path(path)]
+
+    @staticmethod
+    def _is_meaningful_source_path(file_path: str) -> bool:
+        normalized = file_path.strip().lstrip("./")
+        if not normalized:
+            return False
+        path = PurePosixPath(normalized)
+        if any(part in MEANINGFUL_DIFF_IGNORED_PARTS for part in path.parts):
+            return False
+        if path.name in MEANINGFUL_DIFF_IGNORED_NAMES:
+            return False
+        if path.name.endswith(MEANINGFUL_DIFF_IGNORED_SUFFIXES):
+            return False
+        if normalized.startswith("backend/app/generated/"):
+            return False
+        return True
 
     @staticmethod
     def _paths_from_diff(diff_text: str) -> list[str]:
@@ -829,7 +944,7 @@ class RunService:
                 validators = "blocked"
             elif has_build_issue or has_preview_issue:
                 validators = "passed"
-            elif getattr(validation_snapshot, "grounded_spec_valid", False) and getattr(validation_snapshot, "app_ir_valid", False):
+            elif getattr(validation_snapshot, "grounded_spec_valid", False) or getattr(validation_snapshot, "app_ir_valid", False):
                 validators = "passed"
             else:
                 validators = "failed"

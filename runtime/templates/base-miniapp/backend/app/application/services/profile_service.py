@@ -11,9 +11,9 @@ from app.infrastructure.repositories.profile_repository import ProfileRepository
 
 
 DEFAULT_PROFILES: dict[AppRole, dict[str, str | None]] = {
-    "client": {"first_name": "John", "last_name": "Doe", "email": "", "phone": "", "photo_url": None},
-    "specialist": {"first_name": "John", "last_name": "Doe", "email": "", "phone": "", "photo_url": None},
-    "manager": {"first_name": "John", "last_name": "Doe", "email": "", "phone": "", "photo_url": None},
+    "client": {"first_name": "", "last_name": "", "email": "", "phone": "", "photo_url": None},
+    "specialist": {"first_name": "", "last_name": "", "email": "", "phone": "", "photo_url": None},
+    "manager": {"first_name": "", "last_name": "", "email": "", "phone": "", "photo_url": None},
 }
 
 

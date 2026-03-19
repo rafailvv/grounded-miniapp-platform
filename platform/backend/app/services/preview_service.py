@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.models.domain import PreviewRecord
 from app.repositories.state_store import StateStore
 from app.services.runtime_manager import PreviewRuntimeManager
+from app.services.workspace_log_service import WorkspaceLogService
 from app.services.workspace_service import WorkspaceService
 
 ROLE_ORDER = ("client", "specialist", "manager")
@@ -22,16 +23,18 @@ class PreviewService:
         store: StateStore,
         workspace_service: WorkspaceService,
         runtime_manager: PreviewRuntimeManager,
+        workspace_log_service: WorkspaceLogService,
     ) -> None:
         self.settings = settings
         self.store = store
         self.workspace_service = workspace_service
         self.runtime_manager = runtime_manager
+        self.workspace_log_service = workspace_log_service
 
-    @staticmethod
-    def _append_log(preview: PreviewRecord, message: str) -> None:
+    def _append_log(self, preview: PreviewRecord, message: str) -> None:
         preview.logs.append(message)
         preview.logs = preview.logs[-240:]
+        self.workspace_log_service.append(preview.workspace_id, source="preview", message=message)
 
     def _persist(self, preview: PreviewRecord) -> None:
         preview.updated_at = datetime.now(timezone.utc)
@@ -463,6 +466,13 @@ class PreviewService:
 
     @staticmethod
     def _preview_payload_from_source(source_dir: Path) -> dict[str, object]:
+        def empty_profile() -> dict[str, str]:
+            return {
+                "first_name": "",
+                "email": "",
+                "phone": "",
+            }
+
         generated_graph_path = source_dir / "artifacts" / "generated_app_graph.json"
         if generated_graph_path.exists():
             graph = json.loads(generated_graph_path.read_text(encoding="utf-8"))
@@ -481,17 +491,9 @@ class PreviewService:
                         {"metric_id": "routes", "label": "Routes", "value": str(len(pages))},
                     ],
                     "pages": pages,
-                    "profile": {
-                        "first_name": "Иван",
-                        "email": "",
-                        "phone": "",
-                    },
+                    "profile": empty_profile(),
                 }
             return {"roles": roles}
-
-        role_seed_path = source_dir / "backend" / "app" / "generated" / "role_seed.json"
-        if role_seed_path.exists():
-            return json.loads(role_seed_path.read_text(encoding="utf-8"))
 
         grounded_spec_path = source_dir / "artifacts" / "grounded_spec.json"
         if grounded_spec_path.exists():
@@ -509,15 +511,24 @@ class PreviewService:
                         {"metric_id": "scope", "label": "Flows", "value": str(len(spec.get("user_flows", [])))},
                         {"metric_id": "docs", "label": "Sources", "value": str(len(spec.get("doc_refs", [])))},
                     ],
-                    "profile": {
-                        "first_name": "Иван",
-                        "email": "",
-                        "phone": "",
-                    },
+                    "profile": empty_profile(),
                 }
             return {"roles": roles}
 
-        return {"roles": {}}
+        return {
+            "roles": {
+                role: {
+                    "title": f"{role.title()} workspace",
+                    "description": "Minimal base mini-app preview.",
+                    "feature_text": "Profile and home are ready to extend.",
+                    "primary_action_label": "Open role",
+                    "secondary_action_label": "Profile",
+                    "metrics": [],
+                    "profile": empty_profile(),
+                }
+                for role in ROLE_ORDER
+            }
+        }
 
     def _get_or_create(self, workspace_id: str) -> PreviewRecord:
         payload = self.store.get("previews", workspace_id)

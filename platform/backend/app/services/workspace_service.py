@@ -14,6 +14,7 @@ from app.core.config import Settings
 from app.models.artifacts import ApplyPatchResult, PatchEnvelope, PatchOperationModel
 from app.models.domain import DraftFileOperation, RevisionRecord, SaveFileRequest, WorkspaceRecord
 from app.repositories.state_store import StateStore
+from app.services.workspace_log_service import WorkspaceLogService
 
 
 class WorkspaceService:
@@ -31,10 +32,12 @@ class WorkspaceService:
         ".cache",
     }
     IGNORED_TREE_SUFFIXES = (".pyc", ".pyo", ".tsbuildinfo")
+    IGNORED_TREE_NAMES = {".DS_Store", "vite.config.js", "vite.config.d.ts"}
 
-    def __init__(self, settings: Settings, store: StateStore) -> None:
+    def __init__(self, settings: Settings, store: StateStore, workspace_log_service: WorkspaceLogService) -> None:
         self.settings = settings
         self.store = store
+        self.workspace_log_service = workspace_log_service
         self.code_index_service = None
 
     def attach_code_index_service(self, code_index_service) -> None:
@@ -44,6 +47,12 @@ class WorkspaceService:
         workspace_dir = self.settings.workspaces_dir / workspace.workspace_id
         workspace_dir.mkdir(parents=True, exist_ok=True)
         self.store.upsert("workspaces", workspace.workspace_id, workspace.model_dump(mode="json"))
+        self.workspace_log_service.append(
+            workspace.workspace_id,
+            source="workspace",
+            message="Workspace created.",
+            payload={"name": workspace.name, "target_platform": str(workspace.target_platform)},
+        )
         return workspace
 
     def get_workspace(self, workspace_id: str) -> WorkspaceRecord:
@@ -99,6 +108,7 @@ class WorkspaceService:
         workspace.revisions.append(revision)
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self.workspace_log_service.append(workspace_id, source="workspace", message="Canonical template cloned.")
         return workspace
 
     def reset_workspace(self, workspace_id: str) -> WorkspaceRecord:
@@ -107,6 +117,7 @@ class WorkspaceService:
         latest.source = "reset"
         latest.message = "Reset workspace to canonical template"
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self.workspace_log_service.append(workspace_id, source="workspace", message="Workspace reset to canonical template.")
         return workspace
 
     def rollback_last_revision(self, workspace_id: str) -> WorkspaceRecord:
@@ -124,6 +135,7 @@ class WorkspaceService:
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
         self._refresh_indexes_async(workspace)
+        self.workspace_log_service.append(workspace_id, source="workspace", message="Workspace rolled back to previous revision.")
         return workspace
 
     def revert_revision(self, workspace_id: str, revision_id: str, message: str) -> RevisionRecord:
@@ -158,6 +170,12 @@ class WorkspaceService:
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
         self._refresh_indexes_async(workspace)
+        self.workspace_log_service.append(
+            workspace_id,
+            source="workspace",
+            message="Workspace revision reverted.",
+            payload={"revision_id": revision_id},
+        )
         return revision
 
     def apply_patch_operations(self, workspace_id: str, operations: list[PatchOperationModel], message: str) -> RevisionRecord:
@@ -214,12 +232,24 @@ class WorkspaceService:
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
         self._refresh_indexes_async(workspace)
+        self.workspace_log_service.append(
+            workspace_id,
+            source="workspace",
+            message="Draft approved and applied to source.",
+            payload={"run_id": run_id, "revision_id": revision.revision_id},
+        )
         return revision
 
     def discard_draft(self, workspace_id: str, run_id: str) -> None:
         draft_root = self.draft_root(workspace_id, run_id)
         if draft_root.exists():
             shutil.rmtree(draft_root, ignore_errors=True)
+            self.workspace_log_service.append(
+                workspace_id,
+                source="workspace",
+                message="Draft discarded.",
+                payload={"run_id": run_id},
+            )
 
     def save_file(self, workspace_id: str, request: SaveFileRequest) -> RevisionRecord | None:
         source_dir = self.source_dir(workspace_id) if not request.run_id else self.draft_source_dir(workspace_id, request.run_id)
@@ -237,6 +267,12 @@ class WorkspaceService:
         workspace.updated_at = revision.created_at
         self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
         self._refresh_indexes_async(workspace)
+        self.workspace_log_service.append(
+            workspace_id,
+            source="workspace",
+            message="Source file saved.",
+            payload={"relative_path": request.relative_path},
+        )
         return revision
 
     def build_patch_envelope_for_draft(self, workspace_id: str, run_id: str, operations: list[DraftFileOperation]) -> PatchEnvelope:
@@ -481,6 +517,9 @@ class WorkspaceService:
                 ".next",
                 ".vite",
                 ".cache",
+                ".DS_Store",
+                "vite.config.js",
+                "vite.config.d.ts",
                 "*.pyc",
                 "*.pyo",
                 "*.tsbuildinfo",
@@ -519,6 +558,9 @@ class WorkspaceService:
                         ".next",
                         ".vite",
                         ".cache",
+                        ".DS_Store",
+                        "vite.config.js",
+                        "vite.config.d.ts",
                         "*.pyc",
                         "*.pyo",
                         "*.tsbuildinfo",
@@ -556,6 +598,8 @@ class WorkspaceService:
     @classmethod
     def _is_ignored_workspace_path(cls, relative_path: Path) -> bool:
         if any(part in cls.IGNORED_TREE_PARTS for part in relative_path.parts):
+            return True
+        if relative_path.name in cls.IGNORED_TREE_NAMES:
             return True
         return relative_path.name.endswith(cls.IGNORED_TREE_SUFFIXES)
 

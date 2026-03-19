@@ -34,6 +34,7 @@ from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
 from app.services.preview_service import PreviewService
 from app.services.runtime_manager import PreviewRuntimeManager
+from app.services.workspace_log_service import WorkspaceLogService
 from app.services.workspace_service import WorkspaceService
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class FixOrchestrator:
         preview_service: PreviewService,
         runtime_manager: PreviewRuntimeManager,
         openrouter_client: OpenRouterClient,
+        workspace_log_service: WorkspaceLogService,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -59,6 +61,7 @@ class FixOrchestrator:
         self.preview_service = preview_service
         self.runtime_manager = runtime_manager
         self.openrouter_client = openrouter_client
+        self.workspace_log_service = workspace_log_service
 
     def generate(
         self,
@@ -981,12 +984,14 @@ class FixOrchestrator:
         )
         current["entries"] = entries
         self._store_report(report_key, current)
+        self.workspace_log_service.append(workspace_id, source=f"fix.trace.{stage}", message=message, payload=payload or {})
         logger.info("trace workspace_id=%s stage=%s message=%s", workspace_id, stage, message)
 
     def _append_event(self, job: JobRecord, event_type: str, message: str, details: dict[str, Any] | None = None) -> None:
         job.events.append(JobEvent(event_type=event_type, message=message, details=details or {}))
         job.updated_at = utc_now()
         self._sync_run_progress(job, event_type, message, details or {})
+        self.workspace_log_service.append(job.workspace_id, source=f"fix.{event_type}", message=message, payload=details or {})
         self._save_job(job)
 
     def _sync_run_progress(self, job: JobRecord, event_type: str, message: str, details: dict[str, Any]) -> None:

@@ -1,15 +1,14 @@
 import { type RemoteProfilePayload, fetchRoleProfile, persistRoleProfile } from '@/features/profile/api/profileApi';
 import type { AppRole } from '@/entities/role/model/role';
-import { getDeviceStorageItem, getTelegramWebApp, setDeviceStorageItem } from '@/shared/telegram/webApp';
+import { getTelegramWebApp } from '@/shared/telegram/webApp';
 
 const ROLE_LABELS: Record<AppRole, string> = {
   client: 'Client',
   specialist: 'Specialist',
   manager: 'Manager',
 };
-export const CLIENT_ROLE_LABEL = 'Client';
 
-export type ClientProfileDraft = {
+export type RoleProfileDraft = {
   firstName: string;
   lastName: string;
   email: string;
@@ -17,45 +16,27 @@ export type ClientProfileDraft = {
   photoUrl: string | null;
 };
 
-export type ClientProfileView = ClientProfileDraft & {
+export type RoleProfileView = RoleProfileDraft & {
   username: string;
   roleLabel: string;
 };
-
-type StoredProfile = Partial<ClientProfileDraft> & {
-  updatedAt?: number;
-};
-
-function getRoleProfileStorageKey(role: AppRole): string {
-  return `miniapp:${role}:profile`;
-}
-
-function parseStoredProfile(raw: string | null): StoredProfile | null {
-  if (!raw) return null;
-
-  try {
-    return JSON.parse(raw) as StoredProfile;
-  } catch {
-    return null;
-  }
-}
-
-function normalizeStoredProfile(stored: StoredProfile | null, telegramUser: ReturnType<typeof getTelegramUser>): ClientProfileDraft {
-  return {
-    firstName: stored?.firstName?.trim() || telegramUser?.first_name?.trim() || 'John',
-    lastName: stored?.lastName?.trim() || telegramUser?.last_name?.trim() || 'Doe',
-    email: stored?.email?.trim() || '',
-    phone: stored?.phone?.trim() || '',
-    photoUrl: stored?.photoUrl || telegramUser?.photo_url || null,
-  };
-}
 
 function getTelegramUser() {
   return getTelegramWebApp()?.initDataUnsafe?.user;
 }
 
+export function createEmptyRoleProfileDraft(): RoleProfileDraft {
+  return {
+    firstName: '',
+    lastName: '',
+    email: '',
+    phone: '',
+    photoUrl: null,
+  };
+}
+
 export function getTelegramUsernameLabel(username: string | undefined): string {
-  if (!username) return 'No username';
+  if (!username) return 'Telegram user';
   return username.startsWith('@') ? username : `@${username}`;
 }
 
@@ -63,16 +44,22 @@ export function getRoleLabel(role: AppRole): string {
   return ROLE_LABELS[role];
 }
 
-export function loadRoleProfileDraft(role: AppRole): ClientProfileDraft {
-  const stored = parseStoredProfile(localStorage.getItem(getRoleProfileStorageKey(role)));
-  const telegramUser = getTelegramUser();
+export function remoteProfileToDraft(profile: RemoteProfilePayload | null): RoleProfileDraft {
+  if (!profile) {
+    return createEmptyRoleProfileDraft();
+  }
 
-  return normalizeStoredProfile(stored, telegramUser);
+  return {
+    firstName: profile.first_name?.trim() ?? '',
+    lastName: profile.last_name?.trim() ?? '',
+    email: profile.email?.trim() ?? '',
+    phone: profile.phone?.trim() ?? '',
+    photoUrl: profile.photo_url ?? null,
+  };
 }
 
-export function loadRoleProfileView(role: AppRole): ClientProfileView {
+export function createRoleProfileView(role: AppRole, draft: RoleProfileDraft): RoleProfileView {
   const telegramUser = getTelegramUser();
-  const draft = loadRoleProfileDraft(role);
 
   return {
     ...draft,
@@ -81,60 +68,24 @@ export function loadRoleProfileView(role: AppRole): ClientProfileView {
   };
 }
 
-export async function saveRoleProfileDraft(role: AppRole, profile: ClientProfileDraft): Promise<void> {
-  const payload: StoredProfile = {
-    firstName: profile.firstName.trim(),
-    lastName: profile.lastName.trim(),
+export async function loadRoleProfileDraftFromBackend(role: AppRole): Promise<RoleProfileDraft> {
+  const remoteProfile = await fetchRoleProfile(role);
+  return remoteProfileToDraft(remoteProfile);
+}
+
+export async function saveRoleProfileDraft(role: AppRole, profile: RoleProfileDraft): Promise<RoleProfileDraft> {
+  const payload: RemoteProfilePayload = {
+    first_name: profile.firstName.trim(),
+    last_name: profile.lastName.trim(),
     email: profile.email.trim(),
     phone: profile.phone.trim(),
-    photoUrl: profile.photoUrl,
-    updatedAt: Date.now(),
+    photo_url: profile.photoUrl ?? null,
   };
-
-  localStorage.setItem(getRoleProfileStorageKey(role), JSON.stringify(payload));
-  await setDeviceStorageItem(getRoleProfileStorageKey(role), JSON.stringify(payload));
-  await persistRoleProfile(role, {
-    first_name: payload.firstName ?? '',
-    last_name: payload.lastName ?? '',
-    email: payload.email ?? '',
-    phone: payload.phone ?? '',
-    photo_url: payload.photoUrl ?? null,
-  });
+  await persistRoleProfile(role, payload);
+  return remoteProfileToDraft(payload);
 }
 
-export async function loadRoleProfileDraftFromDeviceStorage(role: AppRole): Promise<ClientProfileDraft | null> {
-  const raw = await getDeviceStorageItem(getRoleProfileStorageKey(role));
-  const stored = parseStoredProfile(raw);
-  if (!stored) return null;
-
-  return normalizeStoredProfile(stored, getTelegramUser());
-}
-
-export async function loadRoleProfileDraftFromBackend(role: AppRole): Promise<ClientProfileDraft | null> {
-  const remoteProfile = await fetchRoleProfile(role);
-  if (!remoteProfile) return null;
-  return normalizeStoredProfile(
-    {
-      firstName: remoteProfile.first_name,
-      lastName: remoteProfile.last_name,
-      email: remoteProfile.email,
-      phone: remoteProfile.phone,
-      photoUrl: remoteProfile.photo_url ?? null,
-    } as StoredProfile,
-    getTelegramUser(),
-  );
-}
-
-export function remoteProfileToDraft(profile: RemoteProfilePayload): ClientProfileDraft {
-  return {
-    firstName: profile.first_name ?? '',
-    lastName: profile.last_name ?? '',
-    email: profile.email ?? '',
-    phone: profile.phone ?? '',
-    photoUrl: profile.photo_url ?? null,
-  };
-}
-
-export function getClientProfileDisplayName(profile: Pick<ClientProfileView, 'firstName' | 'lastName'>): string {
-  return `${profile.firstName} ${profile.lastName}`.trim();
+export function getRoleProfileDisplayName(profile: Pick<RoleProfileView, 'firstName' | 'lastName' | 'roleLabel'>): string {
+  const fullName = `${profile.firstName} ${profile.lastName}`.trim();
+  return fullName || `${profile.roleLabel} profile`;
 }

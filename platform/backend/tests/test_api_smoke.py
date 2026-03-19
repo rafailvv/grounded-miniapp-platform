@@ -253,7 +253,7 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
             "flow_mode": "multi_page",
             "files_to_read": [
                 "frontend/src/roles/client/pages/ClientHomePage.tsx",
-                "frontend/src/shared/ui/templates/RoleProfileEditorPage.tsx",
+                "frontend/src/features/profile/ui/RoleProfileEditorPage.tsx",
             ],
             "target_files": ["frontend/src/roles/client/pages/ClientHomePage.tsx"],
             "shared_files": [],
@@ -284,7 +284,7 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
         ],
     }
     roles = []
-    target_files = ["frontend/src/shared/generated/appChrome.tsx", "frontend/src/shared/generated/appState.tsx"]
+    target_files = ["frontend/src/app/routing/RoleRouter.tsx", "frontend/src/app/layout/AppShell.tsx"]
     for role in role_scope:
         role_pages = templates[role]
         roles.append(
@@ -302,13 +302,13 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
         "summary": "Create a routed booking workspace with custom role-specific pages.",
         "flow_mode": "multi_page",
         "files_to_read": [
-            "frontend/src/shared/ui/templates/RoleProfileEditorPage.tsx",
-            "frontend/src/shared/ui/generated/GeneratedRoleScreen.module.css",
+            "frontend/src/features/profile/ui/RoleProfileEditorPage.tsx",
+            "frontend/src/widgets/role-home/RoleHomePage.module.css",
         ],
         "target_files": target_files,
         "shared_files": [
-            "frontend/src/shared/generated/appChrome.tsx",
-            "frontend/src/shared/generated/appState.tsx",
+            "frontend/src/app/routing/RoleRouter.tsx",
+            "frontend/src/app/layout/AppShell.tsx",
         ],
         "backend_targets": [],
         "page_graph": {
@@ -382,22 +382,22 @@ def _composition_payload(payload: dict) -> dict:
     page_graph = payload["page_graph"]
     target_files = set(payload["target_files"])
     operations: list[dict] = []
-    if "frontend/src/shared/generated/appChrome.tsx" in target_files:
+    if "frontend/src/app/routing/RoleRouter.tsx" in target_files:
         operations.append(
             {
-                "file_path": "frontend/src/shared/generated/appChrome.tsx",
+                "file_path": "frontend/src/app/routing/RoleRouter.tsx",
                 "operation": "replace",
-                "content": "export function GeneratedPageFrame(props: { title: string; body: string }): JSX.Element { return <section><h1>{props.title}</h1><p>{props.body}</p></section>; }\n",
-                "reason": "Provide a minimal shared frame for generated pages.",
+                "content": """import type { JSX } from 'react';\nimport type { AppRole } from '@/entities/role/model/role';\nimport { ClientRoutes } from '@/roles/client/ClientRoutes';\nimport { SpecialistRoutes } from '@/roles/specialist/SpecialistRoutes';\nimport { ManagerRoutes } from '@/roles/manager/ManagerRoutes';\n\nconst ROUTER_BY_ROLE: Record<AppRole, () => JSX.Element> = {\n  client: ClientRoutes,\n  specialist: SpecialistRoutes,\n  manager: ManagerRoutes,\n};\n\nexport function RoleRouter({ role }: { role: AppRole }): JSX.Element {\n  const RoutesByRole = ROUTER_BY_ROLE[role];\n  return <RoutesByRole />;\n}\n""",
+                "reason": "Provide the shared role router for the generated app.",
             }
         )
-    if "frontend/src/shared/generated/appState.tsx" in target_files:
+    if "frontend/src/app/layout/AppShell.tsx" in target_files:
         operations.append(
             {
-                "file_path": "frontend/src/shared/generated/appState.tsx",
+                "file_path": "frontend/src/app/layout/AppShell.tsx",
                 "operation": "replace",
-                "content": "export function useGeneratedAppState(): { loading: boolean } { return { loading: false }; }\n",
-                "reason": "Provide generated shared state helpers.",
+                "content": """import { Outlet } from 'react-router-dom';\n\nexport function AppShell(): JSX.Element {\n  return (\n    <main>\n      <Outlet />\n    </main>\n  );\n}\n""",
+                "reason": "Provide the shared app shell used by all generated routes.",
             }
         )
     for role, role_payload in (page_graph.get("roles") or {}).items():
@@ -595,7 +595,8 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
         assert preview_payload["role_urls"] == {}
     else:
         assert preview_payload["role_urls"]["client"].startswith(preview_payload["url"])
-    assert all(item["path"] != "backend/app/generated/runtime_manifest.json" for item in file_tree)
+    assert all("__pycache__" not in item["path"] for item in file_tree)
+    assert all(not item["path"].endswith(".tsbuildinfo") for item in file_tree)
     assert any(item["path"] == "artifacts/grounded_spec.json" for item in draft_tree)
     assert any(item["path"] == "artifacts/generated_app_graph.json" for item in draft_tree)
     assert "ClientRoutes.tsx" in draft_diff
@@ -783,7 +784,8 @@ def test_generate_endpoint_acts_as_compatibility_shim(tmp_path: Path) -> None:
     assert payload["status"] == "completed"
     assert payload["summary"]
     file_tree = client.get(f"/workspaces/{workspace_id}/files/tree").json()
-    assert all(item["path"] != "backend/app/generated/runtime_manifest.json" for item in file_tree)
+    assert all("__pycache__" not in item["path"] for item in file_tree)
+    assert all(not item["path"].endswith(".tsbuildinfo") for item in file_tree)
 
 
 def test_clone_template_boots_preview_automatically(tmp_path: Path) -> None:
