@@ -71,7 +71,9 @@ class WorkspaceService:
 
         workspace_root = self.workspace_root(workspace_id)
         if workspace_root.exists():
-            shutil.rmtree(workspace_root, ignore_errors=True)
+            shutil.rmtree(workspace_root)
+            if workspace_root.exists():
+                raise RuntimeError(f"Workspace directory still exists after deletion: {workspace_root}")
 
         self.store.delete("workspaces", workspace_id)
         self.store.delete("previews", workspace_id)

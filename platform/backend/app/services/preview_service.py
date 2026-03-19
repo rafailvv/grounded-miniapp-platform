@@ -14,6 +14,7 @@ from app.services.workspace_log_service import WorkspaceLogService
 from app.services.workspace_service import WorkspaceService
 
 ROLE_ORDER = ("client", "specialist", "manager")
+STARTING_STALE_AFTER_SEC = 45
 
 
 class PreviewService:
@@ -88,11 +89,17 @@ class PreviewService:
         return preview
 
     def ensure_started(self, workspace_id: str, *, force_rebuild: bool = False) -> PreviewRecord:
-        preview = self._get_or_create(workspace_id)
+        preview = self._reconcile_runtime_state(self._get_or_create(workspace_id), workspace_id)
         if preview.status == "running" and preview.url and not force_rebuild:
             return preview
-        if preview.status == "starting" and preview.stage in {"starting", "rebuilding", "health_check"}:
+        if (
+            preview.status == "starting"
+            and preview.stage in {"starting", "rebuilding", "health_check"}
+            and not self._is_stale_starting_preview(preview)
+        ):
             return preview
+        if preview.status == "starting" and preview.stage in {"starting", "rebuilding", "health_check"}:
+            self._append_log(preview, "Stale preview bootstrap detected. Restarting preview ensure flow.")
 
         preview.status = "starting"
         preview.stage = "rebuilding" if force_rebuild else "starting"
@@ -193,7 +200,7 @@ class PreviewService:
         return self.runtime_manager.allocate_port(workspace_id)
 
     def _ensure_worker(self, workspace_id: str, force_rebuild: bool) -> None:
-        preview = self._get_or_create(workspace_id)
+        preview = self._reconcile_runtime_state(self._get_or_create(workspace_id), workspace_id)
         should_rebuild = force_rebuild or bool(preview.project_name or preview.proxy_port)
         self._append_log(preview, f"Ensure worker started. rebuild={should_rebuild}.")
         preview.stage = "rebuilding" if should_rebuild else "starting"
@@ -216,11 +223,11 @@ class PreviewService:
             on_complete(preview)
 
     def reset(self, workspace_id: str) -> PreviewRecord:
-        preview = self._get_or_create(workspace_id)
+        preview = self._reconcile_runtime_state(self._get_or_create(workspace_id), workspace_id)
         if preview.runtime_mode == "docker":
             try:
                 self._append_log(preview, "Preview reset requested for docker runtime.")
-                logs = self.runtime_manager.reset(workspace_id, self.workspace_service.source_dir(workspace_id), preview.proxy_port)
+                logs = self.runtime_manager.reset(workspace_id, self._runtime_source_dir(workspace_id, preview), preview.proxy_port)
                 preview.logs.extend(logs or ["Docker preview stopped."])
                 preview.logs = preview.logs[-240:]
             except Exception as exc:
@@ -233,6 +240,8 @@ class PreviewService:
                 preview.url = None
                 preview.frontend_url = None
                 preview.backend_url = None
+                preview.proxy_port = None
+                preview.project_name = None
                 preview.last_error = None
                 self._append_log(preview, "Preview runtime stopped.")
         else:
@@ -242,6 +251,8 @@ class PreviewService:
             preview.url = None
             preview.frontend_url = None
             preview.backend_url = None
+            preview.proxy_port = None
+            preview.project_name = None
             preview.last_error = None
             self._append_log(preview, "No external preview session to reset.")
         preview.draft_run_id = None
@@ -252,7 +263,7 @@ class PreviewService:
         payload = self.store.get("previews", workspace_id)
         if not payload:
             return self._get_or_create(workspace_id)
-        preview = PreviewRecord.model_validate(payload)
+        preview = self._reconcile_runtime_state(PreviewRecord.model_validate(payload), workspace_id)
         if preview.runtime_mode == "inline":
             preview.runtime_mode = "docker"
             preview.status = "error"
@@ -264,12 +275,8 @@ class PreviewService:
             preview.project_name = None
             preview.progress_percent = 100
             self._append_log(preview, "Legacy inline preview was disabled. Start the docker runtime preview.")
-        if preview.runtime_mode == "docker" and preview.proxy_port is not None:
-            log_source_dir = (
-                self.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
-                if preview.draft_run_id and self.workspace_service.draft_exists(workspace_id, preview.draft_run_id)
-                else self.workspace_service.source_dir(workspace_id)
-            )
+        if preview.runtime_mode == "docker" and (preview.proxy_port is not None or preview.project_name):
+            log_source_dir = self._runtime_source_dir(workspace_id, preview)
             try:
                 runtime_logs = self.runtime_manager.collect_logs(
                     workspace_id,
@@ -536,4 +543,74 @@ class PreviewService:
             return PreviewRecord.model_validate(payload)
         preview = PreviewRecord(workspace_id=workspace_id)
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
+        return preview
+
+    def _runtime_source_dir(self, workspace_id: str, preview: PreviewRecord) -> Path:
+        if preview.draft_run_id and self.workspace_service.draft_exists(workspace_id, preview.draft_run_id):
+            return self.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
+        return self.workspace_service.source_dir(workspace_id)
+
+    def _is_stale_starting_preview(self, preview: PreviewRecord) -> bool:
+        age_seconds = (datetime.now(timezone.utc) - preview.updated_at).total_seconds()
+        return age_seconds >= STARTING_STALE_AFTER_SEC
+
+    def _reconcile_runtime_state(self, preview: PreviewRecord, workspace_id: str) -> PreviewRecord:
+        if preview.runtime_mode != "docker":
+            return preview
+
+        source_dir: Path | None
+        try:
+            source_dir = self._runtime_source_dir(workspace_id, preview)
+        except KeyError:
+            source_dir = None
+
+        runtime_present = False
+        runtime_running = False
+        if source_dir is not None:
+            containers = self.runtime_manager.inspect_containers(workspace_id, source_dir, preview.proxy_port)
+            runtime_present = any((container.get("state") or "") != "missing" for container in containers)
+            runtime_running = any((container.get("state") or "") == "running" for container in containers)
+
+        changed = False
+        if not runtime_present and (
+            preview.project_name
+            or preview.proxy_port is not None
+            or preview.url
+            or preview.status in {"running", "starting", "error"}
+        ):
+            preview.status = "stopped"
+            preview.stage = "idle"
+            preview.progress_percent = 0
+            preview.url = None
+            preview.frontend_url = None
+            preview.backend_url = None
+            preview.proxy_port = None
+            preview.project_name = None
+            preview.last_error = None
+            self._append_log(preview, "Preview runtime was not found. Resetting stale preview state.")
+            changed = True
+        elif runtime_running and preview.proxy_port is not None and (preview.status != "running" or not preview.url):
+            preview.project_name = preview.project_name or self.runtime_manager.project_name(workspace_id)
+            preview.url = self.runtime_manager.preview_url(preview.proxy_port)
+            preview.frontend_url = preview.url
+            preview.backend_url = self.runtime_manager.backend_url(preview.proxy_port)
+            preview.status = "running"
+            preview.stage = "running"
+            preview.progress_percent = 100
+            preview.last_error = None
+            self._append_log(preview, "Preview runtime is already running. Restored preview state from docker.")
+            changed = True
+        elif runtime_present and not runtime_running and preview.status == "running":
+            preview.status = "error"
+            preview.stage = "error"
+            preview.progress_percent = 100
+            preview.url = None
+            preview.frontend_url = None
+            preview.backend_url = None
+            preview.last_error = "Preview containers exist but none are running."
+            self._append_log(preview, "Preview containers exist but none are running. Marking preview as error.")
+            changed = True
+
+        if changed:
+            self._persist(preview)
         return preview

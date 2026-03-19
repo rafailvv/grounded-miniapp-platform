@@ -9,6 +9,7 @@ from pathlib import Path
 class Settings:
     repo_root: Path
     data_dir: Path
+    host_data_dir: Path
     workspaces_dir: Path
     exports_dir: Path
     runtime_dir: Path
@@ -31,9 +32,11 @@ def get_settings(
     root = repo_root or Path(__file__).resolve().parents[4]
     preview_base_url = os.getenv("PREVIEW_BASE_URL", preview_base_url)
     resolved_data_dir = data_dir or Path(os.getenv("PLATFORM_DATA_DIR", str(root / "data")))
+    resolved_host_data_dir = Path(os.getenv("PLATFORM_HOST_DATA_DIR", str(resolved_data_dir)))
     settings = Settings(
         repo_root=root,
         data_dir=resolved_data_dir,
+        host_data_dir=resolved_host_data_dir,
         workspaces_dir=resolved_data_dir / "workspaces",
         exports_dir=resolved_data_dir / "exports",
         runtime_dir=root / "runtime",

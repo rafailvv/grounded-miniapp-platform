@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import subprocess
+import tempfile
 import time
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -36,20 +37,23 @@ class PreviewRuntimeManager:
 
     def start(self, workspace_id: str, source_dir: Path, proxy_port: int) -> tuple[str, list[str]]:
         project_name = self.project_name(workspace_id)
-        compose_file = source_dir / "docker" / "docker-compose.yml"
         env = self._compose_env(proxy_port)
         compose_cmd = self._compose_command()
         if compose_cmd is None:
             raise RuntimeError("Docker Compose is not available inside the platform backend container.")
+        compose_file = self._render_host_compose_file(source_dir)
         command = [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"]
         started_at = time.perf_counter()
-        result = subprocess.run(
-            command,
-            cwd=source_dir,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=self._compose_workdir(source_dir),
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+        finally:
+            compose_file.unlink(missing_ok=True)
         logs = [
             f"[runtime] starting docker preview for workspace {workspace_id} on port {proxy_port}",
             f"[runtime] command: {' '.join(command)}",
@@ -64,20 +68,23 @@ class PreviewRuntimeManager:
 
     def rebuild(self, workspace_id: str, source_dir: Path, proxy_port: int) -> list[str]:
         project_name = self.project_name(workspace_id)
-        compose_file = source_dir / "docker" / "docker-compose.yml"
         env = self._compose_env(proxy_port)
         compose_cmd = self._compose_command()
         if compose_cmd is None:
             raise RuntimeError("Docker Compose is not available inside the platform backend container.")
+        compose_file = self._render_host_compose_file(source_dir)
         command = [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"]
         started_at = time.perf_counter()
-        result = subprocess.run(
-            command,
-            cwd=source_dir,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=self._compose_workdir(source_dir),
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+        finally:
+            compose_file.unlink(missing_ok=True)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Docker compose rebuild failed.")
         logs = [
@@ -90,26 +97,31 @@ class PreviewRuntimeManager:
         return [item for item in logs if item]
 
     def reset(self, workspace_id: str, source_dir: Path, proxy_port: int | None) -> list[str]:
-        if proxy_port is None:
-            return []
         project_name = self.project_name(workspace_id)
-        compose_file = source_dir / "docker" / "docker-compose.yml"
-        env = self._compose_env(proxy_port)
+        effective_proxy_port = proxy_port or self.settings.preview_port_base
+        env = self._compose_env(effective_proxy_port)
         compose_cmd = self._compose_command()
         if compose_cmd is None:
             raise RuntimeError("Docker Compose is not available inside the platform backend container.")
+        try:
+            compose_file = self._render_host_compose_file(source_dir)
+        except FileNotFoundError as exc:
+            return [f"[runtime] {exc}; nothing to stop."]
         command = [*compose_cmd, "-f", str(compose_file), "-p", project_name, "down", "-v", "--remove-orphans"]
-        result = subprocess.run(
-            command,
-            cwd=source_dir,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=self._compose_workdir(source_dir),
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+        finally:
+            compose_file.unlink(missing_ok=True)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Docker compose down failed.")
         return [
-            f"[runtime] stopping docker preview on port {proxy_port}",
+            f"[runtime] stopping docker preview on port {effective_proxy_port}",
             f"[runtime] command: {' '.join(command)}",
             *self._command_output_logs(result.stdout, result.stderr),
         ]
@@ -118,64 +130,75 @@ class PreviewRuntimeManager:
         return f"grounded_preview_{workspace_id[:18]}"
 
     def collect_logs(self, workspace_id: str, source_dir: Path, proxy_port: int | None) -> list[str]:
-        if proxy_port is None:
+        try:
+            compose_file = self._render_host_compose_file(source_dir)
+        except FileNotFoundError:
             return []
-        compose_cmd, compose_file, project_name, env = self._compose_parts(workspace_id, source_dir, proxy_port)
+        compose_cmd = self._compose_command()
+        project_name = self.project_name(workspace_id)
+        env = self._compose_env(proxy_port or self.settings.preview_port_base)
         if compose_cmd is None:
             return ["Docker Compose is not available inside the platform backend container."]
-        result = subprocess.run(
-            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "logs", "--tail", "200"],
-            cwd=source_dir,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
-        return [line for line in output.splitlines() if line.strip()]
-
-    def collect_container_logs(self, workspace_id: str, source_dir: Path, proxy_port: int | None) -> dict[str, list[str]]:
-        if proxy_port is None:
-            return {}
-        compose_cmd, compose_file, project_name, env = self._compose_parts(workspace_id, source_dir, proxy_port)
-        if compose_cmd is None:
-            return {"platform": ["Docker Compose is not available inside the platform backend container."]}
-        logs_by_service: dict[str, list[str]] = {}
-        for service in self.PREVIEW_SERVICES:
+        try:
             result = subprocess.run(
-                [*compose_cmd, "-f", str(compose_file), "-p", project_name, "logs", "--tail", "120", service],
-                cwd=source_dir,
+                [*compose_cmd, "-f", str(compose_file), "-p", project_name, "logs", "--tail", "200"],
+                cwd=self._compose_workdir(source_dir),
                 capture_output=True,
                 text=True,
                 env=env,
             )
-            output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
-            lines = [line for line in output.splitlines() if line.strip()]
-            logs_by_service[service] = lines or [f"No logs for {service} yet."]
+        finally:
+            compose_file.unlink(missing_ok=True)
+        output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
+        return [line for line in output.splitlines() if line.strip()]
+
+    def collect_container_logs(self, workspace_id: str, source_dir: Path, proxy_port: int | None) -> dict[str, list[str]]:
+        try:
+            compose_file = self._render_host_compose_file(source_dir)
+        except FileNotFoundError:
+            return {}
+        compose_cmd = self._compose_command()
+        project_name = self.project_name(workspace_id)
+        env = self._compose_env(proxy_port or self.settings.preview_port_base)
+        if compose_cmd is None:
+            return {"platform": ["Docker Compose is not available inside the platform backend container."]}
+        logs_by_service: dict[str, list[str]] = {}
+        try:
+            for service in self.PREVIEW_SERVICES:
+                result = subprocess.run(
+                    [*compose_cmd, "-f", str(compose_file), "-p", project_name, "logs", "--tail", "120", service],
+                    cwd=self._compose_workdir(source_dir),
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
+                lines = [line for line in output.splitlines() if line.strip()]
+                logs_by_service[service] = lines or [f"No logs for {service} yet."]
+        finally:
+            compose_file.unlink(missing_ok=True)
         return logs_by_service
 
     def inspect_containers(self, workspace_id: str, source_dir: Path, proxy_port: int | None) -> list[dict[str, str | None]]:
-        if proxy_port is None:
-            return [
-                {
-                    "service": service,
-                    "name": None,
-                    "state": "missing",
-                    "status": "not started",
-                    "health": None,
-                    "exit_code": None,
-                }
-                for service in self.PREVIEW_SERVICES
-            ]
-        compose_cmd, compose_file, project_name, env = self._compose_parts(workspace_id, source_dir, proxy_port)
+        try:
+            compose_file = self._render_host_compose_file(source_dir)
+        except FileNotFoundError:
+            return self._missing_containers()
+        compose_cmd = self._compose_command()
+        project_name = self.project_name(workspace_id)
+        env = self._compose_env(proxy_port or self.settings.preview_port_base)
         if compose_cmd is None:
             return []
-        result = subprocess.run(
-            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "ps", "-a", "--format", "json"],
-            cwd=source_dir,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+        try:
+            result = subprocess.run(
+                [*compose_cmd, "-f", str(compose_file), "-p", project_name, "ps", "-a", "--format", "json"],
+                cwd=self._compose_workdir(source_dir),
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+        finally:
+            compose_file.unlink(missing_ok=True)
         service_map: dict[str, dict[str, str | None]] = {}
         payload = result.stdout.strip()
         if payload:
@@ -209,14 +232,7 @@ class PreviewRuntimeManager:
             containers.append(
                 service_map.get(
                     service,
-                    {
-                        "service": service,
-                        "name": None,
-                        "state": "missing",
-                        "status": "not started",
-                        "health": None,
-                        "exit_code": None,
-                    },
+                    self._missing_container(service),
                 )
             )
         return containers
@@ -266,17 +282,38 @@ class PreviewRuntimeManager:
         env["PREVIEW_POSTGRES_PASSWORD"] = "miniapp"
         return env
 
-    def _compose_parts(
-        self,
-        workspace_id: str,
-        source_dir: Path,
-        proxy_port: int,
-    ) -> tuple[list[str] | None, Path, str, dict[str, str]]:
-        compose_file = source_dir / "docker" / "docker-compose.yml"
-        project_name = self.project_name(workspace_id)
-        env = self._compose_env(proxy_port)
-        compose_cmd = self._compose_command()
-        return compose_cmd, compose_file, project_name, env
+    def _host_source_dir(self, source_dir: Path) -> Path:
+        try:
+            relative = source_dir.relative_to(self.settings.data_dir)
+        except ValueError:
+            return source_dir
+        return self.settings.host_data_dir / relative
+
+    def _compose_workdir(self, source_dir: Path) -> Path:
+        return source_dir if source_dir.exists() else self.settings.data_dir
+
+    def _render_host_compose_file(self, source_dir: Path) -> Path:
+        source_compose_file = source_dir / "docker" / "docker-compose.yml"
+        if not source_dir.exists():
+            raise FileNotFoundError(f"Preview source directory is missing: {source_dir}")
+        if not source_compose_file.exists():
+            raise FileNotFoundError(f"Preview compose file is missing: {source_compose_file}")
+
+        host_source_dir = self._host_source_dir(source_dir)
+        rendered = source_compose_file.read_text(encoding="utf-8")
+        replacements = {
+            "../backend:/app": f"{(host_source_dir / 'backend').as_posix()}:/app",
+            "../frontend:/app": f"{(host_source_dir / 'frontend').as_posix()}:/app",
+            "./nginx.conf:/etc/nginx/conf.d/default.conf:ro": (
+                f"{(host_source_dir / 'docker' / 'nginx.conf').as_posix()}:/etc/nginx/conf.d/default.conf:ro"
+            ),
+        }
+        for pattern, replacement in replacements.items():
+            rendered = rendered.replace(pattern, replacement)
+
+        with tempfile.NamedTemporaryFile("w", suffix="-preview-compose.yml", delete=False, encoding="utf-8") as handle:
+            handle.write(rendered)
+            return Path(handle.name)
 
     @staticmethod
     def _port_free(port: int) -> bool:
@@ -299,6 +336,21 @@ class PreviewRuntimeManager:
         if legacy is not None and legacy.returncode == 0:
             return ["docker-compose"]
         return None
+
+    @classmethod
+    def _missing_container(cls, service: str) -> dict[str, str | None]:
+        return {
+            "service": service,
+            "name": None,
+            "state": "missing",
+            "status": "not started",
+            "health": None,
+            "exit_code": None,
+        }
+
+    @classmethod
+    def _missing_containers(cls) -> list[dict[str, str | None]]:
+        return [cls._missing_container(service) for service in cls.PREVIEW_SERVICES]
 
     @staticmethod
     def _command_output_logs(stdout: str, stderr: str, *, tail_lines: int = 40) -> list[str]:
