@@ -38,17 +38,25 @@ class PreviewRuntimeManager:
         compose_cmd = self._compose_command()
         if compose_cmd is None:
             raise RuntimeError("Docker Compose is not available inside the platform backend container.")
+        command = [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"]
+        started_at = time.perf_counter()
         result = subprocess.run(
-            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"],
+            command,
             cwd=source_dir,
             capture_output=True,
             text=True,
             env=env,
         )
-        logs = [result.stdout.strip(), result.stderr.strip()]
+        logs = [
+            f"[runtime] starting docker preview for workspace {workspace_id} on port {proxy_port}",
+            f"[runtime] command: {' '.join(command)}",
+            *self._command_output_logs(result.stdout, result.stderr),
+        ]
         if result.returncode != 0:
             raise RuntimeError("\n".join(filter(None, logs)) or "Docker compose up failed.")
-        self.wait_until_ready(proxy_port)
+        wait_logs = self.wait_until_ready(proxy_port)
+        logs.extend(wait_logs)
+        logs.append(f"[runtime] docker preview started in {int((time.perf_counter() - started_at) * 1000)}ms")
         return project_name, [item for item in logs if item]
 
     def rebuild(self, workspace_id: str, source_dir: Path, proxy_port: int) -> list[str]:
@@ -58,8 +66,10 @@ class PreviewRuntimeManager:
         compose_cmd = self._compose_command()
         if compose_cmd is None:
             raise RuntimeError("Docker Compose is not available inside the platform backend container.")
+        command = [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"]
+        started_at = time.perf_counter()
         result = subprocess.run(
-            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"],
+            command,
             cwd=source_dir,
             capture_output=True,
             text=True,
@@ -67,8 +77,14 @@ class PreviewRuntimeManager:
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Docker compose rebuild failed.")
-        self.wait_until_ready(proxy_port)
-        return [item for item in [result.stdout.strip(), result.stderr.strip()] if item]
+        logs = [
+            f"[runtime] rebuilding docker preview for workspace {workspace_id} on port {proxy_port}",
+            f"[runtime] command: {' '.join(command)}",
+            *self._command_output_logs(result.stdout, result.stderr),
+        ]
+        logs.extend(self.wait_until_ready(proxy_port))
+        logs.append(f"[runtime] docker preview rebuild completed in {int((time.perf_counter() - started_at) * 1000)}ms")
+        return [item for item in logs if item]
 
     def reset(self, workspace_id: str, source_dir: Path, proxy_port: int | None) -> list[str]:
         if proxy_port is None:
@@ -79,8 +95,9 @@ class PreviewRuntimeManager:
         compose_cmd = self._compose_command()
         if compose_cmd is None:
             raise RuntimeError("Docker Compose is not available inside the platform backend container.")
+        command = [*compose_cmd, "-f", str(compose_file), "-p", project_name, "down", "-v", "--remove-orphans"]
         result = subprocess.run(
-            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "down", "-v", "--remove-orphans"],
+            command,
             cwd=source_dir,
             capture_output=True,
             text=True,
@@ -88,7 +105,11 @@ class PreviewRuntimeManager:
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Docker compose down failed.")
-        return [item for item in [result.stdout.strip(), result.stderr.strip()] if item]
+        return [
+            f"[runtime] stopping docker preview on port {proxy_port}",
+            f"[runtime] command: {' '.join(command)}",
+            *self._command_output_logs(result.stdout, result.stderr),
+        ]
 
     def project_name(self, workspace_id: str) -> str:
         return f"grounded_preview_{workspace_id[:18]}"
@@ -103,7 +124,7 @@ class PreviewRuntimeManager:
         if compose_cmd is None:
             return ["Docker Compose is not available inside the platform backend container."]
         result = subprocess.run(
-            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "logs", "--tail", "80"],
+            [*compose_cmd, "-f", str(compose_file), "-p", project_name, "logs", "--tail", "200"],
             cwd=source_dir,
             capture_output=True,
             text=True,
@@ -118,21 +139,27 @@ class PreviewRuntimeManager:
     def backend_url(self, proxy_port: int) -> str:
         return f"http://localhost:{proxy_port}/api"
 
-    def wait_until_ready(self, proxy_port: int) -> None:
+    def wait_until_ready(self, proxy_port: int) -> list[str]:
         deadline = time.time() + self.settings.preview_start_timeout_sec
         health_urls = [
             f"http://host.docker.internal:{proxy_port}/health",
             f"http://127.0.0.1:{proxy_port}/health",
             f"http://localhost:{proxy_port}/health",
         ]
+        attempts = 0
+        logs = [f"[runtime] waiting for preview health on port {proxy_port}"]
         while time.time() < deadline:
+            attempts += 1
             for health_url in health_urls:
                 try:
                     with urlopen(health_url, timeout=2) as response:
                         if response.status == 200:
-                            return
+                            logs.append(f"[runtime] health probe #{attempts} passed at {health_url}")
+                            return logs
                 except (URLError, OSError):
                     continue
+            if attempts <= 5 or attempts % 5 == 0:
+                logs.append(f"[runtime] health probe #{attempts} pending")
             time.sleep(1)
         raise RuntimeError(
             "Preview runtime did not become healthy at any of: "
@@ -172,3 +199,11 @@ class PreviewRuntimeManager:
         if legacy is not None and legacy.returncode == 0:
             return ["docker-compose"]
         return None
+
+    @staticmethod
+    def _command_output_logs(stdout: str, stderr: str, *, tail_lines: int = 40) -> list[str]:
+        merged = "\n".join(part for part in [stdout.strip(), stderr.strip()] if part.strip())
+        if not merged:
+            return []
+        lines = [line.rstrip() for line in merged.splitlines() if line.strip()]
+        return lines[-tail_lines:]

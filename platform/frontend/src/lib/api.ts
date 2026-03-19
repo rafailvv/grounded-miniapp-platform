@@ -18,6 +18,7 @@ export type Run = {
   workspace_id: string;
   prompt: string;
   mode?: "generate" | "fix";
+  generation_mode?: "fast" | "balanced" | "quality" | "basic";
   intent: "create" | "edit" | "refine" | "role_only_change";
   apply_strategy: "staged_auto_apply" | "manual_approve";
   target_role_scope: Array<"client" | "specialist" | "manager">;
@@ -189,7 +190,7 @@ export type SystemConfiguration = {
     task_profiles?: Record<string, unknown>;
   };
   defaults: {
-    generation_mode: "quality" | "balanced" | "basic";
+    generation_mode: "fast" | "balanced" | "quality" | "basic";
     model_profile: string;
   };
   default_coding_profile: string;
@@ -259,7 +260,7 @@ export async function createRun(
     apply_strategy?: "staged_auto_apply" | "manual_approve";
     target_role_scope?: Array<"client" | "specialist" | "manager">;
     model_profile?: string;
-    generation_mode?: "quality" | "balanced" | "basic";
+    generation_mode?: "fast" | "balanced" | "quality" | "basic";
     target_platform?: "telegram_mini_app" | "max_mini_app";
     preview_profile?: "telegram_mock" | "max_mock" | "web_preview";
     error_context?: {
@@ -276,7 +277,7 @@ export async function createRun(
       intent: "auto",
       apply_strategy: "staged_auto_apply",
       target_role_scope: [],
-      generation_mode: "quality",
+      generation_mode: "balanced",
       target_platform: "telegram_mini_app",
       preview_profile: "telegram_mock",
       ...payload,

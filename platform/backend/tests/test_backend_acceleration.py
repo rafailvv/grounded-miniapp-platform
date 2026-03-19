@@ -58,6 +58,16 @@ def test_code_index_retrieval_prefers_symbol_overlap(tmp_path: Path) -> None:
     assert retrieval["stats"]["code_hits"] > 0
 
 
+def test_system_configuration_defaults_to_balanced(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    response = client.get("/system/configuration")
+    assert response.status_code == 200
+    assert response.json()["defaults"]["generation_mode"] == "balanced"
+
+
 def test_run_exposes_checks_patch_and_index_status(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -120,6 +130,59 @@ def test_run_exposes_checks_patch_and_index_status(tmp_path: Path) -> None:
     assert patch_payload["apply_result"]["status"] == "applied"
 
 
+def test_fast_generation_mode_round_trips_on_run(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    _install_llm_stub(app)
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Fast Workspace",
+            "description": "Fast mode test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
+
+    run_response = client.post(
+        f"/workspaces/{workspace_id}/runs",
+        json={
+            "prompt": "Create a multi-page booking app for all roles.",
+            "intent": "auto",
+            "apply_strategy": "manual_approve",
+            "target_role_scope": ["client", "specialist", "manager"],
+            "model_profile": "openai_code_fast",
+            "generation_mode": "fast",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    )
+    assert run_response.status_code == 200
+
+    run_payload = run_response.json()
+    assert run_payload["generation_mode"] == "fast"
+    run_id = run_payload["run_id"]
+
+    final_run = run_payload
+    for _ in range(90):
+        current = client.get(f"/runs/{run_id}")
+        assert current.status_code == 200
+        final_run = current.json()
+        if final_run["status"] in {"awaiting_approval", "blocked", "failed"}:
+            break
+        time.sleep(0.2)
+
+    assert final_run["status"] == "awaiting_approval"
+    assert final_run["generation_mode"] == "fast"
+    artifacts = client.get(f"/runs/{run_id}/artifacts")
+    assert artifacts.status_code == 200
+    assert artifacts.json()["code_change_plan"]["targets"]
+
+
 def test_fix_mode_run_exposes_failure_analysis_metadata(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -170,6 +233,7 @@ def test_fix_mode_run_exposes_failure_analysis_metadata(tmp_path: Path) -> None:
         time.sleep(0.2)
 
     assert final_run["mode"] == "fix"
+    assert final_run["generation_mode"] == "balanced"
     assert final_run["error_context"]["source"] == "preview"
     artifacts_response = client.get(f"/runs/{run_id}/artifacts")
     assert artifacts_response.status_code == 200

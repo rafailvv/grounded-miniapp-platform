@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -41,7 +44,7 @@ class CheckRunner:
         )
 
         static_started = time.perf_counter()
-        static_result = self._static_check(changed_files)
+        static_result = self._static_check(source_dir=source_dir, changed_files=changed_files)
         static_result.duration_ms = int((time.perf_counter() - static_started) * 1000)
         results.append(static_result)
 
@@ -80,6 +83,8 @@ class CheckRunner:
             message = result.details or f"{result.name} failed."
             if result.name == "schema_validators":
                 message = next((line for line in result.logs if line.strip()), message)
+            if result.name == "changed_files_static":
+                message = next((line for line in result.logs if line.strip()), message)
             if result.name == "preview_boot_smoke":
                 location = "preview"
                 code = "preview.rebuild_failed"
@@ -106,25 +111,35 @@ class CheckRunner:
             return "runtime_preview_boot"
         return None
 
-    @staticmethod
-    def _static_check(changed_files: list[str]) -> RunCheckResult:
-        frontend = any(path.startswith("frontend/") for path in changed_files)
-        backend = any(path.startswith("backend/") for path in changed_files)
+    def _static_check(self, *, source_dir: Path, changed_files: list[str]) -> RunCheckResult:
+        frontend_dir = source_dir / "frontend"
+        backend_dir = source_dir / "backend"
+        logs: list[str] = []
+        executed = False
+
+        if (frontend_dir / "package.json").exists():
+            executed = True
+            frontend_result = self._run_frontend_build(frontend_dir)
+            logs.extend(frontend_result.logs)
+            if frontend_result.status == "failed":
+                return frontend_result
+
+        if (backend_dir / "app").exists():
+            executed = True
+            backend_result = self._run_backend_compile(backend_dir)
+            logs.extend(backend_result.logs)
+            if backend_result.status == "failed":
+                return backend_result
+
+        if executed:
+            return RunCheckResult(
+                name="changed_files_static",
+                status="passed",
+                details="Full draft compile checks passed.",
+                logs=logs or ["Draft compile checks passed."],
+            )
+
         generated = any(path.startswith("artifacts/") for path in changed_files)
-        if frontend:
-            return RunCheckResult(
-                name="changed_files_static",
-                status="passed",
-                details="Frontend-targeted static smoke passed.",
-                logs=["Frontend files changed; lightweight static smoke assumed in current runtime template."],
-            )
-        if backend:
-            return RunCheckResult(
-                name="changed_files_static",
-                status="passed",
-                details="Backend-targeted static smoke passed.",
-                logs=["Backend files changed; lightweight static smoke passed."],
-            )
         if generated:
             return RunCheckResult(
                 name="changed_files_static",
@@ -137,6 +152,134 @@ class CheckRunner:
             status="skipped",
             details="No changed-file static checks were required.",
         )
+
+    def _run_frontend_build(self, frontend_dir: Path) -> RunCheckResult:
+        npm_binary = "npm"
+        env = {
+            **os.environ,
+            "CI": "true",
+            "npm_config_audit": "false",
+            "npm_config_fund": "false",
+            "npm_config_update_notifier": "false",
+        }
+
+        install_timeout = int(os.getenv("FRONTEND_INSTALL_TIMEOUT_SEC", "900"))
+        build_timeout = int(os.getenv("FRONTEND_BUILD_TIMEOUT_SEC", "900"))
+
+        try:
+            if not (frontend_dir / "node_modules").exists():
+                install_cmd = [npm_binary, "ci", "--no-audit", "--no-fund"] if (frontend_dir / "package-lock.json").exists() else [npm_binary, "install", "--no-audit", "--no-fund"]
+                install_result = subprocess.run(
+                    install_cmd,
+                    cwd=frontend_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=install_timeout,
+                    env=env,
+                )
+                if install_result.returncode != 0:
+                    return RunCheckResult(
+                        name="changed_files_static",
+                        status="failed",
+                        details="Frontend dependency install failed before build.",
+                        logs=self._command_logs(
+                            "Frontend dependency install failed before build.",
+                            install_result.stdout,
+                            install_result.stderr,
+                        ),
+                    )
+
+            build_result = subprocess.run(
+                [npm_binary, "run", "build"],
+                cwd=frontend_dir,
+                capture_output=True,
+                text=True,
+                timeout=build_timeout,
+                env=env,
+            )
+            if build_result.returncode != 0:
+                return RunCheckResult(
+                    name="changed_files_static",
+                    status="failed",
+                    details="npm run build failed for the draft frontend.",
+                    logs=self._command_logs(
+                        "npm run build failed for the draft frontend.",
+                        build_result.stdout,
+                        build_result.stderr,
+                    ),
+                )
+            return RunCheckResult(
+                name="changed_files_static",
+                status="passed",
+                details="npm run build passed for the draft frontend.",
+                logs=["npm run build passed for the draft frontend."],
+            )
+        except FileNotFoundError:
+            return RunCheckResult(
+                name="changed_files_static",
+                status="failed",
+                details="npm is not available in the backend runtime.",
+                logs=["npm is not available in the backend runtime."],
+            )
+        except subprocess.TimeoutExpired as exc:
+            return RunCheckResult(
+                name="changed_files_static",
+                status="failed",
+                details="npm run build timed out for the draft frontend.",
+                logs=self._command_logs(
+                    "npm run build timed out for the draft frontend.",
+                    exc.stdout or "",
+                    exc.stderr or "",
+                ),
+            )
+
+    def _run_backend_compile(self, backend_dir: Path) -> RunCheckResult:
+        app_dir = backend_dir / "app"
+        py_files = sorted(str(path.relative_to(backend_dir)) for path in app_dir.rglob("*.py"))
+        if not py_files:
+            return RunCheckResult(
+                name="changed_files_static",
+                status="passed",
+                details="No backend Python files required compilation.",
+                logs=["No backend Python files required compilation."],
+            )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "py_compile", *py_files],
+                cwd=backend_dir,
+                capture_output=True,
+                text=True,
+                timeout=int(os.getenv("BACKEND_COMPILE_TIMEOUT_SEC", "180")),
+            )
+        except subprocess.TimeoutExpired as exc:
+            return RunCheckResult(
+                name="changed_files_static",
+                status="failed",
+                details="Backend py_compile timed out.",
+                logs=self._command_logs("Backend py_compile timed out.", exc.stdout or "", exc.stderr or ""),
+            )
+        if result.returncode != 0:
+            return RunCheckResult(
+                name="changed_files_static",
+                status="failed",
+                details="Backend py_compile failed for the draft backend.",
+                logs=self._command_logs("Backend py_compile failed for the draft backend.", result.stdout, result.stderr),
+            )
+        return RunCheckResult(
+            name="changed_files_static",
+            status="passed",
+            details="Backend py_compile passed for the draft backend.",
+            logs=["Backend py_compile passed for the draft backend."],
+        )
+
+    @staticmethod
+    def _command_logs(summary: str, stdout: str, stderr: str, *, tail_lines: int = 40) -> list[str]:
+        merged = "\n".join(part for part in [stderr.strip(), stdout.strip()] if part.strip())
+        lines = [line.rstrip() for line in merged.splitlines() if line.strip()]
+        if not lines:
+            return [summary]
+        tail = lines[-tail_lines:]
+        return [summary, *tail]
 
     @staticmethod
     def _filter_build_issues(issues: list[ValidationIssue], scope_mode: str) -> list[ValidationIssue]:

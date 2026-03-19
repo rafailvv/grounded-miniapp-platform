@@ -118,6 +118,7 @@ SHARED_GENERATED_FILES = (
 )
 logger = logging.getLogger(__name__)
 QUALITY_FIDELITY = {
+    GenerationMode.FAST: "fast_app",
     GenerationMode.QUALITY: "quality_app",
     GenerationMode.BALANCED: "balanced_app",
     GenerationMode.BASIC: "basic_scaffold",
@@ -182,6 +183,8 @@ class GenerationService:
         else:
             draft_run_id = job.job_id
         self._clear_trace(workspace_id)
+        self._append_event(job, "job_started", "Generation request accepted.")
+        self._append_event(job, "indexing_started", "Refreshing workspace index.")
         self._append_event(job, "retrieval_started", "Preparing workspace index and grounded retrieval.")
         self._append_trace(
             workspace_id,
@@ -241,6 +244,7 @@ class GenerationService:
             prompt=effective_prompt,
             target_platform=target_platform.value,
         )
+        self._append_event(job, "retrieval_completed", f"Retrieved {len(doc_refs)} grounded document references.")
         retrieval_ms = int((time.perf_counter() - started_at) * 1000)
         job.latency_breakdown["retrieval_ms"] = retrieval_ms
         job.retrieval_stats = {
@@ -273,6 +277,7 @@ class GenerationService:
             "Creative direction selected for this run.",
             creative_direction,
         )
+        self._append_event(job, "spec_started", "Building grounded specification.")
         stopped = self._stop_if_requested(job, workspace_id, should_stop)
         if stopped is not None:
             return stopped
@@ -348,6 +353,7 @@ class GenerationService:
             return job
 
         draft_source = self.workspace_service.prepare_draft(workspace_id, draft_run_id)
+        self._append_event(job, "draft_prepared", "Prepared draft workspace from the current revision.")
         self._append_trace(
             workspace_id,
             "draft_prepared",
@@ -357,12 +363,14 @@ class GenerationService:
                 "role_scope": role_scope,
             },
         )
+        self._append_event(job, "role_contract_started", "Analyzing role responsibilities before planning.")
         role_contract_result = self._resolve_role_contract(
             prompt=effective_prompt,
             grounded_spec=grounded_spec,
             doc_refs=doc_refs,
             role_scope=role_scope,
             intent=request.intent,
+            generation_mode=generation_mode,
             creative_direction=creative_direction,
         )
         if "error" in role_contract_result:
@@ -408,9 +416,11 @@ class GenerationService:
                 },
             },
         )
+        self._append_event(job, "role_contract_ready", "Role boundaries prepared for page planning.")
         stopped = self._stop_if_requested(job, workspace_id, should_stop)
         if stopped is not None:
             return stopped
+        self._append_event(job, "planning_started", "Planning route graph and target files.")
         plan_result = self._resolve_code_plan(
             workspace_id=workspace_id,
             prompt=effective_prompt,
@@ -482,9 +492,15 @@ class GenerationService:
             workspace=workspace,
             prompt=effective_prompt,
             model_profile=request.model_profile,
+            generation_mode=generation_mode,
             active_paths=plan_result["files_to_read"],
             target_files=plan_result["target_files"],
             run_id=draft_run_id,
+        )
+        self._append_event(
+            job,
+            "context_pack_started",
+            f"Collecting targeted file context for {len(plan_result['target_files'])} planned files.",
         )
         files_read = sorted(set(plan_result["files_to_read"]) | set(context_pack.targeted_files.keys()) | {chunk.path for chunk in context_pack.code_chunks})
         file_contexts: dict[str, str] = dict(context_pack.targeted_files)
@@ -500,7 +516,13 @@ class GenerationService:
             "stable_prefix_chars": len(context_pack.system_prefix),
         }
         job.latency_breakdown["context_pack_ms"] = int((time.perf_counter() - started_at) * 1000) - retrieval_ms
+        self._append_event(
+            job,
+            "context_pack_ready",
+            f"Context pack ready with {len(context_pack.code_chunks)} code chunks, {len(context_pack.doc_chunks)} doc chunks, and {len(context_pack.targeted_files)} file bodies.",
+        )
 
+        self._append_event(job, "editing_started", "Generating draft file edits.")
         edit_result = self._resolve_code_edits(
             prompt=effective_prompt,
             grounded_spec=grounded_spec,
@@ -632,6 +654,13 @@ class GenerationService:
                     "results": [item.model_dump(mode="json") for item in latest_check_results],
                 },
             )
+            failed_checks = [item.name for item in latest_check_results if item.status == "failed"]
+            self._append_event(
+                job,
+                "checks_completed",
+                "Checks completed." if not failed_checks else f"Checks completed with failures: {', '.join(failed_checks)}.",
+                {"failed_checks": failed_checks, "attempt": attempt},
+            )
             iteration = RunIterationRecord(
                 run_id=draft_run_id,
                 assistant_message=latest_assistant_message,
@@ -723,6 +752,7 @@ class GenerationService:
                 job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
                 return job
 
+            self._append_event(job, "repair_started", "Build or compile checks failed. Preparing the next repair attempt.")
             repair_result = self._repair_draft_after_failure(
                 workspace_id=workspace_id,
                 draft_run_id=draft_run_id,
@@ -872,6 +902,7 @@ class GenerationService:
             "fidelity": job.fidelity,
         }
         self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
+        self._append_event(job, "preview_rebuild_started", "Draft passed checks. Refreshing preview runtime.")
         self._append_event(job, "preview_ready", "Preview is ready.")
         self._append_event(job, "draft_ready", "Draft is ready for review.")
         self._append_event(job, "job_completed", "Generation completed successfully.")
@@ -927,8 +958,11 @@ class GenerationService:
         doc_refs: list[Any],
         role_scope: list[str],
         intent: str,
+        generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
+        if generation_mode == GenerationMode.FAST:
+            return {"role_contract": self._compiled_role_contract(grounded_spec, role_scope)}
         try:
             payload = self._generate_structured_with_retry(
                 role="code_plan",
@@ -963,7 +997,6 @@ class GenerationService:
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
-        del generation_mode
         scope_mode = self._scope_mode(intent, prompt, role_scope)
         require_multi_page = self._requires_multi_page(prompt, grounded_spec, role_scope, intent)
         try:
@@ -981,6 +1014,7 @@ class GenerationService:
                     scope_mode=scope_mode,
                     require_multi_page=require_multi_page,
                     workspace_tree=self.workspace_service.file_tree(workspace_id),
+                    generation_mode=generation_mode,
                     creative_direction=creative_direction,
                 ),
             )
@@ -1012,7 +1046,6 @@ class GenerationService:
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
-        del generation_mode
         target_set = set(target_files)
         page_operations: list[DraftFileOperation] = []
         page_messages: list[str] = []
@@ -1032,6 +1065,7 @@ class GenerationService:
                     scope_mode=scope_mode,
                     intent=intent,
                     file_contexts=file_contexts,
+                    generation_mode=generation_mode,
                     creative_direction=creative_direction,
                 )
                 for role, page in selected_pages
@@ -1047,6 +1081,7 @@ class GenerationService:
                     scope_mode=scope_mode,
                     intent=intent,
                     file_contexts=file_contexts,
+                    generation_mode=generation_mode,
                     creative_direction=creative_direction,
                 )
             )
@@ -1075,6 +1110,7 @@ class GenerationService:
             file_contexts=file_contexts,
             generated_page_sources=generated_page_sources,
             generated_support_sources={},
+            generation_mode=generation_mode,
             creative_direction=creative_direction,
         )
         if "error" in backend_result:
@@ -1097,6 +1133,7 @@ class GenerationService:
             file_contexts=file_contexts,
             generated_page_sources=generated_page_sources,
             generated_support_sources=generated_backend_sources,
+            generation_mode=generation_mode,
             creative_direction=creative_direction,
         )
         if "error" in frontend_result:
@@ -1180,6 +1217,45 @@ class GenerationService:
             "app_summary": str(payload.get("app_summary") or "").strip(),
             "shared_entities": self._normalize_string_list(payload.get("shared_entities")),
             "shared_logic": self._normalize_string_list(payload.get("shared_logic")),
+            "roles": roles,
+        }
+
+    def _compiled_role_contract(self, grounded_spec: GroundedSpecModel, role_scope: list[str]) -> dict[str, Any]:
+        entities = [entity.name for entity in grounded_spec.domain_entities if entity.name]
+        flows = grounded_spec.user_flows
+        roles: dict[str, dict[str, Any]] = {}
+        for role in role_scope:
+            actor = next((item for item in grounded_spec.actors if item.role == role), None)
+            role_flows = [flow for flow in flows if any(step.actor_id == getattr(actor, "actor_id", "") for step in flow.steps)]
+            ui_requirements = [
+                requirement
+                for requirement in grounded_spec.ui_requirements
+                if role in (f"{requirement.description} {requirement.screen_hint or ''}".lower())
+            ]
+            primary_jobs = [flow.name for flow in role_flows[:4] if flow.name]
+            key_entities = entities[:4]
+            ui_style_notes = [item.description for item in ui_requirements[:3] if item.description]
+            success_states = [
+                criterion
+                for flow in role_flows[:2]
+                for criterion in flow.acceptance_criteria[:1]
+                if criterion
+            ] or primary_jobs[:2]
+            roles[role] = {
+                "role": role,
+                "responsibility": getattr(actor, "description", None) or f"{role.capitalize()} workflow execution.",
+                "entry_goal": primary_jobs[0] if primary_jobs else f"Open the {role} workspace and continue the main flow.",
+                "primary_jobs": primary_jobs or [f"Handle the main {role} flow."],
+                "key_entities": key_entities,
+                "ui_style_notes": ui_style_notes or [f"Keep {role}-specific actions visible above generic metrics."],
+                "success_states": success_states or [f"{role.capitalize()} completes the intended task without cross-role confusion."],
+                "must_differ_from": [candidate for candidate in ROLE_ORDER if candidate in role_scope and candidate != role],
+            }
+        return {
+            "app_title": grounded_spec.product_goal[:80] if grounded_spec.product_goal else "Generated mini-app",
+            "app_summary": grounded_spec.product_goal or "Generated role-aware mini-app workspace.",
+            "shared_entities": entities[:6],
+            "shared_logic": [flow.name for flow in flows[:4] if flow.name],
             "roles": roles,
         }
 
@@ -1407,8 +1483,11 @@ class GenerationService:
         return ordered
 
     @staticmethod
-    def _page_edit_parallelism(*, scope_mode: str) -> int:
-        default = "2" if scope_mode == "minimal_patch" else "4"
+    def _page_edit_parallelism(*, scope_mode: str, generation_mode: GenerationMode) -> int:
+        if generation_mode == GenerationMode.FAST:
+            default = "2"
+        else:
+            default = "2" if scope_mode == "minimal_patch" else "4"
         configured = max(1, int(os.getenv("PAGE_EDIT_MAX_PARALLELISM", default)))
         return configured
 
@@ -1423,9 +1502,10 @@ class GenerationService:
         scope_mode: str,
         intent: str,
         file_contexts: dict[str, str],
+        generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        semaphore = asyncio.Semaphore(min(self._page_edit_parallelism(scope_mode=scope_mode), len(selected_pages)))
+        semaphore = asyncio.Semaphore(min(self._page_edit_parallelism(scope_mode=scope_mode, generation_mode=generation_mode), len(selected_pages)))
 
         async def run_one(role: str, page: dict[str, Any]) -> dict[str, Any]:
             async with semaphore:
@@ -1440,6 +1520,7 @@ class GenerationService:
                     scope_mode=scope_mode,
                     intent=intent,
                     file_contexts=file_contexts,
+                    generation_mode=generation_mode,
                     creative_direction=creative_direction,
                 )
 
@@ -1808,8 +1889,10 @@ class GenerationService:
         scope_mode: str,
         require_multi_page: bool,
         workspace_tree: list[dict[str, str]],
+        generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> str:
+        compact = generation_mode == GenerationMode.FAST
         return json_dumps(
             {
                 "task": "Plan a route/page graph for real code generation",
@@ -1817,10 +1900,13 @@ class GenerationService:
                 "role_scope": role_scope,
                 "scope_mode": scope_mode,
                 "require_multi_page": require_multi_page,
-                "grounded_spec": grounded_spec.model_dump(mode="json"),
+                "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec) if compact else grounded_spec.model_dump(mode="json"),
                 "role_contract": role_contract,
-                "doc_refs": [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in doc_refs],
-                "workspace_tree": workspace_tree,
+                "doc_refs": [
+                    item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+                    for item in (doc_refs[:4] if compact else doc_refs)
+                ],
+                "workspace_tree": workspace_tree[:36] if compact else workspace_tree,
                 "design_reference_files": list(DESIGN_REFERENCE_FILES),
                 "creative_direction": creative_direction,
                 "constraints": [
@@ -1854,8 +1940,10 @@ class GenerationService:
         scope_mode: str,
         intent: str,
         file_contexts: dict[str, str],
+        generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> str:
+        compact = generation_mode == GenerationMode.FAST
         sibling_pages = [
             item
             for item in (page_graph.get("roles", {}).get(role, {}) or {}).get("pages", [])
@@ -1867,8 +1955,8 @@ class GenerationService:
                 for path in DESIGN_REFERENCE_FILES
                 if path in file_contexts
             },
-            max_file_chars=4000,
-            max_total_chars=12000,
+            max_file_chars=2400 if compact else 4000,
+            max_total_chars=7200 if compact else 12000,
         )
         return json_dumps(
             {
@@ -1878,7 +1966,7 @@ class GenerationService:
                 "scope_mode": scope_mode,
                 "role": role,
                 "page": page,
-                "sibling_pages": sibling_pages[:4],
+                "sibling_pages": sibling_pages[:2] if compact else sibling_pages[:4],
                 "role_contract": role_contract.get("roles", {}).get(role),
                 "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
                 "shared_contract": {
@@ -1888,7 +1976,7 @@ class GenerationService:
                     ],
                     "design_reference_files": design_reference_files,
                 },
-                "current_file": self._limit_text(file_contexts.get(page["file_path"], ""), 12000),
+                "current_file": self._limit_text(file_contexts.get(page["file_path"], ""), 6000 if compact else 12000),
                 "creative_direction": creative_direction,
                 "rules": [
                     "Create a real page, not a generic stats card screen.",
@@ -1929,12 +2017,14 @@ class GenerationService:
         file_contexts: dict[str, str],
         generated_page_sources: dict[str, str],
         generated_support_sources: dict[str, str],
+        generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> str:
+        compact = generation_mode == GenerationMode.FAST
         trimmed_targets = self._bounded_file_contexts(
             {path: file_contexts.get(path, "") for path in target_files},
-            max_file_chars=9000,
-            max_total_chars=26000,
+            max_file_chars=4000 if compact else 9000,
+            max_total_chars=12000 if compact else 26000,
         )
         return json_dumps(
             {
@@ -1949,8 +2039,16 @@ class GenerationService:
                 "target_files": target_files,
                 "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
                 "file_contexts": trimmed_targets,
-                "generated_page_sources": self._bounded_file_contexts(generated_page_sources, max_file_chars=7000, max_total_chars=18000),
-                "generated_support_sources": self._bounded_file_contexts(generated_support_sources, max_file_chars=5000, max_total_chars=12000),
+                "generated_page_sources": self._bounded_file_contexts(
+                    generated_page_sources,
+                    max_file_chars=2800 if compact else 7000,
+                    max_total_chars=7200 if compact else 18000,
+                ),
+                "generated_support_sources": self._bounded_file_contexts(
+                    generated_support_sources,
+                    max_file_chars=2200 if compact else 5000,
+                    max_total_chars=5200 if compact else 12000,
+                ),
                 "creative_direction": creative_direction,
                 "rules": [
                     "Only touch files listed in target_files.",
@@ -1976,6 +2074,7 @@ class GenerationService:
         scope_mode: str,
         intent: str,
         file_contexts: dict[str, str],
+        generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
         try:
@@ -1994,6 +2093,7 @@ class GenerationService:
                     scope_mode=scope_mode,
                     intent=intent,
                     file_contexts=file_contexts,
+                    generation_mode=generation_mode,
                     creative_direction=creative_direction,
                 ),
             )
@@ -2032,6 +2132,7 @@ class GenerationService:
         file_contexts: dict[str, str],
         generated_page_sources: dict[str, str],
         generated_support_sources: dict[str, str],
+        generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
         if not target_files:
@@ -2056,6 +2157,7 @@ class GenerationService:
                     file_contexts=file_contexts,
                     generated_page_sources=generated_page_sources,
                     generated_support_sources=generated_support_sources,
+                    generation_mode=generation_mode,
                     creative_direction=creative_direction,
                 ),
             )
@@ -2256,11 +2358,13 @@ class GenerationService:
     @staticmethod
     def _repair_attempt_limit(generation_mode: GenerationMode, intent: str) -> int:
         if intent in {"edit", "refine", "role_only_change"}:
-            return max(1, int(os.getenv("EDIT_AUTO_REPAIR_ATTEMPTS", "2")))
+            return max(1, int(os.getenv("EDIT_AUTO_REPAIR_ATTEMPTS", "4")))
+        if generation_mode == GenerationMode.FAST:
+            return max(1, int(os.getenv("FAST_AUTO_REPAIR_ATTEMPTS", "3")))
         if generation_mode == GenerationMode.QUALITY:
-            return max(1, int(os.getenv("QUALITY_AUTO_REPAIR_ATTEMPTS", "2")))
+            return max(1, int(os.getenv("QUALITY_AUTO_REPAIR_ATTEMPTS", "6")))
         if generation_mode == GenerationMode.BALANCED:
-            return max(1, int(os.getenv("BALANCED_AUTO_REPAIR_ATTEMPTS", "2")))
+            return max(1, int(os.getenv("BALANCED_AUTO_REPAIR_ATTEMPTS", "5")))
         return max(0, int(os.getenv("BASIC_AUTO_REPAIR_ATTEMPTS", "1")))
 
     def _collect_existing_file_contexts(self, workspace_id: str, run_id: str, target_files: list[str]) -> dict[str, str]:
@@ -2571,9 +2675,19 @@ class GenerationService:
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
-        del workspace_id, generation_mode
+        del workspace_id
         if not self.openrouter_client.enabled:
             return {"error": "GroundedSpec generation requires OpenRouter configuration."}
+        if generation_mode == GenerationMode.FAST:
+            return self._resolve_grounded_spec_fast(
+                prompt=prompt,
+                doc_refs=doc_refs,
+                target_platform=target_platform,
+                preview_profile=preview_profile,
+                template_revision_id=template_revision_id,
+                prompt_turn_id=prompt_turn_id,
+                creative_direction=creative_direction,
+            )
         try:
             outline_payload, payload, outline = self._generate_grounded_spec_pair(
                 prompt=prompt,
@@ -2645,6 +2759,74 @@ class GenerationService:
                 return {
                     "error": (
                         "GroundedSpec generation failed: "
+                        f"strict mode error: {strict_exc}; relaxed mode error: {relaxed_exc}"
+                    )
+                }
+
+    def _resolve_grounded_spec_fast(
+        self,
+        *,
+        prompt: str,
+        doc_refs: list[Any],
+        target_platform: TargetPlatform,
+        preview_profile: PreviewProfile,
+        template_revision_id: str,
+        prompt_turn_id: str,
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            payload = self._generate_structured_with_retry(
+                role="spec_analysis",
+                schema_name="grounded_spec_fast_v1",
+                schema=GroundedSpecModel.model_json_schema(),
+                system_prompt=self._grounded_spec_system_prompt(),
+                user_prompt=self._grounded_spec_user_prompt(
+                    prompt=prompt,
+                    doc_refs=doc_refs,
+                    target_platform=target_platform,
+                    preview_profile=preview_profile,
+                    template_revision_id=template_revision_id,
+                    prompt_turn_id=prompt_turn_id,
+                    creative_direction=creative_direction,
+                    outline={},
+                    compact=True,
+                ),
+            )
+            spec = GroundedSpecModel.model_validate(self._normalize_model_payload(payload["payload"]))
+            return {"spec": spec, "model": payload["model"], "model_sequence": [str(payload["model"])]}
+        except Exception as strict_exc:
+            try:
+                payload = self._generate_json_object_with_retry(
+                    role="spec_analysis",
+                    schema_name="grounded_spec_fast_v1",
+                    schema=GroundedSpecModel.model_json_schema(),
+                    system_prompt=self._grounded_spec_system_prompt(),
+                    user_prompt=self._grounded_spec_user_prompt(
+                        prompt=prompt,
+                        doc_refs=doc_refs,
+                        target_platform=target_platform,
+                        preview_profile=preview_profile,
+                        template_revision_id=template_revision_id,
+                        prompt_turn_id=prompt_turn_id,
+                        creative_direction=creative_direction,
+                        outline={},
+                        compact=True,
+                    ),
+                )
+                spec = GroundedSpecModel.model_validate(self._normalize_model_payload(payload["payload"]))
+                return {
+                    "spec": spec,
+                    "model": payload["model"],
+                    "model_sequence": [str(payload["model"])],
+                    "warning_kind": "fast_relaxed_json_recovery",
+                    "warning_stage": "spec_relaxed_mode_used",
+                    "warning_title": "Fast GroundedSpec used compact relaxed JSON recovery.",
+                    "warning": f"Fast GroundedSpec strict mode failed and compact relaxed JSON mode was used: {strict_exc}",
+                }
+            except Exception as relaxed_exc:
+                return {
+                    "error": (
+                        "Fast GroundedSpec generation failed: "
                         f"strict mode error: {strict_exc}; relaxed mode error: {relaxed_exc}"
                     )
                 }
@@ -2822,6 +3004,8 @@ class GenerationService:
 
     @staticmethod
     def _refinement_rounds_for_mode(generation_mode: GenerationMode) -> int:
+        if generation_mode == GenerationMode.FAST:
+            return 0
         if generation_mode == GenerationMode.QUALITY:
             return max(1, int(os.getenv("QUALITY_REFINEMENT_ROUNDS", "3")))
         if generation_mode == GenerationMode.BALANCED:
@@ -5247,15 +5431,29 @@ class GenerationService:
     @staticmethod
     def _run_progress_for_event(event_type: str) -> tuple[str, int]:
         progress_map = {
+            "job_started": ("starting", 4),
+            "indexing_started": ("indexing workspace", 8),
             "retrieval_started": ("retrieving context", 12),
-            "spec_ready": ("building grounded spec", 30),
-            "planning_ready": ("planning code changes", 50),
-            "iteration_ready": ("editing draft files", 70),
-            "repair_iteration": ("repairing draft", 82),
+            "retrieval_completed": ("retrieval complete", 18),
+            "spec_started": ("building grounded spec", 24),
+            "spec_ready": ("grounded spec ready", 32),
+            "draft_prepared": ("preparing draft workspace", 38),
+            "role_contract_started": ("analyzing role boundaries", 44),
+            "role_contract_ready": ("role boundaries ready", 50),
+            "planning_started": ("planning code changes", 56),
+            "planning_ready": ("code plan ready", 64),
+            "context_pack_started": ("collecting file context", 68),
+            "context_pack_ready": ("context pack ready", 74),
+            "editing_started": ("generating draft edits", 78),
+            "iteration_ready": ("draft edits prepared", 84),
+            "repair_started": ("repairing after build failure", 86),
+            "repair_iteration": ("repairing draft", 88),
             "build_started": ("running validation and build", 90),
-            "preview_ready": ("refreshing preview", 96),
-            "draft_ready": ("awaiting review", 100),
-            "job_completed": ("completed", 100),
+            "checks_completed": ("checks complete", 93),
+            "preview_rebuild_started": ("refreshing preview", 96),
+            "preview_ready": ("preview ready", 98),
+            "draft_ready": ("awaiting review", 99),
+            "job_completed": ("almost complete", 99),
             "spec_blocked": ("blocked on spec", 100),
             "validation_failed": ("validation failed", 100),
             "job_failed": ("failed", 100),

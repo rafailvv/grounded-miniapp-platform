@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 
+from app.models.common import GenerationMode
 from app.models.domain import CodeChunkRecord, ContextPack, WorkspaceRecord
 from app.services.code_index_service import CodeIndexService
 from app.services.workspace_service import WorkspaceService
@@ -18,18 +19,25 @@ class ContextPackBuilder:
         workspace: WorkspaceRecord,
         prompt: str,
         model_profile: str,
+        generation_mode: GenerationMode = GenerationMode.BALANCED,
         active_paths: list[str] | None = None,
         target_files: list[str] | None = None,
         run_id: str | None = None,
     ) -> ContextPack:
+        code_limit, doc_limit = self._retrieval_limits(generation_mode)
         retrieval = self.code_index_service.retrieve(
             workspace_id=workspace.workspace_id,
             prompt=prompt,
+            code_limit=code_limit,
+            doc_limit=doc_limit,
             active_paths=active_paths or target_files or [],
             recent_paths=self._recent_paths(workspace),
         )
         targeted_files: dict[str, str] = {}
-        for file_path in target_files or []:
+        file_targets = list(target_files or [])
+        if generation_mode == GenerationMode.FAST:
+            file_targets = file_targets[:8]
+        for file_path in file_targets:
             try:
                 targeted_files[file_path] = self.workspace_service.read_file(workspace.workspace_id, file_path, run_id=run_id)
             except FileNotFoundError:
@@ -77,3 +85,11 @@ class ContextPackBuilder:
     @staticmethod
     def _recent_paths(workspace: WorkspaceRecord) -> list[str]:
         return [revision.message.split(": ", 1)[-1] for revision in workspace.revisions[-5:] if ": " in revision.message]
+
+    @staticmethod
+    def _retrieval_limits(generation_mode: GenerationMode) -> tuple[int, int]:
+        if generation_mode == GenerationMode.FAST:
+            return 3, 2
+        if generation_mode == GenerationMode.BALANCED:
+            return 5, 3
+        return 6, 4

@@ -64,7 +64,7 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
                 "task_profiles": llm["task_profiles"],
             },
             "defaults": {
-                "generation_mode": "quality",
+                "generation_mode": "balanced",
                 "model_profile": llm["default_coding_profile"],
             },
             "default_coding_profile": llm["default_coding_profile"],

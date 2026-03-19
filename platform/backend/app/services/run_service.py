@@ -78,6 +78,7 @@ class RunService:
             approval_required=request.apply_strategy == "manual_approve",
             target_role_scope=[role for role in request.target_role_scope if role in ROLE_SCOPE],
             model_profile=request.model_profile,
+            generation_mode=effective_generation_mode,
             llm_provider="openrouter" if self.openrouter_client.enabled else None,
             source_revision_id=workspace.current_revision_id,
             error_context=request.error_context,
@@ -215,6 +216,7 @@ class RunService:
         workspace = self.workspace_service.get_workspace(run.workspace_id)
         effective_generation_mode = self._resolve_generation_mode(workspace, request, run.intent)
         run.status = "running"
+        run.generation_mode = effective_generation_mode
         run.current_stage = "starting"
         run.progress_percent = max(run.progress_percent, 5)
         run.updated_at = datetime.now(timezone.utc)
@@ -409,7 +411,7 @@ class RunService:
         resolved_intent: str,
     ) -> GenerationMode:
         if request.mode == "fix":
-            return GenerationMode.BALANCED if request.generation_mode == GenerationMode.QUALITY else request.generation_mode
+            return request.generation_mode if request.generation_mode == GenerationMode.QUALITY else GenerationMode.BALANCED
         if request.generation_mode != GenerationMode.QUALITY:
             return request.generation_mode
         prompt = request.prompt.lower()

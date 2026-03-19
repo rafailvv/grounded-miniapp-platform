@@ -44,12 +44,15 @@ type PreviewInfo = {
 };
 
 type RunComposerMode = "generate" | "fix";
+type UserGenerationMode = "fast" | "balanced" | "quality";
 
 type FixErrorContext = {
   raw_error: string;
   source?: "build" | "preview" | "backend" | "frontend" | "runtime";
   failing_target?: string;
 };
+
+type RunProgressDisplayMap = Record<string, number>;
 
 function formatLogSection(title: string, lines: string[]): string {
   return [title, ...lines, ""].join("\n");
@@ -263,6 +266,79 @@ function displayRunStatus(run: Run | null): string {
   return run.status;
 }
 
+function progressCeilingForRun(run: Run): number {
+  const stage = (run.current_stage || "").toLowerCase();
+  if (run.status === "completed" || run.status === "failed" || run.status === "blocked" || run.status === "awaiting_approval") {
+    return 100;
+  }
+  if (stage.includes("retrieving context")) {
+    return 28;
+  }
+  if (stage.includes("building grounded spec")) {
+    return 48;
+  }
+  if (stage.includes("planning code changes")) {
+    return 68;
+  }
+  if (stage.includes("editing draft files")) {
+    return 84;
+  }
+  if (stage.includes("repairing draft")) {
+    return 89;
+  }
+  if (stage.includes("running validation and build")) {
+    return 95;
+  }
+  if (stage.includes("refreshing preview")) {
+    return 99;
+  }
+  return Math.min(96, Math.max(18, (run.progress_percent || 0) + 8));
+}
+
+function nextVisualProgress(current: number, run: Run): number {
+  const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
+  const status = displayRunStatus(run);
+  if (["completed", "failed", "blocked", "rolled_back", "awaiting_approval"].includes(status)) {
+    return actual;
+  }
+
+  const floor = Math.max(actual, 4);
+  const ceiling = Math.max(floor, progressCeilingForRun(run));
+  if (current < actual) {
+    const catchUpStep = Math.max(2.25, (actual - current) * 0.55);
+    return Math.min(actual, current + catchUpStep);
+  }
+  if (current >= ceiling) {
+    return current;
+  }
+
+  const stage = (run.current_stage || "").toLowerCase();
+  let driftStep = 0.32;
+  if (stage.includes("planning")) {
+    driftStep = 0.38;
+  } else if (stage.includes("editing")) {
+    driftStep = 0.46;
+  } else if (stage.includes("validation") || stage.includes("preview")) {
+    driftStep = 0.24;
+  }
+  return Math.min(ceiling, current + driftStep);
+}
+
+function displayProgressForRun(run: Run, progressDisplay: RunProgressDisplayMap): number {
+  const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
+  const visual = progressDisplay[run.run_id];
+  if (visual === undefined) {
+    return Math.max(4, actual);
+  }
+  if (displayRunStatus(run) === "completed") {
+    return 100;
+  }
+  if (displayRunStatus(run) === "failed" || displayRunStatus(run) === "blocked") {
+    return actual;
+  }
+  return Math.max(actual, Math.min(100, Math.round(visual)));
+}
+
 function ensureChildrenMap(node: FileTreeNode): Map<string, FileTreeNode> {
   const map = new Map<string, FileTreeNode>();
   node.children.forEach((child) => map.set(child.name, child));
@@ -388,6 +464,109 @@ function FileTree({
   );
 }
 
+type DiffLineKind = "meta" | "hunk" | "add" | "remove" | "context";
+
+function classifyDiffLine(line: string): DiffLineKind {
+  if (
+    line.startsWith("diff --git") ||
+    line.startsWith("index ") ||
+    line.startsWith("--- ") ||
+    line.startsWith("+++ ") ||
+    line.startsWith("new file mode") ||
+    line.startsWith("deleted file mode")
+  ) {
+    return "meta";
+  }
+  if (line.startsWith("@@")) {
+    return "hunk";
+  }
+  if (line.startsWith("+")) {
+    return "add";
+  }
+  if (line.startsWith("-")) {
+    return "remove";
+  }
+  return "context";
+}
+
+function diffStats(text: string): { files: number; additions: number; removals: number } {
+  const lines = text.split("\n");
+  let files = 0;
+  let additions = 0;
+  let removals = 0;
+  lines.forEach((line) => {
+    if (line.startsWith("diff --git")) {
+      files += 1;
+      return;
+    }
+    if (line.startsWith("+++") || line.startsWith("---")) {
+      return;
+    }
+    if (line.startsWith("+")) {
+      additions += 1;
+      return;
+    }
+    if (line.startsWith("-")) {
+      removals += 1;
+    }
+  });
+  return { files, additions, removals };
+}
+
+function DiffViewer({ text }: { text: string }) {
+  if (!text.trim()) {
+    return (
+      <div className="terminal diff-terminal diff-terminal-empty">
+        <div className="diff-empty-state">
+          <strong>No diff recorded</strong>
+          <p>Select a run with draft changes to inspect the patch here.</p>
+        </div>
+      </div>
+    );
+  }
+
+  const stats = diffStats(text);
+  const lines = text.split("\n");
+
+  return (
+    <div className="terminal diff-terminal">
+      <div className="diff-header">
+        <div className="diff-header-copy">
+          <span className="diff-header-eyebrow">Patch review</span>
+          <strong>Generated workspace diff</strong>
+        </div>
+        <div className="diff-stats">
+          <div className="diff-stat">
+            <span>Files</span>
+            <strong>{stats.files}</strong>
+          </div>
+          <div className="diff-stat diff-stat-add">
+            <span>Additions</span>
+            <strong>+{stats.additions}</strong>
+          </div>
+          <div className="diff-stat diff-stat-remove">
+            <span>Removals</span>
+            <strong>-{stats.removals}</strong>
+          </div>
+        </div>
+      </div>
+      <div className="diff-surface">
+        {lines.map((line, index) => {
+          const kind = classifyDiffLine(line);
+          const marker = kind === "add" ? "+" : kind === "remove" ? "−" : kind === "hunk" ? "@@" : kind === "meta" ? "•" : "";
+          return (
+            <div key={`${index}-${line}`} className={`diff-line diff-line-${kind}`}>
+              <span className="diff-line-number">{index + 1}</span>
+              <span className="diff-line-marker">{marker}</span>
+              <code>{line || " "}</code>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
@@ -402,13 +581,14 @@ export default function App() {
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [selectedRunMode, setSelectedRunMode] = useState<RunComposerMode>("generate");
   const [fixErrorContext, setFixErrorContext] = useState<FixErrorContext | null>(null);
-  const [selectedGenerationMode, setSelectedGenerationMode] = useState<"quality" | "balanced">("quality");
+  const [selectedGenerationMode, setSelectedGenerationMode] = useState<UserGenerationMode>("balanced");
   const [selectedRoles, setSelectedRoles] = useState<Record<RoleKey, boolean>>({
     client: true,
     specialist: true,
     manager: true,
   });
   const [runs, setRuns] = useState<Run[]>([]);
+  const [runProgressDisplay, setRunProgressDisplay] = useState<RunProgressDisplayMap>({});
   const [selectedRunId, setSelectedRunId] = useState("");
   const [runDetailsOpen, setRunDetailsOpen] = useState(false);
   const [runArtifacts, setRunArtifacts] = useState<RunArtifacts | null>(null);
@@ -703,6 +883,7 @@ export default function App() {
     selectedRunMode === "fix"
       ? "Paste the exact error or log, for example: Docker preview rebuild failed... or a TypeScript traceback."
       : "Describe the change you want to build. Switch to Fix mode for build failures, preview issues, or stack traces.";
+  const effectiveGenerationMode: UserGenerationMode = selectedRunMode === "fix" ? "balanced" : selectedGenerationMode;
   const previewErrorMessage = useMemo(
     () => extractPreviewErrorMessage(workspaceLogs?.preview?.logs ?? runArtifacts?.preview?.logs ?? []),
     [runArtifacts?.preview?.logs, workspaceLogs?.preview?.logs],
@@ -802,6 +983,53 @@ export default function App() {
       window.removeEventListener("focus", handleVisibilityOrFocus);
     };
   }, [activeRunIds, workspace]);
+
+  useEffect(() => {
+    setRunProgressDisplay((current) => {
+      const next: RunProgressDisplayMap = {};
+      runs.forEach((run) => {
+        const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
+        const existing = current[run.run_id];
+        if (existing === undefined) {
+          next[run.run_id] = Math.max(4, actual);
+          return;
+        }
+        if (displayRunStatus(run) === "completed") {
+          next[run.run_id] = 100;
+          return;
+        }
+        if (displayRunStatus(run) === "failed" || displayRunStatus(run) === "blocked" || displayRunStatus(run) === "rolled_back") {
+          next[run.run_id] = actual;
+          return;
+        }
+        next[run.run_id] = Math.max(existing, actual);
+      });
+      return next;
+    });
+  }, [runs]);
+
+  useEffect(() => {
+    const hasAnimatedRuns = runs.some((run) => displayRunStatus(run) === "running");
+    if (!hasAnimatedRuns) {
+      return;
+    }
+    const intervalId = window.setInterval(() => {
+      setRunProgressDisplay((current) => {
+        let changed = false;
+        const next: RunProgressDisplayMap = { ...current };
+        runs.forEach((run) => {
+          const previous = next[run.run_id] ?? Math.max(4, run.progress_percent || 0);
+          const visual = nextVisualProgress(previous, run);
+          if (Math.abs(visual - previous) > 0.01) {
+            next[run.run_id] = visual;
+            changed = true;
+          }
+        });
+        return changed ? next : current;
+      });
+    }, 180);
+    return () => window.clearInterval(intervalId);
+  }, [runs]);
 
   async function refreshWorkspaceState(workspaceId: string, preferredRunId?: string) {
     setWorkspaceTransitioning(true);
@@ -1009,7 +1237,7 @@ export default function App() {
         apply_strategy: "staged_auto_apply",
         target_role_scope: activeRoleScope,
         model_profile: systemConfig?.default_coding_profile ?? systemConfig?.defaults.model_profile ?? "openai_code_fast",
-        generation_mode: selectedGenerationMode,
+        generation_mode: effectiveGenerationMode,
       });
       setRuns((current) => [run, ...current.filter((item) => item.run_id !== run.run_id)]);
       setSelectedRunId(run.run_id);
@@ -1489,6 +1717,10 @@ export default function App() {
                 <strong>{formatRoleScope(selectedRun.target_role_scope)}</strong>
               </div>
               <div className="run-detail-card">
+                <span>Generation mode</span>
+                <strong>{selectedRun.generation_mode || "n/a"}</strong>
+              </div>
+              <div className="run-detail-card">
                 <span>Files touched</span>
                 <strong>{selectedRun.touched_files.length}</strong>
               </div>
@@ -1691,7 +1923,10 @@ export default function App() {
               <button
                 type="button"
                 className={`composer-mode-pill ${selectedRunMode === "fix" ? "is-active" : ""}`}
-                onClick={() => setSelectedRunMode("fix")}
+                onClick={() => {
+                  setSelectedRunMode("fix");
+                  setSelectedGenerationMode("balanced");
+                }}
               >
                 Fix
               </button>
@@ -1738,9 +1973,14 @@ export default function App() {
 
             <label className="composer-field">
               <span>Generation mode</span>
-              <select value={selectedGenerationMode} onChange={(event) => setSelectedGenerationMode(event.target.value as "quality" | "balanced")}>
-                <option value="quality">Quality</option>
+              <select
+                value={effectiveGenerationMode}
+                disabled={selectedRunMode === "fix"}
+                onChange={(event) => setSelectedGenerationMode(event.target.value as UserGenerationMode)}
+              >
+                <option value="fast">Fast</option>
                 <option value="balanced">Balanced</option>
+                <option value="quality">Quality</option>
               </select>
             </label>
 
@@ -1760,6 +2000,7 @@ export default function App() {
               {runs.length ? (
                 runs.map((run) => {
                   const runStatus = displayRunStatus(run);
+                  const visualProgress = displayProgressForRun(run, runProgressDisplay);
                   const canRollbackRun =
                     Boolean(run.result_revision_id) &&
                     run.status === "completed" &&
@@ -1788,11 +2029,11 @@ export default function App() {
                         <p className="run-card-copy">{clampText(run.prompt, 120)}</p>
                         <div className="run-progress">
                           <div className="run-progress-bar">
-                            <div className="run-progress-fill" style={{ width: `${Math.max(4, run.progress_percent)}%` }} />
+                            <div className="run-progress-fill" style={{ width: `${visualProgress}%` }} />
                           </div>
                           <div className="run-progress-meta">
                             <span>{run.current_stage}</span>
-                            <span>{run.progress_percent}%</span>
+                            <span>{visualProgress}%</span>
                           </div>
                         </div>
                         <div className="run-card-meta">
@@ -1907,9 +2148,7 @@ export default function App() {
           ) : null}
 
           {activeTab === "diff" ? (
-            <div className="terminal">
-              <pre>{diffText || "No diff recorded for the selected run."}</pre>
-            </div>
+            <DiffViewer text={diffText || ""} />
           ) : null}
 
           {activeTab === "preview" ? (

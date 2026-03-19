@@ -27,6 +27,11 @@ class PreviewService:
         self.workspace_service = workspace_service
         self.runtime_manager = runtime_manager
 
+    @staticmethod
+    def _append_log(preview: PreviewRecord, message: str) -> None:
+        preview.logs.append(message)
+        preview.logs = preview.logs[-240:]
+
     def start(self, workspace_id: str, source_dir: Path | None = None, draft_run_id: str | None = None) -> PreviewRecord:
         preview = self._get_or_create(workspace_id)
         source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
@@ -35,7 +40,9 @@ class PreviewService:
         preview.draft_run_id = draft_run_id
         preview.updated_at = datetime.now(timezone.utc)
         try:
+            self._append_log(preview, f"Preview start requested. mode={runtime_mode}.")
             proxy_port = self._select_proxy_port(workspace_id, preview)
+            self._append_log(preview, f"Selected preview port {proxy_port}.")
             project_name, logs = self.runtime_manager.start(workspace_id, source_dir, proxy_port)
             preview.proxy_port = proxy_port
             preview.project_name = project_name
@@ -43,8 +50,10 @@ class PreviewService:
             preview.frontend_url = preview.url
             preview.backend_url = self.runtime_manager.backend_url(proxy_port)
             preview.logs.extend(logs or [f"Docker preview started on port {proxy_port}."])
+            preview.logs = preview.logs[-240:]
             preview.status = "running"
             preview.started_at = preview.started_at or datetime.now(timezone.utc)
+            self._append_log(preview, f"Preview runtime is healthy at {preview.url}.")
         except Exception as exc:
             preview.url = None
             preview.frontend_url = None
@@ -52,7 +61,7 @@ class PreviewService:
             preview.proxy_port = None
             preview.project_name = None
             preview.status = "error"
-            preview.logs.append(f"Docker preview failed: {exc}")
+            self._append_log(preview, f"Docker preview failed: {exc}")
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
         return preview
 
@@ -68,7 +77,7 @@ class PreviewService:
         preview.frontend_url = None
         preview.backend_url = None
         preview.updated_at = datetime.now(timezone.utc)
-        preview.logs.append("Preview ensure requested.")
+        self._append_log(preview, f"Preview ensure requested. force_rebuild={force_rebuild}.")
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
 
         worker = threading.Thread(
@@ -87,7 +96,9 @@ class PreviewService:
         preview.draft_run_id = draft_run_id
         preview.updated_at = datetime.now(timezone.utc)
         try:
+            self._append_log(preview, f"Preview rebuild requested. mode={runtime_mode}.")
             proxy_port = self._select_proxy_port(workspace_id, preview)
+            self._append_log(preview, f"Using preview port {proxy_port} for rebuild.")
             logs = self.runtime_manager.rebuild(workspace_id, source_dir, proxy_port)
             preview.proxy_port = proxy_port
             preview.project_name = self.runtime_manager.project_name(workspace_id)
@@ -95,8 +106,10 @@ class PreviewService:
             preview.frontend_url = preview.url
             preview.backend_url = self.runtime_manager.backend_url(proxy_port)
             preview.logs.extend(logs or ["Docker preview rebuilt."])
+            preview.logs = preview.logs[-240:]
             preview.status = "running"
             preview.started_at = preview.started_at or datetime.now(timezone.utc)
+            self._append_log(preview, f"Preview rebuild completed and runtime is healthy at {preview.url}.")
         except Exception as exc:
             preview.url = None
             preview.frontend_url = None
@@ -104,7 +117,7 @@ class PreviewService:
             preview.proxy_port = None
             preview.project_name = None
             preview.status = "error"
-            preview.logs.append(f"Docker preview rebuild failed: {exc}")
+            self._append_log(preview, f"Docker preview rebuild failed: {exc}")
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
         return preview
 
@@ -117,6 +130,7 @@ class PreviewService:
     def _ensure_worker(self, workspace_id: str, force_rebuild: bool) -> None:
         preview = self._get_or_create(workspace_id)
         should_rebuild = force_rebuild or bool(preview.project_name or preview.proxy_port)
+        self._append_log(preview, f"Ensure worker started. rebuild={should_rebuild}.")
         if should_rebuild:
             self.rebuild(workspace_id)
             return
@@ -126,22 +140,25 @@ class PreviewService:
         preview = self._get_or_create(workspace_id)
         if preview.runtime_mode == "docker":
             try:
+                self._append_log(preview, "Preview reset requested for docker runtime.")
                 logs = self.runtime_manager.reset(workspace_id, self.workspace_service.source_dir(workspace_id), preview.proxy_port)
                 preview.logs.extend(logs or ["Docker preview stopped."])
+                preview.logs = preview.logs[-240:]
             except Exception as exc:
-                preview.logs.append(f"Preview reset failed: {exc}")
+                self._append_log(preview, f"Preview reset failed: {exc}")
                 preview.status = "error"
             else:
                 preview.status = "stopped"
                 preview.url = None
                 preview.frontend_url = None
                 preview.backend_url = None
+                self._append_log(preview, "Preview runtime stopped.")
         else:
             preview.status = "stopped"
             preview.url = None
             preview.frontend_url = None
             preview.backend_url = None
-            preview.logs.append("No external preview session to reset.")
+            self._append_log(preview, "No external preview session to reset.")
         preview.draft_run_id = None
         preview.updated_at = datetime.now(timezone.utc)
         self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
@@ -160,7 +177,7 @@ class PreviewService:
             preview.backend_url = None
             preview.proxy_port = None
             preview.project_name = None
-            preview.logs.append("Legacy inline preview was disabled. Start the docker runtime preview.")
+            self._append_log(preview, "Legacy inline preview was disabled. Start the docker runtime preview.")
         if preview.runtime_mode == "docker" and preview.proxy_port is not None:
             log_source_dir = (
                 self.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
@@ -174,7 +191,7 @@ class PreviewService:
                     preview.proxy_port,
                 )
             except Exception as exc:
-                preview.logs.append(f"Failed to collect runtime logs: {exc}")
+                self._append_log(preview, f"Failed to collect runtime logs: {exc}")
             self.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
         return preview
 

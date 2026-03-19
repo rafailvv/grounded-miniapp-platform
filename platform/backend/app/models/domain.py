@@ -81,14 +81,28 @@ class ChatTurnRecord(StrictModel):
 class JobEvent(StrictModel):
     event_id: str = Field(default_factory=lambda: new_id("evt"))
     event_type: Literal[
+        "job_started",
+        "indexing_started",
         "retrieval_started",
+        "retrieval_completed",
+        "spec_started",
         "spec_ready",
         "spec_blocked",
+        "draft_prepared",
+        "role_contract_started",
+        "role_contract_ready",
+        "planning_started",
         "planning_ready",
+        "context_pack_started",
+        "context_pack_ready",
+        "editing_started",
         "iteration_ready",
         "validation_failed",
         "build_started",
+        "checks_completed",
+        "repair_started",
         "repair_iteration",
+        "preview_rebuild_started",
         "preview_ready",
         "draft_ready",
         "job_failed",
@@ -123,11 +137,11 @@ class JobRecord(StrictModel):
     prompt: str
     status: Literal["pending", "running", "blocked", "completed", "failed"] = "pending"
     mode: RunMode = "generate"
-    generation_mode: GenerationMode = GenerationMode.QUALITY
+    generation_mode: GenerationMode = GenerationMode.BALANCED
     target_platform: TargetPlatform
     preview_profile: PreviewProfile
     current_revision_id: str | None = None
-    fidelity: Literal["quality_app", "balanced_app", "basic_scaffold", "blocked"] = "blocked"
+    fidelity: Literal["fast_app", "quality_app", "balanced_app", "basic_scaffold", "blocked"] = "blocked"
     llm_enabled: bool = False
     llm_provider: str | None = None
     llm_model: str | None = None
@@ -213,7 +227,7 @@ class GenerateRequest(StrictModel):
     mode: RunMode = "generate"
     target_platform: TargetPlatform = TargetPlatform.TELEGRAM
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
-    generation_mode: GenerationMode = GenerationMode.QUALITY
+    generation_mode: GenerationMode = GenerationMode.BALANCED
     intent: Literal["auto", "create", "edit", "refine", "role_only_change"] = "auto"
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
     model_profile: str = "openai_code_fast"
@@ -376,6 +390,7 @@ class RunRecord(StrictModel):
     apply_strategy: Literal["staged_auto_apply", "manual_approve"] = "staged_auto_apply"
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
     model_profile: str = "openai_code_fast"
+    generation_mode: GenerationMode = GenerationMode.BALANCED
     llm_provider: str | None = None
     llm_model: str | None = None
     linked_job_id: str | None = None
@@ -420,5 +435,5 @@ class CreateRunRequest(StrictModel):
     model_profile: str = "openai_code_fast"
     target_platform: TargetPlatform = TargetPlatform.TELEGRAM
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
-    generation_mode: GenerationMode = GenerationMode.QUALITY
+    generation_mode: GenerationMode = GenerationMode.BALANCED
     error_context: ErrorContext | None = None

@@ -22,8 +22,9 @@ class PreviewProfile(str, Enum):
 
 
 class GenerationMode(str, Enum):
-    QUALITY = "quality"
+    FAST = "fast"
     BALANCED = "balanced"
+    QUALITY = "quality"
     BASIC = "basic"
 
 

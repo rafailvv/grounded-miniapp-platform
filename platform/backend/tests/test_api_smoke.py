@@ -7,6 +7,7 @@ import time
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.models.domain import RunCheckResult
 
 ROLE_PREFIX = {
     "client": "Client",
@@ -41,6 +42,9 @@ def _install_llm_stub(app) -> None:
         if schema_name == "grounded_spec_v1":
             prompt = str(payload.get("prompt") or "Generated mini-app")
             return {"model": "openai/gpt-5-mini", "payload": _grounded_spec_payload(prompt)}
+        if schema_name == "grounded_spec_fast_v1":
+            prompt = str(payload.get("prompt") or "Generated mini-app")
+            return {"model": "openai/gpt-5-mini", "payload": _grounded_spec_payload(prompt)}
         if schema_name == "role_contract_v1":
             return {"model": "openai/gpt-5-mini", "payload": _role_contract_payload(payload.get("role_scope") or [])}
         if schema_name == "page_graph_v2":
@@ -58,6 +62,17 @@ def _install_llm_stub(app) -> None:
         raise AssertionError(f"Unexpected schema name: {schema_name}")
 
     openrouter.generate_structured = fake_generate_structured
+
+    def fake_static_check(*, source_dir, changed_files):
+        del source_dir, changed_files
+        return RunCheckResult(
+            name="changed_files_static",
+            status="passed",
+            details="Stubbed compile checks passed.",
+            logs=["Stubbed compile checks passed."],
+        )
+
+    app.state.container.check_runner._static_check = fake_static_check
 
 
 def _grounded_spec_payload(prompt: str) -> dict:
