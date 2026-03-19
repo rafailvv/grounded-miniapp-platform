@@ -251,7 +251,7 @@ export async function listWorkspaces(): Promise<Workspace[]> {
 }
 
 export async function ensureWorkspace(): Promise<Workspace> {
-  const workspace = await request<Workspace>("/workspaces", {
+  return request<Workspace>("/workspaces", {
     method: "POST",
     body: JSON.stringify({
       name: "Research Workspace",
@@ -259,9 +259,6 @@ export async function ensureWorkspace(): Promise<Workspace> {
       target_platform: "telegram_mini_app",
       preview_profile: "telegram_mock",
     }),
-  });
-  return request<Workspace>(`/workspaces/${workspace.workspace_id}/clone-template`, {
-    method: "POST",
   });
 }
 

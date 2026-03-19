@@ -55,6 +55,7 @@ class OpenRouterClient:
     ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("OpenRouter is not configured.")
+        schema_name = self._sanitize_schema_name(schema_name)
         normalized_schema = self._normalize_schema(schema)
         model_config = MODEL_REGISTRY[role]
         primary_model = model_config["primary"]
@@ -747,19 +748,23 @@ class OpenRouterClient:
     @staticmethod
     def _is_retryable_request_error(error: Exception) -> bool:
         text = str(error).lower()
-        markers = (
-            " returned 429",
-            " returned 500",
-            " returned 502",
-            " returned 503",
-            " returned 504",
+        status_match = re.search(r"returned\s+(\d{3})", text)
+        if status_match:
+            status_code = int(status_match.group(1))
+            return status_code == 429 or 500 <= status_code <= 504
+
+        transient_markers = (
             "internal_server_error",
             "timed out",
             "timeout",
             "temporarily unavailable",
-            "provider returned error",
         )
-        return any(marker in text for marker in markers)
+        return any(marker in text for marker in transient_markers)
+
+    @staticmethod
+    def _sanitize_schema_name(schema_name: str) -> str:
+        sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", schema_name).strip("_")
+        return sanitized or "schema"
 
     @staticmethod
     def _parse_json_payload(raw_text: str, endpoint: str) -> dict[str, Any]:
