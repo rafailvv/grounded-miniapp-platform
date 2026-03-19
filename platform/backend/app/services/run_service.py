@@ -545,14 +545,15 @@ class RunService:
             self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
 
     def _queue_resume_generation_from_checkpoint_if_needed(self, run: RunRecord, request: CreateRunRequest) -> None:
-        if request.mode != "fix":
-            return
         checkpoint = self.store.get("reports", f"resume_checkpoint:{run.workspace_id}")
         if not checkpoint or checkpoint.get("status") != "pending":
             return
         if checkpoint.get("mode") == "fix":
             return
         if request.apply_strategy != "staged_auto_apply" or run.apply_status != "applied":
+            return
+        source_run_id = str(checkpoint.get("source_run_id") or "")
+        if request.mode != "fix" and source_run_id != run.run_id:
             return
 
         resume_request = CreateRunRequest(
@@ -599,6 +600,12 @@ class RunService:
         workspace_id = run.workspace_id
         iterations = (self.generation_service.current_report(workspace_id, "iterations") or {}).get("items", [])
         candidate_diff = (self.generation_service.current_report(workspace_id, "candidate_diff") or {}).get("diff", "")
+        if candidate_diff:
+            effective_diff = candidate_diff
+        elif run.draft_ready and self.workspace_service.draft_exists(workspace_id, run.run_id):
+            effective_diff = self.workspace_service.diff(workspace_id, run_id=run.run_id)
+        else:
+            effective_diff = self.workspace_service.diff(workspace_id)
         preview_payload = self._preview_snapshot(workspace_id, preview)
         payload = {
             "run": run.model_dump(mode="json"),
@@ -616,7 +623,7 @@ class RunService:
             "check_results": (self.generation_service.current_report(workspace_id, "check_results") or {}).get("items", []),
             "checks": self.generation_service.current_report(workspace_id, "check_results"),
             "patch": self.generation_service.current_report(workspace_id, "patch"),
-            "diff": self.workspace_service.diff(workspace_id, run_id=run.run_id),
+            "diff": effective_diff,
             "preview": preview_payload,
             "draft_preview": {
                 key: value

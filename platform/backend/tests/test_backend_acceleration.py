@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.ai.openrouter_client import OpenRouterClient
 from app.main import create_app
-from app.models.domain import CreateRunRequest, GenerateRequest, GenerationMode, JobRecord, ValidationSnapshot
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, GenerateRequest, GenerationMode, JobRecord, RunCheckResult, ValidationSnapshot
 from app.services.code_index_service import CodeIndexService
 from app.validators.build_validator import BuildValidator
 
@@ -1177,6 +1177,256 @@ def test_generate_run_auto_switches_to_fix_on_frontend_build_failure(tmp_path: P
     assert run.current_fix_phase == "completed"
     assert run.generation_mode == "balanced"
 
+
+def test_fix_orchestrator_reuses_existing_generation_draft(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Reuse Draft Workspace",
+            "description": "Fix should reuse an existing generation draft instead of resetting it",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    workspace_service = app.state.container.workspace_service
+    workspace_service.clone_template(workspace_id)
+
+    run_id = "run_existing_generation_draft"
+    draft_source = workspace_service.prepare_draft(workspace_id, run_id)
+    app_path = draft_source / "frontend/src/app/App.tsx"
+    marker = "\n// generated-draft-marker\n"
+    app_path.write_text(app_path.read_text(encoding="utf-8") + marker, encoding="utf-8")
+
+    def fake_execute_exact_checks(*, job, workspace_id, run_id, draft_source, changed_files):
+        del job, draft_source, changed_files
+        return (
+            CheckExecutionRecord(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                results=[
+                    RunCheckResult(name="schema_validators", status="passed", details="Validators passed."),
+                    RunCheckResult(
+                        name="changed_files_static",
+                        status="passed",
+                        details="Frontend build passed.",
+                        command="npm run build",
+                        exit_code=0,
+                        logs=["Frontend build passed."],
+                    ),
+                    RunCheckResult(
+                        name="preview_boot_smoke",
+                        status="passed",
+                        details="Preview is healthy.",
+                        command="docker compose up -d --build",
+                        exit_code=0,
+                        logs=["Preview is healthy."],
+                    ),
+                ],
+                duration_ms=1,
+            ),
+            {
+                "status": "running",
+                "stage": "running",
+                "progress_percent": 100,
+                "logs": ["Preview is healthy."],
+                "last_error": None,
+                "containers": [],
+                "container_logs": {},
+            },
+        )
+
+    app.state.container.fix_orchestrator._execute_exact_checks = fake_execute_exact_checks  # type: ignore[method-assign]
+
+    job = app.state.container.fix_orchestrator.generate(
+        workspace_id,
+        GenerateRequest(
+            prompt="Analyze the reported failure and apply the smallest safe fix.",
+            mode="fix",
+            linked_run_id=run_id,
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+            generation_mode="balanced",
+            model_profile="openai_code_fast",
+        ),
+    )
+
+    assert job.status == "completed"
+    assert marker.strip() in app_path.read_text(encoding="utf-8")
+    trace = app.state.container.store.get("reports", f"trace:{workspace_id}")
+    assert trace is not None
+    assert any(entry.get("stage") == "draft_reused" for entry in trace.get("entries", []))
+
+
+def test_auto_fixed_generate_run_resumes_generation_from_same_run_checkpoint(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Auto Fix Resume Workspace",
+            "description": "Auto-fix on generate should resume from the same run checkpoint",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    app.state.container.workspace_service.clone_template(workspace_id)
+
+    workspace_service = app.state.container.workspace_service
+    preview_service = app.state.container.preview_service
+    resumed_generation = threading.Event()
+    generation_modes: list[str] = []
+    fix_calls: list[str] = []
+
+    def fake_rebuild_async(workspace_id: str, source_dir=None, draft_run_id=None, on_complete=None):
+        del source_dir, draft_run_id
+        preview = preview_service._get_or_create(workspace_id)
+        preview.status = "running"
+        preview.stage = "running"
+        preview.progress_percent = 100
+        preview.url = "http://localhost:18181"
+        preview.frontend_url = preview.url
+        preview.backend_url = f"{preview.url}/api"
+        preview_service.store.upsert("previews", workspace_id, preview.model_dump(mode="json"))
+        if on_complete is not None:
+            on_complete(preview)
+        return preview
+
+    def fake_generate(workspace_id: str, request: GenerateRequest, *, should_stop=None):
+        del should_stop
+        generation_modes.append(request.mode)
+        if len(generation_modes) == 1:
+            workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_test")
+            app.state.container.store.upsert(
+                "reports",
+                f"resume_checkpoint:{workspace_id}",
+                {
+                    "workspace_id": workspace_id,
+                    "source_run_id": request.linked_run_id,
+                    "draft_run_id": request.linked_run_id,
+                    "status": "pending",
+                    "prompt": request.prompt,
+                    "intent": "create",
+                    "mode": "generate",
+                    "generation_mode": "balanced",
+                    "target_platform": "telegram_mini_app",
+                    "preview_profile": "telegram_mock",
+                    "target_role_scope": ["client", "specialist", "manager"],
+                    "model_profile": "openai_code_fast",
+                },
+            )
+            return JobRecord(
+                workspace_id=workspace_id,
+                prompt=request.prompt,
+                status="failed",
+                mode="generate",
+                generation_mode=request.generation_mode,
+                target_platform=request.target_platform,
+                preview_profile=request.preview_profile,
+                current_revision_id=workspace_service.get_workspace(workspace_id).current_revision_id,
+                fidelity="balanced_app",
+                linked_run_id=request.linked_run_id,
+                failure_reason="Build validation failed after automatic repair attempts. Root cause: npm run build failed for the draft frontend.",
+                failure_class="syntax/build",
+                root_cause_summary="npm run build failed for the draft frontend.",
+                handoff_from_failed_generate={
+                    "mode": "fix",
+                    "prompt": "Analyze the reported failure and apply the smallest safe fix.",
+                    "error_context": {
+                        "raw_error": "npm run build failed for the draft frontend.",
+                        "source": "frontend",
+                        "failing_target": "frontend build",
+                    },
+                    "failure_class": "syntax/build",
+                },
+                validation_snapshot=ValidationSnapshot(
+                    grounded_spec_valid=True,
+                    app_ir_valid=True,
+                    build_valid=False,
+                    blocking=True,
+                    issues=[{"code": "check.changed_files_static", "message": "npm run build failed for the draft frontend.", "severity": "high"}],
+                ),
+            )
+        resumed_generation.set()
+        workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_resumed")
+        return JobRecord(
+            workspace_id=workspace_id,
+            prompt=request.prompt,
+            status="completed",
+            mode="generate",
+            generation_mode=request.generation_mode,
+            target_platform=request.target_platform,
+            preview_profile=request.preview_profile,
+            current_revision_id=workspace_service.get_workspace(workspace_id).current_revision_id,
+            fidelity="balanced_app",
+            linked_run_id=request.linked_run_id,
+            summary="Resumed generation completed successfully.",
+            validation_snapshot=ValidationSnapshot(
+                grounded_spec_valid=True,
+                app_ir_valid=True,
+                build_valid=True,
+                blocking=False,
+                issues=[],
+            ),
+        )
+
+    def fake_fix_generate(workspace_id: str, request: GenerateRequest, *, should_stop=None):
+        del should_stop
+        fix_calls.append(request.mode)
+        assert workspace_service.draft_exists(workspace_id, request.linked_run_id or "")
+        return JobRecord(
+            workspace_id=workspace_id,
+            prompt=request.prompt,
+            status="completed",
+            mode="fix",
+            generation_mode=request.generation_mode,
+            target_platform=request.target_platform,
+            preview_profile=request.preview_profile,
+            current_revision_id=workspace_service.get_workspace(workspace_id).current_revision_id,
+            fidelity="balanced_app",
+            linked_run_id=request.linked_run_id,
+            summary="Auto-fix completed successfully.",
+            current_fix_phase="completed",
+            validation_snapshot=ValidationSnapshot(
+                grounded_spec_valid=True,
+                app_ir_valid=True,
+                build_valid=True,
+                blocking=False,
+                issues=[],
+            ),
+        )
+
+    preview_service.rebuild_async = fake_rebuild_async  # type: ignore[method-assign]
+    app.state.container.generation_service.generate = fake_generate  # type: ignore[method-assign]
+    app.state.container.fix_orchestrator.generate = fake_fix_generate  # type: ignore[method-assign]
+
+    run = app.state.container.run_service.create_run_sync(
+        workspace_id,
+        CreateRunRequest(
+            prompt="Create a simple multi-page app.",
+            apply_strategy="staged_auto_apply",
+            model_profile="openai_code_fast",
+            generation_mode="balanced",
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+        ),
+    )
+
+    assert run.status == "completed"
+    assert generation_modes == ["generate", "generate"]
+    assert fix_calls == ["fix"]
+    assert resumed_generation.wait(1.0)
+    checkpoint = app.state.container.store.get("reports", f"resume_checkpoint:{workspace_id}")
+    assert checkpoint is not None
+    assert checkpoint["status"] == "resumed"
+    assert checkpoint["resumed_from_fix_run_id"] == run.run_id
 
 def test_successful_fix_run_queues_resume_generation_from_checkpoint(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]

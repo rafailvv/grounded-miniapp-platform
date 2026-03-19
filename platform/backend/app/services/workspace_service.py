@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 from pathlib import Path
+from subprocess import CalledProcessError
 
 from app.core.config import Settings
 from app.models.artifacts import ApplyPatchResult, PatchEnvelope, PatchOperationModel
@@ -183,6 +184,12 @@ class WorkspaceService:
         self._copy_tree(self.source_dir(workspace_id), draft_source)
         return draft_source
 
+    def ensure_draft(self, workspace_id: str, run_id: str) -> Path:
+        draft_source = self.draft_source_dir(workspace_id, run_id)
+        if draft_source.exists():
+            return draft_source
+        return self.prepare_draft(workspace_id, run_id)
+
     def apply_draft_operations(self, workspace_id: str, run_id: str, operations: list[DraftFileOperation]) -> Path:
         draft_source = self.draft_source_dir(workspace_id, run_id)
         if not draft_source.exists():
@@ -317,7 +324,10 @@ class WorkspaceService:
         revisions = self.get_workspace(workspace_id).revisions
         if len(revisions) < 2:
             return ""
-        return self._git_output(source_dir, ["diff", "HEAD~1", "HEAD"])
+        try:
+            return self._git_output(source_dir, ["diff", "HEAD~1", "HEAD"])
+        except CalledProcessError:
+            return ""
 
     def workspace_root(self, workspace_id: str) -> Path:
         return self.settings.workspaces_dir / workspace_id

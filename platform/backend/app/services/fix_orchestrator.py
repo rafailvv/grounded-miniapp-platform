@@ -89,13 +89,27 @@ class FixOrchestrator:
             root_cause_summary=(request.error_context.raw_error.strip() if request.error_context and request.error_context.raw_error.strip() else None),
             current_fix_phase="triaging",
         )
-        self._clear_reports(workspace_id)
-        self._clear_trace(workspace_id)
+        reuse_existing_draft = bool(request.linked_run_id and self.workspace_service.draft_exists(workspace_id, run_id))
+        self._clear_reports(workspace_id, preserve_generation_state=reuse_existing_draft)
+        if not reuse_existing_draft:
+            self._clear_trace(workspace_id)
         self._save_job(job)
-        draft_source = self.workspace_service.prepare_draft(workspace_id, run_id)
+        draft_source = self.workspace_service.ensure_draft(workspace_id, run_id)
 
         self._append_event(job, "job_started", "Fix run started.")
-        self._append_trace(workspace_id, "fix", "Fix orchestrator initialized.", {"run_id": run_id})
+        self._append_trace(
+            workspace_id,
+            "fix",
+            "Fix orchestrator initialized.",
+            {"run_id": run_id, "reused_existing_draft": reuse_existing_draft},
+        )
+        if reuse_existing_draft:
+            self._append_trace(
+                workspace_id,
+                "draft_reused",
+                "Fix reused the existing generation draft instead of resetting it to the current source revision.",
+                {"run_id": run_id},
+            )
 
         scope_entries: list[FixScopeEntry] = []
         scope_expansions: list[dict[str, Any]] = []
@@ -930,18 +944,18 @@ class FixOrchestrator:
         current["items"] = items
         self._store_report(report_key, current)
 
-    def _clear_reports(self, workspace_id: str) -> None:
-        for key in (
+    def _clear_reports(self, workspace_id: str, *, preserve_generation_state: bool = False) -> None:
+        keys = [
             "validation",
-            "iterations",
-            "candidate_diff",
             "check_results",
-            "patch",
             "fix_case",
             "fix_attempts",
             "scope_expansions",
             "fix_runtime",
-        ):
+        ]
+        if not preserve_generation_state:
+            keys.extend(["iterations", "candidate_diff", "patch"])
+        for key in keys:
             self.store.delete("reports", f"{key}:{workspace_id}")
 
     def _save_job(self, job: JobRecord) -> None:
