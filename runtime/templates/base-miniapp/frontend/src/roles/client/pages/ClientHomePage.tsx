@@ -1,5 +1,5 @@
-import { RoleCabinetHomePage } from '@/shared/ui/templates/RoleCabinetHomePage';
+import { RoleHomePage } from '@/widgets/role-home/RoleHomePage';
 
 export function ClientHomePage(): JSX.Element {
-  return <RoleCabinetHomePage role="client" featureText="Client role workspace" />;
+  return <RoleHomePage role="client" featureText="Client role workspace" />;
 }

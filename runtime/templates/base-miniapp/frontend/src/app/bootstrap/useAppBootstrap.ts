@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { resolveRole } from '@/shared/roles/resolveRole';
+import { resolveRole } from '@/app/bootstrap/resolveRole';
 import { getTelegramStartParam } from '@/shared/telegram/webApp';
 import type { BootstrapState } from '@/app/bootstrap/types';
 

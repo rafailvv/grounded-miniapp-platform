@@ -1,4 +1,4 @@
-import { DEFAULT_APP_ROLE, normalizeRole, type AppRole } from '@/shared/roles/role';
+import { DEFAULT_APP_ROLE, normalizeRole, type AppRole } from '@/entities/role/model/role';
 
 type ResolveRoleInput = {
   queryRole: string | null;

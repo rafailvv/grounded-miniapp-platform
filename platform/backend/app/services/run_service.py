@@ -363,12 +363,16 @@ class RunService:
                 run.status = "blocked"
                 run.apply_status = "blocked"
                 run.draft_status = "failed"
+                if run.current_fix_phase == "completed":
+                    run.current_fix_phase = "failed"
                 run.current_stage = "stopped" if self._is_stop_requested(run.run_id) else "blocked"
                 run.progress_percent = max(run.progress_percent, 100)
             else:
                 run.status = "failed"
                 run.apply_status = "failed"
                 run.draft_status = "failed"
+                if run.current_fix_phase == "completed":
+                    run.current_fix_phase = "failed"
                 run.current_stage = "failed"
                 run.progress_percent = max(run.progress_percent, 100)
 
@@ -390,6 +394,8 @@ class RunService:
             run.status = "failed"
             run.apply_status = "failed"
             run.failure_reason = str(exc)
+            if run.current_fix_phase == "completed":
+                run.current_fix_phase = "failed"
             run.current_stage = "failed"
             run.progress_percent = max(run.progress_percent, 100)
             run.updated_at = datetime.now(timezone.utc)

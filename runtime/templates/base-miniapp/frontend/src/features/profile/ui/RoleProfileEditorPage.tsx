@@ -1,5 +1,5 @@
 import { type ChangeEvent, type ClipboardEvent, type FocusEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
-import type { AppRole } from '@/shared/roles/role';
+import type { AppRole } from '@/entities/role/model/role';
 import {
   getClientProfileDisplayName,
   loadRoleProfileDraftFromBackend,
@@ -7,9 +7,9 @@ import {
   loadRoleProfileDraftFromDeviceStorage,
   loadRoleProfileView,
   saveRoleProfileDraft,
-} from '@/shared/profile/clientProfile';
+} from '@/features/profile/model/profileStore';
 import { triggerHapticNotification } from '@/shared/telegram/webApp';
-import styles from '@/shared/ui/templates/RoleProfileEditorPage.module.css';
+import styles from '@/features/profile/ui/RoleProfileEditorPage.module.css';
 
 type RoleProfileEditorPageProps = {
   role: AppRole;

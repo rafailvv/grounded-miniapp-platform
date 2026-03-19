@@ -255,6 +255,15 @@ function displayRunStatus(run: Run | null): string {
   return run.status;
 }
 
+function displayFixPhase(run: Run, phase?: string | null): string {
+  const normalized = (phase ?? run.current_fix_phase ?? "").trim().toLowerCase();
+  const status = displayRunStatus(run);
+  if ((status === "failed" || status === "blocked") && normalized === "completed") {
+    return "failed";
+  }
+  return phase ?? run.current_fix_phase ?? "n/a";
+}
+
 function progressCeilingForRun(run: Run): number {
   const stage = (run.current_stage || "").toLowerCase();
   if (run.status === "completed" || run.status === "failed" || run.status === "blocked" || run.status === "awaiting_approval") {
@@ -1811,7 +1820,7 @@ export default function App() {
                   </div>
                   <div className="run-detail-card">
                     <span>fixbug phase</span>
-                    <strong>{failureAnalysis.current_fix_phase ?? selectedRun.current_fix_phase ?? "n/a"}</strong>
+                    <strong>{displayFixPhase(selectedRun, failureAnalysis.current_fix_phase ?? selectedRun.current_fix_phase)}</strong>
                   </div>
                   <div className="run-detail-card">
                     <span>Repair attempts</span>

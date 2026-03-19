@@ -1,5 +1,5 @@
 import type { JSX } from 'react';
-import type { AppRole } from '@/shared/roles/role';
+import type { AppRole } from '@/entities/role/model/role';
 import { ClientRoutes } from '@/roles/client/ClientRoutes';
 import { SpecialistRoutes } from '@/roles/specialist/SpecialistRoutes';
 import { ManagerRoutes } from '@/roles/manager/ManagerRoutes';

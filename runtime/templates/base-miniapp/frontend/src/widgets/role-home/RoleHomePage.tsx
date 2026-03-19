@@ -1,15 +1,15 @@
 import { useNavigate } from 'react-router-dom';
-import type { AppRole } from '@/shared/roles/role';
-import { getClientProfileDisplayName, loadRoleProfileView } from '@/shared/profile/clientProfile';
-import { ProfileCabinetCard } from '@/shared/ui/ProfileCabinetCard/ProfileCabinetCard';
-import styles from '@/shared/ui/templates/RoleCabinetHomePage.module.css';
+import { ProfileCabinetCard } from '@/entities/profile/ui/ProfileCabinetCard/ProfileCabinetCard';
+import type { AppRole } from '@/entities/role/model/role';
+import { getClientProfileDisplayName, loadRoleProfileView } from '@/features/profile/model/profileStore';
+import styles from '@/widgets/role-home/RoleHomePage.module.css';
 
-type RoleCabinetHomePageProps = {
+type RoleHomePageProps = {
   role: AppRole;
   featureText: string;
 };
 
-export function RoleCabinetHomePage({ role, featureText }: RoleCabinetHomePageProps): JSX.Element {
+export function RoleHomePage({ role, featureText }: RoleHomePageProps): JSX.Element {
   const navigate = useNavigate();
   const profile = loadRoleProfileView(role);
 

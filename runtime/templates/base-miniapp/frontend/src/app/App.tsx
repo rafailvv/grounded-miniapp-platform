@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import { RoleRouter } from '@/app/routing/RoleRouter';
 import { useAppBootstrap } from '@/app/bootstrap/useAppBootstrap';
-import { Loader } from '@/shared/ui/Loader';
 import { useTelegramViewport } from '@/shared/telegram/useTelegramViewport';
 import { triggerHapticImpact } from '@/shared/telegram/webApp';
 import { useAppTheme } from '@/shared/theme/useAppTheme';
+import { Loader } from '@/shared/ui/loader/Loader';
 
 const MIN_LOADER_TIME_MS = 1500;
 const MOCK_API_LOADING_TIME_MS = 1000;

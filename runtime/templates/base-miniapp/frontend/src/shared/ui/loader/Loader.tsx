@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import styles from '@/shared/ui/Loader.module.css';
+import styles from '@/shared/ui/loader/Loader.module.css';
 
 type LoaderProps = {
   isFadingOut?: boolean;

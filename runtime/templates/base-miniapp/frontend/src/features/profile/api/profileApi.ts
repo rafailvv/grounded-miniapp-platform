@@ -1,5 +1,5 @@
-import { httpClient } from '@/shared/http/httpClient';
-import type { AppRole } from '@/shared/roles/role';
+import type { AppRole } from '@/entities/role/model/role';
+import { httpClient } from '@/shared/api/httpClient';
 
 export type RemoteProfilePayload = {
   first_name: string;

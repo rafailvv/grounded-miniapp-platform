@@ -1,4 +1,4 @@
-import styles from '@/shared/ui/ProfileCabinetCard/ProfileCabinetCard.module.css';
+import styles from '@/entities/profile/ui/ProfileCabinetCard/ProfileCabinetCard.module.css';
 
 type ProfileCabinetCardProps = {
   displayName: string;

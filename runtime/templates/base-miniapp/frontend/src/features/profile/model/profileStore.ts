@@ -1,6 +1,6 @@
+import { type RemoteProfilePayload, fetchRoleProfile, persistRoleProfile } from '@/features/profile/api/profileApi';
+import type { AppRole } from '@/entities/role/model/role';
 import { getDeviceStorageItem, getTelegramWebApp, setDeviceStorageItem } from '@/shared/telegram/webApp';
-import type { AppRole } from '@/shared/roles/role';
-import { fetchRoleProfile, persistRoleProfile, type RemoteProfilePayload } from '@/shared/profile/profileApi';
 
 const ROLE_LABELS: Record<AppRole, string> = {
   client: 'Client',

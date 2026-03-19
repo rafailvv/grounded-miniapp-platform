@@ -1,4 +1,4 @@
-import type { AppRole } from '@/shared/roles/role';
+import type { AppRole } from '@/entities/role/model/role';
 
 export type BootstrapState =
   | {
