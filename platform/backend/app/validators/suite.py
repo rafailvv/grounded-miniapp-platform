@@ -7,6 +7,7 @@ from app.models.artifacts import AppIRValidatorResult, GroundedSpecValidatorResu
 from app.models.grounded_spec import GroundedSpecModel
 from app.validators.app_ir_validator import AppIRValidator
 from app.validators.build_validator import BuildValidator
+from app.validators.connectivity_validator import ConnectivityValidator
 from app.validators.grounded_spec_validator import GroundedSpecValidator
 from app.validators.platform_validator import PlatformValidator
 
@@ -17,6 +18,7 @@ class ValidationSuite:
         self.app_ir_validator = AppIRValidator()
         self.platform_validator = PlatformValidator()
         self.build_validator = BuildValidator()
+        self.connectivity_validator = ConnectivityValidator()
 
     def validate_grounded_spec(self, spec: GroundedSpecModel) -> GroundedSpecValidatorResult:
         return self.grounded_spec_validator.validate(spec)
@@ -30,3 +32,6 @@ class ValidationSuite:
 
     def validate_build(self, workspace_path: Path):
         return self.build_validator.validate(workspace_path)
+
+    def validate_connectivity(self, workspace_path: Path):
+        return self.connectivity_validator.validate(workspace_path)

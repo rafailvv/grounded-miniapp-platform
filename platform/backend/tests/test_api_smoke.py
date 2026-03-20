@@ -401,6 +401,21 @@ def _page_file_payload(payload: dict) -> dict:
     description = str(page.get("description") or page.get("purpose") or default_description)
     profile_link = f"/{role}/profile"
     card_href = profile_link if page["route_path"] == f"/{role}" else f"/{role}"
+    has_dynamic_data = bool(page.get("data_dependencies"))
+    dynamic_block = ""
+    if has_dynamic_data:
+        loading_state = str(page.get("loading_state") or "Loading content…")
+        empty_state = str(page.get("empty_state") or "No items yet.")
+        error_state = str(page.get("error_state") or "Something went wrong.")
+        dynamic_block = f"""
+        <section class="feature-block">
+          <div class="feature-content">
+            <span class="feature-title">{loading_state}</span>
+            <span class="caption">{empty_state}</span>
+            <span class="caption">{error_state}</span>
+          </div>
+        </section>
+"""
     content = f"""<!doctype html>
 <html lang="en">
   <head>
@@ -421,6 +436,7 @@ def _page_file_payload(payload: dict) -> dict:
             <a class="card-link" href="{card_href}">Open</a>
           </div>
         </section>
+{dynamic_block}
       </section>
     </main>
     <script src="/static/{role}/{'profile.js' if page['route_path'].endswith('/profile') else 'app.js'}" defer></script>

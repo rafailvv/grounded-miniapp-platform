@@ -801,9 +801,12 @@ class GenerationService:
             if file_path in file_contexts:
                 continue
             try:
-                file_contexts[file_path] = self.workspace_service.read_file(workspace_id, file_path, run_id=draft_run_id)
+                content = self.workspace_service.try_read_text_file(workspace_id, file_path, run_id=draft_run_id)
             except FileNotFoundError:
                 continue
+            if content is None:
+                continue
+            file_contexts[file_path] = content
         current_cache_stats = ACTIVE_LLM_CACHE_STATS.get() or {}
         current_cache_stats["prompt_cache_key"] = context_pack.prompt_cache_key
         current_cache_stats["stable_prefix_chars"] = len(context_pack.system_prefix)
@@ -1604,9 +1607,21 @@ class GenerationService:
                     creative_direction=creative_direction,
                 )
             )
-            if any("error" in result and result.get("retryable") for result in ordered_page_results):
+            if any(
+                "error" in result
+                and (
+                    result.get("retryable")
+                    or self._is_recoverable_page_error_message(str(result.get("error") or ""))
+                )
+                for result in ordered_page_results
+            ):
                 for index, page_result in enumerate(ordered_page_results):
-                    if "error" not in page_result or not page_result.get("retryable"):
+                    if "error" not in page_result:
+                        continue
+                    if not (
+                        page_result.get("retryable")
+                        or self._is_recoverable_page_error_message(str(page_result.get("error") or ""))
+                    ):
                         continue
                     role, page = selected_pages[index]
                     ordered_page_results[index] = self._resolve_page_file_edit(
@@ -1648,9 +1663,12 @@ class GenerationService:
                 if file_path in file_contexts:
                     continue
                 try:
-                    file_contexts[file_path] = self.workspace_service.read_file(workspace_id, file_path, run_id=draft_run_id)
+                    content = self.workspace_service.try_read_text_file(workspace_id, file_path, run_id=draft_run_id)
                 except FileNotFoundError:
                     continue
+                if content is None:
+                    continue
+                file_contexts[file_path] = content
 
         frontend_targets = self._frontend_composition_targets(target_files, selected_pages)
         frontend_bootstrap_targets, frontend_routing_targets = self._partition_frontend_composition_targets(
@@ -1935,7 +1953,9 @@ class GenerationService:
         raw_operations = normalized.get("operations")
         if not isinstance(raw_operations, list):
             raise ValueError("Whole-file cluster did not return operations.")
-        operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
+        operations = self._sanitize_draft_operations(
+            [DraftFileOperation.model_validate(item) for item in raw_operations]
+        )
         allowed_targets = set(cluster_targets)
         invalid = [
             operation.file_path
@@ -2425,6 +2445,8 @@ class GenerationService:
         lowered = prompt.lower()
         if GenerationService._looks_like_fix_request(lowered):
             return "minimal_patch"
+        if GenerationService._looks_like_create_surface_request(lowered, role_scope):
+            return "whole_file_build"
         if intent in {"edit", "refine", "role_only_change"}:
             return "minimal_patch"
         if any(marker in lowered for marker in ("only ", "just ", "точечно", "только ", "without touching", "do not touch anything else")):
@@ -2460,6 +2482,8 @@ class GenerationService:
         lowered = prompt.lower()
         if intent == "create":
             return "Intent=create requires a whole-file build for the primary app surface."
+        if GenerationService._looks_like_create_surface_request(lowered, role_scope):
+            return "The request describes a new workflow-heavy app surface, so generation uses whole-file bundles."
         if len(role_scope) > 1:
             return "Multiple roles are in scope, so generation uses whole-file bundles instead of local patches."
         if require_multi_page:
@@ -2475,6 +2499,8 @@ class GenerationService:
         lowered = prompt.lower()
         if GenerationService._looks_like_fix_request(lowered):
             return False
+        if GenerationService._looks_like_create_surface_request(lowered, role_scope):
+            return True
         if intent in {"edit", "refine", "role_only_change"}:
             return any(
                 marker in lowered
@@ -2516,6 +2542,8 @@ class GenerationService:
         lowered = prompt.lower()
         if GenerationService._looks_like_fix_request(lowered):
             return False
+        if GenerationService._looks_like_create_surface_request(lowered, role_scope):
+            return True
         if any(marker in lowered for marker in WORKFLOW_HEAVY_MARKERS):
             return True
         if intent == "create" and len(role_scope) > 1:
@@ -2571,6 +2599,50 @@ class GenerationService:
             "сбой",
         )
         return any(marker in prompt for marker in fix_markers)
+
+    @staticmethod
+    def _looks_like_create_surface_request(prompt: str, role_scope: list[str]) -> bool:
+        if GenerationService._looks_like_fix_request(prompt):
+            return False
+        creation_markers = (
+            "create ",
+            "build ",
+            "generate ",
+            "make ",
+            "new mini app",
+            "new app",
+            "from scratch",
+            "application should",
+            "app should",
+        )
+        workflow_markers = (
+            "mini app",
+            "mini-app",
+            "multi-page",
+            "multi page",
+            "multi-role",
+            "multi role",
+            "role-based",
+            "role based",
+            "storefront",
+            "catalog",
+            "checkout",
+            "cart",
+            "order",
+            "orders",
+            "workspace",
+            "dashboard",
+            "customer-facing",
+            "customer side",
+        )
+        role_mentions = sum(1 for role in ROLE_ORDER if role in prompt)
+        has_creation_signal = any(marker in prompt for marker in creation_markers)
+        has_workflow_signal = any(marker in prompt for marker in workflow_markers)
+        if has_creation_signal and (has_workflow_signal or len(role_scope) > 1 or role_mentions > 1):
+            return True
+        if len(role_scope) > 1 and has_workflow_signal and any(marker in prompt for marker in ("should", "support", "application", "app")):
+            return True
+        return False
 
     @staticmethod
     def _effective_prompt(request: GenerateRequest) -> str:
@@ -3209,7 +3281,9 @@ class GenerationService:
                 raw_operations = normalized.get("operations")
                 if not isinstance(raw_operations, list):
                     raise ValueError(f"{page['file_path']} did not return operations.")
-                operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
+                operations = self._sanitize_draft_operations(
+                    [DraftFileOperation.model_validate(item) for item in raw_operations]
+                )
                 foreign_operations = [
                     operation.file_path
                     for operation in operations
@@ -3233,9 +3307,11 @@ class GenerationService:
                 }
             except Exception as exc:
                 last_error = exc
-                if mode_attempt + 1 < len(retry_modes) and self._is_retryable_llm_error(exc):
+                if mode_attempt + 1 < len(retry_modes) and (
+                    self._is_retryable_llm_error(exc) or self._is_recoverable_page_error(exc)
+                ):
                     logger.warning(
-                        "Retrying page generation for %s with compact recovery context after transient provider failure: %s",
+                        "Retrying page generation for %s with compact recovery context after recoverable failure: %s",
                         page["file_path"],
                         exc,
                     )
@@ -3325,7 +3401,9 @@ class GenerationService:
                 raw_operations = normalized.get("operations")
                 if not isinstance(raw_operations, list):
                     raise ValueError("Composition did not return operations.")
-                operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
+                operations = self._sanitize_draft_operations(
+                    [DraftFileOperation.model_validate(item) for item in raw_operations]
+                )
                 invalid = [
                     operation.file_path
                     for operation in operations
@@ -3544,6 +3622,7 @@ class GenerationService:
         require_business_pages: bool,
     ) -> list[str]:
         issues: list[str] = []
+        enforce_expanded_structure = scope_mode != "minimal_patch" or len(role_scope) > 1
         roles = page_graph.get("roles") or {}
         planned_paths = set(page_graph.get("shared_files") or []) | set(page_graph.get("backend_targets") or [])
         total_pages = 0
@@ -3560,9 +3639,9 @@ class GenerationService:
                 issues.append(f"{role} is missing page definitions.")
                 continue
             total_pages += len(pages)
-            if scope_mode != "minimal_patch" and require_multi_page and len(pages) < 2:
+            if enforce_expanded_structure and require_multi_page and len(pages) < 2:
                 issues.append(f"{role} did not receive enough distinct pages for a multi-page app.")
-            if scope_mode != "minimal_patch" and require_business_pages:
+            if enforce_expanded_structure and require_business_pages:
                 business_pages = [page for page in pages if isinstance(page, dict) and GenerationService._is_business_page(role, page)]
                 if not business_pages:
                     issues.append(f"{role} is missing separate business pages beyond index.html and profile.html.")
@@ -3577,11 +3656,11 @@ class GenerationService:
                 for page in pages
                 if isinstance(page, dict) and isinstance(page.get("file_path"), str)
             )
-        if scope_mode != "minimal_patch" and require_multi_page and page_graph.get("flow_mode") != "multi_page":
+        if enforce_expanded_structure and require_multi_page and page_graph.get("flow_mode") != "multi_page":
             issues.append("The generated plan did not stay in multi-page mode.")
-        if scope_mode != "minimal_patch" and require_multi_page and total_pages <= len(role_scope):
+        if enforce_expanded_structure and require_multi_page and total_pages <= len(role_scope):
             issues.append("The generated plan still collapses the app into one screen per selected role.")
-        if scope_mode != "minimal_patch" and require_business_pages:
+        if enforce_expanded_structure and require_business_pages:
             default_only = []
             for role in role_scope:
                 role_payload = roles.get(role) or {}
@@ -3591,7 +3670,7 @@ class GenerationService:
                     default_only.append(role)
             if default_only:
                 issues.append(f"Workflow-heavy planning stayed on root/profile routes only for: {', '.join(default_only)}.")
-        if scope_mode != "minimal_patch" and len(normalized_role_routes) > 1:
+        if enforce_expanded_structure and len(normalized_role_routes) > 1:
             route_sets = [routes for _, routes in normalized_role_routes]
             if len(set(route_sets)) == 1:
                 issues.append("Selected roles still share the same route tree.")
@@ -3737,9 +3816,12 @@ class GenerationService:
         file_contexts: dict[str, str] = {}
         for file_path in target_files:
             try:
-                file_contexts[file_path] = self.workspace_service.read_file(workspace_id, file_path, run_id=run_id)
+                content = self.workspace_service.try_read_text_file(workspace_id, file_path, run_id=run_id)
             except FileNotFoundError:
                 continue
+            if content is None:
+                continue
+            file_contexts[file_path] = content
         return file_contexts
 
     @staticmethod
@@ -3809,7 +3891,9 @@ class GenerationService:
             raw_operations = normalized.get("operations")
             if not isinstance(raw_operations, list):
                 raise ValueError("Repair step did not return operations.")
-            operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
+            operations = self._sanitize_draft_operations(
+                [DraftFileOperation.model_validate(item) for item in raw_operations]
+            )
             invalid = [
                 operation.file_path
                 for operation in operations
@@ -3907,6 +3991,8 @@ class GenerationService:
                     "Keep the diff minimal and preserve unrelated behavior.",
                     "Return operations only for files listed in target_files.",
                     "If target_files is non-empty, operations must include at least one create/replace/delete for one of those files.",
+                    "For connectivity missing_ui_loading_state or missing_ui_error_state, satisfy the validator with real loading/error containers, ids, or data-ui-state markers that match the current page contract.",
+                    "Do not invent magic validator-only classes when the current validator contract does not require them.",
                     "Do not return a prose repair plan instead of file operations.",
                     "Do not leave operations empty when target_files is non-empty.",
                 ],
@@ -4056,6 +4142,15 @@ class GenerationService:
                             "route_path": page.get("route_path"),
                             "file_path": page.get("file_path"),
                             "page_kind": page.get("page_kind"),
+                            "navigation_label": page.get("navigation_label"),
+                            "title": page.get("title"),
+                            "description": page.get("description"),
+                            "purpose": page.get("purpose"),
+                            "primary_actions": list((page.get("primary_actions") or [])[:6]),
+                            "data_dependencies": list((page.get("data_dependencies") or [])[:6]),
+                            "loading_state": page.get("loading_state"),
+                            "empty_state": page.get("empty_state"),
+                            "error_state": page.get("error_state"),
                         }
                         for page in ((roles.get(role) or {}).get("pages") or [])[:6]
                     ],
@@ -4080,7 +4175,12 @@ class GenerationService:
             "expects /api/",
         )
         for issue in build_issues:
-            if issue.code in {"check.schema_validators", "build.missing_categories_route"}:
+            if issue.code in {
+                "check.schema_validators",
+                "check.connectivity_validators",
+                "connectivity.missing_backend_route",
+                "connectivity.unwired_page_dependency",
+            }:
                 return True
             lowered = issue.message.lower()
             if any(marker in lowered for marker in markers):
@@ -7964,3 +8064,41 @@ class GenerationService:
             if normalized_scalar == "implicit":
                 return "derived"
         return payload
+
+    @staticmethod
+    def _clean_generated_text(content: str) -> str:
+        return "".join(
+            ch for ch in content
+            if ch in "\n\r\t"
+            or (32 <= ord(ch) and ord(ch) != 0x7F and not 0x80 <= ord(ch) < 0xA0)
+            or ord(ch) in {0x85, 0xA0}
+        )
+
+    @classmethod
+    def _sanitize_draft_operations(cls, operations: list[DraftFileOperation]) -> list[DraftFileOperation]:
+        sanitized: list[DraftFileOperation] = []
+        for operation in operations:
+            if operation.content is None:
+                sanitized.append(operation)
+                continue
+            cleaned = cls._clean_generated_text(operation.content)
+            if cleaned == operation.content:
+                sanitized.append(operation)
+                continue
+            sanitized.append(operation.model_copy(update={"content": cleaned}))
+        return sanitized
+
+    @staticmethod
+    def _is_recoverable_page_error(exc: Exception) -> bool:
+        return GenerationService._is_recoverable_page_error_message(str(exc))
+
+    @staticmethod
+    def _is_recoverable_page_error_message(message: str) -> bool:
+        lowered = message.lower()
+        markers = (
+            "did not return operations",
+            "did not produce a valid create/replace operation",
+            "returned operations for other files",
+            "must be generated as a single create/replace operation",
+        )
+        return any(marker in lowered for marker in markers)

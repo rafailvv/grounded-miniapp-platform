@@ -295,7 +295,7 @@ class FixOrchestrator:
             elif not scope_entries:
                 scope_entries = fix_case.write_scope
 
-            file_contexts = self._collect_file_contexts(workspace_id, run_id, scope_entries)
+            file_contexts = self._collect_file_contexts(workspace_id, run_id, scope_entries, fix_case=fix_case)
             self._append_event(job, "repair_planned", "Prepared minimal repair packet.", {"attempt": attempt, "scope": [entry.file_path for entry in scope_entries]})
             self._append_trace(
                 workspace_id,
@@ -478,9 +478,9 @@ class FixOrchestrator:
             preview_run_id=run_id,
             scope_mode="fix_agentic",
         )
-        results = [item for item in execution.results if item.name != "preview_boot_smoke"]
+        results = [item for item in execution.results if item.name not in {"preview_boot_smoke", "preview_connectivity_smoke"}]
         preview_details: dict[str, Any] = {"status": "skipped", "containers": [], "container_logs": {}, "logs": [], "last_error": None}
-        static_failure = any(item.status == "failed" for item in results if item.name in {"schema_validators", "changed_files_static"})
+        static_failure = any(item.status == "failed" for item in results if item.name in {"schema_validators", "connectivity_validators", "changed_files_static"})
         if not static_failure:
             self._append_event(job, "preview_validation_started", "Rebuilding preview against the draft workspace.")
             preview = self.preview_service.rebuild(workspace_id, source_dir=draft_source, draft_run_id=run_id)
@@ -498,6 +498,13 @@ class FixOrchestrator:
                 logs=(preview.logs[-40:] or [preview.last_error or "Preview rebuild failed."]),
             )
             results.append(preview_result)
+            results.append(
+                self.check_runner._preview_connectivity_smoke(
+                    source_dir=draft_source,
+                    preview=preview,
+                    preview_run_id=run_id,
+                )
+            )
             preview_details = {
                 "status": preview.status,
                 "stage": preview.stage,
@@ -526,6 +533,15 @@ class FixOrchestrator:
                     details="Preview rebuild was skipped because compile/build checks are still failing.",
                     command="docker compose up -d --build",
                     logs=["Preview rebuild was skipped because compile/build checks are still failing."],
+                )
+            )
+            results.append(
+                RunCheckResult(
+                    name="preview_connectivity_smoke",
+                    status="skipped",
+                    details="Preview route smoke was skipped because compile/build checks are still failing.",
+                    command="preview route smoke (current session)",
+                    logs=["Preview route smoke was skipped because compile/build checks are still failing."],
                 )
             )
             preview_details = {
@@ -693,7 +709,14 @@ class FixOrchestrator:
             return current_scope
         return list(merged.values())
 
-    def _collect_file_contexts(self, workspace_id: str, run_id: str, scope_entries: list[FixScopeEntry]) -> dict[str, str]:
+    def _collect_file_contexts(
+        self,
+        workspace_id: str,
+        run_id: str,
+        scope_entries: list[FixScopeEntry],
+        *,
+        fix_case: FixCase | None = None,
+    ) -> dict[str, str]:
         contexts: dict[str, str] = {}
         budget = self.MAX_CONTEXT_CHARS
         for entry in scope_entries:
@@ -708,7 +731,36 @@ class FixOrchestrator:
             excerpt = content[: min(len(content), min(4000, budget))]
             contexts[entry.file_path] = excerpt
             budget -= len(excerpt)
+        for support_path in self._repair_support_files(fix_case):
+            if budget <= 0 or support_path in contexts or not self._file_exists(workspace_id, run_id, support_path):
+                continue
+            content = self.workspace_service.read_file(workspace_id, support_path, run_id=run_id)
+            excerpt = content[: min(len(content), min(2500, budget))]
+            contexts[support_path] = excerpt
+            budget -= len(excerpt)
         return contexts
+
+    @staticmethod
+    def _repair_support_files(fix_case: FixCase | None) -> list[str]:
+        if fix_case is None:
+            return []
+        connectivity_codes = {
+            "connectivity.missing_ui_loading_state",
+            "connectivity.missing_ui_error_state",
+            "connectivity.missing_backend_route",
+        }
+        evidence = "\n".join(
+            [
+                str(fix_case.failure_class or ""),
+                str(fix_case.root_cause_summary or ""),
+                str(fix_case.exact_error_excerpt or ""),
+                *[result.details or "" for result in fix_case.executed_checks],
+                *[line for result in fix_case.executed_checks for line in result.logs],
+            ]
+        ).lower()
+        if any(code in evidence for code in connectivity_codes):
+            return ["artifacts/generated_app_graph.json"]
+        return []
 
     def _implicated_files(
         self,
@@ -781,10 +833,17 @@ class FixOrchestrator:
 
     @staticmethod
     def _is_fix_success(results: list[RunCheckResult], preview_details: dict[str, Any]) -> bool:
-        validators_ok = all(result.status != "failed" for result in results if result.name == "schema_validators")
+        validators_ok = all(result.status != "failed" for result in results if result.name in {"schema_validators", "connectivity_validators"})
         build_ok = all(result.status != "failed" for result in results if result.name == "changed_files_static")
         preview_result = next((result for result in results if result.name == "preview_boot_smoke"), None)
-        preview_ok = preview_result is not None and preview_result.status == "passed" and preview_details.get("status") == "running"
+        preview_connectivity_result = next((result for result in results if result.name == "preview_connectivity_smoke"), None)
+        preview_ok = (
+            preview_result is not None
+            and preview_result.status == "passed"
+            and preview_connectivity_result is not None
+            and preview_connectivity_result.status == "passed"
+            and preview_details.get("status") == "running"
+        )
         return validators_ok and build_ok and preview_ok
 
     @staticmethod

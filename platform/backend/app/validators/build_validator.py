@@ -140,7 +140,6 @@ class BuildValidator:
     def _validate_contract_drift(self, workspace_path: Path) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         static_root = workspace_path / "miniapp" / "app" / "static"
-        backend_routes = workspace_path / "miniapp" / "app" / "routes"
         legacy_dirs = [
             workspace_path / "frontend",
             workspace_path / "miniapp" / "app" / "api",
@@ -173,22 +172,6 @@ class BuildValidator:
                         message="Generated static UI still imports framework-specific frontend modules.",
                         severity="high",
                         location=relative,
-                    )
-                )
-
-        if static_root.exists():
-            categories_usage = any(
-                "/api/categories" in path.read_text(encoding="utf-8")
-                for path in static_root.rglob("*")
-                if path.suffix in {".html", ".js"}
-            )
-            if categories_usage and not (backend_routes / "categories.py").exists():
-                issues.append(
-                    ValidationIssue(
-                        code="build.missing_categories_route",
-                        message="Frontend expects /api/categories but the miniapp route is missing.",
-                        severity="high",
-                        location="miniapp/app/routes/categories.py",
                     )
                 )
 

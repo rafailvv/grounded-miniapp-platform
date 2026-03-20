@@ -775,9 +775,12 @@ class RunService:
         if request.mode == "fix":
             return "edit"
         prompt = request.prompt.lower()
+        role_scope = [role for role in request.target_role_scope if role in ROLE_SCOPE]
         if self._looks_like_fix_request(prompt):
             return "edit"
-        if request.target_role_scope and len(request.target_role_scope) == 1:
+        if GenerationService._looks_like_create_surface_request(prompt, role_scope):
+            return "create"
+        if role_scope and len(role_scope) == 1:
             return "role_only_change"
         if any(token in prompt for token in ("refine", "polish", "improve", "tighten", "cleanup")):
             return "refine"

@@ -39,9 +39,12 @@ class ContextPackBuilder:
             file_targets = file_targets[:8]
         for file_path in file_targets:
             try:
-                targeted_files[file_path] = self.workspace_service.read_file(workspace.workspace_id, file_path, run_id=run_id)
+                content = self.workspace_service.try_read_text_file(workspace.workspace_id, file_path, run_id=run_id)
             except FileNotFoundError:
                 continue
+            if content is None:
+                continue
+            targeted_files[file_path] = content
         stable_prefix = self.stable_prefix(workspace, model_profile)
         return ContextPack(
             workspace_id=workspace.workspace_id,

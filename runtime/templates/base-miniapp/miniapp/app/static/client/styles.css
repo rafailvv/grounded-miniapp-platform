@@ -152,7 +152,6 @@ input {
 }
 
 .feature-block {
-  min-height: clamp(280px, 56vh, 680px);
   padding: clamp(18px, 4vw, 32px);
 }
 
@@ -160,7 +159,6 @@ input {
   display: flex;
   flex-direction: column;
   gap: 18px;
-  height: 100%;
 }
 
 .feature-title,

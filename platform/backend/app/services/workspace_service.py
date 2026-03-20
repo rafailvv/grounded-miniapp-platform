@@ -357,6 +357,13 @@ class WorkspaceService:
         file_path = self._target_dir(workspace_id, run_id) / self._safe_relative_path(relative_path)
         return file_path.read_text(encoding="utf-8")
 
+    def try_read_text_file(self, workspace_id: str, relative_path: str, run_id: str | None = None) -> str | None:
+        file_path = self._target_dir(workspace_id, run_id) / self._safe_relative_path(relative_path)
+        try:
+            return file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return None
+
     def file_tree(self, workspace_id: str, run_id: str | None = None) -> list[dict[str, str]]:
         source_dir = self._target_dir(workspace_id, run_id)
         tree: list[dict[str, str]] = []

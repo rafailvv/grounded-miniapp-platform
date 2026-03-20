@@ -47,6 +47,7 @@ from app.models.grounded_spec import (
 )
 from app.validators.app_ir_validator import AppIRValidator
 from app.validators.build_validator import BuildValidator
+from app.validators.connectivity_validator import ConnectivityValidator
 from app.validators.grounded_spec_validator import GroundedSpecValidator
 
 
@@ -386,6 +387,43 @@ def _multi_page_graph() -> dict:
     }
 
 
+def _write_connectivity_artifacts(workspace_root: Path, *, api_path: str = "/api/orders") -> None:
+    graph = {
+        "flow_mode": "multi_page",
+        "roles": {
+            "client": {
+                "routes_file": "miniapp/app/static/client/index.html",
+                "pages": [
+                    {
+                        "route_path": "/client",
+                        "file_path": "miniapp/app/static/client/index.html",
+                        "title": "Shop",
+                        "description": "Browse live orders",
+                        "data_dependencies": ["orders"],
+                        "loading_state": "Loading orders...",
+                        "error_state": "Unable to load orders.",
+                    }
+                ],
+            }
+        },
+    }
+    spec = {
+        "api_requirements": [
+            {
+                "api_req_id": "api_1",
+                "name": "List orders",
+                "method": "GET",
+                "path": api_path,
+                "purpose": "Load customer orders",
+            }
+        ]
+    }
+    _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "artifacts/grounded_spec.json", json.dumps(spec))
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/app.js", "console.log('client bootstrap');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/routes/__init__.py", "")
+
+
 def test_contract_files_exist_and_expose_required_keys() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     spec_contract = json.loads((repo_root / "contracts" / "grounded-spec.v1.json").read_text(encoding="utf-8"))
@@ -485,3 +523,143 @@ def test_build_validator_flags_placeholder_and_identical_role_pages(tmp_path: Pa
     issue_codes = {issue.code for issue in issues}
     assert "build.placeholder_role_surface" in issue_codes
     assert "build.identical_role_pages" in issue_codes
+
+
+def test_connectivity_validator_flags_missing_backend_route_for_dynamic_page(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_connectivity_artifacts(workspace_root)
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/index.html",
+        """
+        <main>
+          <section>Loading orders...</section>
+          <section>Unable to load orders.</section>
+          <script src="/static/client/app.js"></script>
+        </main>
+        """,
+    )
+
+    issues = ConnectivityValidator().validate(workspace_root)
+    assert any(issue.code == "connectivity.missing_backend_route" for issue in issues)
+
+
+def test_connectivity_validator_flags_unwired_dynamic_page(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_connectivity_artifacts(workspace_root)
+    _write_workspace_file(workspace_root, "miniapp/app/routes/orders.py", "from fastapi import APIRouter\nrouter = APIRouter()\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/index.html",
+        """
+        <main>
+          <section>Loading orders...</section>
+          <section>Unable to load orders.</section>
+          <section>No items yet.</section>
+        </main>
+        """,
+    )
+
+    issues = ConnectivityValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+    assert "connectivity.unwired_page_dependency" in issue_codes
+    assert "connectivity.placeholder_dynamic_page" in issue_codes
+
+
+def test_connectivity_validator_flags_missing_loading_and_error_states(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_connectivity_artifacts(workspace_root)
+    _write_workspace_file(workspace_root, "miniapp/app/routes/orders.py", "from fastapi import APIRouter\nrouter = APIRouter()\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/index.html",
+        """
+        <main>
+          <section id="orders-root"></section>
+          <script src="/static/client/app.js"></script>
+        </main>
+        """,
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/app.js",
+        "async function loadOrders() { const response = await fetch('/api/orders'); return response.json(); }\n",
+    )
+
+    issues = ConnectivityValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+    assert "connectivity.missing_ui_loading_state" in issue_codes
+    assert "connectivity.missing_ui_error_state" in issue_codes
+
+
+def test_connectivity_validator_accepts_semantic_loading_and_error_state_markers(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_connectivity_artifacts(workspace_root)
+    _write_workspace_file(workspace_root, "miniapp/app/routes/orders.py", "from fastapi import APIRouter\nrouter = APIRouter()\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/index.html",
+        """
+        <main>
+          <section id="orders-loading" data-ui-state="loading" hidden></section>
+          <section id="orders-error" data-ui-state="error" hidden></section>
+          <section id="orders-root"></section>
+          <script src="/static/client/app.js"></script>
+        </main>
+        """,
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/app.js",
+        """
+        async function loadOrders() {
+          const loading = document.getElementById("orders-loading");
+          const error = document.getElementById("orders-error");
+          if (loading) loading.hidden = false;
+          if (error) error.hidden = true;
+          const response = await fetch('/api/orders');
+          return response.json();
+        }
+        """,
+    )
+
+    issues = ConnectivityValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+
+    assert "connectivity.missing_ui_loading_state" not in issue_codes
+    assert "connectivity.missing_ui_error_state" not in issue_codes
+
+
+def test_connectivity_validator_accepts_api_reference_with_matching_route(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_connectivity_artifacts(workspace_root, api_path="/api/categories")
+    _write_workspace_file(workspace_root, "miniapp/app/routes/categories.py", "from fastapi import APIRouter\nrouter = APIRouter()\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/index.html",
+        """
+        <main>
+          <section>Loading orders...</section>
+          <section>Unable to load orders.</section>
+          <script src="/static/client/app.js"></script>
+        </main>
+        """,
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/app.js",
+        """
+        async function loadCategories() {
+          const response = await fetch('/api/categories');
+          return response.json();
+        }
+        """,
+    )
+
+    issues = ConnectivityValidator().validate(workspace_root)
+    assert not any(issue.code == "connectivity.missing_backend_route" for issue in issues)

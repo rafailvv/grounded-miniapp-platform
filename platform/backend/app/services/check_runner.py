@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.error import URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 from app.models.artifacts import ValidationIssue
 from app.models.domain import CheckExecutionRecord, RunCheckResult, utc_now
@@ -41,7 +45,20 @@ class CheckRunner:
                 details="Build validators executed against the draft workspace.",
                 duration_ms=int((time.perf_counter() - validator_started) * 1000),
                 command="validation_suite.validate_build",
-                logs=[issue.message for issue in filtered_issues],
+                logs=self._validation_logs(filtered_issues),
+            )
+        )
+
+        connectivity_started = time.perf_counter()
+        connectivity_issues = self.validation_suite.validate_connectivity(source_dir)
+        results.append(
+            RunCheckResult(
+                name="connectivity_validators",
+                status="failed" if connectivity_issues else "passed",
+                details="Connectivity validators executed against the draft workspace.",
+                duration_ms=int((time.perf_counter() - connectivity_started) * 1000),
+                command="validation_suite.validate_connectivity",
+                logs=self._validation_logs(connectivity_issues),
             )
         )
 
@@ -52,15 +69,27 @@ class CheckRunner:
 
         preview_started = time.perf_counter()
         preview = self.preview_service.get(workspace_id)
-        should_skip_preview = bool(filtered_issues) or static_result.status == "failed"
+        should_skip_preview = bool(filtered_issues) or bool(connectivity_issues) or static_result.status == "failed"
         if should_skip_preview:
             preview_status = "skipped"
             preview_details = "Preview smoke skipped because validator/build checks already failed."
             preview_logs: list[str] = []
+            connectivity_result = RunCheckResult(
+                name="preview_connectivity_smoke",
+                status="skipped",
+                details="Preview connectivity smoke skipped because validator/build checks already failed.",
+                command="preview route smoke (current session)",
+                logs=[],
+            )
         else:
             preview_status = "skipped" if preview.status in {"stopped", "error"} else "passed"
             preview_details = "Draft preview smoke recorded using the current preview session."
             preview_logs = preview.logs[-12:]
+            connectivity_result = self._preview_connectivity_smoke(
+                source_dir=source_dir,
+                preview=preview,
+                preview_run_id=preview_run_id,
+            )
         results.append(
             RunCheckResult(
                 name="preview_boot_smoke",
@@ -71,6 +100,8 @@ class CheckRunner:
                 logs=preview_logs,
             )
         )
+        connectivity_result.duration_ms = int((time.perf_counter() - preview_started) * 1000)
+        results.append(connectivity_result)
 
         completed_at = utc_now()
         return CheckExecutionRecord(
@@ -92,13 +123,17 @@ class CheckRunner:
             location = result.name
             code = f"check.{result.name}"
             message = result.details or f"{result.name} failed."
-            if result.name == "schema_validators":
+            if result.name in {"schema_validators", "connectivity_validators"}:
+                parsed = CheckRunner._validation_issues_from_logs(result.logs, fallback_code=code, fallback_location=location)
+                if parsed:
+                    issues.extend(parsed)
+                    continue
                 message = next((line for line in result.logs if line.strip()), message)
             if result.name == "changed_files_static":
                 message = next((line for line in result.logs if line.strip()), message)
-            if result.name == "preview_boot_smoke":
+            if result.name in {"preview_boot_smoke", "preview_connectivity_smoke"}:
                 location = "preview"
-                code = "preview.rebuild_failed"
+                code = "connectivity.preview_route_unreachable" if result.name == "preview_connectivity_smoke" else "preview.rebuild_failed"
                 message = next((line for line in reversed(result.logs) if line.strip()), message)
             issues.append(
                 ValidationIssue(
@@ -116,11 +151,11 @@ class CheckRunner:
         if CheckRunner.has_tooling_failure(results):
             return "tooling/runtime_misconfiguration"
         failed_names = {result.name for result in results if result.status == "failed"}
-        if "schema_validators" in failed_names:
+        if "schema_validators" in failed_names or "connectivity_validators" in failed_names:
             return "validator/domain_constraint"
         if "changed_files_static" in failed_names:
             return "syntax/build"
-        if "preview_boot_smoke" in failed_names:
+        if "preview_boot_smoke" in failed_names or "preview_connectivity_smoke" in failed_names:
             return "runtime_preview_boot"
         return None
 
@@ -136,6 +171,121 @@ class CheckRunner:
             if any(marker in haystack for marker in markers):
                 return True
         return False
+
+    @staticmethod
+    def _validation_logs(issues: list[ValidationIssue]) -> list[str]:
+        return [json.dumps(issue.model_dump(mode="json"), ensure_ascii=False) for issue in issues]
+
+    @staticmethod
+    def _validation_issues_from_logs(
+        logs: list[str],
+        *,
+        fallback_code: str,
+        fallback_location: str,
+    ) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        for line in logs:
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            try:
+                issues.append(ValidationIssue.model_validate(payload))
+            except Exception:
+                continue
+        if issues:
+            return issues
+        if not logs:
+            return []
+        return [
+            ValidationIssue(
+                code=fallback_code,
+                message=next((line for line in logs if line.strip()), "Validation failed."),
+                severity="high",
+                location=fallback_location,
+                blocking=True,
+            )
+        ]
+
+    def _preview_connectivity_smoke(self, *, source_dir: Path, preview, preview_run_id: str | None) -> RunCheckResult:
+        if preview.status != "running" or not preview.url:
+            return RunCheckResult(
+                name="preview_connectivity_smoke",
+                status="skipped",
+                details="Preview connectivity smoke skipped because no running preview session is available.",
+                command="preview route smoke (current session)",
+                logs=[],
+            )
+        if preview_run_id is not None and preview.draft_run_id not in {None, preview_run_id}:
+            return RunCheckResult(
+                name="preview_connectivity_smoke",
+                status="skipped",
+                details="Preview connectivity smoke skipped because the running preview session does not match this draft.",
+                command="preview route smoke (current session)",
+                logs=[],
+            )
+        routes = self._root_preview_routes(source_dir)
+        if not routes:
+            return RunCheckResult(
+                name="preview_connectivity_smoke",
+                status="skipped",
+                details="Preview connectivity smoke skipped because no generated route graph is available.",
+                command="preview route smoke (current session)",
+                logs=[],
+            )
+        failures: list[str] = []
+        logs: list[str] = []
+        for route in routes:
+            target = urljoin(preview.url.rstrip("/") + "/", route.lstrip("/"))
+            try:
+                request = Request(target, headers={"User-Agent": "connectivity-smoke"})
+                with urlopen(request, timeout=2.0) as response:
+                    status_code = response.status if hasattr(response, "status") else response.getcode()
+                    body = response.read().decode("utf-8", errors="ignore")
+                if status_code >= 400:
+                    failures.append(f"{route} returned HTTP {status_code}.")
+                    continue
+                normalized_body = body.lower()
+                if len(normalized_body.strip()) < 40 or "not found" in normalized_body or "<title>404" in normalized_body:
+                    failures.append(f"{route} returned unusable preview content.")
+                    continue
+                logs.append(f"{route} returned usable preview content.")
+            except (TimeoutError, URLError, OSError) as exc:
+                failures.append(f"{route} could not be opened in preview: {exc}")
+        return RunCheckResult(
+            name="preview_connectivity_smoke",
+            status="failed" if failures else "passed",
+            details="Preview route smoke checked generated root routes against the running preview session.",
+            command="preview route smoke (current session)",
+            logs=failures or logs,
+        )
+
+    @staticmethod
+    def _root_preview_routes(source_dir: Path) -> list[str]:
+        graph_path = source_dir / "artifacts" / "generated_app_graph.json"
+        if not graph_path.exists():
+            return []
+        try:
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        except ValueError:
+            return []
+        roles = graph.get("roles") or {}
+        routes: list[str] = []
+        for role in ("client", "specialist", "manager"):
+            role_payload = roles.get(role) or {}
+            pages = role_payload.get("pages") or []
+            root_route = next(
+                (
+                    str(page.get("route_path") or "")
+                    for page in pages
+                    if isinstance(page, dict) and str(page.get("route_path") or "") in {f"/{role}", "/"}
+                ),
+                "",
+            )
+            routes.append(root_route or f"/{role}")
+        return list(dict.fromkeys(route for route in routes if route))
 
     def _static_check(self, *, source_dir: Path, changed_files: list[str]) -> RunCheckResult:
         frontend_dir = source_dir / "frontend"

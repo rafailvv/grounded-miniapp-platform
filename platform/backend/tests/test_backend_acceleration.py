@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
@@ -12,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from app.ai.openrouter_client import OpenRouterClient
 from app.main import create_app
-from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, GenerateRequest, GenerationMode, JobRecord, RunCheckResult, ValidationSnapshot, WorkspaceRecord
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RunCheckResult, ValidationSnapshot, WorkspaceRecord
 from app.services.code_index_service import CodeIndexService
 from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES
 from app.validators.build_validator import BuildValidator
@@ -133,6 +134,71 @@ def test_fix_case_accepts_container_published_port_metadata(tmp_path: Path) -> N
     assert fix_case.container_statuses
     assert fix_case.container_statuses[0].service == "preview-app"
     assert fix_case.container_statuses[0].published_port == "16435"
+
+
+def test_resolve_intent_prefers_create_for_workflow_heavy_app_requests(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+
+    workspace = app.state.container.workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Intent Workspace",
+            description="Intent classification should preserve create-like app requests.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_intent").resolve()),
+        )
+    )
+    request = CreateRunRequest(
+        prompt=(
+            "Create a multi-page flower shop mini app with client, specialist, and manager roles. "
+            "Managers should add products and edit existing products, specialists should process orders, "
+            "and customers should browse the storefront and checkout."
+        ),
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        target_role_scope=["client", "specialist", "manager"],
+    )
+
+    intent = app.state.container.run_service._resolve_intent(workspace, request)
+
+    assert intent == "create"
+
+
+def test_context_pack_and_generation_context_skip_non_utf8_files(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Binary Context Workspace",
+            description="Non-UTF8 files should not crash context collection.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_binary_context").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    run_id = "run_binary_context"
+    draft_source = workspace_service.ensure_draft(workspace.workspace_id, run_id)
+    binary_path = draft_source / "miniapp/app/generated/app.db"
+    binary_path.parent.mkdir(parents=True, exist_ok=True)
+    binary_path.write_bytes(b"\xf8\x00\x01binary")
+
+    context_pack = app.state.container.context_pack_builder.build(
+        workspace=workspace_service.get_workspace(workspace.workspace_id),
+        prompt="Build the app.",
+        model_profile="openai_code_fast",
+        generation_mode=GenerationMode.BALANCED,
+        active_paths=["miniapp/app/generated/app.db"],
+        target_files=["miniapp/app/generated/app.db"],
+        run_id=run_id,
+    )
+    file_contexts = app.state.container.generation_service._collect_existing_file_contexts(
+        workspace.workspace_id,
+        run_id,
+        ["miniapp/app/generated/app.db"],
+    )
+
+    assert "miniapp/app/generated/app.db" not in context_pack.targeted_files
+    assert "miniapp/app/generated/app.db" not in file_contexts
 
 
 def test_run_exposes_checks_patch_and_index_status(tmp_path: Path) -> None:
@@ -1056,6 +1122,72 @@ def test_frontend_build_tooling_failure_is_classified_as_platform_issue(tmp_path
     assert runner.classify_failure([result]) == "tooling/runtime_misconfiguration"
 
 
+def test_check_runner_expands_connectivity_validation_issue_codes() -> None:
+    result = RunCheckResult(
+        name="connectivity_validators",
+        status="failed",
+        details="Connectivity validation failed.",
+        logs=[
+            '{"code":"connectivity.missing_backend_route","message":"Missing orders route.","severity":"high","location":"miniapp/app/routes/orders.py","blocking":true}',
+            '{"code":"connectivity.unwired_page_dependency","message":"Client page is unwired.","severity":"high","location":"miniapp/app/static/client/index.html","blocking":true}',
+        ],
+    )
+
+    issues = check_runner_module.CheckRunner.failing_issues([result])
+
+    assert {issue.code for issue in issues} == {
+        "connectivity.missing_backend_route",
+        "connectivity.unwired_page_dependency",
+    }
+
+
+def test_preview_connectivity_smoke_reports_unreachable_route(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    runner = app.state.container.check_runner
+
+    graph = {
+        "roles": {
+            "client": {"pages": [{"route_path": "/client"}]},
+            "specialist": {"pages": [{"route_path": "/specialist"}]},
+            "manager": {"pages": [{"route_path": "/manager"}]},
+        }
+    }
+    artifacts_dir = tmp_path / "workspace" / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "generated_app_graph.json").write_text(json.dumps(graph), encoding="utf-8")
+
+    class FakeResponse:
+        def __init__(self, body: str):
+            self.status = 200
+            self._body = body.encode("utf-8")
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(request, timeout):
+        if request.full_url.endswith("/specialist"):
+            raise check_runner_module.URLError("connection refused")
+        return FakeResponse("<html><body><main>usable preview content for route</main></body></html>")
+
+    monkeypatch.setattr(check_runner_module, "urlopen", fake_urlopen)
+
+    result = runner._preview_connectivity_smoke(
+        source_dir=tmp_path / "workspace",
+        preview=PreviewRecord(workspace_id="ws_1", status="running", url="http://localhost:3000", draft_run_id="run_1"),
+        preview_run_id="run_1",
+    )
+
+    assert result.status == "failed"
+    assert any("/specialist" in line for line in result.logs)
+
+
 def test_openrouter_json_parser_recovers_first_object_from_concatenated_json() -> None:
     parsed = OpenRouterClient._parse_json_payload(
         '{"assistant_message":"first","operations":[]}{"assistant_message":"second","operations":[]}',
@@ -1174,6 +1306,88 @@ def test_parallel_page_generation_falls_back_to_serial_compact_retry(tmp_path: P
     assert any(item.file_path == page_two for item in result["operations"])
 
 
+def test_page_generation_retries_after_recoverable_format_failure(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    prompts: list[tuple[str, str]] = []
+
+    def fake_generate_structured_with_retry(**kwargs):
+        prompts.append((kwargs["system_prompt"], kwargs["user_prompt"]))
+        if len(prompts) == 1:
+            return {
+                "payload": {
+                    "assistant_message": "Wrong shape.",
+                    "operations": [
+                        {
+                            "file_path": "miniapp/app/static/client/other.html",
+                            "operation": "replace",
+                            "content": "<main>Other</main>\n",
+                            "reason": "wrong target",
+                        }
+                    ],
+                },
+                "model": "stub-model",
+            }
+        return {
+            "payload": {
+                "assistant_message": "Recovered.",
+                "operations": [
+                    {
+                        "file_path": "miniapp/app/static/client/product-detail.html",
+                        "operation": "replace",
+                        "content": "<main><section>Product detail</section></main>\n",
+                        "reason": "recover",
+                    }
+                ],
+            },
+            "model": "stub-model",
+        }
+
+    service._page_edit_system_prompt = lambda: "page-system"  # type: ignore[method-assign]
+    service._page_edit_user_prompt = lambda **kwargs: f"mode={kwargs['generation_mode']}"  # type: ignore[method-assign]
+    service._generate_structured_with_retry = fake_generate_structured_with_retry  # type: ignore[method-assign]
+
+    result = service._resolve_page_file_edit(
+        prompt="Build the product detail page.",
+        grounded_spec=None,  # type: ignore[arg-type]
+        role="client",
+        page={"page_id": "product-detail", "file_path": "miniapp/app/static/client/product-detail.html"},
+        page_graph={"roles": {}},
+        role_contract={},
+        scope_mode="whole_file_build",
+        intent="create",
+        file_contexts={},
+        generation_mode=GenerationMode.BALANCED,
+        creative_direction={},
+    )
+
+    assert "error" not in result
+    assert len(prompts) == 2
+    assert "Provider recovery mode" in prompts[1][0]
+    assert "mode=GenerationMode.FAST" in prompts[1][1]
+
+
+def test_sanitize_draft_operations_strips_control_chars(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    operations = service._sanitize_draft_operations(
+        [
+            DraftFileOperation(
+                file_path="miniapp/app/static/client/index.html",
+                operation="replace",
+                content="<div>Loading\u0007\u007f</div>\n",
+                reason="test",
+            )
+        ]
+    )
+
+    assert operations[0].content == "<div>Loading</div>\n"
+
+
 def test_prompt_assets_are_english_only(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -1190,6 +1404,23 @@ def test_scope_mode_prefers_whole_file_build_for_large_create_requests(tmp_path:
     scope_mode = service._scope_mode(
         "create",
         "Create a multi-page flower shop storefront with manager, specialist, and client roles.",
+        ["client", "specialist", "manager"],
+    )
+
+    assert scope_mode == "whole_file_build"
+
+
+def test_scope_mode_prefers_whole_file_build_for_create_like_edit_requests(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    scope_mode = service._scope_mode(
+        "edit",
+        (
+            "Create a multi-page flower shop storefront with catalog, product detail, cart, checkout, "
+            "and separate manager and specialist workspaces."
+        ),
         ["client", "specialist", "manager"],
     )
 
@@ -1291,6 +1522,42 @@ def test_page_graph_gate_rejects_workflow_heavy_role_trees_without_business_page
     )
 
     assert any("missing separate business pages" in issue for issue in issues)
+
+
+def test_page_graph_gate_rejects_collapsed_workflow_plan_even_in_minimal_patch_mode(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    page_graph = {
+        "flow_mode": "multi_page",
+        "roles": {
+            "client": {
+                "routes_file": "miniapp/app/static/client/index.html",
+                "pages": [{"route_path": "/client", "file_path": "miniapp/app/static/client/index.html"}],
+            },
+            "specialist": {
+                "routes_file": "miniapp/app/static/specialist/index.html",
+                "pages": [{"route_path": "/specialist", "file_path": "miniapp/app/static/specialist/index.html"}],
+            },
+            "manager": {
+                "routes_file": "miniapp/app/static/manager/index.html",
+                "pages": [{"route_path": "/manager", "file_path": "miniapp/app/static/manager/index.html"}],
+            },
+        },
+    }
+
+    issues = service._page_graph_gate_issues(
+        page_graph,
+        ["client", "specialist", "manager"],
+        scope_mode="minimal_patch",
+        require_multi_page=True,
+        require_business_pages=True,
+    )
+
+    assert any("did not receive enough distinct pages" in issue for issue in issues)
+    assert any("missing separate business pages" in issue for issue in issues)
+    assert any("collapses the app into one screen per selected role" in issue for issue in issues)
 
 
 def test_edit_gate_rejects_loading_first_static_page_without_dependencies(tmp_path: Path) -> None:
@@ -1658,6 +1925,7 @@ def test_fix_orchestrator_reuses_existing_generation_draft(tmp_path: Path) -> No
                 run_id=run_id,
                 results=[
                     RunCheckResult(name="schema_validators", status="passed", details="Validators passed."),
+                    RunCheckResult(name="connectivity_validators", status="passed", details="Connectivity validators passed."),
                     RunCheckResult(
                         name="changed_files_static",
                         status="passed",
@@ -1673,6 +1941,14 @@ def test_fix_orchestrator_reuses_existing_generation_draft(tmp_path: Path) -> No
                         command="docker compose up -d --build",
                         exit_code=0,
                         logs=["Preview is healthy."],
+                    ),
+                    RunCheckResult(
+                        name="preview_connectivity_smoke",
+                        status="passed",
+                        details="Preview routes are healthy.",
+                        command="preview route smoke (current session)",
+                        exit_code=0,
+                        logs=["/client returned usable preview content."],
                     ),
                 ],
                 duration_ms=1,
@@ -1707,6 +1983,86 @@ def test_fix_orchestrator_reuses_existing_generation_draft(tmp_path: Path) -> No
     trace = app.state.container.store.get("reports", f"trace:{workspace_id}")
     assert trace is not None
     assert any(entry.get("stage") == "draft_reused" for entry in trace.get("entries", []))
+
+
+def test_fix_context_includes_generated_app_graph_for_connectivity_state_failures(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    _install_llm_stub(app)
+
+    workspace_service = app.state.container.workspace_service
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Fix Context Workspace",
+            description="Connectivity repair should receive generated app graph context.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_fix_context").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    draft_run_id = "run_fix_context"
+    draft_source = workspace_service.ensure_draft(workspace.workspace_id, draft_run_id)
+    (draft_source / "artifacts").mkdir(parents=True, exist_ok=True)
+    (draft_source / "artifacts" / "generated_app_graph.json").write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "client": {
+                        "pages": [
+                            {
+                                "file_path": "miniapp/app/static/client/index.html",
+                                "loading_state": "Show storefront skeleton while products load.",
+                                "error_state": "Show a retry state if catalog loading fails.",
+                            }
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    check_execution = CheckExecutionRecord(
+        workspace_id=workspace.workspace_id,
+        run_id=draft_run_id,
+        results=[
+            RunCheckResult(
+                name="connectivity_validators",
+                status="failed",
+                details="Connectivity validation failed.",
+                logs=[
+                    '{"code":"connectivity.missing_ui_loading_state","message":"miniapp/app/static/client/index.html is missing its planned loading state for dynamic data.","severity":"high","location":"miniapp/app/static/client/index.html","blocking":true}'
+                ],
+            )
+        ],
+        started_at=datetime.now(timezone.utc),
+        completed_at=None,
+    )
+    request = GenerateRequest(
+        prompt="Fix the loading state mismatch.",
+        mode="fix",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        error_context={"raw_error": "Client loading state validator failed."},
+    )
+    scope_entries = [FixScopeEntry(file_path="miniapp/app/static/client/index.html", reason="HTML page failed the validator.")]
+
+    fix_case = app.state.container.fix_orchestrator._build_fix_case(
+        workspace_id=workspace.workspace_id,
+        run_id=draft_run_id,
+        attempt=1,
+        request=request,
+        check_execution=check_execution,
+        preview_details={"logs": [], "containers": [], "container_logs": {}},
+        prior_attempts=[],
+        existing_scope=scope_entries,
+    )
+    contexts = app.state.container.fix_orchestrator._collect_file_contexts(
+        workspace.workspace_id,
+        draft_run_id,
+        scope_entries,
+        fix_case=fix_case,
+    )
+
+    assert "artifacts/generated_app_graph.json" in contexts
 
 
 def test_auto_fixed_generate_run_resumes_generation_from_same_run_checkpoint(tmp_path: Path) -> None:
