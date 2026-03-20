@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.error import URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from app.core.config import Settings
@@ -269,7 +270,11 @@ class PreviewService:
         payload = self.store.get("previews", workspace_id)
         if not payload:
             return self._get_or_create(workspace_id)
-        preview = self._reconcile_runtime_state(PreviewRecord.model_validate(payload), workspace_id)
+        preview = PreviewRecord.model_validate(payload)
+        preview = self._fast_restore_preview_from_http(preview)
+        if preview.status != "running" or not preview.url:
+            preview = self._reconcile_runtime_state(preview, workspace_id)
+            preview = self._fast_restore_preview_from_http(preview)
         preview = self._gate_public_readiness(preview)
         if preview.runtime_mode == "inline":
             preview.runtime_mode = "docker"
@@ -282,17 +287,21 @@ class PreviewService:
             preview.project_name = None
             preview.progress_percent = 100
             self._append_log(preview, "Legacy inline preview was disabled. Start the docker runtime preview.")
-        if preview.runtime_mode == "docker" and (preview.proxy_port is not None or preview.project_name):
-            log_source_dir = self._runtime_source_dir(workspace_id, preview)
-            try:
-                runtime_logs = self.runtime_manager.collect_logs(
-                    workspace_id,
-                    log_source_dir,
-                    preview.proxy_port,
-                )
-                preview.logs = [*preview.logs[-80:], *runtime_logs][-240:]
-            except Exception as exc:
-                self._append_log(preview, f"Failed to collect runtime logs: {exc}")
+        return preview
+
+    def peek(self, workspace_id: str) -> PreviewRecord:
+        payload = self.store.get("previews", workspace_id)
+        if not payload:
+            return self._get_or_create(workspace_id)
+        preview = PreviewRecord.model_validate(payload)
+        if preview.runtime_mode == "docker" and preview.proxy_port is not None and not preview.url and self._has_ready_runtime_log(preview):
+            preview.url = self.runtime_manager.preview_url(preview.proxy_port)
+            preview.frontend_url = preview.url
+            preview.backend_url = self.runtime_manager.backend_url(preview.proxy_port)
+            preview.status = "running"
+            preview.stage = "running"
+            preview.progress_percent = 100
+            preview.last_error = None
             self._persist(preview)
         return preview
 
@@ -301,6 +310,39 @@ class PreviewService:
         if not preview.url:
             return {}
         return {role: f"{preview.url}/{role}" for role in ROLE_ORDER}
+
+    @staticmethod
+    def role_urls_from_preview(preview: PreviewRecord) -> dict[str, str]:
+        if not preview.url:
+            return {}
+        return {role: f"{preview.url}/{role}" for role in ROLE_ORDER}
+
+    def _fast_restore_preview_from_http(self, preview: PreviewRecord) -> PreviewRecord:
+        if preview.runtime_mode != "docker" or preview.proxy_port is None:
+            return preview
+        runtime_url = self.runtime_manager.preview_url(preview.proxy_port)
+        if not self._http_preview_ready(runtime_url):
+            return preview
+        if preview.status == "running" and preview.url == runtime_url:
+            return preview
+        preview.url = runtime_url
+        preview.frontend_url = runtime_url
+        preview.backend_url = self.runtime_manager.backend_url(preview.proxy_port)
+        preview.status = "running"
+        preview.stage = "running"
+        preview.progress_percent = 100
+        preview.last_error = None
+        self._persist(preview)
+        return preview
+
+    @staticmethod
+    def _has_ready_runtime_log(preview: PreviewRecord) -> bool:
+        ready_markers = (
+            "Preview runtime is healthy at ",
+            "Preview runtime is already running. Restored preview state from docker.",
+            "Preview rebuild completed and runtime is healthy at ",
+        )
+        return any(any(marker in line for marker in ready_markers) for line in preview.logs[-40:])
 
     def _gate_public_readiness(self, preview: PreviewRecord) -> PreviewRecord:
         if preview.runtime_mode != "docker" or preview.status != "running" or not preview.url:
@@ -319,10 +361,28 @@ class PreviewService:
 
     def _http_preview_ready(self, preview_url: str) -> bool:
         probe_paths = ("/health", "/client")
-        for probe_path in probe_paths:
-            if not self._probe_http(f"{preview_url}{probe_path}"):
-                return False
-        return True
+        candidate_bases = self._probe_base_urls(preview_url)
+        for base_url in candidate_bases:
+            if all(self._probe_http(f"{base_url}{probe_path}") for probe_path in probe_paths):
+                return True
+        return False
+
+    @staticmethod
+    def _probe_base_urls(preview_url: str) -> list[str]:
+        parsed = urlparse(preview_url)
+        if not parsed.scheme or not parsed.netloc:
+            return [preview_url.rstrip("/")]
+        bases: list[str] = []
+        if parsed.port is not None:
+            for host in ("host.docker.internal", "127.0.0.1", "localhost"):
+                bases.append(f"{parsed.scheme}://{host}:{parsed.port}")
+        bases.append(f"{parsed.scheme}://{parsed.netloc}")
+        unique: list[str] = []
+        for base in bases:
+            normalized = base.rstrip("/")
+            if normalized not in unique:
+                unique.append(normalized)
+        return unique
 
     @staticmethod
     def _probe_http(url: str) -> bool:

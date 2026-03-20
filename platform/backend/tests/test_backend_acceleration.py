@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from app.ai.openrouter_client import OpenRouterClient
 from app.main import create_app
-from app.models.domain import CheckExecutionRecord, CreateRunRequest, GenerateRequest, GenerationMode, JobRecord, RunCheckResult, ValidationSnapshot, WorkspaceRecord
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, GenerateRequest, GenerationMode, JobRecord, RunCheckResult, ValidationSnapshot, WorkspaceRecord
 from app.services.code_index_service import CodeIndexService
 from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES
 from app.validators.build_validator import BuildValidator
@@ -1208,6 +1208,284 @@ def test_scope_mode_prefers_minimal_patch_for_small_local_edits(tmp_path: Path) 
     )
 
     assert scope_mode == "minimal_patch"
+
+
+def test_page_generation_accepts_multiple_same_file_operations_and_uses_last_valid_replace(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    service._page_edit_system_prompt = lambda: "page-system"  # type: ignore[method-assign]
+    service._page_edit_user_prompt = lambda **kwargs: "page-user"  # type: ignore[method-assign]
+    service._generate_structured_with_retry = lambda **kwargs: {  # type: ignore[method-assign]
+        "payload": {
+            "assistant_message": "Generated page.",
+            "operations": [
+                {
+                    "file_path": "miniapp/app/static/client/catalog.html",
+                    "operation": "replace",
+                    "content": "<main>Draft catalog</main>\n",
+                    "reason": "initial draft",
+                },
+                {
+                    "file_path": "miniapp/app/static/client/catalog.html",
+                    "operation": "replace",
+                    "content": "<main><section>Final catalog page</section></main>\n",
+                    "reason": "finalize same file",
+                },
+            ],
+        },
+        "model": "stub-model",
+    }
+
+    result = service._resolve_page_file_edit(
+        prompt="Build the catalog page.",
+        grounded_spec=None,  # type: ignore[arg-type]
+        role="client",
+        page={"page_id": "catalog", "file_path": "miniapp/app/static/client/catalog.html"},
+        page_graph={"roles": {}},
+        role_contract={},
+        scope_mode="whole_file_build",
+        intent="create",
+        file_contexts={},
+        generation_mode=GenerationMode.BALANCED,
+        creative_direction={},
+    )
+
+    assert "error" not in result
+    assert result["operation"].file_path == "miniapp/app/static/client/catalog.html"
+    assert "Final catalog page" in result["operation"].content
+
+
+def test_page_graph_gate_rejects_workflow_heavy_role_trees_without_business_pages(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    page_graph = {
+        "flow_mode": "multi_page",
+        "roles": {
+            "client": {
+                "routes_file": "miniapp/app/static/client/index.html",
+                "pages": [
+                    {"route_path": "/client", "file_path": "miniapp/app/static/client/index.html"},
+                    {"route_path": "/client/profile", "file_path": "miniapp/app/static/client/profile.html"},
+                ],
+            },
+            "specialist": {
+                "routes_file": "miniapp/app/static/specialist/index.html",
+                "pages": [
+                    {"route_path": "/specialist", "file_path": "miniapp/app/static/specialist/index.html"},
+                    {"route_path": "/specialist/profile", "file_path": "miniapp/app/static/specialist/profile.html"},
+                ],
+            },
+        },
+    }
+
+    issues = service._page_graph_gate_issues(
+        page_graph,
+        ["client", "specialist"],
+        scope_mode="whole_file_build",
+        require_multi_page=True,
+        require_business_pages=True,
+    )
+
+    assert any("missing separate business pages" in issue for issue in issues)
+
+
+def test_edit_gate_rejects_loading_first_static_page_without_dependencies(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    page_graph = {
+        "roles": {
+            "client": {
+                "routes_file": "miniapp/app/static/client/index.html",
+                "pages": [
+                    {
+                        "route_path": "/client",
+                        "file_path": "miniapp/app/static/client/index.html",
+                        "data_dependencies": [],
+                    },
+                    {
+                        "route_path": "/client/catalog",
+                        "file_path": "miniapp/app/static/client/catalog.html",
+                        "data_dependencies": ["records"],
+                    },
+                    {
+                        "route_path": "/client/profile",
+                        "file_path": "miniapp/app/static/client/profile.html",
+                        "data_dependencies": [],
+                    },
+                ],
+            }
+        }
+    }
+    operations = [
+        DraftFileOperation(
+            file_path="miniapp/app/static/client/index.html",
+            operation="replace",
+            content="<html><body><main>Loading content… Loading... Loading preview...</main></body></html>",
+            reason="Bad static page",
+        ),
+        DraftFileOperation(
+            file_path="miniapp/app/static/client/catalog.html",
+            operation="replace",
+            content="<html><body><main><h1>Catalog</h1><a href='/client/cart'>Cart</a></main></body></html>",
+            reason="Catalog page",
+        ),
+        DraftFileOperation(
+            file_path="miniapp/app/static/client/profile.html",
+            operation="replace",
+            content="<html><body><main><h1>Profile</h1></main></body></html>",
+            reason="Profile page",
+        ),
+    ]
+
+    issues = service._edit_gate_issues(
+        page_graph,
+        operations,
+        ["client"],
+        scope_mode="whole_file_build",
+        target_files=[item.file_path for item in operations],
+        require_business_pages=True,
+    )
+
+    assert any("loading-first copy" in issue for issue in issues)
+
+
+def test_preview_get_does_not_collect_runtime_logs_for_preview_url_polling(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Preview Poll Workspace",
+            "description": "Preview URL polling should not block on docker log collection.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    client.post(f"/workspaces/{workspace_id}/clone-template")
+
+    preview_service = app.state.container.preview_service
+    preview = preview_service._get_or_create(workspace_id)
+    preview.runtime_mode = "docker"
+    preview.status = "running"
+    preview.stage = "running"
+    preview.url = "http://localhost:19999"
+    preview.frontend_url = preview.url
+    preview.backend_url = f"{preview.url}/api"
+    preview.proxy_port = 19999
+    preview.project_name = "grounded_preview_test"
+    preview_service._persist(preview)
+
+    original_collect_logs = app.state.container.runtime_manager.collect_logs
+    original_http_ready = preview_service._http_preview_ready
+    original_inspect = app.state.container.runtime_manager.inspect_containers
+    app.state.container.runtime_manager.collect_logs = lambda workspace_id, source_dir, proxy_port: (_ for _ in ()).throw(AssertionError("collect_logs should not be called"))
+    preview_service._http_preview_ready = lambda url: True
+    app.state.container.runtime_manager.inspect_containers = (
+        lambda current_workspace_id, source_dir, proxy_port: [{"state": "running", "published_port": str(proxy_port or 19999)}]
+    )
+    try:
+        response = client.get(f"/workspaces/{workspace_id}/preview/url")
+    finally:
+        app.state.container.runtime_manager.collect_logs = original_collect_logs
+        preview_service._http_preview_ready = original_http_ready
+        app.state.container.runtime_manager.inspect_containers = original_inspect
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "running"
+    assert payload["url"] == "http://localhost:19999"
+
+
+def test_preview_get_fast_restores_running_state_from_ready_http_port(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Fast Restore Workspace",
+            "description": "Health-check previews should recover without docker reconcile blocking polling.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    client.post(f"/workspaces/{workspace_id}/clone-template")
+
+    preview_service = app.state.container.preview_service
+    preview = preview_service._get_or_create(workspace_id)
+    preview.runtime_mode = "docker"
+    preview.status = "starting"
+    preview.stage = "health_check"
+    preview.url = None
+    preview.frontend_url = None
+    preview.backend_url = None
+    preview.proxy_port = 16734
+    preview.project_name = "grounded_preview_test"
+    preview_service._persist(preview)
+
+    original_http_ready = preview_service._http_preview_ready
+    original_inspect = app.state.container.runtime_manager.inspect_containers
+    preview_service._http_preview_ready = lambda url: True
+    app.state.container.runtime_manager.inspect_containers = (
+        lambda workspace_id, source_dir, proxy_port: (_ for _ in ()).throw(AssertionError("inspect_containers should not be called"))
+    )
+    try:
+        preview_state = preview_service.get(workspace_id)
+    finally:
+        preview_service._http_preview_ready = original_http_ready
+        app.state.container.runtime_manager.inspect_containers = original_inspect
+
+    assert preview_state.status == "running"
+    assert preview_state.url == "http://localhost:16734"
+
+
+def test_preview_url_uses_lightweight_preview_peek_for_stuck_health_check_state(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Preview Peek Workspace",
+            "description": "Preview URL should recover from persisted health_check state without blocking.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    client.post(f"/workspaces/{workspace_id}/clone-template")
+
+    preview_service = app.state.container.preview_service
+    preview = preview_service._get_or_create(workspace_id)
+    preview.runtime_mode = "docker"
+    preview.status = "starting"
+    preview.stage = "health_check"
+    preview.url = None
+    preview.frontend_url = None
+    preview.backend_url = None
+    preview.proxy_port = 16734
+    preview.project_name = "grounded_preview_test"
+    preview.logs.append("Preview runtime is healthy at http://localhost:16734.")
+    preview_service._persist(preview)
+
+    response = client.get(f"/workspaces/{workspace_id}/preview/url")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "running"
+    assert payload["url"] == "http://localhost:16734"
 
 
 def test_generate_run_auto_switches_to_fix_on_frontend_build_failure(tmp_path: Path) -> None:

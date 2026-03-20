@@ -150,6 +150,24 @@ BUNDLE_CLUSTER_ORDER = (
     "role_specialist_ui",
     "role_client_ui",
 )
+WORKFLOW_HEAVY_MARKERS = (
+    "catalog",
+    "storefront",
+    "checkout",
+    "cart",
+    "product",
+    "products",
+    "order",
+    "orders",
+    "queue",
+    "dashboard",
+    "management",
+    "workspace",
+    "workflow",
+    "detail",
+    "details",
+    "booking",
+)
 logger = logging.getLogger(__name__)
 ACTIVE_LLM_CACHE_CONTEXT: ContextVar[dict[str, str] | None] = ContextVar("active_llm_cache_context", default=None)
 ACTIVE_LLM_CACHE_STATS: ContextVar[dict[str, Any] | None] = ContextVar("active_llm_cache_stats", default=None)
@@ -609,6 +627,7 @@ class GenerationService:
             role_scope,
             scope_mode=plan_result["scope_mode"],
             require_multi_page=bool(plan_result["require_multi_page"]),
+            require_business_pages=bool(plan_result.get("require_business_pages")),
         )
         if plan_gate_issues:
             self._append_trace(
@@ -850,6 +869,7 @@ class GenerationService:
             role_scope,
             scope_mode=plan_result["scope_mode"],
             target_files=plan_result["target_files"],
+            require_business_pages=bool(plan_result.get("require_business_pages")),
         )
         if edit_gate_issues:
             self._append_trace(
@@ -1363,36 +1383,60 @@ class GenerationService:
     ) -> dict[str, Any]:
         scope_mode = self._scope_mode(intent, prompt, role_scope)
         require_multi_page = self._requires_multi_page(prompt, grounded_spec, role_scope, intent)
+        require_business_pages = self._requires_business_pages(prompt, grounded_spec, role_scope, intent)
         strategy_reason = self._strategy_reason(intent, prompt, role_scope, require_multi_page=require_multi_page)
-        try:
-            workspace_tree = self.workspace_service.file_tree(workspace_id)
-            payload = self._generate_code_plan_sections(
-                workspace_id=workspace_id,
-                prompt=prompt,
-                grounded_spec=grounded_spec,
-                doc_refs=doc_refs,
-                role_scope=role_scope,
-                role_contract=role_contract,
-                scope_mode=scope_mode,
-                require_multi_page=require_multi_page,
-                workspace_tree=workspace_tree,
-                generation_mode=generation_mode,
-                creative_direction=creative_direction,
-            )
-            normalized = self._normalize_model_payload(payload["payload"])
-            planned = self._normalize_page_plan(
-                normalized,
-                role_scope=role_scope,
-                scope_mode=scope_mode,
-                require_multi_page=require_multi_page,
-                workspace_tree=workspace_tree,
-            )
-            planned["write_strategy"] = scope_mode
-            planned["strategy_reason"] = strategy_reason
-            planned["model"] = payload["model"]
-            return planned
-        except Exception as exc:
-            return {"error": f"Page graph planning failed: {exc}"}
+        workspace_tree = self.workspace_service.file_tree(workspace_id)
+        corrective_prompt = self._planning_retry_prompt(prompt)
+        last_error: Exception | None = None
+        last_gate_issues: list[str] = []
+        attempts = 2 if scope_mode == "whole_file_build" and require_multi_page else 1
+        for attempt in range(attempts):
+            planning_prompt = prompt if attempt == 0 else corrective_prompt
+            try:
+                payload = self._generate_code_plan_sections(
+                    workspace_id=workspace_id,
+                    prompt=planning_prompt,
+                    grounded_spec=grounded_spec,
+                    doc_refs=doc_refs,
+                    role_scope=role_scope,
+                    role_contract=role_contract,
+                    scope_mode=scope_mode,
+                    require_multi_page=require_multi_page,
+                    workspace_tree=workspace_tree,
+                    generation_mode=generation_mode,
+                    creative_direction=creative_direction,
+                )
+                normalized = self._normalize_model_payload(payload["payload"])
+                planned = self._normalize_page_plan(
+                    normalized,
+                    role_scope=role_scope,
+                    scope_mode=scope_mode,
+                    require_multi_page=require_multi_page,
+                    workspace_tree=workspace_tree,
+                )
+                plan_gate_issues = self._page_graph_gate_issues(
+                    planned["page_graph"],
+                    role_scope,
+                    scope_mode=scope_mode,
+                    require_multi_page=require_multi_page,
+                    require_business_pages=require_business_pages,
+                )
+                planned["write_strategy"] = scope_mode
+                planned["strategy_reason"] = strategy_reason
+                planned["model"] = payload["model"]
+                planned["plan_gate_issues"] = plan_gate_issues
+                planned["require_business_pages"] = require_business_pages
+                if not plan_gate_issues or attempt + 1 >= attempts:
+                    return planned
+                last_gate_issues = plan_gate_issues
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            return {"error": f"Page graph planning failed: {last_error}"}
+        return {
+            "error": "Page graph planning failed the structural readiness checks after retry.",
+            "plan_gate_issues": last_gate_issues,
+        }
 
     def _generate_code_plan_sections(
         self,
@@ -2169,6 +2213,14 @@ class GenerationService:
         if not route_path.startswith("/"):
             route_path = f"/{route_path}"
         file_path_candidates = self._normalize_path_list([payload.get("file_path")], [])
+        data_dependencies = self._normalize_string_list(payload.get("data_dependencies"))
+        loading_state = str(payload.get("loading_state") or "").strip()
+        empty_state = str(payload.get("empty_state") or "").strip()
+        error_state = str(payload.get("error_state") or "").strip()
+        if not data_dependencies:
+            loading_state = ""
+            empty_state = ""
+            error_state = ""
         return {
             "page_id": str(payload.get("page_id") or f"{role}_{index + 1}").strip() or f"{role}_{index + 1}",
             "route_path": route_path,
@@ -2180,10 +2232,10 @@ class GenerationService:
             "purpose": str(payload.get("purpose") or payload.get("description") or "").strip(),
             "page_kind": str(payload.get("page_kind") or "workspace").strip(),
             "primary_actions": self._normalize_string_list(payload.get("primary_actions")),
-            "data_dependencies": self._normalize_string_list(payload.get("data_dependencies")),
-            "loading_state": str(payload.get("loading_state") or "").strip(),
-            "empty_state": str(payload.get("empty_state") or "").strip(),
-            "error_state": str(payload.get("error_state") or "").strip(),
+            "data_dependencies": data_dependencies,
+            "loading_state": loading_state,
+            "empty_state": empty_state,
+            "error_state": error_state,
         }
 
     @staticmethod
@@ -2458,6 +2510,41 @@ class GenerationService:
             "catalog",
         )
         return any(marker in lowered for marker in multi_markers)
+
+    @staticmethod
+    def _requires_business_pages(prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str], intent: str) -> bool:
+        lowered = prompt.lower()
+        if GenerationService._looks_like_fix_request(lowered):
+            return False
+        if any(marker in lowered for marker in WORKFLOW_HEAVY_MARKERS):
+            return True
+        if intent == "create" and len(role_scope) > 1:
+            return True
+        if len(grounded_spec.user_flows) > 1:
+            return True
+        if len(grounded_spec.api_requirements) > 0 or len(grounded_spec.persistence_requirements) > 0:
+            return True
+        return False
+
+    @staticmethod
+    def _planning_retry_prompt(prompt: str) -> str:
+        corrective = (
+            "Planning correction: expand into separate business pages. "
+            "Do not collapse the app into role landing pages. "
+            "Keep index.html as the role entry page only. "
+            "Add real business pages such as catalog, product, cart, orders, detail, or management pages when the workflow implies them. "
+            "Minimize loading-first UI and use loading states only when post-load data is required."
+        )
+        return f"{prompt.rstrip()}\n\n{corrective}"
+
+    @staticmethod
+    def _is_business_page(role: str, page: dict[str, Any]) -> bool:
+        file_path = str(page.get("file_path") or "")
+        route_path = str(page.get("route_path") or "")
+        return file_path not in {
+            f"miniapp/app/static/{role}/index.html",
+            f"miniapp/app/static/{role}/profile.html",
+        } and route_path not in {f"/{role}", f"/{role}/profile"}
 
     @staticmethod
     def _looks_like_fix_request(prompt: str) -> bool:
@@ -2805,6 +2892,8 @@ class GenerationService:
                     "Keep three-role preview compatibility.",
                     "Use the existing profile design language as a style anchor instead of inventing a generic dashboard shell.",
                     "If the prompt implies several flows, entities, or jobs, return a multi-page app with distinct page files and routes.",
+                    "Keep index.html as the role entry page only; put catalog, orders, detail, cart, checkout, and management flows into separate HTML files when the workflow implies them.",
+                    "Do not collapse workflow-heavy apps into index.html plus profile.html only.",
                     "For targeted edits, keep target_files minimal and touch only the files required by the request.",
                     "Do not output role copies with changed titles only.",
                     "Return only repo-relative file paths that fit the current workspace tree and path hints.",
@@ -2902,7 +2991,7 @@ class GenerationService:
         prompt = (
             "Generate one real React page file for a Telegram/MAX mini-app workspace. "
             "The page must feel custom, role-specific, and grounded in the existing profile design language. "
-            "Return a single create/replace operation for the requested page file only."
+            "Return file operations for the requested page file only."
         )
         GenerationService._assert_english_control_text(prompt)
         return prompt
@@ -2961,7 +3050,9 @@ class GenerationService:
                 "rules": [
                     "Create a real page, not a generic stats card screen.",
                     "Respect the requested role and make the actions specific to that role.",
-                    "Add loading, empty, and error states when the page needs data.",
+                    "Only add loading, empty, and error states when the page depends on data fetched after page load.",
+                    "Static or mostly static pages should render immediately without spinner-first UX.",
+                    "Keep landing pages complete on first paint and move business flows into separate HTML pages when the page graph requires them.",
                     "If scope_mode is minimal_patch, preserve unrelated behavior and keep the diff minimal.",
                     "Return exactly one operation for the requested page file path.",
                 ],
@@ -3047,6 +3138,8 @@ class GenerationService:
                     "If stage_name is frontend, wire pages, routes, and shared UI/state to the already planned miniapp surface.",
                     "Generate role routes that expose the page graph as real separate pages when routes are targeted.",
                     "Generate shared app chrome/state files that support the pages instead of rendering placeholder dashboards.",
+                    "Keep role pages usable without waiting on client-side hydration for basic navigation and structure.",
+                    "Do not collapse business flows back into index.html when separate page files are in target_files or page_graph.",
                     "For minimal_patch, preserve unrelated behavior and keep the diff minimal.",
                     "Do not touch page files unless they are included in target_files.",
                     "If target_files is non-empty, operations must include at least one create/replace/delete for one of those files.",
@@ -3100,7 +3193,7 @@ class GenerationService:
                         "Provider recovery mode:\n"
                         "- Previous attempt failed with a transient provider or transport issue.\n"
                         "- Keep the page implementation concise and stable.\n"
-                        "- Return only the single requested page file operation.\n"
+                        "- Return operations only for the requested page file.\n"
                         "- Prefer the smallest valid page implementation over extra polish."
                     )
                     system_prompt = f"{system_prompt.rstrip()}\n\n{recovery_note}".strip()
@@ -3117,16 +3210,25 @@ class GenerationService:
                 if not isinstance(raw_operations, list):
                     raise ValueError(f"{page['file_path']} did not return operations.")
                 operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
+                foreign_operations = [
+                    operation.file_path
+                    for operation in operations
+                    if operation.file_path != page["file_path"]
+                ]
+                if foreign_operations:
+                    raise ValueError(
+                        f"{page['file_path']} returned operations for other files: {', '.join(sorted(set(foreign_operations))[:5])}."
+                    )
                 valid_operations = [
                     operation
                     for operation in operations
                     if operation.file_path == page["file_path"] and operation.operation in {"create", "replace"} and operation.content is not None
                 ]
-                if len(valid_operations) != 1:
-                    raise ValueError(f"{page['file_path']} must be generated as a single create/replace operation.")
+                if not valid_operations:
+                    raise ValueError(f"{page['file_path']} did not produce a valid create/replace operation.")
                 return {
                     "assistant_message": str(normalized.get("assistant_message") or "").strip(),
-                    "operation": valid_operations[0],
+                    "operation": valid_operations[-1],
                     "model": payload["model"],
                 }
             except Exception as exc:
@@ -3433,7 +3535,14 @@ class GenerationService:
         return issues
 
     @staticmethod
-    def _page_graph_gate_issues(page_graph: dict[str, Any], role_scope: list[str], *, scope_mode: str, require_multi_page: bool) -> list[str]:
+    def _page_graph_gate_issues(
+        page_graph: dict[str, Any],
+        role_scope: list[str],
+        *,
+        scope_mode: str,
+        require_multi_page: bool,
+        require_business_pages: bool,
+    ) -> list[str]:
         issues: list[str] = []
         roles = page_graph.get("roles") or {}
         planned_paths = set(page_graph.get("shared_files") or []) | set(page_graph.get("backend_targets") or [])
@@ -3453,6 +3562,10 @@ class GenerationService:
             total_pages += len(pages)
             if scope_mode != "minimal_patch" and require_multi_page and len(pages) < 2:
                 issues.append(f"{role} did not receive enough distinct pages for a multi-page app.")
+            if scope_mode != "minimal_patch" and require_business_pages:
+                business_pages = [page for page in pages if isinstance(page, dict) and GenerationService._is_business_page(role, page)]
+                if not business_pages:
+                    issues.append(f"{role} is missing separate business pages beyond index.html and profile.html.")
             normalized_role_routes.append(
                 (
                     role,
@@ -3468,6 +3581,16 @@ class GenerationService:
             issues.append("The generated plan did not stay in multi-page mode.")
         if scope_mode != "minimal_patch" and require_multi_page and total_pages <= len(role_scope):
             issues.append("The generated plan still collapses the app into one screen per selected role.")
+        if scope_mode != "minimal_patch" and require_business_pages:
+            default_only = []
+            for role in role_scope:
+                role_payload = roles.get(role) or {}
+                pages = role_payload.get("pages") or []
+                route_paths = {str(page.get("route_path") or "") for page in pages if isinstance(page, dict)}
+                if route_paths.issubset({f"/{role}", f"/{role}/profile"}):
+                    default_only.append(role)
+            if default_only:
+                issues.append(f"Workflow-heavy planning stayed on root/profile routes only for: {', '.join(default_only)}.")
         if scope_mode != "minimal_patch" and len(normalized_role_routes) > 1:
             route_sets = [routes for _, routes in normalized_role_routes]
             if len(set(route_sets)) == 1:
@@ -3485,9 +3608,11 @@ class GenerationService:
         *,
         scope_mode: str,
         target_files: list[str],
+        require_business_pages: bool,
     ) -> list[str]:
         issues: list[str] = []
         operation_paths = {operation.file_path for operation in operations}
+        operation_map = {operation.file_path: operation for operation in operations}
         allowed_target_paths = set(target_files) | {"artifacts/generated_app_graph.json"}
         unexpected_paths = [path for path in operation_paths if path not in allowed_target_paths]
         if unexpected_paths:
@@ -3523,6 +3648,37 @@ class GenerationService:
             issues.append("Generated draft does not update the role route files for every selected role.")
         if page_hits <= len(role_scope):
             issues.append("Generated draft still collapses the app into too few real page files.")
+        if require_business_pages:
+            for role in role_scope:
+                role_payload = page_graph.get("roles", {}).get(role) or {}
+                role_pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
+                business_pages = [page for page in role_pages if GenerationService._is_business_page(role, page)]
+                if business_pages and not any(str(page.get("file_path")) in operation_paths for page in business_pages):
+                    issues.append(f"Generated draft skipped separate business page files for {role}.")
+                index_path = f"miniapp/app/static/{role}/index.html"
+                index_operation = operation_map.get(index_path)
+                index_source = str(index_operation.content or "") if index_operation is not None else ""
+                lowered_index = index_source.lower()
+                if index_source:
+                    keyword_hits = sum(lowered_index.count(token) for token in ("catalog", "product", "products", "cart", "checkout", "orders", "queue", "management"))
+                    if keyword_hits >= 3 and not business_pages:
+                        issues.append(f"{role} index.html still absorbs business content instead of splitting it into separate pages.")
+                for page in role_pages:
+                    file_path = str(page.get("file_path") or "")
+                    if not file_path.endswith(".html"):
+                        continue
+                    page_operation = operation_map.get(file_path)
+                    content = str(page_operation.content or "").lower() if page_operation is not None else ""
+                    if not content:
+                        continue
+                    loading_hits = content.count("loading")
+                    dependency_count = len(page.get("data_dependencies") or [])
+                    if dependency_count == 0 and loading_hits > 0:
+                        issues.append(f"{file_path} still uses loading-first copy even though the page has no declared data dependencies.")
+                    if loading_hits >= 3 and len(content) < 2500:
+                        issues.append(f"{file_path} is dominated by loading copy instead of real page content.")
+                    if any(token in content for token in ("placeholder", "coming soon", "todo", "tbd")):
+                        issues.append(f"{file_path} still contains placeholder copy.")
         return issues
 
     @staticmethod

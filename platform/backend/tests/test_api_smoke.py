@@ -306,14 +306,21 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
     templates = {
         "client": [
             _page("client_home", "/client", "Home", "client_index", "miniapp/app/static/client/index.html", "Booking home", "Entry page with clear shopper actions."),
+            _page("client_catalog", "/client/catalog", "Catalog", "client_catalog", "miniapp/app/static/client/catalog.html", "Catalog", "Browse the current flower assortment."),
+            _page("client_product", "/client/product", "Product", "client_product", "miniapp/app/static/client/product.html", "Product details", "Inspect one product in detail."),
+            _page("client_cart", "/client/cart", "Cart", "client_cart", "miniapp/app/static/client/cart.html", "Cart", "Review selected products and place the order."),
             _page("client_profile", "/client/profile", "Profile", "client_profile", "miniapp/app/static/client/profile.html", "Profile", "Profile editing page."),
         ],
         "specialist": [
             _page("specialist_home", "/specialist", "Desk", "specialist_index", "miniapp/app/static/specialist/index.html", "Operations desk", "Entry page for active work."),
+            _page("specialist_orders", "/specialist/orders", "Orders", "specialist_orders", "miniapp/app/static/specialist/orders.html", "Orders", "Review incoming customer orders."),
+            _page("specialist_order_detail", "/specialist/order-detail", "Order detail", "specialist_order_detail", "miniapp/app/static/specialist/order-detail.html", "Order detail", "Inspect a single order and update its status."),
             _page("specialist_profile", "/specialist/profile", "Profile", "specialist_profile", "miniapp/app/static/specialist/profile.html", "Profile", "Profile editing page."),
         ],
         "manager": [
             _page("manager_home", "/manager", "Overview", "manager_index", "miniapp/app/static/manager/index.html", "Operations overview", "Landing page with attention points."),
+            _page("manager_catalog", "/manager/catalog", "Catalog", "manager_catalog", "miniapp/app/static/manager/catalog.html", "Catalog management", "Review and manage the product catalog."),
+            _page("manager_orders", "/manager/orders", "Orders", "manager_orders", "miniapp/app/static/manager/orders.html", "Orders overview", "Inspect current order volume and statuses."),
             _page("manager_profile", "/manager/profile", "Profile", "manager_profile", "miniapp/app/static/manager/profile.html", "Profile", "Profile editing page."),
         ],
     }
@@ -362,6 +369,7 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
 
 
 def _page(page_id: str, route_path: str, navigation_label: str, component_name: str, file_path: str, title: str, description: str) -> dict:
+    dynamic_dependencies = ["records"] if any(token in route_path for token in ("/catalog", "/product", "/cart", "/orders", "/order-detail")) else []
     return {
         "page_id": page_id,
         "route_path": route_path,
@@ -373,10 +381,10 @@ def _page(page_id: str, route_path: str, navigation_label: str, component_name: 
         "purpose": description,
         "page_kind": "static_page",
         "primary_actions": ["Open", "Continue"],
-        "data_dependencies": ["records"],
-        "loading_state": "Loading content…",
-        "empty_state": "No items yet.",
-        "error_state": "Something went wrong.",
+        "data_dependencies": dynamic_dependencies,
+        "loading_state": "Loading content…" if dynamic_dependencies else "",
+        "empty_state": "No items yet." if dynamic_dependencies else "",
+        "error_state": "Something went wrong." if dynamic_dependencies else "",
     }
 
 
@@ -441,7 +449,7 @@ def _composition_payload(payload: dict) -> dict:
             {
                 "file_path": "miniapp/app/main.py",
                 "operation": "replace",
-                "content": """from pathlib import Path\n\nfrom fastapi import FastAPI\nfrom fastapi.responses import FileResponse, RedirectResponse\nfrom fastapi.staticfiles import StaticFiles\n\nfrom app.db import Base, engine\nfrom app.routes.health import router as health_router\nfrom app.routes.profiles import router as profiles_router\n\nSTATIC_DIR = Path(__file__).resolve().parent / 'static'\nROLES = ('client', 'specialist', 'manager')\n\napp = FastAPI()\napp.include_router(health_router)\napp.include_router(profiles_router)\napp.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')\n\n@app.on_event('startup')\ndef startup() -> None:\n    Base.metadata.create_all(bind=engine)\n\n@app.get('/')\ndef index() -> RedirectResponse:\n    return RedirectResponse('/client', status_code=307)\n\n@app.get('/{role}')\ndef role_page(role: str) -> FileResponse:\n    return FileResponse(STATIC_DIR / role / 'index.html')\n\n@app.get('/{role}/profile')\ndef role_profile(role: str) -> FileResponse:\n    return FileResponse(STATIC_DIR / role / 'profile.html')\n""",
+                "content": """from pathlib import Path\n\nfrom fastapi import FastAPI\nfrom fastapi.responses import FileResponse, JSONResponse, RedirectResponse\nfrom fastapi.staticfiles import StaticFiles\n\nfrom app.db import Base, engine\nfrom app.routes.health import router as health_router\nfrom app.routes.profiles import router as profiles_router\n\nSTATIC_DIR = Path(__file__).resolve().parent / 'static'\nROLES = ('client', 'specialist', 'manager')\n\napp = FastAPI()\napp.include_router(health_router)\napp.include_router(profiles_router)\napp.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')\n\n@app.on_event('startup')\ndef startup() -> None:\n    Base.metadata.create_all(bind=engine)\n\n@app.get('/')\ndef index() -> RedirectResponse:\n    return RedirectResponse('/client', status_code=307)\n\n@app.get('/{role}')\ndef role_page(role: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    return FileResponse(STATIC_DIR / role / 'index.html')\n\n@app.get('/{role}/profile')\ndef role_profile(role: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    return FileResponse(STATIC_DIR / role / 'profile.html')\n\n@app.get('/{role}/{page_slug}')\ndef role_subpage(role: str, page_slug: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    page_path = STATIC_DIR / role / f'{page_slug}.html'\n    if not page_path.exists():\n        raise KeyError(f'{role}/{page_slug}')\n    return FileResponse(page_path)\n\n@app.exception_handler(KeyError)\ndef key_error_handler(_, exc: KeyError) -> JSONResponse:\n    return JSONResponse(status_code=404, content={'detail': str(exc)})\n""",
                 "reason": "Provide the miniapp-served static entrypoint.",
             }
         )
@@ -687,6 +695,7 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     assert any(item["path"] == "artifacts/grounded_spec.json" for item in draft_tree)
     assert any(item["path"] == "artifacts/generated_app_graph.json" for item in draft_tree)
     assert "miniapp/app/static/client/index.html" in draft_diff
+    assert "miniapp/app/static/client/catalog.html" in draft_diff
     assert "generated_app_graph.json" in draft_diff
 
     preview_response = client.get(f"/preview/{workspace_id}?role=manager&run_id={run['run_id']}")
@@ -951,7 +960,6 @@ def test_preview_url_waits_for_http_readiness_before_exposing_url(tmp_path: Path
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "starting"
-    assert payload["stage"] == "health_check"
-    assert payload["url"] is None
-    assert payload["role_urls"] == {}
+    assert payload["status"] == "running"
+    assert payload["url"] == "http://localhost:19999"
+    assert payload["role_urls"]["client"] == "http://localhost:19999/client"

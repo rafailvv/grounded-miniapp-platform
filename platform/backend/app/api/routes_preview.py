@@ -31,10 +31,10 @@ def reset_preview(workspace_id: str, container: ServiceContainer = Depends(get_c
 
 @router.get("/workspaces/{workspace_id}/preview/url")
 def get_preview_url(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
-    preview = container.preview_service.get(workspace_id)
+    preview = container.preview_service.peek(workspace_id)
     return {
         "url": preview.url,
-        "role_urls": container.preview_service.role_urls(workspace_id),
+        "role_urls": container.preview_service.role_urls_from_preview(preview),
         "runtime_mode": preview.runtime_mode,
         "status": preview.status,
         "stage": preview.stage,
@@ -47,7 +47,7 @@ def get_preview_url(workspace_id: str, container: ServiceContainer = Depends(get
 
 @router.get("/workspaces/{workspace_id}/preview/logs")
 def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
-    preview = container.preview_service.get(workspace_id)
+    preview = container.preview_service.peek(workspace_id)
     container_logs: dict[str, list[str]] = {}
     if preview.runtime_mode == "docker" and preview.proxy_port is not None:
         source_dir = (
@@ -62,7 +62,7 @@ def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(ge
 @router.get("/workspaces/{workspace_id}/logs")
 def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
     job = container.generation_service.latest_job_for_workspace(workspace_id)
-    preview = container.preview_service.get(workspace_id)
+    preview = container.preview_service.peek(workspace_id)
     platform_log = container.workspace_log_service.read_lines(workspace_id, kind="platform")
     api_log = container.workspace_log_service.read_lines(workspace_id, kind="api")
     container_logs: dict[str, list[str]] = {}
