@@ -1644,7 +1644,7 @@ button:disabled {
 
 .run-details-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 10px;
 }
 
@@ -1659,12 +1659,27 @@ button:disabled {
 .run-detail-card {
   display: grid;
   gap: 5px;
+  min-width: 0;
+  align-content: start;
 }
 
 .run-detail-card span,
 .run-detail-item-top span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.run-detail-card strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.2;
+}
+
+@media (min-width: 900px) {
+  .run-detail-card-wide {
+    grid-column: span 2;
+  }
 }
 
 .run-detail-section {

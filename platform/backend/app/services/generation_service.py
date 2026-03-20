@@ -758,6 +758,8 @@ class GenerationService:
 
         self._append_event(job, "editing_started", "Generating draft file edits.")
         edit_result = self._resolve_code_edits(
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
             prompt=effective_prompt,
             grounded_spec=grounded_spec,
             role_scope=role_scope,
@@ -782,6 +784,26 @@ class GenerationService:
                 event_type="validation_failed",
                 failure_reason=edit_result["error"],
             )
+        if edit_result.get("planner_contract_gap_targets"):
+            added_targets = list(edit_result["planner_contract_gap_targets"])
+            self._append_event(
+                job,
+                "planner_contract_gap_detected",
+                "Frontend/backend contract gap was detected and backend targets were expanded before composition.",
+                {"added_targets": added_targets},
+            )
+            self._append_event(
+                job,
+                "scope_expanded",
+                "Expanded planned targets to cover missing backend contract files.",
+                {"added_targets": added_targets},
+            )
+            plan_result["target_files"] = list(edit_result.get("effective_target_files") or plan_result["target_files"])
+            plan_result["backend_targets"] = list(dict.fromkeys([*(plan_result.get("backend_targets") or []), *added_targets]))
+        for metric_key, metric_value in (edit_result.get("latency_breakdown") or {}).items():
+            job.latency_breakdown[metric_key] = int(metric_value)
+        for trace_stage, payload in (edit_result.get("trace_payloads") or {}).items():
+            self._append_trace(workspace_id, trace_stage, payload["message"], payload["payload"])
         edit_gate_issues = self._edit_gate_issues(
             plan_result["page_graph"],
             edit_result["operations"],
@@ -852,7 +874,10 @@ class GenerationService:
         latest_preview = self.preview_service.get(workspace_id)
         latest_assistant_message = edit_result["assistant_message"]
         repair_attempt_limit = self._repair_attempt_limit(generation_mode, request.intent)
-        repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, plan_result["target_files"])
+        active_repair_targets = list(plan_result["target_files"])
+        repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, active_repair_targets)
+        failure_signature_history: list[str] = []
+        expanded_failure_signatures: set[str] = set()
 
         for attempt in range(repair_attempt_limit + 1):
             stopped = self._stop_if_requested(job, workspace_id, should_stop)
@@ -895,8 +920,20 @@ class GenerationService:
                 job,
                 "checks_completed",
                 "Checks completed." if not failed_checks else f"Checks completed with failures: {', '.join(failed_checks)}.",
-                {"failed_checks": failed_checks, "attempt": attempt},
+                {
+                    "failed_checks": failed_checks,
+                    "attempt": attempt,
+                    "failure_signature": self._failure_signature_for_issues(build_issues, preview_issue),
+                },
             )
+            preview_check = next((item for item in latest_check_results if item.name == "preview_boot_smoke"), None)
+            if preview_check is not None and preview_check.status == "skipped" and "validator/build checks already failed" in (preview_check.details or "").lower():
+                self._append_event(
+                    job,
+                    "preview_skipped_due_to_build_failure",
+                    "Preview smoke was skipped because validator/build checks already failed.",
+                    {"attempt": attempt},
+                )
             iteration = RunIterationRecord(
                 run_id=draft_run_id,
                 assistant_message=latest_assistant_message,
@@ -978,7 +1015,67 @@ class GenerationService:
                 job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
                 return job
 
+            failure_signature = self._failure_signature_for_issues(build_issues, preview_issue)
+            structural_failure = self._is_structural_contract_failure(build_issues)
+            causal_surface = self._causal_surface_for_issues(
+                build_issues=build_issues,
+                check_results=latest_check_results,
+                active_targets=active_repair_targets,
+            )
+            repeated_signature_count = failure_signature_history.count(failure_signature)
+            touched_paths = {operation.file_path for operation in latest_operations}
+            if structural_failure and repeated_signature_count >= 1 and failure_signature not in expanded_failure_signatures:
+                expanded_targets, added_targets = self._expand_structural_repair_targets(
+                    active_targets=active_repair_targets,
+                    build_issues=build_issues,
+                )
+                if added_targets:
+                    active_repair_targets = expanded_targets
+                    repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, active_repair_targets)
+                    expanded_failure_signatures.add(failure_signature)
+                    self._append_event(
+                        job,
+                        "repair_scope_expanded",
+                        "Repair scope expanded to include missing backend contract files.",
+                        {
+                            "attempt": attempt,
+                            "failure_signature": failure_signature,
+                            "added_targets": added_targets,
+                        },
+                    )
+            if repeated_signature_count >= 2 and touched_paths.isdisjoint(causal_surface):
+                issues = [issue.model_dump(mode="json") for issue in build_issues]
+                if preview_issue is not None:
+                    issues.append(preview_issue.model_dump(mode="json"))
+                job.status = "failed"
+                job.failure_reason = "Repair loop aborted because the same failure signature repeated without touching the causal surface."
+                job.failure_class = "repair_repeated_signature"
+                job.root_cause_summary = self._summarize_failed_checks(build_issues, preview_issue) or failure_signature
+                job.fix_targets = sorted(causal_surface)
+                job.validation_snapshot = ValidationSnapshot(grounded_spec_valid=True, app_ir_valid=True, build_valid=False, blocking=True, issues=issues)
+                self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
+                self._append_event(
+                    job,
+                    "repair_repeated_signature_aborted",
+                    "Repair loop aborted because the same failure repeated without changing the causal files.",
+                    {
+                        "attempt": attempt,
+                        "failure_signature": failure_signature,
+                        "causal_surface": sorted(causal_surface),
+                    },
+                )
+                self._append_event(job, "job_failed", job.failure_reason)
+                job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
+                return job
+            failure_signature_history.append(failure_signature)
             self._append_event(job, "repair_started", "Build or compile checks failed. Preparing the next repair attempt.")
+            repair_target_files = self._repair_targets_for_attempt(
+                active_targets=active_repair_targets,
+                check_results=latest_check_results,
+                attempt=attempt + 1,
+                causal_surface=causal_surface,
+            )
+            repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, repair_target_files)
             repair_result = self._repair_draft_after_failure(
                 workspace_id=workspace_id,
                 draft_run_id=draft_run_id,
@@ -988,7 +1085,7 @@ class GenerationService:
                 role_contract=role_contract,
                 page_graph=plan_result["page_graph"],
                 scope_mode=plan_result["scope_mode"],
-                target_files=plan_result["target_files"],
+                target_files=repair_target_files,
                 file_contexts=repair_contexts,
                 build_issues=build_issues,
                 preview_issue=preview_issue,
@@ -1061,7 +1158,7 @@ class GenerationService:
                 self._append_event(job, "job_failed", job.failure_reason)
                 job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
                 return job
-            repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, plan_result["target_files"])
+            repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, active_repair_targets)
             stopped = self._stop_if_requested(job, workspace_id, should_stop)
             if stopped is not None:
                 return stopped
@@ -1228,6 +1325,7 @@ class GenerationService:
         try:
             workspace_tree = self.workspace_service.file_tree(workspace_id)
             payload = self._generate_code_plan_sections(
+                workspace_id=workspace_id,
                 prompt=prompt,
                 grounded_spec=grounded_spec,
                 doc_refs=doc_refs,
@@ -1255,6 +1353,7 @@ class GenerationService:
     def _generate_code_plan_sections(
         self,
         *,
+        workspace_id: str,
         prompt: str,
         grounded_spec: GroundedSpecModel,
         doc_refs: list[Any],
@@ -1266,55 +1365,72 @@ class GenerationService:
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
-        graph_payload = self._generate_structured_with_retry(
-            role="code_plan",
-            schema_name="page_graph_structure_v1",
-            schema=self._code_plan_partial_schema(["summary", "flow_mode", "page_graph"]),
-            system_prompt=self._code_plan_section_system_prompt("Page graph and route structure"),
-            user_prompt=self._code_plan_section_user_prompt(
-                section_id="graph",
-                section_title="Page graph and route structure",
-                section_contract=[
-                    "Return the real page graph, role routes, and page definitions.",
-                    "Keep role surfaces distinct and multi-page when required.",
-                    "Do not decide final file-read lists in this section.",
-                ],
-                prompt=prompt,
-                grounded_spec=grounded_spec,
-                doc_refs=doc_refs,
-                role_scope=role_scope,
-                role_contract=role_contract,
-                scope_mode=scope_mode,
-                require_multi_page=require_multi_page,
-                workspace_tree=workspace_tree,
-                generation_mode=generation_mode,
-                creative_direction=creative_direction,
-            ),
-        )
-        targeting_payload = self._generate_structured_with_retry(
-            role="code_plan",
-            schema_name="page_graph_targeting_v1",
-            schema=self._code_plan_partial_schema(["files_to_read", "target_files", "shared_files", "backend_targets"]),
-            system_prompt=self._code_plan_section_system_prompt("File targeting and read set"),
-            user_prompt=self._code_plan_section_user_prompt(
-                section_id="targeting",
-                section_title="File targeting and read set",
-                section_contract=[
-                    "Return only read-set and file-target lists.",
-                    "Target files must stay minimal for minimal_patch requests.",
-                    "Use the page graph implied by the request and role contract, but do not re-emit full page definitions.",
-                ],
-                prompt=prompt,
-                grounded_spec=grounded_spec,
-                doc_refs=doc_refs,
-                role_scope=role_scope,
-                role_contract=role_contract,
-                scope_mode=scope_mode,
-                require_multi_page=require_multi_page,
-                workspace_tree=workspace_tree,
-                generation_mode=generation_mode,
-                creative_direction=creative_direction,
-            ),
+        sections_started = time.perf_counter()
+
+        async def build_sections() -> tuple[dict[str, Any], dict[str, Any]]:
+            graph_task = asyncio.to_thread(
+                self._generate_structured_with_retry,
+                role="code_plan",
+                schema_name="page_graph_structure_v1",
+                schema=self._code_plan_partial_schema(["summary", "flow_mode", "page_graph"]),
+                system_prompt=self._code_plan_section_system_prompt("Page graph and route structure"),
+                user_prompt=self._code_plan_section_user_prompt(
+                    section_id="graph",
+                    section_title="Page graph and route structure",
+                    section_contract=[
+                        "Return the real page graph, role routes, and page definitions.",
+                        "Keep role surfaces distinct and multi-page when required.",
+                        "Do not decide final file-read lists in this section.",
+                    ],
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    doc_refs=doc_refs,
+                    role_scope=role_scope,
+                    role_contract=role_contract,
+                    scope_mode=scope_mode,
+                    require_multi_page=require_multi_page,
+                    workspace_tree=workspace_tree,
+                    generation_mode=generation_mode,
+                    creative_direction=creative_direction,
+                ),
+            )
+            targeting_task = asyncio.to_thread(
+                self._generate_structured_with_retry,
+                role="code_plan",
+                schema_name="page_graph_targeting_v1",
+                schema=self._code_plan_partial_schema(["files_to_read", "target_files", "shared_files", "backend_targets"]),
+                system_prompt=self._code_plan_section_system_prompt("File targeting and read set"),
+                user_prompt=self._code_plan_section_user_prompt(
+                    section_id="targeting",
+                    section_title="File targeting and read set",
+                    section_contract=[
+                        "Return only read-set and file-target lists.",
+                        "Target files must stay minimal for minimal_patch requests.",
+                        "Use the page graph implied by the request and role contract, but do not re-emit full page definitions.",
+                    ],
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    doc_refs=doc_refs,
+                    role_scope=role_scope,
+                    role_contract=role_contract,
+                    scope_mode=scope_mode,
+                    require_multi_page=require_multi_page,
+                    workspace_tree=workspace_tree,
+                    generation_mode=generation_mode,
+                    creative_direction=creative_direction,
+                ),
+            )
+            return await asyncio.gather(graph_task, targeting_task)
+
+        graph_payload, targeting_payload = asyncio.run(build_sections())
+        self._append_trace(
+            workspace_id,
+            "code_plan_sections_parallel",
+            "Code plan graph and targeting sections completed in parallel.",
+            {
+                "duration_ms": int((time.perf_counter() - sections_started) * 1000),
+                "sections": ["graph", "targeting"],
+            },
         )
         merged_payload = {
             **self._normalize_model_payload(graph_payload["payload"]),
@@ -1329,6 +1445,8 @@ class GenerationService:
     def _resolve_code_edits(
         self,
         *,
+        workspace_id: str,
+        draft_run_id: str,
         prompt: str,
         grounded_spec: GroundedSpecModel,
         role_scope: list[str],
@@ -1346,6 +1464,8 @@ class GenerationService:
         page_messages: list[str] = []
         generated_page_sources: dict[str, str] = {}
         generated_backend_sources: dict[str, str] = {}
+        trace_payloads: dict[str, dict[str, Any]] = {}
+        latency_breakdown: dict[str, int] = {}
         selected_pages = self._selected_pages_for_edit(page_graph, target_set)
 
         if len(selected_pages) <= 1:
@@ -1410,48 +1530,90 @@ class GenerationService:
                 generated_page_sources[operation.file_path] = operation.content
             page_messages.append(page_result["assistant_message"])
 
-        backend_targets = self._backend_target_files(page_graph, target_set)
-        backend_result = self._resolve_composition_edit(
-            prompt=prompt,
-            grounded_spec=grounded_spec,
-            role_scope=role_scope,
-            role_contract=role_contract,
-            page_graph=page_graph,
-            scope_mode=scope_mode,
-            intent=intent,
-            stage_name="backend",
-            target_files=backend_targets,
-            file_contexts=file_contexts,
+        effective_target_files = list(target_files)
+        backend_targets = self._backend_composition_targets(target_files, selected_pages)
+        contract_gap_targets = self._detect_missing_backend_contract_targets(
             generated_page_sources=generated_page_sources,
-            generated_support_sources={},
-            generation_mode=generation_mode,
-            creative_direction=creative_direction,
+            current_target_files=effective_target_files,
+            backend_targets=backend_targets,
         )
-        if "error" in backend_result:
-            return backend_result
-        for operation in backend_result["operations"]:
-            if operation.content is not None:
-                generated_backend_sources[operation.file_path] = operation.content
+        if contract_gap_targets:
+            effective_target_files = list(dict.fromkeys([*effective_target_files, *contract_gap_targets]))
+            backend_targets = list(dict.fromkeys([*backend_targets, *contract_gap_targets]))
+            for file_path in contract_gap_targets:
+                if file_path in file_contexts:
+                    continue
+                try:
+                    file_contexts[file_path] = self.workspace_service.read_file(workspace_id, file_path, run_id=draft_run_id)
+                except FileNotFoundError:
+                    continue
 
-        frontend_targets = self._frontend_target_files(page_graph, target_set)
-        frontend_result = self._resolve_composition_edit(
-            prompt=prompt,
-            grounded_spec=grounded_spec,
-            role_scope=role_scope,
-            role_contract=role_contract,
-            page_graph=page_graph,
-            scope_mode=scope_mode,
-            intent=intent,
-            stage_name="frontend",
-            target_files=frontend_targets,
-            file_contexts=file_contexts,
-            generated_page_sources=generated_page_sources,
-            generated_support_sources=generated_backend_sources,
-            generation_mode=generation_mode,
-            creative_direction=creative_direction,
+        frontend_targets = self._frontend_composition_targets(target_files, selected_pages)
+        frontend_bootstrap_targets, frontend_routing_targets = self._partition_frontend_composition_targets(
+            frontend_targets,
+            page_graph,
         )
-        if "error" in frontend_result:
-            return frontend_result
+        composition_clusters: list[tuple[str, str, list[str]]] = []
+        if backend_targets:
+            composition_clusters.append(("composition_backend", "backend", backend_targets))
+        if frontend_bootstrap_targets:
+            composition_clusters.append(("composition_frontend_bootstrap", "frontend", frontend_bootstrap_targets))
+        if frontend_routing_targets:
+            composition_clusters.append(("composition_frontend_routing", "frontend", frontend_routing_targets))
+
+        if composition_clusters:
+            async def resolve_clusters() -> list[dict[str, Any]]:
+                tasks = [
+                    asyncio.to_thread(
+                        self._timed_composition_cluster,
+                        cluster_name=cluster_name,
+                        prompt=prompt,
+                        grounded_spec=grounded_spec,
+                        role_scope=role_scope,
+                        role_contract=role_contract,
+                        page_graph=page_graph,
+                        scope_mode=scope_mode,
+                        intent=intent,
+                        stage_name=stage_name,
+                        target_files=cluster_targets,
+                        file_contexts=file_contexts,
+                        generated_page_sources=generated_page_sources,
+                        generated_support_sources={},
+                        generation_mode=generation_mode,
+                        creative_direction=creative_direction,
+                    )
+                    for cluster_name, stage_name, cluster_targets in composition_clusters
+                ]
+                return await asyncio.gather(*tasks)
+
+            composition_results = asyncio.run(resolve_clusters())
+        else:
+            composition_results = []
+
+        frontend_messages: list[str] = []
+        for result in composition_results:
+            if "error" in result:
+                return result
+            cluster_name = str(result["cluster_name"])
+            duration_ms = int(result["duration_ms"])
+            latency_breakdown[cluster_name] = duration_ms
+            trace_payloads[cluster_name] = {
+                "message": f"{cluster_name.replace('_', ' ').capitalize()} completed.",
+                "payload": {
+                    "duration_ms": duration_ms,
+                    "target_files": result["target_files"],
+                    "operation_count": len(result["operations"]),
+                },
+            }
+            if cluster_name == "composition_backend":
+                for operation in result["operations"]:
+                    if operation.content is not None:
+                        generated_backend_sources[operation.file_path] = operation.content
+            if str(result.get("assistant_message") or "").strip():
+                if cluster_name == "composition_backend":
+                    page_messages.append(str(result["assistant_message"]).strip())
+                else:
+                    frontend_messages.append(str(result["assistant_message"]).strip())
 
         operations = self._dedupe_operations(
             [
@@ -1462,19 +1624,28 @@ class GenerationService:
                     reason="Persist the LLM-generated page graph for validation, preview, and run artifacts.",
                 ),
                 *page_operations,
-                *backend_result["operations"],
-                *frontend_result["operations"],
+                *[operation for result in composition_results for operation in result["operations"]],
             ]
         )
         assistant_parts = [message for message in page_messages if message]
-        if backend_result["assistant_message"]:
-            assistant_parts.append(backend_result["assistant_message"])
-        if frontend_result["assistant_message"]:
-            assistant_parts.append(frontend_result["assistant_message"])
+        assistant_parts.extend(frontend_messages)
         assistant_message = " ".join(assistant_parts).strip() or (
             f"Generated {len(page_operations)} page files and composed backend then frontend wiring for a {scope_mode} run."
         )
-        return {"assistant_message": assistant_message, "operations": operations}
+        if any(key.startswith("composition_frontend") for key in latency_breakdown):
+            latency_breakdown["composition_frontend_ms"] = sum(
+                value for key, value in latency_breakdown.items() if key.startswith("composition_frontend")
+            )
+        if "composition_backend" in latency_breakdown:
+            latency_breakdown["composition_backend_ms"] = latency_breakdown["composition_backend"]
+        return {
+            "assistant_message": assistant_message,
+            "operations": operations,
+            "planner_contract_gap_targets": contract_gap_targets,
+            "effective_target_files": effective_target_files,
+            "latency_breakdown": latency_breakdown,
+            "trace_payloads": trace_payloads,
+        }
 
     @staticmethod
     def _normalize_path_list(value: Any, fallback: list[str] | None = None) -> list[str]:
@@ -2442,8 +2613,8 @@ class GenerationService:
         compact = generation_mode == GenerationMode.FAST
         trimmed_targets = self._bounded_file_contexts(
             {path: file_contexts.get(path, "") for path in target_files},
-            max_file_chars=4000 if compact else 9000,
-            max_total_chars=12000 if compact else 26000,
+            max_file_chars=3000 if compact else 5200,
+            max_total_chars=9000 if compact else 16000,
         )
         return json_dumps(
             {
@@ -2453,25 +2624,25 @@ class GenerationService:
                 "stage_name": stage_name,
                 "scope_mode": scope_mode,
                 "role_scope": role_scope,
-                "role_contract": role_contract,
-                "page_graph": page_graph,
+                "role_contract": self._compact_role_contract_for_codegen(role_contract, role_scope),
+                "page_graph": self._compact_page_graph_for_codegen(page_graph, role_scope),
                 "target_files": target_files,
                 "workspace_path_hints": {
                     "target_roots": sorted({path.split("/", 1)[0] for path in target_files if "/" in path}),
-                    "target_examples": target_files[:20],
-                    "existing_file_context_paths": sorted(file_contexts.keys())[:20],
+                    "target_examples": target_files[:12],
+                    "existing_file_context_paths": sorted(file_contexts.keys())[:12],
                 },
                 "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
                 "file_contexts": trimmed_targets,
                 "generated_page_sources": self._bounded_file_contexts(
                     generated_page_sources,
-                    max_file_chars=2800 if compact else 7000,
-                    max_total_chars=7200 if compact else 18000,
+                    max_file_chars=2200 if compact else 3600,
+                    max_total_chars=5600 if compact else 11000,
                 ),
                 "generated_support_sources": self._bounded_file_contexts(
                     generated_support_sources,
-                    max_file_chars=2200 if compact else 5000,
-                    max_total_chars=5200 if compact else 12000,
+                    max_file_chars=1600 if compact else 2800,
+                    max_total_chars=3600 if compact else 7200,
                 ),
                 "creative_direction": creative_direction,
                 "rules": [
@@ -2699,6 +2870,51 @@ class GenerationService:
         assert last_error is not None
         return {"error": f"Composition step failed: {last_error}"}
 
+    def _timed_composition_cluster(
+        self,
+        *,
+        cluster_name: str,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        page_graph: dict[str, Any],
+        scope_mode: str,
+        intent: str,
+        stage_name: str,
+        target_files: list[str],
+        file_contexts: dict[str, str],
+        generated_page_sources: dict[str, str],
+        generated_support_sources: dict[str, str],
+        generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = self._resolve_composition_edit(
+            prompt=prompt,
+            grounded_spec=grounded_spec,
+            role_scope=role_scope,
+            role_contract=role_contract,
+            page_graph=page_graph,
+            scope_mode=scope_mode,
+            intent=intent,
+            stage_name=stage_name,
+            target_files=target_files,
+            file_contexts=file_contexts,
+            generated_page_sources=generated_page_sources,
+            generated_support_sources=generated_support_sources,
+            generation_mode=generation_mode,
+            creative_direction=creative_direction,
+        )
+        if "error" in result:
+            return result
+        return {
+            **result,
+            "cluster_name": cluster_name,
+            "target_files": target_files,
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
+
     @staticmethod
     def _selected_pages_for_edit(page_graph: dict[str, Any], target_files: set[str]) -> list[tuple[str, dict[str, Any]]]:
         selected: list[tuple[str, dict[str, Any]]] = []
@@ -2713,24 +2929,84 @@ class GenerationService:
         return selected
 
     @staticmethod
-    def _backend_target_files(page_graph: dict[str, Any], target_files: set[str]) -> list[str]:
-        ordered = [path for path in (page_graph.get("backend_targets") or []) if isinstance(path, str)]
-        if not target_files:
-            return list(dict.fromkeys(ordered))
-        return [path for path in dict.fromkeys(ordered) if path in target_files]
+    def _backend_composition_targets(target_files: list[str], selected_pages: list[tuple[str, dict[str, Any]]]) -> list[str]:
+        page_paths = {
+            str(page.get("file_path"))
+            for _, page in selected_pages
+            if isinstance(page.get("file_path"), str)
+        }
+        ordered = [path for path in target_files if path.startswith("backend/") and path not in page_paths]
+        return list(dict.fromkeys(ordered))
 
     @staticmethod
-    def _frontend_target_files(page_graph: dict[str, Any], target_files: set[str]) -> list[str]:
-        structural_targets = list(page_graph.get("shared_files") or [])
-        structural_targets.extend(
-            role_payload.get("routes_file")
-            for role_payload in (page_graph.get("roles") or {}).values()
-            if isinstance(role_payload, dict)
+    def _frontend_composition_targets(target_files: list[str], selected_pages: list[tuple[str, dict[str, Any]]]) -> list[str]:
+        page_paths = {
+            str(page.get("file_path"))
+            for _, page in selected_pages
+            if isinstance(page.get("file_path"), str)
+        }
+        ordered = [path for path in target_files if path.startswith("frontend/") and path not in page_paths]
+        return list(dict.fromkeys(ordered))
+
+    @staticmethod
+    def _partition_frontend_composition_targets(
+        target_files: list[str],
+        page_graph: dict[str, Any],
+    ) -> tuple[list[str], list[str]]:
+        route_like = {
+            "frontend/src/app/routing/RoleRouter.tsx",
+            *{
+                str(role_payload.get("routes_file"))
+                for role_payload in (page_graph.get("roles") or {}).values()
+                if isinstance(role_payload, dict) and isinstance(role_payload.get("routes_file"), str)
+            },
+        }
+        bootstrap_markers = (
+            "/App.tsx",
+            "/AppShell.tsx",
+            "/resolveRole.ts",
+            "/useAppBootstrap.ts",
+            "/httpClient.ts",
         )
-        ordered = [path for path in structural_targets if isinstance(path, str)]
-        if not target_files:
-            return list(dict.fromkeys(ordered))
-        return [path for path in dict.fromkeys(ordered) if path in target_files]
+        routing_targets: list[str] = []
+        bootstrap_targets: list[str] = []
+        for path in target_files:
+            if path in route_like or path.endswith("Routes.tsx"):
+                routing_targets.append(path)
+                continue
+            if any(path.endswith(marker) for marker in bootstrap_markers):
+                bootstrap_targets.append(path)
+                continue
+            bootstrap_targets.append(path)
+        return list(dict.fromkeys(bootstrap_targets)), list(dict.fromkeys(routing_targets))
+
+    @staticmethod
+    def _detect_missing_backend_contract_targets(
+        *,
+        generated_page_sources: dict[str, str],
+        current_target_files: list[str],
+        backend_targets: list[str],
+    ) -> list[str]:
+        endpoint_names: set[str] = set()
+        for source in generated_page_sources.values():
+            if not isinstance(source, str):
+                continue
+            for match in re.finditer(r"['\"](/api/([a-zA-Z0-9_-]+))([/'\"?]|$)", source):
+                endpoint_names.add(match.group(2))
+        if not endpoint_names:
+            return []
+        existing_targets = set(current_target_files) | set(backend_targets)
+        inferred: list[str] = []
+        router_path = "backend/app/api/router.py"
+        for endpoint_name in sorted(endpoint_names):
+            if endpoint_name in {"health", "profiles"}:
+                continue
+            inferred_path = f"backend/app/api/routes/{endpoint_name}.py"
+            if inferred_path not in existing_targets:
+                inferred.append(inferred_path)
+            if router_path not in existing_targets:
+                inferred.append(router_path)
+        return list(dict.fromkeys(inferred))
 
     @staticmethod
     def _dedupe_operations(operations: list[DraftFileOperation]) -> list[DraftFileOperation]:
@@ -3029,6 +3305,12 @@ class GenerationService:
         preview_logs: list[str],
         attempt: int,
     ) -> str:
+        compact_target_files = target_files[:10]
+        compact_file_contexts = self._compact_file_contexts_for_repair(
+            file_contexts,
+            max_file_chars=2200,
+            max_total_chars=9000,
+        )
         return json_dumps(
             {
                 "task": "Repair build or preview failures in the generated draft",
@@ -3036,14 +3318,18 @@ class GenerationService:
                 "prompt": prompt,
                 "role_scope": role_scope,
                 "scope_mode": scope_mode,
-                "target_files": target_files,
-                "grounded_spec": grounded_spec.model_dump(mode="json"),
-                "role_contract": role_contract,
-                "page_graph": page_graph,
-                "file_contexts": file_contexts,
+                "target_files": compact_target_files,
+                "grounded_spec": {
+                    "product_goal": grounded_spec.product_goal,
+                    "api_requirements": [item.model_dump(mode="json") for item in grounded_spec.api_requirements[:6]],
+                    "assumptions": [item.model_dump(mode="json") for item in grounded_spec.assumptions[:4]],
+                },
+                "role_contract": self._compact_role_contract_for_codegen(role_contract, role_scope),
+                "page_graph": self._compact_page_graph_for_codegen(page_graph, role_scope),
+                "file_contexts": compact_file_contexts,
                 "build_issues": [issue.model_dump(mode="json") for issue in build_issues],
                 "preview_issue": preview_issue.model_dump(mode="json") if preview_issue is not None else None,
-                "preview_logs": preview_logs[-10:],
+                "preview_logs": preview_logs[-6:],
                 "rules": [
                     "Fix only the concrete build/preview failures.",
                     "Prefer editing the existing generated files instead of creating new architecture.",
@@ -3164,6 +3450,160 @@ class GenerationService:
             "platform_constraints": [item.model_dump(mode="json") for item in grounded_spec.platform_constraints[:6]],
             "assumptions": [item.model_dump(mode="json") for item in grounded_spec.assumptions[:6]],
         }
+
+    @staticmethod
+    def _compact_role_contract_for_codegen(role_contract: dict[str, Any], role_scope: list[str]) -> dict[str, Any]:
+        roles = role_contract.get("roles") or {}
+        return {
+            "app_title": role_contract.get("app_title"),
+            "app_summary": role_contract.get("app_summary"),
+            "roles": {
+                role: {
+                    "responsibility": (roles.get(role) or {}).get("responsibility"),
+                    "primary_jobs": list(((roles.get(role) or {}).get("primary_jobs") or [])[:4]),
+                }
+                for role in role_scope
+                if role in roles
+            },
+        }
+
+    @staticmethod
+    def _compact_page_graph_for_codegen(page_graph: dict[str, Any], role_scope: list[str]) -> dict[str, Any]:
+        roles = page_graph.get("roles") or {}
+        return {
+            "app_title": page_graph.get("app_title"),
+            "summary": page_graph.get("summary"),
+            "flow_mode": page_graph.get("flow_mode"),
+            "shared_files": list((page_graph.get("shared_files") or [])[:8]),
+            "backend_targets": list((page_graph.get("backend_targets") or [])[:8]),
+            "roles": {
+                role: {
+                    "routes_file": (roles.get(role) or {}).get("routes_file"),
+                    "pages": [
+                        {
+                            "page_id": page.get("page_id"),
+                            "route_path": page.get("route_path"),
+                            "file_path": page.get("file_path"),
+                            "page_kind": page.get("page_kind"),
+                        }
+                        for page in ((roles.get(role) or {}).get("pages") or [])[:6]
+                    ],
+                }
+                for role in role_scope
+                if role in roles
+            },
+        }
+
+    @staticmethod
+    def _failure_signature_for_issues(build_issues: list[ValidationIssue], preview_issue: ValidationIssue | None) -> str:
+        signature_parts = [f"{issue.code}:{issue.message.strip().lower()}" for issue in build_issues]
+        if preview_issue is not None:
+            signature_parts.append(f"{preview_issue.code}:{preview_issue.message.strip().lower()}")
+        return " | ".join(sorted(dict.fromkeys(signature_parts))) or "no_failure_signature"
+
+    @staticmethod
+    def _is_structural_contract_failure(build_issues: list[ValidationIssue]) -> bool:
+        markers = (
+            "backend route is missing",
+            "missing endpoint",
+            "expects /api/",
+        )
+        for issue in build_issues:
+            if issue.code in {"check.schema_validators", "build.missing_categories_route"}:
+                return True
+            lowered = issue.message.lower()
+            if any(marker in lowered for marker in markers):
+                return True
+        return False
+
+    @staticmethod
+    def _extract_failure_file_hints(check_results: list[RunCheckResult], allowed_targets: list[str]) -> list[str]:
+        allowed_set = set(allowed_targets)
+        resolved: list[str] = []
+        pattern = re.compile(r"([A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|py))\(")
+        for result in check_results:
+            for line in result.logs:
+                for match in pattern.finditer(line):
+                    candidate = match.group(1)
+                    if candidate in allowed_set:
+                        resolved.append(candidate)
+                        continue
+                    prefixed_candidates = [
+                        path for path in allowed_targets if path.endswith(f"/{candidate}") or path == candidate
+                    ]
+                    if prefixed_candidates:
+                        resolved.append(prefixed_candidates[0])
+        return list(dict.fromkeys(resolved))
+
+    def _causal_surface_for_issues(
+        self,
+        *,
+        build_issues: list[ValidationIssue],
+        check_results: list[RunCheckResult],
+        active_targets: list[str],
+    ) -> set[str]:
+        causal = set(self._extract_failure_file_hints(check_results, active_targets))
+        active_target_set = set(active_targets)
+        for issue in build_issues:
+            if issue.location in active_target_set:
+                causal.add(issue.location)
+            for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", issue.message):
+                endpoint_name = match.group(1)
+                causal.add(f"backend/app/api/routes/{endpoint_name}.py")
+                causal.add("backend/app/api/router.py")
+        return causal or active_target_set
+
+    def _expand_structural_repair_targets(
+        self,
+        *,
+        active_targets: list[str],
+        build_issues: list[ValidationIssue],
+    ) -> tuple[list[str], list[str]]:
+        expanded = list(active_targets)
+        added: list[str] = []
+        for issue in build_issues:
+            for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", issue.message):
+                endpoint_name = match.group(1)
+                for candidate in (f"backend/app/api/routes/{endpoint_name}.py", "backend/app/api/router.py"):
+                    if candidate not in expanded:
+                        expanded.append(candidate)
+                        added.append(candidate)
+        return list(dict.fromkeys(expanded)), list(dict.fromkeys(added))
+
+    def _repair_targets_for_attempt(
+        self,
+        *,
+        active_targets: list[str],
+        check_results: list[RunCheckResult],
+        attempt: int,
+        causal_surface: set[str],
+    ) -> list[str]:
+        hinted_files = self._extract_failure_file_hints(check_results, active_targets)
+        if attempt <= 3:
+            narrowed = [path for path in hinted_files if path in set(active_targets)]
+            if narrowed:
+                return narrowed[:6]
+            narrowed = [path for path in active_targets if path in causal_surface]
+            if narrowed:
+                return narrowed[:8]
+        if attempt <= 5:
+            widened = [path for path in active_targets if path in causal_surface]
+            if widened:
+                return widened[:12]
+        return list(active_targets)
+
+    def _compact_file_contexts_for_repair(
+        self,
+        file_contexts: dict[str, str],
+        *,
+        max_file_chars: int,
+        max_total_chars: int,
+    ) -> dict[str, str]:
+        return self._bounded_file_contexts(
+            file_contexts,
+            max_file_chars=max_file_chars,
+            max_total_chars=max_total_chars,
+        )
 
     @staticmethod
     def _is_retryable_llm_error(error: Exception) -> bool:
@@ -3502,51 +3942,68 @@ class GenerationService:
             "non_functional_requirements",
         ]
         governance_fields = ["assumptions", "unknowns", "contradictions"]
+        sections_started = time.perf_counter()
 
-        core_payload = self._generate_grounded_spec_section(
-            section_id="core",
-            section_title="Core domain and workflow",
-            field_names=core_fields,
-            prompt=prompt,
-            doc_refs=doc_refs,
-            target_platform=target_platform,
-            preview_profile=preview_profile,
-            template_revision_id=template_revision_id,
-            prompt_turn_id=prompt_turn_id,
-            creative_direction=creative_direction,
-            outline=outline,
-            relaxed=relaxed,
-            compact=compact,
-        )
-        requirements_payload = self._generate_grounded_spec_section(
-            section_id="requirements",
-            section_title="Runtime requirements",
-            field_names=requirements_fields,
-            prompt=prompt,
-            doc_refs=doc_refs,
-            target_platform=target_platform,
-            preview_profile=preview_profile,
-            template_revision_id=template_revision_id,
-            prompt_turn_id=prompt_turn_id,
-            creative_direction=creative_direction,
-            outline=outline,
-            relaxed=relaxed,
-            compact=compact,
-        )
-        governance_payload = self._generate_grounded_spec_section(
-            section_id="governance",
-            section_title="Assumptions and gaps",
-            field_names=governance_fields,
-            prompt=prompt,
-            doc_refs=doc_refs,
-            target_platform=target_platform,
-            preview_profile=preview_profile,
-            template_revision_id=template_revision_id,
-            prompt_turn_id=prompt_turn_id,
-            creative_direction=creative_direction,
-            outline=outline,
-            relaxed=relaxed,
-            compact=compact,
+        async def build_sections() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+            core_task = asyncio.to_thread(
+                self._generate_grounded_spec_section,
+                section_id="core",
+                section_title="Core domain and workflow",
+                field_names=core_fields,
+                prompt=prompt,
+                doc_refs=doc_refs,
+                target_platform=target_platform,
+                preview_profile=preview_profile,
+                template_revision_id=template_revision_id,
+                prompt_turn_id=prompt_turn_id,
+                creative_direction=creative_direction,
+                outline=outline,
+                relaxed=relaxed,
+                compact=compact,
+            )
+            requirements_task = asyncio.to_thread(
+                self._generate_grounded_spec_section,
+                section_id="requirements",
+                section_title="Runtime requirements",
+                field_names=requirements_fields,
+                prompt=prompt,
+                doc_refs=doc_refs,
+                target_platform=target_platform,
+                preview_profile=preview_profile,
+                template_revision_id=template_revision_id,
+                prompt_turn_id=prompt_turn_id,
+                creative_direction=creative_direction,
+                outline=outline,
+                relaxed=relaxed,
+                compact=compact,
+            )
+            governance_task = asyncio.to_thread(
+                self._generate_grounded_spec_section,
+                section_id="governance",
+                section_title="Assumptions and gaps",
+                field_names=governance_fields,
+                prompt=prompt,
+                doc_refs=doc_refs,
+                target_platform=target_platform,
+                preview_profile=preview_profile,
+                template_revision_id=template_revision_id,
+                prompt_turn_id=prompt_turn_id,
+                creative_direction=creative_direction,
+                outline=outline,
+                relaxed=relaxed,
+                compact=compact,
+            )
+            return await asyncio.gather(core_task, requirements_task, governance_task)
+
+        core_payload, requirements_payload, governance_payload = asyncio.run(build_sections())
+        self._append_trace(
+            workspace_id,
+            "spec_sections_parallel",
+            "GroundedSpec sections completed in parallel.",
+            {
+                "duration_ms": int((time.perf_counter() - sections_started) * 1000),
+                "sections": ["core", "requirements", "governance"],
+            },
         )
 
         merged_payload = {
@@ -6267,8 +6724,12 @@ class GenerationService:
             "iteration_ready": ("draft edits prepared", 84),
             "repair_started": ("repairing after build failure", 86),
             "repair_iteration": ("repairing draft", 88),
+            "repair_scope_expanded": ("expanding repair scope", 89),
+            "repair_repeated_signature_aborted": ("repair aborted", 100),
             "build_started": ("running validation and build", 90),
             "checks_completed": ("checks complete", 93),
+            "preview_skipped_due_to_build_failure": ("preview skipped until build is green", 91),
+            "planner_contract_gap_detected": ("expanding missing backend contract targets", 72),
             "preview_rebuild_started": ("refreshing preview", 96),
             "preview_ready": ("preview ready", 98),
             "draft_ready": ("awaiting review", 99),

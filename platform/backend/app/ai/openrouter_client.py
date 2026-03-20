@@ -388,6 +388,7 @@ class OpenRouterClient:
         )
 
     def _log_response(self, *, endpoint: str, model: str, response: httpx.Response) -> None:
+        usage_summary = self._extract_usage_summary(response)
         logger.info(
             "LLM response endpoint=%s model=%s status=%s body=%s",
             endpoint,
@@ -403,6 +404,7 @@ class OpenRouterClient:
                 "model": model,
                 "status_code": response.status_code,
                 "body": response.text,
+                "usage": usage_summary,
             },
         )
 
@@ -565,6 +567,7 @@ class OpenRouterClient:
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
     ) -> dict[str, Any]:
+        tuning = self._responses_tuning(role=role, schema_name=schema_name)
         payload = {
             "model": model,
             "input": self._responses_input(
@@ -582,6 +585,7 @@ class OpenRouterClient:
                 }
             },
         }
+        payload.update(tuning)
         cache_control = self._cache_control(model)
         if cache_control is not None:
             payload["cache_control"] = cache_control
@@ -656,6 +660,7 @@ class OpenRouterClient:
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
     ) -> dict[str, Any]:
+        tuning = self._responses_tuning(role=role, schema_name=schema_name)
         payload = {
             "model": model,
             "input": self._responses_input(
@@ -670,6 +675,7 @@ class OpenRouterClient:
                 }
             },
         }
+        payload.update(tuning)
         cache_control = self._cache_control(model)
         if cache_control is not None:
             payload["cache_control"] = cache_control
@@ -694,9 +700,22 @@ class OpenRouterClient:
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                with httpx.Client(timeout=120) as client:
+                started = time.perf_counter()
+                with httpx.Client(timeout=httpx.Timeout(connect=10, read=300, write=60, pool=60)) as client:
                     response = client.post(f"{self.base_url}/{endpoint}", headers=self._headers(), json=payload)
+                    duration_ms = int((time.perf_counter() - started) * 1000)
                     self._log_response(endpoint=endpoint, model=model, response=response)
+                    self._append_workspace_api_log(
+                        source="llm.metrics",
+                        message=f"OpenAI request metrics recorded for {endpoint}.",
+                        payload={
+                            "endpoint": endpoint,
+                            "model": model,
+                            "duration_ms": duration_ms,
+                            "target_file_count": self._extract_target_file_count(payload),
+                            "usage": self._extract_usage_summary(response),
+                        },
+                    )
                     self._raise_for_status(response, endpoint)
                     return response.json()
             except Exception as exc:
@@ -806,6 +825,70 @@ class OpenRouterClient:
             or counters["any_of"] > 12
             or counters["objects"] > 40
         )
+
+    @staticmethod
+    def _responses_tuning(*, role: str, schema_name: str) -> dict[str, Any]:
+        if role == "repair":
+            return {"reasoning": {"effort": "low"}}
+        if role == "code_edit":
+            return {"reasoning": {"effort": "low"}}
+        if role == "code_plan":
+            return {"reasoning": {"effort": "low"}}
+        if role == "spec_analysis":
+            return {"reasoning": {"effort": "low"}}
+        if role == "ir_codegen":
+            return {"reasoning": {"effort": "medium"}}
+        if role == "summarize":
+            return {"reasoning": {"effort": "low"}}
+        return {}
+
+    @staticmethod
+    def _extract_usage_summary(response: httpx.Response) -> dict[str, int] | None:
+        try:
+            payload = response.json()
+        except Exception:
+            return None
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            return None
+        output_details = usage.get("output_tokens_details")
+        if not isinstance(output_details, dict):
+            output_details = {}
+        return {
+            "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+            "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+        }
+
+    @staticmethod
+    def _extract_target_file_count(payload: dict[str, Any]) -> int | None:
+        try:
+            input_items = payload.get("input")
+            if not isinstance(input_items, list):
+                return None
+            for item in reversed(input_items):
+                if not isinstance(item, dict):
+                    continue
+                contents = item.get("content")
+                if not isinstance(contents, list):
+                    continue
+                for content in contents:
+                    if not isinstance(content, dict):
+                        continue
+                    text = content.get("text")
+                    if not isinstance(text, str):
+                        continue
+                    stripped = text.strip()
+                    if not stripped.startswith("{"):
+                        continue
+                    parsed = json.loads(stripped)
+                    target_files = parsed.get("target_files")
+                    if isinstance(target_files, list):
+                        return len(target_files)
+        except Exception:
+            return None
+        return None
 
     @staticmethod
     def _schema_hint(schema_name: str, schema: dict[str, Any]) -> str:

@@ -1870,7 +1870,7 @@ export default function App() {
                     <span>Failure class</span>
                     <strong>{failureAnalysis.failure_class ?? "n/a"}</strong>
                   </div>
-                  <div className="run-detail-card">
+                  <div className="run-detail-card run-detail-card-wide">
                     <span>Failure signature</span>
                     <strong>{failureAnalysis.failure_signature ?? selectedRun.failure_signature ?? "n/a"}</strong>
                   </div>

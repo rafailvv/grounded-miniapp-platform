@@ -376,7 +376,12 @@ class RunService:
             run.fix_targets = list(job.fix_targets)
             run.handoff_from_failed_generate = dict(job.handoff_from_failed_generate or {}) or None
             run.checks_summary = self._build_checks_summary(job.validation_snapshot, preview.status)
-            run.touched_files = self._resolve_touched_files(change_plan)
+            run.touched_files = self._resolve_touched_files(
+                workspace_id=run.workspace_id,
+                run=run,
+                change_plan=change_plan,
+                request=request,
+            )
             run.candidate_revision_id = f"draft:{run.run_id}"
             run.iteration_count = len((self.generation_service.current_report(run.workspace_id, "iterations") or {}).get("items", []))
             run.latency_breakdown = dict(job.latency_breakdown)
@@ -398,39 +403,26 @@ class RunService:
             run.updated_at = datetime.now(timezone.utc)
 
             if job.status == "completed":
-                meaningful_paths = self._meaningful_paths_for_run(
-                    workspace_id=run.workspace_id,
-                    run=run,
-                    change_plan=change_plan,
-                )
-                if not meaningful_paths:
-                    self._mark_run_without_meaningful_diff(run, job)
-                elif run.apply_strategy == "manual_approve":
-                    run.status = "awaiting_approval"
-                    run.apply_status = "awaiting_approval"
-                    run.draft_status = "ready"
-                    run.draft_ready = True
-                    run.current_stage = "awaiting review"
-                    run.progress_percent = 99
+                should_apply_fix_draft = request.mode == "fix" and self.workspace_service.draft_exists(run.workspace_id, run.run_id)
+                if should_apply_fix_draft:
+                    self._apply_completed_draft(run, message="Applying verified fix draft to the source workspace.")
                 else:
-                    apply_started_at = time.perf_counter()
-                    run.current_stage = "finalizing apply"
-                    run.progress_percent = 99
-                    run.updated_at = datetime.now(timezone.utc)
-                    self._save_run(run)
-                    self._append_job_event(run.linked_job_id, "apply_started", "Applying generated draft to the source workspace.")
-                    revision = self.workspace_service.approve_draft(run.workspace_id, run.run_id, f"Auto-apply AI draft for run {run.run_id}")
-                    self.workspace_service.discard_draft(run.workspace_id, run.run_id)
-                    run.result_revision_id = revision.revision_id
-                    run.candidate_revision_id = revision.revision_id
-                    run.status = "completed"
-                    run.apply_status = "applied"
-                    run.draft_status = "approved"
-                    run.draft_ready = False
-                    run.current_stage = "completed"
-                    run.progress_percent = 100
-                    run.latency_breakdown["apply_ms"] = int((time.perf_counter() - apply_started_at) * 1000)
-                    self._append_job_event(run.linked_job_id, "apply_completed", "Generated draft was applied successfully.")
+                    meaningful_paths = self._meaningful_paths_for_run(
+                        workspace_id=run.workspace_id,
+                        run=run,
+                        change_plan=change_plan,
+                    )
+                    if not meaningful_paths:
+                        self._mark_run_without_meaningful_diff(run, job)
+                    elif run.apply_strategy == "manual_approve":
+                        run.status = "awaiting_approval"
+                        run.apply_status = "awaiting_approval"
+                        run.draft_status = "ready"
+                        run.draft_ready = True
+                        run.current_stage = "awaiting review"
+                        run.progress_percent = 99
+                    else:
+                        self._apply_completed_draft(run, message="Applying generated draft to the source workspace.")
             elif job.status == "blocked":
                 run.status = "blocked"
                 run.apply_status = "blocked"
@@ -630,6 +622,8 @@ class RunService:
             self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
 
     def _queue_resume_generation_from_checkpoint_if_needed(self, run: RunRecord, request: CreateRunRequest) -> None:
+        if request.mode == "fix":
+            return
         checkpoint = self.store.get("reports", f"resume_checkpoint:{run.workspace_id}")
         if not checkpoint or checkpoint.get("status") != "pending":
             return
@@ -888,12 +882,57 @@ class RunService:
         )
         return any(marker in prompt for marker in fix_markers)
 
-    @classmethod
-    def _resolve_touched_files(cls, change_plan: CodeChangePlan) -> list[str]:
-        paths = [target.file_path for target in change_plan.targets if target.file_path and cls._is_meaningful_source_path(target.file_path)]
+    def _resolve_touched_files(
+        self,
+        *,
+        workspace_id: str,
+        run: RunRecord,
+        change_plan: CodeChangePlan,
+        request: CreateRunRequest,
+    ) -> list[str]:
+        paths = [
+            target.file_path
+            for target in change_plan.targets
+            if target.file_path and self._is_meaningful_source_path(target.file_path)
+        ]
+        if request.mode == "fix":
+            inherited = self._inherited_touched_files_for_fix(workspace_id=workspace_id, run=run)
+            if inherited:
+                paths = list(dict.fromkeys([*paths, *inherited]))
         if paths:
             return list(dict.fromkeys(paths))
-        return [target.file_path for target in change_plan.targets if target.file_path]
+        fallback_paths = [target.file_path for target in change_plan.targets if target.file_path]
+        if request.mode == "fix":
+            inherited = self._inherited_touched_files_for_fix(workspace_id=workspace_id, run=run)
+            if inherited:
+                fallback_paths = list(dict.fromkeys([*fallback_paths, *inherited]))
+        return fallback_paths
+
+    def _inherited_touched_files_for_fix(self, *, workspace_id: str, run: RunRecord) -> list[str]:
+        if run.mode != "fix":
+            return []
+        source_run_id = str(run.resume_from_run_id or "").strip()
+        if not source_run_id:
+            return []
+        try:
+            source_run = self.get_run(source_run_id)
+        except KeyError:
+            return []
+
+        inherited = [path for path in source_run.touched_files if self._is_meaningful_source_path(path)]
+        if inherited:
+            return list(dict.fromkeys(inherited))
+
+        if self.workspace_service.draft_exists(workspace_id, source_run_id):
+            diff_text = self.workspace_service.diff(workspace_id, run_id=source_run_id)
+            diff_paths = [
+                path
+                for path in self._paths_from_diff(diff_text)
+                if self._is_meaningful_source_path(path)
+            ]
+            if diff_paths:
+                return list(dict.fromkeys(diff_paths))
+        return []
 
     def _mark_run_without_meaningful_diff(self, run: RunRecord, job: Any) -> None:
         message = "Generation completed without meaningful source changes to apply."
@@ -911,6 +950,26 @@ class RunService:
         job.summary = message
         job.failure_reason = None
         self.generation_service._append_event(job, "job_completed", message, {"reason": "no_meaningful_diff"})
+
+    def _apply_completed_draft(self, run: RunRecord, *, message: str) -> None:
+        apply_started_at = time.perf_counter()
+        run.current_stage = "finalizing apply"
+        run.progress_percent = 99
+        run.updated_at = datetime.now(timezone.utc)
+        self._save_run(run)
+        self._append_job_event(run.linked_job_id, "apply_started", message)
+        revision = self.workspace_service.approve_draft(run.workspace_id, run.run_id, f"Auto-apply AI draft for run {run.run_id}")
+        self.workspace_service.discard_draft(run.workspace_id, run.run_id)
+        run.result_revision_id = revision.revision_id
+        run.candidate_revision_id = revision.revision_id
+        run.status = "completed"
+        run.apply_status = "applied"
+        run.draft_status = "approved"
+        run.draft_ready = False
+        run.current_stage = "completed"
+        run.progress_percent = 100
+        run.latency_breakdown["apply_ms"] = int((time.perf_counter() - apply_started_at) * 1000)
+        self._append_job_event(run.linked_job_id, "apply_completed", "Generated draft was applied successfully.")
 
     def _meaningful_paths_for_run(
         self,

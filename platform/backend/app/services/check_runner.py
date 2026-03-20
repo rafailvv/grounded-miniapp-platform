@@ -52,15 +52,23 @@ class CheckRunner:
 
         preview_started = time.perf_counter()
         preview = self.preview_service.get(workspace_id)
-        preview_status = "skipped" if preview.status in {"stopped", "error"} else "passed"
+        should_skip_preview = bool(filtered_issues) or static_result.status == "failed"
+        if should_skip_preview:
+            preview_status = "skipped"
+            preview_details = "Preview smoke skipped because validator/build checks already failed."
+            preview_logs: list[str] = []
+        else:
+            preview_status = "skipped" if preview.status in {"stopped", "error"} else "passed"
+            preview_details = "Draft preview smoke recorded using the current preview session."
+            preview_logs = preview.logs[-12:]
         results.append(
             RunCheckResult(
                 name="preview_boot_smoke",
                 status=preview_status,
-                details="Draft preview smoke recorded using the current preview session.",
+                details=preview_details,
                 duration_ms=int((time.perf_counter() - preview_started) * 1000),
                 command="preview smoke (current session)",
-                logs=preview.logs[-12:],
+                logs=preview_logs,
             )
         )
 
@@ -198,29 +206,33 @@ class CheckRunner:
             )
 
         try:
-            if not (frontend_dir / "node_modules").exists():
-                install_cmd = [npm_binary, "ci", "--no-audit", "--no-fund"] if (frontend_dir / "package-lock.json").exists() else [npm_binary, "install", "--no-audit", "--no-fund"]
-                install_result = subprocess.run(
-                    install_cmd,
-                    cwd=frontend_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=install_timeout,
-                    env=env,
+            self._reset_frontend_build_state(frontend_dir)
+            install_cmd = (
+                [npm_binary, "ci", "--no-audit", "--no-fund"]
+                if (frontend_dir / "package-lock.json").exists()
+                else [npm_binary, "install", "--no-audit", "--no-fund"]
+            )
+            install_result = subprocess.run(
+                install_cmd,
+                cwd=frontend_dir,
+                capture_output=True,
+                text=True,
+                timeout=install_timeout,
+                env=env,
+            )
+            if install_result.returncode != 0:
+                return RunCheckResult(
+                    name="changed_files_static",
+                    status="failed",
+                    details="Frontend dependency install failed before build.",
+                    command=" ".join(install_cmd),
+                    exit_code=install_result.returncode,
+                    logs=self._command_logs(
+                        "Frontend dependency install failed before build.",
+                        install_result.stdout,
+                        install_result.stderr,
+                    ),
                 )
-                if install_result.returncode != 0:
-                    return RunCheckResult(
-                        name="changed_files_static",
-                        status="failed",
-                        details="Frontend dependency install failed before build.",
-                        command=" ".join(install_cmd),
-                        exit_code=install_result.returncode,
-                        logs=self._command_logs(
-                            "Frontend dependency install failed before build.",
-                            install_result.stdout,
-                            install_result.stderr,
-                        ),
-                    )
 
             build_result = subprocess.run(
                 [npm_binary, "run", "build"],
@@ -271,6 +283,19 @@ class CheckRunner:
                     exc.stderr or "",
                 ),
             )
+
+    @staticmethod
+    def _reset_frontend_build_state(frontend_dir: Path) -> None:
+        for artifact_name in ("node_modules", "dist", "build", ".vite"):
+            artifact_path = frontend_dir / artifact_name
+            if artifact_path.is_dir():
+                shutil.rmtree(artifact_path, ignore_errors=True)
+        for pattern in ("*.tsbuildinfo",):
+            for artifact_path in frontend_dir.glob(pattern):
+                try:
+                    artifact_path.unlink()
+                except OSError:
+                    pass
 
     def _run_backend_compile(self, backend_dir: Path) -> RunCheckResult:
         app_dir = backend_dir / "app"

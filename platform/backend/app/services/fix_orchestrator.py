@@ -92,7 +92,14 @@ class FixOrchestrator:
             root_cause_summary=(request.error_context.raw_error.strip() if request.error_context and request.error_context.raw_error.strip() else None),
             current_fix_phase="triaging",
         )
-        reuse_existing_draft = bool(request.linked_run_id and self.workspace_service.draft_exists(workspace_id, run_id))
+        source_run_id = str(request.resume_from_run_id or "").strip()
+        cloned_source_draft = False
+        if source_run_id and source_run_id != run_id and self.workspace_service.draft_exists(workspace_id, source_run_id):
+            self.workspace_service.clone_draft(workspace_id, source_run_id, run_id)
+            cloned_source_draft = True
+        reuse_existing_draft = cloned_source_draft or bool(
+            request.linked_run_id and self.workspace_service.draft_exists(workspace_id, run_id)
+        )
         self._clear_reports(workspace_id, preserve_generation_state=reuse_existing_draft)
         if not reuse_existing_draft:
             self._clear_trace(workspace_id)
@@ -104,9 +111,21 @@ class FixOrchestrator:
             workspace_id,
             "fix",
             "Fix orchestrator initialized.",
-            {"run_id": run_id, "reused_existing_draft": reuse_existing_draft},
+            {
+                "run_id": run_id,
+                "reused_existing_draft": reuse_existing_draft,
+                "source_run_id": source_run_id or None,
+                "cloned_source_draft": cloned_source_draft,
+            },
         )
-        if reuse_existing_draft:
+        if cloned_source_draft:
+            self._append_trace(
+                workspace_id,
+                "draft_reused",
+                "Fix cloned the previous failed generation draft and continued from it.",
+                {"run_id": run_id, "source_run_id": source_run_id},
+            )
+        elif reuse_existing_draft:
             self._append_trace(
                 workspace_id,
                 "draft_reused",
