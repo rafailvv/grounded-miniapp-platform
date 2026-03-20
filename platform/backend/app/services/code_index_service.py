@@ -36,28 +36,16 @@ class CodeIndexService:
         if existing.status == "ready" and existing.revision_id == revision_id and existing.chunk_count > 0:
             return existing
 
-        chunks: list[CodeChunkRecord] = []
-        for file_path in sorted(source_dir.rglob("*")):
-            if not file_path.is_file() or ".git" in file_path.parts or "node_modules" in file_path.parts:
-                continue
-            if file_path.suffix.lower() not in TEXT_FILE_SUFFIXES:
-                continue
-            relative_path = str(file_path.relative_to(source_dir))
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-            chunks.extend(
-                self._chunk_text(
-                    workspace_id=workspace.workspace_id,
-                    revision_id=revision_id,
-                    relative_path=relative_path,
-                    content=content,
-                    kind="code",
-                    source_type="workspace_code",
-                )
-            )
-        return self._store_index(workspace.workspace_id, revision_id, chunks)
+        file_count = sum(1 for _ in self._iter_workspace_files(source_dir))
+        status = IndexStatusRecord(
+            workspace_id=workspace.workspace_id,
+            revision_id=revision_id,
+            status="ready",
+            chunk_count=file_count,
+            indexed_at=utc_now(),
+        )
+        self.store.upsert("code_indexes", f"workspace:{workspace.workspace_id}", status.model_dump(mode="json"))
+        return status
 
     def index_documents(self, workspace_id: str, documents: list[DocumentRecord]) -> IndexStatusRecord:
         revision_id = self._doc_revision_id(documents)
@@ -65,35 +53,15 @@ class CodeIndexService:
         if existing.status == "ready" and existing.revision_id == revision_id and existing.chunk_count > 0:
             return existing
 
-        chunks: list[CodeChunkRecord] = []
-        for document in documents:
-            source_chunks = document.chunks or []
-            if source_chunks:
-                for chunk in source_chunks:
-                    chunks.append(
-                        self._build_chunk(
-                            workspace_id=workspace_id,
-                            revision_id=revision_id,
-                            relative_path=document.file_path,
-                            text=chunk.content,
-                            start_line=chunk.start_line or 1,
-                            end_line=chunk.end_line or max(1, chunk.content.count("\n") + 1),
-                            kind="doc",
-                            source_type=document.source_type,
-                        )
-                    )
-                continue
-            chunks.extend(
-                self._chunk_text(
-                    workspace_id=workspace_id,
-                    revision_id=revision_id,
-                    relative_path=document.file_path,
-                    content=document.content,
-                    kind="doc",
-                    source_type=document.source_type,
-                )
-            )
-        return self._store_doc_index(workspace_id, revision_id, chunks)
+        status = IndexStatusRecord(
+            workspace_id=workspace_id,
+            revision_id=revision_id,
+            status="ready",
+            chunk_count=len(documents),
+            indexed_at=utc_now(),
+        )
+        self.store.upsert("code_indexes", f"docs:{workspace_id}", status.model_dump(mode="json"))
+        return status
 
     def get_workspace_status(self, workspace_id: str) -> IndexStatusRecord:
         payload = self.store.get("code_indexes", f"workspace:{workspace_id}")
@@ -129,17 +97,45 @@ class CodeIndexService:
         recent = set(recent_paths or [])
         query_embedding = self._embedding(prompt)
         query_terms = self._tokenize(prompt)
-        code = self._rank_chunks(self.get_chunks(workspace_id, kind="code"), query_terms, query_embedding, active, recent)[:code_limit]
-        docs = self._rank_chunks(self.get_chunks(workspace_id, kind="doc"), query_terms, query_embedding, active, recent)[:doc_limit]
+        status = self.get_workspace_status(workspace_id)
+        revision_id = status.revision_id or "unversioned"
+        source_dir = self.settings.workspaces_dir / workspace_id / "source"
+        candidate_paths = self._candidate_workspace_paths(
+            source_dir=source_dir,
+            query_terms=query_terms,
+            active_paths=active,
+            recent_paths=recent,
+            limit=max(code_limit * 8, 24),
+        )
+        candidate_chunks: list[CodeChunkRecord] = []
+        for relative_path in candidate_paths:
+            file_path = source_dir / relative_path
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            candidate_chunks.extend(
+                self._chunk_text(
+                    workspace_id=workspace_id,
+                    revision_id=revision_id,
+                    relative_path=relative_path,
+                    content=content,
+                    kind="code",
+                    source_type="workspace_code",
+                )
+            )
+        code = self._rank_chunks(candidate_chunks, query_terms, query_embedding, active, recent)[:code_limit]
+        docs: list[CodeChunkRecord] = []
         return {
             "code": [chunk.model_dump(mode="json") for chunk in code],
             "docs": [chunk.model_dump(mode="json") for chunk in docs],
             "stats": {
-                "workspace_chunk_count": len(self.get_chunks(workspace_id, kind="code")),
-                "doc_chunk_count": len(self.get_chunks(workspace_id, kind="doc")),
+                "workspace_chunk_count": len(candidate_chunks),
+                "doc_chunk_count": 0,
                 "code_hits": len(code),
                 "doc_hits": len(docs),
                 "query_terms": len(query_terms),
+                "candidate_files": len(candidate_paths),
             },
         }
 
@@ -174,6 +170,67 @@ class CodeIndexService:
                 self.store.delete("code_chunks", key)
         for chunk in chunks:
             self.store.upsert("code_chunks", f"{kind}:{workspace_id}:{chunk.chunk_id}", chunk.model_dump(mode="json"))
+
+    def _iter_workspace_files(self, source_dir: Path) -> list[Path]:
+        ignored_dirs = {
+            ".git",
+            "node_modules",
+            "dist",
+            "build",
+            "__pycache__",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            ".next",
+            ".vite",
+            "coverage",
+        }
+        files: list[Path] = []
+        for file_path in sorted(source_dir.rglob("*")):
+            if not file_path.is_file():
+                continue
+            if any(part in ignored_dirs for part in file_path.parts):
+                continue
+            if file_path.suffix.lower() not in TEXT_FILE_SUFFIXES:
+                continue
+            files.append(file_path)
+        return files
+
+    def _candidate_workspace_paths(
+        self,
+        *,
+        source_dir: Path,
+        query_terms: set[str],
+        active_paths: set[str],
+        recent_paths: set[str],
+        limit: int,
+    ) -> list[str]:
+        ranked: list[tuple[float, str]] = []
+        for file_path in self._iter_workspace_files(source_dir):
+            relative_path = str(file_path.relative_to(source_dir))
+            score = self._path_score(relative_path, query_terms)
+            if relative_path in active_paths:
+                score += 1.25
+            if relative_path in recent_paths:
+                score += 0.75
+            if score <= 0:
+                continue
+            ranked.append((score, relative_path))
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [path for _, path in ranked[:limit]]
+
+    def _path_score(self, relative_path: str, query_terms: set[str]) -> float:
+        if not query_terms:
+            return 0.0
+        lowered = relative_path.lower()
+        path_terms = self._tokenize(relative_path)
+        overlap = len(query_terms & path_terms)
+        score = overlap * 0.5
+        score += sum(0.15 for term in query_terms if term in lowered)
+        basename = Path(relative_path).name.lower()
+        if any(term in basename for term in query_terms):
+            score += 0.35
+        return score
 
     def _chunk_text(
         self,

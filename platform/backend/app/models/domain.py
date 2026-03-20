@@ -82,6 +82,7 @@ class JobEvent(StrictModel):
     event_id: str = Field(default_factory=lambda: new_id("evt"))
     event_type: Literal[
         "job_started",
+        "resume_started",
         "indexing_started",
         "retrieval_started",
         "retrieval_completed",
@@ -258,6 +259,7 @@ class GenerateRequest(StrictModel):
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
     model_profile: str = "openai_code_fast"
     linked_run_id: str | None = None
+    resume_from_run_id: str | None = None
     error_context: ErrorContext | None = None
 
 
@@ -471,6 +473,7 @@ class RunRecord(StrictModel):
     llm_provider: str | None = None
     llm_model: str | None = None
     linked_job_id: str | None = None
+    resume_from_run_id: str | None = None
     source_revision_id: str | None = None
     result_revision_id: str | None = None
     candidate_revision_id: str | None = None
@@ -519,4 +522,5 @@ class CreateRunRequest(StrictModel):
     target_platform: TargetPlatform = TargetPlatform.TELEGRAM
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
     generation_mode: GenerationMode = GenerationMode.BALANCED
+    resume_from_run_id: str | None = None
     error_context: ErrorContext | None = None

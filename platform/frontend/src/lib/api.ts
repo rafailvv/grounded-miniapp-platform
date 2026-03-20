@@ -26,6 +26,7 @@ export type Run = {
   llm_provider?: string | null;
   llm_model?: string | null;
   linked_job_id?: string | null;
+  resume_from_run_id?: string | null;
   source_revision_id?: string | null;
   result_revision_id?: string | null;
   candidate_revision_id?: string | null;
@@ -176,6 +177,8 @@ export type WorkspaceLogs = {
     created_at: string;
     details?: Record<string, unknown>;
   }>;
+  platform_log?: string[];
+  api_log?: string[];
   preview: {
     status: string;
     runtime_mode: string;
@@ -297,6 +300,7 @@ export async function createRun(
     generation_mode?: "fast" | "balanced" | "quality" | "basic";
     target_platform?: "telegram_mini_app" | "max_mini_app";
     preview_profile?: "telegram_mock" | "max_mock" | "web_preview";
+    resume_from_run_id?: string;
     error_context?: {
       raw_error: string;
       source?: "build" | "preview" | "backend" | "frontend" | "runtime";

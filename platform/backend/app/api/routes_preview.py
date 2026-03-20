@@ -65,6 +65,8 @@ def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(ge
 def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
     job = container.generation_service.latest_job_for_workspace(workspace_id)
     preview = container.preview_service.get(workspace_id)
+    platform_log = container.workspace_log_service.read_lines(workspace_id, kind="platform")
+    api_log = container.workspace_log_service.read_lines(workspace_id, kind="api")
     container_logs: dict[str, list[str]] = {}
     containers: list[dict[str, object]] = []
     if preview.runtime_mode == "docker" and preview.proxy_port is not None:
@@ -92,6 +94,8 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
         "workspace_id": workspace_id,
         "job": job.model_dump(mode="json") if job else None,
         "events": [event.model_dump(mode="json") for event in job.events] if job else [],
+        "platform_log": platform_log,
+        "api_log": api_log,
         "preview": {
             "status": preview.status,
             "stage": preview.stage,

@@ -913,15 +913,25 @@ export default function App() {
   const containerLogs = workspaceLogs?.preview?.container_logs ?? {};
   const selectedContainerLogLines = containerLogs[selectedLogService] ?? [];
   const eventLogLines = useMemo(
-    () =>
-      workspaceLogs?.events?.length
-        ? workspaceLogs.events.map((event) => {
-            const details =
-              event.details && Object.keys(event.details).length ? ` | ${JSON.stringify(event.details)}` : "";
-            return `- [${formatTimestamp(event.created_at)}] ${event.event_type}: ${event.message}${details}`;
-          })
-        : ["No run events yet."],
-    [workspaceLogs?.events],
+    () => {
+      const eventLines =
+        workspaceLogs?.events?.length
+          ? workspaceLogs.events.map((event) => {
+              const details =
+                event.details && Object.keys(event.details).length ? ` | ${JSON.stringify(event.details)}` : "";
+              return `- [${formatTimestamp(event.created_at)}] ${event.event_type}: ${event.message}${details}`;
+            })
+          : [];
+      const platformLines = workspaceLogs?.platform_log?.length ? workspaceLogs.platform_log : [];
+      const apiLines = workspaceLogs?.api_log?.length ? workspaceLogs.api_log : [];
+      const combined = [
+        ...eventLines,
+        ...(platformLines.length ? ["", "=== platform.log ===", ...platformLines] : []),
+        ...(apiLines.length ? ["", "=== api.log ===", ...apiLines] : []),
+      ].filter((line, index, items) => !(line === "" && (index === 0 || items[index - 1] === "")));
+      return combined.length ? combined : ["No run events yet."];
+    },
+    [workspaceLogs?.api_log, workspaceLogs?.events, workspaceLogs?.platform_log],
   );
   useEffect(() => {
     const availableServices = Object.keys(containerLogs);
@@ -1300,6 +1310,7 @@ export default function App() {
         generation_mode: "balanced",
         target_platform: "telegram_mini_app",
         preview_profile: "telegram_mock",
+        resume_from_run_id: run.run_id,
         error_context: handoff.context,
       });
       setSelectedRunMode("fix");

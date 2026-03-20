@@ -210,6 +210,23 @@ class WorkspaceService:
             return draft_source
         return self.prepare_draft(workspace_id, run_id)
 
+    def clone_draft(self, workspace_id: str, source_run_id: str, target_run_id: str) -> Path:
+        source_draft = self.draft_source_dir(workspace_id, source_run_id)
+        if not source_draft.exists():
+            raise KeyError(f"Draft not found for run: {source_run_id}")
+        target_draft = self.draft_source_dir(workspace_id, target_run_id)
+        if target_draft.exists():
+            shutil.rmtree(target_draft)
+        target_draft.parent.mkdir(parents=True, exist_ok=True)
+        self._copy_tree(source_draft, target_draft)
+        self.workspace_log_service.append(
+            workspace_id,
+            source="workspace",
+            message="Draft cloned for run resume.",
+            payload={"source_run_id": source_run_id, "target_run_id": target_run_id},
+        )
+        return target_draft
+
     def apply_draft_operations(self, workspace_id: str, run_id: str, operations: list[DraftFileOperation]) -> Path:
         draft_source = self.draft_source_dir(workspace_id, run_id)
         if not draft_source.exists():

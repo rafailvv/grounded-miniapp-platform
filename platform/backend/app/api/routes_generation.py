@@ -29,6 +29,7 @@ def generate(
                 target_platform=request.target_platform,
                 preview_profile=request.preview_profile,
                 generation_mode=request.generation_mode,
+                resume_from_run_id=request.resume_from_run_id,
                 error_context=request.error_context,
             ),
         )

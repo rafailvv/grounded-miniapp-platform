@@ -179,6 +179,7 @@ class GenerationService:
         }
         ACTIVE_LLM_CACHE_CONTEXT.set(cache_context)
         ACTIVE_LLM_CACHE_STATS.set(cache_stats_sink)
+        resume_bundle = self._load_resume_checkpoint_bundle(workspace_id, request.resume_from_run_id)
 
         job = JobRecord(
             workspace_id=workspace_id,
@@ -202,9 +203,21 @@ class GenerationService:
             draft_run_id = request.linked_run_id
         else:
             draft_run_id = job.job_id
-        self.store.delete("reports", f"resume_checkpoint:{workspace_id}")
+        if resume_bundle is None:
+            self.store.delete("reports", f"resume_checkpoint:{workspace_id}")
         self._clear_trace(workspace_id)
         self._append_event(job, "job_started", "Generation request accepted.")
+        if resume_bundle is not None:
+            self._append_event(job, "resume_started", "Reusing saved planning and continuing generation from checkpoint.")
+            self.workspace_log_service.append(
+                workspace_id,
+                source="generation.resume",
+                message="Generation resumed from a saved planning checkpoint.",
+                payload={
+                    "source_run_id": request.resume_from_run_id,
+                    "draft_run_id": draft_run_id,
+                },
+            )
         self._append_event(job, "indexing_started", "Refreshing workspace index.")
         self._append_event(job, "retrieval_started", "Preparing workspace index and grounded retrieval.")
         self._append_trace(
@@ -258,6 +271,55 @@ class GenerationService:
                 code="generation.llm_required",
                 event_type="job_failed",
                 failure_reason="Generation requires OpenAI because the workspace now uses an LLM-first page planning and code editing pipeline.",
+            )
+
+        if resume_bundle is not None:
+            if request.resume_from_run_id and draft_run_id != request.resume_from_run_id and self.workspace_service.draft_exists(workspace_id, request.resume_from_run_id):
+                self.workspace_service.clone_draft(workspace_id, request.resume_from_run_id, draft_run_id)
+            draft_source = self.workspace_service.ensure_draft(workspace_id, draft_run_id)
+            grounded_spec = resume_bundle["grounded_spec"]
+            role_contract = resume_bundle["role_contract"]
+            plan_result = resume_bundle["plan_result"]
+            resumed_role_scope = list(resume_bundle.get("role_scope") or role_scope)
+            self._append_trace(
+                workspace_id,
+                "planning_resumed",
+                "Saved planning artifacts were reused instead of rebuilding retrieval/spec/planning.",
+                {
+                    "source_run_id": request.resume_from_run_id,
+                    "draft_run_id": draft_run_id,
+                    "target_files": len(plan_result.get("target_files") or []),
+                },
+            )
+            self.workspace_log_service.append(
+                workspace_id,
+                source="generation.resume",
+                message="Saved planning artifacts were loaded from checkpoint.",
+                payload={
+                    "source_run_id": request.resume_from_run_id,
+                    "draft_run_id": draft_run_id,
+                    "target_files": len(plan_result.get("target_files") or []),
+                },
+            )
+            self._append_event(job, "draft_prepared", "Reused draft workspace from the saved planning checkpoint.")
+            self._append_event(job, "planning_ready", "Reused saved code plan.")
+            return self._continue_generation_from_plan(
+                workspace=workspace,
+                workspace_id=workspace_id,
+                job=job,
+                request=request,
+                draft_run_id=draft_run_id,
+                draft_source=draft_source,
+                effective_prompt=effective_prompt,
+                grounded_spec=grounded_spec,
+                role_scope=resumed_role_scope,
+                role_contract=role_contract,
+                plan_result=plan_result,
+                generation_mode=generation_mode,
+                creative_direction=self._select_creative_direction(effective_prompt),
+                retrieval_ms=0,
+                started_at=started_at,
+                should_stop=should_stop,
             )
 
         doc_refs = self.document_service.retrieve(
@@ -529,6 +591,137 @@ class GenerationService:
                 failure_reason="Code planning did not produce a valid multi-page app structure.",
             )
 
+        return self._continue_generation_from_plan(
+            workspace=workspace,
+            workspace_id=workspace_id,
+            job=job,
+            request=request,
+            draft_run_id=draft_run_id,
+            draft_source=draft_source,
+            effective_prompt=effective_prompt,
+            grounded_spec=grounded_spec,
+            role_scope=role_scope,
+            role_contract=role_contract,
+            plan_result=plan_result,
+            generation_mode=generation_mode,
+            creative_direction=creative_direction,
+            retrieval_ms=retrieval_ms,
+            started_at=started_at,
+            should_stop=should_stop,
+        )
+
+    def _store_resume_checkpoint(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        request: GenerateRequest,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        plan_result: dict[str, Any],
+    ) -> None:
+        payload = {
+            "workspace_id": workspace_id,
+            "source_run_id": request.linked_run_id,
+            "draft_run_id": draft_run_id,
+            "status": "pending",
+            "prompt": request.prompt,
+            "intent": request.intent,
+            "mode": request.mode,
+            "generation_mode": request.generation_mode.value if isinstance(request.generation_mode, GenerationMode) else str(request.generation_mode),
+            "target_platform": request.target_platform.value if hasattr(request.target_platform, "value") else str(request.target_platform),
+            "preview_profile": request.preview_profile.value if hasattr(request.preview_profile, "value") else str(request.preview_profile),
+            "target_role_scope": role_scope,
+            "model_profile": request.model_profile,
+            "page_graph": plan_result.get("page_graph"),
+            "role_contract": role_contract,
+            "scope_mode": plan_result.get("scope_mode"),
+            "flow_mode": plan_result.get("flow_mode"),
+            "files_to_read": list(plan_result.get("files_to_read") or []),
+            "target_files": list(plan_result.get("target_files") or []),
+            "shared_files": list(plan_result.get("shared_files") or []),
+            "backend_targets": list(plan_result.get("backend_targets") or []),
+            "execution_plan": plan_result.get("execution_plan") or {},
+            "created_at": utc_now().isoformat(),
+        }
+        self._store_report(f"resume_checkpoint:{workspace_id}", payload)
+
+    def _load_resume_checkpoint_bundle(self, workspace_id: str, source_run_id: str | None) -> dict[str, Any] | None:
+        source_run = str(source_run_id or "").strip()
+        if not source_run:
+            return None
+        checkpoint = self.store.get("reports", f"resume_checkpoint:{workspace_id}")
+        if not checkpoint or checkpoint.get("status") != "pending":
+            return None
+        if str(checkpoint.get("source_run_id") or "") != source_run:
+            return None
+        spec_payload = self.current_report(workspace_id, "spec")
+        role_contract_payload = self.current_report(workspace_id, "role_contract")
+        if not spec_payload or not role_contract_payload:
+            return None
+        try:
+            grounded_spec = GroundedSpecModel.model_validate(spec_payload)
+        except Exception:
+            return None
+        role_contract = role_contract_payload.get("role_contract")
+        page_graph = checkpoint.get("page_graph")
+        if not isinstance(role_contract, dict) or not isinstance(page_graph, dict):
+            return None
+        workspace_tree = self.workspace_service.file_tree(workspace_id, run_id=source_run)
+        valid_tree_paths = {
+            str(item.get("path"))
+            for item in workspace_tree
+            if isinstance(item, dict) and item.get("type") == "file" and isinstance(item.get("path"), str)
+        }
+        target_files = self._normalize_path_list(checkpoint.get("target_files"), [])
+        files_to_read = self._normalize_path_list(checkpoint.get("files_to_read"), [])
+        shared_files = self._normalize_path_list(checkpoint.get("shared_files"), [])
+        backend_targets = self._normalize_path_list(checkpoint.get("backend_targets"), [])
+        target_files = [path for path in target_files if path in valid_tree_paths or path.startswith("frontend/") or path.startswith("backend/")]
+        files_to_read = [path for path in files_to_read if path in valid_tree_paths]
+        shared_files = [path for path in shared_files if path in valid_tree_paths]
+        backend_targets = [path for path in backend_targets if path in valid_tree_paths or path.startswith("backend/")]
+        plan_result = {
+            "page_graph": page_graph,
+            "scope_mode": checkpoint.get("scope_mode") or "minimal_patch",
+            "flow_mode": checkpoint.get("flow_mode") or "multi_page",
+            "files_to_read": files_to_read,
+            "target_files": target_files,
+            "shared_files": shared_files,
+            "backend_targets": backend_targets,
+            "execution_plan": checkpoint.get("execution_plan") or {},
+            "require_multi_page": True,
+        }
+        if not plan_result["target_files"]:
+            return None
+        return {
+            "checkpoint": checkpoint,
+            "grounded_spec": grounded_spec,
+            "role_contract": role_contract,
+            "plan_result": plan_result,
+            "role_scope": list(checkpoint.get("target_role_scope") or []),
+        }
+
+    def _continue_generation_from_plan(
+        self,
+        *,
+        workspace: WorkspaceRecord,
+        workspace_id: str,
+        job: JobRecord,
+        request: GenerateRequest,
+        draft_run_id: str,
+        draft_source: Path,
+        effective_prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        plan_result: dict[str, Any],
+        generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
+        retrieval_ms: int,
+        started_at: float,
+        should_stop: Callable[[], bool] | None,
+    ) -> JobRecord:
         self._append_event(
             job,
             "context_pack_started",
@@ -556,7 +749,7 @@ class GenerationService:
         current_cache_stats["prompt_cache_key"] = context_pack.prompt_cache_key
         current_cache_stats["stable_prefix_chars"] = len(context_pack.system_prefix)
         job.cache_stats = dict(current_cache_stats)
-        job.latency_breakdown["context_pack_ms"] = int((time.perf_counter() - started_at) * 1000) - retrieval_ms
+        job.latency_breakdown["context_pack_ms"] = max(0, int((time.perf_counter() - started_at) * 1000) - retrieval_ms)
         self._append_event(
             job,
             "context_pack_ready",
@@ -581,12 +774,7 @@ class GenerationService:
         if stopped is not None:
             return stopped
         if "error" in edit_result:
-            self._append_trace(
-                workspace_id,
-                "editing_failed",
-                "Code editing failed.",
-                {"error": edit_result["error"]},
-            )
+            self._append_trace(workspace_id, "editing_failed", "Code editing failed.", {"error": edit_result["error"]})
             return self._block_with_messages(
                 job,
                 [edit_result["error"]],
@@ -614,6 +802,25 @@ class GenerationService:
                 code="generation.edit.placeholder_output",
                 event_type="validation_failed",
                 failure_reason="Code editing did not produce the required page-based app structure.",
+            )
+        invalid_operation_paths = [
+            operation.file_path
+            for operation in edit_result["operations"]
+            if self._normalize_path_list([operation.file_path], []) != [operation.file_path]
+        ]
+        if invalid_operation_paths:
+            self._append_trace(
+                workspace_id,
+                "editing_failed",
+                "Code editing produced invalid file paths.",
+                {"invalid_paths": invalid_operation_paths[:10]},
+            )
+            return self._block_with_messages(
+                job,
+                [f"Code editing produced invalid file paths: {', '.join(invalid_operation_paths[:5])}"],
+                code="generation.edit.invalid_paths",
+                event_type="validation_failed",
+                failure_reason="Code editing produced invalid file paths.",
             )
         operations = [
             DraftFileOperation(
@@ -695,11 +902,7 @@ class GenerationService:
                 assistant_message=latest_assistant_message,
                 files_read=files_read if attempt == 0 else sorted(repair_contexts.keys()),
                 operations=[
-                    RunIterationOperation(
-                        file_path=operation.file_path,
-                        operation=operation.operation,
-                        reason=operation.reason,
-                    )
+                    RunIterationOperation(file_path=operation.file_path, operation=operation.operation, reason=operation.reason)
                     for operation in latest_operations
                 ],
                 check_results=latest_check_results,
@@ -721,27 +924,15 @@ class GenerationService:
                         latency_breakdown={"checks_ms": check_execution.duration_ms or 0},
                     )
                 )
-            self._store_report(
-                f"iterations:{workspace_id}",
-                {"run_id": draft_run_id, "items": [item.model_dump(mode="json") for item in iterations]},
-            )
+            self._store_report(f"iterations:{workspace_id}", {"run_id": draft_run_id, "items": [item.model_dump(mode="json") for item in iterations]})
             self._store_report(f"candidate_diff:{workspace_id}", {"run_id": draft_run_id, "diff": latest_candidate_diff})
             self._store_report(
                 f"check_results:{workspace_id}",
-                {
-                    "run_id": draft_run_id,
-                    "items": [item.model_dump(mode="json") for item in latest_check_results],
-                    "execution": check_execution.model_dump(mode="json"),
-                },
+                {"run_id": draft_run_id, "items": [item.model_dump(mode="json") for item in latest_check_results], "execution": check_execution.model_dump(mode="json")},
             )
             self._store_report(
                 f"patch:{workspace_id}",
-                {
-                    "run_id": draft_run_id,
-                    "envelope": patch_envelope.model_dump(mode="json"),
-                    "apply_result": job.apply_result,
-                    "conflict_reason": apply_result.conflict_reason,
-                },
+                {"run_id": draft_run_id, "envelope": patch_envelope.model_dump(mode="json"), "apply_result": job.apply_result, "conflict_reason": apply_result.conflict_reason},
             )
 
             if not build_issues and (preview_issue is None or self._is_non_blocking_preview_issue(preview_issue)):
@@ -757,13 +948,7 @@ class GenerationService:
                 job.failure_reason = f"Build validation could not run because the platform runtime is missing required tooling. Root cause: {job.root_cause_summary}"
                 job.fix_targets = []
                 job.handoff_from_failed_generate = None
-                job.validation_snapshot = ValidationSnapshot(
-                    grounded_spec_valid=True,
-                    app_ir_valid=True,
-                    build_valid=False,
-                    blocking=True,
-                    issues=final_issues,
-                )
+                job.validation_snapshot = ValidationSnapshot(grounded_spec_valid=True, app_ir_valid=True, build_valid=False, blocking=True, issues=final_issues)
                 self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
                 self._append_event(job, "job_failed", job.failure_reason)
                 job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
@@ -774,11 +959,7 @@ class GenerationService:
                 if preview_issue is not None:
                     final_issues.append(preview_issue.model_dump(mode="json"))
                 job.status = "failed"
-                job.failure_reason = (
-                    "Build validation failed after automatic repair attempts."
-                    if build_issues
-                    else "Preview rebuild failed after automatic repair attempts."
-                )
+                job.failure_reason = "Build validation failed after automatic repair attempts." if build_issues else "Preview rebuild failed after automatic repair attempts."
                 job.failure_class = check_failure or self._failure_class_from_error_context(request.error_context)
                 job.root_cause_summary = self._summarize_failed_checks(build_issues, preview_issue) or job.root_cause_summary
                 if job.root_cause_summary:
@@ -791,13 +972,7 @@ class GenerationService:
                     issues=check_issues,
                     mode=request.mode,
                 )
-                job.validation_snapshot = ValidationSnapshot(
-                    grounded_spec_valid=True,
-                    app_ir_valid=True,
-                    build_valid=not bool(build_issues),
-                    blocking=True,
-                    issues=final_issues,
-                )
+                job.validation_snapshot = ValidationSnapshot(grounded_spec_valid=True, app_ir_valid=True, build_valid=not bool(build_issues), blocking=True, issues=final_issues)
                 self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
                 self._append_event(job, "job_failed", job.failure_reason)
                 job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
@@ -847,13 +1022,7 @@ class GenerationService:
                     issues=check_issues,
                     mode=request.mode,
                 )
-                job.validation_snapshot = ValidationSnapshot(
-                    grounded_spec_valid=True,
-                    app_ir_valid=True,
-                    build_valid=not bool(build_issues),
-                    blocking=True,
-                    issues=issues,
-                )
+                job.validation_snapshot = ValidationSnapshot(grounded_spec_valid=True, app_ir_valid=True, build_valid=not bool(build_issues), blocking=True, issues=issues)
                 self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
                 self._append_event(job, "job_failed", job.failure_reason)
                 return job
@@ -887,13 +1056,7 @@ class GenerationService:
                     issues=build_issues,
                     mode=request.mode,
                 )
-                job.validation_snapshot = ValidationSnapshot(
-                    grounded_spec_valid=True,
-                    app_ir_valid=True,
-                    build_valid=False,
-                    blocking=True,
-                    issues=issues,
-                )
+                job.validation_snapshot = ValidationSnapshot(grounded_spec_valid=True, app_ir_valid=True, build_valid=False, blocking=True, issues=issues)
                 self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))
                 self._append_event(job, "job_failed", job.failure_reason)
                 job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
@@ -905,7 +1068,6 @@ class GenerationService:
 
         traceability = self._build_agent_traceability_report(workspace_id, grounded_spec, all_operations)
         self._store_report(f"traceability:{workspace_id}", traceability.model_dump(mode="json"))
-
         summary = self._build_agent_summary(
             grounded_spec=grounded_spec,
             role_scope=role_scope,
@@ -929,13 +1091,7 @@ class GenerationService:
         job.traceability_report_id = traceability.report_id
         job.assumptions_report = [item.model_dump(mode="json") for item in grounded_spec.assumptions]
         job.fix_targets = sorted({operation.file_path for operation in all_operations})
-        job.validation_snapshot = ValidationSnapshot(
-            grounded_spec_valid=True,
-            app_ir_valid=True,
-            build_valid=True,
-            blocking=False,
-            issues=[],
-        )
+        job.validation_snapshot = ValidationSnapshot(grounded_spec_valid=True, app_ir_valid=True, build_valid=True, blocking=False, issues=[])
         job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
         job.latency_breakdown["ttft_ms"] = retrieval_ms
         job.latency_breakdown["total_ms"] = int((time.perf_counter() - started_at) * 1000)
@@ -961,49 +1117,9 @@ class GenerationService:
             workspace_id,
             "job_completed",
             "Generation completed successfully.",
-            {
-                "summary": summary,
-                "compile_summary": job.compile_summary,
-                "artifacts": job.artifacts,
-            },
+            {"summary": summary, "compile_summary": job.compile_summary, "artifacts": job.artifacts},
         )
         return job
-
-    def _store_resume_checkpoint(
-        self,
-        *,
-        workspace_id: str,
-        draft_run_id: str,
-        request: GenerateRequest,
-        role_scope: list[str],
-        role_contract: dict[str, Any],
-        plan_result: dict[str, Any],
-    ) -> None:
-        payload = {
-            "workspace_id": workspace_id,
-            "source_run_id": request.linked_run_id,
-            "draft_run_id": draft_run_id,
-            "status": "pending",
-            "prompt": request.prompt,
-            "intent": request.intent,
-            "mode": request.mode,
-            "generation_mode": request.generation_mode.value if isinstance(request.generation_mode, GenerationMode) else str(request.generation_mode),
-            "target_platform": request.target_platform.value if hasattr(request.target_platform, "value") else str(request.target_platform),
-            "preview_profile": request.preview_profile.value if hasattr(request.preview_profile, "value") else str(request.preview_profile),
-            "target_role_scope": role_scope,
-            "model_profile": request.model_profile,
-            "page_graph": plan_result.get("page_graph"),
-            "role_contract": role_contract,
-            "scope_mode": plan_result.get("scope_mode"),
-            "flow_mode": plan_result.get("flow_mode"),
-            "files_to_read": list(plan_result.get("files_to_read") or []),
-            "target_files": list(plan_result.get("target_files") or []),
-            "shared_files": list(plan_result.get("shared_files") or []),
-            "backend_targets": list(plan_result.get("backend_targets") or []),
-            "execution_plan": plan_result.get("execution_plan") or {},
-            "created_at": utc_now().isoformat(),
-        }
-        self._store_report(f"resume_checkpoint:{workspace_id}", payload)
 
     def retry(self, job_id: str) -> JobRecord:
         job = self.get_job(job_id)
@@ -1371,6 +1487,8 @@ class GenerationService:
             candidate = item.strip().lstrip("/")
             if not candidate or ".." in candidate:
                 continue
+            if any(char.isspace() for char in candidate):
+                continue
             normalized.append(candidate)
         return list(dict.fromkeys(normalized))
 
@@ -1519,7 +1637,12 @@ class GenerationService:
         )
         raw_target_files = self._normalize_path_list(payload.get("target_files"), [])
         if scope_mode == "minimal_patch" and raw_target_files:
-            target_files = raw_target_files
+            computed_target_set = set(computed_targets)
+            intersection = [path for path in raw_target_files if path in computed_target_set]
+            if computed_targets and not intersection:
+                target_files = list(dict.fromkeys(computed_targets))
+            else:
+                target_files = list(dict.fromkeys([*raw_target_files, *computed_targets]))
         else:
             target_files = list(dict.fromkeys([*raw_target_files, *computed_targets]))
 
@@ -2113,6 +2236,7 @@ class GenerationService:
                     for item in (doc_refs[:4] if compact else doc_refs)
                 ],
                 "workspace_tree": workspace_tree[:36] if compact else workspace_tree,
+                "workspace_path_hints": self._workspace_path_hints(workspace_tree),
                 "design_reference_files": list(DESIGN_REFERENCE_FILES),
                 "creative_direction": creative_direction,
                 "constraints": [
@@ -2122,6 +2246,9 @@ class GenerationService:
                     "If the prompt implies several flows, entities, or jobs, return a multi-page app with distinct page files and routes.",
                     "For targeted edits, keep target_files minimal and touch only the files required by the request.",
                     "Do not output role copies with changed titles only.",
+                    "Return only repo-relative file paths that fit the current workspace tree and path hints.",
+                    "Do not return HTTP endpoints, route strings, or prose labels inside target_files or backend_targets.",
+                    "Do not invent alternate backend roots such as backend/src when the current workspace uses another backend layout.",
                 ],
             }
         )
@@ -2160,6 +2287,7 @@ class GenerationService:
                     for item in (doc_refs[:3] if compact else doc_refs[:5])
                 ],
                 "workspace_tree": workspace_tree[:28] if compact else workspace_tree[:40],
+                "workspace_path_hints": self._workspace_path_hints(workspace_tree),
                 "design_reference_files": list(DESIGN_REFERENCE_FILES),
                 "creative_direction": creative_direction,
                 "constraints": [
@@ -2167,10 +2295,36 @@ class GenerationService:
                     "Keep three-role preview compatibility.",
                     "Use the existing profile design language as a style anchor.",
                     "Do not output role copies with changed titles only.",
+                    "Return only repo-relative file paths that fit the current workspace tree and path hints.",
+                    "Do not return HTTP endpoints, route strings, or prose labels inside target_files or backend_targets.",
                 ],
                 "section_contract": section_contract,
             }
         )
+
+    @staticmethod
+    def _workspace_path_hints(workspace_tree: list[dict[str, str]]) -> dict[str, Any]:
+        file_paths = [
+            str(item.get("path"))
+            for item in workspace_tree
+            if isinstance(item, dict) and item.get("type") == "file" and isinstance(item.get("path"), str)
+        ]
+        backend_files = [path for path in file_paths if path.startswith("backend/")]
+        frontend_files = [path for path in file_paths if path.startswith("frontend/")]
+        top_level_dirs = sorted(
+            {
+                path.split("/", 1)[0]
+                for path in file_paths
+                if "/" in path
+            }
+        )
+        return {
+            "top_level_dirs": top_level_dirs[:12],
+            "backend_root_candidates": sorted({"/".join(path.split("/")[:2]) for path in backend_files if "/" in path})[:8],
+            "frontend_root_candidates": sorted({"/".join(path.split("/")[:3]) for path in frontend_files if path.count("/") >= 2})[:12],
+            "backend_examples": backend_files[:12],
+            "frontend_examples": frontend_files[:16],
+        }
 
     def _code_plan_partial_schema(self, field_names: list[str]) -> dict[str, Any]:
         full_schema = self._code_plan_schema()
@@ -2302,6 +2456,11 @@ class GenerationService:
                 "role_contract": role_contract,
                 "page_graph": page_graph,
                 "target_files": target_files,
+                "workspace_path_hints": {
+                    "target_roots": sorted({path.split("/", 1)[0] for path in target_files if "/" in path}),
+                    "target_examples": target_files[:20],
+                    "existing_file_context_paths": sorted(file_contexts.keys())[:20],
+                },
                 "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
                 "file_contexts": trimmed_targets,
                 "generated_page_sources": self._bounded_file_contexts(
@@ -2327,6 +2486,8 @@ class GenerationService:
                     "Do not return a prose plan, checklist, or explanation instead of file operations.",
                     "Do not leave operations empty when target_files is non-empty.",
                     "assistant_message must briefly summarize the patch that was generated, not propose future work.",
+                    "Do not invent files under alternate architecture roots that are absent from target_files.",
+                    "If the workspace uses backend/app, do not switch to backend/src. If the workspace uses frontend/src/roles, do not switch to unrelated frontend page trees unless those exact files are in target_files.",
                 ],
             }
         )
@@ -2443,6 +2604,7 @@ class GenerationService:
         if generation_mode != GenerationMode.FAST:
             retry_modes.append(GenerationMode.FAST)
         last_error: Exception | None = None
+        scope_recovery_used = False
         for mode_attempt, prompt_mode in enumerate(retry_modes):
             try:
                 system_prompt = self._composition_system_prompt(stage_name)
@@ -2462,6 +2624,17 @@ class GenerationService:
                     generation_mode=prompt_mode,
                     creative_direction=creative_direction,
                 )
+                if scope_recovery_used:
+                    scope_recovery_note = (
+                        "Scope recovery mode:\n"
+                        "- The previous attempt used file paths outside the real workspace.\n"
+                        "- You must only emit operations for the exact repo-relative files listed in target_files.\n"
+                        "- Do not invent backend/src, src/server.ts, or any new architecture root unless that exact path is present in target_files.\n"
+                        "- If a backend surface is requested but the target_files are frontend-only, leave backend untouched.\n"
+                        "- If a target file does not exist yet, create only that exact path.\n"
+                    )
+                    system_prompt = f"{system_prompt.rstrip()}\n\n{scope_recovery_note}".strip()
+                    user_prompt = f"{user_prompt.rstrip()}\n\n{scope_recovery_note}".strip()
                 if mode_attempt > 0:
                     recovery_note = (
                         "Provider recovery mode:\n"
@@ -2503,6 +2676,18 @@ class GenerationService:
                 }
             except Exception as exc:
                 last_error = exc
+                error_text = str(exc)
+                if (
+                    not scope_recovery_used
+                    and "outside the planned scope" in error_text.lower()
+                ):
+                    scope_recovery_used = True
+                    logger.warning(
+                        "Retrying %s composition after scope mismatch: %s",
+                        stage_name,
+                        exc,
+                    )
+                    continue
                 if mode_attempt + 1 < len(retry_modes) and self._is_retryable_llm_error(exc):
                     logger.warning(
                         "Retrying %s composition with compact recovery context after transient provider failure: %s",
@@ -2627,6 +2812,9 @@ class GenerationService:
         if unexpected_paths:
             issues.append(f"Generated draft touched files outside the planned target scope: {', '.join(unexpected_paths[:5])}")
         if scope_mode == "minimal_patch":
+            meaningful_hits = [path for path in operation_paths if path in set(target_files)]
+            if target_files and not meaningful_hits:
+                issues.append("Minimal patch draft returned only artifact-level changes and did not touch any planned source targets.")
             if len(operation_paths) > max(1, len(target_files) + 1):
                 issues.append("Minimal patch mode touched too many files.")
             return issues

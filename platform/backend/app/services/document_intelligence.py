@@ -58,19 +58,15 @@ class DocumentIntelligenceService:
         workspace_documents = self.list_documents(workspace_id)
         if workspace_documents:
             self.code_index_service.index_documents(workspace_id, workspace_documents)
-        retrieval = self.code_index_service.retrieve(workspace_id=workspace_id, prompt=prompt, code_limit=max(limit // 2, 1), doc_limit=limit)
-        for item in retrieval["docs"]:  # type: ignore[index]
-            refs.append(
-                DocRef(
-                    doc_ref_id=f"{item['chunk_id']}",
-                    source_type=str(item.get("source_type") or "project_doc"),
-                    file_path=str(item["path"]),
-                    chunk_id=str(item["chunk_id"]),
-                    section_title=str(item.get("summary") or item["path"]),
-                    snippet=str(item["text"])[:280],
-                    relevance=float(item.get("score") or 0.0),
-                )
-            )
+        for document in workspace_documents:
+            refs.extend(self._refs_from_document(document, query_terms))
+
+        retrieval = self.code_index_service.retrieve(
+            workspace_id=workspace_id,
+            prompt=prompt,
+            code_limit=max(limit // 2, 1),
+            doc_limit=0,
+        )
         for item in retrieval["code"][: max(2, limit // 3)]:  # type: ignore[index]
             refs.append(
                 DocRef(
@@ -113,7 +109,8 @@ class DocumentIntelligenceService:
 
     def _refs_from_document(self, document: DocumentRecord, query_terms: set[str]) -> list[DocRef]:
         refs: list[DocRef] = []
-        for chunk in document.chunks:
+        chunks = document.chunks or self._chunk_document(document.content)
+        for chunk in chunks:
             score = self._score(chunk.content, query_terms)
             if score <= 0:
                 continue

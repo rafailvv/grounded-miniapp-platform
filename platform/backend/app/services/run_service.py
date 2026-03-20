@@ -105,6 +105,7 @@ class RunService:
             model_profile=request.model_profile,
             generation_mode=effective_generation_mode,
             llm_provider="openai" if self.openrouter_client.enabled else None,
+            resume_from_run_id=request.resume_from_run_id,
             source_revision_id=workspace.current_revision_id,
             error_context=request.error_context,
             status="pending",
@@ -301,21 +302,40 @@ class RunService:
                 target_role_scope=run.target_role_scope,
                 model_profile=request.model_profile,
                 linked_run_id=run.run_id,
+                resume_from_run_id=request.resume_from_run_id,
                 error_context=request.error_context,
             )
-            job = (
-                self.fix_orchestrator.generate(
-                    run.workspace_id,
-                    generate_request,
-                    should_stop=lambda: self._is_stop_requested(run.run_id),
-                )
-                if request.mode == "fix"
-                else self.generation_service.generate(
-                    run.workspace_id,
-                    generate_request,
-                    should_stop=lambda: self._is_stop_requested(run.run_id),
-                )
-            )
+            with self.openrouter_client.workspace_logging(run.workspace_id):
+                if request.mode == "fix" and self._should_resume_failed_generation_from_checkpoint(run, request):
+                    self.workspace_log_service.append(
+                        run.workspace_id,
+                        source="run.resume",
+                        message="Fix request matched a saved generation checkpoint. Continuing generation from the prepared draft.",
+                        payload={
+                            "run_id": run.run_id,
+                            "source_run_id": request.resume_from_run_id,
+                        },
+                    )
+                    resumed_generate_request = generate_request.model_copy(update={"mode": "generate"})
+                    job = self.generation_service.generate(
+                        run.workspace_id,
+                        resumed_generate_request,
+                        should_stop=lambda: self._is_stop_requested(run.run_id),
+                    )
+                else:
+                    job = (
+                        self.fix_orchestrator.generate(
+                            run.workspace_id,
+                            generate_request,
+                            should_stop=lambda: self._is_stop_requested(run.run_id),
+                        )
+                        if request.mode == "fix"
+                        else self.generation_service.generate(
+                            run.workspace_id,
+                            generate_request,
+                            should_stop=lambda: self._is_stop_requested(run.run_id),
+                        )
+                    )
             if self._should_auto_fix_failed_generate(request, job):
                 run.current_stage = "auto-fixing build failure"
                 run.progress_percent = max(run.progress_percent, 82)
@@ -327,11 +347,12 @@ class RunService:
                     "Frontend build failed during generate. Switching to fix mode automatically.",
                     {"run_id": run.run_id},
                 )
-                job = self.fix_orchestrator.generate(
-                    run.workspace_id,
-                    self._build_auto_fix_request(run=run, request=request, failed_job=job),
-                    should_stop=lambda: self._is_stop_requested(run.run_id),
-                )
+                with self.openrouter_client.workspace_logging(run.workspace_id):
+                    job = self.fix_orchestrator.generate(
+                        run.workspace_id,
+                        self._build_auto_fix_request(run=run, request=request, failed_job=job),
+                        should_stop=lambda: self._is_stop_requested(run.run_id),
+                    )
 
             preview = self.preview_service.get(run.workspace_id)
             change_plan = self._build_change_plan(
@@ -630,6 +651,7 @@ class RunService:
             target_platform=str(checkpoint.get("target_platform") or "telegram_mini_app"),
             preview_profile=str(checkpoint.get("preview_profile") or "telegram_mock"),
             generation_mode=str(checkpoint.get("generation_mode") or run.generation_mode.value),
+            resume_from_run_id=source_run_id or None,
         )
         resumed_run = self.create_run(run.workspace_id, resume_request)
         checkpoint["status"] = "resumed"
@@ -637,12 +659,44 @@ class RunService:
         checkpoint["resumed_from_fix_run_id"] = run.run_id
         checkpoint["resumed_at"] = datetime.now(timezone.utc).isoformat()
         self.store.upsert("reports", f"resume_checkpoint:{run.workspace_id}", checkpoint)
+        self.workspace_log_service.append(
+            run.workspace_id,
+            source="run.resume",
+            message="Fix applied successfully. Queued generation resume from checkpoint.",
+            payload={
+                "fix_run_id": run.run_id,
+                "resumed_run_id": resumed_run.run_id,
+                "source_run_id": checkpoint.get("source_run_id"),
+            },
+        )
         self._append_job_event(
             run.linked_job_id,
             "job_completed",
             f"Fix applied. Continuing generation in run {resumed_run.run_id}.",
             {"resumed_run_id": resumed_run.run_id, "source_run_id": checkpoint.get("source_run_id")},
         )
+
+    def _should_resume_failed_generation_from_checkpoint(self, run: RunRecord, request: CreateRunRequest) -> bool:
+        if request.mode != "fix":
+            return False
+        source_run_id = str(request.resume_from_run_id or "").strip()
+        if not source_run_id:
+            return False
+        try:
+            source_run = self.get_run(source_run_id)
+        except KeyError:
+            return False
+        if source_run.workspace_id != run.workspace_id:
+            return False
+        if source_run.status not in {"blocked", "failed"}:
+            return False
+        failure_class = str(source_run.failure_class or "")
+        if not failure_class.startswith("generation."):
+            return False
+        checkpoint = self.store.get("reports", f"resume_checkpoint:{run.workspace_id}")
+        if not checkpoint or checkpoint.get("status") != "pending":
+            return False
+        return str(checkpoint.get("source_run_id") or "") == source_run_id
 
     def _preview_snapshot(self, workspace_id: str, preview: Any | None = None) -> dict[str, Any]:
         current = preview or self.preview_service.get(workspace_id)

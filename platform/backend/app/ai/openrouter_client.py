@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import logging
 import os
@@ -12,13 +14,16 @@ import httpx
 
 from app.ai.model_registry import MODEL_REGISTRY, TASK_PROFILES
 from app.core.config import Settings
+from app.services.workspace_log_service import WorkspaceLogService
 
 logger = logging.getLogger(__name__)
+ACTIVE_WORKSPACE_LOG_CONTEXT: ContextVar[str | None] = ContextVar("active_workspace_log_context", default=None)
 
 
 class OpenRouterClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, workspace_log_service: WorkspaceLogService | None = None) -> None:
         self.settings = settings
+        self.workspace_log_service = workspace_log_service
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
@@ -39,6 +44,14 @@ class OpenRouterClient:
             "supports_prompt_cache_key": True,
         }
 
+    @contextmanager
+    def workspace_logging(self, workspace_id: str | None) -> Any:
+        token = ACTIVE_WORKSPACE_LOG_CONTEXT.set(workspace_id)
+        try:
+            yield
+        finally:
+            ACTIVE_WORKSPACE_LOG_CONTEXT.reset(token)
+
     def generate_structured(
         self,
         *,
@@ -54,6 +67,27 @@ class OpenRouterClient:
             raise RuntimeError("OpenAI is not configured.")
         schema_name = self._sanitize_schema_name(schema_name)
         normalized_schema = self._normalize_schema(schema)
+        if self._should_bypass_strict_schema(normalized_schema):
+            logger.info(
+                "Bypassing strict json_schema upload for %s and using json_object mode due to complex schema shape.",
+                schema_name,
+            )
+            payload = self._request_json_mode(
+                role=role,
+                model=MODEL_REGISTRY[role]["primary"],
+                schema_name=schema_name,
+                schema=normalized_schema,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                prompt_cache_key=prompt_cache_key,
+                stable_prefix=stable_prefix,
+            )
+            return {
+                "model": MODEL_REGISTRY[role]["primary"],
+                "payload": payload["payload"],
+                "response_mode": "json_object",
+                "cache_stats": payload["cache_stats"],
+            }
         model_config = MODEL_REGISTRY[role]
         primary_model = model_config["primary"]
         fallback_model = model_config["fallback"]
@@ -315,6 +349,11 @@ class OpenRouterClient:
             model,
             self._dump_for_log(payload),
         )
+        self._append_workspace_api_log(
+            source="llm.request",
+            message=f"OpenAI request sent to {endpoint}.",
+            payload={"endpoint": endpoint, "model": model, "payload": payload},
+        )
 
     def _log_prompt_bundle(
         self,
@@ -335,6 +374,18 @@ class OpenRouterClient:
             system_prompt,
             user_prompt,
         )
+        self._append_workspace_api_log(
+            source="llm.prompt",
+            message=f"OpenAI prompt prepared for {role}.",
+            payload={
+                "role": role,
+                "schema_name": schema_name,
+                "endpoint": endpoint,
+                "model": model,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+            },
+        )
 
     def _log_response(self, *, endpoint: str, model: str, response: httpx.Response) -> None:
         logger.info(
@@ -344,6 +395,16 @@ class OpenRouterClient:
             response.status_code,
             response.text,
         )
+        self._append_workspace_api_log(
+            source="llm.response",
+            message=f"OpenAI response received from {endpoint}.",
+            payload={
+                "endpoint": endpoint,
+                "model": model,
+                "status_code": response.status_code,
+                "body": response.text,
+            },
+        )
 
     def _log_parsed_text(self, *, endpoint: str, model: str, text: str) -> None:
         logger.info(
@@ -351,6 +412,22 @@ class OpenRouterClient:
             endpoint,
             model,
             text,
+        )
+        self._append_workspace_api_log(
+            source="llm.parsed_text",
+            message=f"OpenAI parsed text extracted from {endpoint}.",
+            payload={"endpoint": endpoint, "model": model, "text": text},
+        )
+
+    def _append_workspace_api_log(self, *, source: str, message: str, payload: dict[str, Any]) -> None:
+        workspace_id = ACTIVE_WORKSPACE_LOG_CONTEXT.get()
+        if not workspace_id or self.workspace_log_service is None:
+            return
+        self.workspace_log_service.append_api(
+            workspace_id,
+            source=source,
+            message=message,
+            payload=payload,
         )
 
     @staticmethod
@@ -692,6 +769,43 @@ class OpenRouterClient:
             return node
 
         return visit(deepcopy(schema))
+
+    @staticmethod
+    def _should_bypass_strict_schema(schema: dict[str, Any]) -> bool:
+        counters = {
+            "defs": 0,
+            "refs": 0,
+            "any_of": 0,
+            "objects": 0,
+        }
+
+        def visit(node: Any) -> None:
+            if isinstance(node, dict):
+                if "$defs" in node:
+                    counters["defs"] += 1
+                if "$ref" in node:
+                    counters["refs"] += 1
+                if "anyOf" in node:
+                    counters["any_of"] += 1
+                if node.get("type") == "object":
+                    counters["objects"] += 1
+                for value in node.values():
+                    visit(value)
+                return
+            if isinstance(node, list):
+                for item in node:
+                    visit(item)
+
+        visit(schema)
+        # Structured outputs are reliable for small hand-authored schemas, but
+        # large Pydantic-derived partial schemas with many refs/nullable branches
+        # frequently trigger invalid_json_schema on the Responses API.
+        return (
+            counters["defs"] > 0
+            or counters["refs"] > 8
+            or counters["any_of"] > 12
+            or counters["objects"] > 40
+        )
 
     @staticmethod
     def _schema_hint(schema_name: str, schema: dict[str, Any]) -> str:

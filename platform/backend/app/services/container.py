@@ -41,7 +41,7 @@ class ServiceContainer:
         )
         self.validation_suite = ValidationSuite()
         self.check_runner = CheckRunner(self.validation_suite, self.preview_service)
-        self.openrouter_client = OpenRouterClient(self.settings)
+        self.openrouter_client = OpenRouterClient(self.settings, self.workspace_log_service)
         self.context_pack_builder = ContextPackBuilder(self.code_index_service, self.workspace_service)
         self.generation_service = GenerationService(
             self.store,
