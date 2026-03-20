@@ -51,7 +51,7 @@ type UserGenerationMode = "fast" | "balanced" | "quality";
 
 type FixErrorContext = {
   raw_error: string;
-  source?: "build" | "preview" | "backend" | "frontend" | "runtime";
+  source?: "build" | "preview" | "miniapp" | "frontend" | "runtime";
   failing_target?: string;
 };
 
@@ -81,7 +81,7 @@ function inferFixSource(rawError: string): FixErrorContext["source"] {
     return "preview";
   }
   if (lowered.includes("traceback") || lowered.includes("modulenotfounderror") || lowered.includes("importerror")) {
-    return "backend";
+    return "miniapp";
   }
   if (lowered.includes("npm run build") || lowered.includes("vite") || lowered.includes("ts230") || lowered.includes("typescript")) {
     return "frontend";
@@ -113,6 +113,13 @@ function isRoleAtRootPreviewPath(role: RoleKey, path: string | undefined): boole
   const normalized = path || ROOT_PREVIEW_PATH;
   return normalized === ROOT_PREVIEW_PATH || normalized === getRoleRootPreviewPath(role);
 }
+
+function buildRolePreviewSrc(baseUrl: string, role: RoleKey, roleUrl: string | undefined, cycle: number): string {
+  const rawUrl = roleUrl ?? `${baseUrl}/${role}`;
+  const separator = rawUrl.includes("?") ? "&" : "?";
+  return `${rawUrl}${separator}preview_cycle=${cycle}`;
+}
+
 const PREVIEW_BOOT_POLL_ATTEMPTS = 45;
 const PREVIEW_BOOT_POLL_INTERVAL_MS = 1000;
 
@@ -605,7 +612,7 @@ export default function App() {
   const [runDetailsOpen, setRunDetailsOpen] = useState(false);
   const [runArtifacts, setRunArtifacts] = useState<RunArtifacts | null>(null);
   const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
-  const [selectedLogService, setSelectedLogService] = useState<string>("");
+  const [selectedLogSection, setSelectedLogSection] = useState<"mini-app" | "workspace">("mini-app");
   const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "logs">("preview");
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
@@ -909,36 +916,15 @@ export default function App() {
     () => extractPreviewErrorMessage(workspaceLogs?.preview?.logs ?? runArtifacts?.preview?.logs ?? []),
     [runArtifacts?.preview?.logs, workspaceLogs?.preview?.logs],
   );
-  const containerStatuses = workspaceLogs?.preview?.containers ?? [];
-  const containerLogs = workspaceLogs?.preview?.container_logs ?? {};
-  const selectedContainerLogLines = containerLogs[selectedLogService] ?? [];
-  const eventLogLines = useMemo(
-    () => {
-      const eventLines =
-        workspaceLogs?.events?.length
-          ? workspaceLogs.events.map((event) => {
-              const details =
-                event.details && Object.keys(event.details).length ? ` | ${JSON.stringify(event.details)}` : "";
-              return `- [${formatTimestamp(event.created_at)}] ${event.event_type}: ${event.message}${details}`;
-            })
-          : [];
-      const platformLines = workspaceLogs?.platform_log?.length ? workspaceLogs.platform_log : [];
-      const apiLines = workspaceLogs?.api_log?.length ? workspaceLogs.api_log : [];
-      const combined = [
-        ...eventLines,
-        ...(platformLines.length ? ["", "=== platform.log ===", ...platformLines] : []),
-        ...(apiLines.length ? ["", "=== api.log ===", ...apiLines] : []),
-      ].filter((line, index, items) => !(line === "" && (index === 0 || items[index - 1] === "")));
-      return combined.length ? combined : ["No run events yet."];
-    },
-    [workspaceLogs?.api_log, workspaceLogs?.events, workspaceLogs?.platform_log],
-  );
-  useEffect(() => {
-    const availableServices = Object.keys(containerLogs);
-    if (selectedLogService && !availableServices.includes(selectedLogService)) {
-      setSelectedLogService("");
-    }
-  }, [containerLogs, selectedLogService]);
+  const miniAppLogLines = useMemo(() => {
+    const lines = workspaceLogs?.preview?.mini_app_logs ?? [];
+    return lines.length ? lines : ["No mini-app logs yet."];
+  }, [workspaceLogs?.preview?.mini_app_logs]);
+  const workspaceLogLines = useMemo(() => {
+    const lines = workspaceLogs?.workspace_logs ?? [];
+    return lines.length ? lines : ["No workspace logs yet."];
+  }, [workspaceLogs?.workspace_logs]);
+  const activeLogLines = selectedLogSection === "mini-app" ? miniAppLogLines : workspaceLogLines;
 
   useEffect(() => {
     if (!workspace || activeRunIds.length === 0) {
@@ -1179,7 +1165,7 @@ export default function App() {
         setPreviewRuntimeMode(preview.runtime_mode ?? "");
         setPreviewStatus(preview.status ?? "");
 
-        if (preview.url) {
+        if (preview.status === "running" && preview.url) {
           setPreviewUrl(preview.url);
           setRolePreviewUrls(preview.role_urls ?? {});
           setPreviewCycle((current) => current + 1);
@@ -1614,7 +1600,7 @@ export default function App() {
         const preview = await request<PreviewInfo>(`/workspaces/${workspaceId}/preview/url`);
         setPreviewRuntimeMode(preview.runtime_mode ?? "");
         setPreviewStatus(preview.status ?? "");
-        if (preview.status === "running") {
+        if (preview.status === "running" && preview.url) {
           setPreviewUrl(preview.url ?? "");
           setRolePreviewUrls(preview.role_urls ?? {});
           setPreviewCycle((current) => current + 1);
@@ -2419,7 +2405,12 @@ export default function App() {
                         <iframe
                           key={`${role}-${previewCycle}-${rolePreviewCycle[role]}-${rolePreviewUrls[role] ?? previewUrl}`}
                           title={`Live preview ${role}`}
-                          src={rolePreviewUrls[role] ?? `${previewUrl}?role=${role}`}
+                          src={buildRolePreviewSrc(
+                            previewUrl,
+                            role,
+                            rolePreviewUrls[role],
+                            previewCycle + (rolePreviewCycle[role] ?? 0),
+                          )}
                           ref={(node) => {
                             previewFrameRefs.current[role] = node;
                           }}
@@ -2468,52 +2459,35 @@ export default function App() {
             <div className="terminal logs-terminal">
               <div className="logs-shell">
                 <div className="container-status-grid">
-                  {containerStatuses.length ? (
-                    containerStatuses.map((container) => (
-                      <button
-                        key={container.service}
-                        type="button"
-                        className={`container-status-card${selectedLogService === container.service ? " is-active" : ""}`}
-                        onClick={() =>
-                          setSelectedLogService((current) => (current === container.service ? "" : container.service))
-                        }
-                      >
-                        <div className="container-status-card-head">
-                          <strong>{container.service}</strong>
-                          <span className="container-status-meta">
-                            {container.health ?? container.status ?? container.state ?? "unknown"}
-                          </span>
-                        </div>
-                        <small>
-                          {container.state ? `state: ${container.state}` : "state: unknown"}
-                          {container.exit_code ? ` · exit: ${container.exit_code}` : ""}
-                        </small>
-                      </button>
-                    ))
-                  ) : (
-                    <div className="container-status-empty">No container status yet.</div>
-                  )}
+                  <button
+                    type="button"
+                    className={`container-status-card${selectedLogSection === "mini-app" ? " is-active" : ""}`}
+                    onClick={() => setSelectedLogSection("mini-app")}
+                  >
+                    <div className="container-status-card-head">
+                      <strong>mini-app logs</strong>
+                    </div>
+                    <small>Logs collected from the running preview container.</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={`container-status-card${selectedLogSection === "workspace" ? " is-active" : ""}`}
+                    onClick={() => setSelectedLogSection("workspace")}
+                  >
+                    <div className="container-status-card-head">
+                      <strong>workspace logs</strong>
+                    </div>
+                    <small>Platform events, build flow, and workspace-side diagnostics.</small>
+                  </button>
                 </div>
                 <div className="container-logs-panel">
                   <div className="container-logs-header">
-                    <strong>{selectedLogService || "events"}</strong>
+                    <strong>{selectedLogSection === "mini-app" ? "mini-app logs" : "workspace logs"}</strong>
                     <span>
-                      {selectedLogService
-                        ? selectedContainerLogLines.length
-                          ? `${selectedContainerLogLines.length} log lines`
-                          : "No logs yet"
-                        : eventLogLines.length
-                          ? `${eventLogLines.length} events`
-                          : "No events yet"}
+                      {activeLogLines.length ? `${activeLogLines.length} log lines` : "No logs yet"}
                     </span>
                   </div>
-                  <pre>
-                    {selectedLogService
-                      ? selectedContainerLogLines.length
-                        ? selectedContainerLogLines.join("\n")
-                        : "No logs for this container yet."
-                      : eventLogLines.join("\n")}
-                  </pre>
+                  <pre>{activeLogLines.join("\n")}</pre>
                 </div>
               </div>
             </div>

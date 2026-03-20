@@ -15,7 +15,7 @@ from app.core.config import Settings
 
 
 class PreviewRuntimeManager:
-    PREVIEW_SERVICES = ("preview-backend", "preview-frontend", "preview-proxy", "preview-db")
+    PREVIEW_SERVICES = ("preview-app",)
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -25,9 +25,12 @@ class PreviewRuntimeManager:
             return "inline"
         return "docker"
 
-    def allocate_port(self, workspace_id: str) -> int:
+    def allocate_port(self, workspace_id: str, reserved_ports: set[int] | None = None) -> int:
+        reserved_ports = reserved_ports or set()
         start = self.settings.preview_port_base + (sum(ord(char) for char in workspace_id) % 1000)
         for port in range(start, start + 400):
+            if port in reserved_ports:
+                continue
             if self._port_free(port):
                 return port
         raise RuntimeError("No free preview port available.")
@@ -164,7 +167,12 @@ class PreviewRuntimeManager:
             return {"platform": ["Docker Compose is not available inside the platform backend container."]}
         logs_by_service: dict[str, list[str]] = {}
         try:
-            for service in self.PREVIEW_SERVICES:
+            services = self._compose_services(compose_cmd, compose_file, source_dir, project_name, env)
+            if not services:
+                services = list(self._inspect_containers_via_docker(project_name).keys())
+            if not services:
+                services = ["preview-app"]
+            for service in services:
                 result = subprocess.run(
                     [*compose_cmd, "-f", str(compose_file), "-p", project_name, "logs", "--tail", "120", service],
                     cwd=self._compose_workdir(source_dir),
@@ -174,7 +182,8 @@ class PreviewRuntimeManager:
                 )
                 output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
                 lines = [line for line in output.splitlines() if line.strip()]
-                logs_by_service[service] = lines or [f"No logs for {service} yet."]
+                if lines:
+                    logs_by_service[service] = lines
         finally:
             compose_file.unlink(missing_ok=True)
         return logs_by_service
@@ -183,52 +192,33 @@ class PreviewRuntimeManager:
         try:
             compose_file = self._render_host_compose_file(source_dir)
         except FileNotFoundError:
-            return self._missing_containers()
+            compose_file = None
         compose_cmd = self._compose_command()
         project_name = self.project_name(workspace_id)
         env = self._compose_env(proxy_port or self.settings.preview_port_base)
         if compose_cmd is None:
             return []
-        try:
-            result = subprocess.run(
-                [*compose_cmd, "-f", str(compose_file), "-p", project_name, "ps", "-a", "--format", "json"],
-                cwd=self._compose_workdir(source_dir),
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-        finally:
-            compose_file.unlink(missing_ok=True)
         service_map: dict[str, dict[str, str | None]] = {}
-        payload = result.stdout.strip()
-        if payload:
-            parsed_rows: list[dict[str, object]] = []
-            try:
-                decoded = json.loads(payload)
-                if isinstance(decoded, list):
-                    parsed_rows = [item for item in decoded if isinstance(item, dict)]
-            except json.JSONDecodeError:
-                for line in payload.splitlines():
-                    try:
-                        item = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(item, dict):
-                        parsed_rows.append(item)
-            for row in parsed_rows:
-                service = str(row.get("Service") or row.get("service") or "").strip()
-                if not service:
-                    continue
-                service_map[service] = {
-                    "service": service,
-                    "name": str(row.get("Name") or row.get("name") or "") or None,
-                    "state": str(row.get("State") or row.get("state") or "") or None,
-                    "status": str(row.get("Status") or row.get("status") or "") or None,
-                    "health": str(row.get("Health") or row.get("health") or "") or None,
-                    "exit_code": str(row.get("ExitCode") or row.get("exitCode") or "") or None,
-                }
+        try:
+            if compose_file is not None:
+                result = subprocess.run(
+                    [*compose_cmd, "-f", str(compose_file), "-p", project_name, "ps", "-a", "--format", "json"],
+                    cwd=self._compose_workdir(source_dir),
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                service_map.update(self._parse_container_rows(result.stdout))
+        finally:
+            if compose_file is not None:
+                compose_file.unlink(missing_ok=True)
+        if not service_map:
+            service_map.update(self._inspect_containers_via_docker(project_name))
+        services = self._compose_services(compose_cmd, None, source_dir, project_name, env)
+        if not services:
+            services = list(service_map.keys()) or list(self.PREVIEW_SERVICES)
         containers: list[dict[str, str | None]] = []
-        for service in self.PREVIEW_SERVICES:
+        for service in services:
             containers.append(
                 service_map.get(
                     service,
@@ -274,6 +264,7 @@ class PreviewRuntimeManager:
     def _compose_env(self, proxy_port: int) -> dict[str, str]:
         env = os.environ.copy()
         env["PREVIEW_PROXY_PORT"] = str(proxy_port)
+        env["PREVIEW_APP_PORT"] = str(proxy_port)
         env["PREVIEW_AUTH_ENDPOINT"] = "/api/auth/telegram"
         env["PREVIEW_API_BASE_URL"] = ""
         env["PREVIEW_DEFAULT_ROLE"] = "client"
@@ -302,8 +293,7 @@ class PreviewRuntimeManager:
         host_source_dir = self._host_source_dir(source_dir)
         rendered = source_compose_file.read_text(encoding="utf-8")
         replacements = {
-            "../backend:/app": f"{(host_source_dir / 'backend').as_posix()}:/app",
-            "../frontend:/app": f"{(host_source_dir / 'frontend').as_posix()}:/app",
+            "../miniapp:/app": f"{(host_source_dir / 'miniapp').as_posix()}:/app",
             "./nginx.conf:/etc/nginx/conf.d/default.conf:ro": (
                 f"{(host_source_dir / 'docker' / 'nginx.conf').as_posix()}:/etc/nginx/conf.d/default.conf:ro"
             ),
@@ -346,6 +336,7 @@ class PreviewRuntimeManager:
             "status": "not started",
             "health": None,
             "exit_code": None,
+            "published_port": None,
         }
 
     @classmethod
@@ -359,3 +350,108 @@ class PreviewRuntimeManager:
             return []
         lines = [line.rstrip() for line in merged.splitlines() if line.strip()]
         return lines[-tail_lines:]
+
+    @classmethod
+    def _parse_container_rows(cls, payload: str) -> dict[str, dict[str, str | None]]:
+        service_map: dict[str, dict[str, str | None]] = {}
+        raw = payload.strip()
+        if not raw:
+            return service_map
+        parsed_rows: list[dict[str, object]] = []
+        try:
+            decoded = json.loads(raw)
+            if isinstance(decoded, list):
+                parsed_rows = [item for item in decoded if isinstance(item, dict)]
+            elif isinstance(decoded, dict):
+                parsed_rows = [decoded]
+        except json.JSONDecodeError:
+            for line in raw.splitlines():
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    parsed_rows.append(item)
+        for row in parsed_rows:
+            service = str(row.get("Service") or row.get("service") or "").strip()
+            if not service:
+                continue
+            service_map[service] = {
+                "service": service,
+                "name": str(row.get("Name") or row.get("name") or row.get("Names") or "") or None,
+                "state": str(row.get("State") or row.get("state") or "") or None,
+                "status": str(row.get("Status") or row.get("status") or "") or None,
+                "health": str(row.get("Health") or row.get("health") or "") or None,
+                "exit_code": str(row.get("ExitCode") or row.get("exitCode") or "") or None,
+                "published_port": cls._extract_published_port(row),
+            }
+        return service_map
+
+    def _inspect_containers_via_docker(self, project_name: str) -> dict[str, dict[str, str | None]]:
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "ps",
+                    "-a",
+                    "--filter",
+                    f"label=com.docker.compose.project={project_name}",
+                    "--format",
+                    "json",
+                ],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            return {}
+        if result.returncode != 0:
+            return {}
+        return self._parse_container_rows(result.stdout)
+
+    def _compose_services(
+        self,
+        compose_cmd: list[str],
+        compose_file: Path | None,
+        source_dir: Path,
+        project_name: str,
+        env: dict[str, str],
+    ) -> list[str]:
+        command = [*compose_cmd]
+        if compose_file is not None:
+            command.extend(["-f", str(compose_file)])
+        command.extend(["-p", project_name, "config", "--services"])
+        result = subprocess.run(
+            command,
+            cwd=self._compose_workdir(source_dir),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    def _extract_published_port(row: dict[str, object]) -> str | None:
+        publishers = row.get("Publishers") or row.get("publishers")
+        if isinstance(publishers, list):
+            for publisher in publishers:
+                if isinstance(publisher, dict):
+                    published = publisher.get("PublishedPort") or publisher.get("publishedPort")
+                    if published is not None:
+                        return str(published)
+        ports = row.get("Ports") or row.get("ports")
+        if isinstance(ports, str):
+            for token in ports.split(","):
+                token = token.strip()
+                if "->" not in token:
+                    continue
+                host_part = token.split("->", 1)[0].strip()
+                if ":" in host_part:
+                    candidate = host_part.rsplit(":", 1)[-1]
+                else:
+                    candidate = host_part
+                digits = "".join(char for char in candidate if char.isdigit())
+                if digits:
+                    return digits
+        return None

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import time
 from typing import Any, Callable
@@ -108,16 +109,46 @@ ROLE_COMPONENT_PREFIX = {
     "manager": "Manager",
 }
 DESIGN_REFERENCE_FILES = (
-    "frontend/src/features/profile/ui/RoleProfileEditorPage.tsx",
-    "frontend/src/features/profile/ui/RoleProfileEditorPage.module.css",
-    "frontend/src/entities/profile/ui/ProfileCabinetCard/ProfileCabinetCard.tsx",
-    "frontend/src/entities/profile/ui/ProfileCabinetCard/ProfileCabinetCard.module.css",
-    "frontend/src/widgets/role-home/RoleHomePage.tsx",
-    "frontend/src/widgets/role-home/RoleHomePage.module.css",
+    "miniapp/app/static/client/index.html",
+    "miniapp/app/static/client/profile.html",
+    "miniapp/app/static/client/styles.css",
+    "miniapp/app/static/specialist/index.html",
+    "miniapp/app/static/manager/index.html",
 )
 SHARED_GENERATED_FILES = (
-    "frontend/src/app/routing/RoleRouter.tsx",
-    "frontend/src/app/layout/AppShell.tsx",
+    "miniapp/app/main.py",
+    "miniapp/app/routes/profiles.py",
+    "miniapp/app/db.py",
+)
+WRITE_STRATEGIES = ("minimal_patch", "whole_file_build")
+CANONICAL_FRONTEND_ROOTS = (
+    "miniapp/app/static/client/",
+    "miniapp/app/static/specialist/",
+    "miniapp/app/static/manager/",
+)
+CANONICAL_BACKEND_ROOTS = (
+    "miniapp/app/main.py",
+    "miniapp/app/db.py",
+    "miniapp/app/schemas.py",
+    "miniapp/app/routes/",
+    "miniapp/app/static/",
+    "miniapp/app/generated/",
+    "miniapp/main.py",
+    "miniapp/requirements.txt",
+)
+CANONICAL_FILE_ROOTS = (*CANONICAL_FRONTEND_ROOTS, *CANONICAL_BACKEND_ROOTS, "artifacts/")
+LEGACY_ARCHITECTURE_MARKERS = (
+    "frontend/",
+    "miniapp/app/api/",
+    "miniapp/app/application/",
+    "miniapp/app/domain/",
+    "miniapp/app/infrastructure/",
+)
+BUNDLE_CLUSTER_ORDER = (
+    "backend_core",
+    "role_manager_ui",
+    "role_specialist_ui",
+    "role_client_ui",
 )
 logger = logging.getLogger(__name__)
 ACTIVE_LLM_CACHE_CONTEXT: ContextVar[dict[str, str] | None] = ContextVar("active_llm_cache_context", default=None)
@@ -159,6 +190,9 @@ class GenerationService:
 
     def generate(self, workspace_id: str, request: GenerateRequest, *, should_stop: Callable[[], bool] | None = None) -> JobRecord:
         started_at = time.perf_counter()
+        invalid_prompt_assets = self.validate_prompt_assets_are_english()
+        if invalid_prompt_assets:
+            raise ValueError(f"Prompt assets must remain English-only: {', '.join(invalid_prompt_assets[:5])}")
         effective_prompt = self._effective_prompt(request)
         target_platform = self._target_platform(request.target_platform)
         preview_profile = self._preview_profile(request.preview_profile)
@@ -636,12 +670,15 @@ class GenerationService:
             "page_graph": plan_result.get("page_graph"),
             "role_contract": role_contract,
             "scope_mode": plan_result.get("scope_mode"),
+            "write_strategy": plan_result.get("write_strategy") or plan_result.get("scope_mode"),
+            "strategy_reason": plan_result.get("strategy_reason"),
             "flow_mode": plan_result.get("flow_mode"),
             "files_to_read": list(plan_result.get("files_to_read") or []),
             "target_files": list(plan_result.get("target_files") or []),
             "shared_files": list(plan_result.get("shared_files") or []),
             "backend_targets": list(plan_result.get("backend_targets") or []),
             "execution_plan": plan_result.get("execution_plan") or {},
+            "generation_clusters": plan_result.get("generation_clusters") or [],
             "created_at": utc_now().isoformat(),
         }
         self._store_report(f"resume_checkpoint:{workspace_id}", payload)
@@ -677,19 +714,22 @@ class GenerationService:
         files_to_read = self._normalize_path_list(checkpoint.get("files_to_read"), [])
         shared_files = self._normalize_path_list(checkpoint.get("shared_files"), [])
         backend_targets = self._normalize_path_list(checkpoint.get("backend_targets"), [])
-        target_files = [path for path in target_files if path in valid_tree_paths or path.startswith("frontend/") or path.startswith("backend/")]
+        target_files = [path for path in target_files if path in valid_tree_paths or path.startswith("miniapp/")]
         files_to_read = [path for path in files_to_read if path in valid_tree_paths]
         shared_files = [path for path in shared_files if path in valid_tree_paths]
-        backend_targets = [path for path in backend_targets if path in valid_tree_paths or path.startswith("backend/")]
+        backend_targets = [path for path in backend_targets if path in valid_tree_paths or path.startswith("miniapp/")]
         plan_result = {
             "page_graph": page_graph,
             "scope_mode": checkpoint.get("scope_mode") or "minimal_patch",
+            "write_strategy": checkpoint.get("write_strategy") or checkpoint.get("scope_mode") or "minimal_patch",
+            "strategy_reason": checkpoint.get("strategy_reason") or "Resumed from a saved planning checkpoint.",
             "flow_mode": checkpoint.get("flow_mode") or "multi_page",
             "files_to_read": files_to_read,
             "target_files": target_files,
             "shared_files": shared_files,
             "backend_targets": backend_targets,
             "execution_plan": checkpoint.get("execution_plan") or {},
+            "generation_clusters": list(checkpoint.get("generation_clusters") or []),
             "require_multi_page": True,
         }
         if not plan_result["target_files"]:
@@ -789,13 +829,13 @@ class GenerationService:
             self._append_event(
                 job,
                 "planner_contract_gap_detected",
-                "Frontend/backend contract gap was detected and backend targets were expanded before composition.",
+                "Frontend/miniapp contract gap was detected and miniapp targets were expanded before composition.",
                 {"added_targets": added_targets},
             )
             self._append_event(
                 job,
                 "scope_expanded",
-                "Expanded planned targets to cover missing backend contract files.",
+                "Expanded planned targets to cover missing miniapp contract files.",
                 {"added_targets": added_targets},
             )
             plan_result["target_files"] = list(edit_result.get("effective_target_files") or plan_result["target_files"])
@@ -981,7 +1021,7 @@ class GenerationService:
                     final_issues.append(preview_issue.model_dump(mode="json"))
                 job.status = "failed"
                 job.failure_class = check_failure or "tooling/runtime_misconfiguration"
-                job.root_cause_summary = self._summarize_failed_checks(build_issues, preview_issue) or "Frontend build tooling is unavailable in the backend runtime."
+                job.root_cause_summary = self._summarize_failed_checks(build_issues, preview_issue) or "Frontend build tooling is unavailable in the miniapp runtime."
                 job.failure_reason = f"Build validation could not run because the platform runtime is missing required tooling. Root cause: {job.root_cause_summary}"
                 job.fix_targets = []
                 job.handoff_from_failed_generate = None
@@ -1036,7 +1076,7 @@ class GenerationService:
                     self._append_event(
                         job,
                         "repair_scope_expanded",
-                        "Repair scope expanded to include missing backend contract files.",
+                        "Repair scope expanded to include missing miniapp contract files.",
                         {
                             "attempt": attempt,
                             "failure_signature": failure_signature,
@@ -1074,6 +1114,7 @@ class GenerationService:
                 check_results=latest_check_results,
                 attempt=attempt + 1,
                 causal_surface=causal_surface,
+                scope_mode=plan_result["scope_mode"],
             )
             repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, repair_target_files)
             repair_result = self._repair_draft_after_failure(
@@ -1322,6 +1363,7 @@ class GenerationService:
     ) -> dict[str, Any]:
         scope_mode = self._scope_mode(intent, prompt, role_scope)
         require_multi_page = self._requires_multi_page(prompt, grounded_spec, role_scope, intent)
+        strategy_reason = self._strategy_reason(intent, prompt, role_scope, require_multi_page=require_multi_page)
         try:
             workspace_tree = self.workspace_service.file_tree(workspace_id)
             payload = self._generate_code_plan_sections(
@@ -1345,6 +1387,8 @@ class GenerationService:
                 require_multi_page=require_multi_page,
                 workspace_tree=workspace_tree,
             )
+            planned["write_strategy"] = scope_mode
+            planned["strategy_reason"] = strategy_reason
             planned["model"] = payload["model"]
             return planned
         except Exception as exc:
@@ -1459,6 +1503,22 @@ class GenerationService:
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
+        if scope_mode == "whole_file_build":
+            return self._resolve_whole_file_code_edits(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                prompt=prompt,
+                grounded_spec=grounded_spec,
+                role_scope=role_scope,
+                file_contexts=file_contexts,
+                target_files=target_files,
+                role_contract=role_contract,
+                page_graph=page_graph,
+                intent=intent,
+                scope_mode=scope_mode,
+                generation_mode=generation_mode,
+                creative_direction=creative_direction,
+            )
         target_set = set(target_files)
         page_operations: list[DraftFileOperation] = []
         page_messages: list[str] = []
@@ -1555,7 +1615,7 @@ class GenerationService:
         )
         composition_clusters: list[tuple[str, str, list[str]]] = []
         if backend_targets:
-            composition_clusters.append(("composition_backend", "backend", backend_targets))
+            composition_clusters.append(("composition_backend", "miniapp", backend_targets))
         if frontend_bootstrap_targets:
             composition_clusters.append(("composition_frontend_bootstrap", "frontend", frontend_bootstrap_targets))
         if frontend_routing_targets:
@@ -1630,7 +1690,7 @@ class GenerationService:
         assistant_parts = [message for message in page_messages if message]
         assistant_parts.extend(frontend_messages)
         assistant_message = " ".join(assistant_parts).strip() or (
-            f"Generated {len(page_operations)} page files and composed backend then frontend wiring for a {scope_mode} run."
+            f"Generated {len(page_operations)} page files and composed miniapp then frontend wiring for a {scope_mode} run."
         )
         if any(key.startswith("composition_frontend") for key in latency_breakdown):
             latency_breakdown["composition_frontend_ms"] = sum(
@@ -1645,6 +1705,249 @@ class GenerationService:
             "effective_target_files": effective_target_files,
             "latency_breakdown": latency_breakdown,
             "trace_payloads": trace_payloads,
+        }
+
+    def _resolve_whole_file_code_edits(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        file_contexts: dict[str, str],
+        target_files: list[str],
+        role_contract: dict[str, Any],
+        page_graph: dict[str, Any],
+        intent: str,
+        scope_mode: str,
+        generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        clusters = self._build_generation_clusters(target_files)
+        if not clusters:
+            return {"error": "Whole-file generation requires at least one canonical target file."}
+
+        async def resolve_clusters() -> list[dict[str, Any]]:
+            tasks = [
+                asyncio.to_thread(
+                    self._timed_whole_file_cluster,
+                    cluster_name=str(cluster["cluster_name"]),
+                    cluster_targets=list(cluster["target_files"]),
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    role_scope=role_scope,
+                    role_contract=role_contract,
+                    page_graph=page_graph,
+                    scope_mode=scope_mode,
+                    intent=intent,
+                    file_contexts=file_contexts,
+                    generation_mode=generation_mode,
+                    creative_direction=creative_direction,
+                )
+                for cluster in clusters
+            ]
+            return await asyncio.gather(*tasks)
+
+        results = asyncio.run(resolve_clusters())
+        operations: list[DraftFileOperation] = [
+            DraftFileOperation(
+                file_path="artifacts/generated_app_graph.json",
+                operation="replace",
+                content=json_dumps(page_graph),
+                reason="Persist the planned page graph for validation, preview, and run artifacts.",
+            )
+        ]
+        messages: list[str] = []
+        latency_breakdown: dict[str, int] = {}
+        trace_payloads: dict[str, dict[str, Any]] = {}
+        for result in results:
+            if "error" in result:
+                return result
+            operations.extend(result["operations"])
+            if str(result.get("assistant_message") or "").strip():
+                messages.append(str(result["assistant_message"]).strip())
+            latency_breakdown[result["cluster_name"]] = int(result["duration_ms"])
+            trace_payloads[result["cluster_name"]] = {
+                "message": f"{result['cluster_name'].replace('_', ' ').capitalize()} completed.",
+                "payload": {
+                    "duration_ms": result["duration_ms"],
+                    "target_files": result["target_files"],
+                    "operation_count": len(result["operations"]),
+                    "write_strategy": "whole_file_build",
+                },
+            }
+
+        if any(key.startswith("frontend_") for key in latency_breakdown):
+            latency_breakdown["whole_file_frontend_ms"] = sum(
+                value for key, value in latency_breakdown.items() if key.startswith("frontend_")
+            )
+        if "backend_core" in latency_breakdown:
+            latency_breakdown["whole_file_backend_ms"] = latency_breakdown["backend_core"]
+        return {
+            "assistant_message": " ".join(messages).strip() or f"Generated {len(target_files)} files using whole-file bundle generation.",
+            "operations": self._dedupe_operations(operations),
+            "planner_contract_gap_targets": [],
+            "effective_target_files": list(target_files),
+            "latency_breakdown": latency_breakdown,
+            "trace_payloads": trace_payloads,
+        }
+
+    @staticmethod
+    def _whole_file_cluster_system_prompt(cluster_name: str) -> str:
+        prompt = (
+            "Generate a whole-file code bundle for a real Telegram/MAX mini-app workspace. "
+            f"You own the {cluster_name} cluster only. "
+            "Return complete file contents for the allowed target files. "
+            "Do not emit partial patches, placeholder wrappers, or files outside the provided cluster scope."
+        )
+        GenerationService._assert_english_control_text(prompt)
+        return prompt
+
+    def _whole_file_cluster_user_prompt(
+        self,
+        *,
+        cluster_name: str,
+        cluster_targets: list[str],
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        page_graph: dict[str, Any],
+        scope_mode: str,
+        intent: str,
+        file_contexts: dict[str, str],
+        generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
+    ) -> str:
+        compact = generation_mode == GenerationMode.FAST
+        bounded_contexts = self._bounded_file_contexts(
+            {path: file_contexts.get(path, "") for path in cluster_targets},
+            max_file_chars=2600 if compact else 5200,
+            max_total_chars=10000 if compact else 18000,
+        )
+        return json_dumps(
+            {
+                "task": "Generate a whole-file cluster for the planned app change",
+                "cluster_name": cluster_name,
+                "prompt": prompt,
+                "intent": intent,
+                "scope_mode": scope_mode,
+                "role_scope": role_scope,
+                "cluster_targets": cluster_targets,
+                "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
+                "role_contract": self._compact_role_contract_for_codegen(role_contract, role_scope),
+                "page_graph": self._compact_page_graph_for_codegen(page_graph, role_scope),
+                "file_contexts": bounded_contexts,
+                "creative_direction": creative_direction,
+                "rules": [
+                    "Return only create/replace operations for files listed in cluster_targets.",
+                    "Every returned file must contain the complete final file body.",
+                    "Prefer larger coherent role/domain files over micro-modules.",
+                    "Do not create entities, features, widgets, shared, domain, infrastructure, or api sub-architectures.",
+                    "Stay inside the canonical roots miniapp/app, miniapp/app/routes, miniapp/app/static, and miniapp/app/generated.",
+                    "Use English-only control text and code comments.",
+                ],
+            }
+        )
+
+    def _resolve_whole_file_cluster(
+        self,
+        *,
+        cluster_name: str,
+        cluster_targets: list[str],
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        page_graph: dict[str, Any],
+        scope_mode: str,
+        intent: str,
+        file_contexts: dict[str, str],
+        generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = self._generate_structured_with_retry(
+            role="code_edit",
+            schema_name=f"whole_file_bundle_v1_{cluster_name}",
+            schema=self._code_edit_schema(),
+            system_prompt=self._whole_file_cluster_system_prompt(cluster_name),
+            user_prompt=self._whole_file_cluster_user_prompt(
+                cluster_name=cluster_name,
+                cluster_targets=cluster_targets,
+                prompt=prompt,
+                grounded_spec=grounded_spec,
+                role_scope=role_scope,
+                role_contract=role_contract,
+                page_graph=page_graph,
+                scope_mode=scope_mode,
+                intent=intent,
+                file_contexts=file_contexts,
+                generation_mode=generation_mode,
+                creative_direction=creative_direction,
+            ),
+        )
+        normalized = self._normalize_model_payload(payload["payload"])
+        raw_operations = normalized.get("operations")
+        if not isinstance(raw_operations, list):
+            raise ValueError("Whole-file cluster did not return operations.")
+        operations = [DraftFileOperation.model_validate(item) for item in raw_operations]
+        allowed_targets = set(cluster_targets)
+        invalid = [
+            operation.file_path
+            for operation in operations
+            if operation.file_path not in allowed_targets
+            or operation.operation not in {"create", "replace"}
+            or operation.content is None
+        ]
+        if invalid:
+            raise ValueError(f"Whole-file cluster touched files outside its scope: {', '.join(invalid[:5])}")
+        self._validate_targeted_operations(stage_name=cluster_name, target_files=cluster_targets, operations=operations)
+        return {
+            "assistant_message": str(normalized.get("assistant_message") or "").strip(),
+            "operations": operations,
+            "model": payload["model"],
+        }
+
+    def _timed_whole_file_cluster(
+        self,
+        *,
+        cluster_name: str,
+        cluster_targets: list[str],
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        page_graph: dict[str, Any],
+        scope_mode: str,
+        intent: str,
+        file_contexts: dict[str, str],
+        generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            result = self._resolve_whole_file_cluster(
+                cluster_name=cluster_name,
+                cluster_targets=cluster_targets,
+                prompt=prompt,
+                grounded_spec=grounded_spec,
+                role_scope=role_scope,
+                role_contract=role_contract,
+                page_graph=page_graph,
+                scope_mode=scope_mode,
+                intent=intent,
+                file_contexts=file_contexts,
+                generation_mode=generation_mode,
+                creative_direction=creative_direction,
+            )
+        except Exception as exc:
+            return {"error": f"Whole-file cluster failed for {cluster_name}: {exc}"}
+        return {
+            **result,
+            "cluster_name": cluster_name,
+            "target_files": cluster_targets,
+            "duration_ms": int((time.perf_counter() - started) * 1000),
         }
 
     @staticmethod
@@ -1817,15 +2120,20 @@ class GenerationService:
         else:
             target_files = list(dict.fromkeys([*raw_target_files, *computed_targets]))
 
+        flow_mode = str(raw_graph.get("flow_mode") or payload.get("flow_mode") or ("multi_page" if require_multi_page else "single_page"))
+        target_files = self._canonicalize_target_files(target_files, scope_mode=scope_mode)
         raw_files_to_read = self._normalize_path_list(payload.get("files_to_read"), [])
         files_to_read = self._collect_files_to_read(raw_files_to_read, target_files, workspace_tree)
-        flow_mode = str(raw_graph.get("flow_mode") or payload.get("flow_mode") or ("multi_page" if require_multi_page else "single_page"))
+        shared_files = [path for path in shared_files if path in set(target_files)]
+        backend_targets = [path for path in backend_targets if path in set(target_files)]
+        generation_clusters = self._build_generation_clusters(target_files)
         execution_plan = self._build_execution_plan(
             role_scope=role_scope,
             roles=roles,
             shared_files=shared_files,
             backend_targets=backend_targets,
             target_files=target_files,
+            generation_clusters=generation_clusters,
         )
 
         return {
@@ -1835,6 +2143,7 @@ class GenerationService:
             "target_files": target_files,
             "shared_files": shared_files,
             "backend_targets": backend_targets,
+            "generation_clusters": generation_clusters,
             "active_role_scope": execution_plan["active_role_scope"],
             "execution_plan": execution_plan,
             "page_graph": {
@@ -1842,6 +2151,7 @@ class GenerationService:
                 "summary": str(raw_graph.get("summary") or payload.get("summary") or "").strip(),
                 "flow_mode": flow_mode,
                 "scope_mode": scope_mode,
+                "write_strategy": scope_mode,
                 "role_scope": role_scope,
                 "shared_files": shared_files,
                 "backend_targets": backend_targets,
@@ -1878,11 +2188,14 @@ class GenerationService:
 
     @staticmethod
     def _default_routes_file(role: str) -> str:
-        return f"frontend/src/roles/{role}/{ROLE_COMPONENT_PREFIX[role]}Routes.tsx"
+        return f"miniapp/app/static/{role}/index.html"
 
     @staticmethod
     def _default_page_file(role: str, component_name: str) -> str:
-        return f"frontend/src/roles/{role}/pages/generated/{component_name}.tsx"
+        slug = re.sub(r"(?<!^)(?=[A-Z])", "-", component_name).replace("--", "-").strip("-").lower()
+        if slug.endswith("-page"):
+            slug = slug[:-5]
+        return f"miniapp/app/static/{role}/{slug or 'page'}.html"
 
     def _component_name(self, role: str, payload: dict[str, Any], index: int) -> str:
         raw_value = str(payload.get("component_name") or payload.get("title") or payload.get("page_id") or f"{role}_page_{index + 1}").strip()
@@ -1905,6 +2218,7 @@ class GenerationService:
         shared_files: list[str],
         backend_targets: list[str],
         target_files: list[str],
+        generation_clusters: list[dict[str, Any]],
     ) -> dict[str, Any]:
         target_set = set(target_files)
         role_steps: list[dict[str, Any]] = []
@@ -1939,7 +2253,7 @@ class GenerationService:
         ]
         return {
             "role_steps": role_steps,
-            "backend": {
+            "miniapp": {
                 "status": "complete" if not backend_files else "pending",
                 "target_files": backend_files,
                 "skipped": not bool(backend_files),
@@ -1949,6 +2263,7 @@ class GenerationService:
                 "target_files": frontend_files,
                 "skipped": not bool(frontend_files),
             },
+            "generation_clusters": generation_clusters,
             "active_role_scope": active_role_scope,
         }
 
@@ -1973,6 +2288,40 @@ class GenerationService:
             )
         )
         return ordered
+
+    @staticmethod
+    def _is_canonical_target_path(path: str) -> bool:
+        if any(path.startswith(marker) for marker in LEGACY_ARCHITECTURE_MARKERS):
+            return False
+        return any(path == root.rstrip("/") or path.startswith(root) for root in CANONICAL_FILE_ROOTS)
+
+    def _canonicalize_target_files(self, target_files: list[str], *, scope_mode: str) -> list[str]:
+        canonical = [path for path in target_files if self._is_canonical_target_path(path)]
+        if scope_mode == "minimal_patch":
+            return list(dict.fromkeys(canonical))
+        return list(dict.fromkeys(canonical))
+
+    @staticmethod
+    def _build_generation_clusters(target_files: list[str]) -> list[dict[str, Any]]:
+        groups: dict[str, list[str]] = {name: [] for name in BUNDLE_CLUSTER_ORDER}
+        for path in target_files:
+            if path.startswith("miniapp/"):
+                if path.startswith("miniapp/app/static/manager/"):
+                    groups["role_manager_ui"].append(path)
+                    continue
+                if path.startswith("miniapp/app/static/specialist/"):
+                    groups["role_specialist_ui"].append(path)
+                    continue
+                if path.startswith("miniapp/app/static/client/"):
+                    groups["role_client_ui"].append(path)
+                    continue
+                groups["backend_core"].append(path)
+                continue
+        return [
+            {"cluster_name": name, "target_files": list(dict.fromkeys(paths))}
+            for name, paths in groups.items()
+            if paths
+        ]
 
     @staticmethod
     def _page_edit_parallelism(*, scope_mode: str, generation_mode: GenerationMode) -> int:
@@ -2030,7 +2379,42 @@ class GenerationService:
             return "minimal_patch"
         if len(role_scope) == 1 and any(marker in lowered for marker in ("change", "update", "fix", "refine", "polish")):
             return "minimal_patch"
-        return "app_surface_build"
+        if intent == "create":
+            return "whole_file_build"
+        whole_file_markers = (
+            "full implementation",
+            "whole file",
+            "whole files",
+            "generate by files",
+            "generate files",
+            "new app surface",
+            "catalog",
+            "storefront",
+            "checkout",
+            "workspace",
+            "dashboard",
+            "workflow",
+            "multi-page",
+            "multi role",
+            "multi-role",
+            "refactor",
+        )
+        if len(role_scope) > 1 or any(marker in lowered for marker in whole_file_markers):
+            return "whole_file_build"
+        return "minimal_patch"
+
+    @staticmethod
+    def _strategy_reason(intent: str, prompt: str, role_scope: list[str], *, require_multi_page: bool) -> str:
+        lowered = prompt.lower()
+        if intent == "create":
+            return "Intent=create requires a whole-file build for the primary app surface."
+        if len(role_scope) > 1:
+            return "Multiple roles are in scope, so generation uses whole-file bundles instead of local patches."
+        if require_multi_page:
+            return "The request implies multiple pages or flows, so generation uses whole-file bundles."
+        if any(marker in lowered for marker in ("catalog", "storefront", "checkout", "workspace", "dashboard", "full implementation", "refactor")):
+            return "The request introduces a new app surface, so generation uses whole-file bundles."
+        return "The request is narrow enough to stay in minimal patch mode."
 
     @staticmethod
     def _requires_multi_page(prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str], intent: str) -> bool:
@@ -2329,11 +2713,13 @@ class GenerationService:
 
     @staticmethod
     def _role_contract_system_prompt() -> str:
-        return (
+        prompt = (
             "You are the role analyst for a real mini-app coding workspace. "
             "Before planning files, separate what client, specialist, and manager each truly own. "
             "Do not collapse roles into relabeled versions of the same surface."
         )
+        GenerationService._assert_english_control_text(prompt)
+        return prompt
 
     def _role_contract_user_prompt(
         self,
@@ -2364,19 +2750,23 @@ class GenerationService:
 
     @staticmethod
     def _code_plan_system_prompt() -> str:
-        return (
+        prompt = (
             "Plan a real file-level multi-page mini-app. "
-            "Use the role contract first, then infer the page graph, route tree, shared app files, and backend touch points. "
+            "Use the role contract first, then infer the page graph, route tree, shared app files, and miniapp touch points. "
             "Do not output placeholders, metrics-only dashboards, or one-screen role wrappers."
         )
+        GenerationService._assert_english_control_text(prompt)
+        return prompt
 
     @staticmethod
     def _code_plan_section_system_prompt(section_title: str) -> str:
-        return (
+        prompt = (
             "Plan one section of a real file-level multi-page mini-app. "
             f"Return only the requested section: {section_title}. "
             "Keep it concrete, schema-valid, and consistent with the role contract."
         )
+        GenerationService._assert_english_control_text(prompt)
+        return prompt
 
     def _code_plan_user_prompt(
         self,
@@ -2419,7 +2809,7 @@ class GenerationService:
                     "Do not output role copies with changed titles only.",
                     "Return only repo-relative file paths that fit the current workspace tree and path hints.",
                     "Do not return HTTP endpoints, route strings, or prose labels inside target_files or backend_targets.",
-                    "Do not invent alternate backend roots such as backend/src when the current workspace uses another backend layout.",
+                    "Do not invent alternate miniapp roots such as miniapp/src when the current workspace uses another miniapp layout.",
                 ],
             }
         )
@@ -2480,8 +2870,8 @@ class GenerationService:
             for item in workspace_tree
             if isinstance(item, dict) and item.get("type") == "file" and isinstance(item.get("path"), str)
         ]
-        backend_files = [path for path in file_paths if path.startswith("backend/")]
-        frontend_files = [path for path in file_paths if path.startswith("frontend/")]
+        backend_files = [path for path in file_paths if path.startswith("miniapp/")]
+        static_files = [path for path in file_paths if path.startswith("miniapp/app/static/")]
         top_level_dirs = sorted(
             {
                 path.split("/", 1)[0]
@@ -2492,9 +2882,9 @@ class GenerationService:
         return {
             "top_level_dirs": top_level_dirs[:12],
             "backend_root_candidates": sorted({"/".join(path.split("/")[:2]) for path in backend_files if "/" in path})[:8],
-            "frontend_root_candidates": sorted({"/".join(path.split("/")[:3]) for path in frontend_files if path.count("/") >= 2})[:12],
+            "frontend_root_candidates": sorted({"/".join(path.split("/")[:4]) for path in static_files if path.count("/") >= 3})[:12],
             "backend_examples": backend_files[:12],
-            "frontend_examples": frontend_files[:16],
+            "frontend_examples": static_files[:16],
         }
 
     def _code_plan_partial_schema(self, field_names: list[str]) -> dict[str, Any]:
@@ -2509,11 +2899,13 @@ class GenerationService:
 
     @staticmethod
     def _page_edit_system_prompt() -> str:
-        return (
+        prompt = (
             "Generate one real React page file for a Telegram/MAX mini-app workspace. "
             "The page must feel custom, role-specific, and grounded in the existing profile design language. "
             "Return a single create/replace operation for the requested page file only."
         )
+        GenerationService._assert_english_control_text(prompt)
+        return prompt
 
     def _page_edit_user_prompt(
         self,
@@ -2558,9 +2950,9 @@ class GenerationService:
                 "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
                 "shared_contract": {
                     "preferred_imports": [
-                        "@/shared/api/httpClient",
-                        "@/entities/profile/ui/ProfileCabinetCard/ProfileCabinetCard",
-                        "@/features/profile/model/profileStore",
+                        "@/lib/api/httpClient",
+                        "@/lib/profile/ProfileCabinetCard",
+                        "@/lib/profile/profileStore",
                     ],
                     "design_reference_files": design_reference_files,
                 },
@@ -2578,19 +2970,23 @@ class GenerationService:
 
     @staticmethod
     def _composition_system_prompt(stage_name: str) -> str:
-        if stage_name == "backend":
-            return (
-                "Compose the backend/runtime pieces after planning. "
-                "Generate only backend, API, schema, store, or contract files needed by the requested change. "
+        if stage_name == "miniapp":
+            prompt = (
+                "Compose the miniapp/runtime pieces after planning. "
+                "Generate only miniapp, API, schema, store, or contract files needed by the requested change. "
                 "Do not rewrite frontend page files. "
                 "Return executable file operations, not an implementation plan."
             )
-        return (
-            "Compose the shared frontend/runtime pieces after the individual pages and backend are written. "
-            "Generate route files, shared UI helpers, state modules, and frontend glue that connect the generated pages to the backend. "
+            GenerationService._assert_english_control_text(prompt)
+            return prompt
+        prompt = (
+            "Compose the shared UI/runtime pieces after the individual pages and miniapp are written. "
+            "Generate static HTML/CSS/JS files and miniapp-served glue that connect the generated pages to the miniapp. "
             "Do not rewrite page files unless they are explicitly targeted. "
             "Return executable file operations, not an implementation plan."
         )
+        GenerationService._assert_english_control_text(prompt)
+        return prompt
 
     def _composition_user_prompt(
         self,
@@ -2647,8 +3043,8 @@ class GenerationService:
                 "creative_direction": creative_direction,
                 "rules": [
                     "Only touch files listed in target_files.",
-                    "If stage_name is backend, generate only backend/server/shared contract files required by the request.",
-                    "If stage_name is frontend, wire pages, routes, and shared UI/state to the already planned backend surface.",
+                    "If stage_name is miniapp, generate only miniapp/server/shared contract files required by the request.",
+                    "If stage_name is frontend, wire pages, routes, and shared UI/state to the already planned miniapp surface.",
                     "Generate role routes that expose the page graph as real separate pages when routes are targeted.",
                     "Generate shared app chrome/state files that support the pages instead of rendering placeholder dashboards.",
                     "For minimal_patch, preserve unrelated behavior and keep the diff minimal.",
@@ -2658,7 +3054,7 @@ class GenerationService:
                     "Do not leave operations empty when target_files is non-empty.",
                     "assistant_message must briefly summarize the patch that was generated, not propose future work.",
                     "Do not invent files under alternate architecture roots that are absent from target_files.",
-                    "If the workspace uses backend/app, do not switch to backend/src. If the workspace uses frontend/src/roles, do not switch to unrelated frontend page trees unless those exact files are in target_files.",
+                    "If the workspace uses miniapp/app, do not switch to miniapp/src. If the workspace uses miniapp/app/static, do not switch to a separate frontend application unless those exact files are in target_files.",
                 ],
             }
         )
@@ -2800,8 +3196,8 @@ class GenerationService:
                         "Scope recovery mode:\n"
                         "- The previous attempt used file paths outside the real workspace.\n"
                         "- You must only emit operations for the exact repo-relative files listed in target_files.\n"
-                        "- Do not invent backend/src, src/server.ts, or any new architecture root unless that exact path is present in target_files.\n"
-                        "- If a backend surface is requested but the target_files are frontend-only, leave backend untouched.\n"
+                        "- Do not invent miniapp/src, src/server.ts, or any new architecture root unless that exact path is present in target_files.\n"
+                        "- If a miniapp surface is requested but the target_files are frontend-only, leave miniapp untouched.\n"
                         "- If a target file does not exist yet, create only that exact path.\n"
                     )
                     system_prompt = f"{system_prompt.rstrip()}\n\n{scope_recovery_note}".strip()
@@ -2935,7 +3331,7 @@ class GenerationService:
             for _, page in selected_pages
             if isinstance(page.get("file_path"), str)
         }
-        ordered = [path for path in target_files if path.startswith("backend/") and path not in page_paths]
+        ordered = [path for path in target_files if path.startswith("miniapp/") and path not in page_paths]
         return list(dict.fromkeys(ordered))
 
     @staticmethod
@@ -2945,7 +3341,7 @@ class GenerationService:
             for _, page in selected_pages
             if isinstance(page.get("file_path"), str)
         }
-        ordered = [path for path in target_files if path.startswith("frontend/") and path not in page_paths]
+        ordered = [path for path in target_files if path.startswith("miniapp/app/static/") and path not in page_paths]
         return list(dict.fromkeys(ordered))
 
     @staticmethod
@@ -2954,7 +3350,6 @@ class GenerationService:
         page_graph: dict[str, Any],
     ) -> tuple[list[str], list[str]]:
         route_like = {
-            "frontend/src/app/routing/RoleRouter.tsx",
             *{
                 str(role_payload.get("routes_file"))
                 for role_payload in (page_graph.get("roles") or {}).values()
@@ -2962,11 +3357,10 @@ class GenerationService:
             },
         }
         bootstrap_markers = (
-            "/App.tsx",
-            "/AppShell.tsx",
-            "/resolveRole.ts",
-            "/useAppBootstrap.ts",
-            "/httpClient.ts",
+            "/styles.css",
+            "/app.js",
+            "/profile.js",
+            "/profile.html",
         )
         routing_targets: list[str] = []
         bootstrap_targets: list[str] = []
@@ -2997,11 +3391,11 @@ class GenerationService:
             return []
         existing_targets = set(current_target_files) | set(backend_targets)
         inferred: list[str] = []
-        router_path = "backend/app/api/router.py"
+        router_path = "miniapp/app/main.py"
         for endpoint_name in sorted(endpoint_names):
             if endpoint_name in {"health", "profiles"}:
                 continue
-            inferred_path = f"backend/app/api/routes/{endpoint_name}.py"
+            inferred_path = f"miniapp/app/routes/{endpoint_name}.py"
             if inferred_path not in existing_targets:
                 inferred.append(inferred_path)
             if router_path not in existing_targets:
@@ -3042,6 +3436,7 @@ class GenerationService:
     def _page_graph_gate_issues(page_graph: dict[str, Any], role_scope: list[str], *, scope_mode: str, require_multi_page: bool) -> list[str]:
         issues: list[str] = []
         roles = page_graph.get("roles") or {}
+        planned_paths = set(page_graph.get("shared_files") or []) | set(page_graph.get("backend_targets") or [])
         total_pages = 0
         normalized_role_routes: list[tuple[str, tuple[str, ...]]] = []
         for role in role_scope:
@@ -3050,6 +3445,8 @@ class GenerationService:
             routes_file = role_payload.get("routes_file")
             if not isinstance(routes_file, str) or not routes_file:
                 issues.append(f"{role} is missing a routes file.")
+            else:
+                planned_paths.add(routes_file)
             if not isinstance(pages, list) or not pages:
                 issues.append(f"{role} is missing page definitions.")
                 continue
@@ -3062,6 +3459,11 @@ class GenerationService:
                     tuple(sorted(str(page.get("route_path") or "") for page in pages)),
                 )
             )
+            planned_paths.update(
+                str(page.get("file_path"))
+                for page in pages
+                if isinstance(page, dict) and isinstance(page.get("file_path"), str)
+            )
         if scope_mode != "minimal_patch" and require_multi_page and page_graph.get("flow_mode") != "multi_page":
             issues.append("The generated plan did not stay in multi-page mode.")
         if scope_mode != "minimal_patch" and require_multi_page and total_pages <= len(role_scope):
@@ -3070,6 +3472,9 @@ class GenerationService:
             route_sets = [routes for _, routes in normalized_role_routes]
             if len(set(route_sets)) == 1:
                 issues.append("Selected roles still share the same route tree.")
+        invalid_paths = [path for path in planned_paths if isinstance(path, str) and not GenerationService._is_canonical_target_path(path)]
+        if invalid_paths:
+            issues.append(f"Planned targets left the canonical architecture: {', '.join(sorted(invalid_paths)[:5])}")
         return issues
 
     @staticmethod
@@ -3087,6 +3492,14 @@ class GenerationService:
         unexpected_paths = [path for path in operation_paths if path not in allowed_target_paths]
         if unexpected_paths:
             issues.append(f"Generated draft touched files outside the planned target scope: {', '.join(unexpected_paths[:5])}")
+        legacy_paths = [path for path in operation_paths if any(path.startswith(marker) for marker in LEGACY_ARCHITECTURE_MARKERS)]
+        if legacy_paths:
+            issues.append(f"Generated draft reintroduced legacy architecture paths: {', '.join(sorted(legacy_paths)[:5])}")
+        non_canonical_paths = [
+            path for path in operation_paths if path != "artifacts/generated_app_graph.json" and not GenerationService._is_canonical_target_path(path)
+        ]
+        if non_canonical_paths:
+            issues.append(f"Generated draft left the canonical architecture roots: {', '.join(sorted(non_canonical_paths)[:5])}")
         if scope_mode == "minimal_patch":
             meaningful_hits = [path for path in operation_paths if path in set(target_files)]
             if target_files and not meaningful_hits:
@@ -3282,12 +3695,14 @@ class GenerationService:
 
     @staticmethod
     def _repair_system_prompt() -> str:
-        return (
+        prompt = (
             "You repair an existing draft workspace after build or preview failure. "
             "Return only the smallest safe set of file operations needed to make the draft compile and boot. "
             "Do not expand scope, do not redesign the app, and do not touch files outside the provided target list. "
             "Return executable file operations, not a repair plan."
         )
+        GenerationService._assert_english_control_text(prompt)
+        return prompt
 
     def _repair_user_prompt(
         self,
@@ -3504,7 +3919,7 @@ class GenerationService:
     @staticmethod
     def _is_structural_contract_failure(build_issues: list[ValidationIssue]) -> bool:
         markers = (
-            "backend route is missing",
+            "miniapp route is missing",
             "missing endpoint",
             "expects /api/",
         )
@@ -3549,8 +3964,8 @@ class GenerationService:
                 causal.add(issue.location)
             for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", issue.message):
                 endpoint_name = match.group(1)
-                causal.add(f"backend/app/api/routes/{endpoint_name}.py")
-                causal.add("backend/app/api/router.py")
+                causal.add(f"miniapp/app/routes/{endpoint_name}.py")
+                causal.add("miniapp/app/main.py")
         return causal or active_target_set
 
     def _expand_structural_repair_targets(
@@ -3564,7 +3979,7 @@ class GenerationService:
         for issue in build_issues:
             for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", issue.message):
                 endpoint_name = match.group(1)
-                for candidate in (f"backend/app/api/routes/{endpoint_name}.py", "backend/app/api/router.py"):
+                for candidate in (f"miniapp/app/routes/{endpoint_name}.py", "miniapp/app/main.py"):
                     if candidate not in expanded:
                         expanded.append(candidate)
                         added.append(candidate)
@@ -3577,8 +3992,16 @@ class GenerationService:
         check_results: list[RunCheckResult],
         attempt: int,
         causal_surface: set[str],
+        scope_mode: str,
     ) -> list[str]:
         hinted_files = self._extract_failure_file_hints(check_results, active_targets)
+        if scope_mode == "whole_file_build":
+            narrowed = [path for path in hinted_files if path in set(active_targets)]
+            if narrowed:
+                return narrowed[:8]
+            dependent = [path for path in active_targets if path in causal_surface]
+            if dependent:
+                return dependent[:10]
         if attempt <= 3:
             narrowed = [path for path in hinted_files if path in set(active_targets)]
             if narrowed:
@@ -3643,6 +4066,26 @@ class GenerationService:
         tightened["system_prompt"] = f"{str(request_kwargs.get('system_prompt') or '').rstrip()}\n\n{retry_note}".strip()
         tightened["user_prompt"] = f"{str(request_kwargs.get('user_prompt') or '').rstrip()}\n\n{retry_note}".strip()
         return tightened
+
+    @staticmethod
+    def _contains_non_english_control_text(text: str) -> bool:
+        return bool(re.search(r"[\u0400-\u04FF]", text))
+
+    @classmethod
+    def _assert_english_control_text(cls, *texts: str) -> None:
+        invalid = [text for text in texts if isinstance(text, str) and cls._contains_non_english_control_text(text)]
+        if invalid:
+            raise ValueError("Control prompts must remain English-only.")
+
+    @classmethod
+    def validate_prompt_assets_are_english(cls) -> list[str]:
+        prompt_dir = Path(__file__).resolve().parents[1] / "ai" / "prompts"
+        invalid_files: list[str] = []
+        for file_path in sorted(prompt_dir.glob("*.md")):
+            content = file_path.read_text(encoding="utf-8")
+            if cls._contains_non_english_control_text(content):
+                invalid_files.append(str(file_path))
+        return invalid_files
 
     @staticmethod
     def _llm_cache_kwargs() -> dict[str, str]:
@@ -4300,7 +4743,7 @@ class GenerationService:
                     "required",
                     "endpoint",
                     "api",
-                    "backend",
+                    "miniapp",
                     "manager",
                     "specialist",
                     "workflow",
@@ -4331,7 +4774,7 @@ class GenerationService:
                         name="Submit primary request",
                         method="POST",
                         path="/api/submissions",
-                        purpose="Persist the primary end-user form submission in the generated mini-app backend.",
+                        purpose="Persist the primary end-user form submission in the generated mini-app miniapp.",
                         request_fields=[
                             APIField(name="name", type="string", required=True, description="End-user display name"),
                             APIField(name="phone", type="phone", required=True, description="End-user phone number"),
@@ -4365,7 +4808,7 @@ class GenerationService:
             assumptions.append(
                 Assumption(
                     assumption_id="assume_generated_submission_api",
-                    text="The canonical generated backend exposes a default submission API for primary form flows.",
+                    text="The canonical generated miniapp exposes a default submission API for primary form flows.",
                     status="active",
                     rationale="Simple booking and request prompts should compile into a usable end-to-end demo without blocking on undocumented project-specific endpoints.",
                     impact="medium",
@@ -4595,21 +5038,21 @@ class GenerationService:
                     persistence_req_id="persist_request_create",
                     entity_id="entity_request",
                     operation="create",
-                    storage_type="postgres",
+                    storage_type="sqlite",
                     evidence=evidence,
                 ),
                 PersistenceRequirement(
                     persistence_req_id="persist_request_list",
                     entity_id="entity_request",
                     operation="list",
-                    storage_type="postgres",
+                    storage_type="sqlite",
                     evidence=evidence,
                 ),
                 PersistenceRequirement(
                     persistence_req_id="persist_request_update",
                     entity_id="entity_request",
                     operation="update",
-                    storage_type="postgres",
+                    storage_type="sqlite",
                     evidence=evidence,
                 ),
             ],
@@ -4772,7 +5215,7 @@ class GenerationService:
                 StorageBinding(
                     binding_id="storage_request",
                     entity_id=primary_entity.entity_id,
-                    storage_type="postgres",
+                    storage_type="sqlite",
                     table_or_collection="requests",
                 )
             ],
@@ -4868,47 +5311,47 @@ class GenerationService:
             PatchOperationModel(
                 operation_id="op_app_ir",
                 op="update",
-                file_path="backend/app/generated/app_ir.json",
+                file_path="miniapp/app/generated/app_ir.json",
                 content=json_dumps(ir.model_dump(mode="json")),
-                explanation="Persist the current typed AppIR for the template backend.",
+                explanation="Persist the current typed AppIR for the template miniapp.",
                 trace_refs=["prompt-source"],
             ),
             PatchOperationModel(
                 operation_id="op_runtime_manifest_backend",
                 op="update",
-                file_path="backend/app/generated/runtime_manifest.json",
+                file_path="miniapp/app/generated/runtime_manifest.json",
                 content=json_dumps(runtime_manifest),
-                explanation="Compile a role-aware runtime manifest for backend APIs.",
+                explanation="Compile a role-aware runtime manifest for miniapp APIs.",
                 trace_refs=["prompt-source"],
             ),
             PatchOperationModel(
                 operation_id="op_runtime_state",
                 op="update",
-                file_path="backend/app/generated/runtime_state.json",
+                file_path="miniapp/app/generated/runtime_state.json",
                 content=json_dumps(runtime_state),
                 explanation="Seed mutable runtime state for live preview actions and list/detail flows.",
                 trace_refs=["prompt-source"],
             ),
             PatchOperationModel(
-                operation_id="op_frontend_runtime_manifest",
+                operation_id="op_static_runtime_manifest",
                 op="update",
-                file_path="frontend/src/shared/generated/runtime-manifest.json",
+                file_path="miniapp/app/generated/static_runtime_manifest.json",
                 content=json_dumps(runtime_manifest),
-                explanation="Provide a frontend fallback/runtime manifest for generated routing and rendering.",
+                explanation="Provide a static UI/runtime manifest for generated miniapp-served pages.",
                 trace_refs=["prompt-source"],
             ),
             PatchOperationModel(
                 operation_id="op_preview_payload",
                 op="update",
-                file_path="frontend/src/shared/generated/role-experience.json",
+                file_path="miniapp/app/generated/role_experience.json",
                 content=json_dumps(role_experience),
-                explanation="Compile role-aware marketing/summary descriptors for platform preview cards.",
+                explanation="Compile role-aware descriptors for miniapp-served preview pages.",
                 trace_refs=["prompt-source"],
             ),
             PatchOperationModel(
                 operation_id="op_role_seed",
                 op="update",
-                file_path="backend/app/generated/role_seed.json",
+                file_path="miniapp/app/generated/role_seed.json",
                 content=json_dumps(role_seed),
                 explanation="Compile role-aware summaries and metrics for inline preview fallback.",
                 trace_refs=["prompt-source"],
@@ -6729,7 +7172,7 @@ class GenerationService:
             "build_started": ("running validation and build", 90),
             "checks_completed": ("checks complete", 93),
             "preview_skipped_due_to_build_failure": ("preview skipped until build is green", 91),
-            "planner_contract_gap_detected": ("expanding missing backend contract targets", 72),
+            "planner_contract_gap_detected": ("expanding missing miniapp contract targets", 72),
             "preview_rebuild_started": ("refreshing preview", 96),
             "preview_ready": ("preview ready", 98),
             "draft_ready": ("awaiting review", 99),
@@ -7201,12 +7644,12 @@ class GenerationService:
     @staticmethod
     def _detect_contradictions(prompt: str) -> list[Contradiction]:
         lowered = prompt.lower()
-        if "without backend" in lowered and "database" in lowered:
+        if "without miniapp" in lowered and "database" in lowered:
             return [
                 Contradiction(
                     contradiction_id="contr_backend_database",
-                    description="The prompt asks for no backend but also persistence in a database.",
-                    left_side="without backend",
+                    description="The prompt asks for no miniapp but also persistence in a database.",
+                    left_side="without miniapp",
                     right_side="database persistence",
                     severity="critical",
                     resolution_hint="Choose whether the feature is frontend-only or persistent.",

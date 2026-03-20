@@ -5,6 +5,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from app.core.config import Settings
 from app.models.domain import PreviewRecord
@@ -15,6 +17,7 @@ from app.services.workspace_service import WorkspaceService
 
 ROLE_ORDER = ("client", "specialist", "manager")
 STARTING_STALE_AFTER_SEC = 45
+PREVIEW_HTTP_PROBE_TIMEOUT_SEC = 1.5
 
 
 class PreviewService:
@@ -55,7 +58,7 @@ class PreviewService:
         started_at = datetime.now(timezone.utc)
         try:
             self._append_log(preview, f"Preview start requested. mode={runtime_mode}.")
-            proxy_port = self._select_proxy_port(workspace_id, preview)
+            proxy_port = self._select_proxy_port(workspace_id, preview, source_dir)
             self._append_log(preview, f"Selected preview port {proxy_port}.")
             preview.progress_percent = max(preview.progress_percent, 24)
             self._persist(preview)
@@ -135,7 +138,7 @@ class PreviewService:
         started_at = datetime.now(timezone.utc)
         try:
             self._append_log(preview, f"Preview rebuild requested. mode={runtime_mode}.")
-            proxy_port = self._select_proxy_port(workspace_id, preview)
+            proxy_port = self._select_proxy_port(workspace_id, preview, source_dir)
             self._append_log(preview, f"Using preview port {proxy_port} for rebuild.")
             preview.progress_percent = max(preview.progress_percent, 28)
             self._persist(preview)
@@ -193,11 +196,14 @@ class PreviewService:
         worker.start()
         return preview
 
-    def _select_proxy_port(self, workspace_id: str, preview: PreviewRecord) -> int:
+    def _select_proxy_port(self, workspace_id: str, preview: PreviewRecord, source_dir: Path) -> int:
         existing_port = preview.proxy_port
-        if existing_port is not None and self.runtime_manager.port_free(existing_port):
+        reserved_ports = self._reserved_preview_ports(workspace_id)
+        if existing_port is not None and self._port_belongs_to_workspace(workspace_id, source_dir, existing_port):
             return existing_port
-        return self.runtime_manager.allocate_port(workspace_id)
+        if existing_port is not None and existing_port not in reserved_ports and self.runtime_manager.port_free(existing_port):
+            return existing_port
+        return self.runtime_manager.allocate_port(workspace_id, reserved_ports=reserved_ports)
 
     def _ensure_worker(self, workspace_id: str, force_rebuild: bool) -> None:
         preview = self._reconcile_runtime_state(self._get_or_create(workspace_id), workspace_id)
@@ -264,6 +270,7 @@ class PreviewService:
         if not payload:
             return self._get_or_create(workspace_id)
         preview = self._reconcile_runtime_state(PreviewRecord.model_validate(payload), workspace_id)
+        preview = self._gate_public_readiness(preview)
         if preview.runtime_mode == "inline":
             preview.runtime_mode = "docker"
             preview.status = "error"
@@ -293,7 +300,38 @@ class PreviewService:
         preview = self.get(workspace_id)
         if not preview.url:
             return {}
-        return {role: f"{preview.url}?role={role}" for role in ROLE_ORDER}
+        return {role: f"{preview.url}/{role}" for role in ROLE_ORDER}
+
+    def _gate_public_readiness(self, preview: PreviewRecord) -> PreviewRecord:
+        if preview.runtime_mode != "docker" or preview.status != "running" or not preview.url:
+            return preview
+        if self._http_preview_ready(preview.url):
+            return preview
+        preview.url = None
+        preview.status = "starting"
+        preview.stage = "health_check"
+        preview.progress_percent = min(99, max(preview.progress_percent, 92))
+        preview.frontend_url = None
+        preview.backend_url = None
+        preview.last_error = None
+        self._persist(preview)
+        return preview
+
+    def _http_preview_ready(self, preview_url: str) -> bool:
+        probe_paths = ("/health", "/client")
+        for probe_path in probe_paths:
+            if not self._probe_http(f"{preview_url}{probe_path}"):
+                return False
+        return True
+
+    @staticmethod
+    def _probe_http(url: str) -> bool:
+        request = Request(url, headers={"Cache-Control": "no-cache"})
+        try:
+            with urlopen(request, timeout=PREVIEW_HTTP_PROBE_TIMEOUT_SEC) as response:
+                return 200 <= int(response.status) < 400
+        except (URLError, OSError, ValueError):
+            return False
 
     def render_html(self, workspace_id: str, source_dir: Path, role: str = "client") -> str:
         payload = self._preview_payload_from_source(source_dir)
@@ -550,6 +588,32 @@ class PreviewService:
             return self.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
         return self.workspace_service.source_dir(workspace_id)
 
+    def _reserved_preview_ports(self, workspace_id: str) -> set[int]:
+        reserved: set[int] = set()
+        for payload in self.store.list("previews"):
+            try:
+                item = PreviewRecord.model_validate(payload)
+            except Exception:
+                continue
+            if item.workspace_id == workspace_id or item.proxy_port is None:
+                continue
+            if item.runtime_mode != "docker":
+                continue
+            if item.status not in {"starting", "running"}:
+                continue
+            reserved.add(item.proxy_port)
+        return reserved
+
+    def _port_belongs_to_workspace(self, workspace_id: str, source_dir: Path, port: int) -> bool:
+        containers = self.runtime_manager.inspect_containers(workspace_id, source_dir, port)
+        for container in containers:
+            if (container.get("state") or "") != "running":
+                continue
+            published_port = container.get("published_port")
+            if isinstance(published_port, str) and published_port.isdigit() and int(published_port) == port:
+                return True
+        return False
+
     def _is_stale_starting_preview(self, preview: PreviewRecord) -> bool:
         age_seconds = (datetime.now(timezone.utc) - preview.updated_at).total_seconds()
         return age_seconds >= STARTING_STALE_AFTER_SEC
@@ -566,10 +630,19 @@ class PreviewService:
 
         runtime_present = False
         runtime_running = False
+        restored_proxy_port: int | None = None
         if source_dir is not None:
             containers = self.runtime_manager.inspect_containers(workspace_id, source_dir, preview.proxy_port)
             runtime_present = any((container.get("state") or "") != "missing" for container in containers)
             runtime_running = any((container.get("state") or "") == "running" for container in containers)
+            if runtime_running:
+                for container in containers:
+                    if (container.get("state") or "") != "running":
+                        continue
+                    published_port = container.get("published_port")
+                    if isinstance(published_port, str) and published_port.isdigit():
+                        restored_proxy_port = int(published_port)
+                        break
 
         changed = False
         if not runtime_present and (
@@ -589,7 +662,10 @@ class PreviewService:
             preview.last_error = None
             self._append_log(preview, "Preview runtime was not found. Resetting stale preview state.")
             changed = True
-        elif runtime_running and preview.proxy_port is not None and (preview.status != "running" or not preview.url):
+        elif runtime_running and (preview.proxy_port is not None or restored_proxy_port is not None) and (
+            preview.status != "running" or not preview.url
+        ):
+            preview.proxy_port = preview.proxy_port or restored_proxy_port
             preview.project_name = preview.project_name or self.runtime_manager.project_name(workspace_id)
             preview.url = self.runtime_manager.preview_url(preview.proxy_port)
             preview.frontend_url = preview.url

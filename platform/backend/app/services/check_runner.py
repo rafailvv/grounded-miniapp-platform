@@ -26,7 +26,7 @@ class CheckRunner:
         source_dir: Path,
         changed_files: list[str],
         preview_run_id: str | None = None,
-        scope_mode: str = "app_surface_build",
+        scope_mode: str = "whole_file_build",
     ) -> CheckExecutionRecord:
         started = time.perf_counter()
         results: list[RunCheckResult] = []
@@ -127,7 +127,7 @@ class CheckRunner:
     @staticmethod
     def has_tooling_failure(results: list[RunCheckResult]) -> bool:
         markers = (
-            "npm is not available in the backend runtime",
+            "npm is not available in the miniapp runtime",
             "frontend build tooling is unavailable",
             "node.js/npm is missing",
         )
@@ -139,7 +139,7 @@ class CheckRunner:
 
     def _static_check(self, *, source_dir: Path, changed_files: list[str]) -> RunCheckResult:
         frontend_dir = source_dir / "frontend"
-        backend_dir = source_dir / "backend"
+        backend_dir = source_dir / "miniapp"
         logs: list[str] = []
         executed = False
 
@@ -196,12 +196,12 @@ class CheckRunner:
             return RunCheckResult(
                 name="changed_files_static",
                 status="failed",
-                details="Frontend build tooling is unavailable in the backend runtime.",
+                details="Frontend build tooling is unavailable in the miniapp runtime.",
                 command="npm run build",
                 logs=[
-                    "Frontend build tooling is unavailable in the backend runtime.",
+                    "Frontend build tooling is unavailable in the miniapp runtime.",
                     "npm was not found on PATH.",
-                    "Install Node.js/npm in the platform backend runtime and rebuild the backend container.",
+                    "Install Node.js/npm in the platform miniapp runtime and rebuild the miniapp container.",
                 ],
             )
 
@@ -267,9 +267,9 @@ class CheckRunner:
             return RunCheckResult(
                 name="changed_files_static",
                 status="failed",
-                details="npm is not available in the backend runtime.",
+                details="npm is not available in the miniapp runtime.",
                 command="npm run build",
-                logs=["npm is not available in the backend runtime."],
+                logs=["npm is not available in the miniapp runtime."],
             )
         except subprocess.TimeoutExpired as exc:
             return RunCheckResult(
@@ -304,9 +304,9 @@ class CheckRunner:
             return RunCheckResult(
                 name="changed_files_static",
                 status="passed",
-                details="No backend Python files required compilation.",
+                details="No miniapp Python files required compilation.",
                 command="python -m py_compile",
-                logs=["No backend Python files required compilation."],
+                logs=["No miniapp Python files required compilation."],
             )
         try:
             command = [sys.executable, "-m", "py_compile", *py_files]
@@ -329,18 +329,18 @@ class CheckRunner:
             return RunCheckResult(
                 name="changed_files_static",
                 status="failed",
-                details="Backend py_compile failed for the draft backend.",
+                details="Backend py_compile failed for the draft miniapp.",
                 command=f"{sys.executable} -m py_compile {' '.join(py_files)}",
                 exit_code=result.returncode,
-                logs=self._command_logs("Backend py_compile failed for the draft backend.", result.stdout, result.stderr),
+                logs=self._command_logs("Backend py_compile failed for the draft miniapp.", result.stdout, result.stderr),
             )
         return RunCheckResult(
             name="changed_files_static",
             status="passed",
-            details="Backend py_compile passed for the draft backend.",
+            details="Backend py_compile passed for the draft miniapp.",
             command=f"{sys.executable} -m py_compile {' '.join(py_files)}",
             exit_code=result.returncode,
-            logs=["Backend py_compile passed for the draft backend."],
+            logs=["Backend py_compile passed for the draft miniapp."],
         )
 
     @staticmethod

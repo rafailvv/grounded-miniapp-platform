@@ -180,53 +180,56 @@ The implementation keeps the provider-specific details isolated in the client:
 
 The platform still keeps a deterministic synthesis fallback. That is deliberate: if `OPENROUTER_API_KEY` is absent or a provider call fails, the pipeline remains usable for local research instead of failing hard at prompt intake.
 
-### 7. A canonical base mini-app template was implemented, then upgraded to three roles
+### 7. A canonical base mini-app template was implemented, then simplified to one miniapp runtime
 
 The runtime template is under:
 
 - [runtime/templates/base-miniapp](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp)
 
-Originally the generated scaffold was one-flow oriented. After your frontend update, the template was upgraded to match the actual role structure already present in the mini-app frontend:
+The current template is a single FastAPI-served miniapp with separate static pages per role:
 
 - `client`
 - `specialist`
 - `manager`
 
-The template backend now exposes:
+The template miniapp now exposes:
 
-- `POST /api/auth/telegram`
-- `GET /api/roles`
-- `GET /api/dashboard/{role}`
 - `GET /api/profiles/{role}`
 - `PUT /api/profiles/{role}`
-- `POST /api/submissions`
+- `GET /health`
+- `GET /client`
+- `GET /client/profile`
+- `GET /specialist`
+- `GET /specialist/profile`
+- `GET /manager`
+- `GET /manager/profile`
 
 Key files:
 
-- [runtime/templates/base-miniapp/backend/app/main.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/backend/app/main.py)
-- [runtime/templates/base-miniapp/backend/app/store.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/backend/app/store.py)
-- [runtime/templates/base-miniapp/backend/app/generated/role_seed.json](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/backend/app/generated/role_seed.json)
+- [runtime/templates/base-miniapp/miniapp/app/main.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/main.py)
+- [runtime/templates/base-miniapp/miniapp/app/db.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/db.py)
+- [runtime/templates/base-miniapp/miniapp/app/routes/profiles.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/routes/profiles.py)
+- [runtime/templates/base-miniapp/miniapp/app/static/preview-bridge.js](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/static/preview-bridge.js)
 
 This was done because the template is the compilation target. If the target template already has real role routing and role pages, the backend and generated artifacts must respect that structure. Otherwise the platform would compile artifacts into a template that expects a different runtime model, which would create an architectural mismatch immediately.
 
-### 8. The mini-app frontend was connected to the role-aware backend scaffold
+### 8. Role pages are served directly from the miniapp runtime
 
-The updated template frontend already had strong role separation and bootstrap logic. To make it usable as a real template, the following additions were made:
+The current template no longer keeps a separate generated frontend application. Instead, each role has its own static HTML, CSS, and JS files under the miniapp runtime:
 
-- backend profile API integration;
-- backend dashboard loading for role home pages;
-- role-experience generated file for compiler output;
-- `.env.example` for the template frontend.
+- `/miniapp/app/static/client/*`
+- `/miniapp/app/static/specialist/*`
+- `/miniapp/app/static/manager/*`
+- one shared preview bridge under `/miniapp/app/static/preview-bridge.js`
 
 Key files:
 
-- [runtime/templates/base-miniapp/frontend/src/shared/profile/profileApi.ts](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/frontend/src/shared/profile/profileApi.ts)
-- [runtime/templates/base-miniapp/frontend/src/shared/profile/clientProfile.ts](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/frontend/src/shared/profile/clientProfile.ts)
-- [runtime/templates/base-miniapp/frontend/src/shared/ui/templates/RoleCabinetHomePage.tsx](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/frontend/src/shared/ui/templates/RoleCabinetHomePage.tsx)
-- [runtime/templates/base-miniapp/frontend/src/shared/ui/templates/RoleProfileEditorPage.tsx](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/frontend/src/shared/ui/templates/RoleProfileEditorPage.tsx)
-- [runtime/templates/base-miniapp/frontend/src/shared/generated/role-experience.json](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/frontend/src/shared/generated/role-experience.json)
+- [runtime/templates/base-miniapp/miniapp/app/static/client/index.html](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/static/client/index.html)
+- [runtime/templates/base-miniapp/miniapp/app/static/client/profile.html](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/static/client/profile.html)
+- [runtime/templates/base-miniapp/miniapp/app/static/specialist/index.html](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/static/specialist/index.html)
+- [runtime/templates/base-miniapp/miniapp/app/static/manager/index.html](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/static/manager/index.html)
 
-This was done because a template frontend that only stores state locally is useful for UI prototyping, but not sufficient as a generation target for a grounded platform. The template needs a backend contract that the platform can preserve and patch.
+This keeps the generation target flat and whole-file friendly instead of splitting a tiny miniapp into a separate frontend stack.
 
 ### 9. The platform preview was changed from one phone to three phones
 
@@ -254,16 +257,14 @@ Preview is no longer limited to the in-process fallback renderer. The backend no
 
 The canonical template now includes the runtime assets required for that lifecycle:
 
-- [runtime/templates/base-miniapp/backend/Dockerfile](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/backend/Dockerfile)
-- [runtime/templates/base-miniapp/frontend/Dockerfile](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/frontend/Dockerfile)
+- [runtime/templates/base-miniapp/miniapp/Dockerfile](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/Dockerfile)
 - [runtime/templates/base-miniapp/docker/docker-compose.yml](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/docker/docker-compose.yml)
-- [runtime/templates/base-miniapp/docker/nginx.conf](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/docker/nginx.conf)
 
 Each workspace runtime gets:
 
 - an isolated compose project name;
 - an allocated proxy port;
-- backend, frontend, database, and proxy containers;
+- a single miniapp preview container;
 - health-check polling before the preview is marked ready;
 - `rebuild` after generation and `reset` for cleanup.
 
@@ -278,15 +279,15 @@ Artifact generation in:
 no longer writes only a single preview payload. It now writes:
 
 - `artifacts/grounded_spec.json`
-- `backend/app/generated/app_ir.json`
-- `backend/app/generated/role_seed.json`
-- `frontend/src/shared/generated/role-experience.json`
+- `miniapp/app/generated/app_ir.json`
+- `miniapp/app/generated/static_runtime_manifest.json`
+- `miniapp/app/generated/role_experience.json`
 - `artifacts/traceability.json`
 
 This was done because the canonical template is no longer a one-screen stub. It is now a tri-role baseline, so generated artifacts must provide:
 
-- role-aware backend seed data;
-- role-aware frontend experience descriptors;
+- role-aware static runtime metadata;
+- role-aware miniapp experience descriptors;
 - the IR and traceability artifacts for audit and future compilation steps.
 
 ### 12. Root environment configuration was added
@@ -417,9 +418,8 @@ grounded-miniapp-platform/
 - `POST /workspaces/{workspace_id}/preview/reset`
 - `GET /workspaces/{workspace_id}/preview/url`
 - `GET /workspaces/{workspace_id}/preview/logs`
-- `GET /preview/{workspace_id}?role=client`
-- `GET /preview/{workspace_id}?role=specialist`
-- `GET /preview/{workspace_id}?role=manager`
+- `GET /preview/{workspace_id}` for the preview shell
+- per-role preview URLs returned by `GET /workspaces/{workspace_id}/preview/url`
 
 ### Export
 
@@ -439,13 +439,10 @@ The current canonical template is not a blank starter. It is a structured three-
 
 ### Current template capabilities
 
-- Telegram auth bootstrap contract
-- role resolution and role routing
-- role-specific dashboard endpoint
+- role-specific static pages served by one miniapp runtime
 - role-specific profile persistence endpoint
-- local + backend profile synchronization
-- generated role-experience artifact on frontend
-- generated role-seed artifact on backend
+- SQLite-backed profile persistence
+- per-role preview URLs and shared preview bridge behavior
 
 ### Why one canonical template was kept
 
@@ -474,7 +471,7 @@ The project now includes a root environment template and a local environment fil
 - backend preview base URL;
 - backend data directory;
 - OpenRouter base URL and API key slot;
-- base mini-app backend/frontend defaults.
+- base mini-app runtime defaults.
 
 ### Important note
 
@@ -528,17 +525,13 @@ This starts:
 - PostgreSQL
 - Redis
 
-### 4. Base mini-app template frontend
+### 4. Base mini-app template runtime
 
-The template frontend has its own `.env.example`:
-
-- [runtime/templates/base-miniapp/frontend/.env.example](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/frontend/.env.example)
-
-Copy it locally when you run the template separately:
+The template is now a single miniapp runtime:
 
 ```bash
-cd /Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/frontend
-cp .env.example .env
+cd /Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/docker
+docker compose up -d
 ```
 
 ## What Has Been Verified
@@ -569,7 +562,7 @@ The main gaps are:
 - retrieval is lexical and deterministic for now, not full hybrid embeddings + reranking;
 - PostgreSQL and Redis are included in topology, but the current platform persistence layer is file-backed, not yet DB-backed;
 - repair loops are architecturally represented but not yet full autonomous multi-iteration code repair against real compiler/test diagnostics;
-- platform frontend build and template frontend build were not runtime-verified in this environment because local frontend tool dependencies were not installed here at execution time.
+- platform frontend build was runtime-verified, while template verification now focuses on the single miniapp runtime rather than a separate template frontend.
 
 These choices were intentional to keep the current state coherent:
 
@@ -587,8 +580,8 @@ If you want to understand the project quickly, start here:
 - [platform/backend/app/services/workspace_service.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/platform/backend/app/services/workspace_service.py)
 - [platform/backend/app/services/preview_service.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/platform/backend/app/services/preview_service.py)
 - [platform/frontend/src/App.tsx](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/platform/frontend/src/App.tsx)
-- [runtime/templates/base-miniapp/frontend/README.md](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/frontend/README.md)
-- [runtime/templates/base-miniapp/backend/app/main.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/backend/app/main.py)
+- [runtime/templates/base-miniapp/docs/README.md](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/docs/README.md)
+- [runtime/templates/base-miniapp/miniapp/app/main.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/main.py)
 
 ## Summary
 

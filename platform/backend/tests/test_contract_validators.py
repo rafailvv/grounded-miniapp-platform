@@ -116,7 +116,7 @@ def make_valid_spec() -> GroundedSpecModel:
                 persistence_req_id="persist_1",
                 entity_id="entity_1",
                 operation="create",
-                storage_type="postgres",
+                storage_type="sqlite",
                 evidence=evidence,
             )
         ],
@@ -313,7 +313,7 @@ def make_valid_ir() -> AppIRModel:
             StorageBinding(
                 binding_id="binding_1",
                 entity_id="entity_1",
-                storage_type="postgres",
+                storage_type="sqlite",
                 table_or_collection="submissions",
             )
         ],
@@ -347,11 +347,12 @@ def _write_workspace_file(workspace_root: Path, relative_path: str, content: str
 
 
 def _create_workspace_scaffold(workspace_root: Path) -> None:
-    _write_workspace_file(workspace_root, "backend/app/main.py", "app = object()\n")
-    _write_workspace_file(workspace_root, "backend/requirements.txt", "fastapi\n")
-    _write_workspace_file(workspace_root, "frontend/package.json", '{ "name": "test-app" }\n')
-    _write_workspace_file(workspace_root, "frontend/src/main.tsx", "export {};\n")
-    _write_workspace_file(workspace_root, "frontend/src/app/App.tsx", "export function App(): JSX.Element { return <div />; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/main.py", "app = object()\n")
+    _write_workspace_file(workspace_root, "miniapp/requirements.txt", "fastapi\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.html", "<main>client</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile.html", "<main>client profile</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/index.html", "<main>specialist</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/index.html", "<main>manager</main>\n")
     _write_workspace_file(workspace_root, "docker/docker-compose.yml", "services: {}\n")
     _write_workspace_file(workspace_root, "artifacts/grounded_spec.json", "{}\n")
 
@@ -361,24 +362,24 @@ def _multi_page_graph() -> dict:
         "flow_mode": "multi_page",
         "roles": {
             "client": {
-                "routes_file": "frontend/src/roles/client/ClientRoutes.tsx",
+                "routes_file": "miniapp/app/static/client/index.html",
                 "pages": [
-                    {"route_path": "/", "file_path": "frontend/src/roles/client/pages/generated/ClientHomePage.tsx"},
-                    {"route_path": "/catalog", "file_path": "frontend/src/roles/client/pages/generated/ClientCatalogPage.tsx"},
+                    {"route_path": "/client", "file_path": "miniapp/app/static/client/index.html"},
+                    {"route_path": "/client/profile", "file_path": "miniapp/app/static/client/profile.html"},
                 ],
             },
             "specialist": {
-                "routes_file": "frontend/src/roles/specialist/SpecialistRoutes.tsx",
+                "routes_file": "miniapp/app/static/specialist/index.html",
                 "pages": [
-                    {"route_path": "/", "file_path": "frontend/src/roles/specialist/pages/generated/SpecialistHomePage.tsx"},
-                    {"route_path": "/queue", "file_path": "frontend/src/roles/specialist/pages/generated/SpecialistQueuePage.tsx"},
+                    {"route_path": "/specialist", "file_path": "miniapp/app/static/specialist/index.html"},
+                    {"route_path": "/specialist/profile", "file_path": "miniapp/app/static/specialist/profile.html"},
                 ],
             },
             "manager": {
-                "routes_file": "frontend/src/roles/manager/ManagerRoutes.tsx",
+                "routes_file": "miniapp/app/static/manager/index.html",
                 "pages": [
-                    {"route_path": "/", "file_path": "frontend/src/roles/manager/pages/generated/ManagerHomePage.tsx"},
-                    {"route_path": "/dashboard", "file_path": "frontend/src/roles/manager/pages/generated/ManagerDashboardPage.tsx"},
+                    {"route_path": "/manager", "file_path": "miniapp/app/static/manager/index.html"},
+                    {"route_path": "/manager/profile", "file_path": "miniapp/app/static/manager/profile.html"},
                 ],
             },
         },
@@ -403,7 +404,7 @@ def test_grounded_spec_validator_blocks_critical_contradictions() -> None:
                 Contradiction(
                     contradiction_id="c_1",
                     description="Conflict",
-                    left_side="without backend",
+                    left_side="without miniapp",
                     right_side="save to database",
                     severity="critical",
                 )
@@ -441,26 +442,22 @@ def test_build_validator_accepts_distinct_multi_page_role_graph(tmp_path: Path) 
 
     _write_workspace_file(
         workspace_root,
-        "frontend/src/roles/client/ClientRoutes.tsx",
-        "<Route index element={<ClientHomePage />} />\n<Route path=\"catalog\" element={<ClientCatalogPage />} />\n<Route path=\"*\" element={<Navigate to=\"/\" replace />} />\n",
+        "miniapp/app/static/client/index.html",
+        "<main><section>book a new consultation</section></main>\n",
     )
     _write_workspace_file(
         workspace_root,
-        "frontend/src/roles/specialist/SpecialistRoutes.tsx",
-        "<Route index element={<SpecialistHomePage />} />\n<Route path=\"queue\" element={<SpecialistQueuePage />} />\n<Route path=\"*\" element={<Navigate to=\"/\" replace />} />\n",
+        "miniapp/app/static/client/profile.html",
+        "<main><section>client profile editor</section></main>\n",
     )
     _write_workspace_file(
         workspace_root,
-        "frontend/src/roles/manager/ManagerRoutes.tsx",
-        "<Route index element={<ManagerHomePage />} />\n<Route path=\"dashboard\" element={<ManagerDashboardPage />} />\n<Route path=\"*\" element={<Navigate to=\"/\" replace />} />\n",
+        "miniapp/app/static/specialist/index.html",
+        "<main><section>process the live queue</section></main>\n",
     )
-
-    _write_workspace_file(workspace_root, "frontend/src/roles/client/pages/generated/ClientHomePage.tsx", "export function ClientHomePage(): JSX.Element { return <div>book a new consultation</div>; }\n")
-    _write_workspace_file(workspace_root, "frontend/src/roles/client/pages/generated/ClientCatalogPage.tsx", "export function ClientCatalogPage(): JSX.Element { return <div>client catalog</div>; }\n")
-    _write_workspace_file(workspace_root, "frontend/src/roles/specialist/pages/generated/SpecialistHomePage.tsx", "export function SpecialistHomePage(): JSX.Element { return <div>process the live queue</div>; }\n")
-    _write_workspace_file(workspace_root, "frontend/src/roles/specialist/pages/generated/SpecialistQueuePage.tsx", "export function SpecialistQueuePage(): JSX.Element { return <div>specialist queue</div>; }\n")
-    _write_workspace_file(workspace_root, "frontend/src/roles/manager/pages/generated/ManagerHomePage.tsx", "export function ManagerHomePage(): JSX.Element { return <div>supervise operational health</div>; }\n")
-    _write_workspace_file(workspace_root, "frontend/src/roles/manager/pages/generated/ManagerDashboardPage.tsx", "export function ManagerDashboardPage(): JSX.Element { return <div>manager dashboard</div>; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile.html", "<main><section>specialist profile</section></main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/index.html", "<main><section>supervise operational health</section></main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile.html", "<main><section>manager profile</section></main>\n")
 
     issues = BuildValidator().validate(workspace_root)
     issue_codes = {issue.code for issue in issues}
@@ -475,18 +472,14 @@ def test_build_validator_flags_placeholder_and_identical_role_pages(tmp_path: Pa
     graph = _multi_page_graph()
     _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
 
-    placeholder_routes = "import { RoleCabinetHomePage } from '@/shared/ui/templates/RoleCabinetHomePage';\n<Route index element={<RoleCabinetHomePage role=\"client\" />} />\n"
-    _write_workspace_file(workspace_root, "frontend/src/roles/client/ClientRoutes.tsx", placeholder_routes)
-    _write_workspace_file(workspace_root, "frontend/src/roles/specialist/SpecialistRoutes.tsx", placeholder_routes)
-    _write_workspace_file(workspace_root, "frontend/src/roles/manager/ManagerRoutes.tsx", placeholder_routes)
+    placeholder_html = "<main>RoleCabinetHomePage</main>\n"
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.html", placeholder_html)
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/index.html", placeholder_html)
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/index.html", placeholder_html)
 
-    identical_root = "export function SharedHome(): JSX.Element { return <div>Role dashboard</div>; }\n"
-    _write_workspace_file(workspace_root, "frontend/src/roles/client/pages/generated/ClientHomePage.tsx", identical_root)
-    _write_workspace_file(workspace_root, "frontend/src/roles/client/pages/generated/ClientCatalogPage.tsx", "export function ClientCatalogPage(): JSX.Element { return <div>catalog</div>; }\n")
-    _write_workspace_file(workspace_root, "frontend/src/roles/specialist/pages/generated/SpecialistHomePage.tsx", identical_root)
-    _write_workspace_file(workspace_root, "frontend/src/roles/specialist/pages/generated/SpecialistQueuePage.tsx", "export function SpecialistQueuePage(): JSX.Element { return <div>queue</div>; }\n")
-    _write_workspace_file(workspace_root, "frontend/src/roles/manager/pages/generated/ManagerHomePage.tsx", identical_root)
-    _write_workspace_file(workspace_root, "frontend/src/roles/manager/pages/generated/ManagerDashboardPage.tsx", "export function ManagerDashboardPage(): JSX.Element { return <div>dashboard</div>; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile.html", "<main><section>catalog</section></main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile.html", "<main><section>queue</section></main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile.html", "<main><section>dashboard</section></main>\n")
 
     issues = BuildValidator().validate(workspace_root)
     issue_codes = {issue.code for issue in issues}

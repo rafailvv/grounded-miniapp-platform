@@ -1,2 +1,2 @@
-"""Grounded mini-app platform backend."""
+"""Grounded mini-app platform miniapp."""
 

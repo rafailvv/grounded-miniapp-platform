@@ -146,7 +146,7 @@ RunMode = Literal["generate", "fix"]
 
 class ErrorContext(StrictModel):
     raw_error: str
-    source: Literal["build", "preview", "backend", "frontend", "runtime"] | None = None
+    source: Literal["build", "preview", "miniapp", "frontend", "runtime"] | None = None
     failing_target: str | None = None
 
 
@@ -395,6 +395,7 @@ class ContainerStatusRecord(StrictModel):
     status: str | None = None
     health: str | None = None
     exit_code: str | None = None
+    published_port: str | None = None
 
 
 class FixScopeEntry(StrictModel):

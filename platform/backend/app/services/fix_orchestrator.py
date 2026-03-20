@@ -167,7 +167,7 @@ class FixOrchestrator:
                 workspace_id=workspace_id,
                 run_id=run_id,
                 draft_source=draft_source,
-                changed_files=[entry.file_path for entry in scope_entries] or ["frontend", "backend"],
+                changed_files=[entry.file_path for entry in scope_entries] or ["frontend", "miniapp"],
             )
             job.executed_checks = [result.model_dump(mode="json") for result in latest_check_execution.results]
             job.container_statuses = latest_preview_details.get("containers", [])
@@ -469,7 +469,7 @@ class FixOrchestrator:
         changed_files: list[str],
     ) -> tuple[CheckExecutionRecord, dict[str, Any]]:
         self._append_event(job, "frontend_build_started", "Running exact frontend/build verification.")
-        self._append_event(job, "backend_compile_started", "Running exact backend compile verification.")
+        self._append_event(job, "backend_compile_started", "Running exact miniapp compile verification.")
         execution = self.check_runner.run(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -652,13 +652,13 @@ class FixOrchestrator:
     @staticmethod
     def _can_expand_for_file(candidate: str, implicated_files: list[str]) -> bool:
         if not implicated_files:
-            return candidate.startswith(("frontend/", "backend/", "docker/"))
+            return candidate.startswith(("miniapp/", "docker/"))
         for file_path in implicated_files:
             if candidate.startswith(file_path.rsplit("/", 1)[0] + "/"):
                 return True
             if candidate.split("/", 1)[0] == file_path.split("/", 1)[0]:
                 return True
-        return candidate.startswith(("docker/", "frontend/src/shared/", "backend/app/"))
+        return candidate.startswith(("docker/", "miniapp/app/", "miniapp/app/static/"))
 
     def _build_write_scope(
         self,
@@ -672,11 +672,11 @@ class FixOrchestrator:
         for file_path in implicated_files:
             entries.setdefault(file_path, FixScopeEntry(file_path=file_path, reason="Directly implicated by the current failure evidence."))
         if failure_class.startswith("preview_runtime") or failure_class.startswith("runtime") or failure_class.startswith("tooling"):
-            for candidate in ("docker/nginx.conf", "docker/docker-compose.yml", "frontend/package.json", "backend/requirements.txt"):
+            for candidate in ("docker/docker-compose.yml", "miniapp/requirements.txt", "miniapp/app/main.py"):
                 if self._file_exists(workspace_id, run_id, candidate):
                     entries.setdefault(candidate, FixScopeEntry(file_path=candidate, reason="Runtime or preview glue may be involved in the current failure."))
         if not entries:
-            for fallback in ("frontend/src", "backend/app"):
+            for fallback in ("miniapp/app/static", "miniapp/app"):
                 entries.setdefault(fallback, FixScopeEntry(file_path=fallback, reason="Fallback repair surface for the current failure cluster."))
         return list(entries.values())
 
@@ -718,10 +718,10 @@ class FixOrchestrator:
         existing_scope: list[FixScopeEntry],
     ) -> list[str]:
         candidates: list[str] = []
-        for match in re.findall(r"((?:frontend|backend|docker)/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+)", text):
+        for match in re.findall(r"((?:miniapp|docker)/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+)", text):
             candidates.append(match)
-        for match in re.findall(r"(src/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx))", text):
-            candidates.append(f"frontend/{match}")
+        for match in re.findall(r"(static/[A-Za-z0-9_./-]+\.(?:html|css|js))", text):
+            candidates.append(f"miniapp/app/{match}")
         for module in re.findall(r"\"(@/[A-Za-z0-9_./-]+)\"", text):
             resolved = self._resolve_frontend_module(workspace_id, run_id, module)
             if resolved:
@@ -935,17 +935,17 @@ class FixOrchestrator:
         return f"fix:{digest}"
 
     def _resolve_frontend_module(self, workspace_id: str, run_id: str, module_path: str) -> str | None:
-        normalized = module_path.replace("@/", "frontend/src/")
+        normalized = module_path.replace("@/", "miniapp/app/static/")
         candidates = [normalized]
         if "." not in Path(normalized).name:
-            candidates.extend([f"{normalized}.tsx", f"{normalized}.ts", f"{normalized}.jsx", f"{normalized}.js"])
+            candidates.extend([f"{normalized}.html", f"{normalized}.css", f"{normalized}.js"])
         for candidate in candidates:
             if self._file_exists(workspace_id, run_id, candidate):
                 return candidate
         return None
 
     def _resolve_backend_module(self, workspace_id: str, run_id: str, module_path: str) -> str | None:
-        normalized = f"backend/{module_path.replace('.', '/')}.py"
+        normalized = f"miniapp/{module_path.replace('.', '/')}.py"
         return normalized if self._file_exists(workspace_id, run_id, normalized) else None
 
     def _file_exists(self, workspace_id: str, run_id: str, relative_path: str) -> bool:
@@ -1045,7 +1045,7 @@ class FixOrchestrator:
             "job_started": ("starting fix", 6),
             "triage_started": ("triaging failure", 12),
             "frontend_build_started": ("compiling frontend", 22),
-            "backend_compile_started": ("compiling backend", 30),
+            "backend_compile_started": ("compiling miniapp", 30),
             "preview_validation_started": ("rebuilding preview", 40),
             "triage_completed": ("evidence ready", 48),
             "repair_planned": ("planning repair patch", 58),

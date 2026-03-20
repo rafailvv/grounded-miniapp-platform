@@ -214,7 +214,7 @@ class Integration(StrictModel):
 class StorageBinding(StrictModel):
     binding_id: str
     entity_id: str
-    storage_type: Literal["postgres", "redis", "memory", "external"]
+    storage_type: Literal["sqlite", "postgres", "redis", "memory", "external"]
     table_or_collection: str
 
 

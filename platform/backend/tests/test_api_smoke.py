@@ -48,6 +48,41 @@ def _install_llm_stub(app) -> None:
                     "risks": ["Provider instability"],
                 },
             }
+        if schema_name == "grounded_spec_core_v1":
+            spec = _grounded_spec_payload(str(payload.get("prompt") or "Generated mini-app"))
+            return {
+                "model": "openai/gpt-5-mini",
+                "payload": {
+                    "product_goal": spec["product_goal"],
+                    "actors": spec["actors"],
+                    "domain_entities": spec["domain_entities"],
+                    "user_flows": spec["user_flows"],
+                },
+            }
+        if schema_name == "grounded_spec_requirements_v1":
+            spec = _grounded_spec_payload(str(payload.get("prompt") or "Generated mini-app"))
+            return {
+                "model": "openai/gpt-5-mini",
+                "payload": {
+                    "ui_requirements": spec["ui_requirements"],
+                    "api_requirements": spec["api_requirements"],
+                    "persistence_requirements": spec["persistence_requirements"],
+                    "integration_requirements": spec["integration_requirements"],
+                    "security_requirements": spec["security_requirements"],
+                    "platform_constraints": spec["platform_constraints"],
+                    "non_functional_requirements": spec["non_functional_requirements"],
+                },
+            }
+        if schema_name == "grounded_spec_governance_v1":
+            spec = _grounded_spec_payload(str(payload.get("prompt") or "Generated mini-app"))
+            return {
+                "model": "openai/gpt-5-mini",
+                "payload": {
+                    "assumptions": spec["assumptions"],
+                    "unknowns": spec["unknowns"],
+                    "contradictions": spec["contradictions"],
+                },
+            }
         if schema_name == "grounded_spec_v1":
             prompt = str(payload.get("prompt") or "Generated mini-app")
             return {"model": "openai/gpt-5-mini", "payload": _grounded_spec_payload(prompt)}
@@ -56,18 +91,20 @@ def _install_llm_stub(app) -> None:
             return {"model": "openai/gpt-5-mini", "payload": _grounded_spec_payload(prompt)}
         if schema_name == "role_contract_v1":
             return {"model": "openai/gpt-5-mini", "payload": _role_contract_payload(payload.get("role_scope") or [])}
-        if schema_name == "page_graph_v2":
+        if schema_name in {"page_graph_v2", "page_graph_structure_v1", "page_graph_targeting_v1"}:
             return {
                 "model": "openai/gpt-5-mini",
                 "payload": _page_graph_payload(
                     role_scope=payload.get("role_scope") or [],
-                    scope_mode=str(payload.get("scope_mode") or "app_surface_build"),
+                    scope_mode=str(payload.get("scope_mode") or "whole_file_build"),
                 ),
             }
         if schema_name.startswith("page_file_v1_"):
             return {"model": "openai/gpt-5.1-codex-mini", "payload": _page_file_payload(payload)}
         if schema_name == "composition_bundle_v1":
             return {"model": "openai/gpt-5.1-codex-mini", "payload": _composition_payload(payload)}
+        if schema_name.startswith("whole_file_bundle_v1_"):
+            return {"model": "openai/gpt-5.1-codex-mini", "payload": _whole_file_bundle_payload(payload)}
         if schema_name == "fix_patch_v1":
             return {"model": "openai/gpt-5.1-codex-mini", "payload": _fix_patch_payload(payload)}
         raise AssertionError(f"Unexpected schema name: {schema_name}")
@@ -170,7 +207,7 @@ def _grounded_spec_payload(prompt: str) -> dict:
                 "assumption_id": "assume_1",
                 "text": "Use stubbed LLM responses in tests.",
                 "status": "active",
-                "rationale": "The backend tests verify the orchestration flow without calling a real provider.",
+                "rationale": "The miniapp tests verify the orchestration flow without calling a real provider.",
             }
         ],
         "unknowns": [],
@@ -223,25 +260,25 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
         pages = [
             {
                 "role": "client",
-                "entry_path": "/",
+                "entry_path": "/client",
                 "landing_page_id": "client_home",
-                "routes_file": "frontend/src/roles/client/ClientRoutes.tsx",
+                "routes_file": "miniapp/app/static/client/index.html",
                 "pages": [
                     _page(
                         "client_home",
-                        "/",
+                        "/client",
                         "Home",
-                        "ClientHomePage",
-                        "frontend/src/roles/client/pages/ClientHomePage.tsx",
+                        "client_index",
+                        "miniapp/app/static/client/index.html",
                         "Client workspace",
                         "A real role landing page with actions instead of placeholder metrics.",
                     ),
                     _page(
                         "client_profile",
-                        "/profile",
+                        "/client/profile",
                         "Profile",
-                        "ClientProfilePage",
-                        "frontend/src/roles/client/pages/ClientProfile/ClientProfilePage.tsx",
+                        "client_profile",
+                        "miniapp/app/static/client/profile.html",
                         "Profile",
                         "Profile editing page.",
                     ),
@@ -252,10 +289,10 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
             "summary": "Refine the existing client flow without touching unrelated roles.",
             "flow_mode": "multi_page",
             "files_to_read": [
-                "frontend/src/roles/client/pages/ClientHomePage.tsx",
-                "frontend/src/features/profile/ui/RoleProfileEditorPage.tsx",
+                "miniapp/app/static/client/index.html",
+                "miniapp/app/static/client/styles.css",
             ],
-            "target_files": ["frontend/src/roles/client/pages/ClientHomePage.tsx"],
+            "target_files": ["miniapp/app/static/client/index.html"],
             "shared_files": [],
             "backend_targets": [],
             "page_graph": {
@@ -268,47 +305,51 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
 
     templates = {
         "client": [
-            _page("client_home", "/", "Home", "ClientHomePage", "frontend/src/roles/client/pages/generated/ClientHomePage.tsx", "Booking home", "Entry page with clear shopper actions."),
-            _page("client_catalog", "/catalog", "Catalog", "ClientCatalogPage", "frontend/src/roles/client/pages/generated/ClientCatalogPage.tsx", "Catalog", "Browse services or products."),
-            _page("client_detail", "/details/:recordId", "Detail", "ClientDetailPage", "frontend/src/roles/client/pages/generated/ClientDetailPage.tsx", "Detail", "Open an item and inspect its details."),
+            _page("client_home", "/client", "Home", "client_index", "miniapp/app/static/client/index.html", "Booking home", "Entry page with clear shopper actions."),
+            _page("client_profile", "/client/profile", "Profile", "client_profile", "miniapp/app/static/client/profile.html", "Profile", "Profile editing page."),
         ],
         "specialist": [
-            _page("specialist_home", "/", "Desk", "SpecialistHomePage", "frontend/src/roles/specialist/pages/generated/SpecialistHomePage.tsx", "Operations desk", "Entry page for active work."),
-            _page("specialist_queue", "/queue", "Queue", "SpecialistQueuePage", "frontend/src/roles/specialist/pages/generated/SpecialistQueuePage.tsx", "Queue", "List of active items."),
-            _page("specialist_detail", "/queue/:recordId", "Task", "SpecialistDetailPage", "frontend/src/roles/specialist/pages/generated/SpecialistDetailPage.tsx", "Task workspace", "Detailed work item page."),
+            _page("specialist_home", "/specialist", "Desk", "specialist_index", "miniapp/app/static/specialist/index.html", "Operations desk", "Entry page for active work."),
+            _page("specialist_profile", "/specialist/profile", "Profile", "specialist_profile", "miniapp/app/static/specialist/profile.html", "Profile", "Profile editing page."),
         ],
         "manager": [
-            _page("manager_home", "/", "Overview", "ManagerHomePage", "frontend/src/roles/manager/pages/generated/ManagerHomePage.tsx", "Operations overview", "Landing page with attention points."),
-            _page("manager_dashboard", "/dashboard", "Dashboard", "ManagerDashboardPage", "frontend/src/roles/manager/pages/generated/ManagerDashboardPage.tsx", "Dashboard", "Overall status and trends."),
-            _page("manager_team", "/team", "Team", "ManagerTeamPage", "frontend/src/roles/manager/pages/generated/ManagerTeamPage.tsx", "Team load", "Supervision of current team load."),
+            _page("manager_home", "/manager", "Overview", "manager_index", "miniapp/app/static/manager/index.html", "Operations overview", "Landing page with attention points."),
+            _page("manager_profile", "/manager/profile", "Profile", "manager_profile", "miniapp/app/static/manager/profile.html", "Profile", "Profile editing page."),
         ],
     }
     roles = []
-    target_files = ["frontend/src/app/routing/RoleRouter.tsx", "frontend/src/app/layout/AppShell.tsx"]
+    target_files = ["miniapp/app/main.py", "miniapp/app/routes/profiles.py", "miniapp/app/db.py"]
     for role in role_scope:
         role_pages = templates[role]
         roles.append(
             {
                 "role": role,
-                "entry_path": "/",
+                "entry_path": f"/{role}",
                 "landing_page_id": role_pages[0]["page_id"],
-                "routes_file": f"frontend/src/roles/{role}/{ROLE_PREFIX[role]}Routes.tsx",
+                "routes_file": f"miniapp/app/static/{role}/index.html",
                 "pages": role_pages,
             }
         )
-        target_files.append(f"frontend/src/roles/{role}/{ROLE_PREFIX[role]}Routes.tsx")
+        target_files.extend(
+            [
+                f"miniapp/app/static/{role}/styles.css",
+                f"miniapp/app/static/{role}/app.js",
+                f"miniapp/app/static/{role}/profile.js",
+            ]
+        )
         target_files.extend(page["file_path"] for page in role_pages)
     return {
-        "summary": "Create a routed booking workspace with custom role-specific pages.",
+        "summary": "Create a role-based booking workspace with custom static pages served by the miniapp.",
         "flow_mode": "multi_page",
         "files_to_read": [
-            "frontend/src/features/profile/ui/RoleProfileEditorPage.tsx",
-            "frontend/src/widgets/role-home/RoleHomePage.module.css",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/styles.css",
         ],
         "target_files": target_files,
         "shared_files": [
-            "frontend/src/app/routing/RoleRouter.tsx",
-            "frontend/src/app/layout/AppShell.tsx",
+            "miniapp/app/main.py",
+            "miniapp/app/routes/profiles.py",
+            "miniapp/app/db.py",
         ],
         "backend_targets": [],
         "page_graph": {
@@ -330,7 +371,7 @@ def _page(page_id: str, route_path: str, navigation_label: str, component_name: 
         "title": title,
         "description": description,
         "purpose": description,
-        "page_kind": "workspace",
+        "page_kind": "static_page",
         "primary_actions": ["Open", "Continue"],
         "data_dependencies": ["records"],
         "loading_state": "Loading content…",
@@ -342,37 +383,50 @@ def _page(page_id: str, route_path: str, navigation_label: str, component_name: 
 def _page_file_payload(payload: dict) -> dict:
     page = payload["page"]
     role = payload["role"]
-    component_name = page["component_name"]
-    title = page["title"]
-    description = page["description"]
-    home_link = "/" if page["route_path"] != "/" else "/profile"
-    home_label = "Profile" if page["route_path"] == "/" else "Back home"
-    content = f"""import {{ Link }} from 'react-router-dom';
-
-export function {component_name}(): JSX.Element {{
-  return (
-    <section>
-      <header>
-        <span>{role}</span>
-        <h1>{title}</h1>
-        <p>{description}</p>
-      </header>
-      <div>
-        <p>Real routed page content for {component_name}.</p>
-        <Link to="{home_link}">{home_label}</Link>
-      </div>
-    </section>
-  );
-}}
+    role_titles = {
+        "client": ("Client booking", "Start the customer booking flow and open the profile."),
+        "specialist": ("Specialist desk", "Review the active workload and open the profile workspace."),
+        "manager": ("Manager overview", "Inspect operations and open the manager profile workspace."),
+    }
+    default_title, default_description = role_titles.get(role, ("Page", "Open the page."))
+    title = str(page.get("title") or page.get("navigation_label") or default_title)
+    description = str(page.get("description") or page.get("purpose") or default_description)
+    profile_link = f"/{role}/profile"
+    card_href = profile_link if page["route_path"] == f"/{role}" else f"/{role}"
+    content = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{title}</title>
+    <link rel="stylesheet" href="/static/{role}/styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="page">
+        <header class="header">
+          <h1 class="title">{title}</h1>
+        </header>
+        <section class="feature-block">
+          <div class="feature-content">
+            <span class="feature-title">{description}</span>
+            <a class="card-link" href="{card_href}">Open</a>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="/static/{role}/{'profile.js' if page['route_path'].endswith('/profile') else 'app.js'}" defer></script>
+  </body>
+</html>
 """
     return {
-        "assistant_message": f"Generated {component_name}.",
+        "assistant_message": f"Generated {page['file_path']}.",
         "operations": [
             {
                 "file_path": page["file_path"],
                 "operation": "replace",
                 "content": content,
-                "reason": f"Implement the {page['title']} page.",
+                "reason": f"Implement the {title} page.",
             }
         ],
     }
@@ -382,38 +436,104 @@ def _composition_payload(payload: dict) -> dict:
     page_graph = payload["page_graph"]
     target_files = set(payload["target_files"])
     operations: list[dict] = []
-    if "frontend/src/app/routing/RoleRouter.tsx" in target_files:
+    if "miniapp/app/main.py" in target_files:
         operations.append(
             {
-                "file_path": "frontend/src/app/routing/RoleRouter.tsx",
+                "file_path": "miniapp/app/main.py",
                 "operation": "replace",
-                "content": """import type { JSX } from 'react';\nimport type { AppRole } from '@/entities/role/model/role';\nimport { ClientRoutes } from '@/roles/client/ClientRoutes';\nimport { SpecialistRoutes } from '@/roles/specialist/SpecialistRoutes';\nimport { ManagerRoutes } from '@/roles/manager/ManagerRoutes';\n\nconst ROUTER_BY_ROLE: Record<AppRole, () => JSX.Element> = {\n  client: ClientRoutes,\n  specialist: SpecialistRoutes,\n  manager: ManagerRoutes,\n};\n\nexport function RoleRouter({ role }: { role: AppRole }): JSX.Element {\n  const RoutesByRole = ROUTER_BY_ROLE[role];\n  return <RoutesByRole />;\n}\n""",
-                "reason": "Provide the shared role router for the generated app.",
+                "content": """from pathlib import Path\n\nfrom fastapi import FastAPI\nfrom fastapi.responses import FileResponse, RedirectResponse\nfrom fastapi.staticfiles import StaticFiles\n\nfrom app.db import Base, engine\nfrom app.routes.health import router as health_router\nfrom app.routes.profiles import router as profiles_router\n\nSTATIC_DIR = Path(__file__).resolve().parent / 'static'\nROLES = ('client', 'specialist', 'manager')\n\napp = FastAPI()\napp.include_router(health_router)\napp.include_router(profiles_router)\napp.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')\n\n@app.on_event('startup')\ndef startup() -> None:\n    Base.metadata.create_all(bind=engine)\n\n@app.get('/')\ndef index() -> RedirectResponse:\n    return RedirectResponse('/client', status_code=307)\n\n@app.get('/{role}')\ndef role_page(role: str) -> FileResponse:\n    return FileResponse(STATIC_DIR / role / 'index.html')\n\n@app.get('/{role}/profile')\ndef role_profile(role: str) -> FileResponse:\n    return FileResponse(STATIC_DIR / role / 'profile.html')\n""",
+                "reason": "Provide the miniapp-served static entrypoint.",
             }
         )
-    if "frontend/src/app/layout/AppShell.tsx" in target_files:
+    if "miniapp/app/db.py" in target_files:
         operations.append(
             {
-                "file_path": "frontend/src/app/layout/AppShell.tsx",
+                "file_path": "miniapp/app/db.py",
                 "operation": "replace",
-                "content": """import { Outlet } from 'react-router-dom';\n\nexport function AppShell(): JSX.Element {\n  return (\n    <main>\n      <Outlet />\n    </main>\n  );\n}\n""",
-                "reason": "Provide the shared app shell used by all generated routes.",
+                "content": """from datetime import datetime, timezone\nfrom pathlib import Path\n\nfrom sqlalchemy import DateTime, String, create_engine\nfrom sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker\n\nDATABASE_URL = 'sqlite:///./app/generated/app.db'\nengine = create_engine(DATABASE_URL, future=True, connect_args={'check_same_thread': False})\nSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)\n\nclass Base(DeclarativeBase):\n    pass\n\nclass RoleProfileRecord(Base):\n    __tablename__ = 'role_profiles'\n    role: Mapped[str] = mapped_column(String(32), primary_key=True)\n    first_name: Mapped[str] = mapped_column(String(255), default='Ivan')\n    last_name: Mapped[str] = mapped_column(String(255), default='Ivanov')\n    email: Mapped[str] = mapped_column(String(255), default='')\n    phone: Mapped[str] = mapped_column(String(255), default='')\n    photo_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)\n    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))\n""",
+                "reason": "Provide the SQLite-backed storage module.",
             }
         )
-    for role, role_payload in (page_graph.get("roles") or {}).items():
-        routes_file = role_payload["routes_file"]
-        if routes_file not in target_files:
-            continue
+    if "miniapp/app/routes/profiles.py" in target_files:
         operations.append(
             {
-                "file_path": routes_file,
+                "file_path": "miniapp/app/routes/profiles.py",
                 "operation": "replace",
-                "content": _routes_file_source(role, role_payload["pages"]),
-                "reason": f"Wire real routed pages for {role}.",
+                "content": """from datetime import datetime, timezone\n\nfrom fastapi import APIRouter\n\nfrom app.db import RoleProfileRecord, SessionLocal\nfrom app.schemas import AppRole, RoleProfile\n\nrouter = APIRouter(prefix='/api/profiles', tags=['profiles'])\nDEFAULT_PROFILES = {\n    'client': {'first_name': 'Ivan', 'last_name': 'Ivanov', 'email': '', 'phone': '', 'photo_url': None},\n    'specialist': {'first_name': 'Ivan', 'last_name': 'Ivanov', 'email': '', 'phone': '', 'photo_url': None},\n    'manager': {'first_name': 'Ivan', 'last_name': 'Ivanov', 'email': '', 'phone': '', 'photo_url': None},\n}\n\ndef _to_schema(record: RoleProfileRecord) -> RoleProfile:\n    return RoleProfile(first_name=record.first_name, last_name=record.last_name, email=record.email, phone=record.phone, photo_url=record.photo_url, updated_at=record.updated_at)\n\n@router.get('/{role}', response_model=RoleProfile)\ndef get_profile(role: AppRole) -> RoleProfile:\n    with SessionLocal() as session:\n        record = session.get(RoleProfileRecord, role)\n        if record is None:\n            record = RoleProfileRecord(role=role, **DEFAULT_PROFILES[role])\n            session.add(record)\n            session.commit()\n            session.refresh(record)\n        return _to_schema(record)\n\n@router.put('/{role}', response_model=RoleProfile)\ndef update_profile(role: AppRole, profile: RoleProfile) -> RoleProfile:\n    with SessionLocal() as session:\n        record = session.get(RoleProfileRecord, role)\n        if record is None:\n            record = RoleProfileRecord(role=role, **DEFAULT_PROFILES[role])\n            session.add(record)\n        record.first_name = profile.first_name\n        record.last_name = profile.last_name\n        record.email = profile.email\n        record.phone = profile.phone\n        record.photo_url = profile.photo_url\n        record.updated_at = datetime.now(timezone.utc)\n        session.commit()\n        session.refresh(record)\n        return _to_schema(record)\n""",
+                "reason": "Provide the shared profile persistence API.",
             }
         )
+    for role in ("client", "specialist", "manager"):
+        if f"miniapp/app/static/{role}/styles.css" in target_files:
+            operations.append(
+                {
+                    "file_path": f"miniapp/app/static/{role}/styles.css",
+                    "operation": "replace",
+                    "content": ":root { --app-max-width: 620px; --surface-page: #f5f7fb; --surface-card: #f8fafd; --surface-primary: #ffffff; --text-primary: #16263d; --text-secondary: #4d607d; --text-tertiary: #7386a3; --accent: #2d7ff9; --accent-contrast: #ffffff; --accent-soft: #e6f0ff; --border-subtle: #dde6f3; --shadow-soft: 0 14px 38px rgba(22, 49, 95, 0.12); }\n* { box-sizing: border-box; }\nhtml, body { margin: 0; min-height: 100%; }\nbody { font-family: 'Inter', 'Segoe UI', sans-serif; background: var(--surface-page); color: var(--text-primary); }\n.page-shell { max-width: var(--app-max-width); min-height: 100vh; margin: 0 auto; padding: 60px 16px 20px; }\n.page { display: flex; flex-direction: column; gap: 12px; }\n.feature-block, .preview-card, .form-card, .card { border: 1px solid var(--border-subtle); border-radius: 24px; background: var(--surface-primary); box-shadow: var(--shadow-soft); }\n.card { padding: 14px; display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; text-decoration: none; color: inherit; }\n.avatar-wrap, .avatar-large-wrap { width: 74px; height: 74px; border-radius: 50%; overflow: hidden; }\n.avatar-large-wrap { width: 96px; height: 96px; }\n.avatar, .avatar-large { width: 100%; height: 100%; object-fit: cover; }\n.avatar-fallback, .avatar-large-fallback { width: 100%; height: 100%; display: grid; place-items: center; border-radius: 50%; background: var(--accent-soft); font-weight: 700; }\n.info, .preview-info, .feature-content, .form-card { display: flex; flex-direction: column; }\n.name, .preview-name, .title, .feature-title { font-weight: 700; }\n.preview-card, .form-card, .feature-block { padding: 16px; }\n.input-wrapper { position: relative; margin-top: 6px; }\n.input-label { position: absolute; top: -8px; left: 10px; padding: 0 5px; background: var(--surface-primary); font-size: 14px; font-weight: 700; }\n.text-input { width: 100%; min-height: 50px; padding: 12px 14px; border: 1px solid var(--border-subtle); border-radius: 10px; }\n.error { display: none; margin-top: 4px; padding-left: 2px; font-size: 12px; color: #ef4444; }\n.error:not(:empty) { display: block; }\n.primary-button { margin-top: 8px; height: 48px; border: none; border-radius: 12px; background: var(--accent); color: var(--accent-contrast); }\n",
+                    "reason": f"Provide the shared static styles for {role}.",
+                }
+            )
+        if f"miniapp/app/static/{role}/app.js" in target_files:
+            operations.append(
+                {
+                    "file_path": f"miniapp/app/static/{role}/app.js",
+                    "operation": "replace",
+                    "content": f"const role = '{role}';\nfetch(`/api/profiles/${{role}}`).then((response) => response.json()).then((profile) => {{ const name = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Ivan Ivanov'; document.getElementById('profile-name').textContent = name; document.getElementById('profile-avatar').innerHTML = profile.photo_url ? `<img class=\"avatar\" src=\"${{profile.photo_url}}\" alt=\"\" />` : '<div class=\"avatar-fallback\">II</div>'; }});\n",
+                    "reason": f"Provide the landing-page script for {role}.",
+                }
+            )
+        if f"miniapp/app/static/{role}/profile.js" in target_files:
+            operations.append(
+                {
+                    "file_path": f"miniapp/app/static/{role}/profile.js",
+                    "operation": "replace",
+                    "content": f"const role = '{role}'; const form = document.getElementById('profile-form'); const saveButton = document.getElementById('save-button'); let currentPhotoUrl = null; fetch(`/api/profiles/${{role}}`).then((response) => response.json()).then((profile) => {{ currentPhotoUrl = profile.photo_url; form.elements.first_name.value = profile.first_name || ''; form.elements.last_name.value = profile.last_name || ''; form.elements.email.value = profile.email || ''; form.elements.phone.value = profile.phone || ''; document.getElementById('preview-name').textContent = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Ivan Ivanov'; }}); form.addEventListener('submit', async (event) => {{ event.preventDefault(); document.getElementById('email-error').textContent = ''; document.getElementById('phone-error').textContent = ''; const payload = {{ first_name: form.elements.first_name.value.trim(), last_name: form.elements.last_name.value.trim(), email: form.elements.email.value.trim(), phone: form.elements.phone.value.trim(), photo_url: currentPhotoUrl }}; if (!payload.email) {{ document.getElementById('email-error').textContent = 'Enter an email address'; return; }} if (!payload.phone) {{ document.getElementById('phone-error').textContent = 'Enter a phone number'; return; }} saveButton.textContent = 'Saving...'; const response = await fetch(`/api/profiles/${{role}}`, {{ method: 'PUT', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify(payload) }}); const profile = await response.json(); document.getElementById('preview-name').textContent = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Ivan Ivanov'; saveButton.textContent = 'Saved'; setTimeout(() => {{ saveButton.textContent = 'Save'; }}, 1200); }});\n",
+                    "reason": f"Provide the profile-page script for {role}.",
+                }
+            )
     return {"assistant_message": "Composed shared files and routes.", "operations": operations}
 
+
+def _whole_file_bundle_payload(payload: dict) -> dict:
+    target_files = set(payload.get("cluster_targets") or [])
+    page_graph = payload.get("page_graph") or {}
+    operations = list(_composition_payload({"target_files": list(target_files), "page_graph": page_graph})["operations"])
+
+    for role, role_payload in (page_graph.get("roles") or {}).items():
+        for page in role_payload.get("pages") or []:
+            file_path = page.get("file_path")
+            if file_path not in target_files:
+                continue
+            page_payload = {
+                "role": role,
+                "page": page,
+            }
+            operations.extend(_page_file_payload(page_payload)["operations"])
+
+    if any(path.startswith("miniapp/") for path in target_files):
+        for path in sorted(target_files):
+            if path == "miniapp/app/main.py":
+                continue
+            elif path == "miniapp/app/schemas.py":
+                operations.append(
+                    {
+                        "file_path": path,
+                        "operation": "replace",
+                        "content": "from datetime import datetime\nfrom typing import Literal\nfrom pydantic import BaseModel\n\nAppRole = Literal['client', 'specialist', 'manager']\n\nclass RoleProfile(BaseModel):\n    first_name: str\n    last_name: str = ''\n    email: str = ''\n    phone: str = ''\n    photo_url: str | None = None\n    updated_at: datetime | None = None\n",
+                        "reason": "Provide minimal miniapp schemas.",
+                    }
+                )
+            elif path.startswith("miniapp/app/routes/") and path != "miniapp/app/routes/profiles.py":
+                operations.append(
+                    {
+                        "file_path": path,
+                        "operation": "replace",
+                        "content": "from fastapi import APIRouter\n\nrouter = APIRouter()\n",
+                        "reason": f"Provide a minimal miniapp route for {path}.",
+                    }
+                )
+
+    return {"assistant_message": "Generated whole-file bundle.", "operations": operations}
 
 def _fix_patch_payload(payload: dict) -> dict:
     fix_case = payload.get("fix_case") or {}
@@ -485,39 +605,6 @@ def _fix_patch_payload(payload: dict) -> dict:
         "rationale_by_file": rationale,
         "operations": operations,
     }
-
-
-def _routes_file_source(role: str, pages: list[dict]) -> str:
-    imports = ["import { Navigate, Route, Routes } from 'react-router-dom';", "import { AppShell } from '@/app/layout/AppShell';"]
-    route_lines = []
-    for page in pages:
-        import_path = page["file_path"].replace("frontend/src/", "@/").removesuffix(".tsx")
-        imports.append(f"import {{ {page['component_name']} }} from '{import_path}';")
-        route_path = page["route_path"]
-        if route_path == "/":
-            route_lines.append('        <Route index element={{<{component} />}} />'.format(component=page["component_name"]))
-        else:
-            relative_path = route_path.lstrip("/")
-            route_lines.append(
-                '        <Route path="{path}" element={{<{component} />}} />'.format(
-                    path=relative_path,
-                    component=page["component_name"],
-                )
-            )
-    imports_block = "\n".join(imports)
-    return f"""{imports_block}
-
-export function {ROLE_PREFIX[role]}Routes(): JSX.Element {{
-  return (
-    <Routes>
-      <Route element={{<AppShell />}}>
-{chr(10).join(route_lines)}
-        <Route path="*" element={{<Navigate to="/" replace />}} />
-      </Route>
-    </Routes>
-  );
-}}
-"""
 
 
 def test_generation_pipeline_smoke(tmp_path: Path) -> None:
@@ -599,7 +686,7 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     assert all(not item["path"].endswith(".tsbuildinfo") for item in file_tree)
     assert any(item["path"] == "artifacts/grounded_spec.json" for item in draft_tree)
     assert any(item["path"] == "artifacts/generated_app_graph.json" for item in draft_tree)
-    assert "ClientRoutes.tsx" in draft_diff
+    assert "miniapp/app/static/client/index.html" in draft_diff
     assert "generated_app_graph.json" in draft_diff
 
     preview_response = client.get(f"/preview/{workspace_id}?role=manager&run_id={run['run_id']}")
@@ -818,3 +905,53 @@ def test_clone_template_boots_preview_automatically(tmp_path: Path) -> None:
 
     assert preview_payload is not None
     assert preview_payload["status"] in {"running", "error"}
+
+
+def test_preview_url_waits_for_http_readiness_before_exposing_url(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Readiness Workspace",
+            "description": "Preview URL should stay hidden until runtime pages respond.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    clone_response = client.post(f"/workspaces/{workspace_id}/clone-template")
+    assert clone_response.status_code == 200
+
+    container = app.state.container
+    preview = container.preview_service._get_or_create(workspace_id)
+    preview.runtime_mode = "docker"
+    preview.status = "running"
+    preview.stage = "running"
+    preview.url = "http://localhost:19999"
+    preview.frontend_url = preview.url
+    preview.backend_url = f"{preview.url}/api"
+    preview.proxy_port = 19999
+    preview.project_name = "grounded_preview_test"
+    container.preview_service._persist(preview)
+
+    original_probe = container.preview_service._http_preview_ready
+    original_inspect = container.runtime_manager.inspect_containers
+    container.preview_service._http_preview_ready = lambda preview_url: False
+    container.runtime_manager.inspect_containers = (
+        lambda current_workspace_id, source_dir, proxy_port: [{"state": "running", "published_port": str(proxy_port or 19999)}]
+    )
+    try:
+        response = client.get(f"/workspaces/{workspace_id}/preview/url")
+    finally:
+        container.preview_service._http_preview_ready = original_probe
+        container.runtime_manager.inspect_containers = original_inspect
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "starting"
+    assert payload["stage"] == "health_check"
+    assert payload["url"] is None
+    assert payload["role_urls"] == {}

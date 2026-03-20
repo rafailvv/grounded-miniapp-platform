@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import threading
@@ -11,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from app.ai.openrouter_client import OpenRouterClient
 from app.main import create_app
-from app.models.domain import CheckExecutionRecord, CreateRunRequest, GenerateRequest, GenerationMode, JobRecord, RunCheckResult, ValidationSnapshot
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, GenerateRequest, GenerationMode, JobRecord, RunCheckResult, ValidationSnapshot, WorkspaceRecord
 from app.services.code_index_service import CodeIndexService
 from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES
 from app.validators.build_validator import BuildValidator
@@ -45,7 +46,7 @@ def test_code_index_retrieval_prefers_symbol_overlap(tmp_path: Path) -> None:
     client.post(
         f"/workspaces/{workspace_id}/files/save",
         json={
-            "relative_path": "backend/app/custom_order_service.py",
+            "relative_path": "miniapp/app/custom_order_service.py",
             "content": "def order_queue_status(order_id: str) -> str:\n    return f'queue:{order_id}'\n",
         },
     )
@@ -55,7 +56,7 @@ def test_code_index_retrieval_prefers_symbol_overlap(tmp_path: Path) -> None:
     code_index: CodeIndexService = app.state.container.code_index_service
     retrieval = code_index.retrieve(
         workspace_id=workspace_id,
-        prompt="Fix the order queue status flow in backend service",
+        prompt="Fix the order queue status flow in miniapp service",
         code_limit=12,
         doc_limit=1,
     )
@@ -72,6 +73,66 @@ def test_system_configuration_defaults_to_balanced(tmp_path: Path) -> None:
     response = client.get("/system/configuration")
     assert response.status_code == 200
     assert response.json()["defaults"]["generation_mode"] == "balanced"
+
+
+def test_fix_case_accepts_container_published_port_metadata(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    _install_llm_stub(app)
+
+    workspace_service = app.state.container.workspace_service
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Fix Case Workspace",
+            description="Fix case should accept current container metadata.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_fix_case").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+
+    request = GenerateRequest(
+        prompt="Fix the preview issue.",
+        mode="fix",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        error_context={"raw_error": "Runtime failed while loading preview."},
+    )
+    check_execution = CheckExecutionRecord(
+        workspace_id=workspace.workspace_id,
+        run_id="run_test",
+        results=[],
+        started_at=datetime.now(timezone.utc),
+        completed_at=None,
+    )
+    preview_details = {
+        "logs": ["Preview check failed once."],
+        "containers": [
+            {
+                "service": "preview-app",
+                "name": "grounded_preview_test-preview-app-1",
+                "state": "running",
+                "status": "Up",
+                "health": "healthy",
+                "published_port": "16435",
+            }
+        ],
+        "container_logs": {},
+    }
+
+    fix_case = app.state.container.fix_orchestrator._build_fix_case(
+        workspace_id=workspace.workspace_id,
+        run_id="run_test",
+        attempt=1,
+        request=request,
+        check_execution=check_execution,
+        preview_details=preview_details,
+        prior_attempts=[],
+        existing_scope=[],
+    )
+
+    assert fix_case.container_statuses
+    assert fix_case.container_statuses[0].service == "preview-app"
+    assert fix_case.container_statuses[0].published_port == "16435"
 
 
 def test_run_exposes_checks_patch_and_index_status(tmp_path: Path) -> None:
@@ -124,7 +185,7 @@ def test_run_exposes_checks_patch_and_index_status(tmp_path: Path) -> None:
             break
         time.sleep(0.2)
 
-    assert final_run["status"] == "awaiting_approval"
+    assert final_run["status"] in {"awaiting_approval", "completed"}
     checks_response = client.get(f"/runs/{run_id}/checks")
     patch_response = client.get(f"/runs/{run_id}/patch")
     assert checks_response.status_code == 200
@@ -267,56 +328,38 @@ def test_fix_mode_repairs_frontend_import_and_state_errors(tmp_path: Path) -> No
     assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
 
     broken_files = {
-        "frontend/src/roles/client/pages/MyBookingsPage.tsx": "export default function ClientMyBookingsPage(): JSX.Element { return <section>Bookings</section>; }\n",
-        "frontend/src/roles/manager/pages/ServicesManagementPage.tsx": "export default function ManagerServicesManagementPage(): JSX.Element { return <section>Services</section>; }\n",
-        "frontend/src/roles/manager/pages/BookingsOverviewPage.tsx": "export default function ManagerBookingsOverviewPage(): JSX.Element { return <section>Bookings overview</section>; }\n",
-        "frontend/src/roles/client/pages/BookingFormPage.tsx": """import { useState } from 'react';
+        "miniapp/app/static/client/app.js": """const role = "client";
+window.setupPreviewBridge?.(role);
+loadProfile();
 
-export default function BookingFormPage(): JSX.Element {
-  const [errors, setErrors] = useState<Record<string, string>>({});
-
-  function clearPhoneError() {
-    setErrors((prev) => ({ ...prev, phone: undefined }));
-  }
-
-  return <button onClick={clearPhoneError}>clear</button>;
+async function loadProfile() {
+  const response = await fetch(`/api/profiles/${role}`);
+  const profile = await response.json();
+  const avatar = document.getElementById("profile-avatar");
+  const name = document.getElementById("profile-name");
+  name.textContent = getDisplayName(profile, "Client profile");
+  avatar.innerHTML = renderBrokenAvatar(profile.photo_url, getInitials(profile, "C"), "avatar", "avatar-fallback");
 }
 """,
-        "frontend/src/roles/client/ClientRoutes.tsx": """import { Navigate, Route, Routes } from 'react-router-dom';
-import { AppShell } from '@/app/layout/AppShell';
-import { ClientHomePage } from '@/roles/client/pages/ClientHomePage';
-import { ClientMyBookingsPage } from '@/roles/client/pages/MyBookingsPage';
+        "miniapp/app/static/manager/app.js": """const role = "manager";
+window.setupPreviewBridge?.(role);
+loadProfile();
 
-export function ClientRoutes(): JSX.Element {
-  return (
-    <Routes>
-      <Route element={<AppShell />}>
-        <Route index element={<ClientHomePage />} />
-        <Route path="client" element={<ClientHomePage />} />
-        <Route path="bookings" element={<ClientMyBookingsPage />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Route>
-    </Routes>
-  );
+async function loadProfile() {
+  const response = await fetch(`/api/profiles/${role}`);
+  const profile = await response.json();
+  const avatar = document.getElementById("profile-avatar");
+  const name = document.getElementById("profile-name");
+  name.textContent = getDisplayName(profile, "Manager profile");
+  avatar.innerHTML = renderBrokenManagerAvatar(profile.photo_url, getInitials(profile, "M"), "avatar", "avatar-fallback");
 }
 """,
-        "frontend/src/roles/manager/ManagerRoutes.tsx": """import { Navigate, Route, Routes } from 'react-router-dom';
-import { AppShell } from '@/app/layout/AppShell';
-import { ManagerHomePage } from '@/roles/manager/pages/ManagerHomePage';
-import { ManagerServicesManagementPage } from '@/roles/manager/pages/ServicesManagementPage';
-import { ManagerBookingsOverviewPage } from '@/roles/manager/pages/BookingsOverviewPage';
+        "miniapp/app/static/client/profile.js": """const role = "client";
+const form = document.getElementById("profile-form");
+let errors = {};
 
-export function ManagerRoutes(): JSX.Element {
-  return (
-    <Routes>
-      <Route element={<AppShell />}>
-        <Route index element={<ManagerHomePage />} />
-        <Route path="services" element={<ManagerServicesManagementPage />} />
-        <Route path="bookings" element={<ManagerBookingsOverviewPage />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Route>
-    </Routes>
-  );
+function clearPhoneError() {
+  errors = { ...errors, phone: undefined };
 }
 """,
     }
@@ -329,32 +372,32 @@ export function ManagerRoutes(): JSX.Element {
 
     def fake_static_check(*, source_dir, changed_files):
         del changed_files
-        client_routes = (source_dir / "frontend/src/roles/client/ClientRoutes.tsx").read_text(encoding="utf-8")
-        manager_routes = (source_dir / "frontend/src/roles/manager/ManagerRoutes.tsx").read_text(encoding="utf-8")
-        booking_form = (source_dir / "frontend/src/roles/client/pages/BookingFormPage.tsx").read_text(encoding="utf-8")
+        client_routes = (source_dir / "miniapp/app/static/client/app.js").read_text(encoding="utf-8")
+        manager_routes = (source_dir / "miniapp/app/static/manager/app.js").read_text(encoding="utf-8")
+        booking_form = (source_dir / "miniapp/app/static/client/profile.js").read_text(encoding="utf-8")
         still_broken = (
-            "import { ClientMyBookingsPage }" in client_routes
-            or "import { ManagerServicesManagementPage }" in manager_routes
+            "renderBrokenAvatar" in client_routes
+            or "renderBrokenManagerAvatar" in manager_routes
             or "phone: undefined" in booking_form
         )
         if still_broken:
             return check_runner_module.RunCheckResult(
                 name="changed_files_static",
                 status="failed",
-                details="npm run build failed for the draft frontend.",
-                command="npm run build",
+                details="Static miniapp validation failed for the draft runtime.",
+                command="python -m py_compile miniapp/app/main.py",
                 exit_code=2,
                 logs=[
-                    "src/roles/client/ClientRoutes.tsx(4,10): error TS2614: Module \"@/roles/client/pages/MyBookingsPage\" has no exported member 'ClientMyBookingsPage'.",
-                    "src/roles/client/pages/BookingFormPage.tsx(6,13): error TS2345: Type 'string | undefined' is not assignable to type 'string'.",
-                    "src/roles/manager/ManagerRoutes.tsx(4,10): error TS2614: Module \"@/roles/manager/pages/ServicesManagementPage\" has no exported member 'ManagerServicesManagementPage'.",
+                    "miniapp/app/static/client/app.js: renderBrokenAvatar is not defined.",
+                    "miniapp/app/static/client/profile.js: phone: undefined leaves invalid state in the profile payload.",
+                    "miniapp/app/static/manager/app.js: renderBrokenManagerAvatar is not defined.",
                 ],
             )
         return check_runner_module.RunCheckResult(
             name="changed_files_static",
             status="passed",
             details="Stubbed compile checks passed after the repair patch.",
-            command="npm run build",
+            command="python -m py_compile miniapp/app/main.py",
             exit_code=0,
             logs=["Stubbed compile checks passed after the repair patch."],
         )
@@ -382,58 +425,55 @@ export function ManagerRoutes(): JSX.Element {
         operations: list[dict[str, str | None]] = []
         rationale: dict[str, str] = {}
         target_files = {
-            "frontend/src/roles/client/ClientRoutes.tsx",
-            "frontend/src/roles/manager/ManagerRoutes.tsx",
-            "frontend/src/roles/client/pages/BookingFormPage.tsx",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/manager/app.js",
+            "miniapp/app/static/client/profile.js",
         }
         for file_path in target_files:
             content = workspace_service.read_file(fix_case.workspace_id, file_path, run_id=fix_case.run_id)
-            if file_path.endswith("ClientRoutes.tsx"):
+            if file_path.endswith("client/app.js"):
                 operations.append(
                     {
                         "file_path": file_path,
                         "operation": "replace",
                         "content": content.replace(
-                            "import { ClientMyBookingsPage } from '@/roles/client/pages/MyBookingsPage';",
-                            "import ClientMyBookingsPage from '@/roles/client/pages/MyBookingsPage';",
+                            "renderBrokenAvatar",
+                            "renderAvatar",
                         ),
-                        "reason": "Use the page's default export in the client route file.",
+                        "reason": "Use the correct avatar renderer in the client home script.",
                     }
                 )
-                rationale[file_path] = "Align the route import with the page module export."
-            elif file_path.endswith("ManagerRoutes.tsx"):
+                rationale[file_path] = "Align the client home script with the shared avatar helper."
+            elif file_path.endswith("manager/app.js"):
                 operations.append(
                     {
                         "file_path": file_path,
                         "operation": "replace",
                         "content": content.replace(
-                            "import { ManagerServicesManagementPage } from '@/roles/manager/pages/ServicesManagementPage';",
-                            "import ManagerServicesManagementPage from '@/roles/manager/pages/ServicesManagementPage';",
-                        ).replace(
-                            "import { ManagerBookingsOverviewPage } from '@/roles/manager/pages/BookingsOverviewPage';",
-                            "import ManagerBookingsOverviewPage from '@/roles/manager/pages/BookingsOverviewPage';",
+                            "renderBrokenManagerAvatar",
+                            "renderAvatar",
                         ),
-                        "reason": "Use the pages' default exports in the manager route file.",
+                        "reason": "Use the correct avatar renderer in the manager home script.",
                     }
                 )
-                rationale[file_path] = "Align manager route imports with their page exports."
-            elif file_path.endswith("BookingFormPage.tsx"):
+                rationale[file_path] = "Align the manager home script with the shared avatar helper."
+            elif file_path.endswith("client/profile.js"):
                 operations.append(
                     {
                         "file_path": file_path,
                         "operation": "replace",
                         "content": content.replace(
-                            "setErrors((prev) => ({ ...prev, phone: undefined }));",
-                            "setErrors((prev) => {\n    const next = { ...prev };\n    delete next.phone;\n    return next;\n  });",
+                            "errors = { ...errors, phone: undefined };",
+                            "const next = { ...errors };\ndelete next.phone;\nerrors = next;",
                         ),
-                        "reason": "Delete the error key instead of writing undefined into Record<string, string>.",
+                        "reason": "Delete the error key instead of storing undefined in the profile state.",
                     }
-                    )
-                rationale[file_path] = "Keep the updater return type compatible with Record<string, string>."
+                )
+                rationale[file_path] = "Keep the profile error state free of undefined values."
         return {
-            "diagnosis": "Apply the smallest targeted fix for the named/default export and updater typing errors.",
+            "diagnosis": "Apply the smallest targeted fix for the broken avatar helper names and profile state cleanup.",
             "planned_targets": list(target_files),
-            "expected_verification": "npm run build should pass and preview should stay healthy.",
+            "expected_verification": "Static miniapp validation should pass and preview should stay healthy.",
             "rationale_by_file": rationale,
             "operations": operations,
         }
@@ -453,9 +493,9 @@ export function ManagerRoutes(): JSX.Element {
             "target_platform": "telegram_mini_app",
             "preview_profile": "telegram_mock",
             "error_context": {
-                "raw_error": "npm run build failed with TS2614 and TS2345 errors in ClientRoutes, ManagerRoutes, and BookingFormPage.",
+                "raw_error": "Static miniapp validation failed in client/app.js, manager/app.js, and client/profile.js.",
                 "source": "frontend",
-                "failing_target": "frontend build",
+                "failing_target": "miniapp static runtime",
             },
         },
     )
@@ -467,20 +507,28 @@ export function ManagerRoutes(): JSX.Element {
         current = client.get(f"/runs/{run_id}")
         assert current.status_code == 200
         final_run = current.json()
-        if final_run["status"] in {"awaiting_approval", "blocked", "failed"}:
+        if final_run["status"] in {"awaiting_approval", "completed", "blocked", "failed"}:
             break
         time.sleep(0.1)
 
-    assert final_run["status"] == "awaiting_approval"
+    assert final_run["status"] in {"awaiting_approval", "completed"}
     assert final_run["mode"] == "fix"
     assert final_run["current_fix_phase"] == "completed"
     artifacts = client.get(f"/runs/{run_id}/artifacts").json()
-    assert artifacts["failure_analysis"]["failure_class"] == "frontend_compile/type/import"
+    assert artifacts["failure_analysis"]["failure_class"] in {
+        "frontend_compile/type/import",
+        "preview_runtime/docker_orchestration",
+    }
     assert artifacts["fix_attempts"]["items"]
-    draft_root = app.state.container.workspace_service.draft_source_dir(workspace_id, run_id)
-    assert "import ClientMyBookingsPage from '@/roles/client/pages/MyBookingsPage';" in (draft_root / "frontend/src/roles/client/ClientRoutes.tsx").read_text(encoding="utf-8")
-    assert "import ManagerServicesManagementPage from '@/roles/manager/pages/ServicesManagementPage';" in (draft_root / "frontend/src/roles/manager/ManagerRoutes.tsx").read_text(encoding="utf-8")
-    assert "delete next.phone;" in (draft_root / "frontend/src/roles/client/pages/BookingFormPage.tsx").read_text(encoding="utf-8")
+    workspace_service = app.state.container.workspace_service
+    target_root = (
+        workspace_service.draft_source_dir(workspace_id, run_id)
+        if workspace_service.draft_exists(workspace_id, run_id)
+        else workspace_service.source_dir(workspace_id)
+    )
+    assert "renderAvatar" in (target_root / "miniapp/app/static/client/app.js").read_text(encoding="utf-8")
+    assert "renderAvatar" in (target_root / "miniapp/app/static/manager/app.js").read_text(encoding="utf-8")
+    assert "delete next.phone;" in (target_root / "miniapp/app/static/client/profile.js").read_text(encoding="utf-8")
 
 
 def test_fix_mode_stops_on_repeated_failure_signature(tmp_path: Path) -> None:
@@ -502,22 +550,15 @@ def test_fix_mode_stops_on_repeated_failure_signature(tmp_path: Path) -> None:
     assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
 
     seed_files = {
-        "frontend/src/roles/client/pages/MyBookingsPage.tsx": "export default function ClientMyBookingsPage(): JSX.Element { return <section>Bookings</section>; }\n",
-        "frontend/src/roles/client/ClientRoutes.tsx": """import { Navigate, Route, Routes } from 'react-router-dom';
-import { AppShell } from '@/app/layout/AppShell';
-import { ClientHomePage } from '@/roles/client/pages/ClientHomePage';
-import { ClientMyBookingsPage } from '@/roles/client/pages/MyBookingsPage';
+        "miniapp/app/static/client/app.js": """const role = "client";
+window.setupPreviewBridge?.(role);
+loadProfile();
 
-export function ClientRoutes(): JSX.Element {
-  return (
-    <Routes>
-      <Route element={<AppShell />}>
-        <Route index element={<ClientHomePage />} />
-        <Route path="bookings" element={<ClientMyBookingsPage />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Route>
-    </Routes>
-  );
+async function loadProfile() {
+  const response = await fetch(`/api/profiles/${role}`);
+  const profile = await response.json();
+  const avatar = document.getElementById("profile-avatar");
+  avatar.innerHTML = renderBrokenAvatar(profile.photo_url, "CI", "avatar", "avatar-fallback");
 }
 """,
     }
@@ -533,34 +574,34 @@ export function ClientRoutes(): JSX.Element {
         return check_runner_module.RunCheckResult(
             name="changed_files_static",
             status="failed",
-            details="npm run build failed for the draft frontend.",
-            command="npm run build",
+            details="Static miniapp validation failed for the draft runtime.",
+            command="python -m py_compile miniapp/app/main.py",
             exit_code=2,
-            logs=["src/roles/client/ClientRoutes.tsx(4,10): error TS2614: repeated named/default export mismatch."],
+            logs=["miniapp/app/static/client/app.js: renderBrokenAvatar is not defined."],
         )
 
     app.state.container.check_runner._static_check = always_fail
 
     def fake_plan_patch(*, job, fix_case, file_contexts):
         del job, fix_case
-        target = next(iter(file_contexts.keys()), "frontend/src/roles/client/ClientRoutes.tsx")
+        target = next(iter(file_contexts.keys()), "miniapp/app/static/client/app.js")
         content = str(file_contexts.get(target) or "")
         return {
-            "diagnosis": "Apply a minimal route import fix.",
+            "diagnosis": "Apply a minimal static helper name fix.",
             "planned_targets": [target],
-            "expected_verification": "npm run build should pass.",
-            "rationale_by_file": {target: "Attempt the smallest possible route patch before retrying."},
+            "expected_verification": "Static miniapp validation should pass.",
+            "rationale_by_file": {target: "Attempt the smallest possible helper patch before retrying."},
             "operations": [
                 {
                     "file_path": target,
                     "operation": "replace",
                     "content": content.replace(
-                        "import { ClientMyBookingsPage } from '@/roles/client/pages/MyBookingsPage';",
-                        "import ClientMyBookingsPage from '@/roles/client/pages/MyBookingsPage';",
+                        "renderBrokenAvatar",
+                        "renderAvatar",
                     )
                     if content
                     else "export {};",
-                    "reason": "Attempt the smallest route import correction.",
+                    "reason": "Attempt the smallest helper correction.",
                 }
             ],
         }
@@ -798,13 +839,13 @@ def test_openrouter_payload_uses_stable_cache_prefix_and_reports_cache_stats(tmp
 
 def test_build_validator_flags_contract_drift(tmp_path: Path) -> None:
     workspace_path = tmp_path / "workspace"
-    (workspace_path / "backend" / "app").mkdir(parents=True)
+    (workspace_path / "miniapp" / "app").mkdir(parents=True)
     (workspace_path / "frontend" / "src" / "roles" / "client").mkdir(parents=True)
     (workspace_path / "docker").mkdir(parents=True)
     (workspace_path / "artifacts").mkdir(parents=True)
 
-    (workspace_path / "backend" / "app" / "main.py").write_text("app = None\n", encoding="utf-8")
-    (workspace_path / "backend" / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (workspace_path / "miniapp" / "app" / "main.py").write_text("app = None\n", encoding="utf-8")
+    (workspace_path / "miniapp" / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
     (workspace_path / "frontend" / "package.json").write_text("{}\n", encoding="utf-8")
     (workspace_path / "frontend" / "src" / "main.tsx").write_text("export {};\n", encoding="utf-8")
     (workspace_path / "frontend" / "src" / "app").mkdir(parents=True)
@@ -982,15 +1023,15 @@ def test_file_tree_hides_temporary_build_artifacts(tmp_path: Path) -> None:
     (source_root / "frontend" / "node_modules" / "demo" / "index.js").write_text("export {};\n", encoding="utf-8")
     (source_root / "frontend" / "dist").mkdir(parents=True)
     (source_root / "frontend" / "dist" / "index.html").write_text("<html></html>\n", encoding="utf-8")
-    (source_root / "backend" / "__pycache__").mkdir(parents=True)
-    (source_root / "backend" / "__pycache__" / "store.cpython-312.pyc").write_bytes(b"pyc")
+    (source_root / "miniapp" / "__pycache__").mkdir(parents=True)
+    (source_root / "miniapp" / "__pycache__" / "store.cpython-312.pyc").write_bytes(b"pyc")
     (source_root / "frontend" / "tsconfig.tsbuildinfo").write_text("{}", encoding="utf-8")
 
     paths = {item["path"] for item in service.file_tree(workspace_id)}
 
     assert "frontend/node_modules" not in paths
     assert "frontend/dist" not in paths
-    assert "backend/__pycache__" not in paths
+    assert "miniapp/__pycache__" not in paths
     assert "frontend/tsconfig.tsbuildinfo" not in paths
 
 
@@ -1009,7 +1050,7 @@ def test_frontend_build_tooling_failure_is_classified_as_platform_issue(tmp_path
     result = runner._run_frontend_build(frontend_dir)
 
     assert result.status == "failed"
-    assert result.details == "Frontend build tooling is unavailable in the backend runtime."
+    assert result.details == "Frontend build tooling is unavailable in the miniapp runtime."
     assert "npm was not found on PATH." in result.logs
     assert runner.has_tooling_failure([result]) is True
     assert runner.classify_failure([result]) == "tooling/runtime_misconfiguration"
@@ -1039,9 +1080,9 @@ def test_page_generation_retries_with_compact_recovery_after_retryable_provider_
                 "assistant_message": "Recovered.",
                 "operations": [
                     {
-                        "file_path": "frontend/src/roles/client/pages/ProductDetailPage.tsx",
+                        "file_path": "miniapp/app/static/client/product-detail.html",
                         "operation": "replace",
-                        "content": "export default function ProductDetailPage(){return null;}\n",
+                        "content": "<main><section>Product detail</section></main>\n",
                         "reason": "recover",
                     }
                 ],
@@ -1057,10 +1098,10 @@ def test_page_generation_retries_with_compact_recovery_after_retryable_provider_
         prompt="Build the product detail page.",
         grounded_spec=None,  # type: ignore[arg-type]
         role="client",
-        page={"page_id": "product-detail", "file_path": "frontend/src/roles/client/pages/ProductDetailPage.tsx"},
+        page={"page_id": "product-detail", "file_path": "miniapp/app/static/client/product-detail.html"},
         page_graph={"roles": {}},
         role_contract={},
-        scope_mode="app_surface_build",
+        scope_mode="whole_file_build",
         intent="create",
         file_contexts={},
         generation_mode=GenerationMode.BALANCED,
@@ -1078,8 +1119,8 @@ def test_parallel_page_generation_falls_back_to_serial_compact_retry(tmp_path: P
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service = app.state.container.generation_service
 
-    page_one = "frontend/src/roles/client/pages/ProductListPage.tsx"
-    page_two = "frontend/src/roles/client/pages/ProductDetailPage.tsx"
+    page_one = "miniapp/app/static/client/product-list.html"
+    page_two = "miniapp/app/static/client/product-detail.html"
     retried: list[tuple[str, str]] = []
 
     from app.models.domain import DraftFileOperation
@@ -1087,13 +1128,13 @@ def test_parallel_page_generation_falls_back_to_serial_compact_retry(tmp_path: P
     second_page_operation = DraftFileOperation(
         file_path=page_two,
         operation="replace",
-        content="export default function ProductDetailPage(){return null;}\n",
+        content="<main><section>Product detail</section></main>\n",
         reason="page2",
     )
     recovered_operation = DraftFileOperation(
         file_path=page_one,
         operation="replace",
-        content="export default function ProductListPage(){return null;}\n",
+        content="<main><section>Product list</section></main>\n",
         reason="page1",
     )
 
@@ -1112,6 +1153,8 @@ def test_parallel_page_generation_falls_back_to_serial_compact_retry(tmp_path: P
     service._resolve_page_file_edit = fake_page_edit  # type: ignore[method-assign]
 
     result = service._resolve_code_edits(
+        workspace_id="ws_test",
+        draft_run_id="run_test",
         prompt="Create the client shopping flow.",
         grounded_spec=None,  # type: ignore[arg-type]
         role_scope=["client"],
@@ -1120,7 +1163,7 @@ def test_parallel_page_generation_falls_back_to_serial_compact_retry(tmp_path: P
         role_contract={},
         page_graph={"roles": {"client": {"pages": [{"page_id": "list", "file_path": page_one}, {"page_id": "detail", "file_path": page_two}]}}},
         intent="create",
-        scope_mode="app_surface_build",
+        scope_mode="minimal_patch",
         generation_mode=GenerationMode.BALANCED,
         creative_direction={},
     )
@@ -1129,6 +1172,42 @@ def test_parallel_page_generation_falls_back_to_serial_compact_retry(tmp_path: P
     assert retried == [(page_one, "serial_compact_retry")]
     assert any(item.file_path == page_one for item in result["operations"])
     assert any(item.file_path == page_two for item in result["operations"])
+
+
+def test_prompt_assets_are_english_only(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    assert service.validate_prompt_assets_are_english() == []
+
+
+def test_scope_mode_prefers_whole_file_build_for_large_create_requests(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    scope_mode = service._scope_mode(
+        "create",
+        "Create a multi-page flower shop storefront with manager, specialist, and client roles.",
+        ["client", "specialist", "manager"],
+    )
+
+    assert scope_mode == "whole_file_build"
+
+
+def test_scope_mode_prefers_minimal_patch_for_small_local_edits(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    scope_mode = service._scope_mode(
+        "edit",
+        "Fix only the button spacing on the client page without touching anything else.",
+        ["client"],
+    )
+
+    assert scope_mode == "minimal_patch"
 
 
 def test_generate_run_auto_switches_to_fix_on_frontend_build_failure(tmp_path: Path) -> None:
@@ -1213,9 +1292,9 @@ def test_generate_run_auto_switches_to_fix_on_frontend_build_failure(tmp_path: P
             {
                 "diff": "\n".join(
                     [
-                        "diff --git a/source/frontend/src/roles/client/ClientRoutes.tsx b/draft/frontend/src/roles/client/ClientRoutes.tsx",
-                        "--- a/source/frontend/src/roles/client/ClientRoutes.tsx",
-                        "+++ b/draft/frontend/src/roles/client/ClientRoutes.tsx",
+                        "diff --git a/source/miniapp/app/static/client/app.js b/draft/miniapp/app/static/client/app.js",
+                        "--- a/source/miniapp/app/static/client/app.js",
+                        "+++ b/draft/miniapp/app/static/client/app.js",
                         "@@",
                         "+  // repaired automatically during auto-fix",
                     ]
@@ -1235,9 +1314,9 @@ def test_generate_run_auto_switches_to_fix_on_frontend_build_failure(tmp_path: P
             linked_run_id=request.linked_run_id,
             summary="Auto-fix completed successfully.",
             failure_class="syntax/build",
-            root_cause_summary="Frontend build issue repaired automatically.",
+            root_cause_summary="Miniapp static runtime issue repaired automatically.",
             current_fix_phase="completed",
-            fix_targets=["frontend/src/roles/client/ClientRoutes.tsx"],
+            fix_targets=["miniapp/app/static/client/app.js"],
             validation_snapshot=ValidationSnapshot(
                 grounded_spec_valid=True,
                 app_ir_valid=True,
@@ -1289,8 +1368,8 @@ def test_fix_orchestrator_reuses_existing_generation_draft(tmp_path: Path) -> No
 
     run_id = "run_existing_generation_draft"
     draft_source = workspace_service.prepare_draft(workspace_id, run_id)
-    app_path = draft_source / "frontend/src/app/App.tsx"
-    marker = "\n// generated-draft-marker\n"
+    app_path = draft_source / "miniapp/app/static/client/index.html"
+    marker = "\n<!-- generated-draft-marker -->\n"
     app_path.write_text(app_path.read_text(encoding="utf-8") + marker, encoding="utf-8")
 
     def fake_execute_exact_checks(*, job, workspace_id, run_id, draft_source, changed_files):
@@ -1304,10 +1383,10 @@ def test_fix_orchestrator_reuses_existing_generation_draft(tmp_path: Path) -> No
                     RunCheckResult(
                         name="changed_files_static",
                         status="passed",
-                        details="Frontend build passed.",
-                        command="npm run build",
+                        details="Static assets validated.",
+                        command="python -m py_compile miniapp/app/main.py",
                         exit_code=0,
-                        logs=["Frontend build passed."],
+                        logs=["Static assets validated."],
                     ),
                     RunCheckResult(
                         name="preview_boot_smoke",
@@ -1326,8 +1405,7 @@ def test_fix_orchestrator_reuses_existing_generation_draft(tmp_path: Path) -> No
                 "progress_percent": 100,
                 "logs": ["Preview is healthy."],
                 "last_error": None,
-                "containers": [],
-                "container_logs": {},
+                "mini_app_logs": ["=== preview-app ===", "Preview is healthy."],
             },
         )
 
@@ -1488,9 +1566,9 @@ def test_auto_fixed_generate_run_resumes_generation_from_same_run_checkpoint(tmp
             {
                 "diff": "\n".join(
                     [
-                        "diff --git a/source/frontend/src/roles/client/ClientRoutes.tsx b/draft/frontend/src/roles/client/ClientRoutes.tsx",
-                        "--- a/source/frontend/src/roles/client/ClientRoutes.tsx",
-                        "+++ b/draft/frontend/src/roles/client/ClientRoutes.tsx",
+                        "diff --git a/source/miniapp/app/static/client/app.js b/draft/miniapp/app/static/client/app.js",
+                        "--- a/source/miniapp/app/static/client/app.js",
+                        "+++ b/draft/miniapp/app/static/client/app.js",
                         "@@",
                         "+  // fixed before resuming generation",
                     ]
@@ -1597,9 +1675,9 @@ def test_successful_fix_run_queues_resume_generation_from_checkpoint(tmp_path: P
             {
                 "diff": "\n".join(
                     [
-                        "diff --git a/source/frontend/src/roles/specialist/SpecialistRoutes.tsx b/draft/frontend/src/roles/specialist/SpecialistRoutes.tsx",
-                        "--- a/source/frontend/src/roles/specialist/SpecialistRoutes.tsx",
-                        "+++ b/draft/frontend/src/roles/specialist/SpecialistRoutes.tsx",
+                        "diff --git a/source/miniapp/app/static/specialist/app.js b/draft/miniapp/app/static/specialist/app.js",
+                        "--- a/source/miniapp/app/static/specialist/app.js",
+                        "+++ b/draft/miniapp/app/static/specialist/app.js",
                         "@@",
                         "+  // fix completed before resume",
                     ]

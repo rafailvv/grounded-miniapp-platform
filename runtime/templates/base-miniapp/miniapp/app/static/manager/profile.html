@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Manager Profile</title>
+    <link rel="stylesheet" href="/static/manager/styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="page">
+        <header class="header">
+          <h1 class="title">Edit profile</h1>
+        </header>
+
+        <section class="preview-card">
+          <div class="avatar-section">
+            <label class="avatar-upload">
+              <div id="profile-photo" class="avatar-large-wrap"></div>
+              <span class="camera-overlay">+</span>
+              <input id="photo-input" class="hidden-input" type="file" accept="image/*" />
+            </label>
+          </div>
+          <div class="preview-info">
+            <strong class="preview-name" id="preview-name"></strong>
+            <span class="role">Manager</span>
+          </div>
+        </section>
+
+        <form id="profile-form" class="form-card">
+          <label class="input-wrapper">
+            <span class="input-label">First name</span>
+            <input class="text-input" name="first_name" />
+          </label>
+          <label class="input-wrapper">
+            <span class="input-label">Last name</span>
+            <input class="text-input" name="last_name" />
+          </label>
+          <label class="input-wrapper">
+            <span class="input-label">Email <span class="required-indicator">*</span></span>
+            <input class="text-input" name="email" />
+            <span class="error" id="email-error"></span>
+          </label>
+          <label class="input-wrapper">
+            <span class="input-label">Phone <span class="required-indicator">*</span></span>
+            <input class="text-input" name="phone" />
+            <span class="error" id="phone-error"></span>
+          </label>
+          <button class="primary-button" id="save-button" type="submit">Save</button>
+        </form>
+      </section>
+    </main>
+    <script src="/static/preview-bridge.js" defer></script>
+    <script src="/static/manager/profile.js" defer></script>
+  </body>
+  </html>

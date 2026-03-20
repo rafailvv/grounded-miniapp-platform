@@ -143,7 +143,7 @@ class PersistenceRequirement(StrictModel):
     persistence_req_id: str
     entity_id: str
     operation: Literal["create", "read", "update", "delete", "list"]
-    storage_type: Literal["postgres", "redis", "memory", "external"]
+    storage_type: Literal["sqlite", "postgres", "redis", "memory", "external"]
     evidence: list[EvidenceLink]
     retention_policy: str | None = None
 
@@ -251,4 +251,3 @@ class GroundedSpecModel(StrictModel):
     unknowns: list[Unknown]
     contradictions: list[Contradiction]
     doc_refs: list[DocRef]
-

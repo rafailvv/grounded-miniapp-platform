@@ -1,12 +1,9 @@
 # Component Catalog
 
-- `ProfileCabinetCard`: shared role profile entry card.
-- `RoleHomePage`: role-aware home page without domain-specific backend state.
-- `RoleProfileEditorPage`: shared role profile form backed by the profile API.
-- `input`: single-line user input.
-- `textarea`: multi-line notes.
-- `phone_input`: phone-formatted input.
-- `email_input`: email-formatted input.
-- `button`: primary call-to-action.
+- `profile-card`: shared role profile entry card.
+- `workspace-feature-block`: role-aware home section without domain-specific backend state.
+- `profile-editor`: shared role profile form backed by the profile API.
+- `text-input`: single-line user input.
+- `primary-button`: main save action.
 
-Template intentionally keeps only generic starter components, role routing, and profile editing.
+Template intentionally keeps only generic starter markup, a flat visual shell, and profile editing.

@@ -52,14 +52,14 @@ export type Run = {
     prompt?: string;
     error_context?: {
       raw_error: string;
-      source?: "build" | "preview" | "backend" | "frontend" | "runtime" | null;
+      source?: "build" | "preview" | "miniapp" | "frontend" | "runtime" | null;
       failing_target?: string | null;
     } | null;
     failure_class?: string | null;
   } | null;
   error_context?: {
     raw_error: string;
-    source?: "build" | "preview" | "backend" | "frontend" | "runtime" | null;
+    source?: "build" | "preview" | "miniapp" | "frontend" | "runtime" | null;
     failing_target?: string | null;
   } | null;
   checks_summary: {
@@ -177,23 +177,14 @@ export type WorkspaceLogs = {
     created_at: string;
     details?: Record<string, unknown>;
   }>;
-  platform_log?: string[];
-  api_log?: string[];
+  workspace_logs?: string[];
   preview: {
     status: string;
     runtime_mode: string;
     url: string | null;
     logs: string[];
     draft_run_id?: string | null;
-    containers?: Array<{
-      service: string;
-      name?: string | null;
-      state?: string | null;
-      status?: string | null;
-      health?: string | null;
-      exit_code?: string | null;
-    }>;
-    container_logs?: Record<string, string[]>;
+    mini_app_logs?: string[];
   };
   reports: {
     trace?: {
@@ -303,7 +294,7 @@ export async function createRun(
     resume_from_run_id?: string;
     error_context?: {
       raw_error: string;
-      source?: "build" | "preview" | "backend" | "frontend" | "runtime";
+      source?: "build" | "preview" | "miniapp" | "frontend" | "runtime";
       failing_target?: string;
     };
   },

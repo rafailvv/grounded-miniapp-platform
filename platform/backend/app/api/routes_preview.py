@@ -49,7 +49,6 @@ def get_preview_url(workspace_id: str, container: ServiceContainer = Depends(get
 def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
     preview = container.preview_service.get(workspace_id)
     container_logs: dict[str, list[str]] = {}
-    containers: list[dict[str, object]] = []
     if preview.runtime_mode == "docker" and preview.proxy_port is not None:
         source_dir = (
             container.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
@@ -57,8 +56,7 @@ def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(ge
             else container.workspace_service.source_dir(workspace_id)
         )
         container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
-        containers = container.runtime_manager.inspect_containers(workspace_id, source_dir, preview.proxy_port)
-    return {"logs": preview.logs, "containers": containers, "container_logs": container_logs}
+    return {"logs": preview.logs, "mini_app_logs": container_logs}
 
 
 @router.get("/workspaces/{workspace_id}/logs")
@@ -68,7 +66,6 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
     platform_log = container.workspace_log_service.read_lines(workspace_id, kind="platform")
     api_log = container.workspace_log_service.read_lines(workspace_id, kind="api")
     container_logs: dict[str, list[str]] = {}
-    containers: list[dict[str, object]] = []
     if preview.runtime_mode == "docker" and preview.proxy_port is not None:
         source_dir = (
             container.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
@@ -76,7 +73,24 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
             else container.workspace_service.source_dir(workspace_id)
         )
         container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
-        containers = container.runtime_manager.inspect_containers(workspace_id, source_dir, preview.proxy_port)
+    workspace_event_lines = [
+        (
+            f"- [{event.created_at.strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"{event.event_type}: {event.message}"
+            + (f" | {event.details}" if event.details else "")
+        )
+        for event in (job.events if job else [])
+    ]
+    workspace_logs = [
+        *workspace_event_lines,
+        *(["", "=== platform.log ===", *platform_log] if platform_log else []),
+        *(["", "=== api.log ===", *api_log] if api_log else []),
+    ]
+    mini_app_logs = [
+        line
+        for service, lines in container_logs.items()
+        for line in ([f"=== {service} ==="] + lines + [""])
+    ]
     validation = container.generation_service.current_report(workspace_id, "validation")
     assumptions = container.generation_service.current_report(workspace_id, "assumptions")
     traceability = container.generation_service.current_report(workspace_id, "traceability")
@@ -94,8 +108,7 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
         "workspace_id": workspace_id,
         "job": job.model_dump(mode="json") if job else None,
         "events": [event.model_dump(mode="json") for event in job.events] if job else [],
-        "platform_log": platform_log,
-        "api_log": api_log,
+        "workspace_logs": workspace_logs,
         "preview": {
             "status": preview.status,
             "stage": preview.stage,
@@ -106,8 +119,7 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
             "draft_run_id": preview.draft_run_id,
             "latency_breakdown": preview.latency_breakdown,
             "last_error": preview.last_error,
-            "containers": containers,
-            "container_logs": container_logs,
+            "mini_app_logs": mini_app_logs,
         },
         "reports": {
             "trace": trace,

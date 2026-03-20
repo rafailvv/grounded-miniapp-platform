@@ -694,7 +694,7 @@ class RunService:
 
     def _preview_snapshot(self, workspace_id: str, preview: Any | None = None) -> dict[str, Any]:
         current = preview or self.preview_service.get(workspace_id)
-        role_urls = {role: f"{current.url}?role={role}" for role in ("client", "specialist", "manager")} if current.url else {}
+        role_urls = {role: f"{current.url}/{role}" for role in ("client", "specialist", "manager")} if current.url else {}
         return {
             "status": current.status,
             "stage": getattr(current, "stage", "idle"),
@@ -1000,7 +1000,7 @@ class RunService:
             return False
         if path.name.endswith(MEANINGFUL_DIFF_IGNORED_SUFFIXES):
             return False
-        if normalized.startswith("backend/app/generated/"):
+        if normalized.startswith("miniapp/app/generated/"):
             return False
         return True
 
