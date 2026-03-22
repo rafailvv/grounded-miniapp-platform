@@ -423,22 +423,30 @@ class RunService:
                         run.progress_percent = 99
                     else:
                         self._apply_completed_draft(run, message="Applying generated draft to the source workspace.")
-            elif job.status == "blocked":
-                run.status = "blocked"
-                run.apply_status = "blocked"
-                run.draft_status = "failed"
-                if run.current_fix_phase == "completed":
-                    run.current_fix_phase = "failed"
-                run.current_stage = "stopped" if self._is_stop_requested(run.run_id) else "blocked"
-                run.progress_percent = max(run.progress_percent, 100)
             else:
-                run.status = "failed"
-                run.apply_status = "failed"
-                run.draft_status = "failed"
-                if run.current_fix_phase == "completed":
-                    run.current_fix_phase = "failed"
-                run.current_stage = "failed"
-                run.progress_percent = max(run.progress_percent, 100)
+                meaningful_paths = self._meaningful_paths_for_run(
+                    workspace_id=run.workspace_id,
+                    run=run,
+                    change_plan=change_plan,
+                )
+                if self._should_soft_complete_with_warnings(run, job):
+                    self._mark_run_completed_with_warnings(run, job, meaningful_paths=meaningful_paths)
+                elif job.status == "blocked":
+                    run.status = "blocked"
+                    run.apply_status = "blocked"
+                    run.draft_status = "failed"
+                    if run.current_fix_phase == "completed":
+                        run.current_fix_phase = "failed"
+                    run.current_stage = "stopped" if self._is_stop_requested(run.run_id) else "blocked"
+                    run.progress_percent = max(run.progress_percent, 100)
+                else:
+                    run.status = "failed"
+                    run.apply_status = "failed"
+                    run.draft_status = "failed"
+                    if run.current_fix_phase == "completed":
+                        run.current_fix_phase = "failed"
+                    run.current_stage = "failed"
+                    run.progress_percent = max(run.progress_percent, 100)
 
             self._save_run(run)
             if job.status == "completed" and run.apply_status == "applied":
@@ -953,6 +961,33 @@ class RunService:
         job.summary = message
         job.failure_reason = None
         self.generation_service._append_event(job, "job_completed", message, {"reason": "no_meaningful_diff"})
+
+    def _mark_run_completed_with_warnings(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> None:
+        message = "Run completed with validation warnings. Draft was kept for review."
+        run.summary = message
+        run.status = "completed"
+        run.apply_status = "noop"
+        has_draft = self.workspace_service.draft_exists(run.workspace_id, run.run_id)
+        run.draft_status = "ready" if has_draft else "none"
+        run.draft_ready = run.draft_status == "ready"
+        run.current_stage = "completed with warnings"
+        run.progress_percent = max(run.progress_percent, 100)
+        run.current_fix_phase = job.current_fix_phase
+        self._append_job_event(
+            run.linked_job_id,
+            "job_completed",
+            message,
+        )
+
+    def _should_soft_complete_with_warnings(self, run: RunRecord, job: Any) -> bool:
+        if getattr(job, "status", None) not in {"blocked", "failed"}:
+            return False
+        if self._is_stop_requested(run.run_id):
+            return False
+        if str(getattr(job, "failure_class", "") or "") == "stopped_by_user":
+            return False
+        validation_snapshot = getattr(job, "validation_snapshot", None)
+        return validation_snapshot is not None
 
     def _apply_completed_draft(self, run: RunRecord, *, message: str) -> None:
         apply_started_at = time.perf_counter()

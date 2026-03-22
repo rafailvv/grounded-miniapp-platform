@@ -545,6 +545,55 @@ def test_connectivity_validator_flags_missing_backend_route_for_dynamic_page(tmp
     assert any(issue.code == "connectivity.missing_backend_route" for issue in issues)
 
 
+def test_connectivity_validator_reads_page_specific_script_dependencies(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_connectivity_artifacts(workspace_root)
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/index.html",
+        """
+        <main>
+          <section>Loading orders...</section>
+          <section>Unable to load orders.</section>
+          <script src="/static/client/orders.js"></script>
+        </main>
+        """,
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/orders.js",
+        """
+        async function loadOrders() {
+          const response = await fetch('/api/orders');
+          return response.json();
+        }
+        """,
+    )
+
+    issues = ConnectivityValidator().validate(workspace_root)
+    assert any(issue.code == "connectivity.missing_backend_route" for issue in issues)
+
+
+def test_connectivity_validator_flags_missing_static_asset_reference(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(_multi_page_graph()))
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/index.html",
+        """
+        <main>
+          <section>Catalog</section>
+          <script src="/static/client/cart.js"></script>
+        </main>
+        """,
+    )
+
+    issues = ConnectivityValidator().validate(workspace_root)
+    assert any(issue.code == "connectivity.missing_static_asset" for issue in issues)
+
+
 def test_connectivity_validator_flags_unwired_dynamic_page(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
     _create_workspace_scaffold(workspace_root)

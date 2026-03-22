@@ -201,6 +201,75 @@ def test_context_pack_and_generation_context_skip_non_utf8_files(tmp_path: Path)
     assert "miniapp/app/generated/app.db" not in file_contexts
 
 
+def test_run_soft_completes_when_generation_returns_validation_failure(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Soft Complete Workspace",
+            "description": "Validation failures should still produce a completed run with warnings.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    workspace_service = app.state.container.workspace_service
+    workspace_service.clone_template(workspace_id)
+
+    def fake_generate(workspace_id: str, request: GenerateRequest, *, should_stop=None):
+        del should_stop
+        draft_root = workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_soft_complete")
+        target = draft_root / "miniapp/app/static/client/index.html"
+        target.write_text(target.read_text(encoding="utf-8") + "\n<section>draft</section>\n", encoding="utf-8")
+        return JobRecord(
+            workspace_id=workspace_id,
+            prompt=request.prompt,
+            status="failed",
+            mode="generate",
+            generation_mode=request.generation_mode,
+            target_platform=request.target_platform,
+            preview_profile=request.preview_profile,
+            current_revision_id=workspace_service.get_workspace(workspace_id).current_revision_id,
+            fidelity="balanced_app",
+            linked_run_id=request.linked_run_id,
+            summary="Validation failed after draft generation.",
+            failure_reason="Connectivity validators reported unresolved issues.",
+            failure_class="validator/domain_constraint",
+            root_cause_summary="connectivity.missing_ui_loading_state",
+            validation_snapshot=ValidationSnapshot(
+                grounded_spec_valid=True,
+                app_ir_valid=True,
+                build_valid=False,
+                blocking=True,
+                issues=[{"code": "connectivity.missing_ui_loading_state", "message": "Missing loading state.", "severity": "high"}],
+            ),
+        )
+
+    app.state.container.generation_service.generate = fake_generate  # type: ignore[method-assign]
+
+    run = app.state.container.run_service.create_run_sync(
+        workspace_id,
+        CreateRunRequest(
+            prompt="Create a flower shop mini app.",
+            apply_strategy="staged_auto_apply",
+            model_profile="openai_code_fast",
+            generation_mode="balanced",
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+        ),
+    )
+
+    assert run.status == "completed"
+    assert run.apply_status == "noop"
+    assert run.draft_status == "ready"
+    assert run.draft_ready is True
+    assert run.current_stage == "completed with warnings"
+    assert run.failure_reason == "Connectivity validators reported unresolved issues."
+
+
 def test_run_exposes_checks_patch_and_index_status(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -1188,6 +1257,92 @@ def test_preview_connectivity_smoke_reports_unreachable_route(tmp_path: Path, mo
     assert any("/specialist" in line for line in result.logs)
 
 
+def test_preview_connectivity_smoke_retries_transient_route_failures(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    runner = app.state.container.check_runner
+
+    graph = {
+        "roles": {
+            "client": {"pages": [{"route_path": "/client"}]},
+            "specialist": {"pages": [{"route_path": "/specialist"}]},
+            "manager": {"pages": [{"route_path": "/manager"}]},
+        }
+    }
+    artifacts_dir = tmp_path / "workspace" / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "generated_app_graph.json").write_text(json.dumps(graph), encoding="utf-8")
+
+    class FakeResponse:
+        def __init__(self, body: str):
+            self.status = 200
+            self._body = body.encode("utf-8")
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    attempts: dict[str, int] = {}
+
+    def fake_urlopen(request, timeout):
+        route = request.full_url.rsplit("/", 1)[-1]
+        attempts[route] = attempts.get(route, 0) + 1
+        if route == "client" and attempts[route] == 1:
+            raise check_runner_module.URLError("connection refused")
+        return FakeResponse("<html><body><main>usable preview content for route</main></body></html>")
+
+    monkeypatch.setattr(check_runner_module, "urlopen", fake_urlopen)
+
+    result = runner._preview_connectivity_smoke(
+        source_dir=tmp_path / "workspace",
+        preview=PreviewRecord(workspace_id="ws_1", status="running", url="http://localhost:3000", draft_run_id="run_1"),
+        preview_run_id="run_1",
+    )
+
+    assert result.status == "passed"
+    assert attempts["client"] == 2
+    assert any("/client returned usable preview content after 2 attempt(s)." in line for line in result.logs)
+
+
+def test_generation_service_detects_missing_static_asset_targets(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    targets = service._detect_missing_static_asset_targets(
+        generated_page_sources={
+            "miniapp/app/static/client/cart.html": """
+            <main>
+              <script src="/static/client/cart.js"></script>
+              <script src="./checkout.js"></script>
+            </main>
+            """
+        },
+        current_target_files=["miniapp/app/static/client/cart.html"],
+    )
+
+    assert targets == [
+        "miniapp/app/static/client/cart.js",
+        "miniapp/app/static/client/checkout.js",
+    ]
+
+
+def test_fix_orchestrator_does_not_misclassify_preview_route_errors_as_typescript(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+
+    failure_class = app.state.container.fix_orchestrator._classify_failure_text(
+        "/client could not be opened in preview: <urlopen error [Errno 111] Connection refused>"
+    )
+
+    assert failure_class == "runtime_preview_boot"
+
+
 def test_openrouter_json_parser_recovers_first_object_from_concatenated_json() -> None:
     parsed = OpenRouterClient._parse_json_payload(
         '{"assistant_message":"first","operations":[]}{"assistant_message":"second","operations":[]}',
@@ -1439,6 +1594,121 @@ def test_scope_mode_prefers_minimal_patch_for_small_local_edits(tmp_path: Path) 
     )
 
     assert scope_mode == "minimal_patch"
+
+
+def test_normalize_page_plan_proactively_adds_backend_targets_from_page_graph_dependencies(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    planned = service._normalize_page_plan(
+        {
+            "summary": "Plan a storefront flow.",
+            "page_graph": {
+                "app_title": "Flower Shop",
+                "summary": "Catalog and order management.",
+                "flow_mode": "multi_page",
+                "roles": [
+                    {
+                        "role": "client",
+                        "entry_path": "/client",
+                        "landing_page_id": "catalog",
+                        "routes_file": "miniapp/app/static/client/index.html",
+                        "pages": [
+                            {
+                                "page_id": "catalog",
+                                "route_path": "/client/catalog",
+                                "navigation_label": "Catalog",
+                                "component_name": "CatalogPage",
+                                "file_path": "miniapp/app/static/client/catalog.html",
+                                "title": "Catalog",
+                                "description": "Browse flowers.",
+                                "purpose": "Browse flowers.",
+                                "page_kind": "workspace",
+                                "primary_actions": ["Browse products"],
+                                "data_dependencies": ["/api/catalog", "/api/orders?status=open"],
+                                "loading_state": "",
+                                "empty_state": "",
+                                "error_state": "",
+                            }
+                        ],
+                    }
+                ],
+            },
+            "target_files": ["miniapp/app/static/client/catalog.html"],
+            "shared_files": [],
+            "backend_targets": [],
+            "files_to_read": [],
+        },
+        role_scope=["client"],
+        scope_mode="whole_file_build",
+        require_multi_page=True,
+        workspace_tree=[],
+    )
+
+    assert "miniapp/app/routes/catalog.py" in planned["backend_targets"]
+    assert "miniapp/app/routes/orders.py" in planned["backend_targets"]
+    assert "miniapp/app/main.py" in planned["backend_targets"]
+    assert "miniapp/app/routes/catalog.py" in planned["target_files"]
+    assert planned["planner_contract_enrichment"]["proactive_backend_targets"]
+
+
+def test_normalize_page_plan_infers_semantic_state_contract_for_dynamic_pages(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    planned = service._normalize_page_plan(
+        {
+            "summary": "Plan a storefront flow.",
+            "page_graph": {
+                "app_title": "Flower Shop",
+                "summary": "Catalog and order management.",
+                "flow_mode": "multi_page",
+                "roles": [
+                    {
+                        "role": "client",
+                        "entry_path": "/client",
+                        "landing_page_id": "catalog",
+                        "routes_file": "miniapp/app/static/client/index.html",
+                        "pages": [
+                            {
+                                "page_id": "catalog",
+                                "route_path": "/client/catalog",
+                                "navigation_label": "Catalog",
+                                "component_name": "CatalogPage",
+                                "file_path": "miniapp/app/static/client/catalog.html",
+                                "title": "Catalog",
+                                "description": "Browse flowers.",
+                                "purpose": "Browse flowers.",
+                                "page_kind": "workspace",
+                                "primary_actions": ["Browse products"],
+                                "data_dependencies": ["/api/catalog"],
+                                "loading_state": "",
+                                "empty_state": "",
+                                "error_state": "",
+                            }
+                        ],
+                    }
+                ],
+            },
+            "target_files": ["miniapp/app/static/client/catalog.html"],
+            "shared_files": [],
+            "backend_targets": [],
+            "files_to_read": [],
+        },
+        role_scope=["client"],
+        scope_mode="whole_file_build",
+        require_multi_page=True,
+        workspace_tree=[],
+    )
+
+    page = planned["page_graph"]["roles"]["client"]["pages"][0]
+    assert "#catalog-loading" in page["loading_state"]
+    assert '[data-ui-state="loading"]' in page["loading_state"]
+    assert "#catalog-error" in page["error_state"]
+    assert '[data-ui-state="error"]' in page["error_state"]
+    assert "empty-state container" in page["empty_state"]
 
 
 def test_page_generation_accepts_multiple_same_file_operations_and_uses_last_valid_replace(tmp_path: Path) -> None:

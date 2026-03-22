@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import posixpath
 import re
 import time
 from typing import Any, Callable
@@ -595,6 +596,7 @@ class GenerationService:
                 "active_role_scope": plan_result.get("active_role_scope"),
                 "flow_mode": plan_result.get("flow_mode"),
                 "scope_mode": plan_result.get("scope_mode"),
+                "planner_contract_enrichment": plan_result.get("planner_contract_enrichment"),
                 "execution_plan": plan_result.get("execution_plan"),
             },
         )
@@ -781,6 +783,26 @@ class GenerationService:
         started_at: float,
         should_stop: Callable[[], bool] | None,
     ) -> JobRecord:
+        proactive_contract_targets = self._detect_missing_backend_contract_targets_from_page_graph(
+            page_graph=plan_result["page_graph"],
+            current_target_files=plan_result["target_files"],
+            backend_targets=plan_result["backend_targets"],
+        )
+        if proactive_contract_targets:
+            plan_result["target_files"] = list(dict.fromkeys([*plan_result["target_files"], *proactive_contract_targets]))
+            plan_result["backend_targets"] = list(dict.fromkeys([*plan_result["backend_targets"], *proactive_contract_targets]))
+            if isinstance(plan_result.get("page_graph"), dict):
+                existing_backend_targets = list(plan_result["page_graph"].get("backend_targets") or [])
+                plan_result["page_graph"]["backend_targets"] = list(
+                    dict.fromkeys([*existing_backend_targets, *proactive_contract_targets])
+                )
+            plan_result["generation_clusters"] = self._build_generation_clusters(plan_result["target_files"])
+            self._append_trace(
+                workspace_id,
+                "planner_contract_completed",
+                "Planner targets were proactively expanded to include backend contract files before code generation.",
+                {"added_targets": proactive_contract_targets},
+            )
         self._append_event(
             job,
             "context_pack_started",
@@ -861,7 +883,7 @@ class GenerationService:
                 {"added_targets": added_targets},
             )
             plan_result["target_files"] = list(edit_result.get("effective_target_files") or plan_result["target_files"])
-            plan_result["backend_targets"] = list(dict.fromkeys([*(plan_result.get("backend_targets") or []), *added_targets]))
+            plan_result["backend_targets"] = list(edit_result.get("effective_backend_targets") or plan_result.get("backend_targets") or [])
         for metric_key, metric_value in (edit_result.get("latency_breakdown") or {}).items():
             job.latency_breakdown[metric_key] = int(metric_value)
         for trace_stage, payload in (edit_result.get("trace_payloads") or {}).items():
@@ -1651,14 +1673,19 @@ class GenerationService:
 
         effective_target_files = list(target_files)
         backend_targets = self._backend_composition_targets(target_files, selected_pages)
-        contract_gap_targets = self._detect_missing_backend_contract_targets(
+        backend_contract_gap_targets = self._detect_missing_backend_contract_targets(
             generated_page_sources=generated_page_sources,
             current_target_files=effective_target_files,
             backend_targets=backend_targets,
         )
+        static_contract_gap_targets = self._detect_missing_static_asset_targets(
+            generated_page_sources=generated_page_sources,
+            current_target_files=effective_target_files,
+        )
+        contract_gap_targets = list(dict.fromkeys([*backend_contract_gap_targets, *static_contract_gap_targets]))
         if contract_gap_targets:
             effective_target_files = list(dict.fromkeys([*effective_target_files, *contract_gap_targets]))
-            backend_targets = list(dict.fromkeys([*backend_targets, *contract_gap_targets]))
+            backend_targets = list(dict.fromkeys([*backend_targets, *backend_contract_gap_targets]))
             for file_path in contract_gap_targets:
                 if file_path in file_contexts:
                     continue
@@ -1670,7 +1697,7 @@ class GenerationService:
                     continue
                 file_contexts[file_path] = content
 
-        frontend_targets = self._frontend_composition_targets(target_files, selected_pages)
+        frontend_targets = self._frontend_composition_targets(effective_target_files, selected_pages)
         frontend_bootstrap_targets, frontend_routing_targets = self._partition_frontend_composition_targets(
             frontend_targets,
             page_graph,
@@ -1765,6 +1792,7 @@ class GenerationService:
             "operations": operations,
             "planner_contract_gap_targets": contract_gap_targets,
             "effective_target_files": effective_target_files,
+            "effective_backend_targets": backend_targets,
             "latency_breakdown": latency_breakdown,
             "trace_payloads": trace_payloads,
         }
@@ -2163,6 +2191,13 @@ class GenerationService:
             }
             graph_page_targets.extend(page["file_path"] for page in pages)
 
+        proactive_backend_targets = self._detect_missing_backend_contract_targets_from_page_graph(
+            page_graph={"roles": roles},
+            current_target_files=[*shared_files, *backend_targets, *graph_page_targets],
+            backend_targets=backend_targets,
+        )
+        backend_targets = list(dict.fromkeys([*backend_targets, *proactive_backend_targets]))
+
         computed_targets = list(
             dict.fromkeys(
                 [
@@ -2210,6 +2245,9 @@ class GenerationService:
             "generation_clusters": generation_clusters,
             "active_role_scope": execution_plan["active_role_scope"],
             "execution_plan": execution_plan,
+            "planner_contract_enrichment": {
+                "proactive_backend_targets": proactive_backend_targets,
+            },
             "page_graph": {
                 "app_title": str(raw_graph.get("app_title") or "").strip(),
                 "summary": str(raw_graph.get("summary") or payload.get("summary") or "").strip(),
@@ -2234,6 +2272,12 @@ class GenerationService:
             route_path = f"/{route_path}"
         file_path_candidates = self._normalize_path_list([payload.get("file_path")], [])
         data_dependencies = self._normalize_string_list(payload.get("data_dependencies"))
+        file_path = file_path_candidates[0] if file_path_candidates else self._default_page_file(role, component_name)
+        state_marker_base = self._state_marker_base(
+            str(payload.get("page_id") or f"{role}_{index + 1}"),
+            file_path,
+            component_name,
+        )
         loading_state = str(payload.get("loading_state") or "").strip()
         empty_state = str(payload.get("empty_state") or "").strip()
         error_state = str(payload.get("error_state") or "").strip()
@@ -2241,12 +2285,28 @@ class GenerationService:
             loading_state = ""
             empty_state = ""
             error_state = ""
+        else:
+            page_label = str(payload.get("title") or component_name).strip() or component_name
+            if not loading_state:
+                loading_state = self._default_state_contract(
+                    state_kind="loading",
+                    page_label=page_label,
+                    marker_base=state_marker_base,
+                )
+            if not error_state:
+                error_state = self._default_state_contract(
+                    state_kind="error",
+                    page_label=page_label,
+                    marker_base=state_marker_base,
+                )
+            if not empty_state:
+                empty_state = f"Show an empty-state container after {page_label} data loads but returns no records."
         return {
             "page_id": str(payload.get("page_id") or f"{role}_{index + 1}").strip() or f"{role}_{index + 1}",
             "route_path": route_path,
             "navigation_label": str(payload.get("navigation_label") or payload.get("title") or component_name).strip(),
             "component_name": component_name,
-            "file_path": file_path_candidates[0] if file_path_candidates else self._default_page_file(role, component_name),
+            "file_path": file_path,
             "title": str(payload.get("title") or component_name).strip(),
             "description": str(payload.get("description") or payload.get("purpose") or "").strip(),
             "purpose": str(payload.get("purpose") or payload.get("description") or "").strip(),
@@ -2257,6 +2317,22 @@ class GenerationService:
             "empty_state": empty_state,
             "error_state": error_state,
         }
+
+    @staticmethod
+    def _state_marker_base(page_id: str, file_path: str, component_name: str) -> str:
+        raw_value = page_id.strip() or Path(file_path).stem or component_name or "page"
+        slug = re.sub(r"[^a-z0-9]+", "-", raw_value.lower()).strip("-")
+        return slug or "page"
+
+    @staticmethod
+    def _default_state_contract(*, state_kind: str, page_label: str, marker_base: str) -> str:
+        if state_kind == "loading":
+            return (
+                f"Render #{marker_base}-loading or [data-ui-state=\"loading\"] while {page_label} data is loading."
+            )
+        return (
+            f"Render #{marker_base}-error or [data-ui-state=\"error\"] when {page_label} data fails to load."
+        )
 
     @staticmethod
     def _default_routes_file(role: str) -> str:
@@ -2966,6 +3042,8 @@ class GenerationService:
                     "If the prompt implies several flows, entities, or jobs, return a multi-page app with distinct page files and routes.",
                     "Keep index.html as the role entry page only; put catalog, orders, detail, cart, checkout, and management flows into separate HTML files when the workflow implies them.",
                     "Do not collapse workflow-heavy apps into index.html plus profile.html only.",
+                    "For pages with dynamic data dependencies, plan semantic loading/error states that downstream codegen can realize with real containers, ids, or data-ui-state markers.",
+                    "For pages that reference /api endpoints in data dependencies, include the matching miniapp route modules in backend_targets from the start.",
                     "For targeted edits, keep target_files minimal and touch only the files required by the request.",
                     "Do not output role copies with changed titles only.",
                     "Return only repo-relative file paths that fit the current workspace tree and path hints.",
@@ -3016,6 +3094,8 @@ class GenerationService:
                     "Keep Telegram/MAX mini-app compatibility.",
                     "Keep three-role preview compatibility.",
                     "Use the existing profile design language as a style anchor.",
+                    "For pages with dynamic data dependencies, include loading_state and error_state contracts that can be rendered as semantic HTML containers.",
+                    "For pages that reference /api endpoints in data dependencies, include matching backend route modules in backend_targets instead of deferring this to repair.",
                     "Do not output role copies with changed titles only.",
                     "Return only repo-relative file paths that fit the current workspace tree and path hints.",
                     "Do not return HTTP endpoints, route strings, or prose labels inside target_files or backend_targets.",
@@ -3117,12 +3197,20 @@ class GenerationService:
                     ],
                     "design_reference_files": design_reference_files,
                 },
+                "state_contract": {
+                    "data_dependencies": list(page.get("data_dependencies") or []),
+                    "loading_state": page.get("loading_state"),
+                    "empty_state": page.get("empty_state"),
+                    "error_state": page.get("error_state"),
+                },
                 "current_file": self._limit_text(file_contexts.get(page["file_path"], ""), 6000 if compact else 12000),
                 "creative_direction": creative_direction,
                 "rules": [
                     "Create a real page, not a generic stats card screen.",
                     "Respect the requested role and make the actions specific to that role.",
                     "Only add loading, empty, and error states when the page depends on data fetched after page load.",
+                    "If the page has data_dependencies, emit semantic loading and error containers that are discoverable via ids, query selectors, or data-ui-state markers.",
+                    "Use loading/error ids or data-ui-state markers that match the page contract instead of decorative prose only.",
                     "Static or mostly static pages should render immediately without spinner-first UX.",
                     "Keep landing pages complete on first paint and move business flows into separate HTML pages when the page graph requires them.",
                     "If scope_mode is minimal_patch, preserve unrelated behavior and keep the diff minimal.",
@@ -3185,6 +3273,8 @@ class GenerationService:
                 "role_scope": role_scope,
                 "role_contract": self._compact_role_contract_for_codegen(role_contract, role_scope),
                 "page_graph": self._compact_page_graph_for_codegen(page_graph, role_scope),
+                "stateful_pages": self._stateful_page_contracts(page_graph, role_scope),
+                "expected_backend_targets": list((page_graph.get("backend_targets") or [])[:12]),
                 "target_files": target_files,
                 "workspace_path_hints": {
                     "target_roots": sorted({path.split("/", 1)[0] for path in target_files if "/" in path}),
@@ -3208,6 +3298,8 @@ class GenerationService:
                     "Only touch files listed in target_files.",
                     "If stage_name is miniapp, generate only miniapp/server/shared contract files required by the request.",
                     "If stage_name is frontend, wire pages, routes, and shared UI/state to the already planned miniapp surface.",
+                    "When planned pages have dynamic dependencies, generate validator-compatible loading/error containers and wiring in the first draft instead of waiting for repair.",
+                    "When generated sources reference /api endpoints, include the matching miniapp route modules and router wiring from the first draft whenever those files are in target_files.",
                     "Generate role routes that expose the page graph as real separate pages when routes are targeted.",
                     "Generate shared app chrome/state files that support the pages instead of rendering placeholder dashboards.",
                     "Keep role pages usable without waiting on client-side hydration for basic navigation and structure.",
@@ -3567,6 +3659,90 @@ class GenerationService:
                 continue
             for match in re.finditer(r"['\"](/api/([a-zA-Z0-9_-]+))([/'\"?]|$)", source):
                 endpoint_names.add(match.group(2))
+        if not endpoint_names:
+            return []
+        existing_targets = set(current_target_files) | set(backend_targets)
+        inferred: list[str] = []
+        router_path = "miniapp/app/main.py"
+        for endpoint_name in sorted(endpoint_names):
+            if endpoint_name in {"health", "profiles"}:
+                continue
+            inferred_path = f"miniapp/app/routes/{endpoint_name}.py"
+            if inferred_path not in existing_targets:
+                inferred.append(inferred_path)
+            if router_path not in existing_targets:
+                inferred.append(router_path)
+        return list(dict.fromkeys(inferred))
+
+    @staticmethod
+    def _detect_missing_static_asset_targets(
+        *,
+        generated_page_sources: dict[str, str],
+        current_target_files: list[str],
+    ) -> list[str]:
+        existing_targets = set(current_target_files)
+        inferred: list[str] = []
+        for source_path, source in generated_page_sources.items():
+            if not isinstance(source, str):
+                continue
+            for asset_path in GenerationService._extract_static_asset_targets(source, source_path=source_path):
+                if asset_path not in existing_targets:
+                    inferred.append(asset_path)
+        return list(dict.fromkeys(inferred))
+
+    @staticmethod
+    def _extract_static_asset_targets(content: str, *, source_path: str) -> set[str]:
+        refs: set[str] = set()
+        patterns = (
+            r"""(?:src|href)\s*=\s*["']([^"']+\.(?:js|css)(?:[?#][^"']*)?)["']""",
+            r"""(?:import|from)\s*(?:\(\s*)?["']([^"']+\.(?:js|css)(?:[?#][^"']*)?)["']""",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, content, flags=re.IGNORECASE):
+                resolved = GenerationService._resolve_static_asset_target(match.group(1), source_path=source_path)
+                if resolved:
+                    refs.add(resolved)
+        return refs
+
+    @staticmethod
+    def _resolve_static_asset_target(raw_ref: str, *, source_path: str) -> str | None:
+        candidate = raw_ref.strip().split("?", 1)[0].split("#", 1)[0]
+        if not candidate or candidate.startswith(("http://", "https://", "//", "data:")):
+            return None
+        if candidate.startswith("/static/"):
+            resolved = f"miniapp/app{candidate}"
+        elif candidate.startswith("static/"):
+            resolved = f"miniapp/app/{candidate}"
+        elif candidate.startswith("/"):
+            return None
+        else:
+            source_parent = Path(source_path).parent.as_posix()
+            resolved = posixpath.normpath(posixpath.join(source_parent, candidate))
+        if not resolved.startswith("miniapp/app/static/"):
+            return None
+        if Path(resolved).suffix.lower() not in {".js", ".css"}:
+            return None
+        return resolved
+
+    @staticmethod
+    def _detect_missing_backend_contract_targets_from_page_graph(
+        *,
+        page_graph: dict[str, Any],
+        current_target_files: list[str],
+        backend_targets: list[str],
+    ) -> list[str]:
+        endpoint_names: set[str] = set()
+        for role_payload in (page_graph.get("roles") or {}).values():
+            if not isinstance(role_payload, dict):
+                continue
+            for page in role_payload.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                for dependency in page.get("data_dependencies") or []:
+                    if not isinstance(dependency, str):
+                        continue
+                    for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", dependency):
+                        endpoint_names.add(match.group(1))
         if not endpoint_names:
             return []
         existing_targets = set(current_target_files) | set(backend_targets)
@@ -4159,6 +4335,31 @@ class GenerationService:
                 if role in roles
             },
         }
+
+    @staticmethod
+    def _stateful_page_contracts(page_graph: dict[str, Any], role_scope: list[str]) -> list[dict[str, Any]]:
+        roles = page_graph.get("roles") or {}
+        contracts: list[dict[str, Any]] = []
+        for role in role_scope:
+            role_payload = roles.get(role) or {}
+            for page in role_payload.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                data_dependencies = list(page.get("data_dependencies") or [])
+                if not data_dependencies:
+                    continue
+                contracts.append(
+                    {
+                        "role": role,
+                        "page_id": page.get("page_id"),
+                        "file_path": page.get("file_path"),
+                        "data_dependencies": data_dependencies[:6],
+                        "loading_state": page.get("loading_state"),
+                        "empty_state": page.get("empty_state"),
+                        "error_state": page.get("error_state"),
+                    }
+                )
+        return contracts[:12]
 
     @staticmethod
     def _failure_signature_for_issues(build_issues: list[ValidationIssue], preview_issue: ValidationIssue | None) -> str:

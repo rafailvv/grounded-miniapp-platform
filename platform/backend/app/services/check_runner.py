@@ -239,21 +239,32 @@ class CheckRunner:
         logs: list[str] = []
         for route in routes:
             target = urljoin(preview.url.rstrip("/") + "/", route.lstrip("/"))
-            try:
-                request = Request(target, headers={"User-Agent": "connectivity-smoke"})
-                with urlopen(request, timeout=2.0) as response:
-                    status_code = response.status if hasattr(response, "status") else response.getcode()
-                    body = response.read().decode("utf-8", errors="ignore")
-                if status_code >= 400:
-                    failures.append(f"{route} returned HTTP {status_code}.")
-                    continue
-                normalized_body = body.lower()
-                if len(normalized_body.strip()) < 40 or "not found" in normalized_body or "<title>404" in normalized_body:
-                    failures.append(f"{route} returned unusable preview content.")
-                    continue
-                logs.append(f"{route} returned usable preview content.")
-            except (TimeoutError, URLError, OSError) as exc:
-                failures.append(f"{route} could not be opened in preview: {exc}")
+            final_failure: str | None = None
+            for attempt in range(1, 4):
+                try:
+                    request = Request(target, headers={"User-Agent": "connectivity-smoke"})
+                    with urlopen(request, timeout=2.0) as response:
+                        status_code = response.status if hasattr(response, "status") else response.getcode()
+                        body = response.read().decode("utf-8", errors="ignore")
+                    if status_code >= 400:
+                        final_failure = f"{route} returned HTTP {status_code}."
+                    else:
+                        normalized_body = body.lower()
+                        if len(normalized_body.strip()) < 40 or "not found" in normalized_body or "<title>404" in normalized_body:
+                            final_failure = f"{route} returned unusable preview content."
+                        else:
+                            suffix = f" after {attempt} attempt(s)." if attempt > 1 else "."
+                            logs.append(f"{route} returned usable preview content{suffix}")
+                            final_failure = None
+                            break
+                except (TimeoutError, URLError, OSError) as exc:
+                    final_failure = f"{route} could not be opened in preview: {exc}"
+                if final_failure is None:
+                    break
+                if attempt < 3:
+                    time.sleep(0.35 * attempt)
+            if final_failure:
+                failures.append(final_failure)
         return RunCheckResult(
             name="preview_connectivity_smoke",
             status="failed" if failures else "passed",

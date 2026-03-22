@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import posixpath
 import re
 
 from app.models.artifacts import ValidationIssue
@@ -135,7 +136,8 @@ class ConnectivityValidator:
                 if file_path.suffix not in {".html", ".js"}:
                     continue
                 relative = str(file_path.relative_to(workspace_path))
-                for endpoint in self._extract_api_refs(file_path.read_text(encoding="utf-8")):
+                content = file_path.read_text(encoding="utf-8")
+                for endpoint in self._extract_api_refs(content):
                     if endpoint not in route_stems:
                         issues.append(
                             ValidationIssue(
@@ -145,6 +147,17 @@ class ConnectivityValidator:
                                 location=f"miniapp/app/routes/{endpoint}.py",
                             )
                         )
+                for asset_path in self._extract_static_asset_refs(content, source_path=relative):
+                    if (workspace_path / asset_path).exists():
+                        continue
+                    issues.append(
+                        ValidationIssue(
+                            code="connectivity.missing_static_asset",
+                            message=f"{relative} references {self._public_static_asset_path(asset_path)} but the static asset is missing.",
+                            severity="high",
+                            location=asset_path,
+                        )
+                    )
         return self._dedupe_issues(issues)
 
     @staticmethod
@@ -159,7 +172,15 @@ class ConnectivityValidator:
     @staticmethod
     def _page_surface_content(workspace_path: Path, file_path: str) -> str:
         page_file = workspace_path / file_path
-        content_parts = [page_file.read_text(encoding="utf-8")]
+        page_content = page_file.read_text(encoding="utf-8")
+        content_parts = [page_content]
+        appended_assets: set[str] = set()
+        for asset_path in ConnectivityValidator._extract_static_asset_refs(page_content, source_path=file_path):
+            asset_file = workspace_path / asset_path
+            if not asset_file.exists() or asset_path in appended_assets:
+                continue
+            content_parts.append(asset_file.read_text(encoding="utf-8"))
+            appended_assets.add(asset_path)
         match = re.search(r"miniapp/app/static/([^/]+)/", file_path)
         if match is None:
             return "\n".join(content_parts)
@@ -167,8 +188,10 @@ class ConnectivityValidator:
         role_dir = workspace_path / "miniapp" / "app" / "static" / role
         for candidate in ("app.js", "profile.js"):
             target = role_dir / candidate
-            if target.exists():
+            target_relative = str(target.relative_to(workspace_path))
+            if target.exists() and target_relative not in appended_assets:
                 content_parts.append(target.read_text(encoding="utf-8"))
+                appended_assets.add(target_relative)
         return "\n".join(content_parts)
 
     @staticmethod
@@ -177,6 +200,46 @@ class ConnectivityValidator:
         for match in re.finditer(r"['\"]?/api/([a-zA-Z0-9_-]+)(?:[/'\"?)]|$)", content):
             refs.add(match.group(1).lower())
         return refs
+
+    @staticmethod
+    def _extract_static_asset_refs(content: str, *, source_path: str) -> set[str]:
+        refs: set[str] = set()
+        patterns = (
+            r"""(?:src|href)\s*=\s*["']([^"']+\.(?:js|css)(?:[?#][^"']*)?)["']""",
+            r"""(?:import|from)\s*(?:\(\s*)?["']([^"']+\.(?:js|css)(?:[?#][^"']*)?)["']""",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, content, flags=re.IGNORECASE):
+                resolved = ConnectivityValidator._resolve_static_asset_ref(match.group(1), source_path=source_path)
+                if resolved:
+                    refs.add(resolved)
+        return refs
+
+    @staticmethod
+    def _resolve_static_asset_ref(raw_ref: str, *, source_path: str) -> str | None:
+        candidate = raw_ref.strip().split("?", 1)[0].split("#", 1)[0]
+        if not candidate or candidate.startswith(("http://", "https://", "//", "data:")):
+            return None
+        if candidate.startswith("/static/"):
+            resolved = f"miniapp/app{candidate}"
+        elif candidate.startswith("static/"):
+            resolved = f"miniapp/app/{candidate}"
+        elif candidate.startswith("/"):
+            return None
+        else:
+            source_parent = Path(source_path).parent.as_posix()
+            resolved = posixpath.normpath(posixpath.join(source_parent, candidate))
+        if not resolved.startswith("miniapp/app/static/"):
+            return None
+        if Path(resolved).suffix.lower() not in {".js", ".css"}:
+            return None
+        return resolved
+
+    @staticmethod
+    def _public_static_asset_path(relative_path: str) -> str:
+        if relative_path.startswith("miniapp/app/static/"):
+            return f"/static/{relative_path.removeprefix('miniapp/app/static/')}"
+        return relative_path
 
     @staticmethod
     def _normalize_tokens(values: list[str] | tuple[str, ...]) -> set[str]:

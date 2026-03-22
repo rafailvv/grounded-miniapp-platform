@@ -865,7 +865,29 @@ class FixOrchestrator:
         lowered = text.lower()
         if any(marker in lowered for marker in ("npm is not available", "docker compose is not available", "tooling is unavailable", "was not found on path")):
             return "tooling/platform_misconfiguration"
-        if any(marker in lowered for marker in ("has no exported member", "ts", "typescript", "argument of type", "cannot find module", "vite build")):
+        if any(
+            marker in lowered
+            for marker in (
+                "could not be opened in preview",
+                "returned unusable preview content",
+                "preview route smoke",
+                "connection refused",
+            )
+        ):
+            return "runtime_preview_boot"
+        if any(
+            marker in lowered
+            for marker in (
+                "has no exported member",
+                "typescript",
+                "argument of type",
+                "cannot find module",
+                "vite build",
+                "ts230",
+                ".ts:",
+                ".tsx:",
+            )
+        ):
             return "frontend_compile/type/import"
         if any(marker in lowered for marker in ("traceback", "importerror", "modulenotfounderror", "cannot import name", "py_compile failed", "pydantic")):
             return "backend_startup/import/schema"
@@ -959,7 +981,9 @@ class FixOrchestrator:
             "You are a focused software repair agent. "
             "Diagnose the current failure packet, patch only the files justified by the evidence, "
             "keep the diff minimal, and aim for a green compile plus healthy preview runtime. "
-            "Do not redesign the app. Fix the current root-cause cluster only."
+            "Do not redesign the app. Fix the current root-cause cluster only. "
+            "Preserve the existing backend architecture, routers, and static mounting unless the evidence explicitly implicates them. "
+            "Never replace a functioning FastAPI backend or route module with placeholder HTML handlers, stub pages, or a simplified demo app."
         )
 
     @staticmethod
@@ -975,6 +999,8 @@ class FixOrchestrator:
                     "Prefer editing implicated files over broad refactors.",
                     "Respect the provided write scope unless a directly adjacent dependency is required.",
                     "The fix is considered successful only if the app compiles and the preview runtime becomes healthy.",
+                    "Preserve existing endpoints, router wiring, and static file serving unless the evidence shows they are broken.",
+                    "Do not replace main.py, route modules, or backend services with placeholder HTML stubs or hard-coded pages.",
                 ],
             },
             ensure_ascii=False,
