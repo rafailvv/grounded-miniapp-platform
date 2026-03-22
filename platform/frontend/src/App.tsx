@@ -160,11 +160,72 @@ function asStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string");
 }
 
-function formatRoleScope(scope: RoleKey[]): string {
-  if (!scope.length) {
+function normalizeRoleScope(scope: unknown): RoleKey[] {
+  return asStringArray(scope).filter((role): role is RoleKey => role in ROLE_LABELS);
+}
+
+function formatRoleScope(scope?: RoleKey[] | unknown): string {
+  const normalizedScope = normalizeRoleScope(scope);
+  if (!normalizedScope.length) {
     return "all roles";
   }
-  return scope.map((role) => ROLE_LABELS[role]).join(", ");
+  return normalizedScope.map((role) => ROLE_LABELS[role]).join(", ");
+}
+
+type RunIterationView = {
+  iteration_id: string;
+  assistant_message: string;
+  operations: Array<{ file_path: string; operation: string }>;
+  role_scope: RoleKey[];
+  created_at?: string;
+};
+
+function normalizeRunIterations(iterations: unknown): RunIterationView[] {
+  if (!Array.isArray(iterations)) {
+    return [];
+  }
+  return iterations.flatMap((iteration, index) => {
+    if (typeof iteration === "string") {
+      return [
+        {
+          iteration_id: `timeline-${index}`,
+          assistant_message: iteration,
+          operations: [],
+          role_scope: [],
+          created_at: undefined,
+        },
+      ];
+    }
+    if (!iteration || typeof iteration !== "object" || Array.isArray(iteration)) {
+      return [];
+    }
+    const record = iteration as Record<string, unknown>;
+    const operations = asRecordArray(record.operations).flatMap((operation) => {
+      const filePath = typeof operation.file_path === "string" ? operation.file_path : "";
+      const operationName = typeof operation.operation === "string" ? operation.operation : "";
+      if (!filePath && !operationName) {
+        return [];
+      }
+      return [{ file_path: filePath, operation: operationName }];
+    });
+    return [
+      {
+        iteration_id:
+          typeof record.iteration_id === "string" && record.iteration_id
+            ? record.iteration_id
+            : `timeline-${index}`,
+        assistant_message:
+          typeof record.assistant_message === "string"
+            ? record.assistant_message
+            : typeof record.message === "string"
+              ? record.message
+              : "",
+        operations,
+        role_scope: normalizeRoleScope(record.role_scope),
+        created_at: typeof record.created_at === "string" ? record.created_at : undefined,
+      },
+    ];
+  });
 }
 
 function stripAnsi(value: string): string {
@@ -1977,9 +2038,9 @@ export default function App() {
 
             <section className="run-detail-section">
               <h4>Iterations</h4>
-              {runArtifacts?.iterations?.length ? (
+              {normalizeRunIterations(runArtifacts?.iterations).length ? (
                 <div className="run-detail-list">
-                  {runArtifacts.iterations.map((iteration) => (
+                  {normalizeRunIterations(runArtifacts?.iterations).map((iteration) => (
                     <div key={iteration.iteration_id} className="run-detail-item">
                       <div className="run-detail-item-top">
                         <strong>{formatTimestamp(iteration.created_at)}</strong>
