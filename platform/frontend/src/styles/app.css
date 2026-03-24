@@ -1981,9 +1981,18 @@ button:disabled {
 }
 
 @media (max-width: 1200px) {
+  :root {
+    --platform-scale: 1;
+  }
+
   .layout {
     grid-template-columns: 1fr;
-    overflow: auto;
+    align-items: start;
+    overflow: visible;
+  }
+
+  .panel {
+    height: auto;
   }
 
   .preview-grid {
@@ -1996,17 +2005,158 @@ button:disabled {
     min-height: 100dvh;
     overflow: auto;
   }
+
+  .page-scale {
+    width: 100%;
+    height: auto;
+    min-height: 100dvh;
+    transform: none;
+    padding: 14px;
+    overflow: visible;
+  }
+
+  .panel-chat,
+  .panel-preview {
+    height: auto;
+    overflow: visible;
+  }
+
+  .run-list,
+  .runs-panel {
+    flex: 0 0 auto;
+    min-height: auto;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .preview-grid {
+    align-items: start;
+  }
+
+  .preview-column {
+    grid-template-rows: auto auto;
+  }
+
+  .phone-shell {
+    height: auto;
+    min-height: 620px;
+    aspect-ratio: 390 / 844;
+  }
 }
 
 @media (max-width: 900px) {
   .topbar,
-  .topbar-left,
-  .topbar-meta,
-  .preview-toolbar,
+  .preview-toolbar {
+    padding: 14px;
+    gap: 14px;
+  }
+
+  .topbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "left meta"
+      "heading heading";
+    align-items: start;
+  }
+
   .preview-toolbar-main,
   .workspace-item {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .topbar-left {
+    grid-area: left;
+    flex-direction: row;
+    align-items: flex-start;
+    flex: 1;
+  }
+
+  .topbar-title {
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .topbar-title .eyebrow {
+    margin-top: 2px;
+  }
+
+  .topbar-title .topbar-heading {
+    display: contents;
+  }
+
+  .topbar-heading {
+    grid-area: heading;
+    font-size: clamp(18px, 5vw, 28px);
+    line-height: 1.08;
+    margin-top: -2px;
+  }
+
+  .topbar-meta {
+    grid-area: meta;
+    flex: 0 0 auto;
+    justify-content: flex-end;
+    align-items: flex-start;
+  }
+
+  .status-pill,
+  .issues-pill {
+    width: auto;
+    max-width: 140px;
+    padding: 10px 14px;
+  }
+
+  .panel-chat,
+  .panel-preview {
+    padding: 16px;
+  }
+
+  .panel-header-row {
+    align-items: center;
+  }
+
+  .composer-mode-switch {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .composer-mode-pill {
+    min-height: 48px;
+  }
+
+  .composer-field textarea {
+    min-height: 200px;
+  }
+
+  .role-pill-row {
+    grid-template-columns: 1fr;
+  }
+
+  .preview-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .preview-toolbar-main {
+    gap: 12px;
+  }
+
+  .preview-toolbar-actions {
+    width: 100%;
+  }
+
+  .preview-toolbar-actions .ghost-action {
+    width: 100%;
+  }
+
+  .tabs {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .tabs button {
+    padding: 10px 8px;
   }
 
   .code-layout,
@@ -2016,13 +2166,127 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 
-  .composer-mode-switch {
-    grid-template-columns: 1fr;
+  .code-files {
+    max-height: 320px;
+  }
+
+  .editor-header {
+    padding: 12px 14px;
+  }
+
+  .editor-surface {
+    padding: 10px;
   }
 
   .diff-header,
   .diff-stats {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .preview-heading {
+    align-items: baseline;
+  }
+
+  .phone-shell {
+    min-height: 560px;
+    border-width: 8px;
+    border-radius: 28px;
+  }
+
+  .mockup-topbar {
+    top: 14px;
+    left: 14px;
+    right: 14px;
+  }
+
+  .mockup-pill {
+    min-height: 38px;
+    padding: 0 10px;
+  }
+}
+
+@media (max-width: 640px) {
+  .page-scale {
+    padding: 12px;
+    gap: 12px;
+  }
+
+  .topbar {
+    border-radius: 22px;
+  }
+
+  .topbar-left {
+    gap: 12px;
+  }
+
+  .workspace-menu-trigger {
+    width: 40px;
+    height: 40px;
+  }
+
+  .panel-chat,
+  .panel-preview {
+    border-radius: 22px;
+    padding: 14px;
+    gap: 14px;
+  }
+
+  .composer-mode-switch {
+    padding: 5px;
+  }
+
+  .composer-field > span,
+  .workspace-search > span,
+  .role-scope > span,
+  .preview-heading span {
+    font-size: 11px;
+  }
+
+  .generate-full,
+  .workspace-create,
+  .editor-actions button,
+  .ghost-action {
+    width: 100%;
+  }
+
+  .runs-panel-head,
+  .preview-heading {
+    gap: 8px;
+  }
+
+  .runs-panel-head {
+    align-items: baseline;
+    justify-content: space-between;
+  }
+
+  .tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .preview-grid {
+    gap: 16px;
+  }
+
+  .preview-heading {
+    justify-content: space-between;
+  }
+
+  .phone-shell {
+    min-height: 520px;
+    border-width: 7px;
+    border-radius: 24px;
+  }
+
+  .mockup-pill-primary {
+    min-width: 112px;
+  }
+
+  .mockup-pill-menu {
+    min-width: 84px;
+  }
+
+  .diff-surface {
+    padding: 8px;
   }
 }
