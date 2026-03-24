@@ -723,7 +723,10 @@ export default function App() {
       if (!payload || typeof payload !== "object" || payload.type !== "runtime-preview-route") {
         return;
       }
-      const role = ROLE_ORDER.find((candidate) => previewFrameRefs.current[candidate]?.contentWindow === event.source);
+      const payloadRole = typeof payload.role === "string" && ROLE_ORDER.includes(payload.role as RoleKey)
+        ? (payload.role as RoleKey)
+        : null;
+      const role = payloadRole ?? ROLE_ORDER.find((candidate) => previewFrameRefs.current[candidate]?.contentWindow === event.source);
       if (!role) {
         return;
       }
@@ -1633,6 +1636,7 @@ export default function App() {
       {
         type: "runtime-preview-command",
         command,
+        role,
       },
       "*",
     );
