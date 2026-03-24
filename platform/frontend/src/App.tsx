@@ -545,29 +545,25 @@ function FileTree({
 }
 
 type DiffLineKind = "meta" | "hunk" | "add" | "remove" | "context";
-
-function classifyDiffLine(line: string): DiffLineKind {
-  if (
-    line.startsWith("diff --git") ||
-    line.startsWith("index ") ||
-    line.startsWith("--- ") ||
-    line.startsWith("+++ ") ||
-    line.startsWith("new file mode") ||
-    line.startsWith("deleted file mode")
-  ) {
-    return "meta";
-  }
-  if (line.startsWith("@@")) {
-    return "hunk";
-  }
-  if (line.startsWith("+")) {
-    return "add";
-  }
-  if (line.startsWith("-")) {
-    return "remove";
-  }
-  return "context";
-}
+type ParsedDiffLine = {
+  kind: DiffLineKind;
+  text: string;
+  oldLineNumber: number | null;
+  newLineNumber: number | null;
+};
+type ParsedDiffHunk = {
+  header: string;
+  lines: ParsedDiffLine[];
+};
+type ParsedDiffFile = {
+  oldPath: string;
+  newPath: string;
+  header: string;
+  meta: string[];
+  hunks: ParsedDiffHunk[];
+  additions: number;
+  removals: number;
+};
 
 function diffStats(text: string): { files: number; additions: number; removals: number } {
   const lines = text.split("\n");
@@ -593,7 +589,98 @@ function diffStats(text: string): { files: number; additions: number; removals: 
   return { files, additions, removals };
 }
 
-function DiffViewer({ text }: { text: string }) {
+function parseHunkHeader(header: string): { oldStart: number; newStart: number } {
+  const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(header);
+  return {
+    oldStart: Number(match?.[1] || 0),
+    newStart: Number(match?.[2] || 0),
+  };
+}
+
+function parseUnifiedDiff(text: string): ParsedDiffFile[] {
+  const lines = text.split("\n");
+  const files: ParsedDiffFile[] = [];
+  let currentFile: ParsedDiffFile | null = null;
+  let currentHunk: ParsedDiffHunk | null = null;
+  let oldLine = 0;
+  let newLine = 0;
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git ")) {
+      const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+      currentFile = {
+        oldPath: match?.[1] || "",
+        newPath: match?.[2] || "",
+        header: line,
+        meta: [],
+        hunks: [],
+        additions: 0,
+        removals: 0,
+      };
+      files.push(currentFile);
+      currentHunk = null;
+      continue;
+    }
+
+    if (!currentFile) {
+      continue;
+    }
+
+    if (line.startsWith("@@")) {
+      const starts = parseHunkHeader(line);
+      oldLine = starts.oldStart;
+      newLine = starts.newStart;
+      currentHunk = { header: line, lines: [] };
+      currentFile.hunks.push(currentHunk);
+      continue;
+    }
+
+    if (!currentHunk) {
+      currentFile.meta.push(line);
+      continue;
+    }
+
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      currentHunk.lines.push({ kind: "add", text: line.slice(1), oldLineNumber: null, newLineNumber: newLine });
+      currentFile.additions += 1;
+      newLine += 1;
+      continue;
+    }
+    if (line.startsWith("-") && !line.startsWith("---")) {
+      currentHunk.lines.push({ kind: "remove", text: line.slice(1), oldLineNumber: oldLine, newLineNumber: null });
+      currentFile.removals += 1;
+      oldLine += 1;
+      continue;
+    }
+    if (line.startsWith("\\")) {
+      currentHunk.lines.push({ kind: "meta", text: line, oldLineNumber: null, newLineNumber: null });
+      continue;
+    }
+
+    const textValue = line.startsWith(" ") ? line.slice(1) : line;
+    currentHunk.lines.push({ kind: line.startsWith("@@") ? "hunk" : "context", text: textValue, oldLineNumber: oldLine, newLineNumber: newLine });
+    oldLine += 1;
+    newLine += 1;
+  }
+
+  return files;
+}
+
+function DiffViewer({ text, sourceLabel, isLoading }: { text: string; sourceLabel?: string; isLoading?: boolean }) {
+  if (isLoading) {
+    return (
+      <div className="terminal diff-terminal diff-terminal-empty">
+        <div className="preview-loader diff-loader" role="status" aria-live="polite">
+          <div className="preview-loader-card">
+            <div className="preview-loader-spinner" aria-hidden="true" />
+            <strong>Loading diff</strong>
+            <p>Preparing the latest patch view for this workspace.</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (!text.trim()) {
     return (
       <div className="terminal diff-terminal diff-terminal-empty">
@@ -606,13 +693,13 @@ function DiffViewer({ text }: { text: string }) {
   }
 
   const stats = diffStats(text);
-  const lines = text.split("\n");
+  const files = parseUnifiedDiff(text);
 
   return (
     <div className="terminal diff-terminal">
       <div className="diff-header">
         <div className="diff-header-copy">
-          <span className="diff-header-eyebrow">Patch review</span>
+          <span className="diff-header-eyebrow">{sourceLabel ?? "Patch review"}</span>
           <strong>Generated workspace diff</strong>
         </div>
         <div className="diff-stats">
@@ -631,17 +718,50 @@ function DiffViewer({ text }: { text: string }) {
         </div>
       </div>
       <div className="diff-surface">
-        {lines.map((line, index) => {
-          const kind = classifyDiffLine(line);
-          const marker = kind === "add" ? "+" : kind === "remove" ? "−" : kind === "hunk" ? "@@" : kind === "meta" ? "•" : "";
-          return (
-            <div key={`${index}-${line}`} className={`diff-line diff-line-${kind}`}>
-              <span className="diff-line-number">{index + 1}</span>
-              <span className="diff-line-marker">{marker}</span>
-              <code>{line || " "}</code>
-            </div>
-          );
-        })}
+        {files.map((file) => (
+          <section key={file.header} className="diff-file">
+            <header className="diff-file-header">
+              <div className="diff-file-copy">
+                <strong>{file.newPath || file.oldPath}</strong>
+                {file.oldPath && file.newPath && file.oldPath !== file.newPath ? <span>{file.oldPath} → {file.newPath}</span> : null}
+              </div>
+              <div className="diff-file-stats">
+                <span className="diff-file-stat diff-file-stat-add">+{file.additions}</span>
+                <span className="diff-file-stat diff-file-stat-remove">-{file.removals}</span>
+              </div>
+            </header>
+            {file.meta.length ? (
+              <div className="diff-file-meta">
+                {file.meta.map((line, index) => (
+                  <div key={`${file.header}-meta-${index}`} className="diff-line diff-line-meta">
+                    <span className="diff-line-cell diff-line-cell-num"> </span>
+                    <span className="diff-line-cell diff-line-cell-num"> </span>
+                    <span className="diff-line-marker">•</span>
+                    <code>{line || " "}</code>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {file.hunks.map((hunk, index) => (
+              <section key={`${file.header}-hunk-${index}`} className="diff-hunk">
+                <div className="diff-hunk-header">{hunk.header}</div>
+                <div className="diff-hunk-lines">
+                  {hunk.lines.map((line, lineIndex) => {
+                    const marker = line.kind === "add" ? "+" : line.kind === "remove" ? "−" : "";
+                    return (
+                      <div key={`${file.header}-hunk-${index}-line-${lineIndex}`} className={`diff-line diff-line-${line.kind}`}>
+                        <span className="diff-line-cell diff-line-cell-num">{line.oldLineNumber ?? ""}</span>
+                        <span className="diff-line-cell diff-line-cell-num">{line.newLineNumber ?? ""}</span>
+                        <span className="diff-line-marker">{marker}</span>
+                        <code>{line.text || " "}</code>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            ))}
+          </section>
+        ))}
       </div>
     </div>
   );
@@ -672,6 +792,10 @@ export default function App() {
   const [selectedRunId, setSelectedRunId] = useState("");
   const [runDetailsOpen, setRunDetailsOpen] = useState(false);
   const [runArtifacts, setRunArtifacts] = useState<RunArtifacts | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [fallbackDiffText, setFallbackDiffText] = useState("");
+  const [fallbackDiffRunId, setFallbackDiffRunId] = useState("");
+  const [fallbackDiffSource, setFallbackDiffSource] = useState<"" | "run" | "workspace">("");
   const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
   const [selectedLogSection, setSelectedLogSection] = useState<"mini-app" | "workspace">("mini-app");
   const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "logs">("preview");
@@ -808,14 +932,17 @@ export default function App() {
   useEffect(() => {
     if (!selectedRunId) {
       setRunArtifacts(null);
+      setDiffLoading(false);
       return;
     }
     const activeRun = runs.find((item) => item.run_id === selectedRunId);
     if (activeRun && !["awaiting_approval", "completed", "blocked", "failed"].includes(activeRun.status)) {
       setRunArtifacts(null);
+      setDiffLoading(true);
       return;
     }
     let cancelled = false;
+    setDiffLoading(true);
     void (async () => {
       try {
         const nextArtifacts = await getRunArtifacts(selectedRunId);
@@ -832,6 +959,86 @@ export default function App() {
       cancelled = true;
     };
   }, [runs, selectedRunId]);
+
+  useEffect(() => {
+    const activeRunId = selectedRunId || runs[0]?.run_id || "";
+    if (!activeRunId) {
+      setFallbackDiffText("");
+      setFallbackDiffRunId("");
+      setFallbackDiffSource("");
+      setDiffLoading(false);
+      return;
+    }
+    const primaryDiff = `${runArtifacts?.candidate_diff ?? runArtifacts?.diff ?? ""}`.trim();
+    if (primaryDiff) {
+      setFallbackDiffText("");
+      setFallbackDiffRunId("");
+      setFallbackDiffSource("");
+      setDiffLoading(false);
+      return;
+    }
+    const activeIndex = runs.findIndex((item) => item.run_id === activeRunId);
+    if (activeIndex === -1) {
+      setFallbackDiffText("");
+      setFallbackDiffRunId("");
+      setFallbackDiffSource("");
+      setDiffLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setDiffLoading(true);
+    void (async () => {
+      for (const previousRun of runs.slice(activeIndex + 1)) {
+        if (!["awaiting_approval", "completed", "blocked", "failed"].includes(previousRun.status)) {
+          continue;
+        }
+        try {
+          const artifacts = await getRunArtifacts(previousRun.run_id);
+          const previousDiff = `${artifacts?.candidate_diff ?? artifacts?.diff ?? ""}`.trim();
+          if (!previousDiff) {
+            continue;
+          }
+          if (!cancelled) {
+            setFallbackDiffText(previousDiff);
+            setFallbackDiffRunId(previousRun.run_id);
+            setFallbackDiffSource("run");
+            setDiffLoading(false);
+          }
+          return;
+        } catch {
+          // Keep looking for the nearest previous run with artifacts.
+        }
+      }
+      if (workspace?.workspace_id) {
+        try {
+          const workspaceDiffPayload = await request<{ diff?: string }>(`/workspaces/${workspace.workspace_id}/diff`);
+          const workspaceDiff = `${workspaceDiffPayload?.diff ?? ""}`.trim();
+          if (workspaceDiff) {
+            if (!cancelled) {
+              setFallbackDiffText(workspaceDiff);
+              setFallbackDiffRunId("");
+              setFallbackDiffSource("workspace");
+              setDiffLoading(false);
+            }
+            return;
+          }
+        } catch {
+          // Ignore and fall through to the empty state.
+        }
+      }
+      if (!cancelled) {
+        setFallbackDiffText("");
+        setFallbackDiffRunId("");
+        setFallbackDiffSource("");
+        setDiffLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [runs, runArtifacts?.candidate_diff, runArtifacts?.diff, selectedRunId, workspace?.workspace_id]);
 
   useEffect(() => {
     if (!workspace) {
@@ -941,7 +1148,15 @@ export default function App() {
     [runs],
   );
   const draftContextRunId = selectedRun?.draft_ready || selectedRun?.status === "awaiting_approval" ? selectedRun.run_id : "";
-  const diffText = runArtifacts?.candidate_diff ?? runArtifacts?.diff ?? "";
+  const primaryDiffText = runArtifacts?.candidate_diff ?? runArtifacts?.diff ?? "";
+  const diffText = primaryDiffText || fallbackDiffText;
+  const diffSourceLabel = !primaryDiffText.trim()
+    ? fallbackDiffSource === "run" && fallbackDiffRunId
+      ? `Patch review • showing previous run ${fallbackDiffRunId.slice(-8)}`
+      : fallbackDiffSource === "workspace"
+        ? "Patch review • showing live workspace diff"
+        : undefined
+    : undefined;
   const showGlobalLoader = initializing || creatingWorkspace || (workspaceTransitioning && !workspace);
   const runDetailSummary =
     runArtifacts?.final_summary ??
@@ -2355,7 +2570,7 @@ export default function App() {
           ) : null}
 
           {activeTab === "diff" ? (
-            <DiffViewer text={diffText || ""} />
+            <DiffViewer text={diffText || ""} sourceLabel={diffSourceLabel} isLoading={diffLoading} />
           ) : null}
 
           {activeTab === "preview" ? (
