@@ -1,4 +1,11 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import CodeMirror from "@uiw/react-codemirror";
+import { githubLight } from "@uiw/codemirror-theme-github";
+import { javascript } from "@codemirror/lang-javascript";
+import { html } from "@codemirror/lang-html";
+import { css } from "@codemirror/lang-css";
+import { python } from "@codemirror/lang-python";
+import type { Extension } from "@codemirror/state";
 
 import {
   createRun,
@@ -118,6 +125,37 @@ function buildRolePreviewSrc(baseUrl: string, role: RoleKey, roleUrl: string | u
   const rawUrl = roleUrl ?? `${baseUrl}/${role}`;
   const separator = rawUrl.includes("?") ? "&" : "?";
   return `${rawUrl}${separator}preview_cycle=${cycle}`;
+}
+
+function editorLanguageForPath(path: string): { label: string; extensions: Extension[] } {
+  const normalized = path.toLowerCase();
+  if (normalized.endsWith(".py")) {
+    return { label: "Python", extensions: [python()] };
+  }
+  if (normalized.endsWith(".html")) {
+    return { label: "HTML", extensions: [html()] };
+  }
+  if (normalized.endsWith(".css")) {
+    return { label: "CSS", extensions: [css()] };
+  }
+  if (/\.(ts|tsx)$/.test(normalized)) {
+    return { label: "TypeScript", extensions: [javascript({ typescript: true, jsx: normalized.endsWith(".tsx") })] };
+  }
+  if (/\.(js|jsx|mjs|cjs|json)$/.test(normalized)) {
+    return { label: normalized.endsWith(".json") ? "JSON" : "JavaScript", extensions: [javascript({ jsx: normalized.endsWith(".jsx") })] };
+  }
+  return { label: "Plain text", extensions: [] };
+}
+
+function isSupportedEditorPath(path: string): boolean {
+  const normalized = path.toLowerCase();
+  if (normalized.endsWith(".db")) {
+    return false;
+  }
+  return (
+    /\.(py|html|css|js|jsx|ts|tsx|json|md|txt|yml|yaml|toml|sh|env|example)$/i.test(normalized) ||
+    /(^|\/)(docker-compose\.ya?ml|readme\.md|\.gitignore)$/i.test(normalized)
+  );
 }
 
 const PREVIEW_BOOT_POLL_ATTEMPTS = 45;
@@ -802,6 +840,7 @@ export default function App() {
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
   const [fileContent, setFileContent] = useState("");
+  const [originalFileContent, setOriginalFileContent] = useState("");
   const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(new Set());
   const [previewUrl, setPreviewUrl] = useState("");
   const [rolePreviewUrls, setRolePreviewUrls] = useState<Record<string, string>>({});
@@ -1117,6 +1156,18 @@ export default function App() {
     const characters = fileContent.length;
     return { lines, characters };
   }, [fileContent]);
+  const editorSupportsFile = useMemo(
+    () => isSupportedEditorPath(selectedPath || ""),
+    [selectedPath],
+  );
+  const editorLanguage = useMemo(
+    () => editorLanguageForPath(selectedPath || ""),
+    [selectedPath],
+  );
+  const editorIsDirty = useMemo(
+    () => Boolean(selectedPath) && editorSupportsFile && fileContent !== originalFileContent,
+    [editorSupportsFile, fileContent, originalFileContent, selectedPath],
+  );
   const visibleIssues = useMemo(() => {
     const items = [...(topbarRun?.checks_summary.issues ?? [])];
     if (topbarRun?.failure_reason) {
@@ -1599,13 +1650,27 @@ export default function App() {
     if (!workspace) {
       return;
     }
-    setSelectedPath(path);
-    const payload = await request<{ path: string; content: string }>(
-      `/workspaces/${workspace.workspace_id}/files/content?path=${encodeURIComponent(path)}${
-        draftContextRunId ? `&run_id=${encodeURIComponent(draftContextRunId)}` : ""
-      }`,
-    );
-    setFileContent(payload.content);
+    if (!isSupportedEditorPath(path)) {
+      setSelectedPath(path);
+      setFileContent("");
+      setOriginalFileContent("");
+      setActiveTab("code");
+      return;
+    }
+    try {
+      const payload = await request<{ path: string; content: string }>(
+        `/workspaces/${workspace.workspace_id}/files/content?path=${encodeURIComponent(path)}${
+          draftContextRunId ? `&run_id=${encodeURIComponent(draftContextRunId)}` : ""
+        }`,
+      );
+      setSelectedPath(path);
+      setFileContent(payload.content);
+      setOriginalFileContent(payload.content);
+    } catch {
+      setSelectedPath(path);
+      setFileContent("");
+      setOriginalFileContent("");
+    }
     setActiveTab("code");
   }
 
@@ -1659,7 +1724,7 @@ export default function App() {
   }
 
   async function handleSaveFile() {
-    if (!workspace || !selectedPath) {
+    if (!workspace || !selectedPath || !editorIsDirty) {
       return;
     }
     setError("");
@@ -1672,6 +1737,7 @@ export default function App() {
           run_id: draftContextRunId || undefined,
         }),
       });
+      setOriginalFileContent(fileContent);
       await refreshWorkspaceState(workspace.workspace_id, selectedRunId);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save file.");
@@ -2547,23 +2613,42 @@ export default function App() {
                   <div className="editor-title-wrap">
                     <strong>{selectedPath || "Select a file"}</strong>
                     <span className="editor-subtitle">
-                      {selectedPath ? `${editorStats.lines} lines • ${editorStats.characters} chars` : "Open a file from the tree"}
+                      {selectedPath && !editorSupportsFile
+                        ? "Plain text"
+                        : selectedPath
+                        ? `${editorLanguage.label} • ${editorStats.lines} lines • ${editorStats.characters} chars`
+                        : "Open a file from the tree"}
                     </span>
                   </div>
-                  <div className="editor-actions">
-                    <button type="button" onClick={handleSaveFile} disabled={!selectedPath}>
-                      Save
-                    </button>
-                  </div>
+                  {selectedPath && editorSupportsFile ? (
+                    <div className="editor-actions">
+                      <button type="button" onClick={handleSaveFile} disabled={!editorIsDirty}>
+                        Save
+                      </button>
+                    </div>
+                  ) : null}
                 </div>
                 <div className="editor-surface">
-                  <textarea
-                    className="edit-area"
-                    value={fileContent}
-                    onChange={(event) => setFileContent(event.target.value)}
-                    rows={24}
-                    spellCheck={false}
-                  />
+                  {selectedPath && editorSupportsFile ? (
+                    <CodeMirror
+                      className="edit-area"
+                      value={fileContent}
+                      onChange={(value) => setFileContent(value)}
+                      theme={githubLight}
+                      extensions={editorLanguage.extensions}
+                      editable={Boolean(selectedPath)}
+                      basicSetup={{
+                        lineNumbers: true,
+                        foldGutter: true,
+                        highlightActiveLine: true,
+                        highlightActiveLineGutter: true,
+                        syntaxHighlighting: true,
+                      }}
+                      height="100%"
+                    />
+                  ) : (
+                    <div className="editor-empty-state" />
+                  )}
                 </div>
               </div>
             </div>
