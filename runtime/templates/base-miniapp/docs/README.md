@@ -29,7 +29,7 @@ The current baseline is a tri-role app:
 ## Canonical roots
 
 - The miniapp runtime uses `miniapp/app/main.py`, `miniapp/app/db.py`, `miniapp/app/schemas.py`, `miniapp/app/routes/*`, and `miniapp/app/static/*`.
-- Do not reintroduce separate frontend applications, extra service layers, or parallel backend API trees.
+- Extend `db.py` when new persistent entities are introduced, and keep routers thin consumers of that storage.
 
 ## Workspace rules
 

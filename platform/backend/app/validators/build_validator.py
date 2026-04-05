@@ -30,6 +30,7 @@ class BuildValidator:
         issues.extend(self._validate_generated_app_shape(workspace_path))
         issues.extend(self._validate_contract_drift(workspace_path))
         issues.extend(self._validate_route_module_import_safety(workspace_path))
+        issues.extend(self._validate_persistent_storage_contract(workspace_path))
         return issues
 
     def _validate_generated_app_shape(self, workspace_path: Path) -> list[ValidationIssue]:
@@ -162,6 +163,8 @@ class BuildValidator:
                 file_path_raw = page.get("file_path")
                 if not isinstance(file_path_raw, str):
                     continue
+                style_path_raw = str(page.get("style_path") or "")
+                script_path_raw = str(page.get("script_path") or "")
                 file_path = workspace_path / file_path_raw
                 if not file_path.exists():
                     issues.append(
@@ -173,6 +176,36 @@ class BuildValidator:
                         )
                     )
                     continue
+                for asset_kind, asset_path_raw in (("style", style_path_raw), ("script", script_path_raw)):
+                    if not asset_path_raw:
+                        issues.append(
+                            ValidationIssue(
+                                code=f"build.missing_page_{asset_kind}_reference",
+                                message=f"Generated page is missing its {asset_kind} path in the route manifest: {Path(file_path_raw).name}",
+                                severity="high",
+                                location=file_path_raw,
+                            )
+                        )
+                        continue
+                    asset_path = workspace_path / asset_path_raw
+                    if not asset_path.exists():
+                        issues.append(
+                            ValidationIssue(
+                                code=f"build.missing_page_{asset_kind}_asset",
+                                message=f"Generated page asset is missing: {Path(asset_path_raw).name}",
+                                severity="high",
+                                location=asset_path_raw,
+                            )
+                        )
+                    elif not str(asset_path_raw).startswith(f"miniapp/app/static/{role}/"):
+                        issues.append(
+                            ValidationIssue(
+                                code=f"build.page_{asset_kind}_not_role_local",
+                                message=f"{Path(file_path_raw).name} must use its own role-local {asset_kind} asset, not a shared file.",
+                                severity="high",
+                                location=asset_path_raw,
+                            )
+                        )
 
                 content = file_path.read_text(encoding="utf-8")
                 if "RoleCabinetHomePage" in content:
@@ -184,6 +217,57 @@ class BuildValidator:
                             location=file_path_raw,
                         )
                     )
+                if "/static/shared/base.css" not in content:
+                    issues.append(
+                        ValidationIssue(
+                            code="build.page_missing_shell_style_link",
+                            message=f"{Path(file_path_raw).name} does not reference the shared shell stylesheet.",
+                            severity="high",
+                            location=file_path_raw,
+                        )
+                    )
+                if style_path_raw and f"/static/{role}/{Path(style_path_raw).name}" not in content:
+                    issues.append(
+                        ValidationIssue(
+                            code="build.page_missing_style_link",
+                            message=f"{Path(file_path_raw).name} does not reference its page CSS asset.",
+                            severity="high",
+                            location=file_path_raw,
+                        )
+                    )
+                if script_path_raw and f"/static/{role}/{Path(script_path_raw).name}" not in content:
+                    issues.append(
+                        ValidationIssue(
+                            code="build.page_missing_script_link",
+                            message=f"{Path(file_path_raw).name} does not reference its page JS asset.",
+                            severity="high",
+                            location=file_path_raw,
+                        )
+                    )
+                if re.search(r">\s*Refresh\s*<", content, flags=re.IGNORECASE):
+                    issues.append(
+                        ValidationIssue(
+                            code="build.unnecessary_manual_refresh_action",
+                            message=f"{Path(file_path_raw).name} renders a manual refresh action instead of relying on normal page loading.",
+                            severity="high",
+                            location=file_path_raw,
+                        )
+                    )
+                if script_path_raw:
+                    script_abs_path = workspace_path / script_path_raw
+                    if script_abs_path.exists():
+                        html_ids = self._extract_html_ids(content)
+                        script_ids = self._extract_js_dom_ids(script_abs_path.read_text(encoding="utf-8"))
+                        missing_ids = sorted(script_ids - html_ids)
+                        if missing_ids:
+                            issues.append(
+                                ValidationIssue(
+                                    code="build.page_script_dom_contract",
+                                    message=f"{Path(file_path_raw).name} is missing DOM ids required by {Path(script_path_raw).name}: {', '.join(missing_ids[:6])}",
+                                    severity="high",
+                                    location=file_path_raw,
+                                )
+                            )
                 if page.get("route_path") in {"/", f"/{role}"}:
                     normalized_root_pages.append(self._normalize_role_page(content))
 
@@ -295,7 +379,25 @@ class BuildValidator:
                                 location=asset_path_raw,
                             )
                         )
+                    elif not str(asset_path_raw).startswith(f"miniapp/app/static/{role}/"):
+                        issues.append(
+                            ValidationIssue(
+                                code=f"build.page_{asset_kind}_not_role_local",
+                                message=f"{Path(file_path_raw).name} must use its own role-local {asset_kind} asset, not a shared file.",
+                                severity="high",
+                                location=asset_path_raw,
+                            )
+                        )
                 content = file_path.read_text(encoding="utf-8")
+                if "/static/shared/base.css" not in content:
+                    issues.append(
+                        ValidationIssue(
+                            code="build.page_missing_shell_style_link",
+                            message=f"{Path(file_path_raw).name} does not reference the shared shell stylesheet.",
+                            severity="high",
+                            location=file_path_raw,
+                        )
+                    )
                 if style_path_raw and f"/static/{role}/{Path(style_path_raw).name}" not in content:
                     issues.append(
                         ValidationIssue(
@@ -314,6 +416,30 @@ class BuildValidator:
                             location=file_path_raw,
                         )
                     )
+                if re.search(r">\s*Refresh\s*<", content, flags=re.IGNORECASE):
+                    issues.append(
+                        ValidationIssue(
+                            code="build.unnecessary_manual_refresh_action",
+                            message=f"{Path(file_path_raw).name} renders a manual refresh action instead of relying on normal page loading.",
+                            severity="high",
+                            location=file_path_raw,
+                        )
+                    )
+                if script_path_raw:
+                    script_abs_path = workspace_path / script_path_raw
+                    if script_abs_path.exists():
+                        html_ids = self._extract_html_ids(content)
+                        script_ids = self._extract_js_dom_ids(script_abs_path.read_text(encoding="utf-8"))
+                        missing_ids = sorted(script_ids - html_ids)
+                        if missing_ids:
+                            issues.append(
+                                ValidationIssue(
+                                    code="build.page_script_dom_contract",
+                                    message=f"{Path(file_path_raw).name} is missing DOM ids required by {Path(script_path_raw).name}: {', '.join(missing_ids[:6])}",
+                                    severity="high",
+                                    location=file_path_raw,
+                                )
+                            )
                 if str(page.get("route_path") or "/") in {"/", f"/{role}"}:
                     normalized_root_pages.append(self._normalize_role_page(content))
         if len(normalized_root_pages) > 1 and len(set(normalized_root_pages)) == 1:
@@ -353,6 +479,107 @@ class BuildValidator:
                 )
         return issues
 
+    def _validate_persistent_storage_contract(self, workspace_path: Path) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        grounded_spec = self._read_grounded_spec(workspace_path)
+        raw_spec = self._read_json(workspace_path / "artifacts" / "grounded_spec.json")
+        persistence_count = 0
+        api_count = 0
+        if isinstance(raw_spec, dict):
+            persistence_count = len(raw_spec.get("persistence_requirements") or [])
+            api_count = len(raw_spec.get("api_requirements") or [])
+        execution_class = self._execution_class_for_spec(grounded_spec)
+        requires_persistence_contract = execution_class != "shell_app" or persistence_count > 0 or api_count > 0
+        if not requires_persistence_contract:
+            return issues
+
+        db_path = workspace_path / "miniapp" / "app" / "db.py"
+        schemas_path = workspace_path / "miniapp" / "app" / "schemas.py"
+        if not db_path.exists():
+            issues.append(
+                ValidationIssue(
+                    code="build.missing_db_module",
+                    message="Workflow apps must persist data through miniapp/app/db.py.",
+                    severity="high",
+                    location="miniapp/app/db.py",
+                )
+            )
+        if not schemas_path.exists():
+            issues.append(
+                ValidationIssue(
+                    code="build.missing_schemas_module",
+                    message="Workflow apps must define request/response schemas in miniapp/app/schemas.py.",
+                    severity="high",
+                    location="miniapp/app/schemas.py",
+                )
+            )
+        if issues:
+            return issues
+
+        try:
+            db_content = db_path.read_text(encoding="utf-8")
+        except OSError:
+            db_content = ""
+        if "create_engine(" not in db_content or "sessionmaker(" not in db_content or "DeclarativeBase" not in db_content:
+            issues.append(
+                ValidationIssue(
+                    code="build.invalid_db_module",
+                    message="miniapp/app/db.py must define a real SQLAlchemy engine, sessionmaker, and DeclarativeBase for persisted app data.",
+                    severity="high",
+                    location="miniapp/app/db.py",
+                )
+            )
+        db_store_pattern = re.compile(
+            r"^(?P<name>(?:REQUESTS|COMMENTS|ASSIGNMENTS|TIME_SLOTS|SPECIALISTS|USERS|PROFILE_STORE|[A-Z][A-Z0-9_]*(?:_STORE|_CACHE|_TABLE|_ITEMS)))\s*(?::[^=]+)?=\s*(?:\{|\[)",
+            flags=re.MULTILINE,
+        )
+        db_store_match = db_store_pattern.search(db_content)
+        if db_store_match:
+            issues.append(
+                ValidationIssue(
+                    code="build.in_memory_db_store",
+                    message=f"db.py still keeps mutable app data in {db_store_match.group('name')} instead of SQLAlchemy models and persisted rows.",
+                    severity="high",
+                    location="miniapp/app/db.py",
+                )
+            )
+
+        routes_dir = workspace_path / "miniapp" / "app" / "routes"
+        if not routes_dir.exists():
+            return issues
+
+        mutable_store_pattern = re.compile(
+            r"^(?P<name>(?:REQUESTS|COMMENTS|ASSIGNMENTS|TIME_SLOTS|SPECIALISTS|USERS|PROFILE_STORE|[A-Z][A-Z0-9_]*(?:_STORE|_CACHE|_TABLE|_ITEMS)))\s*(?::[^=]+)?=\s*(?:\{|\[)",
+            flags=re.MULTILINE,
+        )
+        for route_file in routes_dir.glob("*.py"):
+            try:
+                content = route_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            for match in mutable_store_pattern.finditer(content):
+                store_name = match.group("name")
+                issues.append(
+                    ValidationIssue(
+                        code="build.in_memory_route_store",
+                        message=f"Route module {route_file.name} keeps mutable app data in {store_name} instead of persisting through db.py.",
+                        severity="high",
+                        location=str(route_file.relative_to(workspace_path)),
+                    )
+                )
+                break
+            if "from pydantic import BaseModel" in content or "from pydantic import BaseModel," in content:
+                issues.append(
+                    ValidationIssue(
+                        code="build.inline_route_schema_model",
+                        message=f"Route module {route_file.name} defines Pydantic models inline; move shared schemas into miniapp/app/schemas.py.",
+                        severity="high",
+                        location=str(route_file.relative_to(workspace_path)),
+                    )
+                )
+                continue
+        return issues
+
     @staticmethod
     def _read_json(path: Path) -> dict | list | None:
         if not path.exists():
@@ -371,6 +598,22 @@ class BuildValidator:
             return GroundedSpecModel.model_validate(json.loads(spec_path.read_text(encoding="utf-8")))
         except Exception:
             return None
+
+    @staticmethod
+    def _extract_html_ids(content: str) -> set[str]:
+        return {match.group(1) for match in re.finditer(r'id=["\']([^"\']+)["\']', content)}
+
+    @staticmethod
+    def _extract_js_dom_ids(content: str) -> set[str]:
+        refs: set[str] = set()
+        patterns = (
+            r'getElementById\(["\']([^"\']+)["\']\)',
+            r'querySelector\(["\']#([^"\']+)["\']\)',
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, content):
+                refs.add(match.group(1))
+        return refs
 
     @staticmethod
     def _execution_class_for_spec(spec: GroundedSpecModel | None) -> str:

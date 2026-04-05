@@ -12,7 +12,7 @@ from subprocess import CalledProcessError
 
 from app.core.config import Settings
 from app.models.artifacts import ApplyPatchResult, PatchEnvelope, PatchOperationModel
-from app.models.domain import DraftFileOperation, RevisionRecord, SaveFileRequest, WorkspaceRecord
+from app.models.domain import DraftFileOperation, RevisionRecord, SaveFileRequest, WorkspaceRecord, utc_now
 from app.repositories.state_store import StateStore
 from app.services.workspace_log_service import WorkspaceLogService
 
@@ -60,6 +60,22 @@ class WorkspaceService:
         if not payload:
             raise KeyError(f"Workspace not found: {workspace_id}")
         return WorkspaceRecord.model_validate(payload)
+
+    def rename_workspace(self, workspace_id: str, name: str) -> WorkspaceRecord:
+        workspace = self.get_workspace(workspace_id)
+        normalized_name = " ".join(str(name or "").split()).strip()
+        if not normalized_name or workspace.name == normalized_name:
+            return workspace
+        workspace.name = normalized_name
+        workspace.updated_at = utc_now()
+        self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self.workspace_log_service.append(
+            workspace_id,
+            source="workspace",
+            message="Workspace renamed.",
+            payload={"name": normalized_name},
+        )
+        return workspace
 
     def list_workspaces(self) -> list[WorkspaceRecord]:
         workspaces = [WorkspaceRecord.model_validate(item) for item in self.store.list("workspaces")]

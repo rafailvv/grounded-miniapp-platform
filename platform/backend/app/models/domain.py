@@ -418,6 +418,7 @@ class FixCase(StrictModel):
     attempt: int = 1
     failure_class: str | None = None
     failure_signature: str | None = None
+    fix_strategy: str | None = None
     failing_command: str | None = None
     root_cause_summary: str | None = None
     exact_error_excerpt: str | None = None

@@ -31,7 +31,7 @@ def reset_preview(workspace_id: str, container: ServiceContainer = Depends(get_c
 
 @router.get("/workspaces/{workspace_id}/preview/url")
 def get_preview_url(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
-    preview = container.preview_service.peek(workspace_id)
+    preview = container.preview_service.get(workspace_id)
     return {
         "url": preview.url,
         "role_urls": container.preview_service.role_urls_from_preview(preview),

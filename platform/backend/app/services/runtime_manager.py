@@ -294,6 +294,7 @@ class PreviewRuntimeManager:
         rendered = source_compose_file.read_text(encoding="utf-8")
         replacements = {
             "../miniapp:/app": f"{(host_source_dir / 'miniapp').as_posix()}:/app",
+            "context: ../miniapp": f"context: {(source_dir / 'miniapp').as_posix()}",
             "./nginx.conf:/etc/nginx/conf.d/default.conf:ro": (
                 f"{(host_source_dir / 'docker' / 'nginx.conf').as_posix()}:/etc/nginx/conf.d/default.conf:ro"
             ),

@@ -49,9 +49,14 @@ logger = logging.getLogger(__name__)
 
 
 class FixOrchestrator:
-    MAX_ATTEMPTS = 8
+    MAX_ATTEMPTS = 12
     MAX_SCOPE_EXPANSIONS = 4
     MAX_CONTEXT_CHARS = 12000
+    STRATEGY_ATTEMPTS = {
+        "targeted_fix": 8,
+        "feature_adjustment": 10,
+        "structural_fix": 12,
+    }
 
     def __init__(
         self,
@@ -197,6 +202,7 @@ class FixOrchestrator:
         latest_preview_details: dict[str, Any] = {}
         latest_apply_result: dict[str, Any] | None = None
         memory_context = (self.store.get("reports", f"project_memory_context:{workspace_id}") or {}).get("summary")
+        active_strategy = "targeted_fix"
 
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             if should_stop and should_stop():
@@ -252,6 +258,7 @@ class FixOrchestrator:
             )
             job.failure_class = fix_case.failure_class
             job.failure_signature = fix_case.failure_signature
+            active_strategy = fix_case.fix_strategy or active_strategy
             job.root_cause_summary = fix_case.root_cause_summary
             job.fix_targets = list(fix_case.implicated_files)
             job.current_fix_phase = "triaging"
@@ -263,12 +270,22 @@ class FixOrchestrator:
                 {
                     "attempt": attempt,
                     "failure_class": fix_case.failure_class,
+                    "fix_strategy": fix_case.fix_strategy,
                     "failure_signature": fix_case.failure_signature,
                     "implicated_files": fix_case.implicated_files,
                 },
             )
 
             if self._is_fix_success(latest_check_execution.results, latest_preview_details):
+                latest_check_execution, latest_preview_details = self._execute_final_checks(
+                    job=job,
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    draft_source=draft_source,
+                    changed_files=self._final_check_changed_files(latest_apply_result, fix_case, scope_entries),
+                )
+                if not self._is_fix_success(latest_check_execution.results, latest_preview_details):
+                    continue
                 success_attempt = FixAttemptRecord(
                     run_id=run_id,
                     attempt=attempt,
@@ -286,6 +303,13 @@ class FixOrchestrator:
                 job.summary = "Fix completed successfully after exact verification."
                 job.failure_reason = None
                 job.current_fix_phase = "completed"
+                job.validation_snapshot = ValidationSnapshot(
+                    grounded_spec_valid=True,
+                    app_ir_valid=True,
+                    build_valid=True,
+                    blocking=False,
+                    issues=[],
+                )
                 self._append_event(job, "checks_completed", "Fix checks passed and preview is healthy.", {"attempt": attempt})
                 self._append_event(job, "job_completed", "Fix completed successfully.")
                 return self._finalize_job(
@@ -317,9 +341,16 @@ class FixOrchestrator:
                 )
 
             signature = fix_case.failure_signature or ""
-            if signature and len(prior_signatures) >= 1 and prior_signatures[-1] == signature:
+            repeated_signature_budget = 2 if active_strategy == "structural_fix" else 1
+            if signature and len(prior_signatures) >= repeated_signature_budget and all(
+                previous == signature for previous in prior_signatures[-repeated_signature_budget:]
+            ):
                 job.status = "failed"
-                job.failure_reason = "Fix loop stopped after the same failure repeated twice in a row."
+                job.failure_reason = (
+                    "Fix loop stopped after the same failure repeated without evidence of progress."
+                    if active_strategy == "structural_fix"
+                    else "Fix loop stopped after the same failure repeated twice in a row."
+                )
                 job.summary = "Fix loop stopped because the root cause signature did not change."
                 job.current_fix_phase = "stopped"
                 self._append_event(job, "job_failed", job.failure_reason, {"failure_signature": signature})
@@ -335,6 +366,29 @@ class FixOrchestrator:
                 )
             if signature:
                 prior_signatures.append(signature)
+
+            strategy_budget = self._attempt_budget_for_strategy(active_strategy)
+            if attempt >= strategy_budget:
+                job.status = "failed"
+                job.failure_reason = f"Fix loop reached the {active_strategy} repair attempt budget without reaching a green build and preview."
+                job.summary = "Fix loop reached the repair attempt budget."
+                job.current_fix_phase = "stopped"
+                self._append_event(
+                    job,
+                    "job_failed",
+                    job.failure_reason,
+                    {"fix_strategy": active_strategy, "attempt_budget": strategy_budget},
+                )
+                return self._finalize_job(
+                    job,
+                    fix_attempts=fix_attempts,
+                    repair_iterations=repair_iterations,
+                    scope_expansions=scope_expansions,
+                    latest_execution=latest_check_execution,
+                    latest_preview_details=latest_preview_details,
+                    latest_apply_result=latest_apply_result,
+                    elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                )
 
             expanded_scope = self._merge_scope(scope_entries, fix_case.write_scope, scope_expansions)
             if expanded_scope != scope_entries:
@@ -631,6 +685,63 @@ class FixOrchestrator:
         execution.completed_at = utc_now()
         return execution, preview_details
 
+    def _execute_final_checks(
+        self,
+        *,
+        job: JobRecord,
+        workspace_id: str,
+        run_id: str,
+        draft_source: Path,
+        changed_files: list[str],
+    ) -> tuple[CheckExecutionRecord, dict[str, Any]]:
+        self._append_event(job, "final_checks_started", "Running final full verification before completing fix.")
+        execution = self.check_runner.run(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            source_dir=draft_source,
+            changed_files=changed_files,
+            preview_run_id=run_id,
+            scope_mode="whole_file_build",
+        )
+        preview = self.preview_service.get(workspace_id)
+        container_logs = {}
+        containers: list[dict[str, Any]] = []
+        if preview.proxy_port is not None:
+            log_source = (
+                self.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
+                if preview.draft_run_id and self.workspace_service.draft_exists(workspace_id, preview.draft_run_id)
+                else self.workspace_service.source_dir(workspace_id)
+            )
+            container_logs = self.runtime_manager.collect_container_logs(workspace_id, log_source, preview.proxy_port)
+            containers = self.runtime_manager.inspect_containers(workspace_id, log_source, preview.proxy_port)
+        preview_details = {
+            "status": preview.status,
+            "stage": preview.stage,
+            "progress_percent": preview.progress_percent,
+            "logs": list(preview.logs),
+            "last_error": preview.last_error,
+            "containers": containers,
+            "container_logs": container_logs,
+        }
+        execution.completed_at = utc_now()
+        return execution, preview_details
+
+    @staticmethod
+    def _final_check_changed_files(
+        latest_apply_result: dict[str, Any] | None,
+        fix_case: FixCase,
+        scope_entries: list[FixScopeEntry],
+    ) -> list[str]:
+        if latest_apply_result and latest_apply_result.get("changed_files"):
+            return [str(path) for path in latest_apply_result.get("changed_files") or []]
+        if fix_case.implicated_files:
+            return list(fix_case.implicated_files)
+        return [entry.file_path for entry in scope_entries]
+
+    @classmethod
+    def _attempt_budget_for_strategy(cls, strategy: str | None) -> int:
+        return cls.STRATEGY_ATTEMPTS.get(str(strategy or "targeted_fix"), cls.MAX_ATTEMPTS)
+
     def _build_fix_case(
         self,
         *,
@@ -657,7 +768,14 @@ class FixOrchestrator:
         root_cause = self._root_cause_summary(check_execution.results, preview_details, raw_error)
         failure_signature = self._failure_signature(failure_class, root_cause)
         implicated_files = self._implicated_files(workspace_id, run_id, combined_text, existing_scope)
-        write_scope = self._build_write_scope(workspace_id, run_id, implicated_files, failure_class, existing_scope)
+        fix_strategy = self._classify_fix_strategy(
+            raw_error=raw_error,
+            failure_class=failure_class,
+            root_cause=root_cause,
+            check_results=check_execution.results,
+            implicated_files=implicated_files,
+        )
+        write_scope = self._build_write_scope(workspace_id, run_id, implicated_files, failure_class, existing_scope, fix_strategy)
         excerpt = self._error_excerpt(check_execution.results, preview_details, raw_error)
         container_statuses = [
             ContainerStatusRecord.model_validate(item)
@@ -670,6 +788,7 @@ class FixOrchestrator:
             attempt=attempt,
             failure_class=failure_class,
             failure_signature=failure_signature,
+            fix_strategy=fix_strategy,
             failing_command=self._first_failing_command(check_execution.results),
             root_cause_summary=root_cause,
             exact_error_excerpt=excerpt,
@@ -759,10 +878,17 @@ class FixOrchestrator:
         implicated_files: list[str],
         failure_class: str,
         existing_scope: list[FixScopeEntry],
+        fix_strategy: str,
     ) -> list[FixScopeEntry]:
         entries = {entry.file_path: entry for entry in existing_scope}
         for file_path in implicated_files:
             entries.setdefault(file_path, FixScopeEntry(file_path=file_path, reason="Directly implicated by the current failure evidence."))
+        if fix_strategy == "structural_fix":
+            for candidate in self._structural_scope_bundle(workspace_id, run_id, implicated_files, failure_class):
+                entries.setdefault(candidate, FixScopeEntry(file_path=candidate, reason="Included as part of a structural fix bundle."))
+        elif fix_strategy == "feature_adjustment":
+            for candidate in self._feature_scope_bundle(workspace_id, run_id, implicated_files):
+                entries.setdefault(candidate, FixScopeEntry(file_path=candidate, reason="Included as part of a feature-local fix bundle."))
         if failure_class.startswith("preview_runtime") or failure_class.startswith("runtime") or failure_class.startswith("tooling"):
             for candidate in ("docker/docker-compose.yml", "miniapp/requirements.txt", "miniapp/app/main.py"):
                 if self._file_exists(workspace_id, run_id, candidate):
@@ -771,6 +897,49 @@ class FixOrchestrator:
             for fallback in ("miniapp/app/static", "miniapp/app"):
                 entries.setdefault(fallback, FixScopeEntry(file_path=fallback, reason="Fallback repair surface for the current failure cluster."))
         return list(entries.values())
+
+    def _structural_scope_bundle(
+        self,
+        workspace_id: str,
+        run_id: str,
+        implicated_files: list[str],
+        failure_class: str,
+    ) -> list[str]:
+        bundle: list[str] = []
+        for candidate in (
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/main.py",
+            "miniapp/app/generated/route_manifest.json",
+            "miniapp/app/generated/runtime_manifest.json",
+            "miniapp/app/generated/static_runtime_manifest.json",
+            "artifacts/generated_app_graph.json",
+        ):
+            if self._file_exists(workspace_id, run_id, candidate):
+                bundle.append(candidate)
+        for file_path in implicated_files:
+            if file_path.startswith("miniapp/app/routes/"):
+                bundle.append(file_path)
+            if file_path.startswith("miniapp/app/static/") and file_path.endswith((".html", ".css", ".js")):
+                parent = str(Path(file_path).parent)
+                if self._file_exists(workspace_id, run_id, parent):
+                    bundle.append(parent)
+        if "route" in failure_class or "contract" in failure_class:
+            routes_dir = "miniapp/app/routes"
+            if self._file_exists(workspace_id, run_id, routes_dir):
+                bundle.append(routes_dir)
+        return list(dict.fromkeys(bundle))
+
+    def _feature_scope_bundle(self, workspace_id: str, run_id: str, implicated_files: list[str]) -> list[str]:
+        bundle: list[str] = []
+        for file_path in implicated_files:
+            if file_path.startswith("miniapp/app/static/") and file_path.endswith((".html", ".css", ".js")):
+                parent = Path(file_path).parent
+                for sibling in (parent / "index.html", parent / "styles.css", parent / "app.js"):
+                    normalized = sibling.as_posix()
+                    if self._file_exists(workspace_id, run_id, normalized):
+                        bundle.append(normalized)
+        return list(dict.fromkeys(bundle))
 
     @staticmethod
     def _merge_scope(
@@ -888,6 +1057,58 @@ class FixOrchestrator:
         raw = raw_error.strip()
         return raw.splitlines()[0] if raw else "Fix mode detected an unresolved build or runtime failure."
 
+    def _classify_fix_strategy(
+        self,
+        *,
+        raw_error: str,
+        failure_class: str,
+        root_cause: str,
+        check_results: list[RunCheckResult],
+        implicated_files: list[str],
+    ) -> str:
+        evidence = "\n".join(
+            [
+                raw_error,
+                failure_class,
+                root_cause,
+                *[result.details or "" for result in check_results],
+                *[line for result in check_results for line in result.logs],
+            ]
+        ).lower()
+        structural_markers = (
+            "build.in_memory_route_store",
+            "build.inline_route_schema_model",
+            "build.missing_db_module",
+            "build.missing_schemas_module",
+            "build.invalid_db_module",
+            "build.missing_backend_surface",
+            "build.page_script_dom_contract",
+            "build.page_missing_shell_style_link",
+            "connectivity.missing_backend_route",
+            "route manifest",
+            "runtime manifest",
+            "sqlalchemy",
+            "schemas.py",
+            "db.py",
+            "navigation mismatch",
+            "contract mismatch",
+        )
+        feature_markers = (
+            "feature",
+            "adjust",
+            "tweak",
+            "change behavior",
+            "change the page",
+            "update the page",
+        )
+        if any(marker in evidence for marker in structural_markers):
+            return "structural_fix"
+        if any(marker in evidence for marker in feature_markers):
+            return "feature_adjustment"
+        if len(implicated_files) >= 5:
+            return "structural_fix"
+        return "targeted_fix"
+
     @staticmethod
     def _failure_signature(failure_class: str, root_cause_summary: str) -> str:
         normalized = re.sub(r"\s+", " ", f"{failure_class}:{root_cause_summary}".strip().lower())
@@ -911,6 +1132,11 @@ class FixOrchestrator:
     def _is_fix_success(results: list[RunCheckResult], preview_details: dict[str, Any]) -> bool:
         validators_ok = all(result.status != "failed" for result in results if result.name in {"schema_validators", "connectivity_validators"})
         build_ok = all(result.status != "failed" for result in results if result.name == "changed_files_static")
+        app_tests_ok = all(
+            result.status == "passed"
+            for result in results
+            if result.name in {"generated_app_python_tests", "generated_app_js_tests"}
+        )
         preview_result = next((result for result in results if result.name == "preview_boot_smoke"), None)
         preview_connectivity_result = next((result for result in results if result.name == "preview_connectivity_smoke"), None)
         preview_deferred = (
@@ -927,7 +1153,7 @@ class FixOrchestrator:
             and preview_connectivity_result.status == "passed"
             and preview_details.get("status") == "running"
         )
-        return validators_ok and build_ok and (preview_ok or preview_deferred)
+        return validators_ok and build_ok and app_tests_ok and (preview_ok or preview_deferred)
 
     @staticmethod
     def _first_failing_command(results: list[RunCheckResult]) -> str | None:
@@ -1045,6 +1271,11 @@ class FixOrchestrator:
             )
         self._store_report(f"fix_attempts:{job.workspace_id}", {"workspace_id": job.workspace_id, "items": job.fix_attempts})
         self._store_report(f"scope_expansions:{job.workspace_id}", {"workspace_id": job.workspace_id, "items": scope_expansions})
+        if job.validation_snapshot is not None:
+            self._store_report(
+                f"validation:{job.workspace_id}",
+                job.validation_snapshot.model_dump(mode="json"),
+            )
         if latest_preview_details:
             self._store_report(
                 f"fix_runtime:{job.workspace_id}",
@@ -1107,12 +1338,16 @@ class FixOrchestrator:
             {
                 "task": "Patch the draft workspace to resolve the current root-cause cluster.",
                 "fix_case": fix_case.model_dump(mode="json"),
+                "fix_strategy": fix_case.fix_strategy or "targeted_fix",
                 "memory_context": fix_case.memory_context,
                 "file_contexts": file_contexts,
                 "rules": [
                     "Fix only the current root-cause cluster before moving on.",
                     "Return the smallest safe patch.",
                     "Prefer editing implicated files over broad refactors.",
+                    "If fix_strategy is structural_fix, prefer a coordinated multi-file repair across the implicated contract bundle instead of a one-file patch that leaves the architecture inconsistent.",
+                    "If fix_strategy is targeted_fix, keep the patch narrow and avoid touching unrelated architecture files.",
+                    "If fix_strategy is feature_adjustment, keep the change local to the implicated feature surface and its immediate page/backend companions.",
                     "Respect the provided write scope unless a directly adjacent dependency is required.",
                     "The fix is considered successful only if the app compiles and the preview runtime becomes healthy.",
                     "Preserve existing endpoints, router wiring, and static file serving unless the evidence shows they are broken.",

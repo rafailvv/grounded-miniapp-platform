@@ -1,0 +1,25 @@
+:root {
+  --telegram-top-safe-offset: 0px;
+  --app-max-width: 620px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  padding-top: var(--telegram-top-safe-offset);
+}
+
+.page-shell {
+  max-width: var(--app-max-width);
+  min-height: 100vh;
+  margin: 0 auto;
+  padding-top: 76px;
+}

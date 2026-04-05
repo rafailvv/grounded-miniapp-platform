@@ -350,24 +350,24 @@ def _write_workspace_file(workspace_root: Path, relative_path: str, content: str
 def _create_workspace_scaffold(workspace_root: Path) -> None:
     _write_workspace_file(workspace_root, "miniapp/app/main.py", "app = object()\n")
     _write_workspace_file(workspace_root, "miniapp/requirements.txt", "fastapi\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.html", "<link rel=\"stylesheet\" href=\"/static/client/index.css\" /><script src=\"/static/client/index.js\"></script><main>client</main>\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.css", "body { color: #111; }\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.js", "console.log('client index');\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile.html", "<link rel=\"stylesheet\" href=\"/static/client/profile.css\" /><script src=\"/static/client/profile.js\"></script><main>client profile</main>\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile.css", "body { color: #222; }\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile.js", "console.log('client profile');\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/index.html", "<link rel=\"stylesheet\" href=\"/static/specialist/index.css\" /><script src=\"/static/specialist/index.js\"></script><main>specialist</main>\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/index.css", "body { color: #333; }\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/index.js", "console.log('specialist index');\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile.html", "<link rel=\"stylesheet\" href=\"/static/specialist/profile.css\" /><script src=\"/static/specialist/profile.js\"></script><main>specialist profile</main>\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile.css", "body { color: #444; }\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile.js", "console.log('specialist profile');\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/manager/index.html", "<link rel=\"stylesheet\" href=\"/static/manager/index.css\" /><script src=\"/static/manager/index.js\"></script><main>manager</main>\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/manager/index.css", "body { color: #555; }\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/manager/index.js", "console.log('manager index');\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile.html", "<link rel=\"stylesheet\" href=\"/static/manager/profile.css\" /><script src=\"/static/manager/profile.js\"></script><main>manager profile</main>\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile.css", "body { color: #666; }\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile.js", "console.log('manager profile');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/home/index.html", "<link rel=\"stylesheet\" href=\"/static/client/home/styles.css\" /><script src=\"/static/client/home/app.js\"></script><main>client</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/home/styles.css", "body { color: #111; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/home/app.js", "console.log('client index');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile/index.html", "<link rel=\"stylesheet\" href=\"/static/client/profile/styles.css\" /><script src=\"/static/client/profile/app.js\"></script><main>client profile</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile/styles.css", "body { color: #222; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile/app.js", "console.log('client profile');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/home/index.html", "<link rel=\"stylesheet\" href=\"/static/specialist/home/styles.css\" /><script src=\"/static/specialist/home/app.js\"></script><main>specialist</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/home/styles.css", "body { color: #333; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/home/app.js", "console.log('specialist index');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile/index.html", "<link rel=\"stylesheet\" href=\"/static/specialist/profile/styles.css\" /><script src=\"/static/specialist/profile/app.js\"></script><main>specialist profile</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile/styles.css", "body { color: #444; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile/app.js", "console.log('specialist profile');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/home/index.html", "<link rel=\"stylesheet\" href=\"/static/manager/home/styles.css\" /><script src=\"/static/manager/home/app.js\"></script><main>manager</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/home/styles.css", "body { color: #555; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/home/app.js", "console.log('manager index');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile/index.html", "<link rel=\"stylesheet\" href=\"/static/manager/profile/styles.css\" /><script src=\"/static/manager/profile/app.js\"></script><main>manager profile</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile/styles.css", "body { color: #666; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile/app.js", "console.log('manager profile');\n")
     _write_workspace_file(workspace_root, "docker/docker-compose.yml", "services: {}\n")
     _write_workspace_file(workspace_root, "artifacts/grounded_spec.json", "{}\n")
 
@@ -379,22 +379,22 @@ def _multi_page_graph() -> dict:
             "client": {
                 "routes_file": "miniapp/app/static/client/index.html",
                 "pages": [
-                    {"route_path": "/client", "file_path": "miniapp/app/static/client/index.html", "style_path": "miniapp/app/static/client/index.css", "script_path": "miniapp/app/static/client/index.js"},
-                    {"route_path": "/client/profile", "file_path": "miniapp/app/static/client/profile.html", "style_path": "miniapp/app/static/client/profile.css", "script_path": "miniapp/app/static/client/profile.js"},
+                    {"route_path": "/client", "file_path": "miniapp/app/static/client/home/index.html", "style_path": "miniapp/app/static/client/home/styles.css", "script_path": "miniapp/app/static/client/home/app.js"},
+                    {"route_path": "/client/profile", "file_path": "miniapp/app/static/client/profile/index.html", "style_path": "miniapp/app/static/client/profile/styles.css", "script_path": "miniapp/app/static/client/profile/app.js"},
                 ],
             },
             "specialist": {
                 "routes_file": "miniapp/app/static/specialist/index.html",
                 "pages": [
-                    {"route_path": "/specialist", "file_path": "miniapp/app/static/specialist/index.html", "style_path": "miniapp/app/static/specialist/index.css", "script_path": "miniapp/app/static/specialist/index.js"},
-                    {"route_path": "/specialist/profile", "file_path": "miniapp/app/static/specialist/profile.html", "style_path": "miniapp/app/static/specialist/profile.css", "script_path": "miniapp/app/static/specialist/profile.js"},
+                    {"route_path": "/specialist", "file_path": "miniapp/app/static/specialist/home/index.html", "style_path": "miniapp/app/static/specialist/home/styles.css", "script_path": "miniapp/app/static/specialist/home/app.js"},
+                    {"route_path": "/specialist/profile", "file_path": "miniapp/app/static/specialist/profile/index.html", "style_path": "miniapp/app/static/specialist/profile/styles.css", "script_path": "miniapp/app/static/specialist/profile/app.js"},
                 ],
             },
             "manager": {
                 "routes_file": "miniapp/app/static/manager/index.html",
                 "pages": [
-                    {"route_path": "/manager", "file_path": "miniapp/app/static/manager/index.html", "style_path": "miniapp/app/static/manager/index.css", "script_path": "miniapp/app/static/manager/index.js"},
-                    {"route_path": "/manager/profile", "file_path": "miniapp/app/static/manager/profile.html", "style_path": "miniapp/app/static/manager/profile.css", "script_path": "miniapp/app/static/manager/profile.js"},
+                    {"route_path": "/manager", "file_path": "miniapp/app/static/manager/home/index.html", "style_path": "miniapp/app/static/manager/home/styles.css", "script_path": "miniapp/app/static/manager/home/app.js"},
+                    {"route_path": "/manager/profile", "file_path": "miniapp/app/static/manager/profile/index.html", "style_path": "miniapp/app/static/manager/profile/styles.css", "script_path": "miniapp/app/static/manager/profile/app.js"},
                 ],
             },
         },
@@ -410,9 +410,9 @@ def _write_connectivity_artifacts(workspace_root: Path, *, api_path: str = "/api
                 "pages": [
                     {
                         "route_path": "/client",
-                        "file_path": "miniapp/app/static/client/index.html",
-                        "style_path": "miniapp/app/static/client/index.css",
-                        "script_path": "miniapp/app/static/client/index.js",
+                        "file_path": "miniapp/app/static/client/home/index.html",
+                        "style_path": "miniapp/app/static/client/home/styles.css",
+                        "script_path": "miniapp/app/static/client/home/app.js",
                         "title": "Shop",
                         "description": "Browse live orders",
                         "data_dependencies": ["orders"],
@@ -436,8 +436,8 @@ def _write_connectivity_artifacts(workspace_root: Path, *, api_path: str = "/api
     }
     _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
     _write_workspace_file(workspace_root, "artifacts/grounded_spec.json", json.dumps(spec))
-    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.css", "body { color: #111; }\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.js", "console.log('client bootstrap');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/home/styles.css", "body { color: #111; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/home/app.js", "console.log('client bootstrap');\n")
     _write_workspace_file(workspace_root, "miniapp/app/routes/__init__.py", "")
 
 
@@ -493,6 +493,10 @@ def test_build_validator_accepts_distinct_multi_page_role_graph(tmp_path: Path) 
     workspace_root = tmp_path / "workspace"
     _create_workspace_scaffold(workspace_root)
     graph = _multi_page_graph()
+    for role_payload in graph["roles"].values():
+        pages = role_payload.get("pages") or []
+        if len(pages) > 1:
+            pages[1]["page_kind"] = "profile"
     _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
 
     _write_workspace_file(
@@ -525,6 +529,10 @@ def test_build_validator_flags_placeholder_and_identical_role_pages(tmp_path: Pa
     workspace_root = tmp_path / "workspace"
     _create_workspace_scaffold(workspace_root)
     graph = _multi_page_graph()
+    for role_payload in graph["roles"].values():
+        pages = role_payload.get("pages") or []
+        if len(pages) > 1:
+            pages[1]["page_kind"] = "profile"
     _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
 
     placeholder_html = "<main>RoleCabinetHomePage</main>\n"
@@ -554,6 +562,145 @@ def test_build_validator_flags_route_self_import(tmp_path: Path) -> None:
     issues = BuildValidator().validate(workspace_root)
 
     assert any(issue.code == "build.route_self_import" for issue in issues)
+
+
+def test_build_validator_flags_in_memory_route_store_for_workflow_app(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_workspace_file(
+        workspace_root,
+        "artifacts/grounded_spec.json",
+        json.dumps(
+            {
+                "target_platform": "telegram_mini_app",
+                "preview_profile": "telegram_mock",
+                "product_goal": "Persistent request workflow",
+                "actors": [],
+                "domain_entities": [{ "entity_id": "request", "name": "Request", "description": "", "attributes": [] }],
+                "user_flows": [{ "flow_id": "flow_1", "name": "Flow", "goal": "Persist requests", "steps": [], "acceptance_criteria": [] }],
+                "ui_requirements": [],
+                "api_requirements": [{ "api_req_id": "api_1", "description": "List requests", "path": "/api/requests", "method": "GET" }],
+                "persistence_requirements": [{ "persistence_req_id": "persist_1", "description": "Store requests", "storage_type": "sqlite", "entity_ids": ["request"] }],
+                "integration_requirements": [],
+                "security_requirements": [],
+                "platform_constraints": [],
+                "non_functional_requirements": [],
+                "assumptions": [],
+                "unknowns": [],
+                "contradictions": [],
+                "doc_refs": [],
+                "metadata": {},
+            }
+        ),
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/routes/requests.py",
+        "REQUESTS = {}\n",
+    )
+    _write_workspace_file(workspace_root, "miniapp/app/db.py", "engine = object()\n")
+    _write_workspace_file(workspace_root, "miniapp/app/schemas.py", "class RequestSchema: ...\n")
+
+    issues = BuildValidator().validate(workspace_root)
+
+    assert any(issue.code == "build.in_memory_route_store" for issue in issues)
+
+
+def test_build_validator_flags_inline_route_schema_model_for_workflow_app(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_workspace_file(
+        workspace_root,
+        "artifacts/grounded_spec.json",
+        json.dumps(
+            {
+                "target_platform": "telegram_mini_app",
+                "preview_profile": "telegram_mock",
+                "product_goal": "Persistent request workflow",
+                "actors": [],
+                "domain_entities": [{ "entity_id": "request", "name": "Request", "description": "", "attributes": [] }],
+                "user_flows": [{ "flow_id": "flow_1", "name": "Flow", "goal": "Persist requests", "steps": [], "acceptance_criteria": [] }],
+                "ui_requirements": [],
+                "api_requirements": [{ "api_req_id": "api_1", "description": "Create request", "path": "/api/requests", "method": "POST" }],
+                "persistence_requirements": [{ "persistence_req_id": "persist_1", "description": "Store requests", "storage_type": "sqlite", "entity_ids": ["request"] }],
+                "integration_requirements": [],
+                "security_requirements": [],
+                "platform_constraints": [],
+                "non_functional_requirements": [],
+                "assumptions": [],
+                "unknowns": [],
+                "contradictions": [],
+                "doc_refs": [],
+                "metadata": {},
+            }
+        ),
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/routes/requests.py",
+        "from pydantic import BaseModel\n\nclass RequestCreate(BaseModel):\n    title: str\n",
+    )
+    _write_workspace_file(workspace_root, "miniapp/app/db.py", "engine = object()\n")
+    _write_workspace_file(workspace_root, "miniapp/app/schemas.py", "class RequestSchema: ...\n")
+
+    issues = BuildValidator().validate(workspace_root)
+
+    assert any(issue.code == "build.inline_route_schema_model" for issue in issues)
+
+
+def test_build_validator_flags_missing_shell_style_and_dom_contract_drift(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    graph = _multi_page_graph()
+    for role_payload in graph["roles"].values():
+        pages = role_payload.get("pages") or []
+        if len(pages) > 1:
+            pages[1]["page_kind"] = "profile"
+    _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/route_manifest.json", json.dumps({"roles": {}}))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/runtime_manifest.json", json.dumps({"roles": {}}))
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.html", "<main>client routes</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/index.html", "<main>specialist routes</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/index.html", "<main>manager routes</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/db.py", "from sqlalchemy import create_engine\nfrom sqlalchemy.orm import DeclarativeBase, sessionmaker\nengine = create_engine('sqlite:///test.db')\nSessionLocal = sessionmaker(bind=engine)\nclass Base(DeclarativeBase):\n    pass\n")
+    _write_workspace_file(workspace_root, "miniapp/app/schemas.py", "from pydantic import BaseModel\nclass RequestSchema(BaseModel):\n    title: str\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/home/index.html",
+        '<html><body><main class="page-shell"><div id="request-list"></div></main><script src="/static/client/home/app.js"></script></body></html>\n',
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/home/styles.css",
+        ".page-shell { padding-top: 76px; }\n",
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/home/app.js",
+        'document.getElementById("request-list"); document.getElementById("request-state");\n',
+    )
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile/index.html", '<html><head><link rel="stylesheet" href="/static/shared/base.css" /><link rel="stylesheet" href="/static/client/profile/styles.css" /></head><body><div id="profile-card"></div><script src="/static/client/profile/app.js"></script></body></html>\n')
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile/styles.css", ".profile { color: #000; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile/app.js", 'document.getElementById("profile-card");\n')
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/home/index.html", '<html><head><link rel="stylesheet" href="/static/shared/base.css" /><link rel="stylesheet" href="/static/specialist/home/styles.css" /></head><body><div id="task-list"></div><script src="/static/specialist/home/app.js"></script></body></html>\n')
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/home/styles.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/home/app.js", 'document.getElementById("task-list");\n')
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile/index.html", '<html><head><link rel="stylesheet" href="/static/shared/base.css" /><link rel="stylesheet" href="/static/specialist/profile/styles.css" /></head><body><div id="profile-card"></div><script src="/static/specialist/profile/app.js"></script></body></html>\n')
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile/styles.css", ".profile { color: #000; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile/app.js", 'document.getElementById("profile-card");\n')
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/home/index.html", '<html><head><link rel="stylesheet" href="/static/shared/base.css" /><link rel="stylesheet" href="/static/manager/home/styles.css" /></head><body><div id="request-list"></div><script src="/static/manager/home/app.js"></script></body></html>\n')
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/home/styles.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/home/app.js", 'document.getElementById("request-list");\n')
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile/index.html", '<html><head><link rel="stylesheet" href="/static/shared/base.css" /><link rel="stylesheet" href="/static/manager/profile/styles.css" /></head><body><div id="profile-card"></div><script src="/static/manager/profile/app.js"></script></body></html>\n')
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile/styles.css", ".profile { color: #000; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile/app.js", 'document.getElementById("profile-card");\n')
+    _write_workspace_file(workspace_root, "miniapp/app/static/shared/base.css", ".page-shell { padding-top: 76px; }\n")
+
+    issues = BuildValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+
+    assert "build.page_missing_shell_style_link" in issue_codes
+    assert "build.page_script_dom_contract" in issue_codes
 
 
 def test_connectivity_validator_flags_missing_backend_route_for_dynamic_page(tmp_path: Path) -> None:

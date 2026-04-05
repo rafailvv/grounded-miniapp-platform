@@ -2564,7 +2564,7 @@ class GenerationService:
         if normalized_kind in {"dashboard", "landing"}:
             return [f"{role}_open_workbench", f"{role}_open_workspace", f"{role}_open_profile"]
         if normalized_kind in {"list", "queue"}:
-            return [f"{role}_open_workspace_from_workbench", f"{role}_refresh_workbench"]
+            return [f"{role}_open_workspace_from_workbench", f"{role}_open_profile"]
         if normalized_kind in {"workspace", "details", "detail"}:
             return [f"{role}_back_to_workbench", f"{role}_open_profile"]
         if normalized_kind == "form":
@@ -2650,9 +2650,9 @@ class GenerationService:
                 {
                     "page_id": f"{role}_{page['suffix']}",
                     "route_path": page["route_path"],
-                    "file_path": f"miniapp/app/static/{role}/{page['file_name']}",
-                    "style_path": f"miniapp/app/static/{role}/{Path(page['file_name']).stem}.css",
-                    "script_path": f"miniapp/app/static/{role}/{Path(page['file_name']).stem}.js",
+                    "file_path": f"miniapp/app/static/{role}/{Path(page['file_name']).stem}/index.html",
+                    "style_path": f"miniapp/app/static/{role}/{Path(page['file_name']).stem}/styles.css",
+                    "script_path": f"miniapp/app/static/{role}/{Path(page['file_name']).stem}/app.js",
                     "page_kind": page["page_kind"],
                     "navigation_label": page["navigation_label"],
                 }
@@ -2679,13 +2679,13 @@ class GenerationService:
     @classmethod
     def _should_rewrite_page_file_for_route(cls, *, route_path: str, file_path: str, page_id: str) -> bool:
         normalized_path = file_path.strip()
-        file_name = Path(normalized_path).name.lower()
+        normalized_suffix = normalized_path.replace("\\", "/").lower()
         page_id_lower = page_id.lower()
         if route_path == "/":
-            return file_name != "index.html"
+            return not normalized_suffix.endswith("/home/index.html")
         if route_path.rstrip("/") == "/profile" or "profile" in page_id_lower:
-            return file_name != "profile.html"
-        return file_name in {"index.html", "profile.html"}
+            return not normalized_suffix.endswith("/profile/index.html")
+        return normalized_suffix.endswith("/home/index.html") or normalized_suffix.endswith("/profile/index.html")
 
     @staticmethod
     def _default_handoff_paths_for_page_kind(page_kind: str, *, route_path: str | None = None) -> list[str]:
@@ -2705,7 +2705,7 @@ class GenerationService:
         if raw:
             return raw
         slug = " ".join([route_path.lower(), file_path.lower(), page_id.lower()])
-        if "/profile" in slug or slug.endswith("profile.html") or "profile" in page_id.lower():
+        if "/profile" in slug or slug.endswith("/profile/index.html") or "profile" in page_id.lower():
             return "profile"
         if any(token in slug for token in ("/workspace", "workspace.html", "detail", "details")):
             return "workspace"
@@ -2732,7 +2732,9 @@ class GenerationService:
 
     @staticmethod
     def _state_marker_base(page_id: str, file_path: str, component_name: str) -> str:
-        raw_value = page_id.strip() or Path(file_path).stem or component_name or "page"
+        path_obj = Path(file_path)
+        stem = path_obj.parent.name if path_obj.stem == "index" and path_obj.parent.name else path_obj.stem
+        raw_value = page_id.strip() or stem or component_name or "page"
         slug = re.sub(r"[^a-z0-9]+", "-", raw_value.lower()).strip("-")
         return slug or "page"
 
@@ -2748,13 +2750,13 @@ class GenerationService:
 
     @staticmethod
     def _default_routes_file(role: str) -> str:
-        return f"miniapp/app/static/{role}/index.html"
+        return f"miniapp/app/static/{role}/home/index.html"
 
     @staticmethod
     def _default_page_file(role: str, component_name: str, *, route_path: str | None = None) -> str:
         normalized_route = (route_path or "").strip().lower()
         if normalized_route in {"", "/"}:
-            slug = "index"
+            slug = "home"
         elif normalized_route.rstrip("/") == "/profile":
             slug = "profile"
         else:
@@ -2768,10 +2770,15 @@ class GenerationService:
             if component_slug.endswith("_page"):
                 component_slug = component_slug[:-5]
             slug = component_slug or "page"
-        return f"miniapp/app/static/{role}/{slug}.html"
+        return f"miniapp/app/static/{role}/{slug}/index.html"
 
     @staticmethod
     def _default_page_asset_path(file_path: str, *, asset_kind: str) -> str:
+        file_path = file_path.replace("\\", "/")
+        if file_path.endswith("/index.html"):
+            base_dir = Path(file_path).parent
+            file_name = "styles.css" if asset_kind == "css" else "app.js"
+            return str(base_dir / file_name).replace("\\", "/")
         suffix = ".css" if asset_kind == "css" else ".js"
         return str(Path(file_path).with_suffix(suffix)).replace("\\", "/")
 
@@ -3551,6 +3558,9 @@ class GenerationService:
                     "Return distinct role page purposes, primary actions, and handoff paths instead of mirrored copies across roles.",
                     "For pages with dynamic data dependencies, plan semantic loading/error states that downstream codegen can realize with real containers, ids, or data-ui-state markers.",
                     "For pages that reference /api endpoints in data dependencies, include the matching miniapp route modules in backend_targets from the start.",
+                    "For workflow or stateful apps, plan miniapp/app/db.py and miniapp/app/schemas.py as canonical backend contract files from the start.",
+                    "Any mutable business data must persist through SQLAlchemy models in db.py, not route-level lists, dicts, or module globals.",
+                    "Request/response payload models must live in schemas.py and be imported by route modules instead of being defined inline.",
                     "For targeted edits, keep target_files minimal and touch only the files required by the request.",
                     "Do not output role copies with changed titles only.",
                     "Return only repo-relative file paths that fit the current workspace tree and path hints.",
@@ -3604,6 +3614,9 @@ class GenerationService:
                     "Use dashboard/workbench/workspace/profile as fallback references only when the prompt does not imply another information architecture.",
                     "For pages with dynamic data dependencies, include loading_state and error_state contracts that can be rendered as semantic HTML containers.",
                     "For pages that reference /api endpoints in data dependencies, include matching backend route modules in backend_targets instead of deferring this to repair.",
+                    "For workflow or stateful apps, include miniapp/app/db.py and miniapp/app/schemas.py in the backend contract from the start.",
+                    "Plan persisted business entities through SQLAlchemy models in db.py, never through route-level dict/list stores.",
+                    "Plan request and response models in schemas.py so route modules import them instead of defining inline Pydantic classes.",
                     "Keep role page purposes, primary actions, and handoff paths distinct.",
                     "Do not output role copies with changed titles only.",
                     "Return only repo-relative file paths that fit the current workspace tree and path hints.",
@@ -3809,6 +3822,9 @@ class GenerationService:
                     "If stage_name is miniapp, generate only miniapp/server/shared contract files required by the request.",
                     "If stage_name is frontend, wire pages, routes, and shared UI/state to the already planned miniapp surface.",
                     "Treat static/shared/common.js and shared/base.css as first-class shared shell assets when they are in target_files.",
+                    "For any workflow or stateful backend, use miniapp/app/db.py plus miniapp/app/schemas.py as the canonical persistence contract.",
+                    "Persist mutable business entities through SQLAlchemy models and sessions from db.py; do not keep route-level dict/list stores for app data.",
+                    "Define request/response models in schemas.py and import them from route modules instead of declaring inline Pydantic BaseModel classes inside routes.",
                     "When planned pages have dynamic dependencies, generate validator-compatible loading/error containers and wiring in the first draft instead of waiting for repair.",
                     "When generated sources reference /api endpoints, include the matching miniapp route modules and router wiring from the first draft whenever those files are in target_files.",
                     "Generate role routes that expose the page graph as real separate pages when routes are targeted.",
@@ -4184,10 +4200,13 @@ class GenerationService:
         existing_targets = set(current_target_files) | set(backend_targets)
         inferred: list[str] = []
         router_path = "miniapp/app/main.py"
+        for contract_path in ("miniapp/app/db.py", "miniapp/app/schemas.py"):
+            if contract_path not in existing_targets:
+                inferred.append(contract_path)
         for endpoint_name in sorted(endpoint_names):
             if endpoint_name in {"health", "profiles"}:
                 continue
-            inferred_path = f"miniapp/app/routes/{endpoint_name}.py"
+            inferred_path = GenerationService._route_module_path_for_endpoint_name(endpoint_name)
             if inferred_path not in existing_targets:
                 inferred.append(inferred_path)
             if router_path not in existing_targets:
@@ -4270,10 +4289,13 @@ class GenerationService:
         existing_targets = set(current_target_files) | set(backend_targets)
         inferred: list[str] = []
         router_path = "miniapp/app/main.py"
+        for contract_path in ("miniapp/app/db.py", "miniapp/app/schemas.py"):
+            if contract_path not in existing_targets:
+                inferred.append(contract_path)
         for endpoint_name in sorted(endpoint_names):
             if endpoint_name in {"health", "profiles"}:
                 continue
-            inferred_path = f"miniapp/app/routes/{endpoint_name}.py"
+            inferred_path = GenerationService._route_module_path_for_endpoint_name(endpoint_name)
             if inferred_path not in existing_targets:
                 inferred.append(inferred_path)
             if router_path not in existing_targets:
@@ -4286,6 +4308,11 @@ class GenerationService:
         for operation in operations:
             deduped[operation.file_path] = operation
         return list(deduped.values())
+
+    @classmethod
+    def _route_module_path_for_endpoint_name(cls, endpoint_name: str) -> str:
+        filename = cls._snake_case_filename((endpoint_name or "").strip())
+        return cls._normalize_runtime_python_path(f"miniapp/app/routes/{filename}.py")
 
     @staticmethod
     def _role_contract_gate_issues(role_contract: dict[str, Any], role_scope: list[str], *, scope_mode: str) -> list[str]:
@@ -4712,11 +4739,65 @@ def _extract_static_asset_refs(html: str) -> list[str]:
     return re.findall(r'(?:src|href)=["\\'](/static/[^"\\']+)["\\']', html)
 
 
+def _extract_local_route_refs(content: str) -> set[str]:
+    refs: set[str] = set()
+    for match in re.finditer(r'(?:href|location(?:\\.href)?)\\s*=\\s*["\\'](/(?!api/|static/|/)[^"\\'#?]*)', content):
+        refs.add(match.group(1))
+    for match in re.finditer(r'["\\'](/(?!api/|static/|/)[a-zA-Z0-9_\\-/{{}}:]+)["\\']', content):
+        refs.add(match.group(1))
+    return {{value for value in refs if value and not value.startswith("//")}}
+
+
+def _extract_html_ids(html: str) -> set[str]:
+    return {{match.group(1) for match in re.finditer(r'id=["\\']([^"\\']+)["\\']', html)}}
+
+
+def _extract_js_dom_ids(content: str) -> set[str]:
+    refs: set[str] = set()
+    patterns = (
+        r'getElementById\\(["\\']([^"\\']+)["\\']\\)',
+        r'querySelector\\(["\\']#([^"\\']+)["\\']\\)',
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, content):
+            refs.add(match.group(1))
+    return refs
+
+
+def _public_static_asset_path(file_path: str) -> str:
+    normalized = file_path.removeprefix("miniapp/app/")
+    return "/" + normalized.replace("\\\\", "/")
+
+
 def _extract_api_refs(content: str) -> set[str]:
     refs: set[str] = set()
     for match in re.finditer(r'["\\'](/api/[a-zA-Z0-9_\\-/{{}}:]+)', content):
         refs.add(match.group(1))
     return refs
+
+
+def _normalize_tokens(value: str) -> set[str]:
+    return {{token for token in re.split(r"[^a-z0-9]+", value.lower()) if token}}
+
+
+def _request_field_value(field_name: str, field_type: str) -> object:
+    lowered_name = field_name.lower()
+    lowered_type = field_type.lower()
+    if "email" in lowered_name:
+        return "workflow@example.com"
+    if "phone" in lowered_name:
+        return "+43123456789"
+    if "date" in lowered_name or lowered_type == "datetime":
+        return "2026-04-05T09:30:00Z"
+    if lowered_type in {{"int", "integer", "number"}}:
+        return 1
+    if lowered_type in {{"bool", "boolean"}}:
+        return True
+    if "status" in lowered_name:
+        return "new"
+    if any(token in lowered_name for token in ("comment", "note", "description", "details", "message")):
+        return "Generated workflow integration check"
+    return "Sample value"
 
 
 def _sample_request_payload(path: str, method: str) -> dict | None:
@@ -4744,6 +4825,173 @@ def _sample_route_path(path: str) -> str:
     return normalized
 
 
+def _resolve_path_params(path: str, replacements: dict[str, str]) -> str:
+    resolved = path
+    for key, value in replacements.items():
+        resolved = re.sub(r"{{" + re.escape(key) + r"}}", value, resolved)
+        resolved = re.sub(r":" + re.escape(key) + r"\\b", value, resolved)
+    resolved = re.sub(r"{{[^/]+}}", "sample", resolved)
+    resolved = re.sub(r":[^/]+", "sample", resolved)
+    return resolved
+
+
+def _extract_record_id(payload: object) -> str | None:
+    queue: list[object] = [payload]
+    seen: set[int] = set()
+    while queue:
+        current = queue.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if isinstance(current, dict):
+            for key, value in current.items():
+                lowered = str(key).lower()
+                if lowered in {{"id", "submission_id", "request_id", "task_id", "item_id", "record_id"}} and value not in (None, ""):
+                    return str(value)
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+        elif isinstance(current, list):
+            queue.extend(current)
+    return None
+
+
+def _extract_items(payload: object) -> list[dict]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("items", "results", "data", "records", "requests", "submissions", "tasks"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _payload_contains_value(payload: object, expected: str) -> bool:
+    if expected in (None, ""):
+        return False
+    queue: list[object] = [payload]
+    seen: set[int] = set()
+    while queue:
+        current = queue.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if isinstance(current, dict):
+            for value in current.values():
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+                elif str(value) == expected:
+                    return True
+        elif isinstance(current, list):
+            queue.extend(current)
+        elif str(current) == expected:
+            return True
+    return False
+
+
+def _response_json(response) -> object:
+    try:
+        return response.json()
+    except Exception:
+        return {{}}
+
+
+def _request_and_assert(client: TestClient, method: str, path: str, *, payload: dict | None = None):
+    response = client.request(method, path, json=payload if payload is not None else None)
+    if response.status_code == 405 and method != "GET":
+        response = client.get(path)
+    return response
+
+
+def _workflow_api_requirements(grounded_spec: dict) -> list[dict]:
+    items = []
+    for raw_item in grounded_spec.get("api_requirements") or []:
+        if not isinstance(raw_item, dict):
+            continue
+        path = str(raw_item.get("path") or "").strip()
+        method = str(raw_item.get("method") or "GET").upper()
+        if not path.startswith("/api/"):
+            continue
+        items.append(
+            {{
+                "name": str(raw_item.get("name") or ""),
+                "path": path,
+                "method": method,
+                "purpose": str(raw_item.get("purpose") or ""),
+                "request_fields": list(raw_item.get("request_fields") or []),
+                "response_fields": list(raw_item.get("response_fields") or []),
+                "tokens": _normalize_tokens(" ".join([
+                    str(raw_item.get("name") or ""),
+                    str(raw_item.get("purpose") or ""),
+                    path,
+                ])),
+            }}
+        )
+    return items
+
+
+def _resource_slug(path: str) -> str:
+    segments = [segment for segment in path.split("/") if segment and not segment.startswith("{{") and not segment.startswith(":")]
+    if not segments:
+        return ""
+    for segment in reversed(segments):
+        if segment != "api":
+            return segment
+    return ""
+
+
+def _pick_workflow_api(requirements: list[dict], *, methods: set[str], tokens_any: set[str], preferred_resource: str | None = None) -> dict | None:
+    candidates = [item for item in requirements if item.get("method") in methods]
+    if preferred_resource:
+        resource_matches = [item for item in candidates if _resource_slug(str(item.get("path") or "")) == preferred_resource]
+        if resource_matches:
+            candidates = resource_matches
+    scored: list[tuple[int, int, int, dict]] = []
+    for item in candidates:
+        tokens = set(item.get("tokens") or set())
+        overlap = len(tokens & tokens_any)
+        resource_bonus = 1 if preferred_resource and _resource_slug(str(item.get("path") or "")) == preferred_resource else 0
+        scored.append((overlap, resource_bonus, -len(str(item.get("path") or "")), item))
+    scored.sort(reverse=True)
+    best = scored[0][3] if scored else None
+    if best and (scored[0][0] > 0 or preferred_resource):
+        return best
+    return None
+
+
+def _payload_for_api(api_requirement: dict, path: str, method: str, *, created_id: str | None = None) -> dict | None:
+    request_fields = [field for field in api_requirement.get("request_fields") or [] if isinstance(field, dict)]
+    if request_fields:
+        payload: dict[str, object] = {{}}
+        for field in request_fields:
+            field_name = str(field.get("name") or "").strip()
+            if not field_name:
+                continue
+            lowered_name = field_name.lower()
+            if created_id and lowered_name in {{"id", "request_id", "submission_id", "task_id", "item_id", "record_id"}}:
+                payload[field_name] = created_id
+                continue
+            if lowered_name in {{"specialist_id", "assignee_id", "owner_id", "owner", "assigned_to"}}:
+                payload[field_name] = "specialist-demo"
+                continue
+            if lowered_name == "status":
+                payload[field_name] = "in_progress"
+                continue
+            if lowered_name in {{"comment", "note", "notes"}}:
+                payload[field_name] = "Workflow comment"
+                continue
+            payload[field_name] = _request_field_value(field_name, str(field.get("type") or "string"))
+        return payload
+    payload = _sample_request_payload(path, method)
+    if payload is None:
+        return None
+    if created_id and method in {{"POST", "PUT", "PATCH"}}:
+        payload.setdefault("request_id", created_id)
+    return payload
+
+
 class GeneratedMiniAppTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -4757,11 +5005,14 @@ class GeneratedMiniAppTests(unittest.TestCase):
         cls.route_manifest = _load_json(cls.route_manifest_path)
         cls.runtime_manifest = _load_json(cls.runtime_manifest_path)
         cls.grounded_spec = _load_json(cls.grounded_spec_path) if cls.grounded_spec_path.exists() else {{}}
-        cls.registered_routes = {{
-            (str(route.path), next(iter(route.methods or {{""}})))
-            for route in app.routes
-            if getattr(route, "path", None)
-        }}
+        cls.workflow_api_requirements = _workflow_api_requirements(cls.grounded_spec)
+        cls.registered_routes = set()
+        for route in app.routes:
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None)
+            if not path or not methods:
+                continue
+            cls.registered_routes.add((str(path), next(iter(methods or {{""}}))))
 
     def test_generated_manifests_exist(self) -> None:
         self.assertTrue(self.route_manifest_path.exists(), f"Missing {{self.route_manifest_path}}")
@@ -4810,8 +5061,14 @@ class GeneratedMiniAppTests(unittest.TestCase):
                 self.assertTrue((MINIAPP_DIR / style_path.removeprefix("miniapp/")).exists(), f"Missing style file {{style_path}}")
                 self.assertTrue((MINIAPP_DIR / script_path.removeprefix("miniapp/")).exists(), f"Missing script file {{script_path}}")
                 html = absolute_path.read_text(encoding="utf-8")
-                self.assertIn(f"/static/{{role}}/{{Path(style_path).name}}", html, f"{{file_path}} must reference {{style_path}}")
-                self.assertIn(f"/static/{{role}}/{{Path(script_path).name}}", html, f"{{file_path}} must reference {{script_path}}")
+                self.assertIn("/static/shared/base.css", html, f"{{file_path}} must reference the shared shell stylesheet")
+                self.assertIn(_public_static_asset_path(style_path), html, f"{{file_path}} must reference {{style_path}}")
+                self.assertIn(_public_static_asset_path(script_path), html, f"{{file_path}} must reference {{script_path}}")
+                html_ids = _extract_html_ids(html)
+                script_content = (MINIAPP_DIR / script_path.removeprefix("miniapp/")).read_text(encoding="utf-8")
+                missing_ids = sorted(_extract_js_dom_ids(script_content) - html_ids)
+                self.assertFalse(missing_ids, f"{{file_path}} is missing DOM ids required by {{script_path}}: {{missing_ids}}")
+                self.assertNotRegex(html, r">\\s*Refresh\\s*<", f"{{file_path}} should not render a manual refresh action")
 
     def test_all_declared_role_pages_render(self) -> None:
         roles_payload = self.route_manifest.get("roles") or {{}}
@@ -4827,6 +5084,24 @@ class GeneratedMiniAppTests(unittest.TestCase):
                     f"{{normalized}} -> {{response.status_code}} {{response.text}}",
                 )
                 self.assertIn("<html", response.text.lower())
+
+    def test_local_page_links_render(self) -> None:
+        roles_payload = self.route_manifest.get("roles") or {{}}
+        for role in ROLES:
+            pages = (roles_payload.get(role) or {{}}).get("pages") or []
+            for page in pages:
+                file_path = str(page.get("file_path") or "")
+                html_path = MINIAPP_DIR / file_path.removeprefix("miniapp/")
+                html = html_path.read_text(encoding="utf-8")
+                script_path = str(page.get("script_path") or "")
+                script_content = ""
+                if script_path:
+                    script_file = MINIAPP_DIR / script_path.removeprefix("miniapp/")
+                    if script_file.exists():
+                        script_content = script_file.read_text(encoding="utf-8")
+                for route_ref in sorted(_extract_local_route_refs(html) | _extract_local_route_refs(script_content)):
+                    response = self.client.get(_sample_route_path(route_ref))
+                    self.assertEqual(response.status_code, 200, f"{{route_ref}} linked from {{file_path}} -> {{response.status_code}} {{response.text}}")
 
     def test_page_assets_and_api_calls_are_consistent(self) -> None:
         roles_payload = self.route_manifest.get("roles") or {{}}
@@ -4870,6 +5145,132 @@ class GeneratedMiniAppTests(unittest.TestCase):
                     500,
                     f"{{method}} {{normalized_path}} raised a server error: {{response.text}}",
                 )
+
+    def test_detected_workflow_lifecycle_executes(self) -> None:
+        if not self.workflow_api_requirements:
+            self.skipTest("Grounded spec did not declare workflow API requirements.")
+        create_api = _pick_workflow_api(
+            self.workflow_api_requirements,
+            methods={{"POST", "PUT"}},
+            tokens_any={{"create", "submit", "new", "request", "submission", "task", "booking", "order"}},
+        )
+        if not create_api:
+            self.skipTest("No workflow creation API detected in grounded spec.")
+
+        create_path = _resolve_path_params(str(create_api.get("path") or ""), {{}})
+        create_method = str(create_api.get("method") or "POST")
+        create_payload = _payload_for_api(create_api, create_path, create_method)
+        create_response = _request_and_assert(self.client, create_method, create_path, payload=create_payload)
+        self.assertNotEqual(create_response.status_code, 404, f"Workflow creation route missing at runtime: {{create_path}}")
+        self.assertLess(create_response.status_code, 500, f"Workflow creation failed: {{create_response.text}}")
+        created_payload = _response_json(create_response)
+        created_id = _extract_record_id(created_payload)
+        resource = _resource_slug(str(create_api.get("path") or ""))
+
+        list_api = _pick_workflow_api(
+            self.workflow_api_requirements,
+            methods={{"GET"}},
+            tokens_any={{"list", "queue", "overview", "items", "records", "request", "submission", "task", resource}},
+            preferred_resource=resource or None,
+        )
+        if list_api:
+            list_path = _resolve_path_params(str(list_api.get("path") or ""), {{}})
+            list_response = _request_and_assert(self.client, "GET", list_path)
+            self.assertNotEqual(list_response.status_code, 404, f"Workflow list route missing at runtime: {{list_path}}")
+            self.assertLess(list_response.status_code, 500, f"Workflow list failed: {{list_response.text}}")
+            list_payload = _response_json(list_response)
+            if created_id:
+                items = _extract_items(list_payload)
+                if items:
+                    self.assertTrue(
+                        any(_payload_contains_value(item, created_id) for item in items),
+                        f"Created workflow record {{created_id}} is not visible in list payload {{list_payload}}",
+                    )
+
+        if not created_id:
+            return
+
+        path_replacements = {{
+            "id": created_id,
+            "request_id": created_id,
+            "submission_id": created_id,
+            "task_id": created_id,
+            "item_id": created_id,
+            "record_id": created_id,
+        }}
+        detail_api = next(
+            (
+                item
+                for item in self.workflow_api_requirements
+                if item.get("method") == "GET"
+                and "{{" in str(item.get("path") or "")
+                and (not resource or _resource_slug(str(item.get("path") or "")) == resource)
+            ),
+            None,
+        )
+        if detail_api:
+            detail_path = _resolve_path_params(str(detail_api.get("path") or ""), path_replacements)
+            detail_response = _request_and_assert(self.client, "GET", detail_path)
+            self.assertNotEqual(detail_response.status_code, 404, f"Workflow detail route missing at runtime: {{detail_path}}")
+            self.assertLess(detail_response.status_code, 500, f"Workflow detail failed: {{detail_response.text}}")
+
+        assign_api = _pick_workflow_api(
+            self.workflow_api_requirements,
+            methods={{"POST", "PUT", "PATCH"}},
+            tokens_any={{"assign", "owner", "specialist", "assignee", "claim"}},
+            preferred_resource=resource or None,
+        )
+        if assign_api:
+            assign_path = _resolve_path_params(str(assign_api.get("path") or ""), path_replacements)
+            assign_method = str(assign_api.get("method") or "PATCH")
+            assign_payload = _payload_for_api(assign_api, assign_path, assign_method, created_id=created_id) or {{}}
+            assign_response = _request_and_assert(self.client, assign_method, assign_path, payload=assign_payload)
+            self.assertNotEqual(assign_response.status_code, 404, f"Workflow assignment route missing at runtime: {{assign_path}}")
+            self.assertLess(assign_response.status_code, 500, f"Workflow assignment failed: {{assign_response.text}}")
+
+        status_api = _pick_workflow_api(
+            self.workflow_api_requirements,
+            methods={{"PUT", "PATCH", "POST"}},
+            tokens_any={{"status", "progress", "complete", "update"}},
+            preferred_resource=resource or None,
+        )
+        if status_api:
+            status_path = _resolve_path_params(str(status_api.get("path") or ""), path_replacements)
+            status_method = str(status_api.get("method") or "PATCH")
+            status_payload = _payload_for_api(status_api, status_path, status_method, created_id=created_id) or {{}}
+            status_payload.setdefault("status", "in_progress")
+            status_response = _request_and_assert(self.client, status_method, status_path, payload=status_payload)
+            self.assertNotEqual(status_response.status_code, 404, f"Workflow status route missing at runtime: {{status_path}}")
+            self.assertLess(status_response.status_code, 500, f"Workflow status update failed: {{status_response.text}}")
+            if detail_api:
+                refreshed_detail = _request_and_assert(
+                    self.client,
+                    "GET",
+                    _resolve_path_params(str(detail_api.get("path") or ""), path_replacements),
+                )
+                self.assertLess(refreshed_detail.status_code, 500, f"Workflow detail refresh failed after status update: {{refreshed_detail.text}}")
+                detail_payload = _response_json(refreshed_detail)
+                if isinstance(detail_payload, (dict, list)):
+                    self.assertTrue(
+                        _payload_contains_value(detail_payload, "in_progress"),
+                        f"Updated workflow status is not visible after mutation: {{detail_payload}}",
+                    )
+
+        comment_api = _pick_workflow_api(
+            self.workflow_api_requirements,
+            methods={{"POST", "PUT", "PATCH"}},
+            tokens_any={{"comment", "note", "notes", "message", "history"}},
+            preferred_resource=resource or None,
+        )
+        if comment_api:
+            comment_path = _resolve_path_params(str(comment_api.get("path") or ""), path_replacements)
+            comment_method = str(comment_api.get("method") or "POST")
+            comment_payload = _payload_for_api(comment_api, comment_path, comment_method, created_id=created_id) or {{}}
+            if "comment" not in {{key.lower() for key in comment_payload}}:
+                comment_payload["comment"] = "Workflow comment"
+            comment_response = _request_and_assert(self.client, comment_method, comment_path, payload=comment_payload)
+            self.assertNotEqual(comment_response.status_code, 404, f"Workflow comment route missing at runtime: {{comment_path}}")
+            self.assertLess(comment_response.status_code, 500, f"Workflow comment failed: {{comment_response.text}}")
 
     def test_backend_route_modules_import(self) -> None:
         for file_path in EXPECTED_BACKEND_TARGETS:
@@ -4939,6 +5340,43 @@ function extractApiRefs(content) {{
   return refs;
 }}
 
+function extractLocalRouteRefs(content) {{
+  const refs = new Set();
+  const patterns = [
+    /(?:href|location(?:\\.href)?)\\s*=\\s*["'](\\/(?!api\\/|static\\/|\\/)[^"'#?]+)["']/g,
+    /["'](\\/(?!api\\/|static\\/|\\/)[a-zA-Z0-9_\\-/:{{}}]+)["']/g,
+  ];
+  for (const pattern of patterns) {{
+    for (const match of content.matchAll(pattern)) {{
+      refs.add(match[1]);
+    }}
+  }}
+  return refs;
+}}
+
+function extractHtmlIds(html) {{
+  const ids = new Set();
+  const regex = /id=["']([^"']+)["']/g;
+  for (const match of html.matchAll(regex)) {{
+    ids.add(match[1]);
+  }}
+  return ids;
+}}
+
+function extractJsDomIds(content) {{
+  const ids = new Set();
+  const patterns = [
+    /getElementById\\(["']([^"']+)["']\\)/g,
+    /querySelector\\(["']#([^"']+)["']\\)/g,
+  ];
+  for (const pattern of patterns) {{
+    for (const match of content.matchAll(pattern)) {{
+      ids.add(match[1]);
+    }}
+  }}
+  return ids;
+}}
+
 function normalizeRoutePath(value) {{
   return value
     .replace(/\\{{[^/]+\\}}/g, 'sample')
@@ -4997,12 +5435,18 @@ test('role pages and static assets exist', () => {{
       const html = fs.readFileSync(absolutePagePath, 'utf8');
       assert.ok(html.toLowerCase().includes('<html'), `Page ${{filePath}} does not look like HTML`);
       assert.ok(html.trim().length > 80, `Page ${{filePath}} is unexpectedly short`);
-      assert.ok(html.includes(`/static/${{role}}/${{path.basename(stylePath)}}`), `Page ${{filePath}} must reference its own CSS file`);
-      assert.ok(html.includes(`/static/${{role}}/${{path.basename(scriptPath)}}`), `Page ${{filePath}} must reference its own JS file`);
+      assert.ok(html.includes('/static/shared/base.css'), `Page ${{filePath}} must reference /static/shared/base.css`);
+      assert.ok(html.includes('/' + stylePath.replace(/^miniapp\\/app\\//, '').replace(/\\\\/g, '/')), `Page ${{filePath}} must reference its own CSS file`);
+      assert.ok(html.includes('/' + scriptPath.replace(/^miniapp\\/app\\//, '').replace(/\\\\/g, '/')), `Page ${{filePath}} must reference its own JS file`);
+      assert.equal(/>\\s*Refresh\\s*</.test(html), false, `Page ${{filePath}} should not render a manual refresh action`);
       for (const asset of extractStaticAssets(html)) {{
         const absoluteAssetPath = path.join(APP_DIR, asset.replace(/^\\/static\\//, 'static/'));
         assert.ok(fs.existsSync(absoluteAssetPath), `Missing referenced asset ${{asset}} from ${{filePath}}`);
       }}
+      const htmlIds = extractHtmlIds(html);
+      const scriptSource = fs.readFileSync(path.join(MINIAPP_DIR, scriptPath.replace(/^miniapp\\//, '')), 'utf8');
+      const missingIds = [...extractJsDomIds(scriptSource)].filter((id) => !htmlIds.has(id));
+      assert.deepEqual(missingIds, [], `Page ${{filePath}} is missing DOM ids required by ${{scriptPath}}: ${{missingIds.join(', ')}}`);
     }}
   }}
 }});
@@ -5037,6 +5481,51 @@ test('planned api references map to registered backend routes', () => {{
   }}
 }});
 
+test('page-local navigation targets resolve to declared routes', () => {{
+  const routeManifest = loadJson(ROUTE_MANIFEST_PATH);
+  const declaredRoutes = new Set();
+  for (const role of ROLES) {{
+    const pages = routeManifest.roles?.[role]?.pages ?? [];
+    for (const page of pages) {{
+      declaredRoutes.add(normalizeRoutePath(String(page.route_path ?? '')));
+    }}
+  }}
+  for (const role of ROLES) {{
+    const pages = routeManifest.roles?.[role]?.pages ?? [];
+    for (const page of pages) {{
+      const sources = [page.file_path, page.script_path]
+        .map((targetPath) => path.join(MINIAPP_DIR, String(targetPath ?? '').replace(/^miniapp\\//, '')))
+        .filter((absolutePath) => fs.existsSync(absolutePath))
+        .map((absolutePath) => fs.readFileSync(absolutePath, 'utf8'));
+      const refs = new Set();
+      for (const source of sources) {{
+        for (const routeRef of extractLocalRouteRefs(source)) {{
+          refs.add(routeRef);
+        }}
+      }}
+      for (const routeRef of refs) {{
+        assert.ok(declaredRoutes.has(normalizeRoutePath(routeRef)), `Route ${{routeRef}} referenced by ${{page.file_path}} is not declared in route_manifest.json`);
+      }}
+    }}
+  }}
+}});
+
+test('grounded workflow roles map to declared page surfaces', () => {{
+  const routeManifest = loadJson(ROUTE_MANIFEST_PATH);
+  const groundedSpec = fs.existsSync(GROUNDED_SPEC_PATH) ? loadJson(GROUNDED_SPEC_PATH) : {{}};
+  const actorById = new Map((groundedSpec.actors ?? []).map((actor) => [String(actor.actor_id ?? ''), String(actor.role ?? '').toLowerCase()]));
+  for (const flow of groundedSpec.user_flows ?? []) {{
+    for (const step of flow.steps ?? []) {{
+      const role = actorById.get(String(step.actor_id ?? ''));
+      if (!role || !ROLES.includes(role)) {{
+        continue;
+      }}
+      const pages = routeManifest.roles?.[role]?.pages ?? [];
+      assert.ok(pages.length > 0, `Workflow role ${{role}} from flow ${{flow.name ?? flow.flow_id ?? 'unknown'}} has no declared pages`);
+    }}
+  }}
+}});
+
 test('generated javascript files parse', () => {{
   const jsFiles = collectFiles(path.join(APP_DIR, 'static'), '.js');
   assert.ok(jsFiles.length > 0, 'No generated JavaScript files found');
@@ -5062,25 +5551,22 @@ test('generated javascript files parse', () => {{
                 if route_path == "/":
                     normalized_route = f"/{role}"
                 page_kind = str(page.get("page_kind") or "").strip().lower()
+                file_path = str(page.get("file_path") or f"miniapp/app/static/{role}/index.html")
+                default_style_path = GenerationService._default_page_asset_path(file_path, asset_kind="css")
+                default_script_path = GenerationService._default_page_asset_path(file_path, asset_kind="js")
+                style_path = str(page.get("style_path") or default_style_path)
+                script_path = str(page.get("script_path") or default_script_path)
+                if not style_path.startswith(f"miniapp/app/static/{role}/"):
+                    style_path = default_style_path
+                if not script_path.startswith(f"miniapp/app/static/{role}/"):
+                    script_path = default_script_path
                 pages.append(
                     {
                         "page_id": str(page.get("page_id") or f"{role}_{index + 1}"),
                         "route_path": normalized_route,
-                        "file_path": str(page.get("file_path") or f"miniapp/app/static/{role}/index.html"),
-                        "style_path": str(
-                            page.get("style_path")
-                            or GenerationService._default_page_asset_path(
-                                str(page.get("file_path") or f"miniapp/app/static/{role}/index.html"),
-                                asset_kind="css",
-                            )
-                        ),
-                        "script_path": str(
-                            page.get("script_path")
-                            or GenerationService._default_page_asset_path(
-                                str(page.get("file_path") or f"miniapp/app/static/{role}/index.html"),
-                                asset_kind="js",
-                            )
-                        ),
+                        "file_path": file_path,
+                        "style_path": style_path,
+                        "script_path": script_path,
                         "page_kind": page_kind or ("profile" if normalized_route.endswith("/profile") else "page"),
                         "navigation_label": str(page.get("navigation_label") or page.get("title") or "Open"),
                         "title": str(page.get("title") or page.get("navigation_label") or role.title()),
@@ -5733,6 +6219,9 @@ test('generated javascript files parse', () => {{
                     "Keep the diff minimal and preserve unrelated behavior.",
                     "Return operations only for files listed in target_files.",
                     "Treat shared shell files, route-linked pages, and generated runtime artifacts as the primary repair surface when they appear in target_files.",
+                    "If the failure involves stateful business data, repair it through db.py and schemas.py instead of introducing or keeping route-level dict/list stores.",
+                    "Move inline Pydantic request/response models out of routes into schemas.py whenever the failing surface is a workflow backend.",
+                    "Keep SQLAlchemy engine/session/model logic in db.py and import it from routes instead of duplicating persistence logic across route files.",
                     "If target_files is non-empty, operations must include at least one create/replace/delete for one of those files.",
                     "For connectivity missing_ui_loading_state or missing_ui_error_state, satisfy the validator with real loading/error containers, ids, or data-ui-state markers that match the current page contract.",
                     "When a failure points to route or navigation mismatch, repair the page graph contract and the route-linked HTML files consistently.",
@@ -5846,6 +6335,7 @@ test('generated javascript files parse', () => {{
             "user_flows": [flow.model_dump(mode="json") for flow in grounded_spec.user_flows[:4]],
             "ui_requirements": [item.model_dump(mode="json") for item in grounded_spec.ui_requirements[:8]],
             "api_requirements": [item.model_dump(mode="json") for item in grounded_spec.api_requirements[:8]],
+            "persistence_requirements": [item.model_dump(mode="json") for item in grounded_spec.persistence_requirements[:8]],
             "security_requirements": [item.model_dump(mode="json") for item in grounded_spec.security_requirements[:6]],
             "non_functional_requirements": [item.model_dump(mode="json") for item in grounded_spec.non_functional_requirements[:6]],
             "platform_constraints": [item.model_dump(mode="json") for item in grounded_spec.platform_constraints[:6]],
@@ -6024,7 +6514,7 @@ test('generated javascript files parse', () => {{
                 causal.add(issue.location)
             for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", issue.message):
                 endpoint_name = match.group(1)
-                causal.add(f"miniapp/app/routes/{endpoint_name}.py")
+                causal.add(self._route_module_path_for_endpoint_name(endpoint_name))
                 causal.add("miniapp/app/main.py")
         return causal or active_target_set
 
@@ -6039,7 +6529,7 @@ test('generated javascript files parse', () => {{
         for issue in build_issues:
             for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", issue.message):
                 endpoint_name = match.group(1)
-                for candidate in (f"miniapp/app/routes/{endpoint_name}.py", "miniapp/app/main.py"):
+                for candidate in (self._route_module_path_for_endpoint_name(endpoint_name), "miniapp/app/main.py"):
                     if candidate not in expanded:
                         expanded.append(candidate)
                         added.append(candidate)
@@ -7594,21 +8084,21 @@ test('generated javascript files parse', () => {{
                 route_path = str(route.get("path") or "/").strip() or "/"
                 route_path = "/" if route_path == "/" else f"/{route_path.strip('/')}"
                 if route_path == "/":
-                    file_name = "index.html"
+                    page_slug = "home"
                 else:
                     route_slug = re.sub(r":[^/]+", "detail", route_path.strip("/"))
                     route_slug = route_slug.replace("/", "_").replace("-", "_")
                     route_slug = re.sub(r"[^a-z0-9_]+", "_", route_slug.lower()).strip("_")
                     route_slug = re.sub(r"_+", "_", route_slug)
-                    file_name = f"{route_slug or 'page'}.html"
+                    page_slug = route_slug or "page"
                 screen = ((payload.get("screens") or {}) or {}).get(route.get("screen_id")) or {}
                 pages.append(
                     {
                         "page_id": str(route.get("screen_id") or route.get("route_id") or f"{role}_{len(pages) + 1}"),
                         "route_path": route_path,
-                        "file_path": f"miniapp/app/static/{role}/{file_name}",
-                        "style_path": f"miniapp/app/static/{role}/{Path(file_name).stem}.css",
-                        "script_path": f"miniapp/app/static/{role}/{Path(file_name).stem}.js",
+                        "file_path": f"miniapp/app/static/{role}/{page_slug}/index.html",
+                        "style_path": f"miniapp/app/static/{role}/{page_slug}/styles.css",
+                        "script_path": f"miniapp/app/static/{role}/{page_slug}/app.js",
                         "page_kind": str(screen.get("kind") or "page"),
                         "navigation_label": str(route.get("label") or screen.get("title") or "Open"),
                         "title": str(screen.get("title") or route.get("label") or "Page"),
@@ -8045,7 +8535,8 @@ test('generated javascript files parse', () => {{
             actions = []
             if has_workspace:
                 actions.append({"action_id": f"{role}_open_workspace_from_workbench", "type": "navigate", "target_screen_id": f"{role}_workspace"})
-            actions.append({"action_id": f"{role}_refresh_workbench", "type": "call_api", "integration_id": "integration_runtime_action"})
+            if has_profile:
+                actions.append({"action_id": f"{role}_open_profile", "type": "navigate", "target_screen_id": f"{role}_profile"})
             return actions
         if slug == "workspace":
             actions = []
@@ -8060,8 +8551,8 @@ test('generated javascript files parse', () => {{
                         {"action_id": "specialist_complete_request", "type": "call_api", "integration_id": "integration_runtime_action"},
                     ]
                 )
-            else:
-                actions.append({"action_id": "manager_refresh_records", "type": "call_api", "integration_id": "integration_runtime_action"})
+            elif has_profile:
+                actions.append({"action_id": f"{role}_open_profile", "type": "navigate", "target_screen_id": f"{role}_profile"})
             return actions
         return [{"action_id": f"{role}_profile_save", "type": "call_api", "integration_id": "integration_save_profile"}]
 
@@ -8520,7 +9011,6 @@ test('generated javascript files parse', () => {{
                 "type": "actions",
                 "actions": [
                     {"action_id": "manager_rebalance", "label": "Rebalance workload", "type": "call_api"},
-                    {"action_id": "manager_refresh_records", "label": "Refresh records", "type": "call_api"},
                 ],
             },
             recent_list,
@@ -8660,7 +9150,6 @@ test('generated javascript files parse', () => {{
                 "type": "actions",
                 "actions": [
                     {"action_id": "manager_rebalance", "label": "Reassign workload", "type": "call_api"},
-                    {"action_id": "manager_refresh_records", "label": "Refresh orders", "type": "call_api"},
                 ],
             },
         ]
@@ -8963,7 +9452,6 @@ test('generated javascript files parse', () => {{
             "client_open_workspace": "Workspace",
             "client_open_profile": "Profile",
             "client_open_workspace_from_workbench": "Open detail",
-            "client_refresh_workbench": "Refresh",
             "client_back_to_workbench": "Back",
             "client_workspace_continue": "Continue",
             "client_submit_form": "Submit",
@@ -8972,7 +9460,6 @@ test('generated javascript files parse', () => {{
             "specialist_open_workspace": "Workspace",
             "specialist_open_profile": "Profile",
             "specialist_open_workspace_from_workbench": "Open detail",
-            "specialist_refresh_workbench": "Refresh",
             "specialist_back_to_workbench": "Back",
             "specialist_claim_next": "Claim next",
             "specialist_mark_in_progress": "Start",
@@ -8984,7 +9471,6 @@ test('generated javascript files parse', () => {{
             "manager_open_workspace_from_workbench": "Open detail",
             "manager_back_to_workbench": "Back",
             "manager_rebalance": "Rebalance",
-            "manager_refresh_records": "Refresh",
             "manager_profile_save": "Save",
         }
         if ui_variant == "atlas":

@@ -8,11 +8,13 @@ from app.db import RoleProfileRecord, SessionLocal
 from app.schemas import AppRole, RoleProfile
 
 router = APIRouter(prefix="/api/profiles", tags=["profiles"])
+
 DEFAULT_PROFILES: dict[AppRole, dict[str, str | None]] = {
     "client": {"first_name": "Ivan", "last_name": "Ivanov", "email": "", "phone": "", "photo_url": None},
     "specialist": {"first_name": "Ivan", "last_name": "Ivanov", "email": "", "phone": "", "photo_url": None},
     "manager": {"first_name": "Ivan", "last_name": "Ivanov", "email": "", "phone": "", "photo_url": None},
 }
+
 
 def _to_schema(record: RoleProfileRecord) -> RoleProfile:
     return RoleProfile(
@@ -59,9 +61,9 @@ def save_role_profile(role: AppRole, profile: RoleProfile) -> RoleProfile:
 
 @router.get("/{role}", response_model=RoleProfile)
 def get_profile(role: AppRole) -> RoleProfile:
-  return load_role_profile(role)
+    return load_role_profile(role)
 
 
 @router.put("/{role}", response_model=RoleProfile)
 def update_profile(role: AppRole, profile: RoleProfile) -> RoleProfile:
-  return save_role_profile(role, profile)
+    return save_role_profile(role, profile)

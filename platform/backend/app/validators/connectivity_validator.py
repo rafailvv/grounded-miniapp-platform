@@ -45,7 +45,11 @@ class ConnectivityValidator:
         issues: list[ValidationIssue] = []
         static_root = workspace_path / "miniapp" / "app" / "static"
         routes_root = workspace_path / "miniapp" / "app" / "routes"
-        route_stems = {path.stem for path in routes_root.glob("*.py") if path.name != "__init__.py"}
+        route_stems = {
+            self._normalize_route_stem(path.stem)
+            for path in routes_root.glob("*.py")
+            if path.name != "__init__.py"
+        }
 
         for role, role_payload in roles.items():
             if not isinstance(role_payload, dict):
@@ -68,13 +72,14 @@ class ConnectivityValidator:
 
                 if api_refs:
                     for ref in sorted(api_refs):
-                        if ref not in route_stems:
+                        normalized_ref = self._normalize_route_stem(ref)
+                        if normalized_ref not in route_stems:
                             issues.append(
                                 ValidationIssue(
                                     code="connectivity.missing_backend_route",
-                                    message=f"{file_path} references /api/{ref} but miniapp/app/routes/{ref}.py is missing.",
+                                    message=f"{file_path} references /api/{ref} but miniapp/app/routes/{normalized_ref}.py is missing.",
                                     severity="high",
-                                    location=f"miniapp/app/routes/{ref}.py",
+                                    location=f"miniapp/app/routes/{normalized_ref}.py",
                                 )
                             )
                 elif expected_route_stems and not any(stem in route_stems for stem in expected_route_stems):
@@ -139,13 +144,14 @@ class ConnectivityValidator:
                 relative = str(file_path.relative_to(workspace_path))
                 content = file_path.read_text(encoding="utf-8")
                 for endpoint in self._extract_api_refs(content):
-                    if endpoint not in route_stems:
+                    normalized_endpoint = self._normalize_route_stem(endpoint)
+                    if normalized_endpoint not in route_stems:
                         issues.append(
                             ValidationIssue(
                                 code="connectivity.missing_backend_route",
                                 message=f"{relative} references /api/{endpoint} but the matching route module is missing.",
                                 severity="high",
-                                location=f"miniapp/app/routes/{endpoint}.py",
+                                location=f"miniapp/app/routes/{normalized_endpoint}.py",
                             )
                         )
                 for asset_path in self._extract_static_asset_refs(content, source_path=relative):
@@ -188,7 +194,7 @@ class ConnectivityValidator:
     def _extract_api_refs(content: str) -> set[str]:
         refs: set[str] = set()
         for match in re.finditer(r"['\"]?/api/([a-zA-Z0-9_-]+)(?:[/'\"?)]|$)", content):
-            refs.add(match.group(1).lower())
+            refs.add(ConnectivityValidator._normalize_route_stem(match.group(1).lower()))
         return refs
 
     @staticmethod
@@ -279,8 +285,12 @@ class ConnectivityValidator:
             if candidate_stems & (dependencies | page_tokens):
                 path_match = re.search(r"/api/([a-zA-Z0-9_-]+)", path)
                 if path_match:
-                    stems.add(path_match.group(1).lower())
+                    stems.add(cls._normalize_route_stem(path_match.group(1).lower()))
         return {stem for stem in stems if stem not in {"api", "data", "page", "state"}}
+
+    @staticmethod
+    def _normalize_route_stem(stem: str) -> str:
+        return stem.strip().lower().replace("-", "_")
 
     @staticmethod
     def _contains_state(content: str, state_text: str, *, state_kind: str) -> bool:

@@ -160,6 +160,8 @@ function isSupportedEditorPath(path: string): boolean {
 
 const PREVIEW_BOOT_POLL_ATTEMPTS = 45;
 const PREVIEW_BOOT_POLL_INTERVAL_MS = 1000;
+const PREVIEW_FRAME_LOAD_TIMEOUT_MS = 25000;
+const PREVIEW_STUCK_REBUILD_ATTEMPT = 18;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -1520,7 +1522,10 @@ export default function App() {
           continue;
         }
 
-        if (!rebuildTriggered && attempt >= 2 && (preview.status === "stopped" || !preview.status)) {
+        const previewLooksStuck =
+          !preview.url &&
+          (preview.status === "starting" || preview.status === "stopped" || !preview.status);
+        if (!rebuildTriggered && ((attempt >= 2 && (preview.status === "stopped" || !preview.status)) || (attempt >= PREVIEW_STUCK_REBUILD_ATTEMPT && previewLooksStuck))) {
           rebuildTriggered = true;
           try {
             await rebuildPreview(workspaceId);
@@ -1901,7 +1906,7 @@ export default function App() {
     previewTimeoutsRef.current[role] = window.setTimeout(() => {
       setPreviewLoading((current) => ({ ...current, [role]: false }));
       setPreviewFailed((current) => ({ ...current, [role]: true }));
-    }, 12000);
+    }, PREVIEW_FRAME_LOAD_TIMEOUT_MS);
   }
 
   function clearPreviewTimeout(role: RoleKey) {

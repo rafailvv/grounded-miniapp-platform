@@ -46,6 +46,33 @@ MEANINGFUL_DIFF_IGNORED_PARTS = {
 MEANINGFUL_DIFF_IGNORED_SUFFIXES = (".pyc", ".pyo", ".tsbuildinfo")
 MEANINGFUL_DIFF_IGNORED_NAMES = {".DS_Store", "vite.config.js", "vite.config.d.ts"}
 logger = logging.getLogger(__name__)
+WORKSPACE_NAME_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "app",
+    "application",
+    "build",
+    "create",
+    "for",
+    "generate",
+    "i",
+    "in",
+    "make",
+    "me",
+    "mini",
+    "miniapp",
+    "mini-app",
+    "my",
+    "need",
+    "of",
+    "simple",
+    "that",
+    "the",
+    "this",
+    "to",
+    "with",
+}
 
 
 class RunService:
@@ -95,6 +122,9 @@ class RunService:
 
     def _start_run(self, workspace_id: str, request: CreateRunRequest, *, wait: bool) -> RunRecord:
         workspace = self.workspace_service.get_workspace(workspace_id)
+        suggested_workspace_name = self._derive_workspace_name_from_prompt(request.prompt)
+        if suggested_workspace_name:
+            workspace = self.workspace_service.rename_workspace(workspace_id, suggested_workspace_name)
         resolved_intent = self._resolve_intent(workspace, request)
         effective_generation_mode = self._resolve_generation_mode(workspace, request, resolved_intent)
         run = RunRecord(
@@ -128,6 +158,42 @@ class RunService:
         )
         worker.start()
         return self.get_run(run.run_id)
+
+    @staticmethod
+    def _derive_workspace_name_from_prompt(prompt: str) -> str:
+        normalized = " ".join(str(prompt or "").split()).strip()
+        if not normalized:
+            return ""
+        normalized = re.sub(r"^['\"`]+|['\"`]+$", "", normalized)
+        lowered = normalized.lower()
+        if lowered.startswith("i need "):
+            normalized = normalized[7:]
+        elif lowered.startswith("create "):
+            normalized = normalized[7:]
+        elif lowered.startswith("build "):
+            normalized = normalized[6:]
+        elif lowered.startswith("make "):
+            normalized = normalized[5:]
+        normalized = re.split(r"[.!?\n]", normalized, maxsplit=1)[0].strip(" ,;-:")
+        if not normalized:
+            return ""
+
+        tokens = re.findall(r"[A-Za-z0-9]+", normalized)
+        meaningful: list[str] = []
+        for token in tokens:
+            lowered_token = token.lower()
+            if lowered_token in WORKSPACE_NAME_STOPWORDS:
+                continue
+            meaningful.append(token)
+            if len(meaningful) >= 5:
+                break
+        if not meaningful:
+            meaningful = tokens[:4]
+        if not meaningful:
+            return ""
+        title = " ".join(word.capitalize() if not word.isupper() else word for word in meaningful)
+        title = re.sub(r"\s+", " ", title).strip()
+        return title[:48].rstrip(" -_,")
 
     def list_runs(self, workspace_id: str) -> list[RunRecord]:
         runs = [
