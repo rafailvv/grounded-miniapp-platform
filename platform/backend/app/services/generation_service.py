@@ -149,6 +149,9 @@ CANONICAL_BACKEND_ROOTS = (
     "miniapp/tests/",
 )
 CANONICAL_FILE_ROOTS = (*CANONICAL_FRONTEND_ROOTS, *CANONICAL_BACKEND_ROOTS, "artifacts/")
+TEMPLATE_OWNED_SHARED_FILES = (
+    "miniapp/app/static/preview_bridge.js",
+)
 LEGACY_ARCHITECTURE_MARKERS = (
     "frontend/",
     "miniapp/app/api/",
@@ -2087,6 +2090,11 @@ class GenerationService:
                     "Do not create entities, features, widgets, shared, domain, infrastructure, or api sub-architectures.",
                     "Stay inside the canonical roots miniapp/app, miniapp/app/routes, miniapp/app/static, and miniapp/app/generated.",
                     "Use English-only control text and code comments.",
+                    "For every HTML page in cluster_targets, make it reference its own page-local styles.css and app.js companions when those files are also in cluster_targets.",
+                    "Render loading and error state containers in the first draft for pages with data_dependencies; do not wait for repair.",
+                    "Do not render manual Refresh buttons or loading-only placeholder shells as the primary surface.",
+                    "Do not introduce flat role entry files like miniapp/app/static/client/index.html unless that exact path is listed in cluster_targets.",
+                    "Use the template runtime conventions for API access instead of raw authless fetch patterns.",
                 ],
             }
         )
@@ -2259,6 +2267,41 @@ class GenerationService:
         candidate = path.strip().lstrip("/")
         if not candidate:
             return candidate
+        landing_alias_match = re.fullmatch(
+            r"miniapp/app/static/(?P<role>client|specialist|manager)/(?P<alias>home|client_home|specialist_home|manager_home)/(?P<name>index\.html|styles\.css|app\.js)",
+            candidate,
+        )
+        if landing_alias_match:
+            role = landing_alias_match.group("role")
+            name = landing_alias_match.group("name")
+            return f"miniapp/app/static/{role}/{name}"
+        flat_static_match = re.fullmatch(
+            r"miniapp/app/static/(?P<role>client|specialist|manager)/(?P<name>[^/]+)\.(?P<ext>html|css|js)",
+            candidate,
+        )
+        if flat_static_match:
+            role = flat_static_match.group("role")
+            name = cls._snake_case_filename(flat_static_match.group("name"))
+            ext = flat_static_match.group("ext")
+            if name == "index":
+                if ext == "html":
+                    return f"miniapp/app/static/{role}/index.html"
+                if ext == "css":
+                    return f"miniapp/app/static/{role}/styles.css"
+                return f"miniapp/app/static/{role}/app.js"
+            if name == "styles" and ext == "css":
+                return f"miniapp/app/static/{role}/styles.css"
+            if name == "app" and ext == "js":
+                return f"miniapp/app/static/{role}/app.js"
+            if name == "app" and ext == "css":
+                return f"miniapp/app/static/{role}/styles.css"
+            if name == "styles" and ext == "js":
+                return f"miniapp/app/static/{role}/app.js"
+            if ext == "html":
+                return f"miniapp/app/static/{role}/{name}/index.html"
+            if ext == "css":
+                return f"miniapp/app/static/{role}/{name}/styles.css"
+            return f"miniapp/app/static/{role}/{name}/app.js"
         if candidate.startswith("miniapp/app/routes/") and candidate.endswith(".py"):
             head, tail = candidate.rsplit("/", 1)
             return f"{head}/{cls._snake_case_filename(tail)}"
@@ -2397,6 +2440,7 @@ class GenerationService:
                     roles_source[role] = item
 
         shared_files = self._normalize_path_list(raw_graph.get("shared_files") or payload.get("shared_files"), list(SHARED_GENERATED_FILES))
+        shared_files = [path for path in shared_files if path not in TEMPLATE_OWNED_SHARED_FILES]
         backend_targets = self._normalize_path_list(raw_graph.get("backend_targets") or payload.get("backend_targets"), [])
         roles: dict[str, dict[str, Any]] = {}
         graph_page_targets: list[str] = []
@@ -2646,13 +2690,22 @@ class GenerationService:
             else (CANONICAL_ROLE_PAGES[0], CANONICAL_ROLE_PAGES[3])
         )
         for page in defaults:
+            if page["route_path"] == "/":
+                file_path = f"miniapp/app/static/{role}/index.html"
+                style_path = f"miniapp/app/static/{role}/styles.css"
+                script_path = f"miniapp/app/static/{role}/app.js"
+            else:
+                stem = Path(page["file_name"]).stem
+                file_path = f"miniapp/app/static/{role}/{stem}/index.html"
+                style_path = f"miniapp/app/static/{role}/{stem}/styles.css"
+                script_path = f"miniapp/app/static/{role}/{stem}/app.js"
             pages.append(
                 {
                     "page_id": f"{role}_{page['suffix']}",
                     "route_path": page["route_path"],
-                    "file_path": f"miniapp/app/static/{role}/{Path(page['file_name']).stem}/index.html",
-                    "style_path": f"miniapp/app/static/{role}/{Path(page['file_name']).stem}/styles.css",
-                    "script_path": f"miniapp/app/static/{role}/{Path(page['file_name']).stem}/app.js",
+                    "file_path": file_path,
+                    "style_path": style_path,
+                    "script_path": script_path,
                     "page_kind": page["page_kind"],
                     "navigation_label": page["navigation_label"],
                 }
@@ -2681,11 +2734,17 @@ class GenerationService:
         normalized_path = file_path.strip()
         normalized_suffix = normalized_path.replace("\\", "/").lower()
         page_id_lower = page_id.lower()
+        if not normalized_suffix.endswith(".html"):
+            return True
         if route_path == "/":
-            return not normalized_suffix.endswith("/home/index.html")
+            return re.fullmatch(r"miniapp/app/static/[^/]+/index\.html", normalized_suffix) is None
         if route_path.rstrip("/") == "/profile" or "profile" in page_id_lower:
             return not normalized_suffix.endswith("/profile/index.html")
-        return normalized_suffix.endswith("/home/index.html") or normalized_suffix.endswith("/profile/index.html")
+        return (
+            not normalized_suffix.endswith("/index.html")
+            or re.fullmatch(r"miniapp/app/static/[^/]+/index\.html", normalized_suffix) is not None
+            or normalized_suffix.endswith("/profile/index.html")
+        )
 
     @staticmethod
     def _default_handoff_paths_for_page_kind(page_kind: str, *, route_path: str | None = None) -> list[str]:
@@ -2750,13 +2809,13 @@ class GenerationService:
 
     @staticmethod
     def _default_routes_file(role: str) -> str:
-        return f"miniapp/app/static/{role}/home/index.html"
+        return f"miniapp/app/routes/{role}.py"
 
     @staticmethod
     def _default_page_file(role: str, component_name: str, *, route_path: str | None = None) -> str:
         normalized_route = (route_path or "").strip().lower()
         if normalized_route in {"", "/"}:
-            slug = "home"
+            return f"miniapp/app/static/{role}/index.html"
         elif normalized_route.rstrip("/") == "/profile":
             slug = "profile"
         else:
@@ -2775,6 +2834,10 @@ class GenerationService:
     @staticmethod
     def _default_page_asset_path(file_path: str, *, asset_kind: str) -> str:
         file_path = file_path.replace("\\", "/")
+        role_root_match = re.fullmatch(r"miniapp/app/static/([^/]+)/index\.html", file_path)
+        if role_root_match:
+            role = role_root_match.group(1)
+            return f"miniapp/app/static/{role}/{'styles.css' if asset_kind == 'css' else 'app.js'}"
         if file_path.endswith("/index.html"):
             base_dir = Path(file_path).parent
             file_name = "styles.css" if asset_kind == "css" else "app.js"
@@ -2810,11 +2873,17 @@ class GenerationService:
         active_role_scope: list[str] = []
         for role in role_scope:
             pages = roles.get(role, {}).get("pages") or []
-            selected_files = [
-                str(page.get("file_path"))
-                for page in pages
-                if isinstance(page, dict) and isinstance(page.get("file_path"), str) and page.get("file_path") in target_set
-            ]
+            selected_files: list[str] = []
+            for page in pages:
+                if not isinstance(page, dict):
+                    continue
+                for path in (
+                    page.get("file_path"),
+                    page.get("style_path"),
+                    page.get("script_path"),
+                ):
+                    if isinstance(path, str) and path in target_set:
+                        selected_files.append(path)
             routes_file = roles.get(role, {}).get("routes_file")
             if isinstance(routes_file, str) and routes_file in target_set:
                 selected_files.append(routes_file)
@@ -2880,8 +2949,18 @@ class GenerationService:
             return False
         return any(path == root.rstrip("/") or path.startswith(root) for root in CANONICAL_FILE_ROOTS)
 
+    @staticmethod
+    def _is_legacy_role_entry_file(path: str) -> bool:
+        return False
+
     def _canonicalize_target_files(self, target_files: list[str], *, scope_mode: str) -> list[str]:
-        canonical = [path for path in target_files if self._is_canonical_target_path(path)]
+        canonical = [
+            path
+            for path in target_files
+            if self._is_canonical_target_path(path)
+            and not self._is_legacy_role_entry_file(path)
+            and path not in TEMPLATE_OWNED_SHARED_FILES
+        ]
         if scope_mode == "minimal_patch":
             return list(dict.fromkeys(canonical))
         return list(dict.fromkeys(canonical))
@@ -3157,7 +3236,7 @@ class GenerationService:
         route_path = str(page.get("route_path") or "")
         return file_path not in {
             f"miniapp/app/static/{role}/index.html",
-            f"miniapp/app/static/{role}/profile.html",
+            f"miniapp/app/static/{role}/profile/index.html",
         } and route_path not in {f"/{role}", f"/{role}/profile", "/", "/profile"}
 
     @staticmethod
@@ -4367,7 +4446,11 @@ class GenerationService:
             total_pages += len(pages)
             if enforce_expanded_structure and require_multi_page and len(pages) < 2:
                 issues.append(f"{role} did not receive enough distinct pages for a multi-page app.")
-            actual_routes = {str(page.get("route_path") or "") for page in pages if isinstance(page, dict)}
+            actual_routes = {
+                GenerationService._normalize_role_route_path(role, str(page.get("route_path") or ""), index=index)
+                for index, page in enumerate(pages)
+                if isinstance(page, dict)
+            }
             actual_page_kinds = {str(page.get("page_kind") or "").strip().lower() for page in pages if isinstance(page, dict)}
             if not actual_routes:
                 issues.append(f"{role} is missing route paths.")
@@ -4637,7 +4720,6 @@ class GenerationService:
         generation_mode: GenerationMode,
         operations: list[DraftFileOperation],
     ) -> list[DraftFileOperation]:
-        operation_map = {operation.file_path: operation for operation in operations}
         route_manifest = self._route_manifest_from_page_graph(page_graph, role_scope)
         runtime_manifest = self._runtime_manifest_from_page_graph(route_manifest, grounded_spec, generation_mode)
         runtime_state = self._runtime_state_from_route_manifest(route_manifest, grounded_spec, generation_mode)
@@ -4660,11 +4742,8 @@ class GenerationService:
             "miniapp/app/generated/role_seed.json": (role_seed, "Persist role summaries and route metadata for generated pages."),
             "miniapp/app/generated/role_experience.json": (role_experience, "Persist role experience descriptors for previews."),
         }
-        ensured_operations = list(operations)
+        ensured_operations = [operation for operation in operations if operation.file_path not in required_artifacts]
         for file_path, (payload, reason) in required_artifacts.items():
-            existing = operation_map.get(file_path)
-            if existing is not None and str(existing.content or "").strip():
-                continue
             ensured_operations.append(
                 DraftFileOperation(
                     file_path=file_path,
@@ -4682,16 +4761,12 @@ class GenerationService:
         role_scope: list[str],
         operations: list[DraftFileOperation],
     ) -> list[DraftFileOperation]:
-        operation_map = {operation.file_path: operation for operation in operations}
         required_tests = {
             "miniapp/tests/test_generated_app.py": self._python_app_level_test_content(page_graph=page_graph, role_scope=role_scope),
             "miniapp/tests/generated_app.test.mjs": self._js_app_level_test_content(page_graph=page_graph, role_scope=role_scope),
         }
-        ensured_operations = list(operations)
+        ensured_operations = [operation for operation in operations if operation.file_path not in required_tests]
         for file_path, content in required_tests.items():
-            existing = operation_map.get(file_path)
-            if existing is not None and str(existing.content or "").strip():
-                continue
             ensured_operations.append(
                 DraftFileOperation(
                     file_path=file_path,
@@ -4998,7 +5073,8 @@ class GeneratedMiniAppTests(unittest.TestCase):
         from app.main import app
 
         cls.app = app
-        cls.client = TestClient(app)
+        cls._client_context = TestClient(app)
+        cls.client = cls._client_context.__enter__()
         cls.route_manifest_path = MINIAPP_DIR / "app" / "generated" / "route_manifest.json"
         cls.runtime_manifest_path = MINIAPP_DIR / "app" / "generated" / "runtime_manifest.json"
         cls.grounded_spec_path = MINIAPP_DIR.parent / "artifacts" / "grounded_spec.json"
@@ -5013,6 +5089,12 @@ class GeneratedMiniAppTests(unittest.TestCase):
             if not path or not methods:
                 continue
             cls.registered_routes.add((str(path), next(iter(methods or {{""}}))))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        client_context = getattr(cls, "_client_context", None)
+        if client_context is not None:
+            client_context.__exit__(None, None, None)
 
     def test_generated_manifests_exist(self) -> None:
         self.assertTrue(self.route_manifest_path.exists(), f"Missing {{self.route_manifest_path}}")
@@ -8084,21 +8166,26 @@ test('generated javascript files parse', () => {{
                 route_path = str(route.get("path") or "/").strip() or "/"
                 route_path = "/" if route_path == "/" else f"/{route_path.strip('/')}"
                 if route_path == "/":
-                    page_slug = "home"
+                    file_path = f"miniapp/app/static/{role}/index.html"
+                    style_path = f"miniapp/app/static/{role}/styles.css"
+                    script_path = f"miniapp/app/static/{role}/app.js"
                 else:
                     route_slug = re.sub(r":[^/]+", "detail", route_path.strip("/"))
                     route_slug = route_slug.replace("/", "_").replace("-", "_")
                     route_slug = re.sub(r"[^a-z0-9_]+", "_", route_slug.lower()).strip("_")
                     route_slug = re.sub(r"_+", "_", route_slug)
                     page_slug = route_slug or "page"
+                    file_path = f"miniapp/app/static/{role}/{page_slug}/index.html"
+                    style_path = f"miniapp/app/static/{role}/{page_slug}/styles.css"
+                    script_path = f"miniapp/app/static/{role}/{page_slug}/app.js"
                 screen = ((payload.get("screens") or {}) or {}).get(route.get("screen_id")) or {}
                 pages.append(
                     {
                         "page_id": str(route.get("screen_id") or route.get("route_id") or f"{role}_{len(pages) + 1}"),
                         "route_path": route_path,
-                        "file_path": f"miniapp/app/static/{role}/{page_slug}/index.html",
-                        "style_path": f"miniapp/app/static/{role}/{page_slug}/styles.css",
-                        "script_path": f"miniapp/app/static/{role}/{page_slug}/app.js",
+                        "file_path": file_path,
+                        "style_path": style_path,
+                        "script_path": script_path,
                         "page_kind": str(screen.get("kind") or "page"),
                         "navigation_label": str(route.get("label") or screen.get("title") or "Open"),
                         "title": str(screen.get("title") or route.get("label") or "Page"),

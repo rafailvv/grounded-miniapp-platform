@@ -207,7 +207,8 @@ button:disabled {
 
 .panel-chat > .panel-header,
 .panel-chat > .composer-form,
-.panel-chat > .error {
+.panel-chat > .error,
+.panel-chat > .status-message {
   flex: 0 0 auto;
 }
 
@@ -676,6 +677,14 @@ button:disabled {
   border-radius: 16px;
   background: rgba(188, 75, 75, 0.12);
   color: var(--danger);
+}
+
+.status-message {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: rgba(45, 103, 246, 0.12);
+  color: var(--accent-strong);
 }
 
 .preview-toolbar {

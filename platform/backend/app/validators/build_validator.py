@@ -226,7 +226,9 @@ class BuildValidator:
                             location=file_path_raw,
                         )
                     )
-                if style_path_raw and f"/static/{role}/{Path(style_path_raw).name}" not in content:
+                expected_style_href = self._static_asset_href(style_path_raw)
+                expected_script_src = self._static_asset_href(script_path_raw)
+                if style_path_raw and expected_style_href and expected_style_href not in content:
                     issues.append(
                         ValidationIssue(
                             code="build.page_missing_style_link",
@@ -235,7 +237,7 @@ class BuildValidator:
                             location=file_path_raw,
                         )
                     )
-                if script_path_raw and f"/static/{role}/{Path(script_path_raw).name}" not in content:
+                if script_path_raw and expected_script_src and expected_script_src not in content:
                     issues.append(
                         ValidationIssue(
                             code="build.page_missing_script_link",
@@ -398,7 +400,9 @@ class BuildValidator:
                             location=file_path_raw,
                         )
                     )
-                if style_path_raw and f"/static/{role}/{Path(style_path_raw).name}" not in content:
+                expected_style_href = self._static_asset_href(style_path_raw)
+                expected_script_src = self._static_asset_href(script_path_raw)
+                if style_path_raw and expected_style_href and expected_style_href not in content:
                     issues.append(
                         ValidationIssue(
                             code="build.page_missing_style_link",
@@ -407,7 +411,7 @@ class BuildValidator:
                             location=file_path_raw,
                         )
                     )
-                if script_path_raw and f"/static/{role}/{Path(script_path_raw).name}" not in content:
+                if script_path_raw and expected_script_src and expected_script_src not in content:
                     issues.append(
                         ValidationIssue(
                             code="build.page_missing_script_link",
@@ -452,6 +456,20 @@ class BuildValidator:
                 )
             )
         return issues
+
+    @staticmethod
+    def _static_asset_href(asset_path_raw: str) -> str:
+        normalized = str(asset_path_raw or "").strip().replace("\\", "/")
+        if not normalized:
+            return ""
+        prefix = "miniapp/app/"
+        if normalized.startswith(prefix):
+            return "/" + normalized[len(prefix):]
+        if normalized.startswith("app/"):
+            return "/" + normalized
+        if normalized.startswith("/"):
+            return normalized
+        return "/" + normalized
 
     def _validate_route_module_import_safety(self, workspace_path: Path) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []

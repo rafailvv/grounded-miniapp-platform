@@ -24,7 +24,7 @@ The current baseline is a tri-role app:
 - Home pages are simple role entry screens.
 - Profile pages load and save through the backend profile API.
 - Static files live in `miniapp/app/static`.
-- Shared preview route sync lives in `miniapp/app/static/preview-bridge.js`.
+- Shared preview route sync lives in `miniapp/app/static/preview_bridge.js`.
 
 ## Canonical roots
 

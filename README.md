@@ -209,7 +209,7 @@ Key files:
 - [runtime/templates/base-miniapp/miniapp/app/main.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/main.py)
 - [runtime/templates/base-miniapp/miniapp/app/db.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/db.py)
 - [runtime/templates/base-miniapp/miniapp/app/routes/profiles.py](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/routes/profiles.py)
-- [runtime/templates/base-miniapp/miniapp/app/static/preview-bridge.js](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/static/preview-bridge.js)
+- [runtime/templates/base-miniapp/miniapp/app/static/preview_bridge.js](/Users/rafailvv/PycharmProjects/grounded-miniapp-platform/runtime/templates/base-miniapp/miniapp/app/static/preview_bridge.js)
 
 This was done because the template is the compilation target. If the target template already has real role routing and role pages, the backend and generated artifacts must respect that structure. Otherwise the platform would compile artifacts into a template that expects a different runtime model, which would create an architectural mismatch immediately.
 
@@ -220,7 +220,7 @@ The current template no longer keeps a separate generated frontend application. 
 - `/miniapp/app/static/client/*`
 - `/miniapp/app/static/specialist/*`
 - `/miniapp/app/static/manager/*`
-- one shared preview bridge under `/miniapp/app/static/preview-bridge.js`
+- one shared preview bridge under `/miniapp/app/static/preview_bridge.js`
 
 Key files:
 

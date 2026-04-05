@@ -167,13 +167,19 @@ class CodeIndexService:
             )
         candidate_chunks: list[CodeChunkRecord] = []
         unchanged_reads = 0
+        manifest_payload = self.store.get("reports", f"file_manifest:{workspace_id}") or {}
+        fingerprint_index = {
+            str(item.get("path")): str(item.get("fingerprint"))
+            for item in (manifest_payload.get("files") or [])
+            if isinstance(item, dict) and item.get("path")
+        }
         for relative_path in candidate_paths:
             file_path = source_dir / relative_path
             try:
                 content = file_path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
                 continue
-            unchanged_reads += 1 if self._cached_fingerprint_matches(workspace_id, relative_path, file_path) else 0
+            unchanged_reads += 1 if self._cached_fingerprint_matches(fingerprint_index, relative_path, file_path) else 0
             candidate_chunks.extend(
                 self._chunk_text(
                     workspace_id=workspace_id,
@@ -228,11 +234,11 @@ class CodeIndexService:
 
     def _replace_kind_chunks(self, workspace_id: str, kind: str, chunks: list[CodeChunkRecord]) -> None:
         prefix = f"{kind}:{workspace_id}:"
-        for key, _ in self.store.items("code_chunks"):
-            if key.startswith(prefix):
-                self.store.delete("code_chunks", key)
-        for chunk in chunks:
-            self.store.upsert("code_chunks", f"{kind}:{workspace_id}:{chunk.chunk_id}", chunk.model_dump(mode="json"))
+        payload = {
+            f"{kind}:{workspace_id}:{chunk.chunk_id}": chunk.model_dump(mode="json")
+            for chunk in chunks
+        }
+        self.store.replace_prefixed("code_chunks", prefix, payload)
 
     def _iter_workspace_files(self, source_dir: Path) -> list[Path]:
         ignored_dirs = {
@@ -268,14 +274,9 @@ class CodeIndexService:
             return ""
         return digest.hexdigest()
 
-    def _cached_fingerprint_matches(self, workspace_id: str, relative_path: str, file_path: Path) -> bool:
-        payload = self.store.get("reports", f"file_manifest:{workspace_id}") or {}
-        files = payload.get("files") or []
+    def _cached_fingerprint_matches(self, fingerprint_index: dict[str, str], relative_path: str, file_path: Path) -> bool:
         current = self._file_fingerprint(file_path)
-        for item in files:
-            if item.get("path") == relative_path:
-                return item.get("fingerprint") == current
-        return False
+        return fingerprint_index.get(relative_path) == current
 
     @staticmethod
     def _candidate_cache_key(

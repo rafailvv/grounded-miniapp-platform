@@ -874,6 +874,7 @@ export default function App() {
   const [stoppingRunId, setStoppingRunId] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
   const previewTimeoutsRef = useRef<Record<string, number | undefined>>({});
   const previewFrameRefs = useRef<Record<RoleKey, HTMLIFrameElement | null>>({
     client: null,
@@ -1562,6 +1563,7 @@ export default function App() {
     }
     setLoading(true);
     setError("");
+    setStatusMessage("");
     setPreviewBooting(true);
     try {
       const trimmedPrompt = prompt.trim();
@@ -1591,6 +1593,10 @@ export default function App() {
         model_profile: systemConfig?.default_coding_profile ?? systemConfig?.defaults.model_profile ?? "openai_code_fast",
         generation_mode: effectiveGenerationMode,
       });
+      setPrompt(DEFAULT_PROMPT);
+      if (selectedRunMode === "fix") {
+        setFixErrorContext(null);
+      }
       setRuns((current) => [run, ...current.filter((item) => item.run_id !== run.run_id)]);
       setSelectedRunId(run.run_id);
       setRunArtifacts(null);
@@ -1619,6 +1625,7 @@ export default function App() {
     const handoff = buildFixPrefill(run);
     setLoading(true);
     setError("");
+    setStatusMessage("");
     setPreviewBooting(true);
     try {
       const nextRun = await createRun(workspace.workspace_id, {
@@ -1635,8 +1642,8 @@ export default function App() {
         error_context: handoff.context,
       });
       setSelectedRunMode("fix");
-      setPrompt(handoff.prompt);
-      setFixErrorContext(handoff.context);
+      setPrompt(DEFAULT_PROMPT);
+      setFixErrorContext(null);
       setRuns((current) => [nextRun, ...current.filter((item) => item.run_id !== nextRun.run_id)]);
       setSelectedRunId(nextRun.run_id);
       setRunArtifacts(null);
@@ -1717,7 +1724,9 @@ export default function App() {
             setRunArtifacts(null);
           }
           if (currentRun.status === "completed") {
+            setStatusMessage("Run completed. Automatically rebuilding the full preview.");
             await rebuildWorkspacePreview(workspaceId);
+            setStatusMessage("Run completed. The full preview was rebuilt automatically.");
           }
           return;
         }
@@ -2483,6 +2492,7 @@ export default function App() {
           </form>
 
           {error ? <p className="error">{error}</p> : null}
+          {statusMessage ? <p className="status-message">{statusMessage}</p> : null}
 
           <div className="runs-panel">
             <div className="runs-panel-head">

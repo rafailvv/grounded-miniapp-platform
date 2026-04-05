@@ -44,8 +44,8 @@ class OpenRouterClient:
             "supports_prompt_cache_key": True,
             "mode_profiles": {
                 "fast": "openai_code_fast",
-                "balanced": "research_balanced",
-                "quality": "openai_quality",
+                "balanced": "openai_code_fast",
+                "quality": "openai_code_fast",
             },
         }
 

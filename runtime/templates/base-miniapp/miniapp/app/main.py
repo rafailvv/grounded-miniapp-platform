@@ -34,7 +34,7 @@ def index() -> RedirectResponse:
 def role_page(role: str) -> FileResponse:
     if role not in ROLES:
         raise KeyError(role)
-    return FileResponse(STATIC_DIR / role / "home" / "index.html")
+    return FileResponse(STATIC_DIR / role / "index.html")
 
 
 @app.get("/{role}/profile", include_in_schema=False)

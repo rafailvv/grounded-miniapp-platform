@@ -262,14 +262,14 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
                 "role": "client",
                 "entry_path": "/client",
                 "landing_page_id": "client_home",
-                "routes_file": "miniapp/app/static/client/home/index.html",
+                "routes_file": "miniapp/app/static/client/index.html",
                 "pages": [
                     _page(
                         "client_home",
                         "/client",
                         "Home",
                         "client_index",
-                        "miniapp/app/static/client/home/index.html",
+                        "miniapp/app/static/client/index.html",
                         "Client workspace",
                         "A real role landing page with actions instead of placeholder metrics.",
                     ),
@@ -289,13 +289,13 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
             "summary": "Refine the existing client flow without touching unrelated roles.",
             "flow_mode": "multi_page",
             "files_to_read": [
-                "miniapp/app/static/client/home/index.html",
-                "miniapp/app/static/client/home/styles.css",
+                "miniapp/app/static/client/index.html",
+                "miniapp/app/static/client/styles.css",
             ],
             "target_files": [
-                "miniapp/app/static/client/home/index.html",
-                "miniapp/app/static/client/home/styles.css",
-                "miniapp/app/static/client/home/app.js",
+                "miniapp/app/static/client/index.html",
+                "miniapp/app/static/client/styles.css",
+                "miniapp/app/static/client/app.js",
                 "miniapp/app/static/client/profile/index.html",
                 "miniapp/app/static/client/profile/styles.css",
                 "miniapp/app/static/client/profile/app.js",
@@ -312,20 +312,20 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
 
     templates = {
         "client": [
-            _page("client_home", "/client", "Home", "client_index", "miniapp/app/static/client/home/index.html", "Booking home", "Entry page with clear shopper actions."),
+            _page("client_home", "/client", "Home", "client_index", "miniapp/app/static/client/index.html", "Booking home", "Entry page with clear shopper actions."),
             _page("client_catalog", "/client/catalog", "Catalog", "client_catalog", "miniapp/app/static/client/catalog/index.html", "Catalog", "Browse the current flower assortment."),
             _page("client_product", "/client/product", "Product", "client_product", "miniapp/app/static/client/product/index.html", "Product details", "Inspect one product in detail."),
             _page("client_cart", "/client/cart", "Cart", "client_cart", "miniapp/app/static/client/cart/index.html", "Cart", "Review selected products and place the order."),
             _page("client_profile", "/client/profile", "Profile", "client_profile", "miniapp/app/static/client/profile/index.html", "Profile", "Profile editing page."),
         ],
         "specialist": [
-            _page("specialist_home", "/specialist", "Desk", "specialist_index", "miniapp/app/static/specialist/home/index.html", "Operations desk", "Entry page for active work."),
+            _page("specialist_home", "/specialist", "Desk", "specialist_index", "miniapp/app/static/specialist/index.html", "Operations desk", "Entry page for active work."),
             _page("specialist_orders", "/specialist/orders", "Orders", "specialist_orders", "miniapp/app/static/specialist/orders/index.html", "Orders", "Review incoming customer orders."),
             _page("specialist_order_detail", "/specialist/order-detail", "Order detail", "specialist_order_detail", "miniapp/app/static/specialist/order_detail/index.html", "Order detail", "Inspect a single order and update its status."),
             _page("specialist_profile", "/specialist/profile", "Profile", "specialist_profile", "miniapp/app/static/specialist/profile/index.html", "Profile", "Profile editing page."),
         ],
         "manager": [
-            _page("manager_home", "/manager", "Overview", "manager_index", "miniapp/app/static/manager/home/index.html", "Operations overview", "Landing page with attention points."),
+            _page("manager_home", "/manager", "Overview", "manager_index", "miniapp/app/static/manager/index.html", "Operations overview", "Landing page with attention points."),
             _page("manager_catalog", "/manager/catalog", "Catalog", "manager_catalog", "miniapp/app/static/manager/catalog/index.html", "Catalog management", "Review and manage the product catalog."),
             _page("manager_orders", "/manager/orders", "Orders", "manager_orders", "miniapp/app/static/manager/orders/index.html", "Orders overview", "Inspect current order volume and statuses."),
             _page("manager_profile", "/manager/profile", "Profile", "manager_profile", "miniapp/app/static/manager/profile/index.html", "Profile", "Profile editing page."),
@@ -340,7 +340,7 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
                 "role": role,
                 "entry_path": f"/{role}",
                 "landing_page_id": role_pages[0]["page_id"],
-                "routes_file": f"miniapp/app/static/{role}/home/index.html",
+                "routes_file": f"miniapp/app/routes/{role}.py",
                 "pages": role_pages,
             }
         )
@@ -351,8 +351,8 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
         "summary": "Create a role-based booking workspace with custom static pages served by the miniapp.",
         "flow_mode": "multi_page",
         "files_to_read": [
-            "miniapp/app/static/client/home/index.html",
-            "miniapp/app/static/client/home/styles.css",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/styles.css",
         ],
         "target_files": target_files,
         "shared_files": [
@@ -371,7 +371,7 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
 
 
 def _page(page_id: str, route_path: str, navigation_label: str, component_name: str, file_path: str, title: str, description: str) -> dict:
-    dynamic_dependencies = ["records"] if any(token in route_path for token in ("/catalog", "/product", "/cart", "/orders", "/order-detail")) else []
+    dynamic_dependencies: list[str] = []
     return {
         "page_id": page_id,
         "route_path": route_path,
@@ -413,7 +413,23 @@ def _page_file_payload(payload: dict) -> dict:
     title = str(page.get("title") or page.get("navigation_label") or default_title)
     description = str(page.get("description") or page.get("purpose") or default_description)
     profile_link = f"/{role}/profile"
-    card_href = profile_link if page["route_path"] == f"/{role}" else f"/{role}"
+    is_role_root_page = page["route_path"] in {"/", f"/{role}"}
+    card_href = profile_link if is_role_root_page else f"/{role}"
+    root_profile_card = ""
+    if is_role_root_page:
+        root_profile_card = f"""
+        <a class="card-link" href="{profile_link}" aria-label="Open {role} profile">
+          <article class="card">
+            <div class="avatar-wrap" id="profile-avatar"></div>
+            <div class="info">
+              <span class="caption">Personal workspace</span>
+              <strong class="name" id="profile-name"></strong>
+              <span class="role">{role.title()}</span>
+            </div>
+            <span class="chevron" aria-hidden="true">›</span>
+          </article>
+        </a>
+"""
     has_dynamic_data = bool(page.get("data_dependencies"))
     dynamic_block = ""
     if has_dynamic_data:
@@ -435,6 +451,7 @@ def _page_file_payload(payload: dict) -> dict:
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{title}</title>
+    <link rel="stylesheet" href="/static/shared/base.css" />
     <link rel="stylesheet" href="/{page['style_path'].removeprefix('miniapp/app/')}" />
   </head>
   <body>
@@ -443,6 +460,7 @@ def _page_file_payload(payload: dict) -> dict:
         <header class="header">
           <h1 class="title">{title}</h1>
         </header>
+{root_profile_card}
         <section class="feature-block">
           <div class="feature-content">
             <span class="feature-title">{description}</span>
@@ -478,7 +496,7 @@ def _composition_payload(payload: dict) -> dict:
             {
                 "file_path": "miniapp/app/main.py",
                 "operation": "replace",
-                "content": """from pathlib import Path\n\nfrom fastapi import FastAPI\nfrom fastapi.responses import FileResponse, JSONResponse, RedirectResponse\nfrom fastapi.staticfiles import StaticFiles\n\nfrom app.db import Base, engine\nfrom app.routes.health import router as health_router\nfrom app.routes.profiles import router as profiles_router\n\nSTATIC_DIR = Path(__file__).resolve().parent / 'static'\nROLES = ('client', 'specialist', 'manager')\n\napp = FastAPI()\napp.include_router(health_router)\napp.include_router(profiles_router)\napp.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')\n\n@app.on_event('startup')\ndef startup() -> None:\n    Base.metadata.create_all(bind=engine)\n\n@app.get('/')\ndef index() -> RedirectResponse:\n    return RedirectResponse('/client', status_code=307)\n\n@app.get('/{role}')\ndef role_page(role: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    return FileResponse(STATIC_DIR / role / 'home' / 'index.html')\n\n@app.get('/{role}/profile')\ndef role_profile(role: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    return FileResponse(STATIC_DIR / role / 'profile' / 'index.html')\n\n@app.get('/{role}/{page_slug}')\ndef role_subpage(role: str, page_slug: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    page_path = STATIC_DIR / role / page_slug / 'index.html'\n    if not page_path.exists():\n        raise KeyError(f'{role}/{page_slug}')\n    return FileResponse(page_path)\n\n@app.exception_handler(KeyError)\ndef key_error_handler(_, exc: KeyError) -> JSONResponse:\n    return JSONResponse(status_code=404, content={'detail': str(exc)})\n""",
+                "content": """from pathlib import Path\n\nfrom fastapi import FastAPI\nfrom fastapi.responses import FileResponse, JSONResponse, RedirectResponse\nfrom fastapi.staticfiles import StaticFiles\n\nfrom app.db import Base, engine\nfrom app.routes.health import router as health_router\nfrom app.routes.profiles import router as profiles_router\n\nSTATIC_DIR = Path(__file__).resolve().parent / 'static'\nROLES = ('client', 'specialist', 'manager')\n\napp = FastAPI()\napp.include_router(health_router)\napp.include_router(profiles_router)\napp.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')\n\n@app.on_event('startup')\ndef startup() -> None:\n    Base.metadata.create_all(bind=engine)\n\n@app.get('/')\ndef index() -> RedirectResponse:\n    return RedirectResponse('/client', status_code=307)\n\n@app.get('/{role}')\ndef role_page(role: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    return FileResponse(STATIC_DIR / role / 'index.html')\n\n@app.get('/{role}/profile')\ndef role_profile(role: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    return FileResponse(STATIC_DIR / role / 'profile' / 'index.html')\n\n@app.get('/{role}/{page_slug}')\ndef role_subpage(role: str, page_slug: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    page_path = STATIC_DIR / role / page_slug / 'index.html'\n    if not page_path.exists():\n        raise KeyError(f'{role}/{page_slug}')\n    return FileResponse(page_path)\n\n@app.exception_handler(KeyError)\ndef key_error_handler(_, exc: KeyError) -> JSONResponse:\n    return JSONResponse(status_code=404, content={'detail': str(exc)})\n""",
                 "reason": "Provide the miniapp-served static entrypoint.",
             }
         )
@@ -507,6 +525,7 @@ def _composition_payload(payload: dict) -> dict:
             style_path = page.get("style_path")
             script_path = page.get("script_path")
             page_kind = page.get("kind") or page.get("page_kind")
+            is_role_root_page = page.get("route_path") in {"/", f"/{role}"}
             if style_path in target_files:
                 operations.append(
                     {
@@ -519,8 +538,10 @@ def _composition_payload(payload: dict) -> dict:
             if script_path in target_files:
                 if page_kind == "profile":
                     script_content = f"const role = '{role}'; const form = document.getElementById('profile-form'); const saveButton = document.getElementById('save-button'); let currentPhotoUrl = null; fetch(`/api/profiles/${{role}}`).then((response) => response.json()).then((profile) => {{ currentPhotoUrl = profile.photo_url; form.elements.first_name.value = profile.first_name || ''; form.elements.last_name.value = profile.last_name || ''; form.elements.email.value = profile.email || ''; form.elements.phone.value = profile.phone || ''; document.getElementById('preview-name').textContent = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Ivan Ivanov'; }}); form.addEventListener('submit', async (event) => {{ event.preventDefault(); document.getElementById('email-error').textContent = ''; document.getElementById('phone-error').textContent = ''; const payload = {{ first_name: form.elements.first_name.value.trim(), last_name: form.elements.last_name.value.trim(), email: form.elements.email.value.trim(), phone: form.elements.phone.value.trim(), photo_url: currentPhotoUrl }}; if (!payload.email) {{ document.getElementById('email-error').textContent = 'Enter an email address'; return; }} if (!payload.phone) {{ document.getElementById('phone-error').textContent = 'Enter a phone number'; return; }} saveButton.textContent = 'Saving...'; const response = await fetch(`/api/profiles/${{role}}`, {{ method: 'PUT', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify(payload) }}); const profile = await response.json(); document.getElementById('preview-name').textContent = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Ivan Ivanov'; saveButton.textContent = 'Saved'; setTimeout(() => {{ saveButton.textContent = 'Save'; }}, 1200); }});\n"
-                else:
+                elif is_role_root_page:
                     script_content = f"const role = '{role}';\nfetch(`/api/profiles/${{role}}`).then((response) => response.json()).then((profile) => {{ const name = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Ivan Ivanov'; const nameNode = document.getElementById('profile-name'); const avatarNode = document.getElementById('profile-avatar'); if (nameNode) nameNode.textContent = name; if (avatarNode) avatarNode.innerHTML = profile.photo_url ? `<img class=\"avatar\" src=\"${{profile.photo_url}}\" alt=\"\" />` : '<div class=\"avatar-fallback\">II</div>'; }});\n"
+                else:
+                    script_content = f"const role = '{role}';\nconsole.log(`loaded ${{role}} page`);\n"
                 operations.append(
                     {
                         "file_path": script_path,
@@ -724,7 +745,7 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     assert all(not item["path"].endswith(".tsbuildinfo") for item in file_tree)
     assert any(item["path"] == "artifacts/grounded_spec.json" for item in draft_tree)
     assert any(item["path"] == "artifacts/generated_app_graph.json" for item in draft_tree)
-    assert "miniapp/app/static/client/home/index.html" in draft_diff
+    assert "miniapp/app/static/client/index.html" in draft_diff
     assert "miniapp/app/static/client/catalog/index.html" in draft_diff
     assert "generated_app_graph.json" in draft_diff
 

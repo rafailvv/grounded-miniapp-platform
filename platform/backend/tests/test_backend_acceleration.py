@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import app.services.check_runner as check_runner_module
 from fastapi.testclient import TestClient
 
+from app.ai.model_registry import TASK_PROFILES
 from app.ai.openrouter_client import OpenRouterClient
 from app.main import create_app
 from app.models.common import PreviewProfile, TargetPlatform
@@ -336,9 +337,9 @@ def test_generated_app_tests_cover_shell_styles_dom_contracts_and_local_routes(t
                     {
                         "page_id": "client_home",
                         "route_path": "/client",
-                        "file_path": "miniapp/app/static/client/home/index.html",
-                        "style_path": "miniapp/app/static/client/home/index.css",
-                        "script_path": "miniapp/app/static/client/home/index.js",
+                        "file_path": "miniapp/app/static/client/index.html",
+                        "style_path": "miniapp/app/static/client/styles.css",
+                        "script_path": "miniapp/app/static/client/app.js",
                         "title": "Client Home",
                     }
                 ]
@@ -357,6 +358,61 @@ def test_generated_app_tests_cover_shell_styles_dom_contracts_and_local_routes(t
     assert "extractJsDomIds" in js_test
     assert "page-local navigation targets resolve to declared routes" in js_test
     assert "grounded workflow roles map to declared page surfaces" in js_test
+    assert "cls._client_context = TestClient(app)" in python_test
+    assert "client_context.__exit__(None, None, None)" in python_test
+
+
+def test_runtime_artifacts_overwrite_noncanonical_generated_manifest(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    generation_service = app.state.container.generation_service
+    spec = generation_service._build_grounded_spec(
+        workspace_id="ws_manifest_overwrite",
+        prompt="Build a minimal workflow app with client, specialist, and manager roles.",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        doc_refs=[],
+        template_revision_id="rev_test",
+        prompt_turn_id="turn_test",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    page_graph = {
+        "roles": {
+            "client": {
+                "pages": [
+                    {
+                        "page_id": "client_home",
+                        "route_path": "/client",
+                        "file_path": "miniapp/app/static/client/index.html",
+                        "style_path": "miniapp/app/static/client/styles.css",
+                        "script_path": "miniapp/app/static/client/app.js",
+                        "title": "Client Home",
+                        "is_entry": True,
+                    }
+                ]
+            }
+        }
+    }
+
+    ensured = generation_service._ensure_runtime_artifact_operations(
+        grounded_spec=spec,
+        page_graph=page_graph,
+        role_scope=["client"],
+        generation_mode=GenerationMode.BALANCED,
+        operations=[
+            DraftFileOperation(
+                file_path="miniapp/app/generated/route_manifest.json",
+                operation="replace",
+                content=json.dumps({"routes": [{"path": "/client", "file": "static/client/index.html"}]}),
+                reason="stale llm artifact",
+            )
+        ],
+    )
+
+    route_manifest = next(operation for operation in ensured if operation.file_path == "miniapp/app/generated/route_manifest.json")
+    payload = json.loads(route_manifest.content or "{}")
+    assert "roles" in payload
+    assert "routes" not in payload
 
 
 def test_codegen_prompts_require_db_and_schemas_for_stateful_apps(tmp_path: Path) -> None:
@@ -723,6 +779,84 @@ def test_generated_paths_use_underscores_for_static_and_route_files() -> None:
     assert all("-" not in Path(path).name for path in normalized)
 
 
+def test_canonicalize_target_files_drops_flat_role_entries_and_template_owned_bridge(tmp_path: Path) -> None:
+    service = create_app(
+        repo_root=Path(__file__).resolve().parents[3],
+        data_dir=tmp_path / "data",
+    ).state.container.generation_service
+
+    canonical = service._canonicalize_target_files(
+        [
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/styles.css",
+            "miniapp/app/static/preview_bridge.js",
+        ],
+        scope_mode="whole_file_build",
+    )
+
+    assert "miniapp/app/static/client/index.html" in canonical
+    assert "miniapp/app/static/preview_bridge.js" not in canonical
+    assert "miniapp/app/static/client/styles.css" in canonical
+
+
+def test_landing_alias_paths_are_canonicalized_to_role_root() -> None:
+    normalized = GenerationService._normalize_path_list(
+        [
+            "miniapp/app/static/client/client_home/index.html",
+            "miniapp/app/static/client/home/styles.css",
+            "miniapp/app/static/manager/manager_home/app.js",
+        ],
+        [],
+    )
+
+    assert normalized == [
+        "miniapp/app/static/client/index.html",
+        "miniapp/app/static/client/styles.css",
+        "miniapp/app/static/manager/app.js",
+    ]
+
+
+def test_page_graph_gate_normalizes_role_prefixed_entry_routes() -> None:
+    page_graph = {
+        "roles": {
+            "client": {
+                "routes_file": "miniapp/app/routes/client.py",
+                "pages": [
+                    {
+                        "page_id": "client_home",
+                        "route_path": "/client",
+                        "file_path": "miniapp/app/static/client/client_home/index.html",
+                        "page_kind": "dashboard",
+                        "handoff_paths": ["/client/profile"],
+                        "purpose": "Client dashboard for starting request work.",
+                    },
+                    {
+                        "page_id": "client_profile",
+                        "route_path": "/client/profile",
+                        "file_path": "miniapp/app/static/client/profile/index.html",
+                        "page_kind": "profile",
+                        "handoff_paths": ["/client"],
+                        "purpose": "Client profile editing page.",
+                    },
+                ],
+            }
+        },
+        "shared_files": [],
+        "backend_targets": [],
+    }
+
+    issues = GenerationService._page_graph_gate_issues(
+        page_graph,
+        ["client"],
+        scope_mode="whole_file_build",
+        require_multi_page=True,
+        require_business_pages=False,
+    )
+
+    assert "client is missing an entry route at /." not in issues
+
+
 def test_default_page_file_uses_snake_case_names() -> None:
     assert (
         GenerationService._default_page_file("client", "ClientRequestNewPage", route_path="/request-new")
@@ -739,6 +873,14 @@ def test_default_page_file_uses_snake_case_names() -> None:
 
 
 def test_default_page_asset_paths_follow_page_stem() -> None:
+    assert GenerationService._default_page_asset_path(
+        "miniapp/app/static/client/index.html",
+        asset_kind="css",
+    ) == "miniapp/app/static/client/styles.css"
+    assert GenerationService._default_page_asset_path(
+        "miniapp/app/static/client/index.html",
+        asset_kind="js",
+    ) == "miniapp/app/static/client/app.js"
     assert GenerationService._default_page_asset_path(
         "miniapp/app/static/client/request_new/index.html",
         asset_kind="css",
@@ -771,20 +913,78 @@ def test_route_manifest_uses_snake_case_file_names() -> None:
 
     pages = manifest["roles"]["manager"]["pages"]
     assert [page["file_path"] for page in pages] == [
-        "miniapp/app/static/manager/home/index.html",
+        "miniapp/app/static/manager/index.html",
         "miniapp/app/static/manager/workload_board/index.html",
         "miniapp/app/static/manager/requests_detail/index.html",
     ]
     assert [page["style_path"] for page in pages] == [
-        "miniapp/app/static/manager/home/styles.css",
+        "miniapp/app/static/manager/styles.css",
         "miniapp/app/static/manager/workload_board/styles.css",
         "miniapp/app/static/manager/requests_detail/styles.css",
     ]
     assert [page["script_path"] for page in pages] == [
-        "miniapp/app/static/manager/home/app.js",
+        "miniapp/app/static/manager/app.js",
         "miniapp/app/static/manager/workload_board/app.js",
         "miniapp/app/static/manager/requests_detail/app.js",
     ]
+
+
+def test_normalize_generated_file_path_canonicalizes_flat_role_pages_to_page_folders() -> None:
+    assert (
+        GenerationService._normalize_generated_file_path("miniapp/app/static/client/request_detail.html")
+        == "miniapp/app/static/client/request_detail/index.html"
+    )
+    assert (
+        GenerationService._normalize_generated_file_path("miniapp/app/static/client/request_detail.css")
+        == "miniapp/app/static/client/request_detail/styles.css"
+    )
+    assert (
+        GenerationService._normalize_generated_file_path("miniapp/app/static/client/request_detail.js")
+        == "miniapp/app/static/client/request_detail/app.js"
+    )
+    assert (
+        GenerationService._normalize_generated_file_path("miniapp/app/static/client/index.css")
+        == "miniapp/app/static/client/styles.css"
+    )
+    assert (
+        GenerationService._normalize_generated_file_path("miniapp/app/static/client/index.js")
+        == "miniapp/app/static/client/app.js"
+    )
+    assert (
+        GenerationService._normalize_generated_file_path("miniapp/app/static/client/app.js")
+        == "miniapp/app/static/client/app.js"
+    )
+    assert (
+        GenerationService._normalize_generated_file_path("miniapp/app/static/client/app.css")
+        == "miniapp/app/static/client/styles.css"
+    )
+    assert (
+        GenerationService._normalize_generated_file_path("miniapp/app/static/client/styles.css")
+        == "miniapp/app/static/client/styles.css"
+    )
+    assert (
+        GenerationService._normalize_generated_file_path("miniapp/app/static/client/styles.js")
+        == "miniapp/app/static/client/app.js"
+    )
+
+
+def test_non_root_page_file_path_is_rewritten_when_model_returns_js_path(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+    page = service._normalize_page_definition(
+        "client",
+        {
+            "page_id": "client_requests",
+            "route_path": "/requests",
+            "file_path": "miniapp/app/static/client/app.js",
+            "title": "Requests",
+        },
+        1,
+    )
+    assert page["file_path"] == "miniapp/app/static/client/requests/index.html"
+    assert page["style_path"] == "miniapp/app/static/client/requests/styles.css"
+    assert page["script_path"] == "miniapp/app/static/client/requests/app.js"
 
 
 def test_plan_expands_page_triplet_targets() -> None:
@@ -798,7 +998,7 @@ def test_plan_expands_page_triplet_targets() -> None:
                         {
                             "page_id": "client_home",
                             "route_path": "/client",
-                            "file_path": "miniapp/app/static/client/home/index.html",
+                            "file_path": "miniapp/app/static/client/index.html",
                         }
                     ]
                 }
@@ -808,10 +1008,10 @@ def test_plan_expands_page_triplet_targets() -> None:
 
     GenerationService._expand_page_asset_targets_in_plan(plan_result)
 
-    assert plan_result["page_graph"]["roles"]["client"]["pages"][0]["style_path"] == "miniapp/app/static/client/home/styles.css"
-    assert plan_result["page_graph"]["roles"]["client"]["pages"][0]["script_path"] == "miniapp/app/static/client/home/app.js"
-    assert "miniapp/app/static/client/home/styles.css" in plan_result["target_files"]
-    assert "miniapp/app/static/client/home/app.js" in plan_result["target_files"]
+    assert plan_result["page_graph"]["roles"]["client"]["pages"][0]["style_path"] == "miniapp/app/static/client/styles.css"
+    assert plan_result["page_graph"]["roles"]["client"]["pages"][0]["script_path"] == "miniapp/app/static/client/app.js"
+    assert "miniapp/app/static/client/styles.css" in plan_result["target_files"]
+    assert "miniapp/app/static/client/app.js" in plan_result["target_files"]
 
 
 def test_whole_file_cluster_safe_companion_expansion_is_role_local_only() -> None:
@@ -838,7 +1038,7 @@ def test_whole_file_cluster_safe_companion_expansion_is_role_local_only() -> Non
 def test_app_level_test_operations_are_synthesized() -> None:
     page_graph = {
         "backend_targets": ["miniapp/app/routes/time-slots.py", "miniapp/app/routes/requests.py"],
-        "shared_files": ["miniapp/app/static/preview-bridge.js"],
+        "shared_files": ["miniapp/app/static/preview_bridge.js"],
         "roles": {
             role: {
                 "pages": [
@@ -3721,6 +3921,16 @@ def test_mode_profiles_differentiate_fast_balanced_and_quality() -> None:
     assert fast.compact_aggressiveness == "high"
     assert balanced.verification_depth == "balanced"
     assert quality.verification_depth == "deep"
+
+
+def test_task_profiles_use_mini_models_only() -> None:
+    for profile in TASK_PROFILES.values():
+        routing = profile["routing"]
+        assert routing["spec_analysis"] == "gpt-5-mini"
+        assert routing["code_plan"] == "gpt-5-mini"
+        assert routing["ir_codegen"] == "gpt-5.1-codex-mini"
+        assert routing["code_edit"] == "gpt-5.1-codex-mini"
+        assert routing["repair"] == "gpt-5.1-codex-mini"
 
 
 def test_context_pack_builder_applies_mode_budget_and_prompt_fingerprint(tmp_path: Path) -> None:

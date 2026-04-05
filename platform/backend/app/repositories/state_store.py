@@ -65,8 +65,27 @@ class StateStore:
             state.setdefault(collection, {})[key] = value
             self._write(state)
 
+    def upsert_many(self, collection: str, values: dict[str, dict[str, Any]]) -> None:
+        if not values:
+            return
+        with self.lock:
+            state = self._read()
+            bucket = state.setdefault(collection, {})
+            bucket.update(values)
+            self._write(state)
+
     def delete(self, collection: str, key: str) -> None:
         with self.lock:
             state = self._read()
             state.setdefault(collection, {}).pop(key, None)
+            self._write(state)
+
+    def replace_prefixed(self, collection: str, prefix: str, values: dict[str, dict[str, Any]]) -> None:
+        with self.lock:
+            state = self._read()
+            bucket = state.setdefault(collection, {})
+            keys_to_delete = [key for key in bucket if key.startswith(prefix)]
+            for key in keys_to_delete:
+                bucket.pop(key, None)
+            bucket.update(values)
             self._write(state)
