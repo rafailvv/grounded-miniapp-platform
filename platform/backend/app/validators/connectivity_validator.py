@@ -89,7 +89,8 @@ class ConnectivityValidator:
                     )
 
                 lowered_surface = surface_content.lower()
-                if not any(marker in lowered_surface for marker in UI_WIRING_MARKERS):
+                has_dynamic_runtime_wiring = bool(api_refs) or any(marker in lowered_surface for marker in UI_WIRING_MARKERS)
+                if not has_dynamic_runtime_wiring:
                     issues.append(
                         ValidationIssue(
                             code="connectivity.unwired_page_dependency",
@@ -100,7 +101,7 @@ class ConnectivityValidator:
                     )
 
                 loading_state = str(page.get("loading_state") or "").strip()
-                if loading_state and not self._contains_state(lowered_surface, loading_state, state_kind="loading"):
+                if loading_state and has_dynamic_runtime_wiring and not self._contains_state(lowered_surface, loading_state, state_kind="loading"):
                     issues.append(
                         ValidationIssue(
                             code="connectivity.missing_ui_loading_state",
@@ -111,7 +112,7 @@ class ConnectivityValidator:
                     )
 
                 error_state = str(page.get("error_state") or "").strip()
-                if error_state and not self._contains_state(lowered_surface, error_state, state_kind="error"):
+                if error_state and has_dynamic_runtime_wiring and not self._contains_state(lowered_surface, error_state, state_kind="error"):
                     issues.append(
                         ValidationIssue(
                             code="connectivity.missing_ui_error_state",

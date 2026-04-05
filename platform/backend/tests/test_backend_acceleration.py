@@ -15,6 +15,7 @@ from app.ai.openrouter_client import OpenRouterClient
 from app.main import create_app
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RunCheckResult, ValidationSnapshot, WorkspaceRecord
 from app.services.code_index_service import CodeIndexService
+from app.services.engine.mode_profiles import ModeProfiles
 from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES
 from app.validators.build_validator import BuildValidator
 
@@ -2750,3 +2751,255 @@ def test_run_fails_when_draft_has_only_auxiliary_changes(tmp_path: Path) -> None
     assert not preview_called.is_set()
     assert not (source_root / "frontend" / "vite.config.js").exists()
     assert not (source_root / "frontend" / "vite.config.d.ts").exists()
+
+
+def test_mode_profiles_differentiate_fast_balanced_and_quality() -> None:
+    fast = ModeProfiles.resolve(GenerationMode.FAST)
+    balanced = ModeProfiles.resolve(GenerationMode.BALANCED)
+    quality = ModeProfiles.resolve(GenerationMode.QUALITY)
+
+    assert fast.targeted_file_limit < balanced.targeted_file_limit < quality.targeted_file_limit
+    assert fast.edit_iteration_limit < balanced.edit_iteration_limit < quality.edit_iteration_limit
+    assert fast.repair_attempt_limit < balanced.repair_attempt_limit < quality.repair_attempt_limit
+    assert fast.compact_aggressiveness == "high"
+    assert balanced.verification_depth == "balanced"
+    assert quality.verification_depth == "deep"
+
+
+def test_context_pack_builder_applies_mode_budget_and_prompt_fingerprint(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    workspace_service = app.state.container.workspace_service
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Budget Workspace",
+            description="Context budgets should differ by mode.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_budget").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    draft_run_id = "run_budget"
+    workspace_service.ensure_draft(workspace.workspace_id, draft_run_id)
+    target_files = [f"miniapp/app/static/client/{name}" for name in ["index.html", "workbench.html", "workspace.html", "profile.html"]]
+
+    fast_pack = app.state.container.context_pack_builder.build(
+        workspace=workspace_service.get_workspace(workspace.workspace_id),
+        prompt="Create a fast flower shop app",
+        model_profile="openai_code_fast",
+        generation_mode=GenerationMode.FAST,
+        target_files=target_files,
+        run_id=draft_run_id,
+    )
+    quality_pack = app.state.container.context_pack_builder.build(
+        workspace=workspace_service.get_workspace(workspace.workspace_id),
+        prompt="Create a quality flower shop app",
+        model_profile="openai_code_fast",
+        generation_mode=GenerationMode.QUALITY,
+        target_files=target_files,
+        run_id=draft_run_id,
+    )
+
+    assert fast_pack.retrieval_stats["budget"]["verification_depth"] == "fast"
+    assert quality_pack.retrieval_stats["budget"]["verification_depth"] == "deep"
+    assert fast_pack.retrieval_stats["mode_profile"]["targeted_file_limit"] < quality_pack.retrieval_stats["mode_profile"]["targeted_file_limit"]
+    assert "combined_hash" in fast_pack.retrieval_stats["prompt_fingerprint"]
+
+
+def test_code_index_retrieval_records_candidate_cache_hits(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Retrieval Cache Workspace",
+            "description": "Candidate path ranking should be cached per prompt and revision.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    client.post(f"/workspaces/{workspace_id}/clone-template")
+    client.post(
+        f"/workspaces/{workspace_id}/files/save",
+        json={
+            "relative_path": "miniapp/app/routes/order_queue.py",
+            "content": "def order_queue_status(order_id: str) -> str:\n    return f'queued:{order_id}'\n",
+        },
+    )
+    client.post(f"/workspaces/{workspace_id}/index")
+
+    code_index: CodeIndexService = app.state.container.code_index_service
+    first = code_index.retrieve(
+        workspace_id=workspace_id,
+        prompt="Inspect the order queue status route",
+        code_limit=4,
+    )
+    second = code_index.retrieve(
+        workspace_id=workspace_id,
+        prompt="Inspect the order queue status route",
+        code_limit=4,
+    )
+
+    assert first["stats"]["candidate_cache_hit"] is False
+    assert second["stats"]["candidate_cache_hit"] is True
+
+
+def test_run_artifacts_expose_engine_diagnostics_reports(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    _install_llm_stub(app)
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Engine Artifacts Workspace",
+            "description": "Engine diagnostics should flow through run artifacts.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    client.post(f"/workspaces/{workspace_id}/clone-template")
+
+    response = client.post(
+        f"/workspaces/{workspace_id}/generate",
+        json={
+            "prompt": "Create a flower shop mini app with clear manager oversight and specialist workflow.",
+            "mode": "generate",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+            "generation_mode": "balanced",
+            "intent": "create",
+            "target_role_scope": ["client", "specialist", "manager"],
+            "model_profile": "openai_code_fast",
+        },
+    )
+    assert response.status_code == 200
+    job = response.json()
+    run_id = job["linked_run_id"]
+
+    artifacts = client.get(f"/runs/{run_id}/artifacts").json()
+
+    assert artifacts["context_budget"]["budget"]["verification_depth"] == "balanced"
+    assert "combined_hash" in artifacts["prompt_fingerprint"]
+    assert artifacts["mode_profile_snapshot"]["generation_mode"] == "balanced"
+    assert isinstance(artifacts["phase_metrics"]["items"], list)
+    assert isinstance(artifacts["engine_trace"]["entries"], list)
+
+
+def test_session_engine_persists_workspace_session_costs_and_project_memory(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    engine = app.state.container.session_engine
+
+    payload = engine.record_run_summary(
+        workspace_id="ws_costs",
+        run_id="run_cost_1",
+        prompt="Build a flower ordering app with delivery tracking.",
+        run_mode="generate",
+        generation_mode="balanced",
+        status="completed",
+        model_profile="openai_code_fast",
+        llm_model="openai/test-model",
+        cache_stats={
+            "llm_requests": 3,
+            "input_tokens": 1200,
+            "output_tokens": 350,
+            "total_tokens": 1550,
+            "reasoning_tokens": 90,
+            "cached_tokens": 800,
+            "cache_write_tokens": 220,
+            "estimated_cost_usd": 0.031,
+        },
+        latency_breakdown={"total_ms": 4200},
+        summary="Generated a delivery-aware flower ordering flow and preserved role routing.",
+        files=["miniapp/app/static/client/app.js", "miniapp/app/main.py"],
+        failure_class=None,
+    )
+
+    session_costs = payload["session_costs"]
+    assert session_costs["totals"]["run_count"] == 1
+    assert session_costs["totals"]["input_tokens"] == 1200
+    assert session_costs["totals"]["cached_tokens"] == 800
+    assert session_costs["totals"]["cache_hit_ratio"] > 0
+
+    memory_context = engine.select_project_memory(
+        workspace_id="ws_costs",
+        prompt="Improve delivery tracking in the flower ordering app.",
+        generation_mode="balanced",
+        run_mode="generate",
+    )
+    assert memory_context["selected_count"] >= 1
+    assert "flower" in memory_context["summary"].lower()
+
+
+def test_session_engine_selects_fix_memory_with_failure_bias(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    engine = app.state.container.session_engine
+
+    engine.record_run_summary(
+        workspace_id="ws_memory",
+        run_id="run_mem_1",
+        prompt="Fix broken avatar helper wiring in client profile.",
+        run_mode="fix",
+        generation_mode="balanced",
+        status="failed",
+        model_profile="openai_code_fast",
+        llm_model="openai/test-model",
+        cache_stats={"llm_requests": 1, "input_tokens": 220, "output_tokens": 40, "total_tokens": 260},
+        latency_breakdown={"fix_total_ms": 900},
+        summary="Broken avatar helper names in client and manager profile scripts caused static validation failures.",
+        files=["miniapp/app/static/client/app.js", "miniapp/app/static/manager/app.js"],
+        failure_class="frontend_compile/type/import",
+    )
+
+    selected = engine.select_project_memory(
+        workspace_id="ws_memory",
+        prompt="Repair avatar helper import failures in the profile scripts.",
+        generation_mode="balanced",
+        run_mode="fix",
+    )
+    assert selected["selected_count"] == 1
+    assert "avatar" in selected["summary"].lower()
+
+
+def test_diminishing_returns_service_stops_after_repeated_low_signal_iterations(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    engine = app.state.container.session_engine
+
+    first = engine.should_stop_for_diminishing_returns(
+        workspace_id="ws_diminishing",
+        run_id="run_dim_1",
+        phase="fix_repair",
+        generation_mode="balanced",
+        metrics={
+            "attempt": 1,
+            "changed_files_count": 1,
+            "diff_chars": 80,
+            "failure_signature": "same:error",
+            "total_tokens": 2000,
+        },
+    )
+    second = engine.should_stop_for_diminishing_returns(
+        workspace_id="ws_diminishing",
+        run_id="run_dim_1",
+        phase="fix_repair",
+        generation_mode="balanced",
+        metrics={
+            "attempt": 2,
+            "changed_files_count": 1,
+            "diff_chars": 70,
+            "failure_signature": "same:error",
+            "total_tokens": 2200,
+        },
+    )
+
+    assert first["should_stop"] is False
+    assert second["should_stop"] is True
+    report = app.state.container.generation_service.current_report("ws_diminishing", "diminishing_returns")
+    assert report["items"]

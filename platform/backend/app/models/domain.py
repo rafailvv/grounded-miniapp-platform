@@ -165,6 +165,8 @@ class JobRecord(StrictModel):
     llm_provider: str | None = None
     llm_model: str | None = None
     model_profile: str | None = None
+    execution_class: Literal["shell_app", "entity_workflow_app", "workflow_dashboard_app", "data_crud_app"] | None = None
+    outcome_kind: Literal["applied", "warnings", "blocked_generation", "blocked_preview_infra", "noop_materialization_failure"] | None = None
     linked_run_id: str | None = None
     error_context: ErrorContext | None = None
     failure_reason: str | None = None
@@ -211,6 +213,12 @@ class PreviewRecord(StrictModel):
     draft_run_id: str | None = None
     logs: list[str] = Field(default_factory=list)
     last_error: str | None = None
+    preview_failure_kind: Literal["address_pool_exhausted", "container_name_conflict", "network_conflict", "compose_start_failure", "unknown"] | None = None
+    preview_retry_count: int = 0
+    preview_cleanup_attempted: bool = False
+    preview_reused_existing_runtime: bool = False
+    preview_cooldown_until: datetime | None = None
+    last_failure_signature: str | None = None
     latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
     started_at: datetime | None = None
     updated_at: datetime = Field(default_factory=utc_now)
@@ -477,6 +485,8 @@ class RunRecord(StrictModel):
     generation_mode: GenerationMode = GenerationMode.BALANCED
     llm_provider: str | None = None
     llm_model: str | None = None
+    execution_class: Literal["shell_app", "entity_workflow_app", "workflow_dashboard_app", "data_crud_app"] | None = None
+    outcome_kind: Literal["applied", "warnings", "blocked_generation", "blocked_preview_infra", "noop_materialization_failure"] | None = None
     linked_job_id: str | None = None
     resume_from_run_id: str | None = None
     source_revision_id: str | None = None

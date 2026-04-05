@@ -47,8 +47,11 @@ from app.models.artifacts import (
     AppIRValidatorResult,
     ArtifactPlanModel,
     GroundedSpecValidatorResult,
+    MaterializationReport,
     PatchEnvelope,
     PatchOperationModel,
+    PreviewFailureKind,
+    RunOutcomeKind,
     TraceabilityReportEntry,
     TraceabilityReportModel,
     ValidationIssue,
@@ -110,16 +113,23 @@ ROLE_COMPONENT_PREFIX = {
     "manager": "Manager",
 }
 DESIGN_REFERENCE_FILES = (
+    "miniapp/app/static/shared/base.css",
+    "miniapp/app/static/shared/common.js",
     "miniapp/app/static/client/index.html",
-    "miniapp/app/static/client/profile.html",
-    "miniapp/app/static/client/styles.css",
     "miniapp/app/static/specialist/index.html",
     "miniapp/app/static/manager/index.html",
+    "miniapp/app/generated/route_manifest.json",
+    "miniapp/app/generated/runtime_manifest.json",
 )
 SHARED_GENERATED_FILES = (
     "miniapp/app/main.py",
     "miniapp/app/routes/profiles.py",
     "miniapp/app/db.py",
+    "miniapp/app/generated/route_manifest.json",
+    "miniapp/app/generated/runtime_manifest.json",
+    "miniapp/app/generated/static_runtime_manifest.json",
+    "miniapp/app/generated/role_seed.json",
+    "miniapp/app/generated/role_experience.json",
 )
 WRITE_STRATEGIES = ("minimal_patch", "whole_file_build")
 CANONICAL_FRONTEND_ROOTS = (
@@ -169,6 +179,12 @@ WORKFLOW_HEAVY_MARKERS = (
     "details",
     "booking",
 )
+CANONICAL_ROLE_PAGES = (
+    {"suffix": "home", "route_path": "/", "file_name": "index.html", "page_kind": "landing", "navigation_label": "Home"},
+    {"suffix": "workbench", "route_path": "/workbench", "file_name": "workbench.html", "page_kind": "list", "navigation_label": "Workbench"},
+    {"suffix": "workspace", "route_path": "/workspace", "file_name": "workspace.html", "page_kind": "workspace", "navigation_label": "Workspace"},
+    {"suffix": "profile", "route_path": "/profile", "file_name": "profile.html", "page_kind": "profile", "navigation_label": "Profile"},
+)
 logger = logging.getLogger(__name__)
 ACTIVE_LLM_CACHE_CONTEXT: ContextVar[dict[str, str] | None] = ContextVar("active_llm_cache_context", default=None)
 ACTIVE_LLM_CACHE_STATS: ContextVar[dict[str, Any] | None] = ContextVar("active_llm_cache_stats", default=None)
@@ -194,6 +210,12 @@ class GenerationService:
         validation_suite: ValidationSuite,
         openrouter_client: OpenRouterClient,
         workspace_log_service: WorkspaceLogService,
+        session_engine: Any | None = None,
+        task_router: Any | None = None,
+        context_budget_manager: Any | None = None,
+        prompt_state_manager: Any | None = None,
+        compaction_service: Any | None = None,
+        artifact_recorder: Any | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -206,6 +228,12 @@ class GenerationService:
         self.validation_suite = validation_suite
         self.openrouter_client = openrouter_client
         self.workspace_log_service = workspace_log_service
+        self.session_engine = session_engine
+        self.task_router = task_router
+        self.context_budget_manager = context_budget_manager
+        self.prompt_state_manager = prompt_state_manager
+        self.compaction_service = compaction_service
+        self.artifact_recorder = artifact_recorder
 
     def generate(self, workspace_id: str, request: GenerateRequest, *, should_stop: Callable[[], bool] | None = None) -> JobRecord:
         started_at = time.perf_counter()
@@ -474,6 +502,26 @@ class GenerationService:
             {"workspace_id": workspace_id, "assumptions": [item.model_dump(mode="json") for item in grounded_spec.assumptions]},
         )
         self._append_event(job, "spec_ready", "GroundedSpec created.")
+        execution_class = self._classify_execution_class(
+            prompt=effective_prompt,
+            grounded_spec=grounded_spec,
+            role_scope=role_scope,
+            intent=request.intent,
+        )
+        job.execution_class = execution_class  # type: ignore[assignment]
+        self._store_report(
+            f"execution_class:{workspace_id}",
+            {
+                "workspace_id": workspace_id,
+                "run_id": draft_run_id,
+                "execution_class": execution_class,
+                "role_scope": role_scope,
+                "entity_count": len(grounded_spec.domain_entities),
+                "flow_count": len(grounded_spec.user_flows),
+                "api_count": len(grounded_spec.api_requirements),
+                "persistence_count": len(grounded_spec.persistence_requirements),
+            },
+        )
         stopped = self._stop_if_requested(job, workspace_id, should_stop)
         if stopped is not None:
             return stopped
@@ -658,6 +706,7 @@ class GenerationService:
             role_scope=role_scope,
             role_contract=role_contract,
             plan_result=plan_result,
+            execution_class=execution_class,
             generation_mode=generation_mode,
             creative_direction=creative_direction,
             retrieval_ms=retrieval_ms,
@@ -777,6 +826,7 @@ class GenerationService:
         role_scope: list[str],
         role_contract: dict[str, Any],
         plan_result: dict[str, Any],
+        execution_class: str,
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
         retrieval_ms: int,
@@ -815,6 +865,8 @@ class GenerationService:
             generation_mode=generation_mode,
             active_paths=plan_result["files_to_read"],
             target_files=plan_result["target_files"],
+            grounded_spec=grounded_spec,
+            execution_class=execution_class,
             run_id=draft_run_id,
         )
         files_read = sorted(set(plan_result["files_to_read"]) | set(context_pack.targeted_files.keys()) | {chunk.path for chunk in context_pack.code_chunks})
@@ -833,6 +885,14 @@ class GenerationService:
         current_cache_stats["prompt_cache_key"] = context_pack.prompt_cache_key
         current_cache_stats["stable_prefix_chars"] = len(context_pack.system_prefix)
         job.cache_stats = dict(current_cache_stats)
+        self._store_report(
+            f"retrieval_anchor_report:{workspace_id}",
+            {
+                "workspace_id": workspace_id,
+                "run_id": draft_run_id,
+                **dict((context_pack.retrieval_stats or {}).get("anchor_report") or {}),
+            },
+        )
         job.latency_breakdown["context_pack_ms"] = max(0, int((time.perf_counter() - started_at) * 1000) - retrieval_ms)
         self._append_event(
             job,
@@ -888,28 +948,6 @@ class GenerationService:
             job.latency_breakdown[metric_key] = int(metric_value)
         for trace_stage, payload in (edit_result.get("trace_payloads") or {}).items():
             self._append_trace(workspace_id, trace_stage, payload["message"], payload["payload"])
-        edit_gate_issues = self._edit_gate_issues(
-            plan_result["page_graph"],
-            edit_result["operations"],
-            role_scope,
-            scope_mode=plan_result["scope_mode"],
-            target_files=plan_result["target_files"],
-            require_business_pages=bool(plan_result.get("require_business_pages")),
-        )
-        if edit_gate_issues:
-            self._append_trace(
-                workspace_id,
-                "editing_blocked",
-                "Code editing was blocked because the draft still collapses into placeholder surfaces.",
-                {"issues": edit_gate_issues},
-            )
-            return self._block_with_messages(
-                job,
-                edit_gate_issues,
-                code="generation.edit.placeholder_output",
-                event_type="validation_failed",
-                failure_reason="Code editing did not produce the required page-based app structure.",
-            )
         invalid_operation_paths = [
             operation.file_path
             for operation in edit_result["operations"]
@@ -949,6 +987,69 @@ class GenerationService:
                 failure_reason=apply_result.conflict_reason or "Draft patch could not be applied safely.",
             )
         job.apply_result = apply_result.model_dump(mode="json")
+        realized_paths = self._realized_draft_file_paths(workspace_id, draft_run_id)
+        stage_reports = self._build_stage_reports(
+            page_graph=plan_result["page_graph"],
+            role_scope=role_scope,
+            realized_paths=realized_paths,
+        )
+        materialization_report = self._build_materialization_report(
+            execution_class=execution_class,
+            page_graph=plan_result["page_graph"],
+            role_scope=role_scope,
+            realized_paths=realized_paths,
+        )
+        self._store_report(
+            f"stage_reports:{workspace_id}",
+            {"workspace_id": workspace_id, "run_id": draft_run_id, "items": stage_reports},
+        )
+        self._store_report(
+            f"materialization_report:{workspace_id}",
+            {"workspace_id": workspace_id, "run_id": draft_run_id, **materialization_report.model_dump(mode="json")},
+        )
+        materialization_gate = self._materialization_gate_result(
+            materialization_report,
+            require_multi_page=bool(plan_result["require_multi_page"]),
+            scope_mode=plan_result["scope_mode"],
+            generation_mode=generation_mode,
+        )
+        if materialization_gate is not None:
+            failure_code, failure_messages = materialization_gate
+            self._append_trace(
+                workspace_id,
+                "materialization_blocked",
+                "Code editing did not materialize the planned workflow surface.",
+                {"messages": failure_messages, "materialization_report": materialization_report.model_dump(mode="json")},
+            )
+            return self._block_with_messages(
+                job,
+                failure_messages,
+                code=failure_code,
+                event_type="validation_failed",
+                failure_reason="Code editing did not materialize the planned workflow surface.",
+            )
+        edit_gate_issues = self._edit_gate_issues(
+            plan_result["page_graph"],
+            operations,
+            role_scope,
+            scope_mode=plan_result["scope_mode"],
+            target_files=plan_result["target_files"],
+            require_business_pages=bool(plan_result.get("require_business_pages")),
+        )
+        if edit_gate_issues:
+            self._append_trace(
+                workspace_id,
+                "editing_blocked",
+                "Code editing was blocked because the draft still collapses into placeholder surfaces.",
+                {"issues": edit_gate_issues, "materialization_report": materialization_report.model_dump(mode="json")},
+            )
+            return self._block_with_messages(
+                job,
+                edit_gate_issues,
+                code="generation.edit.placeholder_surface_detected",
+                event_type="validation_failed",
+                failure_reason="Code editing did not produce the required page-based app structure.",
+            )
         job.latency_breakdown["patch_apply_ms"] = max(0, int((time.perf_counter() - started_at) * 1000) - retrieval_ms)
         latest_operations = list(operations)
         all_operations = list(operations)
@@ -1269,6 +1370,7 @@ class GenerationService:
         self.store.upsert("chat_turns", assistant_turn.turn_id, assistant_turn.model_dump(mode="json"))
 
         job.status = "completed"
+        job.outcome_kind = "applied"
         job.failure_reason = None
         job.summary = summary
         job.traceability_report_id = traceability.report_id
@@ -1290,6 +1392,9 @@ class GenerationService:
             "patch": "reports/patch",
             "role_contract": "reports/role_contract",
             "page_graph": "reports/page_graph",
+            "materialization_report": "reports/materialization_report",
+            "stage_reports": "reports/stage_reports",
+            "retrieval_anchor_report": "reports/retrieval_anchor_report",
             "fidelity": job.fidelity,
         }
         self.store.delete("reports", f"resume_checkpoint:{workspace_id}")
@@ -1491,7 +1596,7 @@ class GenerationService:
                     section_id="graph",
                     section_title="Page graph and route structure",
                     section_contract=[
-                        "Return the real page graph, role routes, and page definitions.",
+                        "Return the real page graph, role routes, page purposes, primary actions, and handoff paths.",
                         "Keep role surfaces distinct and multi-page when required.",
                         "Do not decide final file-read lists in this section.",
                     ],
@@ -1772,6 +1877,12 @@ class GenerationService:
                     content=json_dumps(page_graph),
                     reason="Persist the LLM-generated page graph for validation, preview, and run artifacts.",
                 ),
+                DraftFileOperation(
+                    file_path="artifacts/page_graph_verification.json",
+                    operation="replace",
+                    content=json_dumps(self._build_page_graph_verification_report(page_graph, role_scope)),
+                    reason="Persist structural verification for the planned page graph and route tree.",
+                ),
                 *page_operations,
                 *[operation for result in composition_results for operation in result["operations"]],
             ]
@@ -1846,7 +1957,13 @@ class GenerationService:
                 operation="replace",
                 content=json_dumps(page_graph),
                 reason="Persist the planned page graph for validation, preview, and run artifacts.",
-            )
+            ),
+            DraftFileOperation(
+                file_path="artifacts/page_graph_verification.json",
+                operation="replace",
+                content=json_dumps(self._build_page_graph_verification_report(page_graph, role_scope)),
+                reason="Persist structural verification for the planned page graph and route tree.",
+            ),
         ]
         messages: list[str] = []
         latency_breakdown: dict[str, int] = {}
@@ -1957,12 +2074,11 @@ class GenerationService:
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
-        payload = self._generate_structured_with_retry(
-            role="code_edit",
-            schema_name=f"whole_file_bundle_v1_{cluster_name}",
-            schema=self._code_edit_schema(),
-            system_prompt=self._whole_file_cluster_system_prompt(cluster_name),
-            user_prompt=self._whole_file_cluster_user_prompt(
+        completeness_recovery_used = False
+        last_error: Exception | None = None
+        for _ in range(2):
+            system_prompt = self._whole_file_cluster_system_prompt(cluster_name)
+            user_prompt = self._whole_file_cluster_user_prompt(
                 cluster_name=cluster_name,
                 cluster_targets=cluster_targets,
                 prompt=prompt,
@@ -1975,31 +2091,65 @@ class GenerationService:
                 file_contexts=file_contexts,
                 generation_mode=generation_mode,
                 creative_direction=creative_direction,
-            ),
-        )
-        normalized = self._normalize_model_payload(payload["payload"])
-        raw_operations = normalized.get("operations")
-        if not isinstance(raw_operations, list):
-            raise ValueError("Whole-file cluster did not return operations.")
-        operations = self._sanitize_draft_operations(
-            [DraftFileOperation.model_validate(item) for item in raw_operations]
-        )
-        allowed_targets = set(cluster_targets)
-        invalid = [
-            operation.file_path
-            for operation in operations
-            if operation.file_path not in allowed_targets
-            or operation.operation not in {"create", "replace"}
-            or operation.content is None
-        ]
-        if invalid:
-            raise ValueError(f"Whole-file cluster touched files outside its scope: {', '.join(invalid[:5])}")
-        self._validate_targeted_operations(stage_name=cluster_name, target_files=cluster_targets, operations=operations)
-        return {
-            "assistant_message": str(normalized.get("assistant_message") or "").strip(),
-            "operations": operations,
-            "model": payload["model"],
-        }
+            )
+            if completeness_recovery_used:
+                recovery_note = (
+                    "Cluster completeness recovery mode:\n"
+                    "- The previous attempt omitted required target files from this cluster.\n"
+                    "- You must emit create/replace operations for every new required target file in cluster_targets.\n"
+                    "- Do not stop after index.html or app.js if the cluster also contains detail, workload, form, route, or manifest files.\n"
+                    "- Return one operation per required file path with the complete final file body.\n"
+                )
+                system_prompt = f"{system_prompt.rstrip()}\n\n{recovery_note}".strip()
+                user_prompt = f"{user_prompt.rstrip()}\n\n{recovery_note}".strip()
+            try:
+                payload = self._generate_structured_with_retry(
+                    role="code_edit",
+                    schema_name=f"whole_file_bundle_v1_{cluster_name}",
+                    schema=self._code_edit_schema(),
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                )
+                normalized = self._normalize_model_payload(payload["payload"])
+                raw_operations = normalized.get("operations")
+                if not isinstance(raw_operations, list):
+                    raise ValueError("Whole-file cluster did not return operations.")
+                operations = self._sanitize_draft_operations(
+                    [DraftFileOperation.model_validate(item) for item in raw_operations]
+                )
+                allowed_targets = set(cluster_targets)
+                invalid = [
+                    operation.file_path
+                    for operation in operations
+                    if operation.file_path not in allowed_targets
+                    or operation.operation not in {"create", "replace"}
+                    or operation.content is None
+                ]
+                if invalid:
+                    raise ValueError(f"Whole-file cluster touched files outside its scope: {', '.join(invalid[:5])}")
+                self._validate_targeted_operations(stage_name=cluster_name, target_files=cluster_targets, operations=operations)
+                missing_required_targets = self._missing_required_cluster_targets(
+                    cluster_targets=cluster_targets,
+                    operations=operations,
+                    file_contexts=file_contexts,
+                )
+                if missing_required_targets:
+                    raise ValueError(
+                        f"Whole-file cluster omitted required target files: {', '.join(missing_required_targets[:5])}"
+                    )
+                return {
+                    "assistant_message": str(normalized.get("assistant_message") or "").strip(),
+                    "operations": operations,
+                    "model": payload["model"],
+                }
+            except Exception as exc:
+                last_error = exc
+                if not completeness_recovery_used and "omitted required target files" in str(exc).lower():
+                    completeness_recovery_used = True
+                    continue
+                break
+        assert last_error is not None
+        raise last_error
 
     def _timed_whole_file_cluster(
         self,
@@ -2181,6 +2331,7 @@ class GenerationService:
             if not isinstance(pages_raw, list) or not pages_raw:
                 raise ValueError(f"Page graph is missing page definitions for {role}.")
             pages = [self._normalize_page_definition(role, page, index) for index, page in enumerate(pages_raw)]
+            pages = self._finalize_role_pages(role, pages, require_multi_page=require_multi_page)
             route_candidates = self._normalize_path_list([role_payload.get("routes_file")], [])
             routes_file = route_candidates[0] if route_candidates else self._default_routes_file(role)
             roles[role] = {
@@ -2263,16 +2414,101 @@ class GenerationService:
             "require_multi_page": require_multi_page,
         }
 
+    def _finalize_role_pages(self, role: str, pages: list[dict[str, Any]], *, require_multi_page: bool) -> list[dict[str, Any]]:
+        if not pages:
+            pages = [self._normalize_page_definition(role, page, index) for index, page in enumerate(self._fallback_page_contract(role, require_multi_page=require_multi_page))]
+        deduped: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str, str]] = set()
+        for index, page in enumerate(pages):
+            normalized = self._normalize_page_definition(role, page, index)
+            dedupe_key = (
+                str(normalized.get("page_id") or ""),
+                str(normalized.get("route_path") or ""),
+                str(normalized.get("file_path") or ""),
+            )
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            if not normalized["purpose"]:
+                normalized["purpose"] = self._default_page_purpose(role, normalized["page_kind"], route_path=normalized["route_path"])
+            if not normalized["description"]:
+                normalized["description"] = normalized["purpose"]
+            if not normalized["primary_actions"]:
+                normalized["primary_actions"] = self._default_primary_actions(role, normalized["page_kind"], route_path=normalized["route_path"])
+            if not normalized["handoff_paths"]:
+                normalized["handoff_paths"] = self._default_handoff_paths_for_page_kind(normalized["page_kind"], route_path=normalized["route_path"])
+            deduped.append(normalized)
+        available_routes = {str(page.get("route_path") or "") for page in deduped}
+        page_id_to_route = {
+            str(page.get("page_id") or "").strip().lower(): str(page.get("route_path") or "")
+            for page in deduped
+            if isinstance(page, dict)
+        }
+        for page in deduped:
+            normalized_handoffs: list[str] = []
+            for path in page["handoff_paths"]:
+                normalized_path = self._normalize_role_route_path(role, path, index=0)
+                if normalized_path not in available_routes:
+                    handoff_key = normalized_path.strip("/").lower()
+                    handoff_key = re.sub(rf"^{role}[_-]", "", handoff_key)
+                    normalized_path = page_id_to_route.get(handoff_key, normalized_path)
+                normalized_handoffs.append(normalized_path)
+            filtered_handoffs = [path for path in normalized_handoffs if path in available_routes and path != page["route_path"]]
+            if filtered_handoffs:
+                page["handoff_paths"] = filtered_handoffs
+            elif page["route_path"] != "/" and "/" in available_routes:
+                page["handoff_paths"] = ["/"]
+            elif page["route_path"] == "/" and "/profile" in available_routes:
+                page["handoff_paths"] = ["/profile"]
+        return deduped
+
+    @staticmethod
+    def _default_page_purpose(role: str, page_kind: str, *, route_path: str | None = None) -> str:
+        role_label = role.title()
+        normalized_kind = page_kind.strip().lower()
+        normalized_route = (route_path or "").strip().lower()
+        if normalized_kind in {"dashboard", "landing"}:
+            return f"{role_label} dashboard with overview metrics, prepared blocks, and route-based next actions."
+        if normalized_kind in {"list", "queue"}:
+            return f"{role_label} workbench for queue, record, or list-based coordination."
+        if normalized_kind in {"workspace", "details", "detail"}:
+            return f"{role_label} workspace for focused detail work, module actions, and decision handoffs."
+        if normalized_kind == "form":
+            return f"{role_label} form page for collecting, updating, or validating workflow data."
+        if normalized_kind in {"profile", "info"} or normalized_route.endswith("/profile"):
+            return f"{role_label} profile page for editable identity and preferences."
+        return f"{role_label} profile page for editable identity and preferences."
+
+    @staticmethod
+    def _default_primary_actions(role: str, page_kind: str, *, route_path: str | None = None) -> list[str]:
+        normalized_kind = page_kind.strip().lower()
+        normalized_route = (route_path or "").strip().lower()
+        if normalized_kind in {"dashboard", "landing"}:
+            return [f"{role}_open_workbench", f"{role}_open_workspace", f"{role}_open_profile"]
+        if normalized_kind in {"list", "queue"}:
+            return [f"{role}_open_workspace_from_workbench", f"{role}_refresh_workbench"]
+        if normalized_kind in {"workspace", "details", "detail"}:
+            return [f"{role}_back_to_workbench", f"{role}_open_profile"]
+        if normalized_kind == "form":
+            return [f"{role}_submit_form"]
+        if normalized_kind in {"profile", "info"} or normalized_route.endswith("/profile"):
+            return [f"{role}_profile_save"]
+        return [f"{role}_profile_save"]
+
     def _normalize_page_definition(self, role: str, payload: Any, index: int) -> dict[str, Any]:
         if not isinstance(payload, dict):
             raise ValueError(f"Page definition #{index + 1} for {role} is invalid.")
         component_name = self._component_name(role, payload, index)
-        route_path = str(payload.get("route_path") or "").strip() or ("/" if index == 0 else f"/page-{index + 1}")
-        if not route_path.startswith("/"):
-            route_path = f"/{route_path}"
+        route_path = self._normalize_role_route_path(
+            role,
+            str(payload.get("route_path") or "").strip() or ("/" if index == 0 else f"/page-{index + 1}"),
+            index=index,
+        )
         file_path_candidates = self._normalize_path_list([payload.get("file_path")], [])
         data_dependencies = self._normalize_string_list(payload.get("data_dependencies"))
-        file_path = file_path_candidates[0] if file_path_candidates else self._default_page_file(role, component_name)
+        file_path = file_path_candidates[0] if file_path_candidates else self._default_page_file(role, component_name, route_path=route_path)
+        if self._should_rewrite_page_file_for_route(route_path=route_path, file_path=file_path, page_id=str(payload.get("page_id") or "")):
+            file_path = self._default_page_file(role, component_name, route_path=route_path)
         state_marker_base = self._state_marker_base(
             str(payload.get("page_id") or f"{role}_{index + 1}"),
             file_path,
@@ -2310,13 +2546,105 @@ class GenerationService:
             "title": str(payload.get("title") or component_name).strip(),
             "description": str(payload.get("description") or payload.get("purpose") or "").strip(),
             "purpose": str(payload.get("purpose") or payload.get("description") or "").strip(),
-            "page_kind": str(payload.get("page_kind") or "workspace").strip(),
+            "page_kind": self._page_kind(payload.get("page_kind"), route_path=route_path, file_path=file_path, page_id=str(payload.get("page_id") or "")),
             "primary_actions": self._normalize_string_list(payload.get("primary_actions")),
+            "handoff_paths": self._normalize_handoff_paths(payload.get("handoff_paths")),
             "data_dependencies": data_dependencies,
             "loading_state": loading_state,
             "empty_state": empty_state,
             "error_state": error_state,
         }
+
+    @staticmethod
+    def _fallback_page_contract(role: str, *, require_multi_page: bool) -> list[dict[str, str]]:
+        pages: list[dict[str, str]] = []
+        defaults = (
+            CANONICAL_ROLE_PAGES
+            if require_multi_page
+            else (CANONICAL_ROLE_PAGES[0], CANONICAL_ROLE_PAGES[3])
+        )
+        for page in defaults:
+            pages.append(
+                {
+                    "page_id": f"{role}_{page['suffix']}",
+                    "route_path": page["route_path"],
+                    "file_path": f"miniapp/app/static/{role}/{page['file_name']}",
+                    "page_kind": page["page_kind"],
+                    "navigation_label": page["navigation_label"],
+                }
+            )
+        return pages
+
+    @staticmethod
+    def _normalize_role_route_path(role: str, route_path: str, *, index: int) -> str:
+        normalized = route_path.strip() or ("/" if index == 0 else f"/page-{index + 1}")
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        role_prefix = f"/{role}"
+        compact_prefix = f"/{role}-"
+        if normalized == role_prefix:
+            return "/"
+        if normalized.startswith(f"{role_prefix}/"):
+            suffix = normalized[len(role_prefix):]
+            return suffix or "/"
+        if normalized.startswith(compact_prefix):
+            suffix = normalized[len(compact_prefix):]
+            return f"/{suffix}" if suffix else "/"
+        return normalized
+
+    @classmethod
+    def _should_rewrite_page_file_for_route(cls, *, route_path: str, file_path: str, page_id: str) -> bool:
+        normalized_path = file_path.strip()
+        file_name = Path(normalized_path).name.lower()
+        page_id_lower = page_id.lower()
+        if route_path == "/":
+            return file_name != "index.html"
+        if route_path.rstrip("/") == "/profile" or "profile" in page_id_lower:
+            return file_name != "profile.html"
+        return file_name in {"index.html", "profile.html"}
+
+    @staticmethod
+    def _default_handoff_paths_for_page_kind(page_kind: str, *, route_path: str | None = None) -> list[str]:
+        normalized = page_kind.strip().lower()
+        normalized_route = (route_path or "").strip().lower()
+        if normalized in {"dashboard", "landing"} or normalized_route == "/":
+            return []
+        if normalized in {"list", "queue"}:
+            return ["/"]
+        if normalized in {"workspace", "details", "detail"}:
+            return ["/"]
+        return ["/"]
+
+    @staticmethod
+    def _page_kind(value: Any, *, route_path: str, file_path: str, page_id: str) -> str:
+        raw = str(value or "").strip().lower()
+        if raw:
+            return raw
+        slug = " ".join([route_path.lower(), file_path.lower(), page_id.lower()])
+        if "/profile" in slug or slug.endswith("profile.html") or "profile" in page_id.lower():
+            return "profile"
+        if any(token in slug for token in ("/workspace", "workspace.html", "detail", "details")):
+            return "workspace"
+        if any(token in slug for token in ("/workbench", "workbench.html", "queue", "list", "records", "orders")):
+            return "list"
+        if any(token in slug for token in ("form", "create", "edit")):
+            return "form"
+        if route_path == "/":
+            return "dashboard"
+        return "page"
+
+    @staticmethod
+    def _normalize_handoff_paths(value: Any) -> list[str]:
+        if isinstance(value, list):
+            paths = [str(item).strip() for item in value if isinstance(item, str) and str(item).strip()]
+        elif isinstance(value, str) and value.strip():
+            paths = [value.strip()]
+        else:
+            paths = []
+        normalized = []
+        for path in paths:
+            normalized.append(path if path.startswith("/") else f"/{path}")
+        return list(dict.fromkeys(normalized))
 
     @staticmethod
     def _state_marker_base(page_id: str, file_path: str, component_name: str) -> str:
@@ -2339,11 +2667,23 @@ class GenerationService:
         return f"miniapp/app/static/{role}/index.html"
 
     @staticmethod
-    def _default_page_file(role: str, component_name: str) -> str:
-        slug = re.sub(r"(?<!^)(?=[A-Z])", "-", component_name).replace("--", "-").strip("-").lower()
-        if slug.endswith("-page"):
-            slug = slug[:-5]
-        return f"miniapp/app/static/{role}/{slug or 'page'}.html"
+    def _default_page_file(role: str, component_name: str, *, route_path: str | None = None) -> str:
+        normalized_route = (route_path or "").strip().lower()
+        if normalized_route in {"", "/"}:
+            slug = "index"
+        elif normalized_route.rstrip("/") == "/profile":
+            slug = "profile"
+        else:
+            route_slug = re.sub(r":[^/]+", "detail", normalized_route)
+            route_slug = route_slug.strip("/").replace("/", "-")
+            route_slug = re.sub(r"[^a-z0-9-]+", "-", route_slug).strip("-")
+            slug = route_slug or "page"
+        if not slug or slug == role:
+            component_slug = re.sub(r"(?<!^)(?=[A-Z])", "-", component_name).replace("--", "-").strip("-").lower()
+            if component_slug.endswith("-page"):
+                component_slug = component_slug[:-5]
+            slug = component_slug or "page"
+        return f"miniapp/app/static/{role}/{slug}.html"
 
     def _component_name(self, role: str, payload: dict[str, Any], index: int) -> str:
         raw_value = str(payload.get("component_name") or payload.get("title") or payload.get("page_id") or f"{role}_page_{index + 1}").strip()
@@ -2631,12 +2971,54 @@ class GenerationService:
         return False
 
     @staticmethod
+    def _classify_execution_class(
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        intent: str,
+    ) -> str:
+        lowered = prompt.lower()
+        lifecycle_markers = (
+            "create",
+            "submit",
+            "assign",
+            "update",
+            "comment",
+            "track",
+            "filter",
+            "schedule",
+            "approve",
+            "review",
+            "manage",
+        )
+        lifecycle_hits = sum(1 for marker in lifecycle_markers if marker in lowered)
+        entity_count = len(grounded_spec.domain_entities)
+        flow_count = len(grounded_spec.user_flows)
+        api_count = len(grounded_spec.api_requirements)
+        persistence_count = len(grounded_spec.persistence_requirements)
+        role_handoff = len(role_scope) > 1 and flow_count > 1
+        dashboard_signal = any(
+            marker in lowered
+            for marker in ("dashboard", "overview", "workload", "monitor", "triage", "queue", "status", "statuses")
+        )
+        if persistence_count >= 3 or (entity_count >= 4 and api_count >= 4):
+            return "data_crud_app"
+        if role_handoff and (dashboard_signal or api_count >= 3):
+            return "workflow_dashboard_app"
+        if role_handoff or flow_count > 1 or lifecycle_hits >= 3 or api_count > 0 or persistence_count > 0:
+            return "entity_workflow_app"
+        if intent == "create" and entity_count > 1 and lifecycle_hits >= 2:
+            return "entity_workflow_app"
+        return "shell_app"
+
+    @staticmethod
     def _planning_retry_prompt(prompt: str) -> str:
         corrective = (
-            "Planning correction: expand into separate business pages. "
+            "Planning correction: expand into a realistic route/page graph that matches the workflow. "
             "Do not collapse the app into role landing pages. "
-            "Keep index.html as the role entry page only. "
-            "Add real business pages such as catalog, product, cart, orders, detail, or management pages when the workflow implies them. "
+            "Use dashboard, workbench, workspace, and profile only as fallback patterns when the prompt does not imply a better structure. "
+            "Differentiate the roles through page purpose, actions, and handoffs instead of mirrored wording. "
             "Minimize loading-first UI and use loading states only when post-load data is required."
         )
         return f"{prompt.rstrip()}\n\n{corrective}"
@@ -2648,7 +3030,7 @@ class GenerationService:
         return file_path not in {
             f"miniapp/app/static/{role}/index.html",
             f"miniapp/app/static/{role}/profile.html",
-        } and route_path not in {f"/{role}", f"/{role}/profile"}
+        } and route_path not in {f"/{role}", f"/{role}/profile", "/", "/profile"}
 
     @staticmethod
     def _looks_like_fix_request(prompt: str) -> bool:
@@ -2883,6 +3265,7 @@ class GenerationService:
                                                 "purpose": {"type": "string"},
                                                 "page_kind": {"type": "string"},
                                                 "primary_actions": {"type": "array", "items": {"type": "string"}},
+                                                "handoff_paths": {"type": "array", "items": {"type": "string"}},
                                                 "data_dependencies": {"type": "array", "items": {"type": "string"}},
                                                 "loading_state": {"type": "string"},
                                                 "empty_state": {"type": "string"},
@@ -2899,6 +3282,7 @@ class GenerationService:
                                                 "purpose",
                                                 "page_kind",
                                                 "primary_actions",
+                                                "handoff_paths",
                                                 "data_dependencies",
                                                 "loading_state",
                                                 "empty_state",
@@ -3038,10 +3422,12 @@ class GenerationService:
                 "constraints": [
                     "Keep Telegram/MAX mini-app compatibility.",
                     "Keep three-role preview compatibility.",
-                    "Use the existing profile design language as a style anchor instead of inventing a generic dashboard shell.",
+                    "Use the existing shared shell and profile design language as the invariant style anchor.",
                     "If the prompt implies several flows, entities, or jobs, return a multi-page app with distinct page files and routes.",
-                    "Keep index.html as the role entry page only; put catalog, orders, detail, cart, checkout, and management flows into separate HTML files when the workflow implies them.",
+                    "Use dashboard/workbench/workspace/profile as fallback references only when the prompt does not imply another information architecture.",
+                    "Size the route tree to the actual workflow instead of forcing a fixed page count.",
                     "Do not collapse workflow-heavy apps into index.html plus profile.html only.",
+                    "Return distinct role page purposes, primary actions, and handoff paths instead of mirrored copies across roles.",
                     "For pages with dynamic data dependencies, plan semantic loading/error states that downstream codegen can realize with real containers, ids, or data-ui-state markers.",
                     "For pages that reference /api endpoints in data dependencies, include the matching miniapp route modules in backend_targets from the start.",
                     "For targeted edits, keep target_files minimal and touch only the files required by the request.",
@@ -3093,9 +3479,11 @@ class GenerationService:
                 "constraints": [
                     "Keep Telegram/MAX mini-app compatibility.",
                     "Keep three-role preview compatibility.",
-                    "Use the existing profile design language as a style anchor.",
+                    "Use the existing shared shell and profile design language as a style anchor.",
+                    "Use dashboard/workbench/workspace/profile as fallback references only when the prompt does not imply another information architecture.",
                     "For pages with dynamic data dependencies, include loading_state and error_state contracts that can be rendered as semantic HTML containers.",
                     "For pages that reference /api endpoints in data dependencies, include matching backend route modules in backend_targets instead of deferring this to repair.",
+                    "Keep role page purposes, primary actions, and handoff paths distinct.",
                     "Do not output role copies with changed titles only.",
                     "Return only repo-relative file paths that fit the current workspace tree and path hints.",
                     "Do not return HTTP endpoints, route strings, or prose labels inside target_files or backend_targets.",
@@ -3208,11 +3596,12 @@ class GenerationService:
                 "rules": [
                     "Create a real page, not a generic stats card screen.",
                     "Respect the requested role and make the actions specific to that role.",
+                    "Honor the page purpose, primary actions, and handoff_paths from the page graph.",
                     "Only add loading, empty, and error states when the page depends on data fetched after page load.",
                     "If the page has data_dependencies, emit semantic loading and error containers that are discoverable via ids, query selectors, or data-ui-state markers.",
                     "Use loading/error ids or data-ui-state markers that match the page contract instead of decorative prose only.",
                     "Static or mostly static pages should render immediately without spinner-first UX.",
-                    "Keep landing pages complete on first paint and move business flows into separate HTML pages when the page graph requires them.",
+                    "Keep dashboard pages complete on first paint and move business flows into separate workbench/workspace pages when the page graph requires them.",
                     "If scope_mode is minimal_patch, preserve unrelated behavior and keep the diff minimal.",
                     "Return exactly one operation for the requested page file path.",
                 ],
@@ -3298,12 +3687,13 @@ class GenerationService:
                     "Only touch files listed in target_files.",
                     "If stage_name is miniapp, generate only miniapp/server/shared contract files required by the request.",
                     "If stage_name is frontend, wire pages, routes, and shared UI/state to the already planned miniapp surface.",
+                    "Treat static/shared/common.js and shared/base.css as first-class shared shell assets when they are in target_files.",
                     "When planned pages have dynamic dependencies, generate validator-compatible loading/error containers and wiring in the first draft instead of waiting for repair.",
                     "When generated sources reference /api endpoints, include the matching miniapp route modules and router wiring from the first draft whenever those files are in target_files.",
                     "Generate role routes that expose the page graph as real separate pages when routes are targeted.",
                     "Generate shared app chrome/state files that support the pages instead of rendering placeholder dashboards.",
                     "Keep role pages usable without waiting on client-side hydration for basic navigation and structure.",
-                    "Do not collapse business flows back into index.html when separate page files are in target_files or page_graph.",
+                    "Do not collapse business flows back into index.html when workbench/workspace pages are in target_files or page_graph.",
                     "For minimal_patch, preserve unrelated behavior and keep the diff minimal.",
                     "Do not touch page files unless they are included in target_files.",
                     "If target_files is non-empty, operations must include at least one create/replace/delete for one of those files.",
@@ -3631,8 +4021,9 @@ class GenerationService:
         bootstrap_markers = (
             "/styles.css",
             "/app.js",
-            "/profile.js",
             "/profile.html",
+            "/workbench.html",
+            "/workspace.html",
         )
         routing_targets: list[str] = []
         bootstrap_targets: list[str] = []
@@ -3691,8 +4082,9 @@ class GenerationService:
         return list(dict.fromkeys(inferred))
 
     @staticmethod
-    def _extract_static_asset_targets(content: str, *, source_path: str) -> set[str]:
-        refs: set[str] = set()
+    def _extract_static_asset_targets(content: str, *, source_path: str) -> list[str]:
+        refs: list[str] = []
+        seen: set[str] = set()
         patterns = (
             r"""(?:src|href)\s*=\s*["']([^"']+\.(?:js|css)(?:[?#][^"']*)?)["']""",
             r"""(?:import|from)\s*(?:\(\s*)?["']([^"']+\.(?:js|css)(?:[?#][^"']*)?)["']""",
@@ -3700,8 +4092,9 @@ class GenerationService:
         for pattern in patterns:
             for match in re.finditer(pattern, content, flags=re.IGNORECASE):
                 resolved = GenerationService._resolve_static_asset_target(match.group(1), source_path=source_path)
-                if resolved:
-                    refs.add(resolved)
+                if resolved and resolved not in seen:
+                    seen.add(resolved)
+                    refs.append(resolved)
         return refs
 
     @staticmethod
@@ -3803,6 +4196,7 @@ class GenerationService:
         planned_paths = set(page_graph.get("shared_files") or []) | set(page_graph.get("backend_targets") or [])
         total_pages = 0
         normalized_role_routes: list[tuple[str, tuple[str, ...]]] = []
+        normalized_role_purposes: list[tuple[str, tuple[str, ...]]] = []
         for role in role_scope:
             role_payload = roles.get(role) or {}
             pages = role_payload.get("pages") or []
@@ -3817,14 +4211,54 @@ class GenerationService:
             total_pages += len(pages)
             if enforce_expanded_structure and require_multi_page and len(pages) < 2:
                 issues.append(f"{role} did not receive enough distinct pages for a multi-page app.")
+            actual_routes = {str(page.get("route_path") or "") for page in pages if isinstance(page, dict)}
+            actual_page_kinds = {str(page.get("page_kind") or "").strip().lower() for page in pages if isinstance(page, dict)}
+            if not actual_routes:
+                issues.append(f"{role} is missing route paths.")
+            if "/" not in actual_routes:
+                issues.append(f"{role} is missing an entry route at /.")
             if enforce_expanded_structure and require_business_pages:
                 business_pages = [page for page in pages if isinstance(page, dict) and GenerationService._is_business_page(role, page)]
                 if not business_pages:
                     issues.append(f"{role} is missing separate business pages beyond index.html and profile.html.")
+            focused_pages = [
+                page
+                for page in pages
+                if isinstance(page, dict) and str(page.get("page_kind") or "").strip().lower() in {"workspace", "details", "detail"}
+            ]
+            for focused_page in focused_pages:
+                purpose = str(focused_page.get("purpose") or "").strip().lower()
+                if not purpose:
+                    issues.append(f"{role} focused detail page is missing a concrete purpose.")
+                    continue
+                if len(purpose) < 24 and not any(token in purpose for token in ("focus", "module", "detail", "inspect", "review", "context", "task", "record", "item", "update", "status", "assign", "progress", "comment", "create", "request", "workload", "manage", "history")):
+                    issues.append(f"{role} focused detail page is missing a concrete purpose.")
+            for page in pages:
+                if not isinstance(page, dict):
+                    continue
+                handoff_paths = {str(item).strip() for item in (page.get("handoff_paths") or []) if isinstance(item, str)}
+                if not handoff_paths:
+                    issues.append(f"{role} page {page.get('page_id') or page.get('file_path') or 'unknown'} is missing handoff_paths.")
+                    continue
+                unknown_handoffs = sorted(path for path in handoff_paths if path not in actual_routes)
+                if unknown_handoffs:
+                    issues.append(f"{role} page {page.get('page_id') or page.get('file_path') or 'unknown'} points to unknown handoff paths: {', '.join(unknown_handoffs[:3])}.")
             normalized_role_routes.append(
                 (
                     role,
                     tuple(sorted(str(page.get("route_path") or "") for page in pages)),
+                )
+            )
+            normalized_role_purposes.append(
+                (
+                    role,
+                    tuple(
+                        sorted(
+                            re.sub(r"\s+", " ", str(page.get("purpose") or "").strip().lower())
+                            for page in pages
+                            if isinstance(page, dict)
+                        )
+                    ),
                 )
             )
             planned_paths.update(
@@ -3848,8 +4282,13 @@ class GenerationService:
                 issues.append(f"Workflow-heavy planning stayed on root/profile routes only for: {', '.join(default_only)}.")
         if enforce_expanded_structure and len(normalized_role_routes) > 1:
             route_sets = [routes for _, routes in normalized_role_routes]
-            if len(set(route_sets)) == 1:
+            purpose_sets = [purposes for _, purposes in normalized_role_purposes]
+            if len(set(route_sets)) == 1 and len(set(purpose_sets)) == 1:
                 issues.append("Selected roles still share the same route tree.")
+        if enforce_expanded_structure and len(normalized_role_purposes) > 1:
+            purpose_sets = [purposes for _, purposes in normalized_role_purposes]
+            if len(set(purpose_sets)) == 1:
+                issues.append("Selected roles still share the same page purposes and are not meaningfully differentiated.")
         invalid_paths = [path for path in planned_paths if isinstance(path, str) and not GenerationService._is_canonical_target_path(path)]
         if invalid_paths:
             issues.append(f"Planned targets left the canonical architecture: {', '.join(sorted(invalid_paths)[:5])}")
@@ -3868,7 +4307,20 @@ class GenerationService:
         issues: list[str] = []
         operation_paths = {operation.file_path for operation in operations}
         operation_map = {operation.file_path: operation for operation in operations}
-        allowed_target_paths = set(target_files) | {"artifacts/generated_app_graph.json"}
+        generated_manifest_paths = {
+            "miniapp/app/generated/route_manifest.json",
+            "miniapp/app/generated/runtime_manifest.json",
+            "miniapp/app/generated/static_runtime_manifest.json",
+            "miniapp/app/generated/role_seed.json",
+            "miniapp/app/generated/role_experience.json",
+            "miniapp/app/generated/runtime_state.json",
+            "miniapp/app/generated/app_ir.json",
+        }
+        allowed_target_paths = set(target_files) | generated_manifest_paths | {
+            "artifacts/generated_app_graph.json",
+            "artifacts/page_graph_verification.json",
+            "artifacts/grounded_spec.json",
+        }
         unexpected_paths = [path for path in operation_paths if path not in allowed_target_paths]
         if unexpected_paths:
             issues.append(f"Generated draft touched files outside the planned target scope: {', '.join(unexpected_paths[:5])}")
@@ -3876,20 +4328,33 @@ class GenerationService:
         if legacy_paths:
             issues.append(f"Generated draft reintroduced legacy architecture paths: {', '.join(sorted(legacy_paths)[:5])}")
         non_canonical_paths = [
-            path for path in operation_paths if path != "artifacts/generated_app_graph.json" and not GenerationService._is_canonical_target_path(path)
+            path
+            for path in operation_paths
+            if path not in {"artifacts/generated_app_graph.json", "artifacts/page_graph_verification.json", *generated_manifest_paths}
+            and not GenerationService._is_canonical_target_path(path)
         ]
         if non_canonical_paths:
             issues.append(f"Generated draft left the canonical architecture roots: {', '.join(sorted(non_canonical_paths)[:5])}")
         if scope_mode == "minimal_patch":
             meaningful_hits = [path for path in operation_paths if path in set(target_files)]
+            support_hits = [
+                path
+                for path in operation_paths
+                if path in generated_manifest_paths
+                or path == "miniapp/app/static/shared/common.js"
+                or path.endswith("/app.js")
+                or path.endswith("/styles.css")
+            ]
             if target_files and not meaningful_hits:
                 issues.append("Minimal patch draft returned only artifact-level changes and did not touch any planned source targets.")
-            if len(operation_paths) > max(1, len(target_files) + 1):
+            if len(operation_paths) > max(1, len(target_files) + 1 + len(support_hits)):
                 issues.append("Minimal patch mode touched too many files.")
             return issues
 
         route_hits = 0
         page_hits = 0
+        route_manifest_touched = "miniapp/app/generated/route_manifest.json" in operation_paths
+        known_handoff_paths = {"/"}
         for role in role_scope:
             role_payload = page_graph.get("roles", {}).get(role) or {}
             routes_file = role_payload.get("routes_file")
@@ -3897,11 +4362,14 @@ class GenerationService:
                 route_hits += 1
             for page in role_payload.get("pages") or []:
                 file_path = page.get("file_path")
+                route_path = str(page.get("route_path") or "")
+                if route_path:
+                    known_handoff_paths.add(route_path)
                 if isinstance(file_path, str) and file_path in operation_paths:
                     page_hits += 1
-        if route_hits < len(role_scope):
+        if route_hits < len(role_scope) and not route_manifest_touched:
             issues.append("Generated draft does not update the role route files for every selected role.")
-        if page_hits <= len(role_scope):
+        if page_hits < len(role_scope):
             issues.append("Generated draft still collapses the app into too few real page files.")
         if require_business_pages:
             for role in role_scope:
@@ -3926,15 +4394,212 @@ class GenerationService:
                     content = str(page_operation.content or "").lower() if page_operation is not None else ""
                     if not content:
                         continue
+                    route_path = str(page.get("route_path") or "")
+                    page_kind = str(page.get("page_kind") or "").strip().lower()
+                    is_profile_page = page_kind == "profile" or route_path.rstrip("/") == "/profile" or file_path.endswith("/profile.html")
                     loading_hits = content.count("loading")
                     dependency_count = len(page.get("data_dependencies") or [])
+                    if is_profile_page:
+                        for handoff_path in page.get("handoff_paths") or []:
+                            if isinstance(handoff_path, str) and handoff_path.strip() and handoff_path != route_path:
+                                if handoff_path not in known_handoff_paths:
+                                    issues.append(f"{file_path} references a non-canonical handoff path: {handoff_path}.")
+                        continue
                     if dependency_count == 0 and loading_hits > 0:
                         issues.append(f"{file_path} still uses loading-first copy even though the page has no declared data dependencies.")
                     if loading_hits >= 3 and len(content) < 2500:
                         issues.append(f"{file_path} is dominated by loading copy instead of real page content.")
-                    if any(token in content for token in ("placeholder", "coming soon", "todo", "tbd")):
+                    if GenerationService._contains_placeholder_surface(content):
                         issues.append(f"{file_path} still contains placeholder copy.")
+                    for handoff_path in page.get("handoff_paths") or []:
+                        if isinstance(handoff_path, str) and handoff_path.strip() and handoff_path != route_path:
+                            if handoff_path not in known_handoff_paths:
+                                issues.append(f"{file_path} references a non-canonical handoff path: {handoff_path}.")
         return issues
+
+    @staticmethod
+    def _contains_placeholder_surface(content: str) -> bool:
+        lowered = content.lower()
+        normalized = re.sub(r'placeholder\s*=\s*["\'][^"\']*["\']', "", lowered)
+        markers = (
+            "coming soon",
+            "todo",
+            "tbd",
+            ">placeholder<",
+            " placeholder text",
+            " replace this ",
+            " replace with ",
+            " generic content",
+            " sample placeholder",
+        )
+        return any(marker in normalized for marker in markers)
+
+    @staticmethod
+    def _build_stage_reports(
+        *,
+        page_graph: dict[str, Any],
+        role_scope: list[str],
+        realized_paths: set[str],
+    ) -> list[dict[str, Any]]:
+        planned_backend = {
+            str(path)
+            for path in [*(page_graph.get("backend_targets") or []), *(page_graph.get("shared_files") or [])]
+            if isinstance(path, str) and path.startswith("miniapp/app/")
+        }
+        role_page_paths = {
+            str(page.get("file_path"))
+            for role in role_scope
+            for page in (page_graph.get("roles", {}).get(role, {}) or {}).get("pages", [])
+            if isinstance(page, dict) and isinstance(page.get("file_path"), str)
+        }
+        required_manifests = {
+            "miniapp/app/generated/route_manifest.json",
+            "miniapp/app/generated/runtime_manifest.json",
+            "miniapp/app/generated/static_runtime_manifest.json",
+            "miniapp/app/generated/role_seed.json",
+            "artifacts/generated_app_graph.json",
+        }
+        backend_hits = sorted(path for path in planned_backend if path in realized_paths)
+        page_hits = sorted(path for path in role_page_paths if path in realized_paths)
+        manifest_hits = sorted(path for path in required_manifests if path in realized_paths)
+        return [
+            {
+                "stage": "runtime_backend_foundation",
+                "planned_files": sorted(planned_backend),
+                "created_files": backend_hits,
+                "completed": bool(planned_backend) and len(backend_hits) >= max(1, min(len(planned_backend), 3)),
+            },
+            {
+                "stage": "workflow_page_surfaces",
+                "planned_files": sorted(role_page_paths),
+                "created_files": page_hits,
+                "completed": len(page_hits) >= max(len(role_scope), len(role_page_paths) // 2 if role_page_paths else 0),
+            },
+            {
+                "stage": "integration_contract_completion",
+                "planned_files": sorted(required_manifests),
+                "created_files": manifest_hits,
+                "completed": "miniapp/app/generated/route_manifest.json" in manifest_hits
+                and "artifacts/generated_app_graph.json" in manifest_hits,
+            },
+        ]
+
+    @classmethod
+    def _build_materialization_report(
+        cls,
+        *,
+        execution_class: str,
+        page_graph: dict[str, Any],
+        role_scope: list[str],
+        realized_paths: set[str],
+    ) -> MaterializationReport:
+        planned_pages = [
+            str(page.get("file_path"))
+            for role in role_scope
+            for page in (page_graph.get("roles", {}).get(role, {}) or {}).get("pages", [])
+            if isinstance(page, dict) and isinstance(page.get("file_path"), str)
+        ]
+        expected_backend_files = [
+            str(path)
+            for path in [*(page_graph.get("backend_targets") or []), *(page_graph.get("shared_files") or [])]
+            if isinstance(path, str) and path.startswith("miniapp/app/")
+        ]
+        expected_manifests = [
+            "miniapp/app/generated/route_manifest.json",
+            "miniapp/app/generated/runtime_manifest.json",
+            "miniapp/app/generated/static_runtime_manifest.json",
+            "artifacts/generated_app_graph.json",
+        ]
+        missing_files = [path for path in planned_pages if path not in realized_paths]
+        missing_backend_files = [path for path in expected_backend_files if path not in realized_paths]
+        role_page_counts = {
+            role: sum(
+                1
+                for page in (page_graph.get("roles", {}).get(role, {}) or {}).get("pages", [])
+                if isinstance(page, dict) and str(page.get("file_path") or "") in realized_paths
+            )
+            for role in role_scope
+        }
+        backend_surface_ok = not missing_backend_files if expected_backend_files else execution_class == "shell_app"
+        page_surface_ok = not missing_files and all(count >= 2 for count in role_page_counts.values()) if execution_class != "shell_app" else all(count >= 1 for count in role_page_counts.values())
+        manifest_surface_ok = all(path in realized_paths for path in expected_manifests)
+        fell_back_to_template = execution_class != "shell_app" and not page_surface_ok and all(count <= 2 for count in role_page_counts.values())
+        return MaterializationReport(
+            execution_class=execution_class,  # type: ignore[arg-type]
+            planned_files=sorted(dict.fromkeys(planned_pages)),
+            created_files=sorted(realized_paths),
+            missing_files=sorted(dict.fromkeys(missing_files)),
+            expected_backend_files=sorted(dict.fromkeys(expected_backend_files)),
+            missing_backend_files=sorted(dict.fromkeys(missing_backend_files)),
+            backend_surface_ok=backend_surface_ok,
+            page_surface_ok=page_surface_ok,
+            manifest_surface_ok=manifest_surface_ok,
+            fell_back_to_template=fell_back_to_template,
+            role_page_counts=role_page_counts,
+            stage_reports=cls._build_stage_reports(page_graph=page_graph, role_scope=role_scope, realized_paths=realized_paths),
+        )
+
+    def _realized_draft_file_paths(self, workspace_id: str, run_id: str) -> set[str]:
+        return {
+            str(item.get("path"))
+            for item in self.workspace_service.file_tree(workspace_id, run_id=run_id)
+            if isinstance(item, dict) and item.get("type") == "file" and isinstance(item.get("path"), str)
+        }
+
+    @staticmethod
+    def _missing_required_cluster_targets(
+        *,
+        cluster_targets: list[str],
+        operations: list[DraftFileOperation],
+        file_contexts: dict[str, str],
+    ) -> list[str]:
+        operation_paths = {operation.file_path for operation in operations if operation.operation in {"create", "replace"} and operation.content is not None}
+        required_targets: list[str] = []
+        for path in cluster_targets:
+            existing_content = str(file_contexts.get(path) or "")
+            if existing_content.strip():
+                continue
+            if path.endswith((".css", ".js")) and "generated/" not in path and "/routes/" not in path:
+                continue
+            required_targets.append(path)
+        return [path for path in required_targets if path not in operation_paths]
+
+    @staticmethod
+    def _materialization_gate_result(
+        report: MaterializationReport,
+        *,
+        require_multi_page: bool,
+        scope_mode: str,
+        generation_mode: GenerationMode,
+    ) -> tuple[str, list[str]] | None:
+        if scope_mode == "minimal_patch":
+            return None
+        fast_mode = generation_mode == GenerationMode.FAST
+        if report.execution_class == "shell_app":
+            if report.missing_files:
+                return ("generation.edit.missing_planned_files", [f"Planned pages were not materialized: {', '.join(report.missing_files[:5])}"])
+            return None
+        if report.fell_back_to_template:
+            return (
+                "generation.edit.fell_back_to_template",
+                ["Draft collapsed back to the shell template instead of materializing the planned workflow pages."],
+            )
+        if report.missing_backend_files:
+            return (
+                "generation.edit.missing_backend_surface",
+                [f"Required backend workflow files were not materialized: {', '.join(report.missing_backend_files[:5])}"],
+            )
+        if not report.manifest_surface_ok and generation_mode == GenerationMode.QUALITY:
+            return (
+                "generation.edit.plan_not_materialized",
+                ["Generated runtime manifests were not materialized for the planned workflow app."],
+            )
+        if (report.missing_files and not fast_mode) or (require_multi_page and not report.page_surface_ok):
+            return (
+                "generation.edit.missing_planned_files",
+                [f"Planned workflow pages were not materialized: {', '.join(report.missing_files[:5])}"],
+            )
+        return None
 
     @staticmethod
     def _build_check_results(build_issues: list[ValidationIssue], preview_issue: ValidationIssue | None = None) -> list[RunCheckResult]:
@@ -4166,8 +4831,10 @@ class GenerationService:
                     "Prefer editing the existing generated files instead of creating new architecture.",
                     "Keep the diff minimal and preserve unrelated behavior.",
                     "Return operations only for files listed in target_files.",
+                    "Treat shared shell files, route-linked pages, and generated runtime artifacts as the primary repair surface when they appear in target_files.",
                     "If target_files is non-empty, operations must include at least one create/replace/delete for one of those files.",
                     "For connectivity missing_ui_loading_state or missing_ui_error_state, satisfy the validator with real loading/error containers, ids, or data-ui-state markers that match the current page contract.",
+                    "When a failure points to route or navigation mismatch, repair the page graph contract and the route-linked HTML files consistently.",
                     "Do not invent magic validator-only classes when the current validator contract does not require them.",
                     "Do not return a prose repair plan instead of file operations.",
                     "Do not leave operations empty when target_files is non-empty.",
@@ -4323,6 +4990,7 @@ class GenerationService:
                             "description": page.get("description"),
                             "purpose": page.get("purpose"),
                             "primary_actions": list((page.get("primary_actions") or [])[:6]),
+                            "handoff_paths": list((page.get("handoff_paths") or [])[:6]),
                             "data_dependencies": list((page.get("data_dependencies") or [])[:6]),
                             "loading_state": page.get("loading_state"),
                             "empty_state": page.get("empty_state"),
@@ -4360,6 +5028,40 @@ class GenerationService:
                     }
                 )
         return contracts[:12]
+
+    def _build_page_graph_verification_report(self, page_graph: dict[str, Any], role_scope: list[str]) -> dict[str, Any]:
+        roles = page_graph.get("roles") or {}
+        issues = self._page_graph_gate_issues(
+            page_graph,
+            role_scope,
+            scope_mode=str(page_graph.get("scope_mode") or "whole_file_build"),
+            require_multi_page=str(page_graph.get("flow_mode") or "single_page") == "multi_page",
+            require_business_pages=any(
+                len((roles.get(role) or {}).get("pages") or []) > 2
+                for role in role_scope
+            ),
+        )
+        role_summaries: dict[str, Any] = {}
+        for role in role_scope:
+            role_payload = roles.get(role) or {}
+            pages = role_payload.get("pages") or []
+            role_summaries[role] = {
+                "route_tree": [str(page.get("route_path") or "") for page in pages if isinstance(page, dict)],
+                "page_ids": [str(page.get("page_id") or "") for page in pages if isinstance(page, dict)],
+                "page_purposes": [str(page.get("purpose") or "") for page in pages if isinstance(page, dict)],
+                "handoff_paths": {
+                    str(page.get("page_id") or ""): list(page.get("handoff_paths") or [])
+                    for page in pages
+                    if isinstance(page, dict)
+                },
+            }
+        return {
+            "status": "passed" if not issues else "failed",
+            "role_scope": role_scope,
+            "summary": "Route and page-graph planning verification.",
+            "issues": issues,
+            "roles": role_summaries,
+        }
 
     @staticmethod
     def _failure_signature_for_issues(build_issues: list[ValidationIssue], preview_issue: ValidationIssue | None) -> str:
@@ -4438,6 +5140,30 @@ class GenerationService:
                 endpoint_name = match.group(1)
                 for candidate in (f"miniapp/app/routes/{endpoint_name}.py", "miniapp/app/main.py"):
                     if candidate not in expanded:
+                        expanded.append(candidate)
+                        added.append(candidate)
+            message = str(issue.message or "").lower()
+            if issue.code in {
+                "build.invalid_generated_app_graph",
+                "build.missing_role_routes",
+                "build.insufficient_routes",
+                "build.insufficient_pages",
+            } or any(marker in message for marker in ("route", "navigation", "manifest", "shared", "profile", "workspace", "workbench")):
+                for candidate in (
+                    "artifacts/generated_app_graph.json",
+                    "miniapp/app/static/shared/common.js",
+                    "miniapp/app/static/shared/base.css",
+                    "miniapp/app/generated/route_manifest.json",
+                    "miniapp/app/generated/runtime_manifest.json",
+                    "miniapp/app/generated/static_runtime_manifest.json",
+                    "miniapp/app/generated/role_seed.json",
+                    "miniapp/app/generated/role_experience.json",
+                ):
+                    if candidate not in expanded:
+                        expanded.append(candidate)
+                        added.append(candidate)
+                for candidate in active_targets:
+                    if candidate.startswith("miniapp/app/static/") and candidate.endswith((".html", ".js", ".css")) and candidate not in expanded:
                         expanded.append(candidate)
                         added.append(candidate)
         return list(dict.fromkeys(expanded)), list(dict.fromkeys(added))
@@ -5408,50 +6134,50 @@ class GenerationService:
             user_flows=[
                 UserFlow(
                     flow_id="flow_client_create",
-                    name="Client request creation",
-                    goal="Client submits a request and sees confirmation.",
+                    name="Client dashboard to detail flow",
+                    goal="Client reviews the overview, opens the workbench, and continues into a dedicated workspace.",
                     steps=[
                         FlowStep(step_id="step_client_home", order=1, actor_id="actor_client", action="Open the client home screen"),
-                        FlowStep(step_id="step_client_form", order=2, actor_id="actor_client", action="Navigate to the request form"),
-                        FlowStep(step_id="step_client_submit", order=3, actor_id="actor_client", action="Submit the request"),
+                        FlowStep(step_id="step_client_workbench", order=2, actor_id="actor_client", action="Open the workbench queue"),
+                        FlowStep(step_id="step_client_workspace", order=3, actor_id="actor_client", action="Continue into the workspace page"),
                     ],
-                    postconditions=["A new request is created and visible to the client."],
-                    acceptance_criteria=["The client can submit a request and open its detail page."],
+                    postconditions=["The client can move from overview into queue and detail views."],
+                    acceptance_criteria=["The client can open the workbench and continue into a dedicated workspace page."],
                     evidence=evidence,
                 ),
                 UserFlow(
                     flow_id="flow_specialist_process",
                     name="Specialist queue processing",
-                    goal="Specialist reviews the queue and updates request status.",
+                    goal="Specialist reviews the queue and updates item state from a dedicated workspace.",
                     steps=[
                         FlowStep(step_id="step_specialist_home", order=1, actor_id="actor_specialist", action="Open specialist dashboard"),
-                        FlowStep(step_id="step_specialist_queue", order=2, actor_id="actor_specialist", action="Open queue and claim an item"),
-                        FlowStep(step_id="step_specialist_update", order=3, actor_id="actor_specialist", action="Move request to in-progress or completed"),
+                        FlowStep(step_id="step_specialist_workbench", order=2, actor_id="actor_specialist", action="Open workbench and review queue items"),
+                        FlowStep(step_id="step_specialist_workspace", order=3, actor_id="actor_specialist", action="Open workspace and progress the selected item"),
                     ],
                     postconditions=["Queue state and metrics are updated."],
-                    acceptance_criteria=["The specialist can claim and complete requests."],
+                    acceptance_criteria=["The specialist can review queue items and complete work from the workspace page."],
                     evidence=evidence,
                 ),
                 UserFlow(
                     flow_id="flow_manager_control",
                     name="Manager oversight",
-                    goal="Manager views global metrics and rebalances workload.",
+                    goal="Manager views global metrics, reviews queue state, and rebalances workload.",
                     steps=[
                         FlowStep(step_id="step_manager_home", order=1, actor_id="actor_manager", action="Open manager home"),
-                        FlowStep(step_id="step_manager_dashboard", order=2, actor_id="actor_manager", action="Open control dashboard"),
-                        FlowStep(step_id="step_manager_rebalance", order=3, actor_id="actor_manager", action="Trigger load rebalance"),
+                        FlowStep(step_id="step_manager_workbench", order=2, actor_id="actor_manager", action="Open control workbench"),
+                        FlowStep(step_id="step_manager_workspace", order=3, actor_id="actor_manager", action="Inspect a focused workspace and trigger load rebalance"),
                     ],
                     postconditions=["Control metrics reflect the current workload and SLA."],
-                    acceptance_criteria=["The manager can see role health and trigger a control action."],
+                    acceptance_criteria=["The manager can see role health, open the workbench, and trigger a control action."],
                     evidence=evidence,
                 ),
             ],
             ui_requirements=[
                 UIRequirement(req_id="ui_client_home", category="screen", description="Provide a client landing page with metrics and primary actions.", priority="must", evidence=evidence, screen_hint="client_home"),
-                UIRequirement(req_id="ui_client_form", category="form", description="Render a multi-field request form with validation and confirmation.", priority="must", evidence=evidence, screen_hint="client_form"),
-                UIRequirement(req_id="ui_client_requests", category="navigation", description="Allow the client to browse own requests and open detail pages.", priority="must", evidence=evidence, screen_hint="client_requests"),
-                UIRequirement(req_id="ui_specialist_queue", category="screen", description="Render a specialist queue with next actions and request details.", priority="must", evidence=evidence, screen_hint="specialist_queue"),
-                UIRequirement(req_id="ui_manager_dashboard", category="screen", description="Render a manager dashboard with metrics, alerts, and control actions.", priority="must", evidence=evidence, screen_hint="manager_dashboard"),
+                UIRequirement(req_id="ui_client_workbench", category="screen", description="Render a client workbench with list items and route-based continuation into a detail page.", priority="must", evidence=evidence, screen_hint="client_workbench"),
+                UIRequirement(req_id="ui_specialist_workbench", category="screen", description="Render a specialist workbench with next actions and request details.", priority="must", evidence=evidence, screen_hint="specialist_workbench"),
+                UIRequirement(req_id="ui_manager_workbench", category="screen", description="Render a manager workbench with metrics, queue context, and control actions.", priority="must", evidence=evidence, screen_hint="manager_workbench"),
+                UIRequirement(req_id="ui_workspace_page", category="screen", description="Render a module-oriented workspace page for focused detail work.", priority="must", evidence=evidence, screen_hint="client_workspace"),
                 UIRequirement(req_id="ui_theme", category="theme", description=f"Respect {target_label} theme and viewport constraints.", priority="should", evidence=evidence),
             ],
             api_requirements=[
@@ -5481,7 +6207,7 @@ class GenerationService:
                     name="Create request",
                     method="POST",
                     path="/api/submissions",
-                    purpose="Persist user request submissions and expose them in queue/dashboard views.",
+                    purpose="Persist workflow records and expose them in dashboard, workbench, and workspace views.",
                     request_fields=[APIField(name=field.name, type=field.type, required=field.required) for field in entity_attributes],
                     response_fields=[
                         APIField(name="submission_id", type="uuid", required=True),
@@ -5595,19 +6321,18 @@ class GenerationService:
 
     def _build_scenario_graph(self, spec: GroundedSpecModel) -> dict[str, Any]:
         roles = {
-            "client": ["client_home", "client_form", "client_requests", "client_detail", "client_success", "client_profile"],
-            "specialist": ["specialist_home", "specialist_queue", "specialist_detail", "specialist_profile"],
-            "manager": ["manager_home", "manager_dashboard", "manager_records", "manager_profile"],
+            "client": ["client_home", "client_workbench", "client_workspace", "client_profile"],
+            "specialist": ["specialist_home", "specialist_workbench", "specialist_workspace", "specialist_profile"],
+            "manager": ["manager_home", "manager_workbench", "manager_workspace", "manager_profile"],
         }
         transitions = [
-            ("client_home", "client_form"),
-            ("client_home", "client_requests"),
-            ("client_form", "client_success"),
-            ("client_requests", "client_detail"),
-            ("specialist_home", "specialist_queue"),
-            ("specialist_queue", "specialist_detail"),
-            ("manager_home", "manager_dashboard"),
-            ("manager_dashboard", "manager_records"),
+            ("client_home", "client_workbench"),
+            ("client_home", "client_workspace"),
+            ("client_workbench", "client_workspace"),
+            ("specialist_home", "specialist_workbench"),
+            ("specialist_workbench", "specialist_workspace"),
+            ("manager_home", "manager_workbench"),
+            ("manager_workbench", "manager_workspace"),
         ]
         nodes = sorted({screen_id for role_nodes in roles.values() for screen_id in role_nodes})
         edges = [{"from": source, "to": target} for source, target in transitions]
@@ -5628,8 +6353,8 @@ class GenerationService:
         primary_entity = spec.domain_entities[0]
         variables = self._build_variables(primary_entity.attributes)
         screens = self._build_screens(primary_entity, spec.product_goal)
-        transitions = self._build_transitions()
-        route_groups = self._build_route_groups()
+        transitions = self._build_transitions(spec.product_goal)
+        route_groups = self._build_route_groups(spec.product_goal)
         integrations = self._build_integrations(primary_entity.attributes, target_platform)
         traceability = self._build_traceability(route_groups, integrations, screens, spec)
         return AppIRModel(
@@ -5644,7 +6369,7 @@ class GenerationService:
             platform=target_platform,
             preview_profile=self._preview_profile(spec.preview_profile),
             entry_screen_id="client_home",
-            terminal_screen_ids=["client_success"],
+            terminal_screen_ids=["client_profile", "specialist_profile", "manager_profile"],
             variables=variables,
             entities=[
                 Entity(
@@ -5665,8 +6390,8 @@ class GenerationService:
             screens=screens,
             transitions=transitions,
             route_groups=route_groups,
-            screen_data_sources=self._build_screen_data_sources(),
-            role_action_groups=self._build_role_action_groups(),
+            screen_data_sources=self._build_screen_data_sources(spec.product_goal),
+            role_action_groups=self._build_role_action_groups(spec.product_goal),
             integrations=integrations,
             storage_bindings=[
                 StorageBinding(
@@ -5747,12 +6472,15 @@ class GenerationService:
         generation_mode: GenerationMode,
     ) -> ArtifactPlanModel:
         runtime_manifest = self._build_runtime_manifest(spec, ir, generation_mode)
+        route_manifest = self._build_route_manifest(runtime_manifest)
         runtime_state = self._build_runtime_state(spec, ir, generation_mode)
         role_seed = self._build_role_seed(runtime_manifest, runtime_state)
         role_experience = {
             role: {
                 "title": payload["title"],
                 "featureText": payload["feature_text"],
+                "routeTree": payload["route_tree"],
+                "primaryPages": payload["pages"],
             }
             for role, payload in role_seed["roles"].items()
         }
@@ -5771,6 +6499,14 @@ class GenerationService:
                 file_path="miniapp/app/generated/app_ir.json",
                 content=json_dumps(ir.model_dump(mode="json")),
                 explanation="Persist the current typed AppIR for the template miniapp.",
+                trace_refs=["prompt-source"],
+            ),
+            PatchOperationModel(
+                operation_id="op_route_manifest",
+                op="update",
+                file_path="miniapp/app/generated/route_manifest.json",
+                content=json_dumps(route_manifest),
+                explanation="Persist the canonical role route manifest used by the lightweight template runtime.",
                 trace_refs=["prompt-source"],
             ),
             PatchOperationModel(
@@ -5825,7 +6561,7 @@ class GenerationService:
         return ArtifactPlanModel(
             plan_id=new_id("artifact_plan"),
             workspace_id=workspace_id,
-            summary="Compile grounded artifacts into the canonical multi-page role runtime.",
+            summary="Compile grounded artifacts into the generated role runtime.",
             operations=operations,
         )
 
@@ -5879,37 +6615,54 @@ class GenerationService:
         ui_variant = self._select_ui_variant(spec.product_goal)
         layout_variant = self._select_layout_variant(spec.product_goal, ui_variant)
         theme_palette = self._select_theme_palette(spec.product_goal, ui_variant)
+        screens_by_id = {screen.screen_id: screen for screen in ir.screens}
+        routes_by_role = {group.role: group for group in ir.route_groups}
+        data_sources = {source.screen_id: source for source in ir.screen_data_sources}
         roles: dict[str, Any] = {}
         for role in ROLE_ORDER:
             role_records = self._records_for_role(role, records)
-            screen_id = f"{role}_workspace"
-            route_id = f"route_{role}_workspace"
-            role_screens = {
-                screen_id: {
-                    "screen_id": screen_id,
-                    "path": "/",
-                    "title": self._title_for_role(role, flow_label, ui_variant),
-                    "subtitle": self._role_body(role, flow_label, ui_variant),
-                    "kind": "workspace",
+            route_group = routes_by_role.get(role)
+            role_routes = list(route_group.routes) if route_group is not None else []
+            role_screens: dict[str, Any] = {}
+            for route in role_routes:
+                screen = screens_by_id.get(route.screen_id)
+                if screen is None:
+                    continue
+                runtime_kind = self._runtime_screen_kind(screen, route.path)
+                handoff_paths = self._route_handoffs_for_runtime(route.screen_id, role_routes)
+                role_screens[route.screen_id] = {
+                    "screen_id": route.screen_id,
+                    "path": route.path,
+                    "title": screen.title,
+                    "subtitle": screen.subtitle or self._default_page_purpose(role, runtime_kind, route_path=route.path),
+                    "kind": runtime_kind,
+                    "page_purpose": self._screen_runtime_purpose(role, screen, route.path),
+                    "handoff_paths": handoff_paths,
                     "components": [],
-                    "actions": [],
-                    "sections": self._freeform_role_sections(role, entity, role_records, spec.product_goal, ui_variant, layout_variant),
+                    "actions": [
+                        self._runtime_action_payload(action, role_routes, ui_variant, flow_label)
+                        for action in screen.actions
+                    ],
+                    "sections": self._screen_sections(role, route.screen_id, screen.kind, entity, role_records, spec.product_goal, ui_variant, layout_variant),
+                    "state_key": (data_sources.get(route.screen_id).state_key if data_sources.get(route.screen_id) is not None else None),
                 }
-            }
             roles[role] = {
-                "entry_path": "/",
+                "entry_path": route_group.entry_path if route_group is not None else "/",
+                "route_tree": [route.path for route in role_routes],
                 "routes": [
                     {
-                        "route_id": route_id,
+                        "route_id": route.route_id,
                         "role": role,
-                        "path": "/",
-                        "screen_id": screen_id,
-                        "label": "Workspace",
-                        "is_entry": True,
+                        "path": route.path,
+                        "screen_id": route.screen_id,
+                        "label": route.label or (screens_by_id.get(route.screen_id).title if screens_by_id.get(route.screen_id) is not None else route.path),
+                        "is_entry": route.is_entry,
                     }
+                    for route in role_routes
                 ],
                 "screens": role_screens,
-                "navigation": [],
+                "action_model": self._runtime_action_model(role_screens),
+                "navigation": self._runtime_navigation_items(role_routes, ui_variant, layout_variant),
             }
         return {
             "app": {
@@ -5921,11 +6674,47 @@ class GenerationService:
                 "theme": theme_palette,
                 "platform": spec.target_platform,
                 "preview_profile": spec.preview_profile,
-                "route_count": len(ROLE_ORDER),
-                "screen_count": len(ROLE_ORDER),
+                "route_count": sum(len(payload["routes"]) for payload in roles.values()),
+                "screen_count": sum(len(payload["screens"]) for payload in roles.values()),
             },
             "roles": roles,
         }
+
+    @staticmethod
+    def _build_route_manifest(runtime_manifest: dict[str, Any]) -> dict[str, Any]:
+        roles: dict[str, Any] = {}
+        for role, payload in (runtime_manifest.get("roles") or {}).items():
+            if role not in ROLE_ORDER or not isinstance(payload, dict):
+                continue
+            pages: list[dict[str, Any]] = []
+            for route in payload.get("routes") or []:
+                if not isinstance(route, dict):
+                    continue
+                route_path = str(route.get("path") or "/").strip() or "/"
+                route_path = "/" if route_path == "/" else f"/{route_path.strip('/')}"
+                slug = route_path.strip("/").replace("/", "-")
+                file_name = "index.html" if route_path == "/" else f"{slug}.html"
+                screen = ((payload.get("screens") or {}) or {}).get(route.get("screen_id")) or {}
+                pages.append(
+                    {
+                        "page_id": str(route.get("screen_id") or route.get("route_id") or f"{role}_{len(pages) + 1}"),
+                        "route_path": route_path,
+                        "file_path": f"miniapp/app/static/{role}/{file_name}",
+                        "page_kind": str(screen.get("kind") or "page"),
+                        "navigation_label": str(route.get("label") or screen.get("title") or "Open"),
+                        "title": str(screen.get("title") or route.get("label") or "Page"),
+                        "is_entry": bool(route.get("is_entry") or route_path == "/"),
+                    }
+                )
+            if not pages:
+                pages = GenerationService._fallback_page_contract(role, require_multi_page=False)
+                for page in pages:
+                    page["is_entry"] = True
+            roles[role] = {
+                "entry_path": str(payload.get("entry_path") or "/"),
+                "pages": pages,
+            }
+        return {"roles": roles}
 
     @staticmethod
     def _select_ui_variant(prompt: str) -> str:
@@ -6016,18 +6805,95 @@ class GenerationService:
         role_seed = {"roles": {}}
         for role in ROLE_ORDER:
             role_manifest = runtime_manifest["roles"][role]
-            home_screen = next(iter(role_manifest["screens"].values()))
+            screen_items = list(role_manifest["screens"].values())
+            home_screen = next((screen for screen in screen_items if screen.get("path") == "/"), screen_items[0])
+            extra_routes = [route for route in role_manifest.get("routes", []) if route.get("path") != "/"]
             role_state = runtime_state["roles"][role]
             role_seed["roles"][role] = {
                 "title": home_screen["title"],
                 "description": home_screen["subtitle"] or runtime_manifest["app"]["goal"],
                 "feature_text": self._seed_feature_text(home_screen, runtime_manifest["app"]["goal"]),
                 "primary_action_label": home_screen["actions"][0]["label"] if home_screen["actions"] else "Open",
-                "secondary_action_label": "Profile",
+                "secondary_action_label": str(extra_routes[0].get("label") or "Explore") if extra_routes else "Explore",
+                "route_tree": list(role_manifest.get("route_tree") or []),
+                "pages": [
+                    {
+                        "screen_id": screen["screen_id"],
+                        "path": screen["path"],
+                        "kind": screen["kind"],
+                        "title": screen["title"],
+                        "page_purpose": screen.get("page_purpose"),
+                        "handoff_paths": list(screen.get("handoff_paths") or []),
+                    }
+                    for screen in role_manifest["screens"].values()
+                ],
                 "metrics": role_state["metrics"],
                 "profile": role_state["profile"],
             }
         return role_seed
+
+    @staticmethod
+    def _runtime_screen_kind(screen: Screen, route_path: str) -> str:
+        if route_path == "/":
+            return "dashboard"
+        if route_path.endswith("/profile") or screen.kind == "info":
+            return "profile"
+        if screen.kind == "list":
+            return "list"
+        if screen.kind in {"details", "confirm", "success", "error"}:
+            return "workspace"
+        if screen.kind == "form":
+            return "form"
+        return "page"
+
+    def _screen_runtime_purpose(self, role: str, screen: Screen, route_path: str) -> str:
+        return screen.subtitle or self._default_page_purpose(role, self._runtime_screen_kind(screen, route_path), route_path=route_path)
+
+    def _route_handoffs_for_runtime(self, screen_id: str, role_routes: list[RouteDefinition]) -> list[str]:
+        route_by_screen = {route.screen_id: route for route in role_routes}
+        current = route_by_screen.get(screen_id)
+        if current is None:
+            return []
+        handoffs: list[str] = []
+        for route in role_routes:
+            if route.screen_id == screen_id:
+                continue
+            handoffs.append(route.path)
+        return list(dict.fromkeys(handoffs))
+
+    def _runtime_action_payload(
+        self,
+        action: Action,
+        role_routes: list[RouteDefinition],
+        ui_variant: str,
+        flow_label: str,
+    ) -> dict[str, Any]:
+        target_path = None
+        if action.target_screen_id:
+            target_path = next((route.path for route in role_routes if route.screen_id == action.target_screen_id), None)
+        return {
+            "action_id": action.action_id,
+            "label": self._action_label(action.action_id, ui_variant, flow_label),
+            "target_path": target_path,
+            "type": action.type,
+        }
+
+    @staticmethod
+    def _runtime_action_model(role_screens: dict[str, Any]) -> dict[str, list[str]]:
+        model: dict[str, list[str]] = {}
+        for screen in role_screens.values():
+            model[str(screen.get("kind") or "page")] = [str(action.get("action_id") or "") for action in screen.get("actions") or [] if isinstance(action, dict)]
+        return model
+
+    @staticmethod
+    def _runtime_navigation_items(role_routes: list[RouteDefinition], ui_variant: str, layout_variant: str) -> list[dict[str, str]]:
+        items = [{"label": str(route.label or route.path), "path": route.path} for route in role_routes]
+        if layout_variant == "minimal" and len(items) > 3:
+            profile = [item for item in items if item["path"].endswith("/profile") or item["path"] == "/profile"]
+            primary = [item for item in items if item["path"] == "/"][:1]
+            secondary = [item for item in items if item["path"] not in {"/", "/profile"}][:1]
+            return primary + secondary + profile
+        return items
 
     @staticmethod
     def _seed_feature_text(screen: dict[str, Any], fallback: str) -> str:
@@ -6103,29 +6969,6 @@ class GenerationService:
     def _build_screens(self, entity: DomainEntity, prompt: str) -> list[Screen]:
         flow_label = self._flow_label(prompt, entity)
         entity_title = self._entity_title(entity)
-        entity_plural = self._entity_plural(entity)
-        form_components = [
-            Component(
-                component_id=f"cmp_form_{attribute.name}",
-                type=self._component_type(attribute.type),
-                label=attribute.name.replace("_", " ").title(),
-                binding_variable_id=f"var_{attribute.name}",
-                required=attribute.required,
-                validators=self._component_validators(attribute),
-                placeholder=f"Enter {attribute.name.replace('_', ' ')}",
-            )
-            for attribute in entity.attributes
-        ]
-        form_components.append(
-            Component(
-                component_id="cmp_form_submit",
-                type="button",
-                label="Submit request",
-                binding_variable_id="var_request_id",
-                required=False,
-                validators=[],
-            )
-        )
 
         def screen(screen_id: str, kind: str, title: str, subtitle: str, actions: list[Action], components: list[Component] | None = None) -> Screen:
             return Screen(
@@ -6143,212 +6986,241 @@ class GenerationService:
                 ),
             )
 
-        return [
-            screen(
-                "client_home",
-                "landing",
-                f"{entity_title} home",
-                f"Create, monitor, and manage your {flow_label} lifecycle end-to-end.",
-                [
-                    Action(action_id="client_open_form", type="navigate", target_screen_id="client_form"),
-                    Action(action_id="client_open_requests", type="navigate", target_screen_id="client_requests"),
-                    Action(action_id="client_open_profile", type="navigate", target_screen_id="client_profile"),
-                ],
-            ),
-            screen(
-                "client_form",
-                "form",
-                f"Create {flow_label}",
-                f"Provide complete details, validate inputs, and submit into the shared operational workflow.",
-                [
-                    Action(
-                        action_id="client_submit_request",
-                        type="submit_form",
-                        source_component_id="cmp_form_submit",
-                        integration_id="integration_submit_request",
-                        input_variable_ids=[f"var_{attribute.name}" for attribute in entity.attributes],
-                        success_transition_id="transition_client_success",
-                        error_transition_id="transition_client_form_error",
+        screens: list[Screen] = []
+        for role in ROLE_ORDER:
+            for page in self._role_runtime_page_plan(prompt, role):
+                screens.append(
+                    screen(
+                        page["screen_id"],
+                        page["kind"],
+                        page["title"].format(entity_title=entity_title),
+                        page["subtitle"].format(flow_label=flow_label),
+                        [
+                            Action(
+                                action_id=action["action_id"],
+                                type=action["type"],
+                                target_screen_id=action.get("target_screen_id"),
+                                integration_id=action.get("integration_id"),
+                            )
+                            for action in page["actions"]
+                        ],
                     )
-                ],
-                form_components,
-            ),
-            screen(
-                "client_requests",
-                "list",
-                f"My {entity_plural}",
-                f"Browse active, pending, and completed {flow_label} records.",
-                [
-                    Action(action_id="client_open_request_detail", type="navigate", target_screen_id="client_detail"),
-                    Action(action_id="client_open_form_inline", type="navigate", target_screen_id="client_form"),
-                ],
-            ),
-            screen(
-                "client_detail",
-                "details",
-                f"{entity_title} detail",
-                f"Inspect status history, ownership, timeline, and next actions for this {flow_label}.",
-                [Action(action_id="client_back_to_requests", type="navigate", target_screen_id="client_requests")],
-            ),
-            screen(
-                "client_success",
-                "success",
-                f"{entity_title} submitted",
-                f"The {flow_label} was persisted and routed to downstream processing.",
-                [
-                    Action(action_id="client_success_to_requests", type="navigate", target_screen_id="client_requests"),
-                    Action(action_id="client_success_to_home", type="navigate", target_screen_id="client_home"),
-                ],
-            ),
-            screen(
-                "client_profile",
-                "info",
-                "Client profile",
-                f"Manage contact and preference details used throughout {flow_label} execution.",
-                [Action(action_id="client_profile_save", type="call_api", integration_id="integration_save_profile")],
-            ),
-            screen(
-                "specialist_home",
-                "landing",
-                f"{entity_title} operations",
-                f"Review incoming {flow_label} workload, priorities, and next actions.",
-                [
-                    Action(action_id="specialist_open_queue", type="navigate", target_screen_id="specialist_queue"),
-                    Action(action_id="specialist_open_profile", type="navigate", target_screen_id="specialist_profile"),
-                ],
-            ),
-            screen(
-                "specialist_queue",
-                "list",
-                f"{entity_title} worklist",
-                f"Claim {flow_label} items, execute processing steps, and update lifecycle status.",
-                [
-                    Action(action_id="specialist_claim_next", type="call_api", integration_id="integration_runtime_action"),
-                    Action(action_id="specialist_open_detail", type="navigate", target_screen_id="specialist_detail"),
-                ],
-            ),
-            screen(
-                "specialist_detail",
-                "details",
-                f"{entity_title} details",
-                f"Review full {flow_label} context and apply controlled status transitions.",
-                [
-                    Action(action_id="specialist_mark_in_progress", type="call_api", integration_id="integration_runtime_action"),
-                    Action(action_id="specialist_complete_request", type="call_api", integration_id="integration_runtime_action"),
-                ],
-            ),
-            screen(
-                "specialist_profile",
-                "info",
-                "Specialist profile",
-                f"Adjust specialist data and operational preferences used in {flow_label} handling.",
-                [Action(action_id="specialist_profile_save", type="call_api", integration_id="integration_save_profile")],
-            ),
-            screen(
-                "manager_home",
-                "landing",
-                f"{entity_title} overview",
-                f"Inspect {flow_label} throughput, bottlenecks, and control actions across the full pipeline.",
-                [
-                    Action(action_id="manager_open_dashboard", type="navigate", target_screen_id="manager_dashboard"),
-                    Action(action_id="manager_open_profile", type="navigate", target_screen_id="manager_profile"),
-                ],
-            ),
-            screen(
-                "manager_dashboard",
-                "list",
-                f"{entity_title} operations board",
-                f"Review aggregate {flow_label} metrics, SLA risks, and control decisions.",
-                [
-                    Action(action_id="manager_rebalance", type="call_api", integration_id="integration_runtime_action"),
-                    Action(action_id="manager_open_records", type="navigate", target_screen_id="manager_records"),
-                ],
-            ),
-            screen(
-                "manager_records",
-                "details",
-                f"All {entity_plural}",
-                f"Inspect {flow_label} records by status, ownership, and escalation state.",
-                [Action(action_id="manager_refresh_records", type="call_api", integration_id="integration_runtime_action")],
-            ),
-            screen(
-                "manager_profile",
-                "info",
-                "Manager profile",
-                f"Manage governance and notification preferences for {flow_label} operations.",
-                [Action(action_id="manager_profile_save", type="call_api", integration_id="integration_save_profile")],
-            ),
-        ]
+                )
+        return screens
 
-    def _build_transitions(self) -> list[Transition]:
-        return [
-            Transition(transition_id="transition_client_to_form", from_screen_id="client_home", to_screen_id="client_form", trigger="open_form"),
-            Transition(transition_id="transition_client_to_requests", from_screen_id="client_home", to_screen_id="client_requests", trigger="open_requests"),
-            Transition(transition_id="transition_client_success", from_screen_id="client_form", to_screen_id="client_success", trigger="submit_success"),
-            Transition(transition_id="transition_client_form_error", from_screen_id="client_form", to_screen_id="client_form", trigger="submit_error"),
-            Transition(transition_id="transition_client_detail", from_screen_id="client_requests", to_screen_id="client_detail", trigger="open_detail"),
-            Transition(transition_id="transition_specialist_queue", from_screen_id="specialist_home", to_screen_id="specialist_queue", trigger="open_queue"),
-            Transition(transition_id="transition_specialist_detail", from_screen_id="specialist_queue", to_screen_id="specialist_detail", trigger="open_detail"),
-            Transition(transition_id="transition_manager_dashboard", from_screen_id="manager_home", to_screen_id="manager_dashboard", trigger="open_dashboard"),
-            Transition(transition_id="transition_manager_records", from_screen_id="manager_dashboard", to_screen_id="manager_records", trigger="open_records"),
-        ]
+    def _role_runtime_page_plan(self, prompt: str, role: str) -> list[dict[str, Any]]:
+        lowered = prompt.lower()
+        has_workbench = any(marker in lowered for marker in ("queue", "workbench", "list", "records", "orders", "backlog", "task"))
+        has_workspace = any(marker in lowered for marker in ("workspace", "detail", "details", "module", "editor", "review", "audit"))
+        has_profile = True
+        if self._is_commerce_prompt(prompt) or len(re.findall(r"\bpage\b|\bpages\b", lowered)) >= 2:
+            has_workbench = True
+            has_workspace = True
+        plans = {
+            "client": {
+                "home": {
+                    "kind": "landing",
+                    "title": "{entity_title} overview",
+                    "subtitle": "Review the current {flow_label} state, inspect summary metrics, and open dedicated pages for deeper work.",
+                },
+                "workbench": {
+                    "kind": "list",
+                    "title": "{entity_title} workbench",
+                    "subtitle": "Browse queued {flow_label} items and continue the next relevant record from a dedicated list view.",
+                },
+                "workspace": {
+                    "kind": "details",
+                    "title": "{entity_title} workspace",
+                    "subtitle": "Inspect focused detail modules, supporting context, and next actions for the selected {flow_label} item.",
+                },
+                "profile": {
+                    "kind": "info",
+                    "title": "Client profile",
+                    "subtitle": "Manage contact and identity details used throughout {flow_label} execution.",
+                },
+            },
+            "specialist": {
+                "home": {
+                    "kind": "landing",
+                    "title": "{entity_title} operations",
+                    "subtitle": "Review incoming {flow_label} workload, summary metrics, and route into dedicated operational pages.",
+                },
+                "workbench": {
+                    "kind": "list",
+                    "title": "{entity_title} workbench",
+                    "subtitle": "Review queue-driven {flow_label} work, claim the next item, and route into focused detail handling.",
+                },
+                "workspace": {
+                    "kind": "details",
+                    "title": "{entity_title} workspace",
+                    "subtitle": "Review full {flow_label} context, supporting modules, and apply controlled status transitions.",
+                },
+                "profile": {
+                    "kind": "info",
+                    "title": "Specialist profile",
+                    "subtitle": "Adjust specialist data and operational preferences used in {flow_label} handling.",
+                },
+            },
+            "manager": {
+                "home": {
+                    "kind": "landing",
+                    "title": "{entity_title} overview",
+                    "subtitle": "Inspect {flow_label} throughput, bottlenecks, and route into dedicated control pages across the full pipeline.",
+                },
+                "workbench": {
+                    "kind": "list",
+                    "title": "{entity_title} workbench",
+                    "subtitle": "Review aggregate {flow_label} records, control queue priorities, and choose the next item for deeper inspection.",
+                },
+                "workspace": {
+                    "kind": "details",
+                    "title": "{entity_title} workspace",
+                    "subtitle": "Inspect detailed {flow_label} modules, supporting records, and escalation context.",
+                },
+                "profile": {
+                    "kind": "info",
+                    "title": "Manager profile",
+                    "subtitle": "Manage governance and notification preferences for {flow_label} operations.",
+                },
+            },
+        }
+        sequence = ["home"]
+        if has_workbench:
+            sequence.append("workbench")
+        if has_workspace:
+            sequence.append("workspace")
+        if has_profile:
+            sequence.append("profile")
+        pages: list[dict[str, Any]] = []
+        for slug in sequence:
+            config = plans[role][slug]
+            screen_id = f"{role}_{slug}"
+            actions = self._runtime_page_actions(
+                role,
+                slug,
+                has_workbench=has_workbench,
+                has_workspace=has_workspace,
+                has_profile=has_profile,
+            )
+            pages.append(
+                {
+                    "screen_id": screen_id,
+                    "slug": slug,
+                    "kind": config["kind"],
+                    "title": config["title"],
+                    "subtitle": config["subtitle"],
+                    "actions": actions,
+                }
+            )
+        return pages
 
-    def _build_route_groups(self) -> list[RoleRouteGroup]:
+    @staticmethod
+    def _runtime_page_actions(
+        role: str,
+        slug: str,
+        *,
+        has_workbench: bool,
+        has_workspace: bool,
+        has_profile: bool,
+    ) -> list[dict[str, str]]:
+        if slug == "home":
+            actions: list[dict[str, str]] = []
+            if has_workbench:
+                actions.append({"action_id": f"{role}_open_workbench", "type": "navigate", "target_screen_id": f"{role}_workbench"})
+            if has_workspace:
+                actions.append({"action_id": f"{role}_open_workspace", "type": "navigate", "target_screen_id": f"{role}_workspace"})
+            if has_profile:
+                actions.append({"action_id": f"{role}_open_profile", "type": "navigate", "target_screen_id": f"{role}_profile"})
+            return actions
+        if slug == "workbench":
+            actions = []
+            if has_workspace:
+                actions.append({"action_id": f"{role}_open_workspace_from_workbench", "type": "navigate", "target_screen_id": f"{role}_workspace"})
+            actions.append({"action_id": f"{role}_refresh_workbench", "type": "call_api", "integration_id": "integration_runtime_action"})
+            return actions
+        if slug == "workspace":
+            actions = []
+            if has_workbench:
+                actions.append({"action_id": f"{role}_back_to_workbench", "type": "navigate", "target_screen_id": f"{role}_workbench"})
+            if role == "client":
+                actions.append({"action_id": "client_workspace_continue", "type": "call_api", "integration_id": "integration_runtime_action"})
+            elif role == "specialist":
+                actions.extend(
+                    [
+                        {"action_id": "specialist_mark_in_progress", "type": "call_api", "integration_id": "integration_runtime_action"},
+                        {"action_id": "specialist_complete_request", "type": "call_api", "integration_id": "integration_runtime_action"},
+                    ]
+                )
+            else:
+                actions.append({"action_id": "manager_refresh_records", "type": "call_api", "integration_id": "integration_runtime_action"})
+            return actions
+        return [{"action_id": f"{role}_profile_save", "type": "call_api", "integration_id": "integration_save_profile"}]
+
+    def _build_transitions(self, prompt: str) -> list[Transition]:
+        transitions: list[Transition] = []
+        for role in ROLE_ORDER:
+            page_slugs = {page["slug"] for page in self._role_runtime_page_plan(prompt, role)}
+            if "workbench" in page_slugs:
+                transitions.append(Transition(transition_id=f"transition_{role}_workbench", from_screen_id=f"{role}_home", to_screen_id=f"{role}_workbench", trigger="open_workbench"))
+            if "workspace" in page_slugs:
+                transitions.append(Transition(transition_id=f"transition_{role}_workspace", from_screen_id=f"{role}_home", to_screen_id=f"{role}_workspace", trigger="open_workspace"))
+            if "profile" in page_slugs:
+                transitions.append(Transition(transition_id=f"transition_{role}_profile", from_screen_id=f"{role}_home", to_screen_id=f"{role}_profile", trigger="open_profile"))
+            if "workbench" in page_slugs and "workspace" in page_slugs:
+                transitions.append(Transition(transition_id=f"transition_{role}_workspace_from_workbench", from_screen_id=f"{role}_workbench", to_screen_id=f"{role}_workspace", trigger="open_detail"))
+        return transitions
+
+    def _build_route_groups(self, prompt: str) -> list[RoleRouteGroup]:
         return [
             RoleRouteGroup(
-                role="client",
+                role=role,
                 entry_path="/",
                 routes=[
-                    RouteDefinition(route_id="route_client_home", role="client", path="/", screen_id="client_home", label="Home", is_entry=True),
-                    RouteDefinition(route_id="route_client_form", role="client", path="/book", screen_id="client_form", label="Book"),
-                    RouteDefinition(route_id="route_client_requests", role="client", path="/requests", screen_id="client_requests", label="Requests"),
-                    RouteDefinition(route_id="route_client_detail", role="client", path="/requests/detail", screen_id="client_detail", label="Detail"),
-                    RouteDefinition(route_id="route_client_success", role="client", path="/success", screen_id="client_success", label="Success"),
-                    RouteDefinition(route_id="route_client_profile", role="client", path="/profile", screen_id="client_profile", label="Profile"),
+                    RouteDefinition(
+                        route_id=f"route_{page['screen_id']}",
+                        role=role,
+                        path="/" if page["slug"] == "home" else f"/{page['slug']}",
+                        screen_id=page["screen_id"],
+                        label=page["slug"].title() if page["slug"] != "home" else "Home",
+                        is_entry=page["slug"] == "home",
+                    )
+                    for page in self._role_runtime_page_plan(prompt, role)
                 ],
-            ),
-            RoleRouteGroup(
-                role="specialist",
-                entry_path="/",
-                routes=[
-                    RouteDefinition(route_id="route_specialist_home", role="specialist", path="/", screen_id="specialist_home", label="Home", is_entry=True),
-                    RouteDefinition(route_id="route_specialist_queue", role="specialist", path="/queue", screen_id="specialist_queue", label="Queue"),
-                    RouteDefinition(route_id="route_specialist_detail", role="specialist", path="/queue/detail", screen_id="specialist_detail", label="Detail"),
-                    RouteDefinition(route_id="route_specialist_profile", role="specialist", path="/profile", screen_id="specialist_profile", label="Profile"),
-                ],
-            ),
-            RoleRouteGroup(
-                role="manager",
-                entry_path="/",
-                routes=[
-                    RouteDefinition(route_id="route_manager_home", role="manager", path="/", screen_id="manager_home", label="Home", is_entry=True),
-                    RouteDefinition(route_id="route_manager_dashboard", role="manager", path="/dashboard", screen_id="manager_dashboard", label="Dashboard"),
-                    RouteDefinition(route_id="route_manager_records", role="manager", path="/records", screen_id="manager_records", label="Records"),
-                    RouteDefinition(route_id="route_manager_profile", role="manager", path="/profile", screen_id="manager_profile", label="Profile"),
-                ],
-            ),
+            )
+            for role in ROLE_ORDER
         ]
 
-    def _build_screen_data_sources(self) -> list[ScreenDataSource]:
-        return [
-            ScreenDataSource(source_id="ds_client_home", screen_id="client_home", kind="dashboard", state_key="roles.client", role="client"),
-            ScreenDataSource(source_id="ds_client_requests", screen_id="client_requests", kind="list", state_key="records.client", role="client"),
-            ScreenDataSource(source_id="ds_client_detail", screen_id="client_detail", kind="detail", state_key="records.client_detail", role="client"),
-            ScreenDataSource(source_id="ds_client_form", screen_id="client_form", kind="form", state_key="forms.client_request", role="client"),
-            ScreenDataSource(source_id="ds_specialist_home", screen_id="specialist_home", kind="dashboard", state_key="roles.specialist", role="specialist"),
-            ScreenDataSource(source_id="ds_specialist_queue", screen_id="specialist_queue", kind="list", state_key="records.queue", role="specialist"),
-            ScreenDataSource(source_id="ds_specialist_detail", screen_id="specialist_detail", kind="detail", state_key="records.queue_detail", role="specialist"),
-            ScreenDataSource(source_id="ds_manager_home", screen_id="manager_home", kind="dashboard", state_key="roles.manager", role="manager"),
-            ScreenDataSource(source_id="ds_manager_dashboard", screen_id="manager_dashboard", kind="dashboard", state_key="roles.manager_dashboard", role="manager"),
-            ScreenDataSource(source_id="ds_manager_records", screen_id="manager_records", kind="list", state_key="records.all", role="manager"),
-        ]
+    def _build_screen_data_sources(self, prompt: str) -> list[ScreenDataSource]:
+        sources: list[ScreenDataSource] = []
+        for role in ROLE_ORDER:
+            for page in self._role_runtime_page_plan(prompt, role):
+                slug = page["slug"]
+                if slug == "home":
+                    kind = "dashboard"
+                    state_key = f"roles.{role}"
+                elif slug == "workbench":
+                    kind = "list"
+                    state_key = f"records.{role}_workbench"
+                elif slug == "workspace":
+                    kind = "detail"
+                    state_key = f"records.{role}_workspace"
+                elif slug == "profile":
+                    kind = "profile"
+                    state_key = f"roles.{role}.profile"
+                else:
+                    kind = "timeline"
+                    state_key = f"records.{role}"
+                sources.append(ScreenDataSource(source_id=f"ds_{page['screen_id']}", screen_id=page["screen_id"], kind=kind, state_key=state_key, role=role))
+        return sources
 
-    def _build_role_action_groups(self) -> list[RoleActionGroup]:
-        return [
-            RoleActionGroup(role="client", action_ids=["client_open_form", "client_open_requests", "client_submit_request"]),
-            RoleActionGroup(role="specialist", action_ids=["specialist_open_queue", "specialist_claim_next", "specialist_complete_request"]),
-            RoleActionGroup(role="manager", action_ids=["manager_open_dashboard", "manager_rebalance", "manager_refresh_records"]),
-        ]
+    def _build_role_action_groups(self, prompt: str) -> list[RoleActionGroup]:
+        groups: list[RoleActionGroup] = []
+        for role in ROLE_ORDER:
+            action_ids: list[str] = []
+            for page in self._role_runtime_page_plan(prompt, role):
+                action_ids.extend(action["action_id"] for action in page["actions"])
+            groups.append(RoleActionGroup(role=role, action_ids=list(dict.fromkeys(action_ids))))
+        return groups
 
     def _build_integrations(self, attributes: list[EntityAttribute], target_platform: TargetPlatform) -> list[Integration]:
         return [
@@ -6565,42 +7437,6 @@ class GenerationService:
                 return [summary]
             return [summary, stats]
 
-        if screen_id == "client_form":
-            intro_body = (
-                f"Complete the {flow_label} form with validated inputs and route it into the shared workflow."
-                if ui_variant != "editorial"
-                else f"Capture the core {flow_label} details and submit for operational processing."
-            )
-            intro_section = {
-                "section_id": "client_form_intro",
-                "type": "hero",
-                "title": f"{entity_title} form",
-                "body": intro_body,
-            }
-            form_section = {
-                "section_id": "client_form_fields",
-                "type": "form",
-                "fields": [
-                    {
-                        "field_id": attribute.name,
-                        "name": attribute.name,
-                        "label": attribute.name.replace("_", " ").title(),
-                        "field_type": attribute.type,
-                        "required": attribute.required,
-                        "placeholder": f"Enter {attribute.name.replace('_', ' ')}",
-                    }
-                    for attribute in entity.attributes
-                ],
-            }
-            if layout_variant == "minimal":
-                return [form_section]
-            if layout_variant == "stream":
-                return [form_section, intro_section]
-            return [
-                intro_section,
-                form_section,
-            ]
-
         if kind == "list":
             list_section = {
                 "section_id": f"{screen_id}_list",
@@ -6620,7 +7456,7 @@ class GenerationService:
                 return [stats_section, list_section]
             return [list_section]
 
-        if kind == "details":
+        if kind in {"details", "workspace"}:
             record = records[0] if records else {"title": entity.name, "summary": prompt_goal, "payload": {}, "timeline": []}
             detail_section = {
                 "section_id": f"{screen_id}_detail",
@@ -6629,18 +7465,26 @@ class GenerationService:
                 "body": record["summary"],
                 "fields": [{"label": key.replace("_", " ").title(), "value": value} for key, value in record["payload"].items()],
             }
+            module_section = {
+                "section_id": f"{screen_id}_modules",
+                "type": "actions",
+                "actions": [
+                    {"action_id": f"{role}_open_workbench", "label": "Back to workbench", "type": "navigate"},
+                    {"action_id": f"{role}_open_profile", "label": "Open profile", "type": "navigate"},
+                ],
+            }
             timeline_section = {
                 "section_id": f"{screen_id}_timeline",
                 "type": "timeline",
                 "items": record["timeline"],
             }
             if layout_variant == "minimal":
-                return [detail_section]
+                return [detail_section, module_section]
             if layout_variant in {"stream", "magazine"}:
-                return [timeline_section, detail_section]
+                return [timeline_section, detail_section, module_section]
             if ui_variant == "editorial":
-                return [timeline_section, detail_section]
-            return [detail_section, timeline_section]
+                return [timeline_section, detail_section, module_section]
+            return [detail_section, module_section, timeline_section]
 
         if screen_id.endswith("profile"):
             return [
@@ -6648,20 +7492,6 @@ class GenerationService:
                     "section_id": f"{screen_id}_profile",
                     "type": "profile",
                     "body": f"Update profile data and keep it consistent across {flow_label} runtime actions.",
-                }
-            ]
-
-        if kind == "success":
-            return [
-                {
-                    "section_id": "client_success_message",
-                    "type": "hero",
-                    "title": f"{entity_title} created",
-                    "body": (
-                        f"The {flow_label} is now visible in specialist and manager workflows."
-                        if layout_variant != "magazine" and ui_variant != "atlas"
-                        else f"Your {flow_label} has been registered and routed through the pipeline."
-                    ),
                 }
             ]
 
@@ -6862,7 +7692,7 @@ class GenerationService:
         if role == "specialist":
             return [
                 {
-                    "section_id": "specialist_queue_stats",
+                    "section_id": "specialist_workbench_stats",
                     "type": "stats",
                     "items": [
                         {"label": "New orders", "value": str(counts.get("new", 0))},
@@ -6946,20 +7776,21 @@ class GenerationService:
 
         base_items = {
             "client": [
-                {"label": "Home", "path": "/"},
-                {"label": "Create", "path": "/book"},
-                {"label": "Requests", "path": "/requests"},
+                {"label": "Dashboard", "path": "/"},
+                {"label": "Workbench", "path": "/workbench"},
+                {"label": "Workspace", "path": "/workspace"},
                 {"label": "Profile", "path": "/profile"},
             ],
             "specialist": [
-                {"label": "Home", "path": "/"},
-                {"label": "Queue", "path": "/queue"},
+                {"label": "Dashboard", "path": "/"},
+                {"label": "Workbench", "path": "/workbench"},
+                {"label": "Workspace", "path": "/workspace"},
                 {"label": "Profile", "path": "/profile"},
             ],
             "manager": [
-                {"label": "Home", "path": "/"},
-                {"label": "Dashboard", "path": "/dashboard"},
-                {"label": "Records", "path": "/records"},
+                {"label": "Dashboard", "path": "/"},
+                {"label": "Workbench", "path": "/workbench"},
+                {"label": "Workspace", "path": "/workspace"},
                 {"label": "Profile", "path": "/profile"},
             ],
         }
@@ -6968,19 +7799,20 @@ class GenerationService:
             atlas = {
                 "client": [
                     {"label": "Overview", "path": "/"},
-                    {"label": "Intake", "path": "/book"},
-                    {"label": "Pipeline", "path": "/requests"},
+                    {"label": "Queue", "path": "/workbench"},
+                    {"label": "Modules", "path": "/workspace"},
                     {"label": "Profile", "path": "/profile"},
                 ],
                 "specialist": [
-                    {"label": "Ops", "path": "/"},
-                    {"label": "Backlog", "path": "/queue"},
+                    {"label": "Overview", "path": "/"},
+                    {"label": "Backlog", "path": "/workbench"},
+                    {"label": "Modules", "path": "/workspace"},
                     {"label": "Profile", "path": "/profile"},
                 ],
                 "manager": [
                     {"label": "Command", "path": "/"},
-                    {"label": "Insights", "path": "/dashboard"},
-                    {"label": "Records", "path": "/records"},
+                    {"label": "Queue", "path": "/workbench"},
+                    {"label": "Modules", "path": "/workspace"},
                     {"label": "Profile", "path": "/profile"},
                 ],
             }
@@ -6989,19 +7821,20 @@ class GenerationService:
             editorial = {
                 "client": [
                     {"label": "Start", "path": "/"},
-                    {"label": "New", "path": "/book"},
-                    {"label": "History", "path": "/requests"},
+                    {"label": "Queue", "path": "/workbench"},
+                    {"label": "Detail", "path": "/workspace"},
                     {"label": "Me", "path": "/profile"},
                 ],
                 "specialist": [
                     {"label": "Start", "path": "/"},
-                    {"label": "Work", "path": "/queue"},
+                    {"label": "Work", "path": "/workbench"},
+                    {"label": "Detail", "path": "/workspace"},
                     {"label": "Me", "path": "/profile"},
                 ],
                 "manager": [
                     {"label": "Start", "path": "/"},
-                    {"label": "Control", "path": "/dashboard"},
-                    {"label": "Audit", "path": "/records"},
+                    {"label": "Control", "path": "/workbench"},
+                    {"label": "Audit", "path": "/workspace"},
                     {"label": "Me", "path": "/profile"},
                 ],
             }
@@ -7011,19 +7844,20 @@ class GenerationService:
             pulse = {
                 "client": [
                     {"label": "Now", "path": "/"},
-                    {"label": f"New {main_token}", "path": "/book"},
-                    {"label": "Track", "path": "/requests"},
+                    {"label": f"{main_token} queue", "path": "/workbench"},
+                    {"label": "Track", "path": "/workspace"},
                     {"label": "Profile", "path": "/profile"},
                 ],
                 "specialist": [
                     {"label": "Now", "path": "/"},
-                    {"label": "Queue", "path": "/queue"},
+                    {"label": "Queue", "path": "/workbench"},
+                    {"label": "Detail", "path": "/workspace"},
                     {"label": "Profile", "path": "/profile"},
                 ],
                 "manager": [
                     {"label": "Now", "path": "/"},
-                    {"label": "Board", "path": "/dashboard"},
-                    {"label": "Records", "path": "/records"},
+                    {"label": "Board", "path": "/workbench"},
+                    {"label": "Detail", "path": "/workspace"},
                     {"label": "Profile", "path": "/profile"},
                 ],
             }
@@ -7033,33 +7867,33 @@ class GenerationService:
 
         if layout_variant == "dashboard":
             order = {
-                "client": ["/requests", "/book", "/", "/profile"],
-                "specialist": ["/queue", "/", "/profile"],
-                "manager": ["/dashboard", "/records", "/", "/profile"],
+                "client": ["/", "/workbench", "/workspace", "/profile"],
+                "specialist": ["/", "/workbench", "/workspace", "/profile"],
+                "manager": ["/", "/workbench", "/workspace", "/profile"],
             }
             return reorder(selected, order[role])
 
         if layout_variant == "stream":
             order = {
-                "client": ["/book", "/requests", "/", "/profile"],
-                "specialist": ["/queue", "/", "/profile"],
-                "manager": ["/records", "/dashboard", "/", "/profile"],
+                "client": ["/workbench", "/workspace", "/", "/profile"],
+                "specialist": ["/workbench", "/workspace", "/", "/profile"],
+                "manager": ["/workbench", "/workspace", "/", "/profile"],
             }
             return reorder(selected, order[role])
 
         if layout_variant == "minimal":
             order = {
-                "client": ["/", "/book", "/profile"],
-                "specialist": ["/", "/queue"],
-                "manager": ["/", "/dashboard"],
+                "client": ["/", "/workbench", "/profile"],
+                "specialist": ["/", "/workbench", "/profile"],
+                "manager": ["/", "/workbench", "/profile"],
             }
             return reorder(selected, order[role])
 
         if layout_variant == "magazine":
             order = {
-                "client": ["/", "/requests", "/book", "/profile"],
-                "specialist": ["/", "/profile", "/queue"],
-                "manager": ["/", "/records", "/dashboard", "/profile"],
+                "client": ["/", "/workspace", "/workbench", "/profile"],
+                "specialist": ["/", "/workspace", "/workbench", "/profile"],
+                "manager": ["/", "/workspace", "/workbench", "/profile"],
             }
             return reorder(selected, order[role])
 
@@ -7216,22 +8050,30 @@ class GenerationService:
     @staticmethod
     def _action_label(action_id: str, ui_variant: str, flow_label: str) -> str:
         labels = {
-            "client_open_form": "New order",
-            "client_open_requests": "Orders",
-            "client_submit_request": "Submit request",
-            "client_open_request_detail": "Order details",
-            "client_open_form_inline": "Another order",
-            "client_success_to_requests": "View orders",
-            "client_success_to_home": "Back",
+            "client_open_workbench": "Workbench",
+            "client_open_workspace": "Workspace",
+            "client_open_profile": "Profile",
+            "client_open_workspace_from_workbench": "Open detail",
+            "client_refresh_workbench": "Refresh",
+            "client_back_to_workbench": "Back",
+            "client_workspace_continue": "Continue",
+            "client_submit_form": "Submit",
             "client_profile_save": "Save",
-            "specialist_open_queue": "Queue",
+            "specialist_open_workbench": "Workbench",
+            "specialist_open_workspace": "Workspace",
+            "specialist_open_profile": "Profile",
+            "specialist_open_workspace_from_workbench": "Open detail",
+            "specialist_refresh_workbench": "Refresh",
+            "specialist_back_to_workbench": "Back",
             "specialist_claim_next": "Claim next",
-            "specialist_open_detail": "Details",
             "specialist_mark_in_progress": "Start",
             "specialist_complete_request": "Complete",
             "specialist_profile_save": "Save",
-            "manager_open_dashboard": "Dashboard",
-            "manager_open_records": "Records",
+            "manager_open_workbench": "Workbench",
+            "manager_open_workspace": "Workspace",
+            "manager_open_profile": "Profile",
+            "manager_open_workspace_from_workbench": "Open detail",
+            "manager_back_to_workbench": "Back",
             "manager_rebalance": "Rebalance",
             "manager_refresh_records": "Refresh",
             "manager_profile_save": "Save",
@@ -7239,25 +8081,25 @@ class GenerationService:
         if ui_variant == "atlas":
             labels.update(
                 {
-                    "client_open_form": "Open intake",
-                    "client_open_requests": "Open pipeline",
-                    "specialist_open_queue": "Open backlog",
-                    "manager_open_dashboard": "Open insights",
+                    "client_open_workbench": "Open queue",
+                    "client_open_workspace": "Open modules",
+                    "specialist_open_workbench": "Open backlog",
+                    "manager_open_workbench": "Open insights",
                 }
             )
         if ui_variant == "editorial":
             labels.update(
                 {
-                    "client_open_form": f"Write new {flow_label}",
-                    "client_open_requests": "Open history",
-                    "specialist_open_queue": "Open worklist",
-                    "manager_open_records": "Open audit trail",
+                    "client_open_workbench": "Open journal",
+                    "client_open_workspace": "Open detail",
+                    "specialist_open_workbench": "Open worklist",
+                    "manager_open_workspace": "Open audit trail",
                 }
             )
         if ui_variant == "pulse":
             labels.update(
                 {
-                    "client_open_form": "Start now",
+                    "client_open_workbench": "Start now",
                     "specialist_claim_next": "Claim next live",
                     "manager_rebalance": "Balance live load",
                 }
@@ -7486,6 +8328,7 @@ class GenerationService:
     ) -> JobRecord:
         job.status = "blocked"
         job.fidelity = "blocked"
+        job.outcome_kind = self._outcome_kind_for_failure(code)
         job.failure_reason = failure_reason
         job.failure_class = job.failure_class or code
         job.root_cause_summary = job.root_cause_summary or (messages[0] if messages else failure_reason)
@@ -7527,6 +8370,12 @@ class GenerationService:
             {"messages": messages, "code": code},
         )
         return job
+
+    @staticmethod
+    def _outcome_kind_for_failure(code: str) -> RunOutcomeKind:
+        if code.startswith("preview.") or code.startswith("generation.preview.") or code.startswith("runtime.preview."):
+            return "blocked_preview_infra"
+        return "blocked_generation"
 
     def _stop_if_requested(
         self,
@@ -7601,6 +8450,10 @@ class GenerationService:
             run_payload["llm_provider"] = job.llm_provider
         if job.llm_model:
             run_payload["llm_model"] = job.llm_model
+        if job.execution_class:
+            run_payload["execution_class"] = job.execution_class
+        if job.outcome_kind:
+            run_payload["outcome_kind"] = job.outcome_kind
         run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.store.upsert("runs", job.linked_run_id, run_payload)
 
@@ -7860,10 +8713,10 @@ class GenerationService:
                 "creative_direction": creative_direction,
                 "delivery_contract": [
                     "Generate role-differentiated flows with meaningful actions and state transitions.",
-                    "Include realistic list/detail/form/dashboard patterns where appropriate.",
+                    "Use the shared shell as a fallback reference, but size the actual route/page graph to the workflow described by the prompt.",
                     "Preserve traceability between prompt intent, routes, actions, and integrations.",
                     "Avoid generic labels and placeholder-only screens.",
-                    "Do not force fixed route/screen patterns when alternative architectures are equally valid.",
+                    "Do not mirror the same wording, page purpose, or action model across roles.",
                 ],
             }
         )
@@ -8257,6 +9110,15 @@ class GenerationService:
             for key in numeric_default_keys:
                 if key in normalized and normalized[key] is None:
                     normalized[key] = 5000
+            if isinstance(normalized.get("assumptions"), list):
+                normalized["assumptions"] = [GenerationService._normalize_assumption_item(item) for item in normalized["assumptions"]]
+            if isinstance(normalized.get("contradictions"), list):
+                normalized["contradictions"] = [GenerationService._normalize_contradiction_item(item) for item in normalized["contradictions"]]
+            if isinstance(normalized.get("non_functional_requirements"), list):
+                normalized["non_functional_requirements"] = [
+                    GenerationService._normalize_non_functional_requirement_item(item)
+                    for item in normalized["non_functional_requirements"]
+                ]
             return normalized
         if isinstance(payload, list):
             return [GenerationService._normalize_model_payload(item) for item in payload]
@@ -8265,6 +9127,89 @@ class GenerationService:
             if normalized_scalar == "implicit":
                 return "derived"
         return payload
+
+    @staticmethod
+    def _normalize_assumption_item(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        normalized = dict(item)
+        if "assumption_id" in normalized and "text" in normalized and "rationale" in normalized:
+            normalized.setdefault("status", "active")
+            normalized.setdefault("impact", "medium")
+            return normalized
+        fallback_key = next(
+            (
+                key
+                for key in normalized.keys()
+                if isinstance(key, str) and key.startswith("assumption_") and key != "assumption_id"
+            ),
+            None,
+        )
+        if fallback_key:
+            return {
+                "assumption_id": str(normalized.get("assumption_id") or fallback_key),
+                "text": str(normalized.get("text") or normalized.get(fallback_key) or "Clarify this assumption."),
+                "status": str(normalized.get("status") or "active"),
+                "rationale": str(normalized.get("rationale") or "Recovered from malformed model output."),
+                "impact": str(normalized.get("impact") or "medium"),
+            }
+        return normalized
+
+    @staticmethod
+    def _normalize_contradiction_item(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        normalized = dict(item)
+        if "contradiction_id" in normalized and "description" in normalized:
+            normalized.setdefault("left_side", "Clarify conflicting requirement.")
+            normalized.setdefault("right_side", "Clarify conflicting requirement.")
+            normalized.setdefault("severity", "medium")
+            return normalized
+        fallback_key = next(
+            (
+                key
+                for key in normalized.keys()
+                if isinstance(key, str) and key.startswith("contradiction_") and key != "contradiction_id"
+            ),
+            None,
+        )
+        if fallback_key:
+            return {
+                "contradiction_id": str(normalized.get("contradiction_id") or fallback_key),
+                "description": str(normalized.get("description") or normalized.get(fallback_key) or "Potential contradiction detected."),
+                "left_side": str(normalized.get("left_side") or "Prompt statement A"),
+                "right_side": str(normalized.get("right_side") or "Prompt statement B"),
+                "severity": str(normalized.get("severity") or "medium"),
+                "resolution_hint": normalized.get("resolution_hint"),
+            }
+        return normalized
+
+    @staticmethod
+    def _normalize_non_functional_requirement_item(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        normalized = dict(item)
+        if "nfr_id" in normalized and "category" in normalized and "description" in normalized:
+            normalized.setdefault("priority", "should")
+            normalized.setdefault("evidence", [])
+            return normalized
+        fallback_key = next(
+            (
+                key
+                for key in normalized.keys()
+                if isinstance(key, str) and re.match(r"^nfr[-_]", key) and key != "nfr_id"
+            ),
+            None,
+        )
+        if fallback_key:
+            return {
+                "nfr_id": str(normalized.get("nfr_id") or fallback_key),
+                "category": str(normalized.get("category") or normalized.get(fallback_key) or "usability"),
+                "description": str(normalized.get("description") or "Recovered from malformed model output."),
+                "priority": str(normalized.get("priority") or "should"),
+                "evidence": normalized.get("evidence") if isinstance(normalized.get("evidence"), list) else [],
+            }
+        return normalized
 
     @staticmethod
     def _clean_generated_text(content: str) -> str:

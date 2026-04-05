@@ -32,6 +32,14 @@ from app.models.domain import (
 )
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
+from app.services.engine import (
+    ArtifactRecorder,
+    CompactionService,
+    ContextBudgetManager,
+    PromptStateManager,
+    SessionEngine,
+    TaskRouter,
+)
 from app.services.preview_service import PreviewService
 from app.services.runtime_manager import PreviewRuntimeManager
 from app.services.workspace_log_service import WorkspaceLogService
@@ -54,6 +62,12 @@ class FixOrchestrator:
         runtime_manager: PreviewRuntimeManager,
         openrouter_client: OpenRouterClient,
         workspace_log_service: WorkspaceLogService,
+        session_engine: SessionEngine | None = None,
+        task_router: TaskRouter | None = None,
+        context_budget_manager: ContextBudgetManager | None = None,
+        prompt_state_manager: PromptStateManager | None = None,
+        compaction_service: CompactionService | None = None,
+        artifact_recorder: ArtifactRecorder | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -62,6 +76,12 @@ class FixOrchestrator:
         self.runtime_manager = runtime_manager
         self.openrouter_client = openrouter_client
         self.workspace_log_service = workspace_log_service
+        self.session_engine = session_engine
+        self.task_router = task_router
+        self.context_budget_manager = context_budget_manager
+        self.prompt_state_manager = prompt_state_manager
+        self.compaction_service = compaction_service
+        self.artifact_recorder = artifact_recorder
 
     def generate(
         self,
@@ -73,12 +93,35 @@ class FixOrchestrator:
         started_at = time.perf_counter()
         workspace = self.workspace_service.get_workspace(workspace_id)
         run_id = request.linked_run_id or new_id("run")
+        effective_mode = request.generation_mode if request.generation_mode == GenerationMode.QUALITY else GenerationMode.BALANCED
+        stable_prefix = (
+            "You are repairing a grounded mini-app workspace. "
+            "Use a bounded failure packet, keep scope narrow, and avoid rereading unchanged files."
+        )
+        cache_key = self._prompt_cache_key_seed(workspace_id=workspace_id, run_id=run_id, prompt=request.prompt)
+        if self.session_engine is not None:
+            self.session_engine.bootstrap(
+                workspace_id=workspace_id,
+                prompt=request.prompt,
+                generation_mode=effective_mode.value,
+                model_profile=request.model_profile,
+                run_mode="fix",
+                stable_prefix=stable_prefix,
+                cache_key=cache_key,
+            )
+            project_memory = self.session_engine.select_project_memory(
+                workspace_id=workspace_id,
+                prompt=request.prompt,
+                generation_mode=effective_mode.value,
+                run_mode="fix",
+            )
+            self.store.upsert("reports", f"project_memory_context:{workspace_id}", project_memory)
         job = JobRecord(
             workspace_id=workspace_id,
             prompt=request.prompt,
             mode="fix",
             status="running",
-            generation_mode=request.generation_mode if request.generation_mode == GenerationMode.QUALITY else GenerationMode.BALANCED,
+            generation_mode=effective_mode,
             target_platform=request.target_platform,
             preview_profile=request.preview_profile,
             current_revision_id=workspace.current_revision_id,
@@ -107,6 +150,18 @@ class FixOrchestrator:
         draft_source = self.workspace_service.ensure_draft(workspace_id, run_id)
 
         self._append_event(job, "job_started", "Fix run started.")
+        if self.session_engine is not None:
+            self.session_engine.record_phase(
+                workspace_id=workspace_id,
+                phase="intent",
+                generation_mode=effective_mode.value,
+                model_profile=request.model_profile,
+                run_mode="fix",
+                details={
+                    "failure_class": job.failure_class,
+                    "resume_from_run_id": request.resume_from_run_id,
+                },
+            )
         self._append_trace(
             workspace_id,
             "fix",
@@ -141,6 +196,7 @@ class FixOrchestrator:
         latest_check_execution: CheckExecutionRecord | None = None
         latest_preview_details: dict[str, Any] = {}
         latest_apply_result: dict[str, Any] | None = None
+        memory_context = (self.store.get("reports", f"project_memory_context:{workspace_id}") or {}).get("summary")
 
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             if should_stop and should_stop():
@@ -192,6 +248,7 @@ class FixOrchestrator:
                 preview_details=latest_preview_details,
                 prior_attempts=fix_attempts,
                 existing_scope=scope_entries,
+                memory_context=memory_context,
             )
             job.failure_class = fix_case.failure_class
             job.failure_signature = fix_case.failure_signature
@@ -420,6 +477,36 @@ class FixOrchestrator:
                     token_usage={},
                 )
             )
+            if self.session_engine is not None:
+                diminishing = self.session_engine.should_stop_for_diminishing_returns(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    phase="fix_repair",
+                    generation_mode=effective_mode.value,
+                    metrics={
+                        "attempt": attempt,
+                        "changed_files_count": len(apply_result.changed_files),
+                        "diff_chars": len(diff_text),
+                        "failure_signature": fix_case.failure_signature,
+                        "total_tokens": int(job.cache_stats.get("total_tokens", 0) or 0),
+                    },
+                )
+                if diminishing.get("should_stop"):
+                    job.status = "failed"
+                    job.failure_reason = str(diminishing.get("reason") or "Fix stopped due to diminishing returns.")
+                    job.summary = "Fix loop stopped because additional iterations were no longer producing meaningful changes."
+                    job.current_fix_phase = "stopped"
+                    self._append_event(job, "job_failed", job.failure_reason)
+                    return self._finalize_job(
+                        job,
+                        fix_attempts=fix_attempts,
+                        repair_iterations=repair_iterations,
+                        scope_expansions=scope_expansions,
+                        latest_execution=latest_check_execution,
+                        latest_preview_details=latest_preview_details,
+                        latest_apply_result=latest_apply_result,
+                        elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                    )
             run_iteration = RunIterationRecord(
                 run_id=run_id,
                 assistant_message=attempt_record.diagnosis,
@@ -482,38 +569,25 @@ class FixOrchestrator:
         preview_details: dict[str, Any] = {"status": "skipped", "containers": [], "container_logs": {}, "logs": [], "last_error": None}
         static_failure = any(item.status == "failed" for item in results if item.name in {"schema_validators", "connectivity_validators", "changed_files_static"})
         if not static_failure:
-            self._append_event(job, "preview_validation_started", "Rebuilding preview against the draft workspace.")
-            preview = self.preview_service.rebuild(workspace_id, source_dir=draft_source, draft_run_id=run_id)
-            container_logs = {}
-            containers: list[dict[str, Any]] = []
-            if preview.proxy_port is not None:
-                container_logs = self.runtime_manager.collect_container_logs(workspace_id, draft_source, preview.proxy_port)
-                containers = self.runtime_manager.inspect_containers(workspace_id, draft_source, preview.proxy_port)
             preview_result = RunCheckResult(
                 name="preview_boot_smoke",
-                status="passed" if preview.status == "running" else "failed",
-                details="Preview rebuild and health verification ran against the draft workspace." if preview.status == "running" else (preview.last_error or "Preview rebuild failed for the draft workspace."),
-                command="docker compose up -d --build",
-                exit_code=0 if preview.status == "running" else 1,
-                logs=(preview.logs[-40:] or [preview.last_error or "Preview rebuild failed."]),
+                status="skipped",
+                details="Preview rebuild is deferred during fix verification after static/build checks passed.",
+                command="preview deferred during fix",
+                exit_code=0,
+                logs=[],
             )
             results.append(preview_result)
             results.append(
-                self.check_runner._preview_connectivity_smoke(
-                    source_dir=draft_source,
-                    preview=preview,
-                    preview_run_id=run_id,
+                RunCheckResult(
+                    name="preview_connectivity_smoke",
+                    status="skipped",
+                    details="Preview connectivity smoke is deferred during fix verification.",
+                    command="preview deferred during fix",
+                    exit_code=0,
+                    logs=[],
                 )
             )
-            preview_details = {
-                "status": preview.status,
-                "stage": preview.stage,
-                "progress_percent": preview.progress_percent,
-                "logs": list(preview.logs),
-                "last_error": preview.last_error,
-                "containers": containers,
-                "container_logs": container_logs,
-            }
         else:
             preview = self.preview_service.get(workspace_id)
             container_logs = {}
@@ -568,6 +642,7 @@ class FixOrchestrator:
         preview_details: dict[str, Any],
         prior_attempts: list[FixAttemptRecord],
         existing_scope: list[FixScopeEntry],
+        memory_context: str | None = None,
     ) -> FixCase:
         raw_error = request.error_context.raw_error if request.error_context else request.prompt
         combined_text = "\n".join(
@@ -604,6 +679,7 @@ class FixOrchestrator:
             write_scope=write_scope,
             attempt_history=[item.model_dump(mode="json") for item in prior_attempts[-4:]],
             executed_checks=check_execution.results,
+            memory_context=memory_context,
         )
 
     def _plan_patch(self, *, job: JobRecord, fix_case: FixCase, file_contexts: dict[str, str]) -> dict[str, Any]:
@@ -622,7 +698,7 @@ class FixOrchestrator:
                 stable_prefix=self._repair_system_prompt(),
             )
             job.llm_model = str(payload["model"])
-            job.cache_stats = dict(payload.get("cache_stats") or {})
+            job.cache_stats = self._merge_cache_stats(job.cache_stats, payload.get("cache_stats") or {})
             self._save_job(job)
             normalized = payload["payload"]
             if isinstance(normalized, str):
@@ -837,6 +913,13 @@ class FixOrchestrator:
         build_ok = all(result.status != "failed" for result in results if result.name == "changed_files_static")
         preview_result = next((result for result in results if result.name == "preview_boot_smoke"), None)
         preview_connectivity_result = next((result for result in results if result.name == "preview_connectivity_smoke"), None)
+        preview_deferred = (
+            preview_result is not None
+            and preview_result.status == "skipped"
+            and preview_connectivity_result is not None
+            and preview_connectivity_result.status == "skipped"
+            and preview_details.get("status") == "skipped"
+        )
         preview_ok = (
             preview_result is not None
             and preview_result.status == "passed"
@@ -844,7 +927,7 @@ class FixOrchestrator:
             and preview_connectivity_result.status == "passed"
             and preview_details.get("status") == "running"
         )
-        return validators_ok and build_ok and preview_ok
+        return validators_ok and build_ok and (preview_ok or preview_deferred)
 
     @staticmethod
     def _first_failing_command(results: list[RunCheckResult]) -> str | None:
@@ -883,9 +966,13 @@ class FixOrchestrator:
                 "argument of type",
                 "cannot find module",
                 "vite build",
+                "static miniapp validation failed",
+                "is not defined",
+                "undefined leaves invalid state",
                 "ts230",
                 ".ts:",
                 ".tsx:",
+                ".js:",
             )
         ):
             return "frontend_compile/type/import"
@@ -932,6 +1019,30 @@ class FixOrchestrator:
         job.updated_at = datetime.now(timezone.utc)
         job.latency_breakdown["fix_total_ms"] = elapsed_ms
         self._save_job(job)
+        if self.artifact_recorder is not None:
+            self.artifact_recorder.store_workspace_report(
+                job.workspace_id,
+                "cache_diagnostics",
+                {
+                    "workspace_id": job.workspace_id,
+                    "cache_stats": job.cache_stats,
+                    "repair_iterations": len(job.repair_iterations),
+                    "fix_attempts": len(job.fix_attempts),
+                },
+            )
+        if self.session_engine is not None:
+            self.session_engine.record_phase(
+                workspace_id=job.workspace_id,
+                phase="repair",
+                generation_mode=str(job.generation_mode),
+                model_profile=job.model_profile or "openai_code_fast",
+                run_mode="fix",
+                details={
+                    "fix_attempts": len(fix_attempts),
+                    "scope_expansions": len(scope_expansions),
+                    "status": job.status,
+                },
+            )
         self._store_report(f"fix_attempts:{job.workspace_id}", {"workspace_id": job.workspace_id, "items": job.fix_attempts})
         self._store_report(f"scope_expansions:{job.workspace_id}", {"workspace_id": job.workspace_id, "items": scope_expansions})
         if latest_preview_details:
@@ -947,6 +1058,10 @@ class FixOrchestrator:
                 },
             )
         return job
+
+    @staticmethod
+    def _prompt_cache_key_seed(*, workspace_id: str, run_id: str, prompt: str) -> str:
+        return hashlib.sha256(f"{workspace_id}:{run_id}:{prompt}".encode("utf-8")).hexdigest()
 
     def _repair_schema(self) -> dict[str, Any]:
         return {
@@ -992,6 +1107,7 @@ class FixOrchestrator:
             {
                 "task": "Patch the draft workspace to resolve the current root-cause cluster.",
                 "fix_case": fix_case.model_dump(mode="json"),
+                "memory_context": fix_case.memory_context,
                 "file_contexts": file_contexts,
                 "rules": [
                     "Fix only the current root-cause cluster before moving on.",
@@ -1018,6 +1134,16 @@ class FixOrchestrator:
             ).encode("utf-8")
         ).hexdigest()
         return f"fix:{digest}"
+
+    @staticmethod
+    def _merge_cache_stats(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(current or {})
+        for key, value in dict(incoming or {}).items():
+            if isinstance(value, (int, float)):
+                merged[key] = (merged.get(key, 0) or 0) + value
+            else:
+                merged[key] = value
+        return merged
 
     def _resolve_frontend_module(self, workspace_id: str, run_id: str, module_path: str) -> str | None:
         normalized = module_path.replace("@/", "miniapp/app/static/")

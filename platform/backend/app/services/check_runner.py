@@ -287,7 +287,7 @@ class CheckRunner:
         for role in ("client", "specialist", "manager"):
             role_payload = roles.get(role) or {}
             pages = role_payload.get("pages") or []
-            root_route = next(
+            role_route = next(
                 (
                     str(page.get("route_path") or "")
                     for page in pages
@@ -295,7 +295,14 @@ class CheckRunner:
                 ),
                 "",
             )
-            routes.append(root_route or f"/{role}")
+            if not role_route or role_route == "/":
+                routes.append(f"/{role}")
+                continue
+            if role_route == f"/{role}":
+                routes.append(role_route)
+                continue
+            normalized = role_route if role_route.startswith("/") else f"/{role_route}"
+            routes.append(f"/{role}{normalized}")
         return list(dict.fromkeys(route for route in routes if route))
 
     def _static_check(self, *, source_dir: Path, changed_files: list[str]) -> RunCheckResult:

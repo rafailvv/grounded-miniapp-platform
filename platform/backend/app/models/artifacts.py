@@ -95,3 +95,32 @@ class TraceabilityReportModel(StrictModel):
     report_id: str
     workspace_id: str
     entries: list[TraceabilityReportEntry]
+
+
+ExecutionClass = Literal["shell_app", "entity_workflow_app", "workflow_dashboard_app", "data_crud_app"]
+PreviewFailureKind = Literal["address_pool_exhausted", "container_name_conflict", "network_conflict", "compose_start_failure", "unknown"]
+RunOutcomeKind = Literal["applied", "warnings", "blocked_generation", "blocked_preview_infra", "noop_materialization_failure"]
+
+
+class MaterializationReport(StrictModel):
+    execution_class: ExecutionClass
+    planned_files: list[str] = Field(default_factory=list)
+    created_files: list[str] = Field(default_factory=list)
+    missing_files: list[str] = Field(default_factory=list)
+    expected_backend_files: list[str] = Field(default_factory=list)
+    missing_backend_files: list[str] = Field(default_factory=list)
+    backend_surface_ok: bool = False
+    page_surface_ok: bool = False
+    manifest_surface_ok: bool = False
+    fell_back_to_template: bool = False
+    role_page_counts: dict[str, int] = Field(default_factory=dict)
+    stage_reports: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class PreviewInfraDiagnostics(StrictModel):
+    failure_kind: PreviewFailureKind = "unknown"
+    retry_count: int = 0
+    cleanup_attempted: bool = False
+    reused_existing_runtime: bool = False
+    cooldown_until: datetime | None = None
+    last_error: str | None = None

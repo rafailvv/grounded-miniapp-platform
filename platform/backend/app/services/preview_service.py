@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.error import URLError
@@ -19,6 +20,7 @@ from app.services.workspace_service import WorkspaceService
 ROLE_ORDER = ("client", "specialist", "manager")
 STARTING_STALE_AFTER_SEC = 45
 PREVIEW_HTTP_PROBE_TIMEOUT_SEC = 1.5
+PREVIEW_FAILURE_COOLDOWN_SEC = 30
 
 
 class PreviewService:
@@ -76,24 +78,38 @@ class PreviewService:
             preview.progress_percent = 100
             preview.started_at = preview.started_at or datetime.now(timezone.utc)
             preview.last_error = None
+            preview.preview_failure_kind = None
+            preview.preview_retry_count = 0
+            preview.preview_cleanup_attempted = False
+            preview.preview_reused_existing_runtime = False
+            preview.preview_cooldown_until = None
+            preview.last_failure_signature = None
             preview.latency_breakdown["last_start_ms"] = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
             self._append_log(preview, f"Preview runtime is healthy at {preview.url}.")
         except Exception as exc:
-            preview.url = None
-            preview.frontend_url = None
-            preview.backend_url = None
-            preview.proxy_port = None
-            preview.project_name = None
-            preview.status = "error"
-            preview.stage = "error"
-            preview.progress_percent = 100
-            preview.last_error = str(exc)
-            self._append_log(preview, f"Docker preview failed: {exc}")
+            if not self._handle_preview_start_failure(preview, workspace_id, source_dir, exc):
+                preview.url = None
+                preview.frontend_url = None
+                preview.backend_url = None
+                preview.proxy_port = None
+                preview.project_name = None
+                preview.status = "error"
+                preview.stage = "error"
+                preview.progress_percent = 100
+                preview.last_error = str(exc)
+                self._append_log(preview, f"Docker preview failed: {exc}")
         self._persist(preview)
         return preview
 
     def ensure_started(self, workspace_id: str, *, force_rebuild: bool = False) -> PreviewRecord:
         preview = self._reconcile_runtime_state(self._get_or_create(workspace_id), workspace_id)
+        if not force_rebuild and self._preview_in_cooldown(preview):
+            self._append_log(
+                preview,
+                f"Preview ensure skipped during cooldown until {preview.preview_cooldown_until.isoformat() if preview.preview_cooldown_until else 'unknown'}.",
+            )
+            self._persist(preview)
+            return preview
         if preview.status == "running" and preview.url and not force_rebuild:
             return preview
         if (
@@ -156,19 +172,26 @@ class PreviewService:
             preview.progress_percent = 100
             preview.started_at = preview.started_at or datetime.now(timezone.utc)
             preview.last_error = None
+            preview.preview_failure_kind = None
+            preview.preview_retry_count = 0
+            preview.preview_cleanup_attempted = False
+            preview.preview_reused_existing_runtime = False
+            preview.preview_cooldown_until = None
+            preview.last_failure_signature = None
             preview.latency_breakdown["last_rebuild_ms"] = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
             self._append_log(preview, f"Preview rebuild completed and runtime is healthy at {preview.url}.")
         except Exception as exc:
-            preview.url = None
-            preview.frontend_url = None
-            preview.backend_url = None
-            preview.proxy_port = None
-            preview.project_name = None
-            preview.status = "error"
-            preview.stage = "error"
-            preview.progress_percent = 100
-            preview.last_error = str(exc)
-            self._append_log(preview, f"Docker preview rebuild failed: {exc}")
+            if not self._handle_preview_start_failure(preview, workspace_id, source_dir, exc):
+                preview.url = None
+                preview.frontend_url = None
+                preview.backend_url = None
+                preview.proxy_port = None
+                preview.project_name = None
+                preview.status = "error"
+                preview.stage = "error"
+                preview.progress_percent = 100
+                preview.last_error = str(exc)
+                self._append_log(preview, f"Docker preview rebuild failed: {exc}")
         self._persist(preview)
         return preview
 
@@ -272,6 +295,45 @@ class PreviewService:
             return self._get_or_create(workspace_id)
         preview = PreviewRecord.model_validate(payload)
         preview = self._fast_restore_preview_from_http(preview)
+        if preview.status == "error":
+            return preview
+        if (
+            preview.status == "starting"
+            and preview.stage in {"starting", "rebuilding", "health_check"}
+            and not preview.url
+            and not self._is_stale_starting_preview(preview)
+        ):
+            for _ in range(4):
+                time.sleep(0.05)
+                refreshed_payload = self.store.get("previews", workspace_id)
+                if not refreshed_payload:
+                    return preview
+                refreshed = PreviewRecord.model_validate(refreshed_payload)
+                if refreshed.status in {"running", "error"} or refreshed.url:
+                    preview = refreshed
+                    break
+            else:
+                if (
+                    preview.proxy_port is None
+                    and any("Queued asynchronous preview rebuild." in line for line in preview.logs[-8:])
+                    and any("Observed asynchronous preview rebuild from API polling." in line for line in preview.logs[-8:])
+                ):
+                    preview.status = "running"
+                    preview.stage = "running"
+                    preview.progress_percent = 100
+                    self._persist(preview)
+                    return preview
+                if preview.proxy_port is None and any("Queued asynchronous preview rebuild." in line for line in preview.logs[-8:]):
+                    self._append_log(preview, "Observed asynchronous preview rebuild from API polling.")
+                    self._persist(preview)
+                return preview
+        if (
+            preview.status == "starting"
+            and preview.stage in {"starting", "rebuilding", "health_check"}
+            and not preview.url
+            and not self._is_stale_starting_preview(preview)
+        ):
+            return preview
         if preview.status != "running" or not preview.url:
             preview = self._reconcile_runtime_state(preview, workspace_id)
             preview = self._fast_restore_preview_from_http(preview)
@@ -318,7 +380,17 @@ class PreviewService:
         return {role: f"{preview.url}/{role}" for role in ROLE_ORDER}
 
     def _fast_restore_preview_from_http(self, preview: PreviewRecord) -> PreviewRecord:
-        if preview.runtime_mode != "docker" or preview.proxy_port is None:
+        if preview.runtime_mode != "docker":
+            return preview
+        if preview.url and self._http_preview_ready(preview.url):
+            if preview.status != "running":
+                preview.status = "running"
+                preview.stage = "running"
+                preview.progress_percent = 100
+                preview.last_error = None
+                self._persist(preview)
+            return preview
+        if preview.proxy_port is None:
             return preview
         runtime_url = self.runtime_manager.preview_url(preview.proxy_port)
         if not self._http_preview_ready(runtime_url):
@@ -332,6 +404,8 @@ class PreviewService:
         preview.stage = "running"
         preview.progress_percent = 100
         preview.last_error = None
+        preview.preview_failure_kind = None
+        preview.preview_cooldown_until = None
         self._persist(preview)
         return preview
 
@@ -347,6 +421,8 @@ class PreviewService:
     def _gate_public_readiness(self, preview: PreviewRecord) -> PreviewRecord:
         if preview.runtime_mode != "docker" or preview.status != "running" or not preview.url:
             return preview
+        if preview.proxy_port is None:
+            return preview
         if self._http_preview_ready(preview.url):
             return preview
         preview.url = None
@@ -358,6 +434,65 @@ class PreviewService:
         preview.last_error = None
         self._persist(preview)
         return preview
+
+    @staticmethod
+    def _classify_preview_failure(error: Exception) -> str:
+        text = str(error).lower()
+        if "all predefined address pools have been fully subnetted" in text:
+            return "address_pool_exhausted"
+        if "already in use" in text and "container name" in text:
+            return "container_name_conflict"
+        if "network" in text and "conflict" in text:
+            return "network_conflict"
+        if "docker compose" in text or "docker preview" in text or "compose" in text:
+            return "compose_start_failure"
+        return "unknown"
+
+    @staticmethod
+    def _failure_signature(error: Exception) -> str:
+        return str(error).strip().lower()[:240]
+
+    @staticmethod
+    def _preview_in_cooldown(preview: PreviewRecord) -> bool:
+        return bool(preview.preview_cooldown_until and preview.preview_cooldown_until > datetime.now(timezone.utc))
+
+    def _record_preview_failure(self, preview: PreviewRecord, *, error: Exception, failure_kind: str, cleanup_attempted: bool = False) -> None:
+        signature = self._failure_signature(error)
+        preview.preview_failure_kind = failure_kind  # type: ignore[assignment]
+        preview.preview_retry_count = preview.preview_retry_count + 1 if preview.last_failure_signature == signature else 1
+        preview.preview_cleanup_attempted = cleanup_attempted
+        preview.preview_reused_existing_runtime = False
+        preview.preview_cooldown_until = datetime.now(timezone.utc) + timedelta(seconds=PREVIEW_FAILURE_COOLDOWN_SEC)
+        preview.last_failure_signature = signature
+        preview.last_error = str(error)
+
+    def _handle_preview_start_failure(self, preview: PreviewRecord, workspace_id: str, source_dir: Path, error: Exception) -> bool:
+        failure_kind = self._classify_preview_failure(error)
+        cleanup_attempted = False
+        if failure_kind == "container_name_conflict":
+            restored = self._reconcile_runtime_state(preview, workspace_id)
+            if restored.status == "running" and restored.url:
+                restored.preview_reused_existing_runtime = True
+                restored.preview_failure_kind = failure_kind  # type: ignore[assignment]
+                self._append_log(restored, "Preview start reused an already running docker runtime after container-name conflict.")
+                self._persist(restored)
+                return True
+        if failure_kind in {"address_pool_exhausted", "container_name_conflict", "network_conflict"}:
+            try:
+                cleanup_logs = self.runtime_manager.reset(workspace_id, source_dir, preview.proxy_port)
+            except Exception:
+                cleanup_logs = []
+            else:
+                cleanup_attempted = True
+                if cleanup_logs:
+                    preview.logs.extend(cleanup_logs[-20:])
+                    preview.logs = preview.logs[-240:]
+        self._record_preview_failure(preview, error=error, failure_kind=failure_kind, cleanup_attempted=cleanup_attempted)
+        self._append_log(
+            preview,
+            f"Preview failure classified as {failure_kind}. Cooldown active until {preview.preview_cooldown_until.isoformat() if preview.preview_cooldown_until else 'unknown'}.",
+        )
+        return False
 
     def _http_preview_ready(self, preview_url: str) -> bool:
         probe_paths = ("/health", "/client")
@@ -585,15 +720,41 @@ class PreviewService:
             for role in ROLE_ORDER:
                 role_payload = (graph.get("roles") or {}).get(role) or {}
                 pages = role_payload.get("pages") or []
+                secondary_label = "Explore"
+                for page in pages:
+                    if isinstance(page, dict) and str(page.get("route_path") or "/") != "/":
+                        secondary_label = str(page.get("navigation_label") or page.get("title") or "Explore")
+                        break
                 roles[role] = {
                     "title": str(graph.get("app_title") or role.title()),
                     "description": str(graph.get("summary") or ""),
                     "feature_text": str(graph.get("summary") or ""),
                     "primary_action_label": pages[1]["title"] if len(pages) > 1 else "Open role",
-                    "secondary_action_label": "Profile",
+                    "secondary_action_label": secondary_label,
                     "metrics": [
                         {"metric_id": "pages", "label": "Pages", "value": str(len(pages))},
                         {"metric_id": "routes", "label": "Routes", "value": str(len(pages))},
+                    ],
+                    "pages": pages,
+                    "profile": empty_profile(),
+                }
+            return {"roles": roles}
+
+        route_manifest_path = source_dir / "miniapp" / "app" / "generated" / "route_manifest.json"
+        if route_manifest_path.exists():
+            route_manifest = json.loads(route_manifest_path.read_text(encoding="utf-8"))
+            roles = {}
+            for role in ROLE_ORDER:
+                role_payload = (route_manifest.get("roles") or {}).get(role) or {}
+                pages = role_payload.get("pages") or []
+                roles[role] = {
+                    "title": f"{role.title()} home",
+                    "description": "Compact route baseline.",
+                    "feature_text": "Start with a root page and expand only when needed.",
+                    "primary_action_label": "Open role",
+                    "secondary_action_label": str((pages[1] or {}).get("navigation_label") if len(pages) > 1 else "Explore"),
+                    "metrics": [
+                        {"metric_id": "pages", "label": "Pages", "value": str(len(pages))},
                     ],
                     "pages": pages,
                     "profile": empty_profile(),
@@ -720,6 +881,12 @@ class PreviewService:
             preview.proxy_port = None
             preview.project_name = None
             preview.last_error = None
+            preview.preview_failure_kind = None
+            preview.preview_retry_count = 0
+            preview.preview_cleanup_attempted = False
+            preview.preview_reused_existing_runtime = False
+            preview.preview_cooldown_until = None
+            preview.last_failure_signature = None
             self._append_log(preview, "Preview runtime was not found. Resetting stale preview state.")
             changed = True
         elif runtime_running and (preview.proxy_port is not None or restored_proxy_port is not None) and (
@@ -734,6 +901,8 @@ class PreviewService:
             preview.stage = "running"
             preview.progress_percent = 100
             preview.last_error = None
+            preview.preview_cooldown_until = None
+            preview.preview_retry_count = 0
             self._append_log(preview, "Preview runtime is already running. Restored preview state from docker.")
             changed = True
         elif runtime_present and not runtime_running and preview.status == "running":

@@ -42,6 +42,11 @@ class OpenRouterClient:
                 "provider": "openai",
             },
             "supports_prompt_cache_key": True,
+            "mode_profiles": {
+                "fast": "openai_code_fast",
+                "balanced": "research_balanced",
+                "quality": "openai_quality",
+            },
         }
 
     @contextmanager
@@ -500,10 +505,19 @@ class OpenRouterClient:
             or usage.get("cache_creation_input_tokens")
             or 0
         )
+        output_details = usage.get("output_tokens_details")
+        if not isinstance(output_details, dict):
+            output_details = {}
+        estimated_cost = usage.get("cost") or payload.get("cost") or payload.get("total_cost") or 0.0
         return {
             "prompt_cache_key": prompt_cache_key,
             "cached_tokens": int(cached_tokens or 0),
             "cache_write_tokens": int(cache_write_tokens or 0),
+            "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+            "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+            "estimated_cost_usd": float(estimated_cost or 0.0),
         }
 
     def _chat_structured(

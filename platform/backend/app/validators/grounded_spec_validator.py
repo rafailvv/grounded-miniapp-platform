@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.models.artifacts import GroundedSpecValidatorResult, ValidationIssue
-from app.models.grounded_spec import GroundedSpecModel
+from app.models.grounded_spec import Contradiction, GroundedSpecModel
 
 
 class GroundedSpecValidator:
@@ -54,13 +54,25 @@ class GroundedSpecValidator:
                         location=f"api_requirements.{api_req.api_req_id}",
                     )
                 )
-        if any(item.severity == "critical" for item in spec.contradictions):
+        blocking_contradictions = [item for item in spec.contradictions if self._is_blocking_contradiction(item)]
+        non_blocking_contradictions = [item for item in spec.contradictions if item.severity == "critical" and item not in blocking_contradictions]
+        if blocking_contradictions:
             issues.append(
                 ValidationIssue(
                     code="spec.contradictions.critical",
                     message="Critical contradictions block code generation.",
                     severity="critical",
                     location="contradictions",
+                )
+            )
+        elif non_blocking_contradictions:
+            issues.append(
+                ValidationIssue(
+                    code="spec.contradictions.review",
+                    message="Potential contradictions were noted in the spec, but they look like design trade-offs rather than blocking conflicts.",
+                    severity="high",
+                    location="contradictions",
+                    blocking=False,
                 )
             )
         if any(item.impact == "high" for item in spec.unknowns):
@@ -76,3 +88,29 @@ class GroundedSpecValidator:
 
         blocking = any(issue.blocking for issue in issues)
         return GroundedSpecValidatorResult(valid=not issues, blocking=blocking, issues=issues)
+
+    @staticmethod
+    def _is_blocking_contradiction(item: Contradiction) -> bool:
+        if item.severity != "critical":
+            return False
+        haystack = " ".join(
+            part.strip().lower()
+            for part in (item.description, item.left_side, item.right_side, item.resolution_hint)
+            if part
+        )
+        hard_conflict_markers = (
+            "mutually exclusive",
+            "cannot both",
+            "can't both",
+            "incompatible",
+            "impossible",
+            "without miniapp",
+            "without backend",
+            "without database",
+            "frontend-only",
+            "no backend",
+            "no database",
+            "must not",
+            "forbids",
+        )
+        return any(marker in haystack for marker in hard_conflict_markers)

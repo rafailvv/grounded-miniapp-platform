@@ -30,6 +30,7 @@ from app.services.workspace_service import WorkspaceService
 ROLE_SCOPE = {"client", "specialist", "manager"}
 MEANINGFUL_DIFF_IGNORED_PARTS = {
     ".git",
+    "frontend",
     "node_modules",
     "dist",
     "build",
@@ -57,6 +58,7 @@ class RunService:
         preview_service: PreviewService,
         openrouter_client: OpenRouterClient,
         workspace_log_service: WorkspaceLogService,
+        session_engine: Any | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -65,6 +67,7 @@ class RunService:
         self.preview_service = preview_service
         self.openrouter_client = openrouter_client
         self.workspace_log_service = workspace_log_service
+        self.session_engine = session_engine
 
     def stop_run(self, run_id: str) -> RunRecord:
         run = self.get_run(run_id)
@@ -193,6 +196,7 @@ class RunService:
         run.candidate_revision_id = revision.revision_id
         run.status = "completed"
         run.apply_status = "applied"
+        run.outcome_kind = "applied"
         run.draft_status = "approved"
         run.draft_ready = False
         run.current_stage = "completed"
@@ -434,6 +438,7 @@ class RunService:
                 elif job.status == "blocked":
                     run.status = "blocked"
                     run.apply_status = "blocked"
+                    run.outcome_kind = "blocked_preview_infra" if str(job.outcome_kind or "") == "blocked_preview_infra" else "blocked_generation"
                     run.draft_status = "failed"
                     if run.current_fix_phase == "completed":
                         run.current_fix_phase = "failed"
@@ -442,6 +447,7 @@ class RunService:
                 else:
                     run.status = "failed"
                     run.apply_status = "failed"
+                    run.outcome_kind = "blocked_preview_infra" if str(job.outcome_kind or "") == "blocked_preview_infra" else "blocked_generation"
                     run.draft_status = "failed"
                     if run.current_fix_phase == "completed":
                         run.current_fix_phase = "failed"
@@ -452,6 +458,9 @@ class RunService:
             if job.status == "completed" and run.apply_status == "applied":
                 self._queue_preview_refresh(run, reason="run completion")
                 self._queue_resume_generation_from_checkpoint_if_needed(run, request)
+                preview = self.preview_service.get(run.workspace_id)
+            elif run.status == "completed" and run.apply_status == "noop" and run.draft_ready:
+                self._queue_preview_refresh(run, reason="draft completion with warnings", draft_run_id=run.run_id)
                 preview = self.preview_service.get(run.workspace_id)
             self._store_run_artifacts(run, change_plan, job, preview)
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
@@ -574,14 +583,18 @@ class RunService:
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.store.upsert("jobs", job_id, payload)
 
-    def _queue_preview_refresh(self, run: RunRecord, *, reason: str) -> None:
+    def _queue_preview_refresh(self, run: RunRecord, *, reason: str, draft_run_id: str | None = None) -> None:
         queue_started_at = time.perf_counter()
         self._append_job_event(
             run.linked_job_id,
             "preview_rebuild_started",
             f"Queued preview rebuild after {reason}.",
-            {"reason": reason, "run_id": run.run_id},
+            {"reason": reason, "run_id": run.run_id, "draft_run_id": draft_run_id},
         )
+
+        source_dir = None
+        if draft_run_id and self.workspace_service.draft_exists(run.workspace_id, draft_run_id):
+            source_dir = self.workspace_service.draft_source_dir(run.workspace_id, draft_run_id)
 
         def on_complete(preview: Any) -> None:
             if preview.status == "running":
@@ -593,6 +606,7 @@ class RunService:
                         "url": preview.url,
                         "stage": getattr(preview, "stage", "running"),
                         "progress_percent": getattr(preview, "progress_percent", 100),
+                        "draft_run_id": getattr(preview, "draft_run_id", None),
                     },
                 )
             else:
@@ -603,6 +617,7 @@ class RunService:
                     {
                         "stage": getattr(preview, "stage", "error"),
                         "progress_percent": getattr(preview, "progress_percent", 100),
+                        "draft_run_id": getattr(preview, "draft_run_id", None),
                     },
                 )
             artifacts_payload = self.store.get("reports", f"run_artifacts:{run.run_id}")
@@ -615,7 +630,12 @@ class RunService:
                 }
                 self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
 
-        preview = self.preview_service.rebuild_async(run.workspace_id, on_complete=on_complete)
+        preview = self.preview_service.rebuild_async(
+            run.workspace_id,
+            source_dir=source_dir,
+            draft_run_id=draft_run_id,
+            on_complete=on_complete,
+        )
         run.latency_breakdown["preview_enqueue_ms"] = int((time.perf_counter() - queue_started_at) * 1000)
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
@@ -630,8 +650,6 @@ class RunService:
             self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
 
     def _queue_resume_generation_from_checkpoint_if_needed(self, run: RunRecord, request: CreateRunRequest) -> None:
-        if request.mode == "fix":
-            return
         checkpoint = self.store.get("reports", f"resume_checkpoint:{run.workspace_id}")
         if not checkpoint or checkpoint.get("status") != "pending":
             return
@@ -743,6 +761,10 @@ class RunService:
             "check_results": (self.generation_service.current_report(workspace_id, "check_results") or {}).get("items", []),
             "checks": self.generation_service.current_report(workspace_id, "check_results"),
             "patch": self.generation_service.current_report(workspace_id, "patch"),
+            "materialization_report": self.generation_service.current_report(workspace_id, "materialization_report"),
+            "stage_reports": self.generation_service.current_report(workspace_id, "stage_reports"),
+            "retrieval_anchor_report": self.generation_service.current_report(workspace_id, "retrieval_anchor_report"),
+            "execution_class": self.generation_service.current_report(workspace_id, "execution_class"),
             "diff": effective_diff,
             "preview": preview_payload,
             "draft_preview": {
@@ -760,6 +782,16 @@ class RunService:
             "fix_attempts": self.generation_service.current_report(workspace_id, "fix_attempts"),
             "scope_expansions": self.generation_service.current_report(workspace_id, "scope_expansions"),
             "fix_runtime": self.generation_service.current_report(workspace_id, "fix_runtime"),
+            "preview_infra_diagnostics": {
+                "failure_kind": getattr(preview, "preview_failure_kind", None),
+                "retry_count": getattr(preview, "preview_retry_count", 0),
+                "cleanup_attempted": getattr(preview, "preview_cleanup_attempted", False),
+                "reused_existing_runtime": getattr(preview, "preview_reused_existing_runtime", False),
+                "cooldown_until": getattr(preview, "preview_cooldown_until", None).isoformat()
+                if getattr(preview, "preview_cooldown_until", None)
+                else None,
+                "last_error": preview.last_error,
+            },
             "failure_analysis": {
                 "mode": run.mode,
                 "failure_class": job.failure_class,
@@ -946,27 +978,31 @@ class RunService:
         return []
 
     def _mark_run_without_meaningful_diff(self, run: RunRecord, job: Any) -> None:
-        message = "Generation completed without meaningful source changes to apply."
+        message = "Draft produced no meaningful source changes to apply."
         run.summary = message
-        run.failure_reason = None
-        run.status = "completed"
-        run.apply_status = "noop"
-        run.draft_status = "none"
+        run.failure_reason = message
+        run.status = "failed"
+        run.apply_status = "failed"
+        run.outcome_kind = "noop_materialization_failure"
+        run.draft_status = "discarded" if self.workspace_service.draft_exists(run.workspace_id, run.run_id) else "none"
         run.draft_ready = False
-        run.current_stage = "completed"
+        run.current_stage = "failed"
         run.progress_percent = max(run.progress_percent, 100)
         run.current_fix_phase = job.current_fix_phase
 
-        job.status = "completed"
+        if self.workspace_service.draft_exists(run.workspace_id, run.run_id):
+            self.workspace_service.discard_draft(run.workspace_id, run.run_id)
+        job.status = "failed"
         job.summary = message
-        job.failure_reason = None
-        self.generation_service._append_event(job, "job_completed", message, {"reason": "no_meaningful_diff"})
+        job.failure_reason = message
+        self.generation_service._append_event(job, "job_failed", message, {"reason": "no_meaningful_diff"})
 
     def _mark_run_completed_with_warnings(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> None:
         message = "Run completed with validation warnings. Draft was kept for review."
         run.summary = message
         run.status = "completed"
         run.apply_status = "noop"
+        run.outcome_kind = "warnings"
         has_draft = self.workspace_service.draft_exists(run.workspace_id, run.run_id)
         run.draft_status = "ready" if has_draft else "none"
         run.draft_ready = run.draft_status == "ready"
@@ -980,7 +1016,17 @@ class RunService:
         )
 
     def _should_soft_complete_with_warnings(self, run: RunRecord, job: Any) -> bool:
+        if run.mode == "fix":
+            return False
         if getattr(job, "status", None) not in {"blocked", "failed"}:
+            return False
+        failure_class = str(getattr(job, "failure_class", "") or "")
+        if (
+            failure_class.startswith("generation.edit.plan_not_materialized")
+            or failure_class.startswith("generation.edit.missing_")
+            or failure_class.startswith("generation.edit.fell_back_to_template")
+            or failure_class.startswith("generation.edit.placeholder_surface_detected")
+        ):
             return False
         if self._is_stop_requested(run.run_id):
             return False
@@ -1002,6 +1048,7 @@ class RunService:
         run.candidate_revision_id = revision.revision_id
         run.status = "completed"
         run.apply_status = "applied"
+        run.outcome_kind = "applied"
         run.draft_status = "approved"
         run.draft_ready = False
         run.current_stage = "completed"
