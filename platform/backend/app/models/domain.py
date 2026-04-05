@@ -427,6 +427,7 @@ class FixCase(StrictModel):
     write_scope: list[FixScopeEntry] = Field(default_factory=list)
     attempt_history: list[dict[str, Any]] = Field(default_factory=list)
     executed_checks: list[RunCheckResult] = Field(default_factory=list)
+    memory_context: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 

@@ -8,11 +8,12 @@ Minimal Telegram-first starter used as the canonical workspace baseline.
 - `docs/`: lightweight template notes and environment examples.
 - `docker/`: single-service preview compose for the backend app.
 - `backend/app`: simplified to `main.py`, `db.py`, `schemas.py`, `routes/`, and `static/`.
+- `miniapp/app/static/<role>/<page>/`: each starter page keeps its own `index.html`, `styles.css`, and `app.js`.
 
 ## Baseline contract
 
 - Three roles are always available: `client`, `specialist`, `manager`.
 - Backend persists profiles in SQLite.
-- The UI is plain HTML, CSS, and JS served by FastAPI.
+- The UI is plain HTML, CSS, and JS served by FastAPI, with page-local assets stored in separate folders.
 - Only home and profile flows are included by default.
 - No authentication or domain-specific business logic is included.

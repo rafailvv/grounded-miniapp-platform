@@ -34,14 +34,24 @@ def index() -> RedirectResponse:
 def role_page(role: str) -> FileResponse:
     if role not in ROLES:
         raise KeyError(role)
-    return FileResponse(STATIC_DIR / role / "index.html")
+    return FileResponse(STATIC_DIR / role / "home" / "index.html")
 
 
 @app.get("/{role}/profile", include_in_schema=False)
 def role_profile_page(role: str) -> FileResponse:
     if role not in ROLES:
         raise KeyError(role)
-    return FileResponse(STATIC_DIR / role / "profile.html")
+    return FileResponse(STATIC_DIR / role / "profile" / "index.html")
+
+
+@app.get("/{role}/{page_slug}", include_in_schema=False)
+def role_nested_page(role: str, page_slug: str) -> FileResponse:
+    if role not in ROLES:
+        raise KeyError(role)
+    page_file = STATIC_DIR / role / page_slug / "index.html"
+    if not page_file.exists():
+        raise KeyError(f"{role}/{page_slug}")
+    return FileResponse(page_file)
 
 
 @app.exception_handler(KeyError)

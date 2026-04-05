@@ -350,10 +350,24 @@ def _write_workspace_file(workspace_root: Path, relative_path: str, content: str
 def _create_workspace_scaffold(workspace_root: Path) -> None:
     _write_workspace_file(workspace_root, "miniapp/app/main.py", "app = object()\n")
     _write_workspace_file(workspace_root, "miniapp/requirements.txt", "fastapi\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.html", "<main>client</main>\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile.html", "<main>client profile</main>\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/index.html", "<main>specialist</main>\n")
-    _write_workspace_file(workspace_root, "miniapp/app/static/manager/index.html", "<main>manager</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.html", "<link rel=\"stylesheet\" href=\"/static/client/index.css\" /><script src=\"/static/client/index.js\"></script><main>client</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.css", "body { color: #111; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.js", "console.log('client index');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile.html", "<link rel=\"stylesheet\" href=\"/static/client/profile.css\" /><script src=\"/static/client/profile.js\"></script><main>client profile</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile.css", "body { color: #222; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile.js", "console.log('client profile');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/index.html", "<link rel=\"stylesheet\" href=\"/static/specialist/index.css\" /><script src=\"/static/specialist/index.js\"></script><main>specialist</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/index.css", "body { color: #333; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/index.js", "console.log('specialist index');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile.html", "<link rel=\"stylesheet\" href=\"/static/specialist/profile.css\" /><script src=\"/static/specialist/profile.js\"></script><main>specialist profile</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile.css", "body { color: #444; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/specialist/profile.js", "console.log('specialist profile');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/index.html", "<link rel=\"stylesheet\" href=\"/static/manager/index.css\" /><script src=\"/static/manager/index.js\"></script><main>manager</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/index.css", "body { color: #555; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/index.js", "console.log('manager index');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile.html", "<link rel=\"stylesheet\" href=\"/static/manager/profile.css\" /><script src=\"/static/manager/profile.js\"></script><main>manager profile</main>\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile.css", "body { color: #666; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/manager/profile.js", "console.log('manager profile');\n")
     _write_workspace_file(workspace_root, "docker/docker-compose.yml", "services: {}\n")
     _write_workspace_file(workspace_root, "artifacts/grounded_spec.json", "{}\n")
 
@@ -365,22 +379,22 @@ def _multi_page_graph() -> dict:
             "client": {
                 "routes_file": "miniapp/app/static/client/index.html",
                 "pages": [
-                    {"route_path": "/client", "file_path": "miniapp/app/static/client/index.html"},
-                    {"route_path": "/client/profile", "file_path": "miniapp/app/static/client/profile.html"},
+                    {"route_path": "/client", "file_path": "miniapp/app/static/client/index.html", "style_path": "miniapp/app/static/client/index.css", "script_path": "miniapp/app/static/client/index.js"},
+                    {"route_path": "/client/profile", "file_path": "miniapp/app/static/client/profile.html", "style_path": "miniapp/app/static/client/profile.css", "script_path": "miniapp/app/static/client/profile.js"},
                 ],
             },
             "specialist": {
                 "routes_file": "miniapp/app/static/specialist/index.html",
                 "pages": [
-                    {"route_path": "/specialist", "file_path": "miniapp/app/static/specialist/index.html"},
-                    {"route_path": "/specialist/profile", "file_path": "miniapp/app/static/specialist/profile.html"},
+                    {"route_path": "/specialist", "file_path": "miniapp/app/static/specialist/index.html", "style_path": "miniapp/app/static/specialist/index.css", "script_path": "miniapp/app/static/specialist/index.js"},
+                    {"route_path": "/specialist/profile", "file_path": "miniapp/app/static/specialist/profile.html", "style_path": "miniapp/app/static/specialist/profile.css", "script_path": "miniapp/app/static/specialist/profile.js"},
                 ],
             },
             "manager": {
                 "routes_file": "miniapp/app/static/manager/index.html",
                 "pages": [
-                    {"route_path": "/manager", "file_path": "miniapp/app/static/manager/index.html"},
-                    {"route_path": "/manager/profile", "file_path": "miniapp/app/static/manager/profile.html"},
+                    {"route_path": "/manager", "file_path": "miniapp/app/static/manager/index.html", "style_path": "miniapp/app/static/manager/index.css", "script_path": "miniapp/app/static/manager/index.js"},
+                    {"route_path": "/manager/profile", "file_path": "miniapp/app/static/manager/profile.html", "style_path": "miniapp/app/static/manager/profile.css", "script_path": "miniapp/app/static/manager/profile.js"},
                 ],
             },
         },
@@ -397,6 +411,8 @@ def _write_connectivity_artifacts(workspace_root: Path, *, api_path: str = "/api
                     {
                         "route_path": "/client",
                         "file_path": "miniapp/app/static/client/index.html",
+                        "style_path": "miniapp/app/static/client/index.css",
+                        "script_path": "miniapp/app/static/client/index.js",
                         "title": "Shop",
                         "description": "Browse live orders",
                         "data_dependencies": ["orders"],
@@ -420,7 +436,8 @@ def _write_connectivity_artifacts(workspace_root: Path, *, api_path: str = "/api
     }
     _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
     _write_workspace_file(workspace_root, "artifacts/grounded_spec.json", json.dumps(spec))
-    _write_workspace_file(workspace_root, "miniapp/app/static/client/app.js", "console.log('client bootstrap');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.css", "body { color: #111; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/index.js", "console.log('client bootstrap');\n")
     _write_workspace_file(workspace_root, "miniapp/app/routes/__init__.py", "")
 
 
@@ -523,6 +540,20 @@ def test_build_validator_flags_placeholder_and_identical_role_pages(tmp_path: Pa
     issue_codes = {issue.code for issue in issues}
     assert "build.placeholder_role_surface" in issue_codes
     assert "build.identical_role_pages" in issue_codes
+
+
+def test_build_validator_flags_route_self_import(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/routes/time_slots.py",
+        "from app.routes.time_slots import list_time_slots\n",
+    )
+
+    issues = BuildValidator().validate(workspace_root)
+
+    assert any(issue.code == "build.route_self_import" for issue in issues)
 
 
 def test_connectivity_validator_flags_missing_backend_route_for_dynamic_page(tmp_path: Path) -> None:

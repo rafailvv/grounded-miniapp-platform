@@ -146,6 +146,7 @@ CANONICAL_BACKEND_ROOTS = (
     "miniapp/app/generated/",
     "miniapp/main.py",
     "miniapp/requirements.txt",
+    "miniapp/tests/",
 )
 CANONICAL_FILE_ROOTS = (*CANONICAL_FRONTEND_ROOTS, *CANONICAL_BACKEND_ROOTS, "artifacts/")
 LEGACY_ARCHITECTURE_MARKERS = (
@@ -833,6 +834,23 @@ class GenerationService:
         started_at: float,
         should_stop: Callable[[], bool] | None,
     ) -> JobRecord:
+        self._normalize_runtime_python_paths_in_plan(plan_result)
+        self._expand_page_asset_targets_in_plan(plan_result)
+        plan_result["target_files"] = list(dict.fromkeys(plan_result.get("target_files") or []))
+        plan_result["backend_targets"] = list(dict.fromkeys(plan_result.get("backend_targets") or []))
+        plan_result["files_to_read"] = list(dict.fromkeys(plan_result.get("files_to_read") or []))
+        plan_result["shared_files"] = list(dict.fromkeys(plan_result.get("shared_files") or []))
+        plan_result["generation_clusters"] = self._build_generation_clusters(plan_result["target_files"])
+        page_graph_roles = plan_result.get("page_graph", {}).get("roles") if isinstance(plan_result.get("page_graph"), dict) else {}
+        if isinstance(page_graph_roles, dict):
+            plan_result["execution_plan"] = self._build_execution_plan(
+                role_scope=role_scope,
+                roles=page_graph_roles,
+                shared_files=plan_result["shared_files"],
+                backend_targets=plan_result["backend_targets"],
+                target_files=plan_result["target_files"],
+                generation_clusters=plan_result["generation_clusters"],
+            )
         proactive_contract_targets = self._detect_missing_backend_contract_targets_from_page_graph(
             page_graph=plan_result["page_graph"],
             current_target_files=plan_result["target_files"],
@@ -974,8 +992,23 @@ class GenerationService:
                 content=json_dumps(grounded_spec.model_dump(mode="json")),
                 reason="Persist the grounded planning artifact inside the draft workspace.",
             ),
-            *edit_result["operations"],
+            *[
+                operation.model_copy(update={"file_path": self._normalize_runtime_python_path(operation.file_path)})
+                for operation in edit_result["operations"]
+            ],
         ]
+        operations = self._ensure_runtime_artifact_operations(
+            grounded_spec=grounded_spec,
+            page_graph=plan_result["page_graph"],
+            role_scope=role_scope,
+            generation_mode=generation_mode,
+            operations=operations,
+        )
+        operations = self._ensure_app_level_test_operations(
+            page_graph=plan_result["page_graph"],
+            role_scope=role_scope,
+            operations=operations,
+        )
         patch_envelope = self.workspace_service.build_patch_envelope_for_draft(workspace_id, draft_run_id, operations)
         apply_result = self.workspace_service.apply_patch_envelope_to_draft(workspace_id, draft_run_id, patch_envelope)
         if apply_result.status != "applied":
@@ -1770,10 +1803,10 @@ class GenerationService:
             assert page_result is not None
             if "error" in page_result:
                 return page_result
-            operation = page_result["operation"]
-            page_operations.append(operation)
-            if operation.content is not None:
-                generated_page_sources[operation.file_path] = operation.content
+            for operation in page_result.get("operations", []):
+                page_operations.append(operation)
+                if operation.content is not None:
+                    generated_page_sources[operation.file_path] = operation.content
             page_messages.append(page_result["assistant_message"])
 
         effective_target_files = list(target_files)
@@ -2075,8 +2108,9 @@ class GenerationService:
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
         completeness_recovery_used = False
+        scope_recovery_used = False
         last_error: Exception | None = None
-        for _ in range(2):
+        for _ in range(3):
             system_prompt = self._whole_file_cluster_system_prompt(cluster_name)
             user_prompt = self._whole_file_cluster_user_prompt(
                 cluster_name=cluster_name,
@@ -2102,6 +2136,16 @@ class GenerationService:
                 )
                 system_prompt = f"{system_prompt.rstrip()}\n\n{recovery_note}".strip()
                 user_prompt = f"{user_prompt.rstrip()}\n\n{recovery_note}".strip()
+            if scope_recovery_used:
+                scope_note = (
+                    "Cluster scope recovery mode:\n"
+                    "- The previous attempt introduced a canonical role-local support file outside cluster_targets.\n"
+                    "- Keep one page triplet per planned page: HTML, CSS, and JS with the same stem.\n"
+                    "- Do not collapse page behavior into role-level app.js/styles.css files.\n"
+                    "- Do not use inline style or script blocks when page CSS/JS targets exist.\n"
+                )
+                system_prompt = f"{system_prompt.rstrip()}\n\n{scope_note}".strip()
+                user_prompt = f"{user_prompt.rstrip()}\n\n{scope_note}".strip()
             try:
                 payload = self._generate_structured_with_retry(
                     role="code_edit",
@@ -2126,6 +2170,15 @@ class GenerationService:
                     or operation.content is None
                 ]
                 if invalid:
+                    expanded_targets = self._expand_cluster_targets_for_safe_companions(
+                        cluster_name=cluster_name,
+                        cluster_targets=cluster_targets,
+                        invalid_paths=invalid,
+                    )
+                    if expanded_targets is not None and expanded_targets != cluster_targets:
+                        cluster_targets = expanded_targets
+                        scope_recovery_used = True
+                        continue
                     raise ValueError(f"Whole-file cluster touched files outside its scope: {', '.join(invalid[:5])}")
                 self._validate_targeted_operations(stage_name=cluster_name, target_files=cluster_targets, operations=operations)
                 missing_required_targets = self._missing_required_cluster_targets(
@@ -2193,14 +2246,39 @@ class GenerationService:
         }
 
     @staticmethod
-    def _normalize_path_list(value: Any, fallback: list[str] | None = None) -> list[str]:
+    def _snake_case_filename(name: str) -> str:
+        parts = name.split(".")
+        stem = parts[0]
+        suffix = f".{'.'.join(parts[1:])}" if len(parts) > 1 else ""
+        normalized = re.sub(r"[^a-z0-9]+", "_", stem.lower()).strip("_")
+        normalized = re.sub(r"_+", "_", normalized)
+        return f"{normalized or 'file'}{suffix.lower()}"
+
+    @classmethod
+    def _normalize_generated_file_path(cls, path: str) -> str:
+        candidate = path.strip().lstrip("/")
+        if not candidate:
+            return candidate
+        if candidate.startswith("miniapp/app/routes/") and candidate.endswith(".py"):
+            head, tail = candidate.rsplit("/", 1)
+            return f"{head}/{cls._snake_case_filename(tail)}"
+        if candidate.startswith("miniapp/app/static/") and "." in Path(candidate).name:
+            head, tail = candidate.rsplit("/", 1)
+            return f"{head}/{cls._snake_case_filename(tail)}"
+        if candidate.startswith("miniapp/tests/") and "." in Path(candidate).name:
+            head, tail = candidate.rsplit("/", 1)
+            return f"{head}/{cls._snake_case_filename(tail)}"
+        return candidate
+
+    @classmethod
+    def _normalize_path_list(cls, value: Any, fallback: list[str] | None = None) -> list[str]:
         if not isinstance(value, list):
             return list(fallback or [])
         normalized: list[str] = []
         for item in value:
             if not isinstance(item, str):
                 continue
-            candidate = item.strip().lstrip("/")
+            candidate = cls._normalize_generated_file_path(item)
             if not candidate or ".." in candidate:
                 continue
             if any(char.isspace() for char in candidate):
@@ -2509,6 +2587,8 @@ class GenerationService:
         file_path = file_path_candidates[0] if file_path_candidates else self._default_page_file(role, component_name, route_path=route_path)
         if self._should_rewrite_page_file_for_route(route_path=route_path, file_path=file_path, page_id=str(payload.get("page_id") or "")):
             file_path = self._default_page_file(role, component_name, route_path=route_path)
+        style_path = self._default_page_asset_path(file_path, asset_kind="css")
+        script_path = self._default_page_asset_path(file_path, asset_kind="js")
         state_marker_base = self._state_marker_base(
             str(payload.get("page_id") or f"{role}_{index + 1}"),
             file_path,
@@ -2543,6 +2623,8 @@ class GenerationService:
             "navigation_label": str(payload.get("navigation_label") or payload.get("title") or component_name).strip(),
             "component_name": component_name,
             "file_path": file_path,
+            "style_path": str(payload.get("style_path") or style_path).strip() or style_path,
+            "script_path": str(payload.get("script_path") or script_path).strip() or script_path,
             "title": str(payload.get("title") or component_name).strip(),
             "description": str(payload.get("description") or payload.get("purpose") or "").strip(),
             "purpose": str(payload.get("purpose") or payload.get("description") or "").strip(),
@@ -2569,6 +2651,8 @@ class GenerationService:
                     "page_id": f"{role}_{page['suffix']}",
                     "route_path": page["route_path"],
                     "file_path": f"miniapp/app/static/{role}/{page['file_name']}",
+                    "style_path": f"miniapp/app/static/{role}/{Path(page['file_name']).stem}.css",
+                    "script_path": f"miniapp/app/static/{role}/{Path(page['file_name']).stem}.js",
                     "page_kind": page["page_kind"],
                     "navigation_label": page["navigation_label"],
                 }
@@ -2675,15 +2759,21 @@ class GenerationService:
             slug = "profile"
         else:
             route_slug = re.sub(r":[^/]+", "detail", normalized_route)
-            route_slug = route_slug.strip("/").replace("/", "-")
-            route_slug = re.sub(r"[^a-z0-9-]+", "-", route_slug).strip("-")
+            route_slug = route_slug.strip("/").replace("/", "_").replace("-", "_")
+            route_slug = re.sub(r"[^a-z0-9_]+", "_", route_slug).strip("_")
+            route_slug = re.sub(r"_+", "_", route_slug)
             slug = route_slug or "page"
         if not slug or slug == role:
-            component_slug = re.sub(r"(?<!^)(?=[A-Z])", "-", component_name).replace("--", "-").strip("-").lower()
-            if component_slug.endswith("-page"):
+            component_slug = re.sub(r"(?<!^)(?=[A-Z])", "_", component_name).replace("__", "_").strip("_").lower()
+            if component_slug.endswith("_page"):
                 component_slug = component_slug[:-5]
             slug = component_slug or "page"
         return f"miniapp/app/static/{role}/{slug}.html"
+
+    @staticmethod
+    def _default_page_asset_path(file_path: str, *, asset_kind: str) -> str:
+        suffix = ".css" if asset_kind == "css" else ".js"
+        return str(Path(file_path).with_suffix(suffix)).replace("\\", "/")
 
     def _component_name(self, role: str, payload: dict[str, Any], index: int) -> str:
         raw_value = str(payload.get("component_name") or payload.get("title") or payload.get("page_id") or f"{role}_page_{index + 1}").strip()
@@ -2810,6 +2900,37 @@ class GenerationService:
             for name, paths in groups.items()
             if paths
         ]
+
+    @classmethod
+    def _expand_cluster_targets_for_safe_companions(
+        cls,
+        *,
+        cluster_name: str,
+        cluster_targets: list[str],
+        invalid_paths: list[str],
+    ) -> list[str] | None:
+        role_prefix_map = {
+            "role_client_ui": "miniapp/app/static/client/",
+            "role_specialist_ui": "miniapp/app/static/specialist/",
+            "role_manager_ui": "miniapp/app/static/manager/",
+        }
+        allowed_prefix = role_prefix_map.get(cluster_name)
+        if not allowed_prefix:
+            return None
+        additions: list[str] = []
+        for path in invalid_paths:
+            if not isinstance(path, str):
+                return None
+            if not path.startswith(allowed_prefix):
+                return None
+            if not cls._is_canonical_target_path(path):
+                return None
+            if not path.endswith((".js", ".css")):
+                return None
+            additions.append(path)
+        if not additions:
+            return None
+        return list(dict.fromkeys([*cluster_targets, *additions]))
 
     @staticmethod
     def _page_edit_parallelism(*, scope_mode: str, generation_mode: GenerationMode) -> int:
@@ -3701,6 +3822,9 @@ class GenerationService:
                     "Do not leave operations empty when target_files is non-empty.",
                     "assistant_message must briefly summarize the patch that was generated, not propose future work.",
                     "Do not invent files under alternate architecture roots that are absent from target_files.",
+                    "Every planned page must materialize as a page triplet: one HTML, one CSS, and one JS file that share the same stem.",
+                    "Do not collapse multiple pages into shared role-level app.js/styles.css files.",
+                    "Do not leave page behavior or styling inline when page-level JS/CSS targets exist.",
                     "If the workspace uses miniapp/app, do not switch to miniapp/src. If the workspace uses miniapp/app/static, do not switch to a separate frontend application unless those exact files are in target_files.",
                 ],
             }
@@ -3747,7 +3871,7 @@ class GenerationService:
                         "Provider recovery mode:\n"
                         "- Previous attempt failed with a transient provider or transport issue.\n"
                         "- Keep the page implementation concise and stable.\n"
-                        "- Return operations only for the requested page file.\n"
+                        "- Return operations for the requested page HTML plus its CSS and JS companion files.\n"
                         "- Prefer the smallest valid page implementation over extra polish."
                     )
                     system_prompt = f"{system_prompt.rstrip()}\n\n{recovery_note}".strip()
@@ -3766,25 +3890,30 @@ class GenerationService:
                 operations = self._sanitize_draft_operations(
                     [DraftFileOperation.model_validate(item) for item in raw_operations]
                 )
+                allowed_paths = {
+                    page["file_path"],
+                    str(page.get("style_path") or self._default_page_asset_path(page["file_path"], asset_kind="css")),
+                    str(page.get("script_path") or self._default_page_asset_path(page["file_path"], asset_kind="js")),
+                }
                 foreign_operations = [
                     operation.file_path
                     for operation in operations
-                    if operation.file_path != page["file_path"]
+                    if operation.file_path not in allowed_paths
                 ]
                 if foreign_operations:
                     raise ValueError(
                         f"{page['file_path']} returned operations for other files: {', '.join(sorted(set(foreign_operations))[:5])}."
                     )
-                valid_operations = [
-                    operation
+                valid_operations = {
+                    operation.file_path: operation
                     for operation in operations
-                    if operation.file_path == page["file_path"] and operation.operation in {"create", "replace"} and operation.content is not None
-                ]
-                if not valid_operations:
-                    raise ValueError(f"{page['file_path']} did not produce a valid create/replace operation.")
+                    if operation.file_path in allowed_paths and operation.operation in {"create", "replace"} and operation.content is not None
+                }
+                if set(valid_operations) != allowed_paths:
+                    raise ValueError(f"{page['file_path']} did not produce the required HTML/CSS/JS triplet.")
                 return {
                     "assistant_message": str(normalized.get("assistant_message") or "").strip(),
-                    "operation": valid_operations[-1],
+                    "operations": [valid_operations[path] for path in sorted(allowed_paths)],
                     "model": payload["model"],
                 }
             except Exception as exc:
@@ -4217,6 +4346,18 @@ class GenerationService:
                 issues.append(f"{role} is missing route paths.")
             if "/" not in actual_routes:
                 issues.append(f"{role} is missing an entry route at /.")
+            file_paths = [
+                str(page.get("file_path") or "")
+                for page in pages
+                if isinstance(page, dict) and str(page.get("file_path") or "").strip()
+            ]
+            duplicate_paths = sorted(
+                path
+                for path, count in Counter(file_paths).items()
+                if count > 1
+            )
+            if duplicate_paths:
+                issues.append(f"{role} reuses the same file for multiple routes: {', '.join(duplicate_paths[:3])}.")
             if enforce_expanded_structure and require_business_pages:
                 business_pages = [page for page in pages if isinstance(page, dict) and GenerationService._is_business_page(role, page)]
                 if not business_pages:
@@ -4316,7 +4457,11 @@ class GenerationService:
             "miniapp/app/generated/runtime_state.json",
             "miniapp/app/generated/app_ir.json",
         }
-        allowed_target_paths = set(target_files) | generated_manifest_paths | {
+        generated_test_paths = {
+            "miniapp/tests/test_generated_app.py",
+            "miniapp/tests/generated_app.test.mjs",
+        }
+        allowed_target_paths = set(target_files) | generated_manifest_paths | generated_test_paths | {
             "artifacts/generated_app_graph.json",
             "artifacts/page_graph_verification.json",
             "artifacts/grounded_spec.json",
@@ -4399,15 +4544,16 @@ class GenerationService:
                     is_profile_page = page_kind == "profile" or route_path.rstrip("/") == "/profile" or file_path.endswith("/profile.html")
                     loading_hits = content.count("loading")
                     dependency_count = len(page.get("data_dependencies") or [])
+                    has_real_surface = GenerationService._has_real_interactive_surface(content)
                     if is_profile_page:
                         for handoff_path in page.get("handoff_paths") or []:
                             if isinstance(handoff_path, str) and handoff_path.strip() and handoff_path != route_path:
                                 if handoff_path not in known_handoff_paths:
                                     issues.append(f"{file_path} references a non-canonical handoff path: {handoff_path}.")
                         continue
-                    if dependency_count == 0 and loading_hits > 0:
+                    if dependency_count == 0 and loading_hits > 0 and not has_real_surface:
                         issues.append(f"{file_path} still uses loading-first copy even though the page has no declared data dependencies.")
-                    if loading_hits >= 3 and len(content) < 2500:
+                    if loading_hits >= 3 and len(content) < 2500 and not has_real_surface:
                         issues.append(f"{file_path} is dominated by loading copy instead of real page content.")
                     if GenerationService._contains_placeholder_surface(content):
                         issues.append(f"{file_path} still contains placeholder copy.")
@@ -4433,6 +4579,731 @@ class GenerationService:
             " sample placeholder",
         )
         return any(marker in normalized for marker in markers)
+
+    @staticmethod
+    def _has_real_interactive_surface(content: str) -> bool:
+        markers = (
+            "<main",
+            "<section",
+            "<article",
+            "<button",
+            "href=",
+            "card-link",
+            "feature-block",
+            "filters",
+            "chip",
+            "task-list",
+            "request-list",
+            "empty",
+            "error",
+            "retry-button",
+            "form-card",
+        )
+        return sum(1 for marker in markers if marker in content) >= 4
+
+    def _ensure_runtime_artifact_operations(
+        self,
+        *,
+        grounded_spec: GroundedSpecModel,
+        page_graph: dict[str, Any],
+        role_scope: list[str],
+        generation_mode: GenerationMode,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        route_manifest = self._route_manifest_from_page_graph(page_graph, role_scope)
+        runtime_manifest = self._runtime_manifest_from_page_graph(route_manifest, grounded_spec, generation_mode)
+        runtime_state = self._runtime_state_from_route_manifest(route_manifest, grounded_spec, generation_mode)
+        role_seed = self._role_seed_from_route_manifest(route_manifest, runtime_manifest, runtime_state, grounded_spec)
+        role_experience = {
+            role: {
+                "title": payload["title"],
+                "featureText": payload["feature_text"],
+                "routeTree": payload["route_tree"],
+                "primaryPages": payload["pages"],
+            }
+            for role, payload in (role_seed.get("roles") or {}).items()
+            if isinstance(payload, dict)
+        }
+        required_artifacts = {
+            "miniapp/app/generated/route_manifest.json": (route_manifest, "Persist the canonical route manifest for the generated role pages."),
+            "miniapp/app/generated/runtime_manifest.json": (runtime_manifest, "Persist the lightweight runtime manifest for the generated role pages."),
+            "miniapp/app/generated/static_runtime_manifest.json": (runtime_manifest, "Provide the static runtime manifest used by generated role pages."),
+            "miniapp/app/generated/runtime_state.json": (runtime_state, "Seed the generated runtime state for demo interactions."),
+            "miniapp/app/generated/role_seed.json": (role_seed, "Persist role summaries and route metadata for generated pages."),
+            "miniapp/app/generated/role_experience.json": (role_experience, "Persist role experience descriptors for previews."),
+        }
+        ensured_operations = list(operations)
+        for file_path, (payload, reason) in required_artifacts.items():
+            existing = operation_map.get(file_path)
+            if existing is not None and str(existing.content or "").strip():
+                continue
+            ensured_operations.append(
+                DraftFileOperation(
+                    file_path=file_path,
+                    operation="replace",
+                    content=json_dumps(payload),
+                    reason=reason,
+                )
+            )
+        return ensured_operations
+
+    def _ensure_app_level_test_operations(
+        self,
+        *,
+        page_graph: dict[str, Any],
+        role_scope: list[str],
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        required_tests = {
+            "miniapp/tests/test_generated_app.py": self._python_app_level_test_content(page_graph=page_graph, role_scope=role_scope),
+            "miniapp/tests/generated_app.test.mjs": self._js_app_level_test_content(page_graph=page_graph, role_scope=role_scope),
+        }
+        ensured_operations = list(operations)
+        for file_path, content in required_tests.items():
+            existing = operation_map.get(file_path)
+            if existing is not None and str(existing.content or "").strip():
+                continue
+            ensured_operations.append(
+                DraftFileOperation(
+                    file_path=file_path,
+                    operation="replace",
+                    content=content,
+                    reason="Provide deterministic generated app-level tests for the synthesized miniapp workspace.",
+                )
+            )
+        return ensured_operations
+
+    @classmethod
+    def _python_app_level_test_content(cls, *, page_graph: dict[str, Any], role_scope: list[str]) -> str:
+        roles_literal = ", ".join(repr(role) for role in role_scope)
+        backend_targets = [
+            cls._normalize_runtime_python_path(str(path))
+            for path in [*(page_graph.get("backend_targets") or []), *(page_graph.get("shared_files") or [])]
+            if isinstance(path, str) and path.startswith("miniapp/app/")
+        ]
+        backend_targets_literal = json.dumps(sorted(dict.fromkeys(backend_targets)), ensure_ascii=True, indent=2)
+        return f"""from __future__ import annotations
+
+import importlib
+import json
+import re
+import sys
+import unittest
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+MINIAPP_DIR = Path(__file__).resolve().parents[1]
+if str(MINIAPP_DIR) not in sys.path:
+    sys.path.insert(0, str(MINIAPP_DIR))
+
+ROLES = ({roles_literal},)
+EXPECTED_BACKEND_TARGETS = {backend_targets_literal}
+
+
+def _load_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _extract_static_asset_refs(html: str) -> list[str]:
+    return re.findall(r'(?:src|href)=["\\'](/static/[^"\\']+)["\\']', html)
+
+
+def _extract_api_refs(content: str) -> set[str]:
+    refs: set[str] = set()
+    for match in re.finditer(r'["\\'](/api/[a-zA-Z0-9_\\-/{{}}:]+)', content):
+        refs.add(match.group(1))
+    return refs
+
+
+def _sample_request_payload(path: str, method: str) -> dict | None:
+    lowered_path = path.lower()
+    if method in {{"POST", "PUT", "PATCH"}} and "/profiles/" in lowered_path:
+        return {{
+            "first_name": "Test",
+            "last_name": "User",
+            "email": "test@example.com",
+            "phone": "+43123456789",
+            "photo_url": None,
+        }}
+    if method in {{"POST", "PUT", "PATCH"}} and any(token in lowered_path for token in ("/request", "/requests", "/task", "/tasks")):
+        return {{
+            "title": "Test request",
+            "description": "Generated app integration check",
+        }}
+    return {{}}
+
+
+def _sample_route_path(path: str) -> str:
+    normalized = path
+    normalized = re.sub(r"{{[^/]+}}", "sample", normalized)
+    normalized = re.sub(r":[^/]+", "sample", normalized)
+    return normalized
+
+
+class GeneratedMiniAppTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from app.main import app
+
+        cls.app = app
+        cls.client = TestClient(app)
+        cls.route_manifest_path = MINIAPP_DIR / "app" / "generated" / "route_manifest.json"
+        cls.runtime_manifest_path = MINIAPP_DIR / "app" / "generated" / "runtime_manifest.json"
+        cls.grounded_spec_path = MINIAPP_DIR.parent / "artifacts" / "grounded_spec.json"
+        cls.route_manifest = _load_json(cls.route_manifest_path)
+        cls.runtime_manifest = _load_json(cls.runtime_manifest_path)
+        cls.grounded_spec = _load_json(cls.grounded_spec_path) if cls.grounded_spec_path.exists() else {{}}
+        cls.registered_routes = {{
+            (str(route.path), next(iter(route.methods or {{""}})))
+            for route in app.routes
+            if getattr(route, "path", None)
+        }}
+
+    def test_generated_manifests_exist(self) -> None:
+        self.assertTrue(self.route_manifest_path.exists(), f"Missing {{self.route_manifest_path}}")
+        self.assertTrue(self.runtime_manifest_path.exists(), f"Missing {{self.runtime_manifest_path}}")
+        self.assertIsInstance(self.route_manifest.get("roles"), dict)
+        self.assertIsInstance(self.runtime_manifest.get("roles"), dict)
+
+    def test_health_endpoint(self) -> None:
+        response = self.client.get("/health")
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_role_entry_pages_render(self) -> None:
+        for role in ROLES:
+            response = self.client.get(f"/{{role}}")
+            self.assertEqual(response.status_code, 200, f"/{{role}} -> {{response.status_code}} {{response.text}}")
+            self.assertIn("<html", response.text.lower())
+            self.assertGreater(len(response.text.strip()), 80)
+
+    def test_role_profile_pages_render(self) -> None:
+        roles_payload = self.route_manifest.get("roles") or {{}}
+        for role in ROLES:
+            pages = (roles_payload.get(role) or {{}}).get("pages") or []
+            has_profile = any(str(page.get("page_kind") or "").lower() == "profile" for page in pages if isinstance(page, dict))
+            if not has_profile:
+                continue
+            response = self.client.get(f"/{{role}}/profile")
+            self.assertEqual(response.status_code, 200, f"/{{role}}/profile -> {{response.status_code}} {{response.text}}")
+            self.assertIn("<html", response.text.lower())
+
+    def test_manifest_page_files_exist(self) -> None:
+        roles_payload = self.route_manifest.get("roles") or {{}}
+        for role in ROLES:
+            pages = (roles_payload.get(role) or {{}}).get("pages") or []
+            self.assertTrue(pages, f"No pages declared for role {{role}}")
+            file_paths = [str(page.get("file_path") or "") for page in pages if isinstance(page, dict)]
+            self.assertEqual(len(file_paths), len(set(file_paths)), f"Role {{role}} reuses the same file across multiple routes: {{file_paths}}")
+            for page in pages:
+                file_path = str(page.get("file_path") or "")
+                style_path = str(page.get("style_path") or "")
+                script_path = str(page.get("script_path") or "")
+                self.assertTrue(file_path.startswith("miniapp/"), f"Unexpected page file path {{file_path}}")
+                absolute_path = MINIAPP_DIR / file_path.removeprefix("miniapp/")
+                self.assertTrue(absolute_path.exists(), f"Missing page file {{file_path}}")
+                self.assertTrue(style_path.startswith("miniapp/"), f"Unexpected page style path {{style_path}}")
+                self.assertTrue(script_path.startswith("miniapp/"), f"Unexpected page script path {{script_path}}")
+                self.assertTrue((MINIAPP_DIR / style_path.removeprefix("miniapp/")).exists(), f"Missing style file {{style_path}}")
+                self.assertTrue((MINIAPP_DIR / script_path.removeprefix("miniapp/")).exists(), f"Missing script file {{script_path}}")
+                html = absolute_path.read_text(encoding="utf-8")
+                self.assertIn(f"/static/{{role}}/{{Path(style_path).name}}", html, f"{{file_path}} must reference {{style_path}}")
+                self.assertIn(f"/static/{{role}}/{{Path(script_path).name}}", html, f"{{file_path}} must reference {{script_path}}")
+
+    def test_all_declared_role_pages_render(self) -> None:
+        roles_payload = self.route_manifest.get("roles") or {{}}
+        for role in ROLES:
+            pages = (roles_payload.get(role) or {{}}).get("pages") or []
+            for page in pages:
+                route_path = str(page.get("route_path") or "")
+                normalized = _sample_route_path(route_path or f"/{{role}}")
+                response = self.client.get(normalized)
+                self.assertEqual(
+                    response.status_code,
+                    200,
+                    f"{{normalized}} -> {{response.status_code}} {{response.text}}",
+                )
+                self.assertIn("<html", response.text.lower())
+
+    def test_page_assets_and_api_calls_are_consistent(self) -> None:
+        roles_payload = self.route_manifest.get("roles") or {{}}
+        discovered_api_refs: set[str] = set()
+        for role in ROLES:
+            pages = (roles_payload.get(role) or {{}}).get("pages") or []
+            for page in pages:
+                html_path = MINIAPP_DIR / str(page.get("file_path") or "").removeprefix("miniapp/")
+                html = html_path.read_text(encoding="utf-8")
+                for asset in _extract_static_asset_refs(html):
+                    asset_path = MINIAPP_DIR / "app" / asset.removeprefix("/static/")
+                    self.assertTrue(asset_path.exists(), f"Missing asset {{asset}} referenced from {{html_path}}")
+                    discovered_api_refs.update(_extract_api_refs(asset_path.read_text(encoding="utf-8")))
+                discovered_api_refs.update(_extract_api_refs(html))
+        expected_api_paths = {{
+            str(item.get("path") or "").strip()
+            for item in (self.grounded_spec.get("api_requirements") or [])
+            if isinstance(item, dict) and str(item.get("path") or "").strip().startswith("/api/")
+        }}
+        expected_api_paths.update(discovered_api_refs)
+        for api_path in sorted(expected_api_paths):
+            normalized_path = _sample_route_path(api_path)
+            methods = {{
+                method
+                for route_path, method in self.registered_routes
+                if _sample_route_path(route_path) == normalized_path
+            }}
+            self.assertTrue(methods, f"No registered FastAPI route matches {{api_path}}")
+            for method in sorted(methods):
+                if method not in {{"GET", "POST", "PUT", "PATCH", "DELETE"}}:
+                    continue
+                payload = _sample_request_payload(normalized_path, method)
+                response = self.client.request(method, normalized_path, json=payload if payload is not None else None)
+                self.assertNotEqual(
+                    response.status_code,
+                    404,
+                    f"{{method}} {{normalized_path}} was planned but is missing at runtime.",
+                )
+                self.assertLess(
+                    response.status_code,
+                    500,
+                    f"{{method}} {{normalized_path}} raised a server error: {{response.text}}",
+                )
+
+    def test_backend_route_modules_import(self) -> None:
+        for file_path in EXPECTED_BACKEND_TARGETS:
+            if not file_path.startswith("miniapp/app/routes/") or not file_path.endswith(".py"):
+                continue
+            module_name = file_path.removeprefix("miniapp/").removesuffix(".py").replace("/", ".")
+            importlib.import_module(module_name)
+
+
+if __name__ == "__main__":
+    unittest.main()
+"""
+
+    @classmethod
+    def _js_app_level_test_content(cls, *, page_graph: dict[str, Any], role_scope: list[str]) -> str:
+        roles_literal = json.dumps(list(role_scope), ensure_ascii=True)
+        return f"""import assert from 'node:assert/strict';
+import {{ spawnSync }} from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import {{ fileURLToPath }} from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const MINIAPP_DIR = path.resolve(__dirname, '..');
+const APP_DIR = path.join(MINIAPP_DIR, 'app');
+const ROUTE_MANIFEST_PATH = path.join(APP_DIR, 'generated', 'route_manifest.json');
+const RUNTIME_MANIFEST_PATH = path.join(APP_DIR, 'generated', 'runtime_manifest.json');
+const GROUNDED_SPEC_PATH = path.join(MINIAPP_DIR, '..', 'artifacts', 'grounded_spec.json');
+const ROLES = {roles_literal};
+
+function loadJson(filePath) {{
+  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}}
+
+function collectFiles(rootDir, extension) {{
+  const items = [];
+  for (const entry of fs.readdirSync(rootDir, {{ withFileTypes: true }})) {{
+    const absolutePath = path.join(rootDir, entry.name);
+    if (entry.isDirectory()) {{
+      items.push(...collectFiles(absolutePath, extension));
+      continue;
+    }}
+    if (absolutePath.endsWith(extension)) {{
+      items.push(absolutePath);
+    }}
+  }}
+  return items;
+}}
+
+function extractStaticAssets(html) {{
+  const assets = [];
+  const regex = /(?:src|href)=["'](\\/static\\/[^"']+)["']/g;
+  for (const match of html.matchAll(regex)) {{
+    assets.push(match[1]);
+  }}
+  return assets;
+}}
+
+function extractApiRefs(content) {{
+  const refs = new Set();
+  const regex = /["'](\\/api\\/[a-zA-Z0-9_\\-/:{{}}]+)/g;
+  for (const match of content.matchAll(regex)) {{
+    refs.add(match[1]);
+  }}
+  return refs;
+}}
+
+function normalizeRoutePath(value) {{
+  return value
+    .replace(/\\{{[^/]+\\}}/g, 'sample')
+    .replace(/:[^/]+/g, 'sample');
+}}
+
+function collectRegisteredRoutes() {{
+  const script = `
+import json
+from app.main import app
+routes = []
+for route in app.routes:
+    path = getattr(route, 'path', None)
+    methods = sorted(getattr(route, 'methods', []) or [])
+    if path:
+        routes.append({{'path': path, 'methods': methods}})
+print(json.dumps(routes))
+`;
+  const env = {{ ...process.env, PYTHONPATH: [MINIAPP_DIR, process.env.PYTHONPATH || ''].filter(Boolean).join(path.delimiter) }};
+  const result = spawnSync(process.env.PYTHON || 'python3', ['-c', script], {{
+    cwd: MINIAPP_DIR,
+    encoding: 'utf8',
+    env,
+  }});
+  assert.equal(result.status, 0, `Failed to inspect FastAPI routes\\n${{result.stderr || result.stdout}}`);
+  return JSON.parse(result.stdout);
+}}
+
+test('generated manifests exist', () => {{
+  assert.equal(fs.existsSync(ROUTE_MANIFEST_PATH), true, `Missing ${{ROUTE_MANIFEST_PATH}}`);
+  assert.equal(fs.existsSync(RUNTIME_MANIFEST_PATH), true, `Missing ${{RUNTIME_MANIFEST_PATH}}`);
+  const routeManifest = loadJson(ROUTE_MANIFEST_PATH);
+  const runtimeManifest = loadJson(RUNTIME_MANIFEST_PATH);
+  assert.equal(typeof routeManifest.roles, 'object');
+  assert.equal(typeof runtimeManifest.roles, 'object');
+}});
+
+test('role pages and static assets exist', () => {{
+  const routeManifest = loadJson(ROUTE_MANIFEST_PATH);
+  for (const role of ROLES) {{
+    const pages = routeManifest.roles?.[role]?.pages ?? [];
+    assert.ok(pages.length > 0, `No pages declared for role ${{role}}`);
+    const filePaths = pages.map((page) => String(page.file_path ?? ''));
+    assert.equal(new Set(filePaths).size, filePaths.length, `Role ${{role}} reuses the same file across multiple routes: ${{filePaths.join(', ')}}`);
+    for (const page of pages) {{
+      const filePath = String(page.file_path ?? '');
+      const stylePath = String(page.style_path ?? '');
+      const scriptPath = String(page.script_path ?? '');
+      assert.ok(filePath.startsWith('miniapp/'), `Unexpected page file path ${{filePath}}`);
+      const absolutePagePath = path.join(MINIAPP_DIR, filePath.replace(/^miniapp\\//, ''));
+      assert.ok(fs.existsSync(absolutePagePath), `Missing page file ${{filePath}}`);
+      assert.ok(stylePath.startsWith('miniapp/'), `Unexpected page style path ${{stylePath}}`);
+      assert.ok(scriptPath.startsWith('miniapp/'), `Unexpected page script path ${{scriptPath}}`);
+      assert.ok(fs.existsSync(path.join(MINIAPP_DIR, stylePath.replace(/^miniapp\\//, ''))), `Missing page style ${{stylePath}}`);
+      assert.ok(fs.existsSync(path.join(MINIAPP_DIR, scriptPath.replace(/^miniapp\\//, ''))), `Missing page script ${{scriptPath}}`);
+      const html = fs.readFileSync(absolutePagePath, 'utf8');
+      assert.ok(html.toLowerCase().includes('<html'), `Page ${{filePath}} does not look like HTML`);
+      assert.ok(html.trim().length > 80, `Page ${{filePath}} is unexpectedly short`);
+      assert.ok(html.includes(`/static/${{role}}/${{path.basename(stylePath)}}`), `Page ${{filePath}} must reference its own CSS file`);
+      assert.ok(html.includes(`/static/${{role}}/${{path.basename(scriptPath)}}`), `Page ${{filePath}} must reference its own JS file`);
+      for (const asset of extractStaticAssets(html)) {{
+        const absoluteAssetPath = path.join(APP_DIR, asset.replace(/^\\/static\\//, 'static/'));
+        assert.ok(fs.existsSync(absoluteAssetPath), `Missing referenced asset ${{asset}} from ${{filePath}}`);
+      }}
+    }}
+  }}
+}});
+
+test('planned api references map to registered backend routes', () => {{
+  const routeManifest = loadJson(ROUTE_MANIFEST_PATH);
+  const groundedSpec = fs.existsSync(GROUNDED_SPEC_PATH) ? loadJson(GROUNDED_SPEC_PATH) : {{}};
+  const expectedApiPaths = new Set(
+    (groundedSpec.api_requirements ?? [])
+      .map((item) => String(item?.path ?? ''))
+      .filter((value) => value.startsWith('/api/'))
+  );
+  for (const role of ROLES) {{
+    const pages = routeManifest.roles?.[role]?.pages ?? [];
+    for (const page of pages) {{
+      for (const targetPath of [page.file_path, page.style_path, page.script_path]) {{
+        const absolutePath = path.join(MINIAPP_DIR, String(targetPath ?? '').replace(/^miniapp\\//, ''));
+        if (!fs.existsSync(absolutePath)) {{
+          continue;
+        }}
+        for (const apiRef of extractApiRefs(fs.readFileSync(absolutePath, 'utf8'))) {{
+          expectedApiPaths.add(apiRef);
+        }}
+      }}
+    }}
+  }}
+  const registeredRoutes = collectRegisteredRoutes();
+  for (const apiPath of expectedApiPaths) {{
+    const normalized = normalizeRoutePath(apiPath);
+    const matches = registeredRoutes.filter((item) => normalizeRoutePath(String(item.path ?? '')) === normalized);
+    assert.ok(matches.length > 0, `No registered backend route matches planned API path ${{apiPath}}`);
+  }}
+}});
+
+test('generated javascript files parse', () => {{
+  const jsFiles = collectFiles(path.join(APP_DIR, 'static'), '.js');
+  assert.ok(jsFiles.length > 0, 'No generated JavaScript files found');
+  for (const filePath of jsFiles) {{
+    const result = spawnSync(process.execPath, ['--check', filePath], {{ encoding: 'utf8' }});
+    assert.equal(result.status, 0, `node --check failed for ${{filePath}}\\n${{result.stderr || result.stdout}}`);
+  }}
+}});
+"""
+
+    @staticmethod
+    def _route_manifest_from_page_graph(page_graph: dict[str, Any], role_scope: list[str]) -> dict[str, Any]:
+        roles: dict[str, Any] = {}
+        role_payloads = page_graph.get("roles") or {}
+        for role in role_scope:
+            payload = role_payloads.get(role) or {}
+            pages: list[dict[str, Any]] = []
+            for index, page in enumerate(payload.get("pages") or []):
+                if not isinstance(page, dict):
+                    continue
+                route_path = str(page.get("route_path") or f"/{role}").strip() or f"/{role}"
+                normalized_route = "/" + route_path.strip("/")
+                if route_path == "/":
+                    normalized_route = f"/{role}"
+                page_kind = str(page.get("page_kind") or "").strip().lower()
+                pages.append(
+                    {
+                        "page_id": str(page.get("page_id") or f"{role}_{index + 1}"),
+                        "route_path": normalized_route,
+                        "file_path": str(page.get("file_path") or f"miniapp/app/static/{role}/index.html"),
+                        "style_path": str(
+                            page.get("style_path")
+                            or GenerationService._default_page_asset_path(
+                                str(page.get("file_path") or f"miniapp/app/static/{role}/index.html"),
+                                asset_kind="css",
+                            )
+                        ),
+                        "script_path": str(
+                            page.get("script_path")
+                            or GenerationService._default_page_asset_path(
+                                str(page.get("file_path") or f"miniapp/app/static/{role}/index.html"),
+                                asset_kind="js",
+                            )
+                        ),
+                        "page_kind": page_kind or ("profile" if normalized_route.endswith("/profile") else "page"),
+                        "navigation_label": str(page.get("navigation_label") or page.get("title") or "Open"),
+                        "title": str(page.get("title") or page.get("navigation_label") or role.title()),
+                        "handoff_paths": [str(path) for path in (page.get("handoff_paths") or []) if isinstance(path, str)],
+                        "is_entry": bool(page.get("is_entry") or normalized_route == f"/{role}"),
+                    }
+                )
+            if not pages:
+                pages = GenerationService._fallback_page_contract(role, require_multi_page=False)
+                for page in pages:
+                    page["route_path"] = str(page.get("route_path") or f"/{role}")
+                    page["is_entry"] = str(page["route_path"]).rstrip("/") == f"/{role}"
+            roles[role] = {
+                "entry_path": str(payload.get("entry_path") or f"/{role}"),
+                "pages": pages,
+            }
+        return {"roles": roles}
+
+    @staticmethod
+    def _normalize_runtime_python_path(path: str) -> str:
+        if path.startswith("miniapp/app/routes/") and path.endswith(".py"):
+            head, tail = path.rsplit("/", 1)
+            if "-" in tail:
+                return f"{head}/{tail.replace('-', '_')}"
+        return path
+
+    @classmethod
+    def _normalize_runtime_python_paths_in_plan(cls, plan_result: dict[str, Any]) -> None:
+        for key in ("target_files", "backend_targets", "files_to_read", "shared_files"):
+            values = plan_result.get(key)
+            if isinstance(values, list):
+                plan_result[key] = [
+                    cls._normalize_runtime_python_path(str(value))
+                    for value in values
+                    if isinstance(value, str)
+                ]
+        cls._normalize_runtime_python_paths_in_structure(plan_result.get("page_graph"))
+        cls._normalize_runtime_python_paths_in_structure(plan_result.get("execution_plan"))
+        cls._normalize_runtime_python_paths_in_structure(plan_result.get("planner_contract_enrichment"))
+        cls._normalize_runtime_python_paths_in_structure(plan_result.get("generation_clusters"))
+
+    @classmethod
+    def _expand_page_asset_targets_in_plan(cls, plan_result: dict[str, Any]) -> None:
+        page_graph = plan_result.get("page_graph")
+        if not isinstance(page_graph, dict):
+            return
+        target_files = list(plan_result.get("target_files") or [])
+        files_to_read = list(plan_result.get("files_to_read") or [])
+        expanded_paths: list[str] = []
+        for role_payload in (page_graph.get("roles") or {}).values():
+            if not isinstance(role_payload, dict):
+                continue
+            for page in role_payload.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                file_path = str(page.get("file_path") or "").strip()
+                if not file_path:
+                    continue
+                style_path = str(page.get("style_path") or cls._default_page_asset_path(file_path, asset_kind="css")).strip()
+                script_path = str(page.get("script_path") or cls._default_page_asset_path(file_path, asset_kind="js")).strip()
+                page["style_path"] = style_path
+                page["script_path"] = script_path
+                expanded_paths.extend([file_path, style_path, script_path])
+        plan_result["target_files"] = list(dict.fromkeys([*target_files, *expanded_paths]))
+        plan_result["files_to_read"] = list(dict.fromkeys([*files_to_read, *expanded_paths]))
+
+    @classmethod
+    def _normalize_runtime_python_paths_in_structure(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return cls._normalize_runtime_python_path(value)
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                value[index] = cls._normalize_runtime_python_paths_in_structure(item)
+            if all(isinstance(item, str) for item in value):
+                deduped = list(dict.fromkeys(str(item) for item in value))
+                value[:] = deduped
+            return value
+        if isinstance(value, dict):
+            for key, item in list(value.items()):
+                value[key] = cls._normalize_runtime_python_paths_in_structure(item)
+            return value
+        return value
+
+    @staticmethod
+    def _runtime_manifest_from_page_graph(
+        route_manifest: dict[str, Any],
+        grounded_spec: GroundedSpecModel,
+        generation_mode: GenerationMode,
+    ) -> dict[str, Any]:
+        roles: dict[str, Any] = {}
+        for role in ROLE_ORDER:
+            role_payload = ((route_manifest.get("roles") or {}).get(role) or {})
+            pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
+            routes = []
+            screens = {}
+            navigation = []
+            route_tree = []
+            for index, page in enumerate(pages):
+                route_path = str(page.get("route_path") or f"/{role}")
+                screen_id = str(page.get("page_id") or f"{role}_{index + 1}")
+                title = str(page.get("title") or page.get("navigation_label") or role.title())
+                page_kind = str(page.get("page_kind") or "page")
+                route_tree.append(route_path)
+                routes.append(
+                    {
+                        "route_id": f"{role}_route_{index + 1}",
+                        "role": role,
+                        "path": route_path,
+                        "screen_id": screen_id,
+                        "label": str(page.get("navigation_label") or title),
+                        "is_entry": bool(page.get("is_entry")),
+                    }
+                )
+                screens[screen_id] = {
+                    "screen_id": screen_id,
+                    "path": route_path,
+                    "title": title,
+                    "subtitle": grounded_spec.product_goal[:160],
+                    "kind": page_kind,
+                    "page_purpose": title,
+                    "handoff_paths": list(page.get("handoff_paths") or []),
+                    "components": [],
+                    "actions": [],
+                    "sections": [],
+                    "state_key": f"{role}:{screen_id}",
+                }
+                navigation.append(
+                    {
+                        "path": route_path,
+                        "label": str(page.get("navigation_label") or title),
+                        "is_entry": bool(page.get("is_entry")),
+                    }
+                )
+            roles[role] = {
+                "entry_path": str(role_payload.get("entry_path") or f"/{role}"),
+                "route_tree": route_tree,
+                "routes": routes,
+                "screens": screens,
+                "action_model": [],
+                "navigation": navigation,
+            }
+        return {
+            "app": {
+                "title": grounded_spec.product_goal[:80],
+                "goal": grounded_spec.product_goal,
+                "generation_mode": generation_mode.value,
+                "ui_variant": "generated",
+                "layout_variant": "stacked",
+                "theme": {"accent": "#2d7ff9", "surface": "#ffffff", "card": "#f8fbff", "border": "#d8e4f7"},
+                "platform": grounded_spec.target_platform,
+                "preview_profile": grounded_spec.preview_profile,
+                "route_count": sum(len(role_payload["routes"]) for role_payload in roles.values()),
+                "screen_count": sum(len(role_payload["screens"]) for role_payload in roles.values()),
+            },
+            "roles": roles,
+        }
+
+    @staticmethod
+    def _runtime_state_from_route_manifest(
+        route_manifest: dict[str, Any],
+        grounded_spec: GroundedSpecModel,
+        generation_mode: GenerationMode,
+    ) -> dict[str, Any]:
+        return {
+            "metadata": {
+                "generated_at": utc_now().isoformat(),
+                "generation_mode": generation_mode.value,
+                "goal": grounded_spec.product_goal,
+            },
+            "records": [],
+            "roles": {
+                role: {
+                    "profile": {
+                        "first_name": "Ivan",
+                        "last_name": "Ivanov",
+                        "email": "",
+                        "phone": "",
+                        "photo_url": None,
+                    },
+                    "metrics": [
+                        {"metric_id": "pages", "label": "Pages", "value": str(len(((route_manifest.get("roles") or {}).get(role) or {}).get("pages") or []))}
+                    ],
+                }
+                for role in ROLE_ORDER
+            },
+            "activity": [],
+        }
+
+    @staticmethod
+    def _role_seed_from_route_manifest(
+        route_manifest: dict[str, Any],
+        runtime_manifest: dict[str, Any],
+        runtime_state: dict[str, Any],
+        grounded_spec: GroundedSpecModel,
+    ) -> dict[str, Any]:
+        role_seed = {"roles": {}}
+        for role in ROLE_ORDER:
+            role_payload = ((route_manifest.get("roles") or {}).get(role) or {})
+            pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
+            home_page = next((page for page in pages if page.get("is_entry")), pages[0] if pages else {"title": role.title(), "route_path": f"/{role}"})
+            secondary_page = next((page for page in pages if not page.get("is_entry")), home_page)
+            role_seed["roles"][role] = {
+                "title": str(home_page.get("title") or role.title()),
+                "description": grounded_spec.product_goal[:160],
+                "feature_text": grounded_spec.product_goal[:160],
+                "primary_action_label": str(home_page.get("navigation_label") or home_page.get("title") or "Open"),
+                "secondary_action_label": str(secondary_page.get("navigation_label") or secondary_page.get("title") or "Explore"),
+                "route_tree": list((((runtime_manifest.get("roles") or {}).get(role) or {}).get("route_tree") or [])),
+                "pages": [
+                    {
+                        "screen_id": str(page.get("page_id") or f"{role}_page"),
+                        "path": str(page.get("route_path") or f"/{role}"),
+                        "kind": str(page.get("page_kind") or "page"),
+                        "title": str(page.get("title") or page.get("navigation_label") or role.title()),
+                        "page_purpose": str(page.get("title") or page.get("navigation_label") or role.title()),
+                        "handoff_paths": list(page.get("handoff_paths") or []),
+                    }
+                    for page in pages
+                ],
+                "metrics": list((((runtime_state.get("roles") or {}).get(role) or {}).get("metrics") or [])),
+                "profile": dict((((runtime_state.get("roles") or {}).get(role) or {}).get("profile") or {})),
+            }
+        return role_seed
 
     @staticmethod
     def _build_stage_reports(
@@ -4493,14 +5364,19 @@ class GenerationService:
         role_scope: list[str],
         realized_paths: set[str],
     ) -> MaterializationReport:
+        normalized_realized_paths = {
+            cls._normalize_runtime_python_path(str(path))
+            for path in realized_paths
+            if isinstance(path, str)
+        }
         planned_pages = [
-            str(page.get("file_path"))
+            cls._normalize_runtime_python_path(str(page.get("file_path")))
             for role in role_scope
             for page in (page_graph.get("roles", {}).get(role, {}) or {}).get("pages", [])
             if isinstance(page, dict) and isinstance(page.get("file_path"), str)
         ]
         expected_backend_files = [
-            str(path)
+            cls._normalize_runtime_python_path(str(path))
             for path in [*(page_graph.get("backend_targets") or []), *(page_graph.get("shared_files") or [])]
             if isinstance(path, str) and path.startswith("miniapp/app/")
         ]
@@ -4510,24 +5386,41 @@ class GenerationService:
             "miniapp/app/generated/static_runtime_manifest.json",
             "artifacts/generated_app_graph.json",
         ]
-        missing_files = [path for path in planned_pages if path not in realized_paths]
-        missing_backend_files = [path for path in expected_backend_files if path not in realized_paths]
+        missing_files = [path for path in planned_pages if path not in normalized_realized_paths]
+        missing_backend_files = [path for path in expected_backend_files if path not in normalized_realized_paths]
+        role_unique_page_counts: dict[str, int] = {}
+        duplicate_page_file_roles: dict[str, list[str]] = {}
         role_page_counts = {
             role: sum(
                 1
                 for page in (page_graph.get("roles", {}).get(role, {}) or {}).get("pages", [])
-                if isinstance(page, dict) and str(page.get("file_path") or "") in realized_paths
+                if isinstance(page, dict)
+                and cls._normalize_runtime_python_path(str(page.get("file_path") or "")) in normalized_realized_paths
             )
             for role in role_scope
         }
+        for role in role_scope:
+            role_pages = [
+                cls._normalize_runtime_python_path(str(page.get("file_path") or ""))
+                for page in (page_graph.get("roles", {}).get(role, {}) or {}).get("pages", [])
+                if isinstance(page, dict) and isinstance(page.get("file_path"), str)
+            ]
+            role_unique_page_counts[role] = len(set(role_pages))
+            duplicates = sorted(path for path, count in Counter(role_pages).items() if count > 1 and path)
+            if duplicates:
+                duplicate_page_file_roles[role] = duplicates
         backend_surface_ok = not missing_backend_files if expected_backend_files else execution_class == "shell_app"
-        page_surface_ok = not missing_files and all(count >= 2 for count in role_page_counts.values()) if execution_class != "shell_app" else all(count >= 1 for count in role_page_counts.values())
-        manifest_surface_ok = all(path in realized_paths for path in expected_manifests)
+        page_surface_ok = (
+            not missing_files
+            and not duplicate_page_file_roles
+            and all(count >= 2 for count in role_page_counts.values())
+        ) if execution_class != "shell_app" else all(count >= 1 for count in role_page_counts.values())
+        manifest_surface_ok = all(path in normalized_realized_paths for path in expected_manifests)
         fell_back_to_template = execution_class != "shell_app" and not page_surface_ok and all(count <= 2 for count in role_page_counts.values())
         return MaterializationReport(
             execution_class=execution_class,  # type: ignore[arg-type]
             planned_files=sorted(dict.fromkeys(planned_pages)),
-            created_files=sorted(realized_paths),
+            created_files=sorted(normalized_realized_paths),
             missing_files=sorted(dict.fromkeys(missing_files)),
             expected_backend_files=sorted(dict.fromkeys(expected_backend_files)),
             missing_backend_files=sorted(dict.fromkeys(missing_backend_files)),
@@ -4536,7 +5429,9 @@ class GenerationService:
             manifest_surface_ok=manifest_surface_ok,
             fell_back_to_template=fell_back_to_template,
             role_page_counts=role_page_counts,
-            stage_reports=cls._build_stage_reports(page_graph=page_graph, role_scope=role_scope, realized_paths=realized_paths),
+            role_unique_page_counts=role_unique_page_counts,
+            duplicate_page_file_roles=duplicate_page_file_roles,
+            stage_reports=cls._build_stage_reports(page_graph=page_graph, role_scope=role_scope, realized_paths=normalized_realized_paths),
         )
 
     def _realized_draft_file_paths(self, workspace_id: str, run_id: str) -> set[str]:
@@ -4588,6 +5483,12 @@ class GenerationService:
             return (
                 "generation.edit.missing_backend_surface",
                 [f"Required backend workflow files were not materialized: {', '.join(report.missing_backend_files[:5])}"],
+            )
+        if report.duplicate_page_file_roles:
+            role, duplicates = next(iter(report.duplicate_page_file_roles.items()))
+            return (
+                "generation.edit.duplicate_page_surface",
+                [f"{role} reuses the same page file for multiple planned routes: {', '.join(duplicates[:5])}"],
             )
         if not report.manifest_surface_ok and generation_mode == GenerationMode.QUALITY:
             return (
@@ -6692,14 +7593,22 @@ class GenerationService:
                     continue
                 route_path = str(route.get("path") or "/").strip() or "/"
                 route_path = "/" if route_path == "/" else f"/{route_path.strip('/')}"
-                slug = route_path.strip("/").replace("/", "-")
-                file_name = "index.html" if route_path == "/" else f"{slug}.html"
+                if route_path == "/":
+                    file_name = "index.html"
+                else:
+                    route_slug = re.sub(r":[^/]+", "detail", route_path.strip("/"))
+                    route_slug = route_slug.replace("/", "_").replace("-", "_")
+                    route_slug = re.sub(r"[^a-z0-9_]+", "_", route_slug.lower()).strip("_")
+                    route_slug = re.sub(r"_+", "_", route_slug)
+                    file_name = f"{route_slug or 'page'}.html"
                 screen = ((payload.get("screens") or {}) or {}).get(route.get("screen_id")) or {}
                 pages.append(
                     {
                         "page_id": str(route.get("screen_id") or route.get("route_id") or f"{role}_{len(pages) + 1}"),
                         "route_path": route_path,
                         "file_path": f"miniapp/app/static/{role}/{file_name}",
+                        "style_path": f"miniapp/app/static/{role}/{Path(file_name).stem}.css",
+                        "script_path": f"miniapp/app/static/{role}/{Path(file_name).stem}.js",
                         "page_kind": str(screen.get("kind") or "page"),
                         "navigation_label": str(route.get("label") or screen.get("title") or "Open"),
                         "title": str(screen.get("title") or route.get("label") or "Page"),

@@ -7,16 +7,18 @@ from pathlib import Path
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
 
 import app.services.check_runner as check_runner_module
 from fastapi.testclient import TestClient
 
 from app.ai.openrouter_client import OpenRouterClient
 from app.main import create_app
+from app.models.common import PreviewProfile, TargetPlatform
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RunCheckResult, ValidationSnapshot, WorkspaceRecord
 from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
-from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES
+from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES, GenerationService
 from app.validators.build_validator import BuildValidator
 
 
@@ -202,6 +204,453 @@ def test_context_pack_and_generation_context_skip_non_utf8_files(tmp_path: Path)
     assert "miniapp/app/generated/app.db" not in file_contexts
 
 
+def test_runtime_artifacts_are_synthesized_from_page_graph(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    generation_service = app.state.container.generation_service
+    spec = generation_service._build_grounded_spec(
+        workspace_id="ws_manifest",
+        prompt="Create a requests mini app for clients, specialists, and managers.",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        doc_refs=[],
+        template_revision_id="rev_test",
+        prompt_turn_id="turn_test",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    page_graph = {
+        "roles": {
+            "client": {
+                "entry_path": "/client",
+                "pages": [
+                    {"page_id": "client_home", "route_path": "/client", "file_path": "miniapp/app/static/client/index.html", "title": "Client Home", "navigation_label": "Home", "is_entry": True},
+                    {"page_id": "client_profile", "route_path": "/client/profile", "file_path": "miniapp/app/static/client/profile.html", "title": "Profile", "navigation_label": "Profile", "page_kind": "profile"},
+                ],
+            },
+            "specialist": {
+                "entry_path": "/specialist",
+                "pages": [
+                    {"page_id": "specialist_home", "route_path": "/specialist", "file_path": "miniapp/app/static/specialist/index.html", "title": "Desk", "navigation_label": "Desk", "is_entry": True},
+                    {"page_id": "specialist_profile", "route_path": "/specialist/profile", "file_path": "miniapp/app/static/specialist/profile.html", "title": "Profile", "navigation_label": "Profile", "page_kind": "profile"},
+                ],
+            },
+            "manager": {
+                "entry_path": "/manager",
+                "pages": [
+                    {"page_id": "manager_home", "route_path": "/manager", "file_path": "miniapp/app/static/manager/index.html", "title": "Overview", "navigation_label": "Overview", "is_entry": True},
+                    {"page_id": "manager_profile", "route_path": "/manager/profile", "file_path": "miniapp/app/static/manager/profile.html", "title": "Profile", "navigation_label": "Profile", "page_kind": "profile"},
+                ],
+            },
+        }
+    }
+
+    ensured = generation_service._ensure_runtime_artifact_operations(
+        grounded_spec=spec,
+        page_graph=page_graph,
+        role_scope=["client", "specialist", "manager"],
+        generation_mode=GenerationMode.BALANCED,
+        operations=[],
+    )
+    ensured_paths = {operation.file_path for operation in ensured}
+
+    assert "miniapp/app/generated/route_manifest.json" in ensured_paths
+    assert "miniapp/app/generated/runtime_manifest.json" in ensured_paths
+    assert "miniapp/app/generated/static_runtime_manifest.json" in ensured_paths
+    assert "miniapp/app/generated/role_seed.json" in ensured_paths
+    assert "miniapp/app/generated/role_experience.json" in ensured_paths
+
+
+def test_edit_gate_allows_loading_copy_when_page_has_real_surface() -> None:
+    page_graph = {
+        "roles": {
+            "specialist": {
+                "pages": [
+                    {
+                        "page_id": "specialist_home",
+                        "route_path": "/specialist",
+                        "file_path": "miniapp/app/static/specialist/index.html",
+                        "title": "Assigned Tasks",
+                        "navigation_label": "Desk",
+                        "data_dependencies": [],
+                    }
+                ]
+            }
+        }
+    }
+    operations = [
+        DraftFileOperation(
+            file_path="miniapp/app/static/specialist/index.html",
+            operation="replace",
+            content="""<!doctype html>
+<html lang="en">
+  <body>
+    <main class="page-shell">
+      <section class="page">
+        <a class="card-link" href="/specialist/profile">Open profile</a>
+        <section class="feature-block">Loading workload...</section>
+        <section class="filters"><button class="chip">All</button></section>
+        <section class="state" id="tasks-loading">Loading tasks...</section>
+        <section class="state hidden" id="tasks-empty">No tasks yet.</section>
+        <section class="state hidden" id="tasks-error">Unable to load tasks. <button id="retry-button">Retry</button></section>
+        <section class="task-list" id="task-list"></section>
+      </section>
+    </main>
+  </body>
+</html>""",
+            reason="Generated specialist desk page.",
+        )
+    ]
+
+    issues = GenerationService._edit_gate_issues(
+        page_graph,
+        operations,
+        ["specialist"],
+        scope_mode="whole_file_build",
+        target_files=["miniapp/app/static/specialist/index.html"],
+        require_business_pages=True,
+    )
+
+    assert "miniapp/app/static/specialist/index.html is dominated by loading copy instead of real page content." not in issues
+
+
+def test_edit_gate_allows_generated_app_level_test_files() -> None:
+    page_graph = {
+        "roles": {
+            "client": {
+                "pages": [
+                    {
+                        "page_id": "client_home",
+                        "route_path": "/client",
+                        "file_path": "miniapp/app/static/client/index.html",
+                        "title": "Client Home",
+                        "navigation_label": "Home",
+                        "data_dependencies": [],
+                    }
+                ]
+            }
+        }
+    }
+    operations = [
+        DraftFileOperation(
+            file_path="miniapp/app/static/client/index.html",
+            operation="replace",
+            content="<html><body><main>Client</main></body></html>",
+            reason="Generated client page.",
+        ),
+        DraftFileOperation(
+            file_path="miniapp/tests/test_generated_app.py",
+            operation="replace",
+            content="class GeneratedMiniAppTests: ...\n",
+            reason="Generated backend app-level test.",
+        ),
+        DraftFileOperation(
+            file_path="miniapp/tests/generated_app.test.mjs",
+            operation="replace",
+            content="import test from 'node:test';\n",
+            reason="Generated frontend app-level test.",
+        ),
+    ]
+
+    issues = GenerationService._edit_gate_issues(
+        page_graph,
+        operations,
+        ["client"],
+        scope_mode="whole_file_build",
+        target_files=["miniapp/app/static/client/index.html"],
+        require_business_pages=False,
+    )
+
+    assert not any("planned target scope" in issue for issue in issues)
+    assert not any("canonical architecture roots" in issue for issue in issues)
+
+
+def test_runtime_python_route_paths_are_normalized() -> None:
+    plan_result = {
+        "target_files": ["miniapp/app/routes/time-slots.py", "miniapp/app/static/client/index.html"],
+        "backend_targets": ["miniapp/app/routes/time-slots.py"],
+        "files_to_read": ["miniapp/app/routes/time-slots.py"],
+        "shared_files": [],
+        "planner_contract_enrichment": {
+            "proactive_backend_targets": ["miniapp/app/routes/time-slots.py"],
+        },
+        "generation_clusters": [
+            {"cluster_name": "backend_core", "target_files": ["miniapp/app/routes/time-slots.py"]},
+        ],
+        "execution_plan": {
+            "miniapp": {"target_files": ["miniapp/app/routes/time-slots.py"]},
+            "generation_clusters": [{"cluster_name": "backend_core", "target_files": ["miniapp/app/routes/time-slots.py"]}],
+        },
+        "page_graph": {
+            "backend_targets": ["miniapp/app/routes/time-slots.py"],
+            "roles": {
+                "client": {
+                    "routes_file": "miniapp/app/routes/time-slots.py",
+                    "pages": [
+                        {"file_path": "miniapp/app/routes/time-slots.py"},
+                    ],
+                }
+            },
+        },
+    }
+
+    GenerationService._normalize_runtime_python_paths_in_plan(plan_result)
+
+    assert "miniapp/app/routes/time_slots.py" in plan_result["target_files"]
+    assert "miniapp/app/routes/time_slots.py" in plan_result["backend_targets"]
+    assert plan_result["planner_contract_enrichment"]["proactive_backend_targets"] == ["miniapp/app/routes/time_slots.py"]
+    assert plan_result["generation_clusters"][0]["target_files"] == ["miniapp/app/routes/time_slots.py"]
+    assert plan_result["execution_plan"]["miniapp"]["target_files"] == ["miniapp/app/routes/time_slots.py"]
+    assert plan_result["execution_plan"]["generation_clusters"][0]["target_files"] == ["miniapp/app/routes/time_slots.py"]
+    assert plan_result["page_graph"]["roles"]["client"]["routes_file"] == "miniapp/app/routes/time_slots.py"
+    assert plan_result["page_graph"]["roles"]["client"]["pages"][0]["file_path"] == "miniapp/app/routes/time_slots.py"
+
+
+def test_generated_paths_use_underscores_for_static_and_route_files() -> None:
+    normalized = GenerationService._normalize_path_list(
+        [
+            "miniapp/app/routes/time-slots.py",
+            "miniapp/app/static/client/request-new.html",
+            "miniapp/app/static/manager/workload-board.html",
+            "miniapp/tests/generated-app.test.mjs",
+        ],
+        [],
+    )
+
+    assert "miniapp/app/routes/time_slots.py" in normalized
+    assert "miniapp/app/static/client/request_new.html" in normalized
+    assert "miniapp/app/static/manager/workload_board.html" in normalized
+    assert "miniapp/tests/generated_app.test.mjs" in normalized
+    assert all("-" not in Path(path).name for path in normalized)
+
+
+def test_default_page_file_uses_snake_case_names() -> None:
+    assert (
+        GenerationService._default_page_file("client", "ClientRequestNewPage", route_path="/request-new")
+        == "miniapp/app/static/client/request_new.html"
+    )
+    assert (
+        GenerationService._default_page_file("manager", "ManagerWorkloadBoardPage", route_path="/workload-board")
+        == "miniapp/app/static/manager/workload_board.html"
+    )
+    assert (
+        GenerationService._default_page_file("specialist", "SpecialistRequestDetailPage", route_path="/requests/:request_id")
+        == "miniapp/app/static/specialist/requests_detail.html"
+    )
+
+
+def test_default_page_asset_paths_follow_page_stem() -> None:
+    assert GenerationService._default_page_asset_path(
+        "miniapp/app/static/client/request_new.html",
+        asset_kind="css",
+    ) == "miniapp/app/static/client/request_new.css"
+    assert GenerationService._default_page_asset_path(
+        "miniapp/app/static/client/request_new.html",
+        asset_kind="js",
+    ) == "miniapp/app/static/client/request_new.js"
+
+
+def test_route_manifest_uses_snake_case_file_names() -> None:
+    manifest = GenerationService._build_route_manifest(
+        {
+            "roles": {
+                "manager": {
+                    "routes": [
+                        {"path": "/", "screen_id": "manager_home", "is_entry": True},
+                        {"path": "/workload-board", "screen_id": "manager_workload"},
+                        {"path": "/requests/:request_id", "screen_id": "manager_request"},
+                    ],
+                    "screens": {
+                        "manager_home": {"kind": "dashboard", "title": "Home"},
+                        "manager_workload": {"kind": "workspace", "title": "Workload"},
+                        "manager_request": {"kind": "workspace", "title": "Request"},
+                    },
+                }
+            }
+        }
+    )
+
+    pages = manifest["roles"]["manager"]["pages"]
+    assert [page["file_path"] for page in pages] == [
+        "miniapp/app/static/manager/index.html",
+        "miniapp/app/static/manager/workload_board.html",
+        "miniapp/app/static/manager/requests_detail.html",
+    ]
+    assert [page["style_path"] for page in pages] == [
+        "miniapp/app/static/manager/index.css",
+        "miniapp/app/static/manager/workload_board.css",
+        "miniapp/app/static/manager/requests_detail.css",
+    ]
+    assert [page["script_path"] for page in pages] == [
+        "miniapp/app/static/manager/index.js",
+        "miniapp/app/static/manager/workload_board.js",
+        "miniapp/app/static/manager/requests_detail.js",
+    ]
+
+
+def test_plan_expands_page_triplet_targets() -> None:
+    plan_result = {
+        "target_files": ["miniapp/app/static/client/index.html"],
+        "files_to_read": [],
+        "page_graph": {
+            "roles": {
+                "client": {
+                    "pages": [
+                        {
+                            "page_id": "client_home",
+                            "route_path": "/client",
+                            "file_path": "miniapp/app/static/client/index.html",
+                        }
+                    ]
+                }
+            }
+        },
+    }
+
+    GenerationService._expand_page_asset_targets_in_plan(plan_result)
+
+    assert plan_result["page_graph"]["roles"]["client"]["pages"][0]["style_path"] == "miniapp/app/static/client/index.css"
+    assert plan_result["page_graph"]["roles"]["client"]["pages"][0]["script_path"] == "miniapp/app/static/client/index.js"
+    assert "miniapp/app/static/client/index.css" in plan_result["target_files"]
+    assert "miniapp/app/static/client/index.js" in plan_result["target_files"]
+
+
+def test_whole_file_cluster_safe_companion_expansion_is_role_local_only() -> None:
+    expanded = GenerationService._expand_cluster_targets_for_safe_companions(
+        cluster_name="role_manager_ui",
+        cluster_targets=["miniapp/app/static/manager/index.html"],
+        invalid_paths=["miniapp/app/static/manager/request-detail.js"],
+    )
+
+    assert expanded == [
+        "miniapp/app/static/manager/index.html",
+        "miniapp/app/static/manager/request-detail.js",
+    ]
+    assert (
+        GenerationService._expand_cluster_targets_for_safe_companions(
+            cluster_name="role_manager_ui",
+            cluster_targets=["miniapp/app/static/manager/index.html"],
+            invalid_paths=["miniapp/app/static/client/request-detail.js"],
+        )
+        is None
+    )
+
+
+def test_app_level_test_operations_are_synthesized() -> None:
+    page_graph = {
+        "backend_targets": ["miniapp/app/routes/time-slots.py", "miniapp/app/routes/requests.py"],
+        "shared_files": ["miniapp/app/static/preview-bridge.js"],
+        "roles": {
+            role: {
+                "pages": [
+                    {
+                        "page_id": f"{role}_home",
+                        "route_path": f"/{role}",
+                        "file_path": f"miniapp/app/static/{role}/index.html",
+                        "page_kind": "dashboard",
+                    }
+                ]
+            }
+            for role in ("client", "specialist", "manager")
+        },
+    }
+    generation_service = GenerationService.__new__(GenerationService)
+
+    ensured = generation_service._ensure_app_level_test_operations(
+        page_graph=page_graph,
+        role_scope=["client", "specialist", "manager"],
+        operations=[],
+    )
+    ensured_paths = {operation.file_path for operation in ensured}
+
+    assert "miniapp/tests/test_generated_app.py" in ensured_paths
+    assert "miniapp/tests/generated_app.test.mjs" in ensured_paths
+    python_test = next(operation for operation in ensured if operation.file_path == "miniapp/tests/test_generated_app.py")
+    assert "time_slots.py" in python_test.content
+    assert "GeneratedMiniAppTests" in python_test.content
+
+
+def test_page_graph_gate_rejects_multiple_routes_sharing_one_file() -> None:
+    page_graph = {
+        "flow_mode": "multi_page",
+        "roles": {
+            "manager": {
+                "routes_file": "miniapp/app/routes/manager.py",
+                "pages": [
+                    {
+                        "page_id": "manager_home",
+                        "route_path": "/",
+                        "file_path": "miniapp/app/static/manager/index.html",
+                        "page_kind": "dashboard",
+                        "purpose": "Manager dashboard with queue metrics and alerts.",
+                        "handoff_paths": ["/profile"],
+                    },
+                    {
+                        "page_id": "manager_workload",
+                        "route_path": "/workload",
+                        "file_path": "miniapp/app/static/manager/index.html",
+                        "page_kind": "workspace",
+                        "purpose": "Manager workload page for balancing assignments and capacity.",
+                        "handoff_paths": ["/"],
+                    },
+                    {
+                        "page_id": "manager_profile",
+                        "route_path": "/profile",
+                        "file_path": "miniapp/app/static/manager/profile.html",
+                        "page_kind": "profile",
+                        "purpose": "Manager profile page for identity and preferences.",
+                        "handoff_paths": ["/"],
+                    },
+                ],
+            }
+        },
+        "shared_files": [],
+        "backend_targets": [],
+    }
+
+    issues = GenerationService._page_graph_gate_issues(
+        page_graph,
+        ["manager"],
+        scope_mode="whole_file_build",
+        require_multi_page=True,
+        require_business_pages=True,
+    )
+
+    assert any("reuses the same file for multiple routes" in issue for issue in issues)
+
+
+def test_materialization_report_rejects_duplicate_page_file_mappings() -> None:
+    page_graph = {
+        "backend_targets": [],
+        "shared_files": [],
+        "roles": {
+            "manager": {
+                "pages": [
+                    {"route_path": "/", "file_path": "miniapp/app/static/manager/index.html"},
+                    {"route_path": "/workload", "file_path": "miniapp/app/static/manager/index.html"},
+                    {"route_path": "/profile", "file_path": "miniapp/app/static/manager/profile.html"},
+                ]
+            }
+        },
+    }
+
+    report = GenerationService._build_materialization_report(
+        execution_class="data_crud_app",
+        page_graph=page_graph,
+        role_scope=["manager"],
+        realized_paths={
+            "miniapp/app/static/manager/index.html",
+            "miniapp/app/static/manager/profile.html",
+            "miniapp/app/generated/route_manifest.json",
+            "miniapp/app/generated/runtime_manifest.json",
+            "miniapp/app/generated/static_runtime_manifest.json",
+            "artifacts/generated_app_graph.json",
+        },
+    )
+
+    assert report.page_surface_ok is False
+    assert report.duplicate_page_file_roles == {"manager": ["miniapp/app/static/manager/index.html"]}
+
+
 def test_run_soft_completes_when_generation_returns_validation_failure(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -269,6 +718,165 @@ def test_run_soft_completes_when_generation_returns_validation_failure(tmp_path:
     assert run.draft_ready is True
     assert run.current_stage == "completed with warnings"
     assert run.failure_reason == "Connectivity validators reported unresolved issues."
+
+
+def test_run_does_not_soft_complete_when_only_preview_issue_remains(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+
+    run = SimpleNamespace(run_id="run_preview_warning", mode="generate")
+    job = SimpleNamespace(
+        status="failed",
+        failure_class="runtime_preview_boot",
+        validation_snapshot=ValidationSnapshot(
+            grounded_spec_valid=True,
+            app_ir_valid=True,
+            build_valid=True,
+            blocking=True,
+            issues=[
+                {
+                    "code": "connectivity.preview_route_unreachable",
+                    "message": "/manager could not be opened in preview.",
+                    "severity": "high",
+                    "location": "preview",
+                    "blocking": True,
+                }
+            ],
+        ),
+    )
+
+    assert run_service._should_soft_complete_with_warnings(run, job) is False
+
+
+def test_run_applies_draft_when_only_preview_warning_remains(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Preview Warning Apply Workspace",
+            "description": "Preview-only warnings should still apply the draft to source.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    workspace_service = app.state.container.workspace_service
+    workspace_service.clone_template(workspace_id)
+
+    def fake_generate(workspace_id: str, request: GenerateRequest, *, should_stop=None):
+        del should_stop
+        draft_root = workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_preview_apply")
+        target = draft_root / "README.md"
+        target.write_text(target.read_text(encoding="utf-8") + "\npreview-warning-fix\n", encoding="utf-8")
+        app.state.container.store.upsert(
+            "reports",
+            f"candidate_diff:{workspace_id}",
+            {
+                "diff": "\n".join(
+                    [
+                        "diff --git a/source/README.md b/draft/README.md",
+                        "--- a/source/README.md",
+                        "+++ b/draft/README.md",
+                        "@@",
+                        "+preview-warning-fix",
+                    ]
+                )
+            },
+        )
+        return JobRecord(
+            workspace_id=workspace_id,
+            prompt=request.prompt,
+            status="failed",
+            mode="generate",
+            generation_mode=request.generation_mode,
+            target_platform=request.target_platform,
+            preview_profile=request.preview_profile,
+            current_revision_id=workspace_service.get_workspace(workspace_id).current_revision_id,
+            fidelity="balanced_app",
+            linked_run_id=request.linked_run_id,
+            summary="Preview connectivity warning remained after repair.",
+            failure_reason="Preview route smoke still failed.",
+            failure_class="runtime_preview_boot",
+            root_cause_summary="/manager could not be opened in preview.",
+            validation_snapshot=ValidationSnapshot(
+                grounded_spec_valid=True,
+                app_ir_valid=True,
+                build_valid=True,
+                blocking=True,
+                issues=[
+                    {
+                        "code": "connectivity.preview_route_unreachable",
+                        "message": "/manager could not be opened in preview.",
+                        "severity": "high",
+                        "location": "preview",
+                        "blocking": True,
+                    }
+                ],
+            ),
+        )
+
+    app.state.container.generation_service.generate = fake_generate  # type: ignore[method-assign]
+
+    run = app.state.container.run_service.create_run_sync(
+        workspace_id,
+        CreateRunRequest(
+            prompt="Create a service requests mini app.",
+            apply_strategy="staged_auto_apply",
+            model_profile="openai_code_fast",
+            generation_mode="balanced",
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+        ),
+    )
+
+    source_readme = workspace_service.source_dir(workspace_id) / "README.md"
+
+    assert run.status == "completed"
+    assert run.apply_status == "applied"
+    assert run.outcome_kind == "warnings"
+    assert run.current_stage == "completed with warnings"
+    assert run.draft_ready is False
+    assert "preview-warning-fix" in source_readme.read_text(encoding="utf-8")
+
+
+def test_run_auto_fix_triggers_for_failed_generate_preview_issue(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+
+    request = CreateRunRequest(
+        prompt="Create a requests mini app.",
+        apply_strategy="staged_auto_apply",
+        model_profile="openai_code_fast",
+        generation_mode="balanced",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+    )
+    job = SimpleNamespace(
+        status="failed",
+        handoff_from_failed_generate={"prompt": "Fix the preview route issue."},
+        validation_snapshot=ValidationSnapshot(
+            grounded_spec_valid=True,
+            app_ir_valid=True,
+            build_valid=True,
+            blocking=True,
+            issues=[
+                {
+                    "code": "connectivity.preview_route_unreachable",
+                    "message": "/manager could not be opened in preview.",
+                    "severity": "high",
+                    "location": "preview",
+                    "blocking": True,
+                }
+            ],
+        ),
+    )
+
+    assert run_service._should_auto_fix_failed_generate(request, job) is True
 
 
 def test_run_exposes_checks_patch_and_index_status(tmp_path: Path) -> None:
@@ -1190,6 +1798,33 @@ def test_frontend_build_tooling_failure_is_classified_as_platform_issue(tmp_path
     assert "npm was not found on PATH." in result.logs
     assert runner.has_tooling_failure([result]) is True
     assert runner.classify_failure([result]) == "tooling/runtime_misconfiguration"
+
+
+def test_generated_python_tests_install_workspace_requirements_first(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    runner = app.state.container.check_runner
+
+    backend_dir = tmp_path / "miniapp"
+    tests_dir = backend_dir / "tests"
+    tests_dir.mkdir(parents=True)
+    (backend_dir / "requirements.txt").write_text("fastapi\nsqlalchemy\n", encoding="utf-8")
+    (tests_dir / "test_generated_app.py").write_text("def test_placeholder():\n    assert True\n", encoding="utf-8")
+
+    commands: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        commands.append(list(command))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(check_runner_module.subprocess, "run", fake_run)
+
+    result = runner._run_python_app_tests(backend_dir)
+
+    assert result.status == "passed"
+    assert commands[0][:5] == [check_runner_module.sys.executable, "-m", "pip", "install", "--no-cache-dir"]
+    assert commands[0][-2:] == ["-r", "requirements.txt"]
+    assert commands[1][:4] == [check_runner_module.sys.executable, "-m", "unittest", "discover"]
 
 
 def test_check_runner_expands_connectivity_validation_issue_codes() -> None:
@@ -2336,7 +2971,7 @@ def test_fix_context_includes_generated_app_graph_for_connectivity_state_failure
     assert "artifacts/generated_app_graph.json" in contexts
 
 
-def test_auto_fixed_generate_run_resumes_generation_from_same_run_checkpoint(tmp_path: Path) -> None:
+def test_auto_fixed_generate_run_does_not_resume_generation_from_checkpoint(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     client = TestClient(app)
@@ -2355,7 +2990,6 @@ def test_auto_fixed_generate_run_resumes_generation_from_same_run_checkpoint(tmp
 
     workspace_service = app.state.container.workspace_service
     preview_service = app.state.container.preview_service
-    resumed_generation = threading.Event()
     generation_modes: list[str] = []
     fix_calls: list[str] = []
 
@@ -2428,28 +3062,7 @@ def test_auto_fixed_generate_run_resumes_generation_from_same_run_checkpoint(tmp
                     issues=[{"code": "check.changed_files_static", "message": "npm run build failed for the draft frontend.", "severity": "high"}],
                 ),
             )
-        resumed_generation.set()
-        workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_resumed")
-        return JobRecord(
-            workspace_id=workspace_id,
-            prompt=request.prompt,
-            status="completed",
-            mode="generate",
-            generation_mode=request.generation_mode,
-            target_platform=request.target_platform,
-            preview_profile=request.preview_profile,
-            current_revision_id=workspace_service.get_workspace(workspace_id).current_revision_id,
-            fidelity="balanced_app",
-            linked_run_id=request.linked_run_id,
-            summary="Resumed generation completed successfully.",
-            validation_snapshot=ValidationSnapshot(
-                grounded_spec_valid=True,
-                app_ir_valid=True,
-                build_valid=True,
-                blocking=False,
-                issues=[],
-            ),
-        )
+        raise AssertionError("Generation should not auto-resume after successful fix.")
 
     def fake_fix_generate(workspace_id: str, request: GenerateRequest, *, should_stop=None):
         del should_stop
@@ -2457,14 +3070,8 @@ def test_auto_fixed_generate_run_resumes_generation_from_same_run_checkpoint(tmp
         assert workspace_service.draft_exists(workspace_id, request.linked_run_id or "")
         run_id = request.linked_run_id or "run_test"
         draft_root = workspace_service.ensure_draft(workspace_id, run_id)
-        client_routes = draft_root / "frontend" / "src" / "roles" / "client" / "ClientRoutes.tsx"
-        client_routes.write_text(
-            client_routes.read_text(encoding="utf-8").replace(
-                "export function ClientRoutes(): JSX.Element {",
-                "export function ClientRoutes(): JSX.Element {\n  // fixed before resuming generation\n",
-            ),
-            encoding="utf-8",
-        )
+        readme = draft_root / "README.md"
+        readme.write_text(readme.read_text(encoding="utf-8") + "\nfix applied\n", encoding="utf-8")
         app.state.container.store.upsert(
             "reports",
             f"candidate_diff:{workspace_id}",
@@ -2519,15 +3126,13 @@ def test_auto_fixed_generate_run_resumes_generation_from_same_run_checkpoint(tmp
     )
 
     assert run.status == "completed"
-    assert generation_modes == ["generate", "generate"]
+    assert generation_modes == ["generate"]
     assert fix_calls == ["fix"]
-    assert resumed_generation.wait(1.0)
     checkpoint = app.state.container.store.get("reports", f"resume_checkpoint:{workspace_id}")
     assert checkpoint is not None
-    assert checkpoint["status"] == "resumed"
-    assert checkpoint["resumed_from_fix_run_id"] == run.run_id
+    assert checkpoint["status"] == "pending"
 
-def test_successful_fix_run_queues_resume_generation_from_checkpoint(tmp_path: Path) -> None:
+def test_successful_fix_run_does_not_queue_resume_generation_from_checkpoint(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     client = TestClient(app)
@@ -2566,14 +3171,8 @@ def test_successful_fix_run_queues_resume_generation_from_checkpoint(tmp_path: P
         del should_stop
         run_id = request.linked_run_id or "run_test"
         draft_root = workspace_service.prepare_draft(workspace_id, run_id)
-        specialist_routes = draft_root / "frontend" / "src" / "roles" / "specialist" / "SpecialistRoutes.tsx"
-        specialist_routes.write_text(
-            specialist_routes.read_text(encoding="utf-8").replace(
-                "export function SpecialistRoutes(): JSX.Element {",
-                "export function SpecialistRoutes(): JSX.Element {\n  // fix completed before resume\n",
-            ),
-            encoding="utf-8",
-        )
+        readme = draft_root / "README.md"
+        readme.write_text(readme.read_text(encoding="utf-8") + "\nfix completed\n", encoding="utf-8")
         app.state.container.store.upsert(
             "reports",
             f"candidate_diff:{workspace_id}",
@@ -2671,11 +3270,10 @@ def test_successful_fix_run_queues_resume_generation_from_checkpoint(tmp_path: P
     )
 
     assert run.status == "completed"
-    assert resumed_generation.wait(1.0)
+    assert not resumed_generation.wait(0.2)
     checkpoint = app.state.container.store.get("reports", f"resume_checkpoint:{workspace_id}")
     assert checkpoint is not None
-    assert checkpoint["status"] == "resumed"
-    assert checkpoint["resumed_from_fix_run_id"] == run.run_id
+    assert checkpoint["status"] == "pending"
 
 
 def test_run_fails_when_draft_has_only_auxiliary_changes(tmp_path: Path) -> None:

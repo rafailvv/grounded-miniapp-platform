@@ -182,17 +182,6 @@ class ConnectivityValidator:
                 continue
             content_parts.append(asset_file.read_text(encoding="utf-8"))
             appended_assets.add(asset_path)
-        match = re.search(r"miniapp/app/static/([^/]+)/", file_path)
-        if match is None:
-            return "\n".join(content_parts)
-        role = match.group(1)
-        role_dir = workspace_path / "miniapp" / "app" / "static" / role
-        for candidate in ("app.js", "profile.js"):
-            target = role_dir / candidate
-            target_relative = str(target.relative_to(workspace_path))
-            if target.exists() and target_relative not in appended_assets:
-                content_parts.append(target.read_text(encoding="utf-8"))
-                appended_assets.add(target_relative)
         return "\n".join(content_parts)
 
     @staticmethod

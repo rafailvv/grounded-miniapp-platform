@@ -435,6 +435,17 @@ class RunService:
                 )
                 if self._should_soft_complete_with_warnings(run, job):
                     self._mark_run_completed_with_warnings(run, job, meaningful_paths=meaningful_paths)
+                elif self._should_apply_draft_with_warnings(run, job, meaningful_paths=meaningful_paths):
+                    self._apply_completed_draft(
+                        run,
+                        message="Applying generated draft despite preview-only validation warnings.",
+                    )
+                    self._mark_run_completed_with_warnings(
+                        run,
+                        job,
+                        meaningful_paths=meaningful_paths,
+                        draft_kept=False,
+                    )
                 elif job.status == "blocked":
                     run.status = "blocked"
                     run.apply_status = "blocked"
@@ -455,13 +466,13 @@ class RunService:
                     run.progress_percent = max(run.progress_percent, 100)
 
             self._save_run(run)
+            queue_preview_reason: str | None = None
+            queue_preview_draft_run_id: str | None = None
             if job.status == "completed" and run.apply_status == "applied":
-                self._queue_preview_refresh(run, reason="run completion")
-                self._queue_resume_generation_from_checkpoint_if_needed(run, request)
-                preview = self.preview_service.get(run.workspace_id)
+                queue_preview_reason = "run completion"
             elif run.status == "completed" and run.apply_status == "noop" and run.draft_ready:
-                self._queue_preview_refresh(run, reason="draft completion with warnings", draft_run_id=run.run_id)
-                preview = self.preview_service.get(run.workspace_id)
+                queue_preview_reason = "draft completion with warnings"
+                queue_preview_draft_run_id = run.run_id
             self._store_run_artifacts(run, change_plan, job, preview)
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
             logger.info(
@@ -477,6 +488,8 @@ class RunService:
                 message="Run finished.",
                 payload={"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status},
             )
+            if queue_preview_reason is not None:
+                self._queue_preview_refresh(run, reason=queue_preview_reason, draft_run_id=queue_preview_draft_run_id)
         except Exception as exc:
             run.status = "failed"
             run.apply_status = "failed"
@@ -505,27 +518,20 @@ class RunService:
         if not getattr(job, "handoff_from_failed_generate", None):
             return False
         validation_snapshot = getattr(job, "validation_snapshot", None)
-        build_failed = bool(validation_snapshot and not getattr(validation_snapshot, "build_valid", True))
-        haystack_parts = [
-            getattr(job, "failure_reason", None),
-            getattr(job, "root_cause_summary", None),
-            getattr(job, "failure_class", None),
+        if validation_snapshot is None:
+            return False
+        if not getattr(validation_snapshot, "blocking", False):
+            return False
+        issues = [
+            issue
+            for issue in getattr(validation_snapshot, "issues", [])
+            if isinstance(issue, dict) and issue.get("blocking", True)
         ]
-        if validation_snapshot is not None:
-            haystack_parts.extend(
-                str(issue.get("message") or "")
-                for issue in getattr(validation_snapshot, "issues", [])
-                if isinstance(issue, dict)
-            )
-        haystack = " ".join(part for part in haystack_parts if part).lower()
-        frontend_build_markers = (
-            "npm run build",
-            "draft frontend",
-            "vite build",
-            "typescript",
-            "tsc",
-        )
-        return build_failed and any(marker in haystack for marker in frontend_build_markers)
+        if not issues:
+            return not getattr(validation_snapshot, "build_valid", True)
+        if not getattr(validation_snapshot, "build_valid", True):
+            return True
+        return any(str(issue.get("location") or "") in {"preview", "tests"} for issue in issues)
 
     def _build_auto_fix_request(
         self,
@@ -997,15 +1003,32 @@ class RunService:
         job.failure_reason = message
         self.generation_service._append_event(job, "job_failed", message, {"reason": "no_meaningful_diff"})
 
-    def _mark_run_completed_with_warnings(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> None:
-        message = "Run completed with validation warnings. Draft was kept for review."
+    def _mark_run_completed_with_warnings(
+        self,
+        run: RunRecord,
+        job: Any,
+        *,
+        meaningful_paths: list[str],
+        draft_kept: bool = True,
+    ) -> None:
+        del meaningful_paths
+        message = (
+            "Run completed with validation warnings. Draft was kept for review."
+            if draft_kept
+            else "Run completed with validation warnings after applying the draft to source."
+        )
         run.summary = message
         run.status = "completed"
-        run.apply_status = "noop"
+        if run.apply_status != "applied":
+            run.apply_status = "noop"
         run.outcome_kind = "warnings"
         has_draft = self.workspace_service.draft_exists(run.workspace_id, run.run_id)
-        run.draft_status = "ready" if has_draft else "none"
-        run.draft_ready = run.draft_status == "ready"
+        if run.apply_status == "applied":
+            run.draft_status = "approved"
+            run.draft_ready = False
+        else:
+            run.draft_status = "ready" if has_draft else "none"
+            run.draft_ready = run.draft_status == "ready"
         run.current_stage = "completed with warnings"
         run.progress_percent = max(run.progress_percent, 100)
         run.current_fix_phase = job.current_fix_phase
@@ -1033,7 +1056,39 @@ class RunService:
         if str(getattr(job, "failure_class", "") or "") == "stopped_by_user":
             return False
         validation_snapshot = getattr(job, "validation_snapshot", None)
-        return validation_snapshot is not None
+        if validation_snapshot is None:
+            return False
+        issues = [
+            issue
+            for issue in getattr(validation_snapshot, "issues", [])
+            if isinstance(issue, dict) and issue.get("blocking", True)
+        ]
+        if any(str(issue.get("location") or "") in {"preview", "tests"} for issue in issues):
+            return False
+        return True
+
+    def _should_apply_draft_with_warnings(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
+        if run.mode == "fix":
+            return False
+        if getattr(job, "status", None) not in {"blocked", "failed"}:
+            return False
+        if not meaningful_paths:
+            return False
+        if not self.workspace_service.draft_exists(run.workspace_id, run.run_id):
+            return False
+        validation_snapshot = getattr(job, "validation_snapshot", None)
+        if validation_snapshot is None:
+            return False
+        if not getattr(validation_snapshot, "build_valid", False):
+            return False
+        issues = [
+            issue
+            for issue in getattr(validation_snapshot, "issues", [])
+            if isinstance(issue, dict) and issue.get("blocking", True)
+        ]
+        if not issues:
+            return False
+        return all(str(issue.get("location") or "") == "preview" for issue in issues)
 
     def _apply_completed_draft(self, run: RunRecord, *, message: str) -> None:
         apply_started_at = time.perf_counter()

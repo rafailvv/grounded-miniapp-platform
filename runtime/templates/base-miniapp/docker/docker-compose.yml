@@ -5,7 +5,7 @@ services:
     volumes:
       - ../miniapp:/app
     command: >
-      sh -c "pip install --no-cache-dir -r requirements.txt &&
+      sh -c "python -m pip install --no-cache-dir -r requirements.txt &&
              uvicorn app.main:app --host ${UVICORN_HOST:-0.0.0.0} --port ${UVICORN_PORT:-8000}"
     environment:
       DATABASE_URL: sqlite:////app/app/generated/app.db

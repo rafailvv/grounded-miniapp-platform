@@ -29,6 +29,7 @@ class BuildValidator:
                 )
         issues.extend(self._validate_generated_app_shape(workspace_path))
         issues.extend(self._validate_contract_drift(workspace_path))
+        issues.extend(self._validate_route_module_import_safety(workspace_path))
         return issues
 
     def _validate_generated_app_shape(self, workspace_path: Path) -> list[ValidationIssue]:
@@ -258,6 +259,8 @@ class BuildValidator:
                 if not isinstance(page, dict):
                     continue
                 file_path_raw = str(page.get("file_path") or "")
+                style_path_raw = str(page.get("style_path") or "")
+                script_path_raw = str(page.get("script_path") or "")
                 if not file_path_raw:
                     continue
                 file_path = workspace_path / file_path_raw
@@ -271,7 +274,46 @@ class BuildValidator:
                         )
                     )
                     continue
+                for asset_kind, asset_path_raw in (("style", style_path_raw), ("script", script_path_raw)):
+                    if not asset_path_raw:
+                        issues.append(
+                            ValidationIssue(
+                                code=f"build.missing_page_{asset_kind}_reference",
+                                message=f"Generated page is missing its {asset_kind} path in the route manifest: {Path(file_path_raw).name}",
+                                severity="high",
+                                location=file_path_raw,
+                            )
+                        )
+                        continue
+                    asset_path = workspace_path / asset_path_raw
+                    if not asset_path.exists():
+                        issues.append(
+                            ValidationIssue(
+                                code=f"build.missing_page_{asset_kind}_asset",
+                                message=f"Generated page asset is missing: {Path(asset_path_raw).name}",
+                                severity="high",
+                                location=asset_path_raw,
+                            )
+                        )
                 content = file_path.read_text(encoding="utf-8")
+                if style_path_raw and f"/static/{role}/{Path(style_path_raw).name}" not in content:
+                    issues.append(
+                        ValidationIssue(
+                            code="build.page_missing_style_link",
+                            message=f"{Path(file_path_raw).name} does not reference its page CSS asset.",
+                            severity="high",
+                            location=file_path_raw,
+                        )
+                    )
+                if script_path_raw and f"/static/{role}/{Path(script_path_raw).name}" not in content:
+                    issues.append(
+                        ValidationIssue(
+                            code="build.page_missing_script_link",
+                            message=f"{Path(file_path_raw).name} does not reference its page JS asset.",
+                            severity="high",
+                            location=file_path_raw,
+                        )
+                    )
                 if str(page.get("route_path") or "/") in {"/", f"/{role}"}:
                     normalized_root_pages.append(self._normalize_role_page(content))
         if len(normalized_root_pages) > 1 and len(set(normalized_root_pages)) == 1:
@@ -283,6 +325,32 @@ class BuildValidator:
                     location="miniapp/app/generated/route_manifest.json",
                 )
             )
+        return issues
+
+    def _validate_route_module_import_safety(self, workspace_path: Path) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        routes_dir = workspace_path / "miniapp" / "app" / "routes"
+        if not routes_dir.exists():
+            return issues
+        for route_file in routes_dir.glob("*.py"):
+            module_name = route_file.stem
+            try:
+                content = route_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            self_import_markers = (
+                f"from app.routes.{module_name} import ",
+                f"import app.routes.{module_name}",
+            )
+            if any(marker in content for marker in self_import_markers):
+                issues.append(
+                    ValidationIssue(
+                        code="build.route_self_import",
+                        message=f"Route module {route_file.name} imports itself and will fail at runtime.",
+                        severity="high",
+                        location=str(route_file.relative_to(workspace_path)),
+                    )
+                )
         return issues
 
     @staticmethod

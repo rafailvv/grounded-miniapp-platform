@@ -34,6 +34,7 @@ class CheckRunner:
     ) -> CheckExecutionRecord:
         started = time.perf_counter()
         results: list[RunCheckResult] = []
+        backend_dir = source_dir / "miniapp"
 
         validator_started = time.perf_counter()
         build_issues = self.validation_suite.validate_build(source_dir)
@@ -67,17 +68,33 @@ class CheckRunner:
         static_result.duration_ms = int((time.perf_counter() - static_started) * 1000)
         results.append(static_result)
 
+        python_tests_started = time.perf_counter()
+        python_tests_result = self._run_python_app_tests(backend_dir)
+        python_tests_result.duration_ms = int((time.perf_counter() - python_tests_started) * 1000)
+        results.append(python_tests_result)
+
+        js_tests_started = time.perf_counter()
+        js_tests_result = self._run_js_app_tests(backend_dir)
+        js_tests_result.duration_ms = int((time.perf_counter() - js_tests_started) * 1000)
+        results.append(js_tests_result)
+
         preview_started = time.perf_counter()
         preview = self.preview_service.get(workspace_id)
-        should_skip_preview = bool(filtered_issues) or bool(connectivity_issues) or static_result.status == "failed"
+        should_skip_preview = (
+            bool(filtered_issues)
+            or bool(connectivity_issues)
+            or static_result.status == "failed"
+            or python_tests_result.status == "failed"
+            or js_tests_result.status == "failed"
+        )
         if should_skip_preview:
             preview_status = "skipped"
-            preview_details = "Preview smoke skipped because validator/build checks already failed."
+            preview_details = "Preview smoke skipped because validator/build/app tests already failed."
             preview_logs: list[str] = []
             connectivity_result = RunCheckResult(
                 name="preview_connectivity_smoke",
                 status="skipped",
-                details="Preview connectivity smoke skipped because validator/build checks already failed.",
+                details="Preview connectivity smoke skipped because validator/build/app tests already failed.",
                 command="preview route smoke (current session)",
                 logs=[],
             )
@@ -131,6 +148,10 @@ class CheckRunner:
                 message = next((line for line in result.logs if line.strip()), message)
             if result.name == "changed_files_static":
                 message = next((line for line in result.logs if line.strip()), message)
+            if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
+                location = "tests"
+                code = "tests.python_generated_app" if result.name == "generated_app_python_tests" else "tests.js_generated_app"
+                message = next((line for line in reversed(result.logs) if line.strip()), message)
             if result.name in {"preview_boot_smoke", "preview_connectivity_smoke"}:
                 location = "preview"
                 code = "connectivity.preview_route_unreachable" if result.name == "preview_connectivity_smoke" else "preview.rebuild_failed"
@@ -155,6 +176,8 @@ class CheckRunner:
             return "validator/domain_constraint"
         if "changed_files_static" in failed_names:
             return "syntax/build"
+        if "generated_app_python_tests" in failed_names or "generated_app_js_tests" in failed_names:
+            return "app/runtime_test"
         if "preview_boot_smoke" in failed_names or "preview_connectivity_smoke" in failed_names:
             return "runtime_preview_boot"
         return None
@@ -165,6 +188,7 @@ class CheckRunner:
             "npm is not available in the miniapp runtime",
             "frontend build tooling is unavailable",
             "node.js/npm is missing",
+            "node.js is missing for generated app tests",
         )
         for result in results:
             haystack = "\n".join([result.details or "", *result.logs]).lower()
@@ -345,6 +369,163 @@ class CheckRunner:
             name="changed_files_static",
             status="skipped",
             details="No changed-file static checks were required.",
+        )
+
+    def _run_python_app_tests(self, backend_dir: Path) -> RunCheckResult:
+        test_file = backend_dir / "tests" / "test_generated_app.py"
+        if not test_file.exists():
+            return RunCheckResult(
+                name="generated_app_python_tests",
+                status="skipped",
+                details="Generated Python app tests were not present in the draft workspace.",
+                command=f"{sys.executable} -m unittest discover -s tests -p test_generated_app.py",
+                logs=[],
+            )
+        install_result = self._install_python_requirements(backend_dir)
+        if install_result is not None:
+            return install_result
+        env = {**os.environ}
+        python_path_parts = [str(backend_dir)]
+        existing_python_path = env.get("PYTHONPATH")
+        if existing_python_path:
+            python_path_parts.append(existing_python_path)
+        env["PYTHONPATH"] = os.pathsep.join(python_path_parts)
+        command = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_generated_app.py"]
+        try:
+            result = subprocess.run(
+                command,
+                cwd=backend_dir,
+                capture_output=True,
+                text=True,
+                timeout=int(os.getenv("GENERATED_APP_PYTHON_TEST_TIMEOUT_SEC", "240")),
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                details="Generated Python app tests timed out.",
+                command=" ".join(command),
+                logs=self._command_logs("Generated Python app tests timed out.", exc.stdout or "", exc.stderr or ""),
+            )
+        if result.returncode != 0:
+            return RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                details="Generated Python app tests failed for the draft miniapp.",
+                command=" ".join(command),
+                exit_code=result.returncode,
+                logs=self._command_logs("Generated Python app tests failed for the draft miniapp.", result.stdout, result.stderr),
+            )
+        return RunCheckResult(
+            name="generated_app_python_tests",
+            status="passed",
+            details="Generated Python app tests passed.",
+            command=" ".join(command),
+            exit_code=result.returncode,
+            logs=["Generated Python app tests passed."],
+        )
+
+    def _install_python_requirements(self, backend_dir: Path) -> RunCheckResult | None:
+        requirements_file = backend_dir / "requirements.txt"
+        if not requirements_file.exists():
+            return None
+        command = [sys.executable, "-m", "pip", "install", "--no-cache-dir", "-r", "requirements.txt"]
+        env = {
+            **os.environ,
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        }
+        try:
+            result = subprocess.run(
+                command,
+                cwd=backend_dir,
+                capture_output=True,
+                text=True,
+                timeout=int(os.getenv("GENERATED_APP_PYTHON_INSTALL_TIMEOUT_SEC", "600")),
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                details="Generated Python dependency install timed out.",
+                command=" ".join(command),
+                logs=self._command_logs(
+                    "Generated Python dependency install timed out.",
+                    exc.stdout or "",
+                    exc.stderr or "",
+                ),
+            )
+        if result.returncode != 0:
+            return RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                details="Generated Python dependency install failed.",
+                command=" ".join(command),
+                exit_code=result.returncode,
+                logs=self._command_logs(
+                    "Generated Python dependency install failed.",
+                    result.stdout,
+                    result.stderr,
+                ),
+            )
+        return None
+
+    def _run_js_app_tests(self, backend_dir: Path) -> RunCheckResult:
+        test_file = backend_dir / "tests" / "generated_app.test.mjs"
+        if not test_file.exists():
+            return RunCheckResult(
+                name="generated_app_js_tests",
+                status="skipped",
+                details="Generated JS app tests were not present in the draft workspace.",
+                command="node --test tests/generated_app.test.mjs",
+                logs=[],
+            )
+        node_binary = shutil.which("node") or shutil.which("nodejs")
+        if not node_binary:
+            return RunCheckResult(
+                name="generated_app_js_tests",
+                status="failed",
+                details="Node.js is missing for generated app tests.",
+                command="node --test tests/generated_app.test.mjs",
+                logs=[
+                    "Node.js is missing for generated app tests.",
+                    "Install Node.js in the platform runtime so generated JS tests can run.",
+                ],
+            )
+        command = [node_binary, "--test", "tests/generated_app.test.mjs"]
+        try:
+            result = subprocess.run(
+                command,
+                cwd=backend_dir,
+                capture_output=True,
+                text=True,
+                timeout=int(os.getenv("GENERATED_APP_JS_TEST_TIMEOUT_SEC", "240")),
+            )
+        except subprocess.TimeoutExpired as exc:
+            return RunCheckResult(
+                name="generated_app_js_tests",
+                status="failed",
+                details="Generated JS app tests timed out.",
+                command=" ".join(command),
+                logs=self._command_logs("Generated JS app tests timed out.", exc.stdout or "", exc.stderr or ""),
+            )
+        if result.returncode != 0:
+            return RunCheckResult(
+                name="generated_app_js_tests",
+                status="failed",
+                details="Generated JS app tests failed for the draft miniapp.",
+                command=" ".join(command),
+                exit_code=result.returncode,
+                logs=self._command_logs("Generated JS app tests failed for the draft miniapp.", result.stdout, result.stderr),
+            )
+        return RunCheckResult(
+            name="generated_app_js_tests",
+            status="passed",
+            details="Generated JS app tests passed.",
+            command=" ".join(command),
+            exit_code=result.returncode,
+            logs=["Generated JS app tests passed."],
         )
 
     def _run_frontend_build(self, frontend_dir: Path) -> RunCheckResult:
