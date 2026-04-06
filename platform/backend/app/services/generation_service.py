@@ -1012,6 +1012,14 @@ class GenerationService:
             role_scope=role_scope,
             operations=operations,
         )
+        operations = self._run_pre_apply_contract_pass(
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
+            page_graph=plan_result["page_graph"],
+            role_scope=role_scope,
+            generation_mode=generation_mode,
+            operations=operations,
+        )
         patch_envelope = self.workspace_service.build_patch_envelope_for_draft(workspace_id, draft_run_id, operations)
         apply_result = self.workspace_service.apply_patch_envelope_to_draft(workspace_id, draft_run_id, patch_envelope)
         if apply_result.status != "applied":
@@ -1111,22 +1119,46 @@ class GenerationService:
             else:
                 self._append_event(job, "repair_iteration", f"Applied repair iteration {attempt}.")
             self._append_event(job, "build_started", "Build validation started.")
-            check_execution = self.check_runner.run(
+            preflight_issues = self._preflight_generation_issues(
                 workspace_id=workspace_id,
-                run_id=draft_run_id,
-                source_dir=draft_source,
+                draft_run_id=draft_run_id,
                 changed_files=sorted({operation.file_path for operation in latest_operations}),
-                preview_run_id=draft_run_id,
-                scope_mode=plan_result["scope_mode"],
+                page_graph=plan_result["page_graph"],
+                role_scope=role_scope,
             )
-            latest_preview = self.preview_service.get(workspace_id)
-            latest_check_results = check_execution.results
-            check_failure = self.check_runner.classify_failure(latest_check_results)
-            check_issues = self.check_runner.failing_issues(latest_check_results)
-            build_issues = [issue for issue in check_issues if issue.location != "preview"]
-            preview_issue = next((issue for issue in check_issues if issue.location == "preview"), None)
-            tooling_failure = self.check_runner.has_tooling_failure(latest_check_results)
-            job.latency_breakdown["checks_ms"] = (job.latency_breakdown.get("checks_ms", 0) or 0) + (check_execution.duration_ms or 0)
+            if preflight_issues:
+                latest_preview = self.preview_service.get(workspace_id)
+                latest_check_results = self._preflight_check_results(preflight_issues)
+                check_failure = self.check_runner.classify_failure(latest_check_results)
+                check_issues = list(preflight_issues)
+                build_issues = list(preflight_issues)
+                preview_issue = None
+                tooling_failure = False
+                check_execution = CheckExecutionRecord(
+                    workspace_id=workspace_id,
+                    run_id=draft_run_id,
+                    results=latest_check_results,
+                    duration_ms=0,
+                    started_at=utc_now(),
+                    completed_at=utc_now(),
+                )
+            else:
+                check_execution = self.check_runner.run(
+                    workspace_id=workspace_id,
+                    run_id=draft_run_id,
+                    source_dir=draft_source,
+                    changed_files=sorted({operation.file_path for operation in latest_operations}),
+                    preview_run_id=draft_run_id,
+                    scope_mode=plan_result["scope_mode"],
+                )
+                latest_preview = self.preview_service.get(workspace_id)
+                latest_check_results = check_execution.results
+                check_failure = self.check_runner.classify_failure(latest_check_results)
+                check_issues = self.check_runner.failing_issues(latest_check_results)
+                build_issues = [issue for issue in check_issues if issue.location != "preview"]
+                preview_issue = next((issue for issue in check_issues if issue.location == "preview"), None)
+                tooling_failure = self.check_runner.has_tooling_failure(latest_check_results)
+                job.latency_breakdown["checks_ms"] = (job.latency_breakdown.get("checks_ms", 0) or 0) + (check_execution.duration_ms or 0)
             self._append_trace(
                 workspace_id,
                 "checks_completed",
@@ -1297,6 +1329,7 @@ class GenerationService:
                 attempt=attempt + 1,
                 causal_surface=causal_surface,
                 scope_mode=plan_result["scope_mode"],
+                structural_failure=structural_failure,
             )
             repair_contexts = self._collect_existing_file_contexts(workspace_id, draft_run_id, repair_target_files)
             repair_result = self._repair_draft_after_failure(
@@ -2095,6 +2128,8 @@ class GenerationService:
                     "Do not render manual Refresh buttons or loading-only placeholder shells as the primary surface.",
                     "Do not introduce flat role entry files like miniapp/app/static/client/index.html unless that exact path is listed in cluster_targets.",
                     "Use the template runtime conventions for API access instead of raw authless fetch patterns.",
+                    "Do not invent auth/login/me endpoints, auth bootstrap modules, or /api/auth references in generated app code.",
+                    "Preserve the template profile flow: root role pages may link to /<role>/profile, and profile persistence stays compatible with routes/profiles.py plus RoleProfileRecord in db.py.",
                 ],
             }
         )
@@ -2582,6 +2617,22 @@ class GenerationService:
                 page["handoff_paths"] = ["/"]
             elif page["route_path"] == "/" and "/profile" in available_routes:
                 page["handoff_paths"] = ["/profile"]
+        required_routes = {"/", "/profile"}
+        existing_routes = {str(page.get("route_path") or "") for page in deduped if isinstance(page, dict)}
+        if not required_routes.issubset(existing_routes):
+            fallback_pages = {
+                str(page.get("route_path") or ""): page
+                for page in self._fallback_page_contract(role, require_multi_page=require_multi_page)
+            }
+            for route_path in ("/", "/profile"):
+                if route_path in existing_routes:
+                    continue
+                fallback_page = fallback_pages.get(route_path)
+                if not isinstance(fallback_page, dict):
+                    continue
+                normalized = self._normalize_page_definition(role, fallback_page, len(deduped))
+                normalized["handoff_paths"] = ["/profile"] if route_path == "/" else ["/"]
+                deduped.append(normalized)
         return deduped
 
     @staticmethod
@@ -2628,9 +2679,12 @@ class GenerationService:
         )
         file_path_candidates = self._normalize_path_list([payload.get("file_path")], [])
         data_dependencies = self._normalize_string_list(payload.get("data_dependencies"))
-        file_path = file_path_candidates[0] if file_path_candidates else self._default_page_file(role, component_name, route_path=route_path)
+        default_file_path = self._default_page_file(role, component_name, route_path=route_path)
+        file_path = file_path_candidates[0] if file_path_candidates else default_file_path
         if self._should_rewrite_page_file_for_route(route_path=route_path, file_path=file_path, page_id=str(payload.get("page_id") or "")):
-            file_path = self._default_page_file(role, component_name, route_path=route_path)
+            file_path = default_file_path
+        elif self._should_canonicalize_page_file_alias(role=role, route_path=route_path, file_path=file_path, default_file_path=default_file_path):
+            file_path = default_file_path
         style_path = self._default_page_asset_path(file_path, asset_kind="css")
         script_path = self._default_page_asset_path(file_path, asset_kind="js")
         state_marker_base = self._state_marker_base(
@@ -2667,8 +2721,8 @@ class GenerationService:
             "navigation_label": str(payload.get("navigation_label") or payload.get("title") or component_name).strip(),
             "component_name": component_name,
             "file_path": file_path,
-            "style_path": str(payload.get("style_path") or style_path).strip() or style_path,
-            "script_path": str(payload.get("script_path") or script_path).strip() or script_path,
+            "style_path": style_path,
+            "script_path": script_path,
             "title": str(payload.get("title") or component_name).strip(),
             "description": str(payload.get("description") or payload.get("purpose") or "").strip(),
             "purpose": str(payload.get("purpose") or payload.get("description") or "").strip(),
@@ -2680,6 +2734,20 @@ class GenerationService:
             "empty_state": empty_state,
             "error_state": error_state,
         }
+
+    @staticmethod
+    def _should_canonicalize_page_file_alias(*, role: str, route_path: str, file_path: str, default_file_path: str) -> bool:
+        if file_path == default_file_path:
+            return False
+        if not file_path.startswith(f"miniapp/app/static/{role}/"):
+            return False
+        if not file_path.endswith(".html"):
+            return False
+        if route_path.rstrip("/") == "/profile":
+            return True
+        if route_path in {"", "/"}:
+            return True
+        return file_path.endswith("/index.html")
 
     @staticmethod
     def _fallback_page_contract(role: str, *, require_multi_page: bool) -> list[dict[str, str]]:
@@ -2728,6 +2796,17 @@ class GenerationService:
             suffix = normalized[len(compact_prefix):]
             return f"/{suffix}" if suffix else "/"
         return normalized
+
+    @staticmethod
+    def _absolute_role_route_path(role: str, route_path: str) -> str:
+        normalized = str(route_path or "").strip() or "/"
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        if normalized == "/":
+            return f"/{role}"
+        if normalized == f"/{role}" or normalized.startswith(f"/{role}/"):
+            return normalized
+        return f"/{role}{normalized}"
 
     @classmethod
     def _should_rewrite_page_file_for_route(cls, *, route_path: str, file_path: str, page_id: str) -> bool:
@@ -2961,9 +3040,27 @@ class GenerationService:
             and not self._is_legacy_role_entry_file(path)
             and path not in TEMPLATE_OWNED_SHARED_FILES
         ]
+        expanded = self._expand_page_triplet_targets(canonical)
         if scope_mode == "minimal_patch":
-            return list(dict.fromkeys(canonical))
-        return list(dict.fromkeys(canonical))
+            return list(dict.fromkeys(expanded))
+        return list(dict.fromkeys(expanded))
+
+    @classmethod
+    def _expand_page_triplet_targets(cls, target_files: list[str]) -> list[str]:
+        expanded = list(target_files)
+        for path in target_files:
+            if not isinstance(path, str):
+                continue
+            if not path.startswith("miniapp/app/static/"):
+                continue
+            if not path.endswith(".html"):
+                continue
+            normalized = path.strip()
+            if not normalized:
+                continue
+            expanded.append(cls._default_page_asset_path(normalized, asset_kind="css"))
+            expanded.append(cls._default_page_asset_path(normalized, asset_kind="js"))
+        return list(dict.fromkeys(expanded))
 
     @staticmethod
     def _build_generation_clusters(target_files: list[str]) -> list[dict[str, Any]]:
@@ -3921,6 +4018,8 @@ class GenerationService:
                     "Do not collapse multiple pages into shared role-level app.js/styles.css files.",
                     "Do not leave page behavior or styling inline when page-level JS/CSS targets exist.",
                     "If the workspace uses miniapp/app, do not switch to miniapp/src. If the workspace uses miniapp/app/static, do not switch to a separate frontend application unless those exact files are in target_files.",
+                    "Do not generate auth/login/me endpoints, auth bootstrap modules, or /api/auth references for the generated app.",
+                    "Keep the template profile contract intact: routes/profiles.py stays supported, db.py keeps RoleProfileRecord, and route manifests must retain each role's /profile page.",
                 ],
             }
         )
@@ -4283,7 +4382,7 @@ class GenerationService:
             if contract_path not in existing_targets:
                 inferred.append(contract_path)
         for endpoint_name in sorted(endpoint_names):
-            if endpoint_name in {"health", "profiles"}:
+            if endpoint_name in {"health", "profiles", "auth", "login", "me"}:
                 continue
             inferred_path = GenerationService._route_module_path_for_endpoint_name(endpoint_name)
             if inferred_path not in existing_targets:
@@ -4361,8 +4460,7 @@ class GenerationService:
                 for dependency in page.get("data_dependencies") or []:
                     if not isinstance(dependency, str):
                         continue
-                    for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", dependency):
-                        endpoint_names.add(match.group(1))
+                    endpoint_names.update(GenerationService._endpoint_names_from_dependency_text(dependency))
         if not endpoint_names:
             return []
         existing_targets = set(current_target_files) | set(backend_targets)
@@ -4372,7 +4470,7 @@ class GenerationService:
             if contract_path not in existing_targets:
                 inferred.append(contract_path)
         for endpoint_name in sorted(endpoint_names):
-            if endpoint_name in {"health", "profiles"}:
+            if endpoint_name in {"health", "profiles", "auth", "login", "me"}:
                 continue
             inferred_path = GenerationService._route_module_path_for_endpoint_name(endpoint_name)
             if inferred_path not in existing_targets:
@@ -4380,6 +4478,18 @@ class GenerationService:
             if router_path not in existing_targets:
                 inferred.append(router_path)
         return list(dict.fromkeys(inferred))
+
+    @staticmethod
+    def _endpoint_names_from_dependency_text(dependency: str) -> set[str]:
+        endpoint_names: set[str] = set()
+        for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", dependency):
+            endpoint_names.add(match.group(1).strip().lower())
+        for match in re.finditer(r"(?:GET|POST|PUT|PATCH|DELETE)\s+/([a-zA-Z0-9_-]+)", dependency, flags=re.IGNORECASE):
+            endpoint_name = match.group(1).strip().lower()
+            if endpoint_name in {"api", "client", "specialist", "manager", "profile", "profiles", "health", "auth", "login", "me"}:
+                continue
+            endpoint_names.add(endpoint_name)
+        return endpoint_names
 
     @staticmethod
     def _dedupe_operations(operations: list[DraftFileOperation]) -> list[DraftFileOperation]:
@@ -4776,6 +4886,280 @@ class GenerationService:
                 )
             )
         return ensured_operations
+
+    def _run_pre_apply_contract_pass(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        page_graph: dict[str, Any],
+        role_scope: list[str],
+        generation_mode: GenerationMode,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        ensured = self._ensure_runtime_artifact_operations(
+            grounded_spec=self._grounded_spec_from_operations(operations),
+            page_graph=page_graph,
+            role_scope=role_scope,
+            generation_mode=generation_mode,
+            operations=operations,
+        )
+        return self._synchronize_profile_schema_contract(workspace_id, draft_run_id, ensured)
+
+    @staticmethod
+    def _grounded_spec_from_operations(operations: list[DraftFileOperation]) -> GroundedSpecModel:
+        for operation in operations:
+            if operation.file_path == "artifacts/grounded_spec.json" and operation.content:
+                try:
+                    return GroundedSpecModel.model_validate(json.loads(operation.content))
+                except Exception:
+                    break
+        raise ValueError("grounded_spec.json operation must exist before runtime artifact synthesis.")
+
+    def _synchronize_profile_schema_contract(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        profiles_path = "miniapp/app/routes/profiles.py"
+        schemas_path = "miniapp/app/schemas.py"
+        profiles_content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, profiles_path)
+        schemas_content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, schemas_path)
+        if not profiles_content or not schemas_content:
+            return operations
+        if "from app.schemas import" not in profiles_content or "RoleProfile" not in profiles_content:
+            return operations
+        updated_schemas = schemas_content
+        if "AppRole =" not in updated_schemas:
+            if "from typing import Literal" in updated_schemas:
+                updated_schemas = updated_schemas.replace("from typing import Literal", "from typing import Literal", 1)
+            else:
+                updated_schemas = "from typing import Literal\n" + updated_schemas
+            updated_schemas += "\n\nAppRole = Literal[\"client\", \"specialist\", \"manager\"]\n"
+        if "class RoleProfile" not in updated_schemas:
+            if "from datetime import datetime" not in updated_schemas:
+                updated_schemas = "from datetime import datetime\n" + updated_schemas
+            if "from pydantic import" not in updated_schemas:
+                updated_schemas = updated_schemas + "\nfrom pydantic import BaseModel\n"
+            elif "BaseModel" not in updated_schemas:
+                updated_schemas = updated_schemas.replace("from pydantic import ", "from pydantic import BaseModel, ", 1)
+            updated_schemas += (
+                "\n\nclass RoleProfile(BaseModel):\n"
+                "    first_name: str\n"
+                "    last_name: str\n"
+                "    email: str | None = None\n"
+                "    phone: str | None = None\n"
+                "    photo_url: str | None = None\n"
+                "    updated_at: datetime\n"
+            )
+        if updated_schemas == schemas_content:
+            return operations
+        operation_map[schemas_path] = DraftFileOperation(
+            file_path=schemas_path,
+            operation="replace",
+            content=updated_schemas,
+            reason="Pre-apply contract sync: keep schemas.py compatible with routes/profiles.py imports.",
+        )
+        return list(operation_map.values())
+
+    def _operation_or_workspace_content(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        operation_map: dict[str, DraftFileOperation],
+        file_path: str,
+    ) -> str | None:
+        operation = operation_map.get(file_path)
+        if operation and operation.content is not None:
+            return operation.content
+        try:
+            return self.workspace_service.read_file(workspace_id, file_path, run_id=draft_run_id)
+        except Exception:
+            return None
+
+    def _preflight_generation_issues(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        changed_files: list[str],
+        page_graph: dict[str, Any],
+        role_scope: list[str],
+    ) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        draft_root = self.workspace_service.draft_source_dir(workspace_id, draft_run_id)
+        issues.extend(self._preflight_backend_syntax_issues(draft_root, changed_files))
+        issues.extend(self._preflight_profile_schema_issues(draft_root))
+        issues.extend(self._preflight_route_manifest_link_issues(draft_root, page_graph, role_scope))
+        deduped: list[ValidationIssue] = []
+        seen: set[tuple[str, str]] = set()
+        for issue in issues:
+            key = (issue.code, issue.location)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(issue)
+        return deduped
+
+    @staticmethod
+    def _preflight_backend_syntax_issues(draft_root: Path, changed_files: list[str]) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        for file_path in changed_files:
+            if not file_path.startswith("miniapp/app/") or not file_path.endswith(".py"):
+                continue
+            absolute = draft_root / file_path
+            if not absolute.exists():
+                continue
+            try:
+                compile(absolute.read_text(encoding="utf-8"), file_path, "exec")
+            except SyntaxError as exc:
+                issues.append(
+                    ValidationIssue(
+                        code="preflight.python_syntax_error",
+                        message=f"{file_path} has invalid Python syntax before full checks: {exc.msg}.",
+                        severity="high",
+                        location=file_path,
+                        blocking=True,
+                    )
+                )
+        return issues
+
+    @staticmethod
+    def _preflight_profile_schema_issues(draft_root: Path) -> list[ValidationIssue]:
+        profiles_path = draft_root / "miniapp/app/routes/profiles.py"
+        schemas_path = draft_root / "miniapp/app/schemas.py"
+        if not profiles_path.exists() or not schemas_path.exists():
+            return []
+        profiles_content = profiles_path.read_text(encoding="utf-8")
+        schemas_content = schemas_path.read_text(encoding="utf-8")
+        issues: list[ValidationIssue] = []
+        if "from app.schemas import" in profiles_content and "RoleProfile" in profiles_content and "class RoleProfile" not in schemas_content:
+            issues.append(
+                ValidationIssue(
+                    code="preflight.profile_schema_contract",
+                    message="routes/profiles.py imports RoleProfile, but schemas.py does not define it.",
+                    severity="high",
+                    location="miniapp/app/schemas.py",
+                    blocking=True,
+                )
+            )
+        if "from app.schemas import" in profiles_content and "AppRole" in profiles_content and "AppRole =" not in schemas_content:
+            issues.append(
+                ValidationIssue(
+                    code="preflight.profile_schema_contract",
+                    message="routes/profiles.py imports AppRole, but schemas.py does not define it.",
+                    severity="high",
+                    location="miniapp/app/schemas.py",
+                    blocking=True,
+                )
+            )
+        return issues
+
+    @classmethod
+    def _preflight_route_manifest_link_issues(cls, draft_root: Path, page_graph: dict[str, Any], role_scope: list[str]) -> list[ValidationIssue]:
+        manifest_path = draft_root / "miniapp/app/generated/route_manifest.json"
+        if not manifest_path.exists():
+            return []
+        try:
+            route_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        declared_routes: set[str] = set()
+        for role in role_scope:
+            for page in (((route_manifest.get("roles") or {}).get(role) or {}).get("pages") or []):
+                if isinstance(page, dict):
+                    route_path = str(page.get("route_path") or "").strip()
+                    if route_path:
+                        declared_routes.add(route_path)
+        issues: list[ValidationIssue] = []
+        href_pattern = re.compile(r"""href=["']([^"']+)["']""")
+        for role in role_scope:
+            for page in (((page_graph.get("roles") or {}).get(role) or {}).get("pages") or []):
+                if not isinstance(page, dict):
+                    continue
+                file_path = str(page.get("file_path") or "")
+                if not file_path.endswith(".html"):
+                    continue
+                absolute = draft_root / file_path
+                if not absolute.exists():
+                    continue
+                content = absolute.read_text(encoding="utf-8")
+                for route_ref in href_pattern.findall(content):
+                    route_ref = str(route_ref).strip()
+                    if not route_ref.startswith("/") or route_ref.startswith("/api/") or route_ref.startswith("/static/"):
+                        continue
+                    if route_ref not in declared_routes:
+                        issues.append(
+                            ValidationIssue(
+                                code="preflight.route_manifest_link_mismatch",
+                                message=f"{file_path} references {route_ref}, but route_manifest.json does not declare it.",
+                                severity="high",
+                                location=file_path,
+                                blocking=True,
+                            )
+                        )
+        return issues
+
+    @staticmethod
+    def _preflight_check_results(issues: list[ValidationIssue]) -> list[RunCheckResult]:
+        syntax_logs = [json.dumps(issue.model_dump(mode="json"), ensure_ascii=False) for issue in issues if issue.code == "preflight.python_syntax_error"]
+        contract_logs = [json.dumps(issue.model_dump(mode="json"), ensure_ascii=False) for issue in issues if issue.code != "preflight.python_syntax_error"]
+        results: list[RunCheckResult] = []
+        if contract_logs:
+            results.append(
+                RunCheckResult(
+                    name="connectivity_validators",
+                    status="failed",
+                    details="Preflight contract checks failed before running the full check pipeline.",
+                    command="preflight.contract_checks",
+                    exit_code=1,
+                    logs=contract_logs,
+                )
+            )
+        else:
+            results.append(
+                RunCheckResult(
+                    name="connectivity_validators",
+                    status="passed",
+                    details="Preflight contract checks passed.",
+                    command="preflight.contract_checks",
+                    exit_code=0,
+                    logs=[],
+                )
+            )
+        if syntax_logs:
+            results.append(
+                RunCheckResult(
+                    name="changed_files_static",
+                    status="failed",
+                    details="Preflight backend syntax checks failed before running the full check pipeline.",
+                    command="preflight.python_syntax_checks",
+                    exit_code=1,
+                    logs=syntax_logs,
+                )
+            )
+        else:
+            results.append(
+                RunCheckResult(
+                    name="changed_files_static",
+                    status="passed",
+                    details="Preflight backend syntax checks passed.",
+                    command="preflight.python_syntax_checks",
+                    exit_code=0,
+                    logs=[],
+                )
+            )
+        results.extend(
+            [
+                RunCheckResult(name="generated_app_python_tests", status="skipped", details="Generated Python app tests skipped because preflight issues already failed.", command="preflight.skip", exit_code=None, logs=[]),
+                RunCheckResult(name="generated_app_js_tests", status="skipped", details="Generated JS app tests skipped because preflight issues already failed.", command="preflight.skip", exit_code=None, logs=[]),
+                RunCheckResult(name="preview_boot_smoke", status="skipped", details="Preview smoke skipped because preflight issues already failed.", command="preflight.skip", exit_code=None, logs=[]),
+                RunCheckResult(name="preview_connectivity_smoke", status="skipped", details="Preview connectivity smoke skipped because preflight issues already failed.", command="preflight.skip", exit_code=None, logs=[]),
+            ]
+        )
+        return results
 
     @classmethod
     def _python_app_level_test_content(cls, *, page_graph: dict[str, Any], role_scope: list[str]) -> str:
@@ -5194,7 +5578,7 @@ class GeneratedMiniAppTests(unittest.TestCase):
                 html_path = MINIAPP_DIR / str(page.get("file_path") or "").removeprefix("miniapp/")
                 html = html_path.read_text(encoding="utf-8")
                 for asset in _extract_static_asset_refs(html):
-                    asset_path = MINIAPP_DIR / "app" / asset.removeprefix("/static/")
+                    asset_path = MINIAPP_DIR / "app" / "static" / asset.removeprefix("/static/")
                     self.assertTrue(asset_path.exists(), f"Missing asset {{asset}} referenced from {{html_path}}")
                     discovered_api_refs.update(_extract_api_refs(asset_path.read_text(encoding="utf-8")))
                 discovered_api_refs.update(_extract_api_refs(html))
@@ -5629,9 +6013,8 @@ test('generated javascript files parse', () => {{
                 if not isinstance(page, dict):
                     continue
                 route_path = str(page.get("route_path") or f"/{role}").strip() or f"/{role}"
-                normalized_route = "/" + route_path.strip("/")
-                if route_path == "/":
-                    normalized_route = f"/{role}"
+                normalized_role_route = GenerationService._normalize_role_route_path(role, route_path, index=index)
+                normalized_route = GenerationService._absolute_role_route_path(role, normalized_role_route)
                 page_kind = str(page.get("page_kind") or "").strip().lower()
                 file_path = str(page.get("file_path") or f"miniapp/app/static/{role}/index.html")
                 default_style_path = GenerationService._default_page_asset_path(file_path, asset_kind="css")
@@ -6210,12 +6593,24 @@ test('generated javascript files parse', () => {{
                 if operation.file_path not in allowed_targets or (operation.operation in {"create", "replace"} and operation.content is None)
             ]
             if invalid:
-                raise ValueError(f"Repair touched files outside the planned scope: {', '.join(invalid[:5])}")
-            self._validate_targeted_operations(
-                stage_name="repair",
-                target_files=target_files,
-                operations=operations,
-            )
+                expanded_targets = self._expand_repair_targets_for_safe_companions(
+                    target_files=target_files,
+                    invalid_paths=invalid,
+                    build_issues=build_issues,
+                )
+                if expanded_targets is None:
+                    raise ValueError(f"Repair touched files outside the planned scope: {', '.join(invalid[:5])}")
+                allowed_targets = set(expanded_targets)
+                residual_invalid = [
+                    operation.file_path
+                    for operation in operations
+                    if operation.file_path not in allowed_targets
+                    or (operation.operation in {"create", "replace"} and operation.content is None)
+                ]
+                if residual_invalid:
+                    raise ValueError(f"Repair touched files outside the planned scope: {', '.join(residual_invalid[:5])}")
+                target_files = expanded_targets
+            self._validate_targeted_operations(stage_name="repair", target_files=target_files, operations=operations)
             return {
                 "assistant_message": str(normalized.get("assistant_message") or "").strip(),
                 "operations": operations,
@@ -6223,6 +6618,34 @@ test('generated javascript files parse', () => {{
             }
         except Exception as exc:
             return {"error": f"Automatic repair step failed: {exc}"}
+
+    @classmethod
+    def _expand_repair_targets_for_safe_companions(
+        cls,
+        *,
+        target_files: list[str],
+        invalid_paths: list[str],
+        build_issues: list[ValidationIssue],
+    ) -> list[str] | None:
+        if not invalid_paths:
+            return list(dict.fromkeys(target_files))
+        issue_text = " ".join(f"{issue.code} {issue.message}" for issue in build_issues).lower()
+        if not any(marker in issue_text for marker in ("shared", "static asset", "script", "dom", "loading", "error state", "ui")):
+            return None
+        additions: list[str] = []
+        for path in invalid_paths:
+            if not isinstance(path, str):
+                return None
+            if not cls._is_canonical_target_path(path):
+                return None
+            if not path.startswith("miniapp/app/static/shared/"):
+                return None
+            if not path.endswith((".js", ".css")):
+                return None
+            additions.append(path)
+        if not additions:
+            return None
+        return list(dict.fromkeys([*target_files, *additions]))
 
     @staticmethod
     def _validate_targeted_operations(
@@ -6270,16 +6693,18 @@ test('generated javascript files parse', () => {{
         preview_logs: list[str],
         attempt: int,
     ) -> str:
-        compact_target_files = target_files[:10]
+        structural_failure = self._is_structural_contract_failure(build_issues)
+        compact_target_files = target_files[:18] if structural_failure else target_files[:10]
         compact_file_contexts = self._compact_file_contexts_for_repair(
             file_contexts,
-            max_file_chars=2200,
-            max_total_chars=9000,
+            max_file_chars=3600 if structural_failure else 2200,
+            max_total_chars=18000 if structural_failure else 9000,
         )
         return json_dumps(
             {
                 "task": "Repair build or preview failures in the generated draft",
                 "attempt": attempt,
+                "repair_mode": "structural_bundle" if structural_failure else "targeted_patch",
                 "prompt": prompt,
                 "role_scope": role_scope,
                 "scope_mode": scope_mode,
@@ -6298,12 +6723,14 @@ test('generated javascript files parse', () => {{
                 "rules": [
                     "Fix only the concrete build/preview failures.",
                     "Prefer editing the existing generated files instead of creating new architecture.",
-                    "Keep the diff minimal and preserve unrelated behavior.",
+                    "Keep the diff minimal for narrow fixes, but complete the whole failing contract when the errors are structural.",
                     "Return operations only for files listed in target_files.",
                     "Treat shared shell files, route-linked pages, and generated runtime artifacts as the primary repair surface when they appear in target_files.",
                     "If the failure involves stateful business data, repair it through db.py and schemas.py instead of introducing or keeping route-level dict/list stores.",
                     "Move inline Pydantic request/response models out of routes into schemas.py whenever the failing surface is a workflow backend.",
                     "Keep SQLAlchemy engine/session/model logic in db.py and import it from routes instead of duplicating persistence logic across route files.",
+                    "Preserve the template profile contract: role home pages can link to /<role>/profile, routes/profiles.py must remain compatible with db.py, and db.py must keep RoleProfileRecord when profiles.py imports it.",
+                    "Do not introduce auth/login/me APIs or /api/auth references in generated app code; use explicit workflow routes and profile routes instead.",
                     "If target_files is non-empty, operations must include at least one create/replace/delete for one of those files.",
                     "For connectivity missing_ui_loading_state or missing_ui_error_state, satisfy the validator with real loading/error containers, ids, or data-ui-state markers that match the current page contract.",
                     "When a failure points to route or navigation mismatch, repair the page graph contract and the route-linked HTML files consistently.",
@@ -6556,6 +6983,16 @@ test('generated javascript files parse', () => {{
                 "check.connectivity_validators",
                 "connectivity.missing_backend_route",
                 "connectivity.unwired_page_dependency",
+                "build.missing_role_profile_page",
+                "build.missing_role_routes",
+                "build.insufficient_routes",
+                "build.insufficient_pages",
+                "build.page_missing_script_link",
+                "build.page_script_dom_contract",
+                "connectivity.missing_ui_loading_state",
+                "connectivity.missing_ui_error_state",
+                "tests.python_generated_app",
+                "tests.js_generated_app",
             }:
                 return True
             lowered = issue.message.lower()
@@ -6621,9 +7058,20 @@ test('generated javascript files parse', () => {{
                 "build.missing_role_routes",
                 "build.insufficient_routes",
                 "build.insufficient_pages",
-            } or any(marker in message for marker in ("route", "navigation", "manifest", "shared", "profile", "workspace", "workbench")):
+                "build.missing_role_profile_page",
+                "build.page_missing_script_link",
+                "build.page_script_dom_contract",
+                "connectivity.missing_ui_loading_state",
+                "connectivity.missing_ui_error_state",
+                "tests.python_generated_app",
+                "tests.js_generated_app",
+            } or any(marker in message for marker in ("route", "navigation", "manifest", "shared", "profile", "workspace", "workbench", "roleprofilerecord", "db.py", "schemas.py")):
                 for candidate in (
                     "artifacts/generated_app_graph.json",
+                    "miniapp/app/main.py",
+                    "miniapp/app/db.py",
+                    "miniapp/app/schemas.py",
+                    "miniapp/app/routes/profiles.py",
                     "miniapp/app/static/shared/common.js",
                     "miniapp/app/static/shared/base.css",
                     "miniapp/app/generated/route_manifest.json",
@@ -6649,8 +7097,14 @@ test('generated javascript files parse', () => {{
         attempt: int,
         causal_surface: set[str],
         scope_mode: str,
+        structural_failure: bool,
     ) -> list[str]:
         hinted_files = self._extract_failure_file_hints(check_results, active_targets)
+        if structural_failure:
+            prioritized = [path for path in active_targets if path in causal_surface]
+            if prioritized:
+                return list(dict.fromkeys([*prioritized, *active_targets]))[:20]
+            return list(dict.fromkeys(active_targets))[:20]
         if scope_mode == "whole_file_build":
             narrowed = [path for path in hinted_files if path in set(active_targets)]
             if narrowed:
@@ -7420,7 +7874,11 @@ test('generated javascript files parse', () => {{
             else:
                 unresolved_unknowns.append(unknown)
 
-        api_requirements = list(spec.api_requirements)
+        api_requirements = [
+            item
+            for item in spec.api_requirements
+            if not self._is_forbidden_generated_api_requirement(item)
+        ]
         if not api_requirements and any(term in spec.product_goal.lower() for term in ("booking", "consultation", "form", "request")):
             evidence = [EvidenceLink(doc_ref_id="prompt-source", evidence_type="derived", note="Synthesized from prompt intent and canonical runtime defaults.")]
             api_requirements.extend(
@@ -7484,6 +7942,25 @@ test('generated javascript files parse', () => {{
                 "api_requirements": api_requirements,
             }
         )
+
+    @staticmethod
+    def _is_forbidden_generated_api_requirement(requirement: APIRequirement) -> bool:
+        path = str(requirement.path or "").strip().lower()
+        name = str(requirement.name or "").strip().lower()
+        purpose = str(requirement.purpose or "").strip().lower()
+        if path.startswith("/auth/") or path.startswith("/api/auth") or path in {"/auth", "/api/auth", "/api/me"}:
+            return True
+        if any(marker in path for marker in ("/events", "/stream", "/sse", "/ws", "/websocket")):
+            return True
+        if any(marker in name for marker in ("login", "sign in", "auth", "session bootstrap")):
+            return True
+        if any(marker in name for marker in ("websocket", "server-sent events", "sse", "push endpoint", "realtime")):
+            return True
+        if any(marker in purpose for marker in ("auth/login", "role-based session bootstrap", "session bootstrap")):
+            return True
+        if any(marker in purpose for marker in ("role-aware session token", "telegram init data", "websocket", "server-sent events", "sse", "push endpoint", "realtime updates")):
+            return True
+        return False
 
     def _stabilize_app_ir(
         self,

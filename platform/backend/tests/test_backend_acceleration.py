@@ -16,7 +16,9 @@ from app.ai.model_registry import TASK_PROFILES
 from app.ai.openrouter_client import OpenRouterClient
 from app.main import create_app
 from app.models.common import PreviewProfile, TargetPlatform
+from app.models.artifacts import ValidationIssue
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixCase, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RunCheckResult, ValidationSnapshot, WorkspaceRecord
+from app.models.grounded_spec import APIRequirement
 from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
 from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES, GenerationService
@@ -355,6 +357,7 @@ def test_generated_app_tests_cover_shell_styles_dom_contracts_and_local_routes(t
     assert "test_local_page_links_render" in python_test
     assert "test_detected_workflow_lifecycle_executes" in python_test
     assert "_workflow_api_requirements" in python_test
+    assert 'asset_path = MINIAPP_DIR / "app" / "static" / asset.removeprefix("/static/")' in python_test
     assert "extractJsDomIds" in js_test
     assert "page-local navigation targets resolve to declared routes" in js_test
     assert "grounded workflow roles map to declared page surfaces" in js_test
@@ -565,6 +568,270 @@ def test_fix_strategy_classifies_structural_vs_targeted_and_uses_budgets(tmp_pat
     assert structural == "structural_fix"
     assert targeted == "targeted_fix"
     assert orchestrator._attempt_budget_for_strategy("structural_fix") > orchestrator._attempt_budget_for_strategy("targeted_fix")
+
+
+def test_fix_strategy_promotes_generated_test_startup_and_manifest_failures_to_structural(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    orchestrator = app.state.container.fix_orchestrator
+
+    strategy = orchestrator._classify_fix_strategy(
+        raw_error="Generated app tests failed.",
+        failure_class="app/runtime_test",
+        root_cause="NameError: name 'SessionLocal' is not defined",
+        check_results=[
+            RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                details="Python generated app tests failed.",
+                logs=["NameError: name 'SessionLocal' is not defined"],
+            ),
+            RunCheckResult(
+                name="generated_app_js_tests",
+                status="failed",
+                details="JS generated app tests failed.",
+                logs=["Route /client/profile referenced by miniapp/app/static/client/index.html is not declared in route_manifest.json"],
+            ),
+        ],
+        implicated_files=["miniapp/app/main.py", "miniapp/app/generated/route_manifest.json"],
+    )
+
+    assert strategy == "structural_fix"
+
+
+def test_fix_implicated_files_include_missing_runtime_and_profile_contract_targets(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    workspace_service = app.state.container.workspace_service
+    orchestrator = app.state.container.fix_orchestrator
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Fix Scope Workspace",
+            description="Scope inference should include missing structural files.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_fix_scope").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    draft_run_id = "run_fix_scope"
+    workspace_service.prepare_draft(workspace.workspace_id, draft_run_id)
+
+    implicated = orchestrator._implicated_files(
+        workspace.workspace_id,
+        draft_run_id,
+        "\n".join(
+            [
+                "NameError: name 'SessionLocal' is not defined",
+                "Route /client/profile referenced by miniapp/app/static/client/index.html is not declared in route_manifest.json",
+            ]
+        ),
+        [],
+    )
+
+    assert "miniapp/app/main.py" in implicated
+    assert "miniapp/app/db.py" in implicated
+    assert "miniapp/app/generated/route_manifest.json" in implicated
+    assert "miniapp/app/static/client/profile/index.html" in implicated
+    assert "miniapp/app/static/client/profile/styles.css" in implicated
+    assert "miniapp/app/static/client/profile/app.js" in implicated
+
+
+def test_structural_write_scope_keeps_missing_contract_files_editable(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    workspace_service = app.state.container.workspace_service
+    orchestrator = app.state.container.fix_orchestrator
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Structural Scope Workspace",
+            description="Structural fix scope should allow creating missing files.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_structural_scope").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    draft_run_id = "run_structural_scope"
+    workspace_service.prepare_draft(workspace.workspace_id, draft_run_id)
+
+    scope = orchestrator._build_write_scope(
+        workspace.workspace_id,
+        draft_run_id,
+        [
+            "miniapp/app/main.py",
+            "miniapp/app/generated/route_manifest.json",
+            "miniapp/app/static/client/profile/index.html",
+            "miniapp/app/static/client/profile/styles.css",
+            "miniapp/app/static/client/profile/app.js",
+        ],
+        "app/runtime_test",
+        [],
+        "structural_fix",
+    )
+    scope_paths = {entry.file_path for entry in scope}
+
+    assert "miniapp/app/routes/profiles.py" in scope_paths
+    assert "miniapp/tests/test_generated_app.py" not in scope_paths
+    assert "miniapp/tests/generated_app.test.mjs" not in scope_paths
+    assert "miniapp/app/static/client/profile/index.html" in scope_paths
+    assert "miniapp/app/static/client/profile/styles.css" in scope_paths
+    assert "miniapp/app/static/client/profile/app.js" in scope_paths
+
+
+def test_runtime_fix_scope_excludes_generated_tests_from_write_surface(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    workspace_service = app.state.container.workspace_service
+    orchestrator = app.state.container.fix_orchestrator
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="No Test Rewrite Workspace",
+            description="Runtime fixes should patch app files, not generated tests.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_no_test_rewrite").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    draft_run_id = "run_no_test_rewrite"
+    workspace_service.prepare_draft(workspace.workspace_id, draft_run_id)
+
+    scope = orchestrator._build_write_scope(
+        workspace.workspace_id,
+        draft_run_id,
+        [
+            "miniapp/tests/test_generated_app.py",
+            "miniapp/tests/generated_app.test.mjs",
+            "miniapp/app/main.py",
+            "miniapp/app/generated/route_manifest.json",
+        ],
+        "backend_startup/import/schema",
+        [],
+        "structural_fix",
+    )
+    scope_paths = {entry.file_path for entry in scope}
+
+    assert "miniapp/app/main.py" in scope_paths
+    assert "miniapp/app/generated/route_manifest.json" in scope_paths
+    assert "miniapp/tests/test_generated_app.py" not in scope_paths
+    assert "miniapp/tests/generated_app.test.mjs" not in scope_paths
+
+
+def test_forbidden_generated_api_requirement_blocks_auth_and_realtime_contracts() -> None:
+    assert GenerationService._is_forbidden_generated_api_requirement(
+        APIRequirement(
+            api_req_id="api_auth",
+            name="Auth: login, role-aware session token",
+            method="POST",
+            path="/api/auth/login",
+            purpose="Create a role-aware session token for the mini app.",
+            request_fields=[],
+            response_fields=[],
+            evidence=[],
+        )
+    )
+
+
+def test_route_manifest_prefixes_role_local_paths() -> None:
+    manifest = GenerationService._route_manifest_from_page_graph(
+        {
+            "roles": {
+                "client": {
+                    "pages": [
+                        {"route_path": "/", "file_path": "miniapp/app/static/client/index.html"},
+                        {"route_path": "/new", "file_path": "miniapp/app/static/client/new/index.html"},
+                        {"route_path": "/profile", "file_path": "miniapp/app/static/client/profile/index.html"},
+                    ]
+                }
+            }
+        },
+        ["client"],
+    )
+
+    routes = [page["route_path"] for page in manifest["roles"]["client"]["pages"]]
+    assert routes == ["/client", "/client/new", "/client/profile"]
+
+
+def test_preflight_profile_schema_contract_detects_missing_role_profile(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    (workspace_root / "miniapp/app/routes").mkdir(parents=True, exist_ok=True)
+    (workspace_root / "miniapp/app").mkdir(parents=True, exist_ok=True)
+    (workspace_root / "miniapp/app/routes/profiles.py").write_text(
+        "from app.schemas import AppRole, RoleProfile\n",
+        encoding="utf-8",
+    )
+    (workspace_root / "miniapp/app/schemas.py").write_text(
+        "from pydantic import BaseModel\nclass Placeholder(BaseModel):\n    value: str\n",
+        encoding="utf-8",
+    )
+
+    issues = GenerationService._preflight_profile_schema_issues(workspace_root)
+
+    assert any(issue.code == "preflight.profile_schema_contract" for issue in issues)
+
+
+def test_preflight_route_manifest_link_detects_missing_declared_route(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    (workspace_root / "miniapp/app/generated").mkdir(parents=True, exist_ok=True)
+    (workspace_root / "miniapp/app/static/client").mkdir(parents=True, exist_ok=True)
+    (workspace_root / "miniapp/app/generated/route_manifest.json").write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "client": {
+                        "pages": [
+                            {"route_path": "/client", "file_path": "miniapp/app/static/client/index.html"},
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (workspace_root / "miniapp/app/static/client/index.html").write_text(
+        '<a href="/client/new">Create</a>\n',
+        encoding="utf-8",
+    )
+
+    issues = GenerationService._preflight_route_manifest_link_issues(
+        workspace_root,
+        {
+            "roles": {
+                "client": {
+                    "pages": [
+                        {"file_path": "miniapp/app/static/client/index.html"},
+                    ]
+                }
+            }
+        },
+        ["client"],
+    )
+
+    assert any(issue.code == "preflight.route_manifest_link_mismatch" for issue in issues)
+
+
+def test_preflight_backend_syntax_issues_detect_invalid_python(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    target = workspace_root / "miniapp/app/routes/uploads.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('url = f"https://example.com/{token"\n', encoding="utf-8")
+
+    issues = GenerationService._preflight_backend_syntax_issues(
+        workspace_root,
+        ["miniapp/app/routes/uploads.py"],
+    )
+
+    assert any(issue.code == "preflight.python_syntax_error" for issue in issues)
+    assert GenerationService._is_forbidden_generated_api_requirement(
+        APIRequirement(
+            api_req_id="api_events",
+            name="Realtime updates stream",
+            method="GET",
+            path="/api/events/stream",
+            purpose="Server-sent events stream for realtime updates.",
+            request_fields=[],
+            response_fields=[],
+            evidence=[],
+        )
+    )
 
 
 def test_fix_prompt_includes_strategy_specific_guidance(tmp_path: Path) -> None:
@@ -800,6 +1067,28 @@ def test_canonicalize_target_files_drops_flat_role_entries_and_template_owned_br
     assert "miniapp/app/static/client/styles.css" in canonical
 
 
+def test_canonicalize_target_files_adds_missing_page_triplet_companions(tmp_path: Path) -> None:
+    service = create_app(
+        repo_root=Path(__file__).resolve().parents[3],
+        data_dir=tmp_path / "data",
+    ).state.container.generation_service
+
+    canonical = service._canonicalize_target_files(
+        [
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/new/index.html",
+        ],
+        scope_mode="whole_file_build",
+    )
+
+    assert "miniapp/app/static/client/index.html" in canonical
+    assert "miniapp/app/static/client/styles.css" in canonical
+    assert "miniapp/app/static/client/app.js" in canonical
+    assert "miniapp/app/static/client/new/index.html" in canonical
+    assert "miniapp/app/static/client/new/styles.css" in canonical
+    assert "miniapp/app/static/client/new/app.js" in canonical
+
+
 def test_landing_alias_paths_are_canonicalized_to_role_root() -> None:
     normalized = GenerationService._normalize_path_list(
         [
@@ -985,6 +1274,109 @@ def test_non_root_page_file_path_is_rewritten_when_model_returns_js_path(tmp_pat
     assert page["file_path"] == "miniapp/app/static/client/requests/index.html"
     assert page["style_path"] == "miniapp/app/static/client/requests/styles.css"
     assert page["script_path"] == "miniapp/app/static/client/requests/app.js"
+
+
+def test_page_definition_canonicalizes_alias_folder_names_from_route_path(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    new_page = service._normalize_page_definition(
+        "client",
+        {
+            "page_id": "client_create_request",
+            "route_path": "/new",
+            "file_path": "miniapp/app/static/client/create_request/index.html",
+            "style_path": "miniapp/app/static/client/create_request/styles.css",
+            "script_path": "miniapp/app/static/client/create_request/app.js",
+            "title": "New request",
+        },
+        1,
+    )
+    detail_page = service._normalize_page_definition(
+        "specialist",
+        {
+            "page_id": "specialist_request_detail",
+            "route_path": "/requests/:request_id",
+            "file_path": "miniapp/app/static/specialist/request_detail/index.html",
+            "style_path": "miniapp/app/static/specialist/request_detail/styles.css",
+            "script_path": "miniapp/app/static/specialist/request_detail/app.js",
+            "title": "Request detail",
+        },
+        2,
+    )
+
+    assert new_page["file_path"] == "miniapp/app/static/client/new/index.html"
+    assert new_page["style_path"] == "miniapp/app/static/client/new/styles.css"
+    assert new_page["script_path"] == "miniapp/app/static/client/new/app.js"
+    assert detail_page["file_path"] == "miniapp/app/static/specialist/requests_detail/index.html"
+    assert detail_page["style_path"] == "miniapp/app/static/specialist/requests_detail/styles.css"
+    assert detail_page["script_path"] == "miniapp/app/static/specialist/requests_detail/app.js"
+
+
+def test_finalize_role_pages_reinserts_required_profile_page(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    pages = service._finalize_role_pages(
+        "client",
+        [
+            {
+                "page_id": "client_home",
+                "route_path": "/",
+                "file_path": "miniapp/app/static/client/index.html",
+                "page_kind": "dashboard",
+                "title": "Home",
+            }
+        ],
+        require_multi_page=True,
+    )
+
+    route_paths = {page["route_path"] for page in pages}
+    profile_page = next(page for page in pages if page["route_path"] == "/profile")
+    assert "/" in route_paths
+    assert "/profile" in route_paths
+    assert profile_page["file_path"] == "miniapp/app/static/client/profile/index.html"
+
+
+def test_endpoint_names_from_dependency_text_supports_non_api_paths() -> None:
+    endpoints = GenerationService._endpoint_names_from_dependency_text("GET /users?role=specialist")
+    assert endpoints == {"users"}
+
+
+def test_endpoint_names_from_dependency_text_does_not_infer_api_as_route_module() -> None:
+    endpoints = GenerationService._endpoint_names_from_dependency_text("GET /api/requests?role=client")
+    assert "requests" in endpoints
+    assert "api" not in endpoints
+
+
+def test_structural_repair_targets_stay_broad_for_profile_and_manifest_failures(tmp_path: Path) -> None:
+    service = create_app(
+        repo_root=Path(__file__).resolve().parents[3],
+        data_dir=tmp_path / "data",
+    ).state.container.generation_service
+    active_targets = [
+        "miniapp/app/db.py",
+        "miniapp/app/schemas.py",
+        "miniapp/app/main.py",
+        "miniapp/app/routes/profiles.py",
+        "miniapp/app/generated/route_manifest.json",
+        "miniapp/app/static/client/index.html",
+        "miniapp/app/static/client/app.js",
+    ]
+    selected = service._repair_targets_for_attempt(
+        active_targets=active_targets,
+        check_results=[],
+        attempt=1,
+        causal_surface={"miniapp/app/generated/route_manifest.json", "miniapp/app/routes/profiles.py"},
+        scope_mode="whole_file_build",
+        structural_failure=True,
+    )
+
+    assert "miniapp/app/generated/route_manifest.json" in selected
+    assert "miniapp/app/routes/profiles.py" in selected
+    assert "miniapp/app/db.py" in selected
 
 
 def test_plan_expands_page_triplet_targets() -> None:
@@ -1890,6 +2282,33 @@ async function loadProfile() {
     assert artifacts["fix_attempts"]["items"]
 
 
+def test_fix_orchestrator_detects_context_refusal_diagnosis() -> None:
+    from app.services.fix_orchestrator import FixOrchestrator
+
+    assert FixOrchestrator._looks_like_context_refusal(
+        "I’m not able to proceed because I can’t inspect or edit the workspace files."
+    )
+    assert FixOrchestrator._looks_like_context_refusal(
+        "Without access to the actual file contents, I cannot craft the patch."
+    )
+    assert not FixOrchestrator._looks_like_context_refusal(
+        "Patch the DOM ids and route wiring in the implicated files."
+    )
+
+
+def test_structural_repeated_signature_guard_detects_expandable_scope() -> None:
+    from app.services.fix_orchestrator import FixOrchestrator
+
+    current_scope = [FixScopeEntry(file_path="miniapp/app/main.py", reason="current")]
+    next_scope = [
+        FixScopeEntry(file_path="miniapp/app/main.py", reason="current"),
+        FixScopeEntry(file_path="miniapp/app/db.py", reason="new"),
+    ]
+
+    assert FixOrchestrator._scope_can_still_expand(current_scope, next_scope) is True
+    assert FixOrchestrator._scope_can_still_expand(next_scope, next_scope) is False
+
+
 def test_run_completes_before_async_preview_rebuild_finishes(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -2114,6 +2533,55 @@ def test_build_validator_flags_contract_drift(tmp_path: Path) -> None:
     assert "build.authless_api_fetch" in issue_codes
     assert "build.unproxied_backend_route" in issue_codes
     assert "build.route_export_mismatch" in issue_codes
+
+
+def test_generation_repair_allows_safe_shared_static_companion_targets(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    service._generate_structured_with_retry = lambda **_kwargs: {
+        "model": "stub",
+        "payload": {
+            "assistant_message": "Repair shared UI asset.",
+            "operations": [
+                {
+                    "file_path": "miniapp/app/static/shared/ui.js",
+                    "operation": "replace",
+                    "content": "export const ready = true;\n",
+                    "reason": "Provide the shared UI script the page wiring expects.",
+                }
+            ],
+        },
+    }
+    service._repair_user_prompt = lambda **_kwargs: "repair"
+
+    result = service._repair_draft_after_failure(
+        workspace_id="ws_1",
+        draft_run_id="run_1",
+        prompt="Fix the generated app.",
+        grounded_spec=SimpleNamespace(),
+        role_scope=["client"],
+        role_contract={},
+        page_graph={},
+        scope_mode="whole_file_build",
+        target_files=["miniapp/app/static/client/index.html"],
+        file_contexts={},
+        build_issues=[
+            ValidationIssue(
+                code="connectivity.missing_static_asset",
+                message="miniapp/app/static/client/index.html references /static/shared/ui.js but the static asset is missing.",
+                severity="high",
+                location="miniapp/app/static/client/index.html",
+            )
+        ],
+        preview_issue=None,
+        preview_logs=[],
+        attempt=1,
+    )
+
+    assert "error" not in result
+    assert [operation.file_path for operation in result["operations"]] == ["miniapp/app/static/shared/ui.js"]
 
 
 def test_clone_template_skips_heavy_frontend_artifacts(tmp_path: Path) -> None:

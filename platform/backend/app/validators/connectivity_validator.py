@@ -258,35 +258,35 @@ class ConnectivityValidator:
     ) -> set[str]:
         if api_refs:
             return set(api_refs)
+        explicit_dependency_refs = cls._extract_dependency_api_refs(page.get("data_dependencies") or [])
+        if explicit_dependency_refs:
+            return explicit_dependency_refs
         stems: set[str] = set()
-        stems.update(dependencies)
-        page_tokens = cls._normalize_tokens(
-            [
-                str(page.get("route_path") or ""),
-                str(Path(str(page.get("file_path") or "")).stem),
-                str(page.get("title") or ""),
-                str(page.get("description") or ""),
-            ]
-        )
-        stems.update(page_tokens)
         for requirement in api_requirements:
             if not isinstance(requirement, dict):
                 continue
             path = str(requirement.get("path") or "")
             if "/api/" not in path:
                 continue
-            candidate_stems = cls._normalize_tokens(
-                [
-                    path,
-                    str(requirement.get("name") or ""),
-                    str(requirement.get("purpose") or ""),
-                ]
-            )
-            if candidate_stems & (dependencies | page_tokens):
-                path_match = re.search(r"/api/([a-zA-Z0-9_-]+)", path)
-                if path_match:
-                    stems.add(cls._normalize_route_stem(path_match.group(1).lower()))
+            path_match = re.search(r"/api/([a-zA-Z0-9_-]+)", path)
+            if not path_match:
+                continue
+            endpoint_stem = cls._normalize_route_stem(path_match.group(1).lower())
+            endpoint_tokens = {endpoint_stem}
+            if endpoint_stem.endswith("s") and len(endpoint_stem) > 4:
+                endpoint_tokens.add(endpoint_stem[:-1])
+            if endpoint_tokens & dependencies:
+                stems.add(endpoint_stem)
         return {stem for stem in stems if stem not in {"api", "data", "page", "state"}}
+
+    @classmethod
+    def _extract_dependency_api_refs(cls, values: list[str] | tuple[str, ...]) -> set[str]:
+        refs: set[str] = set()
+        for value in values:
+            text = str(value)
+            for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", text):
+                refs.add(cls._normalize_route_stem(match.group(1).lower()))
+        return refs
 
     @staticmethod
     def _normalize_route_stem(stem: str) -> str:

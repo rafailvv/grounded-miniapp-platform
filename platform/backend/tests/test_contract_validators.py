@@ -558,6 +558,39 @@ def test_build_validator_accepts_nested_page_asset_links(tmp_path: Path) -> None
     assert "build.page_missing_script_link" not in issue_codes
 
 
+def test_build_validator_reports_invalid_generated_page_entries_instead_of_crashing(tmp_path: Path) -> None:
+    workspace_path = tmp_path / "workspace"
+    (workspace_path / "miniapp" / "app").mkdir(parents=True)
+    (workspace_path / "miniapp" / "app" / "generated").mkdir(parents=True)
+    (workspace_path / "docker").mkdir(parents=True)
+    (workspace_path / "artifacts").mkdir(parents=True)
+
+    (workspace_path / "miniapp" / "app" / "main.py").write_text("app = None\n", encoding="utf-8")
+    (workspace_path / "miniapp" / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (workspace_path / "docker" / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (workspace_path / "artifacts" / "grounded_spec.json").write_text(json.dumps(make_valid_spec().model_dump(mode="json")), encoding="utf-8")
+    (workspace_path / "artifacts" / "generated_app_graph.json").write_text(
+        json.dumps(
+            {
+                "flow_mode": "multi_page",
+                "roles": {
+                    "client": {
+                        "routes_file": "miniapp/app/routes/client.py",
+                        "pages": ["client_index"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (workspace_path / "miniapp" / "app" / "generated" / "route_manifest.json").write_text(json.dumps({"routes": []}), encoding="utf-8")
+    (workspace_path / "miniapp" / "app" / "generated" / "runtime_manifest.json").write_text(json.dumps({"pages": []}), encoding="utf-8")
+
+    issues = BuildValidator().validate(workspace_path)
+
+    assert "build.invalid_generated_page_entry" in {issue.code for issue in issues}
+
+
 def test_contract_files_exist_and_expose_required_keys() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     spec_contract = json.loads((repo_root / "contracts" / "grounded-spec.v1.json").read_text(encoding="utf-8"))
@@ -763,6 +796,66 @@ def test_build_validator_flags_inline_route_schema_model_for_workflow_app(tmp_pa
     issues = BuildValidator().validate(workspace_root)
 
     assert any(issue.code == "build.inline_route_schema_model" for issue in issues)
+
+
+def test_build_validator_flags_profile_contract_db_drift(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_workspace_file(
+        workspace_root,
+        "artifacts/grounded_spec.json",
+        json.dumps(
+            {
+                "target_platform": "telegram_mini_app",
+                "preview_profile": "telegram_mock",
+                "product_goal": "Persistent request workflow",
+                "actors": [],
+                "domain_entities": [{"entity_id": "request", "name": "Request", "description": "", "attributes": []}],
+                "user_flows": [{"flow_id": "flow_1", "name": "Flow", "goal": "Persist requests", "steps": [], "acceptance_criteria": []}],
+                "ui_requirements": [],
+                "api_requirements": [{"api_req_id": "api_1", "description": "List requests", "path": "/api/requests", "method": "GET"}],
+                "persistence_requirements": [{"persistence_req_id": "persist_1", "description": "Store requests", "storage_type": "sqlite", "entity_ids": ["request"]}],
+                "integration_requirements": [],
+                "security_requirements": [],
+                "platform_constraints": [],
+                "non_functional_requirements": [],
+                "assumptions": [],
+                "unknowns": [],
+                "contradictions": [],
+                "doc_refs": [],
+                "metadata": {},
+            }
+        ),
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/db.py",
+        "from sqlalchemy import create_engine\nfrom sqlalchemy.orm import DeclarativeBase, sessionmaker\nengine = create_engine('sqlite:///test.db')\nSessionLocal = sessionmaker(bind=engine)\nclass Base(DeclarativeBase):\n    pass\n",
+    )
+    _write_workspace_file(workspace_root, "miniapp/app/schemas.py", "from pydantic import BaseModel\nclass RequestSchema(BaseModel):\n    title: str\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/routes/profiles.py",
+        "from app.db import RoleProfileRecord, SessionLocal\n",
+    )
+
+    issues = BuildValidator().validate(workspace_root)
+
+    assert any(issue.code == "build.profile_contract_db_drift" for issue in issues)
+
+
+def test_build_validator_flags_unexpected_auth_reference(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/app.js",
+        'fetch("/api/auth");\n',
+    )
+
+    issues = BuildValidator().validate(workspace_root)
+
+    assert any(issue.code == "build.unexpected_auth_reference" for issue in issues)
 
 
 def test_build_validator_flags_missing_shell_style_and_dom_contract_drift(tmp_path: Path) -> None:
@@ -1007,3 +1100,87 @@ def test_connectivity_validator_accepts_api_reference_with_matching_route(tmp_pa
 
     issues = ConnectivityValidator().validate(workspace_root)
     assert not any(issue.code == "connectivity.missing_backend_route" for issue in issues)
+
+
+def test_connectivity_validator_does_not_infer_route_names_from_plain_english_dependencies(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    graph = {
+        "flow_mode": "multi_page",
+        "roles": {
+            "client": {
+                "routes_file": "miniapp/app/routes/client.py",
+                "pages": [
+                    {
+                        "route_path": "/client/create",
+                        "file_path": "miniapp/app/static/client/create/index.html",
+                        "style_path": "miniapp/app/static/client/create/styles.css",
+                        "script_path": "miniapp/app/static/client/create/app.js",
+                        "title": "Create request",
+                        "description": "Create request and assign specialist after manager review",
+                        "data_dependencies": [
+                            "Create request and assign specialist after manager review"
+                        ],
+                        "loading_state": "Loading request data...",
+                        "error_state": "Unable to load request data.",
+                    }
+                ],
+            }
+        },
+    }
+    spec = {
+        "api_requirements": [
+            {
+                "api_req_id": "api_1",
+                "name": "Create request",
+                "method": "POST",
+                "path": "/api/requests",
+                "purpose": "Create request and assign specialist after manager review",
+            }
+        ]
+    }
+    _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "artifacts/grounded_spec.json", json.dumps(spec))
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/create/index.html",
+        """
+        <main>
+          <section>Loading request data...</section>
+          <section>Unable to load request data.</section>
+        </main>
+        """,
+    )
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/create/styles.css", "body { color: #111; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/create/app.js", "console.log('create');\n")
+    _write_workspace_file(workspace_root, "miniapp/app/routes/__init__.py", "")
+
+    issues = ConnectivityValidator().validate(workspace_root)
+    missing_route_locations = {issue.location for issue in issues if issue.code == "connectivity.missing_backend_route"}
+    assert "miniapp/app/routes/action.py" not in missing_route_locations
+    assert "miniapp/app/routes/and.py" not in missing_route_locations
+
+
+def test_build_validator_flags_invalid_route_import_root(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/db.py",
+        "from sqlalchemy import create_engine\nfrom sqlalchemy.orm import DeclarativeBase, sessionmaker\nengine = create_engine('sqlite:///test.db')\nSessionLocal = sessionmaker(bind=engine)\nclass Base(DeclarativeBase):\n    pass\n",
+    )
+    _write_workspace_file(workspace_root, "miniapp/app/schemas.py", "from pydantic import BaseModel\nclass Placeholder(BaseModel):\n    value: str\n")
+    _write_workspace_file(
+        workspace_root,
+        "artifacts/grounded_spec.json",
+        json.dumps({"api_requirements": [{"path": "/api/requests"}], "persistence_requirements": [{"entity_id": "request"}]}),
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/routes/requests.py",
+        "from miniapp.app import db, schemas\n",
+    )
+
+    issues = BuildValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+    assert "build.invalid_route_import_root" in issue_codes

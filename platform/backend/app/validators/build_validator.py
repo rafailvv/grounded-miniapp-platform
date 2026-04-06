@@ -101,6 +101,16 @@ class BuildValidator:
                 )
 
         for role, role_payload in roles.items():
+            if not isinstance(role_payload, dict):
+                issues.append(
+                    ValidationIssue(
+                        code="build.invalid_generated_role_entry",
+                        message=f"{role} has an invalid role payload in generated_app_graph.json.",
+                        severity="high",
+                        location="artifacts/generated_app_graph.json",
+                    )
+                )
+                continue
             pages = role_payload.get("pages") or []
             routes_file_raw = role_payload.get("routes_file")
             if isinstance(routes_file_raw, str) and routes_file_raw:
@@ -160,6 +170,16 @@ class BuildValidator:
                 )
 
             for page in pages:
+                if not isinstance(page, dict):
+                    issues.append(
+                        ValidationIssue(
+                            code="build.invalid_generated_page_entry",
+                            message=f"{role} contains a non-object page entry in generated_app_graph.json.",
+                            severity="high",
+                            location="artifacts/generated_app_graph.json",
+                        )
+                    )
+                    continue
                 file_path_raw = page.get("file_path")
                 if not isinstance(file_path_raw, str):
                     continue
@@ -495,6 +515,15 @@ class BuildValidator:
                         location=str(route_file.relative_to(workspace_path)),
                     )
                 )
+            if "from miniapp.app import " in content or "import miniapp.app." in content:
+                issues.append(
+                    ValidationIssue(
+                        code="build.invalid_route_import_root",
+                        message=f"Route module {route_file.name} imports from miniapp.app; generated runtime modules must import from app.* inside the workspace.",
+                        severity="high",
+                        location=str(route_file.relative_to(workspace_path)),
+                    )
+                )
         return issues
 
     def _validate_persistent_storage_contract(self, workspace_path: Path) -> list[ValidationIssue]:
@@ -547,6 +576,21 @@ class BuildValidator:
                     location="miniapp/app/db.py",
                 )
             )
+        profiles_path = workspace_path / "miniapp" / "app" / "routes" / "profiles.py"
+        if profiles_path.exists():
+            try:
+                profiles_content = profiles_path.read_text(encoding="utf-8")
+            except OSError:
+                profiles_content = ""
+            if "RoleProfileRecord" in profiles_content and "class RoleProfileRecord" not in db_content:
+                issues.append(
+                    ValidationIssue(
+                        code="build.profile_contract_db_drift",
+                        message="db.py no longer defines RoleProfileRecord even though routes/profiles.py still imports it.",
+                        severity="high",
+                        location="miniapp/app/db.py",
+                    )
+                )
         db_store_pattern = re.compile(
             r"^(?P<name>(?:REQUESTS|COMMENTS|ASSIGNMENTS|TIME_SLOTS|SPECIALISTS|USERS|PROFILE_STORE|[A-Z][A-Z0-9_]*(?:_STORE|_CACHE|_TABLE|_ITEMS)))\s*(?::[^=]+)?=\s*(?:\{|\[)",
             flags=re.MULTILINE,
@@ -747,6 +791,15 @@ class BuildValidator:
                             location=relative,
                         )
                     )
+            if "/api/auth" in content or "/auth/login" in content or "/auth/me" in content:
+                issues.append(
+                    ValidationIssue(
+                        code="build.unexpected_auth_reference",
+                        message="Generated app code must not introduce auth/login bootstrap endpoints.",
+                        severity="high",
+                        location=relative,
+                    )
+                )
 
         return issues
 

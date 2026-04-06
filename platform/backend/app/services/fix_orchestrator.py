@@ -52,6 +52,7 @@ class FixOrchestrator:
     MAX_ATTEMPTS = 12
     MAX_SCOPE_EXPANSIONS = 4
     MAX_CONTEXT_CHARS = 12000
+    MAX_CONTEXT_CHARS_EXPANDED = 32000
     STRATEGY_ATTEMPTS = {
         "targeted_fix": 8,
         "feature_adjustment": 10,
@@ -345,6 +346,9 @@ class FixOrchestrator:
             if signature and len(prior_signatures) >= repeated_signature_budget and all(
                 previous == signature for previous in prior_signatures[-repeated_signature_budget:]
             ):
+                if active_strategy == "structural_fix" and self._scope_can_still_expand(scope_entries, fix_case.write_scope):
+                    prior_signatures.append(signature)
+                    continue
                 job.status = "failed"
                 job.failure_reason = (
                     "Fix loop stopped after the same failure repeated without evidence of progress."
@@ -432,7 +436,29 @@ class FixOrchestrator:
                     elapsed_ms=int((time.perf_counter() - started_at) * 1000),
                 )
 
-            operations = self._coerce_operations(llm_result.get("operations") or [], scope_entries, fix_case, scope_expansions)
+            raw_operations = llm_result.get("operations") or []
+            diagnosis_text = str(llm_result.get("diagnosis") or "")
+            if not raw_operations and self._looks_like_context_refusal(diagnosis_text):
+                expanded_contexts = self._collect_file_contexts(
+                    workspace_id,
+                    run_id,
+                    scope_entries,
+                    fix_case=fix_case,
+                    budget_override=self.MAX_CONTEXT_CHARS_EXPANDED,
+                    full_files=True,
+                )
+                if expanded_contexts and expanded_contexts != file_contexts:
+                    self._append_event(
+                        job,
+                        "repair_planned",
+                        "Repair model requested more file context; retrying patch planning with expanded excerpts.",
+                        {"attempt": attempt, "scope": [entry.file_path for entry in scope_entries], "expanded_context": True},
+                    )
+                    llm_result = self._plan_patch(job=job, fix_case=fix_case, file_contexts=expanded_contexts)
+                    raw_operations = llm_result.get("operations") or []
+                    diagnosis_text = str(llm_result.get("diagnosis") or "")
+
+            operations = self._coerce_operations(raw_operations, scope_entries, fix_case, scope_expansions)
             if not operations:
                 job.status = "failed"
                 job.failure_reason = "Repair model did not return any patch operations."
@@ -764,6 +790,7 @@ class FixOrchestrator:
                 *(preview_details.get("logs") or []),
             ]
         )
+        combined_text = self._augment_failure_evidence_from_test_results(combined_text, check_execution.results)
         failure_class = self._classify_failure_text(combined_text) or CheckRunner.classify_failure(check_execution.results) or "build/runtime"
         root_cause = self._root_cause_summary(check_execution.results, preview_details, raw_error)
         failure_signature = self._failure_signature(failure_class, root_cause)
@@ -838,6 +865,8 @@ class FixOrchestrator:
         operations: list[DraftFileOperation] = []
         for index, item in enumerate(raw_operations):
             operation = DraftFileOperation.model_validate(item)
+            if operation.file_path.startswith("miniapp/tests/") and not self._allow_test_file_writes(fix_case):
+                raise ValueError(f"Repair attempted to edit generated tests instead of the app surface: {operation.file_path}")
             if operation.file_path not in scope_paths:
                 if len(scope_expansions) >= self.MAX_SCOPE_EXPANSIONS or not self._can_expand_for_file(operation.file_path, fix_case.implicated_files):
                     raise ValueError(f"Repair touched files outside the allowed evidence-based scope: {operation.file_path}")
@@ -891,8 +920,10 @@ class FixOrchestrator:
                 entries.setdefault(candidate, FixScopeEntry(file_path=candidate, reason="Included as part of a feature-local fix bundle."))
         if failure_class.startswith("preview_runtime") or failure_class.startswith("runtime") or failure_class.startswith("tooling"):
             for candidate in ("docker/docker-compose.yml", "miniapp/requirements.txt", "miniapp/app/main.py"):
-                if self._file_exists(workspace_id, run_id, candidate):
+                if self._file_exists(workspace_id, run_id, candidate) or self._allow_missing_scope_path(candidate):
                     entries.setdefault(candidate, FixScopeEntry(file_path=candidate, reason="Runtime or preview glue may be involved in the current failure."))
+        if not self._allow_test_file_writes_for_failure(failure_class):
+            entries = {path: entry for path, entry in entries.items() if not path.startswith("miniapp/tests/")}
         if not entries:
             for fallback in ("miniapp/app/static", "miniapp/app"):
                 entries.setdefault(fallback, FixScopeEntry(file_path=fallback, reason="Fallback repair surface for the current failure cluster."))
@@ -910,19 +941,22 @@ class FixOrchestrator:
             "miniapp/app/db.py",
             "miniapp/app/schemas.py",
             "miniapp/app/main.py",
+            "miniapp/app/routes/profiles.py",
             "miniapp/app/generated/route_manifest.json",
             "miniapp/app/generated/runtime_manifest.json",
             "miniapp/app/generated/static_runtime_manifest.json",
+            "miniapp/tests/test_generated_app.py",
+            "miniapp/tests/generated_app.test.mjs",
             "artifacts/generated_app_graph.json",
         ):
-            if self._file_exists(workspace_id, run_id, candidate):
+            if self._file_exists(workspace_id, run_id, candidate) or self._allow_missing_scope_path(candidate):
                 bundle.append(candidate)
         for file_path in implicated_files:
             if file_path.startswith("miniapp/app/routes/"):
                 bundle.append(file_path)
             if file_path.startswith("miniapp/app/static/") and file_path.endswith((".html", ".css", ".js")):
                 parent = str(Path(file_path).parent)
-                if self._file_exists(workspace_id, run_id, parent):
+                if self._file_exists(workspace_id, run_id, parent) or self._allow_missing_scope_path(file_path):
                     bundle.append(parent)
         if "route" in failure_class or "contract" in failure_class:
             routes_dir = "miniapp/app/routes"
@@ -937,7 +971,7 @@ class FixOrchestrator:
                 parent = Path(file_path).parent
                 for sibling in (parent / "index.html", parent / "styles.css", parent / "app.js"):
                     normalized = sibling.as_posix()
-                    if self._file_exists(workspace_id, run_id, normalized):
+                    if self._file_exists(workspace_id, run_id, normalized) or self._allow_missing_scope_path(normalized):
                         bundle.append(normalized)
         return list(dict.fromkeys(bundle))
 
@@ -961,9 +995,11 @@ class FixOrchestrator:
         scope_entries: list[FixScopeEntry],
         *,
         fix_case: FixCase | None = None,
+        budget_override: int | None = None,
+        full_files: bool = False,
     ) -> dict[str, str]:
         contexts: dict[str, str] = {}
-        budget = self.MAX_CONTEXT_CHARS
+        budget = budget_override or self.MAX_CONTEXT_CHARS
         for entry in scope_entries:
             if budget <= 0:
                 break
@@ -973,17 +1009,37 @@ class FixOrchestrator:
             if target_path.is_dir():
                 continue
             content = self.workspace_service.read_file(workspace_id, entry.file_path, run_id=run_id)
-            excerpt = content[: min(len(content), min(4000, budget))]
+            excerpt = content if full_files else content[: min(len(content), min(4000, budget))]
+            if len(excerpt) > budget:
+                excerpt = excerpt[:budget]
             contexts[entry.file_path] = excerpt
             budget -= len(excerpt)
         for support_path in self._repair_support_files(fix_case):
             if budget <= 0 or support_path in contexts or not self._file_exists(workspace_id, run_id, support_path):
                 continue
             content = self.workspace_service.read_file(workspace_id, support_path, run_id=run_id)
-            excerpt = content[: min(len(content), min(2500, budget))]
+            excerpt = content if full_files else content[: min(len(content), min(2500, budget))]
+            if len(excerpt) > budget:
+                excerpt = excerpt[:budget]
             contexts[support_path] = excerpt
             budget -= len(excerpt)
         return contexts
+
+    @staticmethod
+    def _looks_like_context_refusal(diagnosis: str) -> bool:
+        lowered = diagnosis.lower().replace("’", "'").replace("‘", "'")
+        markers = (
+            "can't inspect",
+            "cannot inspect",
+            "can't access",
+            "cannot access",
+            "can't edit the workspace files",
+            "cannot edit the workspace files",
+            "without access to the actual file contents",
+            "unable to inspect",
+            "unable to access the file",
+        )
+        return any(marker in lowered for marker in markers)
 
     @staticmethod
     def _repair_support_files(fix_case: FixCase | None) -> list[str]:
@@ -1034,6 +1090,7 @@ class FixOrchestrator:
                     resolved = self._resolve_backend_module(workspace_id, run_id, backend_match.group(1))
                     if resolved:
                         candidates.append(resolved)
+        candidates.extend(self._test_failure_implicated_paths(text))
         for entry in existing_scope:
             candidates.append(entry.file_path)
         unique: list[str] = []
@@ -1041,7 +1098,7 @@ class FixOrchestrator:
             normalized = candidate.strip().lstrip("./")
             if not normalized or normalized in unique:
                 continue
-            if self._file_exists(workspace_id, run_id, normalized):
+            if self._file_exists(workspace_id, run_id, normalized) or self._allow_missing_scope_path(normalized):
                 unique.append(normalized)
         return unique[:24]
 
@@ -1076,6 +1133,7 @@ class FixOrchestrator:
             ]
         ).lower()
         structural_markers = (
+            "app/runtime_test",
             "build.in_memory_route_store",
             "build.inline_route_schema_model",
             "build.missing_db_module",
@@ -1090,6 +1148,12 @@ class FixOrchestrator:
             "sqlalchemy",
             "schemas.py",
             "db.py",
+            "sessionlocal",
+            "roleprofilerecord",
+            "not declared in route_manifest.json",
+            "missing the required profile page",
+            "generated_app_python_tests",
+            "generated_app_js_tests",
             "navigation mismatch",
             "contract mismatch",
         )
@@ -1103,11 +1167,145 @@ class FixOrchestrator:
         )
         if any(marker in evidence for marker in structural_markers):
             return "structural_fix"
+        failed_names = {result.name for result in check_results if result.status == "failed"}
+        if "generated_app_python_tests" in failed_names and any(
+            marker in evidence
+            for marker in (
+                "nameerror",
+                "sessionlocal",
+                "cannot import name",
+                "importerror",
+                "roleprofilerecord",
+                "main.py",
+                "db.py",
+                "schemas.py",
+            )
+        ):
+            return "structural_fix"
+        if "generated_app_js_tests" in failed_names and any(
+            marker in evidence
+            for marker in (
+                "route ",
+                "route_manifest.json",
+                "/profile",
+                "page js asset",
+                "dom ids required by app.js",
+            )
+        ):
+            return "structural_fix"
         if any(marker in evidence for marker in feature_markers):
             return "feature_adjustment"
         if len(implicated_files) >= 5:
             return "structural_fix"
         return "targeted_fix"
+
+    @staticmethod
+    def _allow_missing_scope_path(file_path: str) -> bool:
+        normalized = str(file_path or "").strip().lstrip("./")
+        if not normalized:
+            return False
+        return normalized.startswith(
+            (
+                "miniapp/app/static/",
+                "miniapp/app/routes/",
+                "miniapp/app/generated/",
+                "miniapp/app/db.py",
+                "miniapp/app/schemas.py",
+                "miniapp/app/main.py",
+                "miniapp/tests/",
+                "artifacts/",
+            )
+        )
+
+    @staticmethod
+    def _scope_can_still_expand(existing_scope: list[FixScopeEntry], next_scope: list[FixScopeEntry]) -> bool:
+        current = {entry.file_path for entry in existing_scope}
+        upcoming = {entry.file_path for entry in next_scope}
+        return bool(upcoming - current)
+
+    @staticmethod
+    def _augment_failure_evidence_from_test_results(base_text: str, results: list[RunCheckResult]) -> str:
+        markers: list[str] = []
+        for result in results:
+            if result.status != "failed":
+                continue
+            haystack = "\n".join([result.details or "", *result.logs]).lower()
+            if result.name == "generated_app_python_tests":
+                if "sessionlocal" in haystack:
+                    markers.append("runtime.startup.missing_sessionlocal")
+                if "roleprofilerecord" in haystack:
+                    markers.append("runtime.startup.missing_role_profile_record")
+                if "cannot import name" in haystack or "importerror" in haystack:
+                    markers.append("runtime.startup.import_drift")
+            if result.name == "generated_app_js_tests":
+                if "not declared in route_manifest.json" in haystack:
+                    markers.append("route_manifest.missing_declared_route")
+                if "/profile" in haystack:
+                    markers.append("route_manifest.missing_profile_route")
+        if not markers:
+            return base_text
+        return "\n".join([base_text, *markers])
+
+    def _test_failure_implicated_paths(self, text: str) -> list[str]:
+        lowered = text.lower()
+        candidates: list[str] = []
+        if "sessionlocal" in lowered:
+            candidates.extend(
+                [
+                    "miniapp/app/main.py",
+                    "miniapp/app/db.py",
+                    "miniapp/tests/test_generated_app.py",
+                ]
+            )
+        if "roleprofilerecord" in lowered:
+            candidates.extend(
+                [
+                    "miniapp/app/db.py",
+                    "miniapp/app/routes/profiles.py",
+                    "miniapp/app/schemas.py",
+                    "miniapp/tests/test_generated_app.py",
+                ]
+            )
+        if "route_manifest.json" in lowered or "not declared in route_manifest.json" in lowered:
+            candidates.extend(
+                [
+                    "miniapp/app/generated/route_manifest.json",
+                    "miniapp/tests/generated_app.test.mjs",
+                ]
+            )
+        route_refs = re.findall(r"Route\s+([/A-Za-z0-9_{}:-]+)\s+referenced", text)
+        route_refs.extend(match for _, match in re.findall(r"(['\"])(/[^'\"]+)\1", text))
+        normalized_routes: list[str] = []
+        for route in route_refs:
+            route = str(route).strip()
+            if not route.startswith("/") or route.startswith("/api/") or route in normalized_routes:
+                continue
+            normalized_routes.append(route)
+        for route in normalized_routes:
+            candidates.extend(self._page_triplet_candidates_for_route(route))
+            role = route.strip("/").split("/", 1)[0]
+            if role in {"client", "specialist", "manager"}:
+                candidates.append(f"miniapp/app/routes/{role}.py")
+        return candidates
+
+    @staticmethod
+    def _page_triplet_candidates_for_route(route_path: str) -> list[str]:
+        route = str(route_path or "").strip()
+        if not route.startswith("/"):
+            return []
+        segments = [segment for segment in route.strip("/").split("/") if segment]
+        if not segments:
+            return []
+        role = segments[0]
+        if role not in {"client", "specialist", "manager"}:
+            return []
+        page_segments = segments[1:]
+        if not page_segments:
+            base = f"miniapp/app/static/{role}"
+            return [f"{base}/index.html", f"{base}/styles.css", f"{base}/app.js"]
+        folder = "_".join(segment.replace("-", "_") for segment in page_segments)
+        base = f"miniapp/app/static/{role}/{folder}"
+        return [f"{base}/index.html", f"{base}/styles.css", f"{base}/app.js"]
 
     @staticmethod
     def _failure_signature(failure_class: str, root_cause_summary: str) -> str:
@@ -1329,7 +1527,8 @@ class FixOrchestrator:
             "keep the diff minimal, and aim for a green compile plus healthy preview runtime. "
             "Do not redesign the app. Fix the current root-cause cluster only. "
             "Preserve the existing backend architecture, routers, and static mounting unless the evidence explicitly implicates them. "
-            "Never replace a functioning FastAPI backend or route module with placeholder HTML handlers, stub pages, or a simplified demo app."
+            "Never replace a functioning FastAPI backend or route module with placeholder HTML handlers, stub pages, or a simplified demo app. "
+            "Do not rewrite generated tests to make the app pass; repair the application code and runtime contract instead."
         )
 
     @staticmethod
@@ -1349,6 +1548,9 @@ class FixOrchestrator:
                     "If fix_strategy is targeted_fix, keep the patch narrow and avoid touching unrelated architecture files.",
                     "If fix_strategy is feature_adjustment, keep the change local to the implicated feature surface and its immediate page/backend companions.",
                     "Respect the provided write scope unless a directly adjacent dependency is required.",
+                    "Do not modify miniapp/tests/* unless the failure packet explicitly shows the generated tests themselves are wrong; default to repairing app code instead of test code.",
+                    "Do not replace route modules with placeholder text/html responses to satisfy navigation tests; repair real route wiring and page surfaces.",
+                    "Keep miniapp/app/generated/route_manifest.json in its canonical object shape with per-role pages; do not rewrite it into an ad hoc list format.",
                     "The fix is considered successful only if the app compiles and the preview runtime becomes healthy.",
                     "Preserve existing endpoints, router wiring, and static file serving unless the evidence shows they are broken.",
                     "Do not replace main.py, route modules, or backend services with placeholder HTML stubs or hard-coded pages.",
@@ -1356,6 +1558,15 @@ class FixOrchestrator:
             },
             ensure_ascii=False,
         )
+
+    @staticmethod
+    def _allow_test_file_writes_for_failure(failure_class: str | None) -> bool:
+        lowered = str(failure_class or "").lower()
+        return lowered.startswith("tooling/") or lowered.startswith("test_harness/")
+
+    @classmethod
+    def _allow_test_file_writes(cls, fix_case: FixCase) -> bool:
+        return cls._allow_test_file_writes_for_failure(fix_case.failure_class)
 
     @staticmethod
     def _prompt_cache_key(fix_case: FixCase) -> str:
