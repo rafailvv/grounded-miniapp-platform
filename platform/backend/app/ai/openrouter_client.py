@@ -782,6 +782,17 @@ class OpenRouterClient:
                     return response.json()
             except Exception as exc:
                 last_error = exc
+                self._append_workspace_api_log(
+                    source="llm.error",
+                    message=f"OpenAI request failed for {endpoint}.",
+                    payload={
+                        "endpoint": endpoint,
+                        "model": model,
+                        "attempt": attempt + 1,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                )
                 if attempt == 2 or not self._is_retryable_request_error(exc):
                     raise
                 logger.warning("Retrying OpenAI request endpoint=%s model=%s after transient failure: %s", endpoint, model, exc)
@@ -984,6 +995,16 @@ class OpenRouterClient:
             return status_code == 429 or 500 <= status_code <= 504
 
         transient_markers = (
+            "connecterror",
+            "requesterror",
+            "name or service not known",
+            "nodename nor servname provided",
+            "temporary failure in name resolution",
+            "failed to resolve",
+            "dns",
+            "connection aborted",
+            "connection refused",
+            "connection error",
             "internal_server_error",
             "timed out",
             "timeout",

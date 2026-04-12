@@ -84,17 +84,15 @@ class CheckRunner:
             bool(filtered_issues)
             or bool(connectivity_issues)
             or static_result.status == "failed"
-            or python_tests_result.status == "failed"
-            or js_tests_result.status == "failed"
         )
         if should_skip_preview:
             preview_status = "skipped"
-            preview_details = "Preview smoke skipped because validator/build/app tests already failed."
+            preview_details = "Preview smoke skipped because validator or build checks already failed."
             preview_logs: list[str] = []
             connectivity_result = RunCheckResult(
                 name="preview_connectivity_smoke",
                 status="skipped",
-                details="Preview connectivity smoke skipped because validator/build/app tests already failed.",
+                details="Preview connectivity smoke skipped because validator or build checks already failed.",
                 command="preview route smoke (current session)",
                 logs=[],
             )

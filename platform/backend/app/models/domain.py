@@ -86,16 +86,18 @@ class JobEvent(StrictModel):
         "indexing_started",
         "retrieval_started",
         "retrieval_completed",
+        "building_scaffold",
+        "scaffold_ready",
         "spec_started",
         "spec_ready",
         "spec_blocked",
         "draft_prepared",
-        "role_contract_started",
-        "role_contract_ready",
-        "planning_started",
-        "planning_ready",
         "context_pack_started",
         "context_pack_ready",
+        "generating_code",
+        "running_checks",
+        "fixing_code",
+        "applying",
         "editing_started",
         "iteration_ready",
         "validation_failed",
@@ -113,6 +115,7 @@ class JobEvent(StrictModel):
         "patch_apply_completed",
         "frontend_build_started",
         "backend_compile_started",
+        "final_checks_started",
         "preview_validation_started",
         "failure_reanalyzed",
         "scope_expanded",
@@ -429,6 +432,37 @@ class FixCase(StrictModel):
     attempt_history: list[dict[str, Any]] = Field(default_factory=list)
     executed_checks: list[RunCheckResult] = Field(default_factory=list)
     memory_context: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class RepairPacket(StrictModel):
+    repair_packet_id: str = Field(default_factory=lambda: new_id("repair_packet"))
+    workspace_id: str
+    run_id: str
+    attempt: int
+    failure_class: str | None = None
+    failure_signature: str | None = None
+    root_cause_summary: str | None = None
+    exact_error_excerpt: str | None = None
+    context_mode: Literal["minimal", "expanded", "full_bundle"] = "minimal"
+    failing_checks: list[dict[str, Any]] = Field(default_factory=list)
+    failing_file_paths: list[str] = Field(default_factory=list)
+    deterministic_companions: list[str] = Field(default_factory=list)
+    expected_contract: dict[str, Any] = Field(default_factory=dict)
+    file_contexts: dict[str, str] = Field(default_factory=dict)
+    read_only_surfaces: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class FixAttemptOutcome(StrictModel):
+    outcome: Literal["patch_ready", "needs_more_context", "no_progress", "fatal_invalid_response"]
+    diagnosis: str | None = None
+    operations: list[DraftFileOperation] = Field(default_factory=list)
+    planned_targets: list[str] = Field(default_factory=list)
+    validation_error: str | None = None
+    expected_verification: str | None = None
+    rationale_by_file: dict[str, str] = Field(default_factory=dict)
+    raw_response: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
 
 

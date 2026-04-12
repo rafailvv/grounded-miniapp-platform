@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait
 from collections import Counter
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from datetime import datetime, timezone
 import json
 import logging
@@ -192,6 +192,59 @@ CANONICAL_ROLE_PAGES = (
     {"suffix": "workspace", "route_path": "/workspace", "file_name": "workspace.html", "page_kind": "workspace", "navigation_label": "Workspace"},
     {"suffix": "profile", "route_path": "/profile", "file_name": "profile.html", "page_kind": "profile", "navigation_label": "Profile"},
 )
+THIN_ROLE_PAGE_BLUEPRINTS = {
+    "client": (
+        {"route_path": "/", "page_kind": "landing", "navigation_label": "Home", "title": "Dashboard"},
+        {"route_path": "/create", "page_kind": "form", "navigation_label": "New Request", "title": "New Request"},
+        {"route_path": "/requests", "page_kind": "list", "navigation_label": "Requests", "title": "My Requests"},
+        {"route_path": "/requests/:requestId", "page_kind": "detail", "navigation_label": "Details", "title": "Request Details"},
+        {"route_path": "/profile", "page_kind": "profile", "navigation_label": "Profile", "title": "Profile"},
+    ),
+    "specialist": (
+        {"route_path": "/", "page_kind": "landing", "navigation_label": "Home", "title": "Dashboard"},
+        {"route_path": "/requests", "page_kind": "list", "navigation_label": "Assigned", "title": "Assigned Requests"},
+        {"route_path": "/requests/:requestId", "page_kind": "detail", "navigation_label": "Details", "title": "Request Details"},
+        {"route_path": "/profile", "page_kind": "profile", "navigation_label": "Profile", "title": "Profile"},
+    ),
+    "manager": (
+        {"route_path": "/", "page_kind": "landing", "navigation_label": "Home", "title": "Dashboard"},
+        {"route_path": "/requests", "page_kind": "list", "navigation_label": "Requests", "title": "All Requests"},
+        {"route_path": "/requests/:requestId", "page_kind": "detail", "navigation_label": "Details", "title": "Request Details"},
+        {"route_path": "/workload", "page_kind": "workspace", "navigation_label": "Workload", "title": "Team Workload"},
+        {"route_path": "/profile", "page_kind": "profile", "navigation_label": "Profile", "title": "Profile"},
+    ),
+}
+THIN_CORE_BACKEND_TARGETS = (
+    "miniapp/app/main.py",
+    "miniapp/app/db.py",
+    "miniapp/app/schemas.py",
+    "miniapp/app/routes/profiles.py",
+)
+THIN_OPTIONAL_ROUTE_TARGETS = {
+    "requests": "miniapp/app/routes/requests.py",
+    "comments": "miniapp/app/routes/comments.py",
+    "assignments": "miniapp/app/routes/assignments.py",
+    "users": "miniapp/app/routes/users.py",
+    "workload": "miniapp/app/routes/workload.py",
+    "time_slots": "miniapp/app/routes/time_slots.py",
+}
+CANONICAL_ENDPOINT_ALIASES = {
+    "submission": "requests",
+    "submissions": "requests",
+    "booking": "requests",
+    "bookings": "requests",
+    "appointment": "requests",
+    "appointments": "requests",
+    "task": "requests",
+    "tasks": "requests",
+    "assignee": "assignments",
+    "owners": "assignments",
+    "owner": "assignments",
+    "notes": "comments",
+    "note": "comments",
+    "specialist": "users",
+    "specialists": "users",
+}
 FORBIDDEN_ROUTE_MODULE_STEMS = {
     "auth",
     "auth_telegram",
@@ -390,7 +443,7 @@ class GenerationService:
                 ],
                 code="generation.llm_required",
                 event_type="job_failed",
-                failure_reason="Generation requires OpenAI because the workspace now uses an LLM-first page planning and code editing pipeline.",
+                failure_reason="Generation requires OpenAI because the workspace now uses the thin direct code generation loop.",
             )
 
         if resume_bundle is not None:
@@ -422,7 +475,7 @@ class GenerationService:
                 },
             )
             self._append_event(job, "draft_prepared", "Reused draft workspace from the saved planning checkpoint.")
-            self._append_event(job, "planning_ready", "Reused saved code plan.")
+            self._append_event(job, "scaffold_ready", "Reused saved deterministic scaffold.")
             return self._continue_generation_from_plan(
                 workspace=workspace,
                 workspace_id=workspace_id,
@@ -480,67 +533,73 @@ class GenerationService:
             "Creative direction selected for this run.",
             creative_direction,
         )
-        self._append_event(job, "spec_started", "Building grounded specification.")
-        stopped = self._stop_if_requested(job, workspace_id, should_stop)
-        if stopped is not None:
-            return stopped
 
-        spec_result = self._resolve_grounded_spec(
+        return self._generate_with_thin_loop(
+            workspace=workspace,
+            workspace_id=workspace_id,
+            job=job,
+            request=request,
+            draft_run_id=draft_run_id,
+            effective_prompt=effective_prompt,
+            target_platform=target_platform,
+            preview_profile=preview_profile,
+            generation_mode=generation_mode,
+            role_scope=role_scope,
+            doc_refs=doc_refs,
+            retrieval_ms=retrieval_ms,
+            started_at=started_at,
+            creative_direction=creative_direction,
+            should_stop=should_stop,
+            prompt_turn_id=chat_turn.turn_id,
+        )
+
+    def _generate_with_thin_loop(
+        self,
+        *,
+        workspace: WorkspaceRecord,
+        workspace_id: str,
+        job: JobRecord,
+        request: GenerateRequest,
+        draft_run_id: str,
+        effective_prompt: str,
+        target_platform: TargetPlatform,
+        preview_profile: PreviewProfile,
+        generation_mode: GenerationMode,
+        role_scope: list[str],
+        doc_refs: list[Any],
+        retrieval_ms: int,
+        started_at: float,
+        creative_direction: dict[str, Any],
+        should_stop: Callable[[], bool] | None,
+        prompt_turn_id: str,
+    ) -> JobRecord:
+        self._append_event(job, "building_scaffold", "Compiling deterministic app scaffold.")
+        self._append_trace(
+            workspace_id,
+            "thin_loop_started",
+            "Thin direct generation loop selected as the default path.",
+            {"role_scope": role_scope, "generation_mode": generation_mode.value},
+        )
+        grounded_spec = self._build_grounded_spec(
             workspace_id=workspace_id,
             prompt=effective_prompt,
             target_platform=target_platform,
             preview_profile=preview_profile,
             doc_refs=doc_refs,
             template_revision_id=workspace.current_revision_id or "template-unknown",
-            prompt_turn_id=chat_turn.turn_id,
+            prompt_turn_id=prompt_turn_id,
             generation_mode=generation_mode,
-            creative_direction=creative_direction,
         )
-        if "error" in spec_result:
-            self._append_trace(
-                workspace_id,
-                "spec_failed",
-                "GroundedSpec generation failed.",
-                {"error": spec_result["error"]},
-            )
-            return self._block_with_messages(
-                job,
-                [spec_result["error"]],
-                code="generation.spec.llm_failure",
-                event_type="spec_blocked",
-                failure_reason=spec_result["error"],
-            )
-        grounded_spec: GroundedSpecModel = spec_result["spec"]
-        grounded_spec = self._stabilize_grounded_spec(grounded_spec)
-        if spec_result.get("warning"):
-            self._append_trace(
-                workspace_id,
-                str(spec_result.get("warning_stage") or "spec_recovery_used"),
-                str(spec_result.get("warning_title") or "GroundedSpec used a recovery path before validation."),
-                {"warning": spec_result["warning"], "warning_kind": spec_result.get("warning_kind")},
-            )
-        if spec_result.get("model"):
-            job.llm_model = str(spec_result["model"])
         self._append_trace(
             workspace_id,
-            "spec_built",
-            "GroundedSpec created.",
-            {
-                "product_goal": grounded_spec.product_goal,
-                "actors": len(grounded_spec.actors),
-                "flows": len(grounded_spec.user_flows),
-                "api_requirements": len(grounded_spec.api_requirements),
-                "model": spec_result.get("model"),
-            },
+            "thin_spec_compiler",
+            "Thin loop used deterministic grounded spec compilation.",
+            {"llm_spec_stage_removed": True},
         )
-
-        spec_validation = self.validation_suite.validate_grounded_spec(grounded_spec)
+        grounded_spec = self._stabilize_grounded_spec(grounded_spec)
         self._store_report(f"spec:{workspace_id}", grounded_spec.model_dump(mode="json"))
-        self._store_report(
-            f"assumptions:{workspace_id}",
-            {"workspace_id": workspace_id, "assumptions": [item.model_dump(mode="json") for item in grounded_spec.assumptions]},
-        )
-        self._append_event(job, "spec_ready", "GroundedSpec created.")
+        self._append_event(job, "spec_ready", "Grounded specification compiled for thin generation.")
+
         execution_class = self._classify_execution_class(
             prompt=effective_prompt,
             grounded_spec=grounded_spec,
@@ -548,190 +607,34 @@ class GenerationService:
             intent=request.intent,
         )
         job.execution_class = execution_class  # type: ignore[assignment]
-        self._store_report(
-            f"execution_class:{workspace_id}",
-            {
-                "workspace_id": workspace_id,
-                "run_id": draft_run_id,
-                "execution_class": execution_class,
-                "role_scope": role_scope,
-                "entity_count": len(grounded_spec.domain_entities),
-                "flow_count": len(grounded_spec.user_flows),
-                "api_count": len(grounded_spec.api_requirements),
-                "persistence_count": len(grounded_spec.persistence_requirements),
-            },
-        )
-        stopped = self._stop_if_requested(job, workspace_id, should_stop)
-        if stopped is not None:
-            return stopped
-        if spec_validation.blocking:
-            self._block_job(job, spec_validation, grounded_spec.assumptions, failure_reason="GroundedSpec validation blocked generation.")
-            self._append_trace(
-                workspace_id,
-                "spec_validation_failed",
-                "GroundedSpec validation blocked generation.",
-                {"issues": [issue.model_dump(mode="json") for issue in spec_validation.issues]},
-            )
-            self._append_event(job, "spec_blocked", "GroundedSpec validation blocked generation.")
-            return job
-
         draft_source = self.workspace_service.prepare_draft(workspace_id, draft_run_id)
         self._append_event(job, "draft_prepared", "Prepared draft workspace from the current revision.")
-        self._append_trace(
-            workspace_id,
-            "draft_prepared",
-            "Draft workspace prepared from the current revision.",
-            {
-                "draft_run_id": draft_run_id,
-                "role_scope": role_scope,
-            },
-        )
-        self._append_event(job, "role_contract_started", "Analyzing role responsibilities before planning.")
-        role_contract_result = self._resolve_role_contract(
+
+        workspace_tree = self.workspace_service.file_tree(workspace_id, run_id=draft_run_id)
+        role_contract, plan_result = self._compile_prompt_to_scaffold(
             prompt=effective_prompt,
             grounded_spec=grounded_spec,
-            doc_refs=doc_refs,
             role_scope=role_scope,
-            intent=request.intent,
-            generation_mode=generation_mode,
-            creative_direction=creative_direction,
+            workspace_tree=workspace_tree,
         )
-        if "error" in role_contract_result:
-            self._append_trace(
-                workspace_id,
-                "role_contract_failed",
-                "Role architecture analysis failed.",
-                {"error": role_contract_result["error"]},
-            )
-            return self._block_with_messages(
-                job,
-                [role_contract_result["error"]],
-                code="generation.role_contract.llm_failure",
-                event_type="validation_failed",
-                failure_reason=role_contract_result["error"],
-            )
-        role_contract = role_contract_result["role_contract"]
-        role_contract_issues = self._role_contract_gate_issues(role_contract, role_scope, scope_mode=self._scope_mode(request.intent, effective_prompt, role_scope))
-        if role_contract_issues:
-            self._append_trace(
-                workspace_id,
-                "role_contract_blocked",
-                "Role architecture analysis did not separate the selected roles clearly enough.",
-                {"issues": role_contract_issues},
-            )
-            return self._block_with_messages(
-                job,
-                role_contract_issues,
-                code="generation.role_contract.invalid",
-                event_type="validation_failed",
-                failure_reason="Role architecture analysis did not produce sufficiently distinct responsibilities.",
-            )
+        self._append_event(job, "scaffold_ready", "Deterministic scaffold and target bundles are ready.")
         self._append_trace(
             workspace_id,
-            "role_contract_ready",
-            "Role responsibilities and boundaries were analyzed before page planning.",
+            "thin_scaffold_ready",
+            "Deterministic scaffold compiled without planner-owned manifests.",
             {
-                "model": role_contract_result.get("model"),
-                "roles": {
-                    role: role_contract["roles"][role]["responsibility"]
-                    for role in role_scope
-                    if role in role_contract["roles"]
-                },
-            },
-        )
-        self._append_event(job, "role_contract_ready", "Role boundaries prepared for page planning.")
-        stopped = self._stop_if_requested(job, workspace_id, should_stop)
-        if stopped is not None:
-            return stopped
-        self._append_event(job, "planning_started", "Planning route graph and target files.")
-        plan_result = self._resolve_code_plan(
-            workspace_id=workspace_id,
-            prompt=effective_prompt,
-            grounded_spec=grounded_spec,
-            doc_refs=doc_refs,
-            role_scope=role_scope,
-            role_contract=role_contract,
-            intent=request.intent,
-            generation_mode=generation_mode,
-            creative_direction=creative_direction,
-        )
-        if "error" in plan_result:
-            self._append_trace(
-                workspace_id,
-                "planning_failed",
-                "Code planning failed.",
-                {"error": plan_result["error"]},
-            )
-            return self._block_with_messages(
-                job,
-                [plan_result["error"]],
-                code="generation.plan.llm_failure",
-                event_type="validation_failed",
-                failure_reason=plan_result["error"],
-            )
-        if plan_result.get("model"):
-            job.llm_model = str(plan_result["model"])
-        self._append_trace(
-            workspace_id,
-            "planning_ready",
-            "Code plan was built from grounded spec and workspace context.",
-            {
-                "files_to_read": len(plan_result["files_to_read"]),
                 "target_files": len(plan_result["target_files"]),
-                "model": plan_result.get("model"),
-                "role_scope": role_scope,
-                "active_role_scope": plan_result.get("active_role_scope"),
-                "flow_mode": plan_result.get("flow_mode"),
-                "scope_mode": plan_result.get("scope_mode"),
-                "planner_contract_enrichment": plan_result.get("planner_contract_enrichment"),
-                "execution_plan": plan_result.get("execution_plan"),
+                "backend_targets": len(plan_result["backend_targets"]),
+                "generation_clusters": plan_result["generation_clusters"],
             },
         )
-        self._append_event(job, "planning_ready", "Code plan created.")
-        self._store_report(
-            f"role_contract:{workspace_id}",
-            {"run_id": draft_run_id, "role_contract": role_contract},
-        )
-        self._store_report(
-            f"page_graph:{workspace_id}",
-            {"run_id": draft_run_id, "page_graph": plan_result["page_graph"]},
-        )
-        self._store_report(
-            f"execution_plan:{workspace_id}",
-            {"run_id": draft_run_id, "execution_plan": plan_result.get("execution_plan", {})},
-        )
-        self._store_resume_checkpoint(
-            workspace_id=workspace_id,
-            draft_run_id=draft_run_id,
-            request=request,
-            role_scope=role_scope,
-            role_contract=role_contract,
-            plan_result=plan_result,
-        )
+        self._store_report(f"role_contract:{workspace_id}", {"run_id": draft_run_id, "role_contract": role_contract})
+        self._store_report(f"page_graph:{workspace_id}", {"run_id": draft_run_id, "page_graph": plan_result["page_graph"]})
+        self._store_report(f"execution_plan:{workspace_id}", {"run_id": draft_run_id, "execution_plan": plan_result.get("execution_plan", {})})
+
         stopped = self._stop_if_requested(job, workspace_id, should_stop)
         if stopped is not None:
             return stopped
-        plan_gate_issues = self._page_graph_gate_issues(
-            plan_result["page_graph"],
-            role_scope,
-            scope_mode=plan_result["scope_mode"],
-            require_multi_page=bool(plan_result["require_multi_page"]),
-            require_business_pages=bool(plan_result.get("require_business_pages")),
-        )
-        if plan_gate_issues:
-            self._append_trace(
-                workspace_id,
-                "planning_blocked",
-                "Code planning was blocked because it did not produce a real page-based app structure.",
-                {"issues": plan_gate_issues},
-            )
-            return self._block_with_messages(
-                job,
-                plan_gate_issues,
-                code="generation.plan.placeholder_output",
-                event_type="validation_failed",
-                failure_reason="Code planning did not produce a valid multi-page app structure.",
-            )
 
         return self._continue_generation_from_plan(
             workspace=workspace,
@@ -752,6 +655,173 @@ class GenerationService:
             started_at=started_at,
             should_stop=should_stop,
         )
+
+    def _compile_prompt_to_scaffold(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        workspace_tree: list[dict[str, str]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        page_graph_roles: dict[str, dict[str, Any]] = {}
+        role_contract_roles: dict[str, dict[str, Any]] = {}
+        target_files: list[str] = []
+        backend_targets = list(THIN_CORE_BACKEND_TARGETS)
+        inferred_route_targets = self._thin_backend_targets_from_spec(prompt=prompt, grounded_spec=grounded_spec, role_scope=role_scope)
+        backend_targets.extend(inferred_route_targets)
+        for role in role_scope:
+            pages = self._thin_role_pages_for_role(role=role, prompt=prompt, grounded_spec=grounded_spec)
+            role_routes_file = f"miniapp/app/routes/{role}.py"
+            page_graph_roles[role] = {
+                "entry_path": f"/{role}",
+                "routes_file": role_routes_file,
+                "pages": pages,
+            }
+            role_contract_roles[role] = {
+                "responsibility": self._thin_role_responsibility(role, grounded_spec),
+                "pages": [str(page["page_id"]) for page in pages],
+            }
+            backend_targets.append(role_routes_file)
+            for page in pages:
+                target_files.extend([page["file_path"], page["style_path"], page["script_path"]])
+        target_files.extend(backend_targets)
+        target_files = self._sanitize_planner_target_files(
+            target_files=self._canonicalize_target_files(target_files, scope_mode="whole_file_build"),
+            backend_targets=backend_targets,
+            page_graph={"roles": page_graph_roles},
+        )
+        backend_targets = self._sanitize_backend_targets(backend_targets)
+        shared_files = [path for path in DESIGN_REFERENCE_FILES if path.startswith("miniapp/app/static/shared/")]
+        files_to_read = self._collect_files_to_read(list(DESIGN_REFERENCE_FILES), target_files, workspace_tree)
+        generation_clusters = self._build_generation_clusters(target_files)
+        execution_plan = self._build_execution_plan(
+            role_scope=role_scope,
+            roles=page_graph_roles,
+            shared_files=shared_files,
+            backend_targets=backend_targets,
+            target_files=target_files,
+            generation_clusters=generation_clusters,
+        )
+        return (
+            {"roles": role_contract_roles, "source": "thin_loop"},
+            {
+                "page_graph": {"roles": page_graph_roles, "backend_targets": backend_targets, "flow_mode": "multi_page"},
+                "scope_mode": "whole_file_build",
+                "write_strategy": "whole_file_build",
+                "strategy_reason": "Thin scaffold-driven generation pipeline.",
+                "flow_mode": "multi_page",
+                "files_to_read": files_to_read,
+                "target_files": target_files,
+                "shared_files": shared_files,
+                "backend_targets": backend_targets,
+                "execution_plan": execution_plan,
+                "generation_clusters": generation_clusters,
+                "require_multi_page": True,
+                "require_business_pages": True,
+            },
+        )
+
+    def _thin_role_pages_for_role(
+        self,
+        *,
+        role: str,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+    ) -> list[dict[str, Any]]:
+        pages: list[dict[str, Any]] = []
+        include_create = role == "client"
+        include_workload = role == "manager"
+        include_requests = True
+        include_detail = True
+        if self._mentions_schedule_or_time(prompt, grounded_spec):
+            include_create = True
+        for blueprint in THIN_ROLE_PAGE_BLUEPRINTS.get(role, ()):
+            route_path = str(blueprint["route_path"])
+            if route_path == "/create" and not include_create:
+                continue
+            if route_path == "/workload" and not include_workload:
+                continue
+            if route_path == "/requests" and not include_requests:
+                continue
+            if route_path == "/requests/:requestId" and not include_detail:
+                continue
+            file_path = self._default_page_file(role, f"{role}_{blueprint['title']}", route_path=route_path)
+            pages.append(
+                {
+                    "page_id": f"{role}_{self._thin_page_slug_for_route(route_path)}",
+                    "route_path": route_path,
+                    "file_path": file_path,
+                    "style_path": self._default_page_asset_path(file_path, asset_kind="css"),
+                    "script_path": self._default_page_asset_path(file_path, asset_kind="js"),
+                    "page_kind": blueprint["page_kind"],
+                    "navigation_label": blueprint["navigation_label"],
+                    "title": blueprint["title"],
+                    "is_entry": route_path == "/",
+                    "handoff_paths": self._default_handoff_paths_for_page_kind(
+                        str(blueprint["page_kind"]),
+                        route_path=route_path,
+                    ),
+                }
+            )
+        return pages
+
+    @staticmethod
+    def _thin_page_slug_for_route(route_path: str) -> str:
+        normalized = route_path.strip() or "/"
+        if normalized == "/":
+            return "index"
+        slug = re.sub(r":[^/]+", "detail", normalized.strip("/"))
+        slug = slug.replace("/", "_").replace("-", "_")
+        slug = re.sub(r"[^a-z0-9_]+", "_", slug.lower()).strip("_")
+        return re.sub(r"_+", "_", slug) or "page"
+
+    def _thin_backend_targets_from_spec(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+    ) -> list[str]:
+        targets = [THIN_OPTIONAL_ROUTE_TARGETS["requests"]]
+        evidence = " ".join(
+            [
+                prompt.lower(),
+                " ".join(item.path.lower() for item in grounded_spec.api_requirements),
+                " ".join(item.name.lower() for item in grounded_spec.api_requirements),
+                " ".join(item.name.lower() for item in grounded_spec.domain_entities),
+                " ".join(item.goal.lower() for item in grounded_spec.user_flows),
+            ]
+        )
+        if any(token in evidence for token in ("comment", "progress", "note", "completion")):
+            targets.append(THIN_OPTIONAL_ROUTE_TARGETS["comments"])
+        if any(role in role_scope for role in ("specialist", "manager")):
+            targets.append(THIN_OPTIONAL_ROUTE_TARGETS["assignments"])
+        if "manager" in role_scope:
+            targets.extend([THIN_OPTIONAL_ROUTE_TARGETS["users"], THIN_OPTIONAL_ROUTE_TARGETS["workload"]])
+        if self._mentions_schedule_or_time(prompt, grounded_spec):
+            targets.append(THIN_OPTIONAL_ROUTE_TARGETS["time_slots"])
+        return list(dict.fromkeys(targets))
+
+    @staticmethod
+    def _mentions_schedule_or_time(prompt: str, grounded_spec: GroundedSpecModel) -> bool:
+        haystack = " ".join(
+            [
+                prompt.lower(),
+                " ".join(flow.goal.lower() for flow in grounded_spec.user_flows),
+                " ".join(req.description.lower() for req in grounded_spec.ui_requirements),
+            ]
+        )
+        return any(token in haystack for token in ("time", "slot", "schedule", "calendar", "booking"))
+
+    @staticmethod
+    def _thin_role_responsibility(role: str, grounded_spec: GroundedSpecModel) -> str:
+        role_map = {
+            "client": "Create requests, provide details, choose timing, and track status.",
+            "specialist": "Work assigned requests, update status, and leave progress comments.",
+            "manager": "Review requests, assign specialists, and monitor workload.",
+        }
+        return role_map.get(role, grounded_spec.product_goal)
 
     def _store_resume_checkpoint(
         self,
@@ -947,8 +1017,12 @@ class GenerationService:
         plan_result["files_to_read"] = list(
             dict.fromkeys(
                 [
-                    *[path for path in plan_result["files_to_read"] if path in target_set],
-                    *[path for path in DESIGN_REFERENCE_FILES if path in target_set],
+                    *[
+                        path
+                        for path in plan_result["files_to_read"]
+                        if path in target_set or path in DESIGN_REFERENCE_FILES
+                    ],
+                    *[path for path in DESIGN_REFERENCE_FILES if (draft_source / path).exists()],
                 ]
             )
         )
@@ -1010,6 +1084,7 @@ class GenerationService:
             f"Context pack ready with {len(context_pack.code_chunks)} code chunks, {len(context_pack.doc_chunks)} doc chunks, and {len(context_pack.targeted_files)} file bodies.",
         )
 
+        self._append_event(job, "generating_code", "Generating backend and page bundles.")
         self._append_event(job, "editing_started", "Generating draft file edits.")
         edit_result = self._resolve_code_edits(
             workspace_id=workspace_id,
@@ -1207,6 +1282,7 @@ class GenerationService:
                 self._append_event(job, "iteration_ready", f"Prepared {len(latest_operations)} draft file operations.")
             else:
                 self._append_event(job, "repair_iteration", f"Applied repair iteration {attempt}.")
+            self._append_event(job, "running_checks", "Running validation and generated app checks.")
             self._append_event(job, "build_started", "Build validation started.")
             preflight_issues = self._preflight_generation_issues(
                 workspace_id=workspace_id,
@@ -1411,6 +1487,7 @@ class GenerationService:
                 job.repair_iterations = [item.model_dump(mode="json") for item in repair_iterations]
                 return job
             failure_signature_history.append(failure_signature)
+            self._append_event(job, "fixing_code", "Applying exact repair loop to the failing bundle.")
             self._append_event(job, "repair_started", "Build or compile checks failed. Preparing the next repair attempt.")
             repair_target_files = self._repair_targets_for_attempt(
                 active_targets=active_repair_targets,
@@ -1792,7 +1869,7 @@ class GenerationService:
         **kwargs: Any,
     ) -> dict[str, Any]:
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="code-plan-total")
-        future = executor.submit(self._generate_code_plan_sections, **kwargs)
+        future = self._submit_with_context(executor, self._generate_code_plan_sections, **kwargs)
         try:
             return future.result(timeout=timeout_seconds)
         except FuturesTimeoutError as exc:
@@ -1834,7 +1911,7 @@ class GenerationService:
             "miniapp/app/routes/assignments.py",
             "miniapp/app/routes/comments.py",
             "miniapp/app/routes/status.py",
-            "miniapp/app/routes/specialists.py",
+            "miniapp/app/routes/users.py",
             "miniapp/app/routes/workload.py",
             "miniapp/app/routes/time_slots.py",
         ]
@@ -2108,7 +2185,8 @@ class GenerationService:
         sections_started = time.perf_counter()
         executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="code-plan")
         futures = {
-            "graph": executor.submit(
+            "graph": self._submit_with_context(
+                executor,
                 self._generate_structured_with_retry,
                 role="code_plan",
                 schema_name="page_graph_structure_v1",
@@ -2134,7 +2212,8 @@ class GenerationService:
                     creative_direction=creative_direction,
                 ),
             ),
-            "targeting": executor.submit(
+            "targeting": self._submit_with_context(
+                executor,
                 self._generate_structured_with_retry,
                 role="code_plan",
                 schema_name="page_graph_targeting_v1",
@@ -2512,53 +2591,103 @@ class GenerationService:
         if not clusters:
             return {"error": "Whole-file generation requires at least one canonical target file."}
 
+        total_target_files = max(1, sum(len(list(cluster["target_files"])) for cluster in clusters))
+        completed_target_files = 0
         results: list[dict[str, Any]] = []
-        for cluster in clusters:
-            cluster_name = str(cluster["cluster_name"])
-            logger.info(
-                "whole_file_cluster_started workspace_id=%s draft_run_id=%s cluster=%s targets=%s",
-                workspace_id,
-                draft_run_id,
-                cluster_name,
-                len(list(cluster["target_files"])),
+        for batch in self._group_generation_clusters_for_execution(clusters):
+            self._sync_generation_batch_started(
+                linked_run_id=draft_run_id,
+                completed_target_files=completed_target_files,
+                total_target_files=total_target_files,
+                batch=batch,
             )
-            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"whole-file-{cluster_name}")
-            future = executor.submit(
-                self._timed_whole_file_cluster,
-                cluster_name=cluster_name,
-                cluster_targets=list(cluster["target_files"]),
-                prompt=prompt,
-                grounded_spec=grounded_spec,
-                role_scope=role_scope,
-                role_contract=role_contract,
-                page_graph=page_graph,
-                scope_mode=scope_mode,
-                intent=intent,
-                file_contexts=file_contexts,
-                generation_mode=generation_mode,
-                creative_direction=creative_direction,
+            executor = ThreadPoolExecutor(
+                max_workers=len(batch),
+                thread_name_prefix=f"whole-file-batch-{self._whole_file_parallel_group(str(batch[0]['cluster_name']))}",
             )
-            try:
-                cluster_result = future.result(timeout=self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS)
+            future_map: dict[Any, tuple[str, int]] = {}
+            for cluster in batch:
+                cluster_name = str(cluster["cluster_name"])
+                cluster_targets = list(cluster["target_files"])
+                cluster_target_count = len(cluster_targets)
                 logger.info(
-                    "whole_file_cluster_completed workspace_id=%s draft_run_id=%s cluster=%s duration_ms=%s",
+                    "whole_file_cluster_started workspace_id=%s draft_run_id=%s cluster=%s targets=%s",
                     workspace_id,
                     draft_run_id,
                     cluster_name,
-                    cluster_result.get("duration_ms"),
+                    cluster_target_count,
                 )
-                results.append(cluster_result)
-            except FuturesTimeoutError:
+                future = self._submit_with_context(
+                    executor,
+                    self._timed_whole_file_cluster,
+                    cluster_name=cluster_name,
+                    cluster_targets=cluster_targets,
+                    prompt=prompt,
+                    grounded_spec=grounded_spec,
+                    role_scope=role_scope,
+                    role_contract=role_contract,
+                    page_graph=page_graph,
+                    scope_mode=scope_mode,
+                    intent=intent,
+                    file_contexts=file_contexts,
+                    generation_mode=generation_mode,
+                    creative_direction=creative_direction,
+                )
+                future_map[future] = (cluster_name, cluster_target_count)
+            done, not_done = wait(future_map.keys(), timeout=self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS, return_when=ALL_COMPLETED)
+            if not_done:
                 executor.shutdown(wait=False, cancel_futures=True)
+                pending_names = ", ".join(future_map[future][0] for future in not_done)
                 return {
                     "error": (
                         "Whole-file generation timed out while waiting for cluster result: "
-                        f"{cluster_name}"
+                        f"{pending_names}"
                     )
                 }
+            try:
+                for future in done:
+                    cluster_name, cluster_target_count = future_map[future]
+                    cluster_result = future.result()
+                    if "error" in cluster_result:
+                        return {"error": str(cluster_result["error"])}
+                    cluster_operations = [
+                        DraftFileOperation.model_validate(item)
+                        for item in cluster_result.get("operations", [])
+                    ]
+                    if cluster_operations:
+                        self.workspace_service.apply_draft_operations(
+                            workspace_id,
+                            draft_run_id,
+                            self._dedupe_operations(cluster_operations),
+                        )
+                        self.workspace_log_service.append(
+                            workspace_id,
+                            source="generation.cluster_persisted",
+                            message="Persisted completed code cluster into the draft workspace.",
+                            payload={
+                                "draft_run_id": draft_run_id,
+                                "cluster_name": cluster_name,
+                                "file_paths": [operation.file_path for operation in cluster_operations],
+                            },
+                        )
+                    logger.info(
+                        "whole_file_cluster_completed workspace_id=%s draft_run_id=%s cluster=%s duration_ms=%s",
+                        workspace_id,
+                        draft_run_id,
+                        cluster_name,
+                        cluster_result.get("duration_ms"),
+                    )
+                    results.append(cluster_result)
+                    completed_target_files += cluster_target_count
+                    self._sync_generation_cluster_progress(
+                        linked_run_id=draft_run_id,
+                        completed_target_files=completed_target_files,
+                        total_target_files=total_target_files,
+                        cluster_name=cluster_name,
+                    )
             except Exception as exc:
                 executor.shutdown(wait=False, cancel_futures=True)
-                return {"error": f"Whole-file cluster failed for {cluster_name}: {exc}"}
+                return {"error": f"Whole-file cluster failed: {exc}"}
             else:
                 executor.shutdown(wait=False, cancel_futures=False)
         operations: list[DraftFileOperation] = [
@@ -5331,13 +5460,18 @@ class GenerationService:
 
     @classmethod
     def _route_module_path_for_endpoint_name(cls, endpoint_name: str) -> str:
-        filename = cls._snake_case_filename((endpoint_name or "").strip())
+        filename = cls._canonical_endpoint_name(endpoint_name)
         return cls._normalize_runtime_python_path(f"miniapp/app/routes/{filename}.py")
 
     @classmethod
     def _is_forbidden_endpoint_name(cls, endpoint_name: str) -> bool:
-        normalized = cls._snake_case_filename((endpoint_name or "").strip()).lower()
+        normalized = cls._canonical_endpoint_name(endpoint_name)
         return normalized in FORBIDDEN_ROUTE_MODULE_STEMS or normalized in {"health", "profiles", "auth", "login", "me"}
+
+    @classmethod
+    def _canonical_endpoint_name(cls, endpoint_name: str) -> str:
+        normalized = cls._snake_case_filename((endpoint_name or "").strip()).lower()
+        return CANONICAL_ENDPOINT_ALIASES.get(normalized, normalized)
 
     @staticmethod
     def _role_contract_gate_issues(role_contract: dict[str, Any], role_scope: list[str], *, scope_mode: str) -> list[str]:
@@ -5734,7 +5868,11 @@ class GenerationService:
         operations: list[DraftFileOperation],
     ) -> list[DraftFileOperation]:
         ensured = self._ensure_runtime_artifact_operations(
-            grounded_spec=self._grounded_spec_from_operations(operations),
+            grounded_spec=self._resolve_grounded_spec_for_contract_pass(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                operations=operations,
+            ),
             page_graph=page_graph,
             role_scope=role_scope,
             generation_mode=generation_mode,
@@ -5742,7 +5880,11 @@ class GenerationService:
         )
         ensured = self._synchronize_profile_schema_contract(workspace_id, draft_run_id, ensured)
         ensured = self._synchronize_route_schema_contract(workspace_id, draft_run_id, ensured)
+        ensured = self._synchronize_db_session_contract(workspace_id, draft_run_id, ensured)
+        ensured = self._synchronize_main_runtime_contract(workspace_id, draft_run_id, ensured)
+        ensured = self._synchronize_minimal_workflow_route_contracts(workspace_id, draft_run_id, ensured)
         ensured = self._synchronize_backend_dependency_contract(workspace_id, draft_run_id, ensured)
+        ensured = self._synchronize_frontend_navigation_contract(workspace_id, draft_run_id, ensured)
         ensured = self._synchronize_frontend_api_contract(workspace_id, draft_run_id, ensured)
         return self._synchronize_basic_page_state_contract(
             workspace_id,
@@ -5760,6 +5902,101 @@ class GenerationService:
                 except Exception:
                     break
         raise ValueError("grounded_spec.json operation must exist before runtime artifact synthesis.")
+
+    def _resolve_grounded_spec_for_contract_pass(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        operations: list[DraftFileOperation],
+    ) -> GroundedSpecModel:
+        try:
+            return self._grounded_spec_from_operations(operations)
+        except ValueError:
+            content = self.workspace_service.try_read_text_file(
+                workspace_id,
+                "artifacts/grounded_spec.json",
+                run_id=draft_run_id,
+            )
+            if content:
+                try:
+                    return GroundedSpecModel.model_validate(json.loads(content))
+                except Exception:
+                    pass
+            spec_payload = self.current_report(workspace_id, "spec")
+            if spec_payload:
+                try:
+                    return GroundedSpecModel.model_validate(spec_payload)
+                except Exception:
+                    pass
+            return self._fallback_grounded_spec_for_contract_pass(workspace_id=workspace_id)
+
+    def _fallback_grounded_spec_for_contract_pass(self, *, workspace_id: str) -> GroundedSpecModel:
+        workspace_payload = self.store.get("workspaces", workspace_id) or {}
+        target_platform_raw = str(workspace_payload.get("target_platform") or TargetPlatform.TELEGRAM.value)
+        preview_profile_raw = str(workspace_payload.get("preview_profile") or PreviewProfile.TELEGRAM_MOCK.value)
+        try:
+            target_platform = TargetPlatform(target_platform_raw)
+        except Exception:
+            target_platform = TargetPlatform.TELEGRAM
+        try:
+            preview_profile = PreviewProfile(preview_profile_raw)
+        except Exception:
+            preview_profile = PreviewProfile.TELEGRAM_MOCK
+        product_goal = "Generated role-aware business mini app."
+        evidence = [EvidenceLink(doc_ref_id="contract-pass-fallback", evidence_type="derived")]
+        return GroundedSpecModel(
+            metadata=Metadata(
+                workspace_id=workspace_id,
+                conversation_id=f"conv_{workspace_id}",
+                prompt_turn_id="contract-pass-fallback",
+                template_revision_id="contract-pass-fallback",
+                language="en",
+                created_at=utc_now(),
+            ),
+            target_platform=target_platform,
+            preview_profile=preview_profile,
+            product_goal=product_goal,
+            actors=[
+                Actor(
+                    actor_id="actor_client",
+                    name="Client",
+                    role="client",
+                    description="Submits requests and tracks progress.",
+                    permissions_hint=["create_request", "view_own_requests"],
+                    evidence=evidence,
+                ),
+                Actor(
+                    actor_id="actor_specialist",
+                    name="Specialist",
+                    role="specialist",
+                    description="Processes assigned work and updates status.",
+                    permissions_hint=["claim_request", "change_status", "respond"],
+                    evidence=evidence,
+                ),
+                Actor(
+                    actor_id="actor_manager",
+                    name="Manager",
+                    role="manager",
+                    description="Coordinates requests and manages workload.",
+                    permissions_hint=["assign_specialist", "monitor_workload", "review_requests"],
+                    evidence=evidence,
+                ),
+            ],
+            domain_entities=[],
+            user_flows=[],
+            ui_requirements=[],
+            api_requirements=[],
+            persistence_requirements=[],
+            integration_requirements=[],
+            security_requirements=[],
+            platform_constraints=[],
+            non_functional_requirements=[],
+            assumptions=[],
+            unknowns=[],
+            contradictions=[],
+            doc_refs=[],
+        )
 
     def _synchronize_profile_schema_contract(
         self,
@@ -5809,6 +6046,44 @@ class GenerationService:
         )
         return list(operation_map.values())
 
+    def _synchronize_db_session_contract(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        db_path = "miniapp/app/db.py"
+        db_content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, db_path)
+        if not db_content:
+            return operations
+        if "def get_db(" in db_content:
+            return operations
+        for file_path in list(operation_map):
+            if not (file_path.startswith("miniapp/app/routes/") and file_path.endswith(".py")):
+                continue
+            content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
+            if not content:
+                continue
+            if "get_db" not in content:
+                continue
+            if "from app.db import" not in content and "Depends(get_db)" not in content:
+                continue
+            operation_map[db_path] = DraftFileOperation(
+                file_path=db_path,
+                operation="replace",
+                content=db_content.rstrip()
+                + "\n\n\ndef get_db():\n"
+                + "    session = SessionLocal()\n"
+                + "    try:\n"
+                + "        yield session\n"
+                + "    finally:\n"
+                + "        session.close()\n",
+                reason="Pre-apply contract sync: ensure db.py exports get_db when routes depend on it.",
+            )
+            return list(operation_map.values())
+        return operations
+
     def _synchronize_backend_dependency_contract(
         self,
         workspace_id: str,
@@ -5836,6 +6111,70 @@ class GenerationService:
                 operation="replace",
                 content=updated,
                 reason="Pre-apply contract sync: use FastAPI dependency injection directly for get_actor_context.",
+        )
+        return list(operation_map.values())
+
+    def _synchronize_main_runtime_contract(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        main_path = "miniapp/app/main.py"
+        current_main = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, main_path)
+        if current_main is None:
+            return operations
+        route_root = self.workspace_service.draft_source_dir(workspace_id, draft_run_id) / "miniapp/app/routes"
+        route_modules: set[str] = set()
+        if route_root.exists():
+            for file_path in route_root.glob("*.py"):
+                stem = file_path.stem
+                if stem not in {"__init__", "health", "profiles"}:
+                    route_modules.add(stem)
+        for file_path in operation_map:
+            if not file_path.startswith("miniapp/app/routes/") or not file_path.endswith(".py"):
+                continue
+            stem = Path(file_path).stem
+            if stem not in {"__init__", "health", "profiles"}:
+                route_modules.add(stem)
+        desired = self._deterministic_main_runtime_source(sorted(route_modules))
+        if desired == current_main:
+            return operations
+        operation_map[main_path] = DraftFileOperation(
+            file_path=main_path,
+            operation="replace",
+            content=desired,
+            reason="Pre-apply contract sync: keep main.py manifest-aware and include all canonical backend routers.",
+        )
+        return list(operation_map.values())
+
+    def _synchronize_minimal_workflow_route_contracts(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        route_templates = {
+            "miniapp/app/routes/requests.py": self._deterministic_requests_route_source(),
+            "miniapp/app/routes/comments.py": self._deterministic_comments_route_source(),
+            "miniapp/app/routes/assignments.py": self._deterministic_assignments_route_source(),
+            "miniapp/app/routes/users.py": self._deterministic_users_route_source(),
+            "miniapp/app/routes/workload.py": self._deterministic_workload_route_source(),
+            "miniapp/app/routes/time_slots.py": self._deterministic_time_slots_route_source(),
+        }
+        for file_path, template in route_templates.items():
+            content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
+            if content is None:
+                continue
+            if not self._route_module_needs_stub(content):
+                continue
+            operation_map[file_path] = DraftFileOperation(
+                file_path=file_path,
+                operation="replace",
+                content=template,
+                reason="Pre-apply contract sync: replace empty canonical route module with deterministic workflow runtime stub.",
             )
         return list(operation_map.values())
 
@@ -5909,15 +6248,29 @@ class GenerationService:
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
         for file_path in list(operation_map):
-            if not (file_path.startswith("miniapp/app/static/") and file_path.endswith(".js")):
+            if not (
+                file_path.startswith("miniapp/app/static/")
+                and (file_path.endswith(".js") or file_path.endswith(".html"))
+            ):
                 continue
             content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
             if not content:
                 continue
+            updated = self._normalize_api_aliases_in_text(content)
+            if file_path.endswith(".html"):
+                if updated == content:
+                    continue
+                operation_map[file_path] = DraftFileOperation(
+                    file_path=file_path,
+                    operation="replace",
+                    content=updated,
+                    reason="Pre-apply contract sync: canonicalize frontend API aliases before runtime checks.",
+                )
+                continue
             updated = re.sub(
                 r"(?<![\w.])fetch\(\s*([\"'`])/api/",
                 r"window.miniappApiFetch(\1/api/",
-                content,
+                updated,
             )
             updated = re.sub(
                 r"const\s+fetchJson\s*=\s*runtime\.fetchJson\s*\?\?\s*\(window\.fetch\s*\?\s*\(\(url,\s*options\s*=\s*\{\}\)\s*=>\s*window\.fetch\(url,\s*options\)\)\s*:\s*null\);",
@@ -5943,6 +6296,533 @@ class GenerationService:
                 reason="Pre-apply contract sync: route frontend API calls through the preview-aware shared fetch helper.",
             )
         return list(operation_map.values())
+
+    @staticmethod
+    def _canonicalize_local_role_links_in_text(content: str) -> str:
+        updated = str(content or "")
+        role_root_pattern = re.compile(
+            r'(?P<quote>["\'`])(?P<path>/(?:client|specialist|manager)(?:/[A-Za-z0-9_{}:-]+)*)/(?P<suffix>(?:[?#][^"\'`]*)?)(?P=quote)'
+        )
+
+        def _replace(match: re.Match[str]) -> str:
+            quote = match.group("quote")
+            path = match.group("path")
+            suffix = match.group("suffix") or ""
+            return f"{quote}{path}{suffix}{quote}"
+
+        return role_root_pattern.sub(_replace, updated)
+
+    def _synchronize_frontend_navigation_contract(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        for file_path in list(operation_map):
+            if not (
+                file_path.startswith("miniapp/app/static/")
+                and (file_path.endswith(".html") or file_path.endswith(".js"))
+            ):
+                continue
+            content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
+            if not content:
+                continue
+            updated = self._canonicalize_local_role_links_in_text(content)
+            if updated == content:
+                continue
+            operation_map[file_path] = DraftFileOperation(
+                file_path=file_path,
+                operation="replace",
+                content=updated,
+                reason="Pre-apply contract sync: canonicalize local role navigation links before generated route checks.",
+            )
+        return list(operation_map.values())
+
+    @staticmethod
+    def _route_module_needs_stub(content: str) -> bool:
+        normalized = str(content or "").strip()
+        if not normalized:
+            return True
+        mutable_store_pattern = re.compile(
+            r"^(?P<name>(?:REQUESTS|COMMENTS|ASSIGNMENTS|TIME_SLOTS|SPECIALISTS|USERS|PROFILE_STORE|[A-Z][A-Z0-9_]*(?:_STORE|_CACHE|_TABLE|_ITEMS)))\s*(?::[^=]+)?=\s*(?:\{|\[)",
+            flags=re.MULTILINE,
+        )
+        compact = re.sub(r"\s+", " ", normalized)
+        if compact in {
+            "from fastapi import APIRouter router = APIRouter()",
+            "router = APIRouter()",
+        } or ("router = APIRouter()" in compact and "@router." not in compact):
+            return True
+        if mutable_store_pattern.search(normalized):
+            return True
+        if "from pydantic import BaseModel" in normalized or "from pydantic import BaseModel," in normalized:
+            return True
+        return False
+
+    @staticmethod
+    def _deterministic_main_runtime_source(route_modules: list[str]) -> str:
+        route_import_lines = "\n".join(
+            f"from app.routes.{module} import router as {module}_router"
+            for module in route_modules
+        )
+        include_lines = "\n".join(f"app.include_router({module}_router)" for module in route_modules)
+        if route_import_lines:
+            route_import_lines = f"{route_import_lines}\n"
+        if include_lines:
+            include_lines = f"{include_lines}\n"
+        return f"""from __future__ import annotations
+
+import json
+from pathlib import Path
+import re
+
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.db import Base, engine
+from app.routes.health import router as health_router
+from app.routes.profiles import router as profiles_router
+{route_import_lines}BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+GENERATED_DIR = BASE_DIR / "generated"
+ROUTE_MANIFEST_PATH = GENERATED_DIR / "route_manifest.json"
+RUNTIME_MANIFEST_PATH = GENERATED_DIR / "runtime_manifest.json"
+ROLES = ("client", "specialist", "manager")
+
+app = FastAPI()
+app.include_router(health_router)
+app.include_router(profiles_router)
+{include_lines}app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.on_event("startup")
+def startup() -> None:
+    Base.metadata.create_all(bind=engine)
+
+
+@app.get("/", include_in_schema=False)
+def index() -> RedirectResponse:
+    return RedirectResponse(url="/client", status_code=307)
+
+
+def _load_route_manifest() -> dict:
+    if not ROUTE_MANIFEST_PATH.exists():
+        return {{}}
+    try:
+        return json.loads(ROUTE_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {{}}
+
+
+def _load_runtime_manifest() -> dict:
+    if not RUNTIME_MANIFEST_PATH.exists():
+        return {{}}
+    try:
+        return json.loads(RUNTIME_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {{}}
+
+
+def _normalize_runtime_role(role: str) -> str:
+    normalized = (role or "").strip().strip("/")
+    if normalized == "sample":
+        return "client"
+    return normalized
+
+
+def _canonicalize_role_path(path: str) -> str:
+    normalized = str(path or "").strip() or "/"
+    if normalized != "/" and normalized.endswith("/"):
+        normalized = normalized.rstrip("/")
+    return normalized or "/"
+
+
+def _route_matches(pattern: str, actual: str) -> bool:
+    normalized_pattern = re.sub(r"\\{{[^/]+\\}}", "[^/]+", pattern)
+    normalized_pattern = re.sub(r":[^/]+", "[^/]+", normalized_pattern)
+    return re.fullmatch(normalized_pattern, actual) is not None
+
+
+def _resolve_declared_page_file(role: str, actual_path: str) -> Path | None:
+    actual_path = _canonicalize_role_path(actual_path)
+    route_manifest = _load_route_manifest()
+    pages = (((route_manifest.get("roles") or {{}}).get(role) or {{}}).get("pages") or [])
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        route_path = str(page.get("route_path") or "").strip()
+        file_path = str(page.get("file_path") or "").strip()
+        if not route_path or not file_path:
+            continue
+        if not _route_matches(route_path, actual_path):
+            continue
+        normalized_file_path = file_path.replace("\\\\", "/")
+        if normalized_file_path.startswith("miniapp/app/"):
+            resolved = BASE_DIR.parent / normalized_file_path.removeprefix("miniapp/app/")
+        elif normalized_file_path.startswith("app/"):
+            resolved = BASE_DIR.parent / normalized_file_path.removeprefix("app/")
+        else:
+            resolved = BASE_DIR / normalized_file_path
+        if resolved.exists():
+            return resolved
+    return None
+
+
+def _resolve_role_page(role: str, actual_path: str) -> Path:
+    actual_path = _canonicalize_role_path(actual_path)
+    if role not in ROLES:
+        raise KeyError(role)
+    declared_page = _resolve_declared_page_file(role, actual_path)
+    if declared_page is not None:
+        return declared_page
+    if actual_path == f"/{{role}}":
+        page_file = STATIC_DIR / role / "index.html"
+        if page_file.exists():
+            return page_file
+    if actual_path == f"/{{role}}/profile":
+        page_file = STATIC_DIR / role / "profile" / "index.html"
+        if page_file.exists():
+            return page_file
+    slug_parts = [segment for segment in actual_path.removeprefix(f"/{{role}}").split("/") if segment]
+    if len(slug_parts) == 1:
+        page_file = STATIC_DIR / role / slug_parts[0] / "index.html"
+        if page_file.exists():
+            return page_file
+    if len(slug_parts) >= 2:
+        dynamic_candidate = STATIC_DIR / role / f"{{slug_parts[0]}}_detail" / "index.html"
+        if dynamic_candidate.exists():
+            return dynamic_candidate
+    raise KeyError(actual_path)
+
+
+@app.get("/{{role}}", include_in_schema=False)
+def role_page(role: str) -> FileResponse:
+    return FileResponse(_resolve_role_page(role, f"/{{role}}"))
+
+
+@app.get("/{{role}}/", include_in_schema=False)
+def role_page_trailing_slash(role: str) -> FileResponse:
+    return FileResponse(_resolve_role_page(role, f"/{{role}}/"))
+
+
+@app.get("/{{role}}/{{page_path:path}}", include_in_schema=False)
+def role_nested_page(role: str, page_path: str) -> FileResponse:
+    return FileResponse(_resolve_role_page(role, f"/{{role}}/{{page_path}}"))
+
+
+@app.get("/api/runtime/{{role}}/manifest")
+def runtime_manifest(role: str) -> JSONResponse:
+    requested_role = role
+    role = _normalize_runtime_role(role)
+    if role not in ROLES:
+        return JSONResponse(status_code=404, content={{"detail": f"unknown role: {{requested_role}}"}})
+    runtime_manifest_payload = _load_runtime_manifest()
+    route_manifest_payload = _load_route_manifest()
+    return JSONResponse(
+        content={{
+            "role": role,
+            "requested_role": requested_role,
+            "runtime": ((runtime_manifest_payload.get("roles") or {{}}).get(role) or {{}}),
+            "routes": ((route_manifest_payload.get("roles") or {{}}).get(role) or {{}}),
+            "version": runtime_manifest_payload.get("version") or "generated",
+        }}
+    )
+
+
+@app.exception_handler(KeyError)
+def key_error_handler(_, exc: KeyError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={{"detail": str(exc)}})
+"""
+
+    @classmethod
+    def _normalize_api_aliases_in_text(cls, content: str) -> str:
+        updated = str(content or "")
+        for alias, canonical in CANONICAL_ENDPOINT_ALIASES.items():
+            if alias == canonical:
+                continue
+            updated = re.sub(rf"/api/{alias}(?=[/\"'`?#]|$)", f"/api/{canonical}", updated)
+        return updated
+
+    @staticmethod
+    def _deterministic_requests_route_source() -> str:
+        return """from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+from uuid import uuid4
+
+from fastapi import APIRouter, Body
+from sqlalchemy import text
+
+from app.db import engine
+
+router = APIRouter(prefix="/api", tags=["requests"])
+
+
+def _ensure_tables() -> None:
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS requests ("
+            "id TEXT PRIMARY KEY, "
+            "title TEXT, "
+            "description TEXT, "
+            "client_name TEXT, "
+            "phone TEXT, "
+            "preferred_time TEXT, "
+            "comment TEXT, "
+            "status TEXT, "
+            "assigned_specialist TEXT, "
+            "created_at TEXT, "
+            "updated_at TEXT)"
+        ))
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS comments ("
+            "id TEXT PRIMARY KEY, "
+            "request_id TEXT, "
+            "comment TEXT, "
+            "author_role TEXT, "
+            "created_at TEXT)"
+        ))
+
+
+def _serialize_request(row: Any) -> dict[str, Any]:
+    mapping = getattr(row, "_mapping", row)
+    return {
+        "request_id": mapping["id"],
+        "title": mapping["title"] or "Request",
+        "description": mapping["description"] or "",
+        "client_name": mapping["client_name"] or "",
+        "phone": mapping["phone"] or "",
+        "preferred_time": mapping["preferred_time"] or "",
+        "comment": mapping["comment"] or "",
+        "status": mapping["status"] or "new",
+        "assigned_specialist": mapping["assigned_specialist"],
+        "created_at": mapping["created_at"],
+        "updated_at": mapping["updated_at"],
+    }
+
+
+@router.get("/requests")
+@router.get("/submissions")
+def list_requests() -> dict[str, list[dict[str, Any]]]:
+    _ensure_tables()
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT * FROM requests ORDER BY created_at DESC")).fetchall()
+    return {"items": [_serialize_request(row) for row in rows]}
+
+
+@router.post("/requests")
+@router.post("/submissions")
+def create_request(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    _ensure_tables()
+    request_id = str(payload.get("request_id") or payload.get("id") or uuid4().hex[:12])
+    now = datetime.now(timezone.utc).isoformat()
+    record = {
+        "id": request_id,
+        "title": str(payload.get("title") or payload.get("task") or payload.get("subject") or "Request"),
+        "description": str(payload.get("description") or payload.get("comment") or payload.get("details") or ""),
+        "client_name": str(payload.get("name") or payload.get("client_name") or ""),
+        "phone": str(payload.get("phone") or ""),
+        "preferred_time": str(payload.get("preferred_time") or payload.get("date") or payload.get("slot") or ""),
+        "comment": str(payload.get("comment") or ""),
+        "status": str(payload.get("status") or "new"),
+        "assigned_specialist": payload.get("assigned_specialist"),
+        "created_at": now,
+        "updated_at": now,
+    }
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT OR REPLACE INTO requests "
+            "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, created_at, updated_at) "
+            "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :created_at, :updated_at)"
+        ), record)
+        row = conn.execute(text("SELECT * FROM requests WHERE id = :id"), {"id": request_id}).first()
+    return _serialize_request(row)
+
+
+@router.get("/requests/{request_id}")
+@router.get("/submissions/{request_id}")
+def get_request(request_id: str) -> dict[str, Any]:
+    _ensure_tables()
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT * FROM requests WHERE id = :id"), {"id": request_id}).first()
+        if row is None:
+            placeholder = {
+                "id": request_id,
+                "title": "Request",
+                "description": "",
+                "client_name": "",
+                "phone": "",
+                "preferred_time": "",
+                "comment": "",
+                "status": "new",
+                "assigned_specialist": None,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            conn.execute(text(
+                "INSERT OR REPLACE INTO requests "
+                "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, created_at, updated_at) "
+                "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :created_at, :updated_at)"
+            ), placeholder)
+            row = conn.execute(text("SELECT * FROM requests WHERE id = :id"), {"id": request_id}).first()
+    return _serialize_request(row)
+
+
+@router.patch("/requests/{request_id}/status")
+def update_request_status(request_id: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    _ensure_tables()
+    status = str(payload.get("status") or "in_progress")
+    now = datetime.now(timezone.utc).isoformat()
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE requests SET status = :status, updated_at = :updated_at WHERE id = :id"), {"id": request_id, "status": status, "updated_at": now})
+        row = conn.execute(text("SELECT * FROM requests WHERE id = :id"), {"id": request_id}).first()
+    if row is None:
+        return create_request({"request_id": request_id, "status": status})
+    return _serialize_request(row)
+"""
+
+    @staticmethod
+    def _deterministic_comments_route_source() -> str:
+        return """from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+from uuid import uuid4
+
+from fastapi import APIRouter, Body
+from sqlalchemy import text
+
+from app.db import engine
+
+router = APIRouter(prefix="/api/comments", tags=["comments"])
+
+
+def _ensure_tables() -> None:
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, request_id TEXT, comment TEXT, author_role TEXT, created_at TEXT)"))
+
+
+@router.post("")
+@router.post("/")
+def create_comment(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    _ensure_tables()
+    comment_id = uuid4().hex[:12]
+    request_id = str(payload.get("request_id") or payload.get("id") or "")
+    record = {
+        "id": comment_id,
+        "request_id": request_id,
+        "comment": str(payload.get("comment") or payload.get("note") or "Workflow comment"),
+        "author_role": str(payload.get("author_role") or "specialist"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO comments (id, request_id, comment, author_role, created_at) VALUES (:id, :request_id, :comment, :author_role, :created_at)"), record)
+    return {"comment_id": comment_id, **record}
+"""
+
+    @staticmethod
+    def _deterministic_assignments_route_source() -> str:
+        return """from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import APIRouter, Body
+from sqlalchemy import text
+
+from app.db import engine
+
+router = APIRouter(prefix="/api/assignments", tags=["assignments"])
+
+
+@router.post("")
+@router.patch("/{request_id}")
+def assign_request(request_id: str | None = None, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    assignment_request_id = str(request_id or payload.get("request_id") or payload.get("id") or "")
+    specialist = str(payload.get("specialist_id") or payload.get("assignee_id") or payload.get("assigned_specialist") or "specialist-1")
+    now = datetime.now(timezone.utc).isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, title TEXT, description TEXT, client_name TEXT, phone TEXT, preferred_time TEXT, comment TEXT, status TEXT, assigned_specialist TEXT, created_at TEXT, updated_at TEXT)"
+        ))
+        conn.execute(text(
+            "INSERT OR IGNORE INTO requests (id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, created_at, updated_at) VALUES (:id, 'Request', '', '', '', '', '', 'new', NULL, :now, :now)"
+        ), {"id": assignment_request_id, "now": now})
+        conn.execute(text("UPDATE requests SET assigned_specialist = :specialist, updated_at = :updated_at WHERE id = :id"), {"id": assignment_request_id, "specialist": specialist, "updated_at": now})
+    return {"request_id": assignment_request_id, "assigned_specialist": specialist, "updated_at": now}
+"""
+
+    @staticmethod
+    def _deterministic_users_route_source() -> str:
+        return """from __future__ import annotations
+
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/api", tags=["users"])
+
+
+@router.get("/users")
+@router.get("/users/")
+@router.get("/specialists")
+@router.get("/specialists/")
+def list_users() -> dict[str, list[dict[str, str]]]:
+    return {
+        "items": [
+            {"user_id": "specialist-1", "role": "specialist", "name": "Alex Specialist"},
+            {"user_id": "specialist-2", "role": "specialist", "name": "Nina Specialist"},
+            {"user_id": "manager-1", "role": "manager", "name": "Maria Manager"},
+        ]
+    }
+"""
+
+    @staticmethod
+    def _deterministic_workload_route_source() -> str:
+        return """from __future__ import annotations
+
+from fastapi import APIRouter
+from sqlalchemy import text
+
+from app.db import engine
+
+router = APIRouter(prefix="/api/workload", tags=["workload"])
+
+
+@router.get("")
+@router.get("/")
+def get_workload() -> dict[str, list[dict[str, object]]]:
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, title TEXT, description TEXT, client_name TEXT, phone TEXT, preferred_time TEXT, comment TEXT, status TEXT, assigned_specialist TEXT, created_at TEXT, updated_at TEXT)"
+        ))
+        rows = conn.execute(text(
+            "SELECT COALESCE(assigned_specialist, 'unassigned') AS assignee, COUNT(*) AS total FROM requests GROUP BY COALESCE(assigned_specialist, 'unassigned') ORDER BY total DESC"
+        )).fetchall()
+    return {"items": [{"assignee": row._mapping["assignee"], "total": row._mapping["total"]} for row in rows]}
+"""
+
+    @staticmethod
+    def _deterministic_time_slots_route_source() -> str:
+        return """from __future__ import annotations
+
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/api/time-slots", tags=["time_slots"])
+
+
+@router.get("")
+@router.get("/")
+def list_time_slots() -> dict[str, list[dict[str, str]]]:
+    return {
+        "items": [
+            {"slot_id": "slot-0900", "label": "09:00"},
+            {"slot_id": "slot-1100", "label": "11:00"},
+            {"slot_id": "slot-1400", "label": "14:00"},
+        ]
+    }
+"""
 
     def _synchronize_basic_page_state_contract(
         self,
@@ -6034,6 +6914,7 @@ class GenerationService:
                     '        <div class="status-card error" data-ui-state="error" role="alert" hidden></div>\n    </main>',
                     1,
                 )
+            updated = self._ensure_html_dom_ids_for_script(updated, script)
             updated = re.sub(r">\s*Refresh\s*<", ">Reload<", updated, flags=re.IGNORECASE)
             if updated == html:
                 continue
@@ -6078,6 +6959,55 @@ class GenerationService:
         if "</body>" in html:
             return html.replace("</body>", f"    {tag}\n</body>", 1)
         return f"{html}\n{tag}"
+
+    @classmethod
+    def _ensure_html_dom_ids_for_script(cls, html: str, script: str | None) -> str:
+        if not script:
+            return html
+        required_ids = sorted(cls._extract_js_dom_ids(script) - cls._extract_html_ids(html))
+        if not required_ids:
+            return html
+        placeholders = "\n".join(cls._dom_placeholder_markup(dom_id) for dom_id in required_ids)
+        injection = f"{placeholders}\n"
+        if "</main>" in html:
+            return html.replace("</main>", f"{injection}    </main>", 1)
+        if "</body>" in html:
+            return html.replace("</body>", f"{injection}</body>", 1)
+        return f"{html}\n{placeholders}\n"
+
+    @staticmethod
+    def _dom_placeholder_markup(dom_id: str) -> str:
+        lowered = dom_id.lower()
+        if lowered.endswith("-button") or lowered == "save-button":
+            return f'        <button id="{dom_id}" type="button" hidden aria-hidden="true"></button>'
+        if lowered.endswith("-input") or lowered in {"phone", "email", "profile-photo"}:
+            input_type = "file" if "photo" in lowered else "text"
+            return f'        <input id="{dom_id}" type="{input_type}" hidden aria-hidden="true" />'
+        if lowered.endswith("-form") or lowered == "profile-form":
+            return f'        <form id="{dom_id}" hidden aria-hidden="true"></form>'
+        if lowered.endswith("-error"):
+            return f'        <div id="{dom_id}" class="status-card error" role="alert" hidden></div>'
+        if lowered.startswith("preview-") or lowered.endswith("-name") or lowered.endswith("-count"):
+            return f'        <span id="{dom_id}" hidden aria-hidden="true"></span>'
+        if lowered.endswith("-avatar") or lowered.endswith("-image"):
+            return f'        <img id="{dom_id}" hidden aria-hidden="true" alt="" />'
+        return f'        <div id="{dom_id}" hidden aria-hidden="true"></div>'
+
+    @staticmethod
+    def _extract_html_ids(html: str) -> set[str]:
+        return {match.group(1) for match in re.finditer(r'id=["\']([^"\']+)["\']', html or "")}
+
+    @staticmethod
+    def _extract_js_dom_ids(content: str) -> set[str]:
+        refs: set[str] = set()
+        patterns = (
+            r'getElementById\(["\']([^"\']+)["\']\)',
+            r'querySelector\(["\']#([^"\']+)["\']\)',
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, content or ""):
+                refs.add(match.group(1))
+        return refs
 
     @staticmethod
     def _static_asset_href(asset_path_raw: str) -> str:
@@ -8433,6 +9363,15 @@ test('generated javascript files parse', () => {{
             " returned 502",
             " returned 503",
             " returned 504",
+            "nodename nor servname provided",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "failed to resolve",
+            "connecterror",
+            "requesterror",
+            "connection error",
+            "connection refused",
+            "connection aborted",
             "internal_server_error",
             "rate limit",
             "timed out",
@@ -8563,7 +9502,8 @@ test('generated javascript files parse', () => {{
         role = str(kwargs.get("role") or "llm")
         schema_name = str(kwargs.get("schema_name") or "request")
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"llm-{role}")
-        future = executor.submit(func, **kwargs)
+        context = copy_context()
+        future = executor.submit(lambda: context.run(func, **kwargs))
         try:
             return future.result(timeout=timeout_seconds)
         except FuturesTimeoutError as exc:
@@ -8573,6 +9513,17 @@ test('generated javascript files parse', () => {{
             ) from exc
         finally:
             executor.shutdown(wait=False, cancel_futures=False)
+
+    @staticmethod
+    def _submit_with_context(
+        executor: ThreadPoolExecutor,
+        func: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        context = copy_context()
+        return executor.submit(lambda: context.run(func, *args, **kwargs))
 
     @staticmethod
     def _should_tighten_json_retry(error: Exception) -> bool:
@@ -8719,7 +9670,7 @@ test('generated javascript files parse', () => {{
         **kwargs: Any,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grounded-spec-total")
-        future = executor.submit(self._generate_grounded_spec_pair, **kwargs)
+        future = self._submit_with_context(executor, self._generate_grounded_spec_pair, **kwargs)
         try:
             return future.result(timeout=timeout_seconds)
         except FuturesTimeoutError as exc:
@@ -8733,12 +9684,79 @@ test('generated javascript files parse', () => {{
     def _resolve_grounded_spec_fast(
         self,
         *,
+        workspace_id: str,
         prompt: str,
         doc_refs: list[Any],
         target_platform: TargetPlatform,
         preview_profile: PreviewProfile,
         template_revision_id: str,
         prompt_turn_id: str,
+        generation_mode: GenerationMode,
+        creative_direction: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return self._resolve_grounded_spec_fast_with_timeout(
+                timeout_seconds=float(self.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS),
+                workspace_id=workspace_id,
+                prompt=prompt,
+                doc_refs=doc_refs,
+                target_platform=target_platform,
+                preview_profile=preview_profile,
+                template_revision_id=template_revision_id,
+                prompt_turn_id=prompt_turn_id,
+                generation_mode=generation_mode,
+                creative_direction=creative_direction,
+            )
+        except TimeoutError as exc:
+            fallback_spec = self._build_grounded_spec(
+                workspace_id=workspace_id,
+                prompt=prompt,
+                target_platform=target_platform,
+                preview_profile=preview_profile,
+                doc_refs=doc_refs,
+                template_revision_id=template_revision_id,
+                prompt_turn_id=prompt_turn_id,
+                generation_mode=generation_mode,
+            )
+            return {
+                "spec": fallback_spec,
+                "model": None,
+                "model_sequence": [],
+                "warning_kind": "fast_spec_timeout_compiler_fallback",
+                "warning_stage": "fast_spec_timeout_fallback_used",
+                "warning_title": "Fast GroundedSpec timed out and used compiler fallback.",
+                "warning": f"Fast GroundedSpec timed out and compiler fallback was used: {exc}",
+            }
+
+    def _resolve_grounded_spec_fast_with_timeout(
+        self,
+        *,
+        timeout_seconds: float,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grounded-spec-fast-total")
+        future = self._submit_with_context(executor, self._resolve_grounded_spec_fast_inner, **kwargs)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FuturesTimeoutError as exc:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError(
+                f"Timed out waiting for fast grounded spec generation after {int(timeout_seconds)}s."
+            ) from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=False)
+
+    def _resolve_grounded_spec_fast_inner(
+        self,
+        *,
+        workspace_id: str | None = None,
+        prompt: str,
+        doc_refs: list[Any],
+        target_platform: TargetPlatform,
+        preview_profile: PreviewProfile,
+        template_revision_id: str,
+        prompt_turn_id: str,
+        generation_mode: GenerationMode | None = None,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
         try:
@@ -8855,7 +9873,8 @@ test('generated javascript files parse', () => {{
 
         executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="grounded-spec")
         futures = {
-            "core": executor.submit(
+            "core": self._submit_with_context(
+                executor,
                 self._generate_grounded_spec_section,
                 section_id="core",
                 section_title="Core domain and workflow",
@@ -8871,7 +9890,8 @@ test('generated javascript files parse', () => {{
                 relaxed=relaxed,
                 compact=compact,
             ),
-            "requirements": executor.submit(
+            "requirements": self._submit_with_context(
+                executor,
                 self._generate_grounded_spec_section,
                 section_id="requirements",
                 section_title="Runtime requirements",
@@ -8887,7 +9907,8 @@ test('generated javascript files parse', () => {{
                 relaxed=relaxed,
                 compact=compact,
             ),
-            "governance": executor.submit(
+            "governance": self._submit_with_context(
+                executor,
                 self._generate_grounded_spec_section,
                 section_id="governance",
                 section_title="Assumptions and gaps",
@@ -11994,32 +13015,180 @@ test('generated javascript files parse', () => {{
         run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.store.upsert("runs", job.linked_run_id, run_payload)
 
+    def _sync_generation_cluster_progress(
+        self,
+        *,
+        linked_run_id: str | None,
+        completed_target_files: int,
+        total_target_files: int,
+        cluster_name: str,
+    ) -> None:
+        if not linked_run_id:
+            return
+        run_payload = self.store.get("runs", linked_run_id)
+        if not run_payload:
+            return
+        ratio = min(1.0, max(0.0, completed_target_files / max(1, total_target_files)))
+        progress = 16 + int(round(ratio * 60))
+        run_payload["current_stage"] = f"generating code ({completed_target_files}/{total_target_files} files)"
+        run_payload["progress_percent"] = max(int(run_payload.get("progress_percent", 0)), progress)
+        run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.store.upsert("runs", linked_run_id, run_payload)
+        self.workspace_log_service.append(
+            run_payload["workspace_id"],
+            source="generation.progress",
+            message="Updated generation progress from completed code clusters.",
+            payload={
+                "linked_run_id": linked_run_id,
+                "cluster_name": cluster_name,
+                "completed_target_files": completed_target_files,
+                "total_target_files": total_target_files,
+                "progress_percent": progress,
+            },
+        )
+
+    def _sync_generation_cluster_started(
+        self,
+        *,
+        linked_run_id: str | None,
+        completed_target_files: int,
+        total_target_files: int,
+        cluster_name: str,
+        cluster_targets: list[str],
+    ) -> None:
+        if not linked_run_id:
+            return
+        run_payload = self.store.get("runs", linked_run_id)
+        if not run_payload:
+            return
+        cluster_target_count = max(1, len(cluster_targets))
+        in_flight_ratio = min(1.0, max(0.0, (completed_target_files + (cluster_target_count * 0.35)) / max(1, total_target_files)))
+        progress = 16 + int(round(in_flight_ratio * 60))
+        preview_target = cluster_targets[0] if cluster_targets else cluster_name
+        suffix = f" (+{len(cluster_targets) - 1} more)" if len(cluster_targets) > 1 else ""
+        run_payload["current_stage"] = (
+            f"generating {completed_target_files + 1}-{min(total_target_files, completed_target_files + cluster_target_count)}"
+            f"/{total_target_files}: {preview_target}{suffix}"
+        )
+        run_payload["progress_percent"] = max(int(run_payload.get("progress_percent", 0)), progress)
+        run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.store.upsert("runs", linked_run_id, run_payload)
+        self.workspace_log_service.append(
+            run_payload["workspace_id"],
+            source="generation.progress",
+            message="Started generation for the next code cluster.",
+            payload={
+                "linked_run_id": linked_run_id,
+                "cluster_name": cluster_name,
+                "cluster_targets": cluster_targets,
+                "completed_target_files": completed_target_files,
+                "total_target_files": total_target_files,
+                "progress_percent": progress,
+            },
+        )
+
+    def _sync_generation_batch_started(
+        self,
+        *,
+        linked_run_id: str | None,
+        completed_target_files: int,
+        total_target_files: int,
+        batch: list[dict[str, Any]],
+    ) -> None:
+        if not linked_run_id or not batch:
+            return
+        run_payload = self.store.get("runs", linked_run_id)
+        if not run_payload:
+            return
+        batch_target_count = sum(len(list(cluster["target_files"])) for cluster in batch)
+        in_flight_ratio = min(1.0, max(0.0, (completed_target_files + (batch_target_count * 0.35)) / max(1, total_target_files)))
+        progress = 16 + int(round(in_flight_ratio * 60))
+        first_targets = list(batch[0]["target_files"])
+        preview_target = first_targets[0] if first_targets else str(batch[0]["cluster_name"])
+        extra_clusters = len(batch) - 1
+        parallel_suffix = f" (+{extra_clusters} parallel cluster{'s' if extra_clusters != 1 else ''})" if extra_clusters > 0 else ""
+        run_payload["current_stage"] = (
+            f"generating {completed_target_files + 1}-{min(total_target_files, completed_target_files + batch_target_count)}"
+            f"/{total_target_files}: {preview_target}{parallel_suffix}"
+        )
+        run_payload["progress_percent"] = max(int(run_payload.get("progress_percent", 0)), progress)
+        run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.store.upsert("runs", linked_run_id, run_payload)
+        self.workspace_log_service.append(
+            run_payload["workspace_id"],
+            source="generation.progress",
+            message="Started generation batch for code clusters.",
+            payload={
+                "linked_run_id": linked_run_id,
+                "batch_clusters": [str(cluster["cluster_name"]) for cluster in batch],
+                "batch_targets": [list(cluster["target_files"]) for cluster in batch],
+                "completed_target_files": completed_target_files,
+                "total_target_files": total_target_files,
+                "progress_percent": progress,
+            },
+        )
+
+    @staticmethod
+    def _whole_file_parallel_group(cluster_name: str) -> str:
+        if cluster_name in {"backend_support", "shared_static"}:
+            return "serial"
+        if cluster_name.startswith("backend_route_"):
+            return "backend_route"
+        if cluster_name.startswith("role_") and "_ui_" in cluster_name:
+            return "role_ui"
+        return "serial"
+
+    @classmethod
+    def _group_generation_clusters_for_execution(cls, clusters: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        grouped: list[list[dict[str, Any]]] = []
+        index = 0
+        while index < len(clusters):
+            cluster = clusters[index]
+            group_name = cls._whole_file_parallel_group(str(cluster["cluster_name"]))
+            if group_name == "serial":
+                grouped.append([cluster])
+                index += 1
+                continue
+            batch_limit = 2 if group_name == "backend_route" else 3
+            batch = [cluster]
+            index += 1
+            while index < len(clusters) and len(batch) < batch_limit:
+                candidate = clusters[index]
+                if cls._whole_file_parallel_group(str(candidate["cluster_name"])) != group_name:
+                    break
+                batch.append(candidate)
+                index += 1
+            grouped.append(batch)
+        return grouped
+
     @staticmethod
     def _run_progress_for_event(event_type: str) -> tuple[str, int]:
         progress_map = {
-            "job_started": ("starting", 4),
-            "indexing_started": ("indexing workspace", 8),
-            "retrieval_started": ("retrieving context", 12),
-            "retrieval_completed": ("retrieval complete", 18),
-            "spec_started": ("building grounded spec", 24),
-            "spec_ready": ("grounded spec ready", 32),
-            "draft_prepared": ("preparing draft workspace", 38),
-            "role_contract_started": ("analyzing role boundaries", 44),
-            "role_contract_ready": ("role boundaries ready", 50),
-            "planning_started": ("planning code changes", 56),
-            "planning_ready": ("code plan ready", 64),
-            "context_pack_started": ("collecting file context", 68),
-            "context_pack_ready": ("context pack ready", 74),
-            "editing_started": ("generating draft edits", 78),
-            "iteration_ready": ("draft edits prepared", 84),
-            "repair_started": ("repairing after build failure", 86),
-            "repair_iteration": ("repairing draft", 88),
-            "repair_scope_expanded": ("expanding repair scope", 89),
+            "job_started": ("starting", 2),
+            "indexing_started": ("indexing workspace", 3),
+            "retrieval_started": ("retrieving context", 4),
+            "retrieval_completed": ("retrieval complete", 6),
+            "building_scaffold": ("building scaffold", 7),
+            "scaffold_ready": ("scaffold ready", 12),
+            "spec_started": ("building grounded spec", 7),
+            "spec_ready": ("grounded spec ready", 9),
+            "draft_prepared": ("preparing draft workspace", 10),
+            "context_pack_started": ("collecting file context", 13),
+            "context_pack_ready": ("context pack ready", 15),
+            "generating_code": ("generating code", 16),
+            "editing_started": ("generating draft edits", 16),
+            "iteration_ready": ("draft edits prepared", 78),
+            "fixing_code": ("fixing generated code", 82),
+            "repair_started": ("repairing after build failure", 82),
+            "repair_iteration": ("repairing draft", 86),
+            "repair_scope_expanded": ("expanding repair scope", 88),
             "repair_repeated_signature_aborted": ("repair aborted", 100),
+            "running_checks": ("running validation and build", 90),
             "build_started": ("running validation and build", 90),
-            "checks_completed": ("checks complete", 93),
-            "preview_skipped_due_to_build_failure": ("preview skipped until build is green", 91),
-            "planner_contract_gap_detected": ("expanding missing miniapp contract targets", 72),
+            "checks_completed": ("checks complete", 94),
+            "preview_skipped_due_to_build_failure": ("preview skipped until build is green", 92),
+            "planner_contract_gap_detected": ("expanding missing miniapp contract targets", 14),
+            "applying": ("applying draft", 96),
             "preview_rebuild_started": ("refreshing preview", 96),
             "preview_ready": ("preview ready", 98),
             "draft_ready": ("awaiting review", 99),

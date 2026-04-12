@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
@@ -13,7 +14,7 @@ import app.services.check_runner as check_runner_module
 from fastapi.testclient import TestClient
 
 from app.ai.model_registry import TASK_PROFILES
-from app.ai.openrouter_client import OpenRouterClient
+from app.ai.openrouter_client import ACTIVE_WORKSPACE_LOG_CONTEXT, OpenRouterClient
 from app.main import create_app
 from app.models.common import PreviewProfile, TargetPlatform
 from app.models.artifacts import ValidationIssue
@@ -108,11 +109,135 @@ def test_openrouter_client_compacts_large_nested_payloads() -> None:
     assert "[truncated " in text_value
 
 
+def test_openrouter_client_retries_dns_resolution_failures() -> None:
+    error = RuntimeError("[Errno 8] nodename nor servname provided, or not known")
+    assert OpenRouterClient._is_retryable_request_error(error) is True
+
+
+def test_generation_service_retries_dns_resolution_failures() -> None:
+    error = RuntimeError("Whole-file cluster failed: [Errno 8] nodename nor servname provided, or not known")
+    assert GenerationService._is_retryable_llm_error(error) is True
+
+
+def test_invoke_llm_with_timeout_preserves_workspace_log_context() -> None:
+    token = ACTIVE_WORKSPACE_LOG_CONTEXT.set("ws_context")
+    try:
+        result = GenerationService._invoke_llm_with_timeout(
+            lambda **_kwargs: {"workspace_id": ACTIVE_WORKSPACE_LOG_CONTEXT.get()},
+            timeout_seconds=1.0,
+            role="spec_analysis",
+            schema_name="context_test",
+        )
+    finally:
+        ACTIVE_WORKSPACE_LOG_CONTEXT.reset(token)
+
+    assert result["workspace_id"] == "ws_context"
+
+
+def test_submit_with_context_preserves_workspace_log_context() -> None:
+    token = ACTIVE_WORKSPACE_LOG_CONTEXT.set("ws_context_submit")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = GenerationService._submit_with_context(
+                executor,
+                lambda **_kwargs: {"workspace_id": ACTIVE_WORKSPACE_LOG_CONTEXT.get()},
+            )
+            result = future.result(timeout=1)
+    finally:
+        ACTIVE_WORKSPACE_LOG_CONTEXT.reset(token)
+
+    assert result["workspace_id"] == "ws_context_submit"
+
+
+def test_fast_grounded_spec_times_out_to_compiler_fallback(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    original_timeout = service.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS
+    original_inner = service._resolve_grounded_spec_fast_inner
+    original_build = service._build_grounded_spec
+
+    def _hung_fast_inner(**_kwargs):
+        time.sleep(0.2)
+        return {"spec": "unreachable"}
+
+    def _fallback_spec(**_kwargs):
+        return original_build(**_kwargs)
+
+    service.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS = 0.01
+    service._resolve_grounded_spec_fast_inner = _hung_fast_inner  # type: ignore[method-assign]
+    service._build_grounded_spec = _fallback_spec  # type: ignore[method-assign]
+    try:
+        result = service._resolve_grounded_spec_fast(
+            workspace_id="ws_timeout",
+            prompt="Create a client, specialist, and manager workflow app.",
+            doc_refs=[],
+            target_platform=TargetPlatform.TELEGRAM,
+            preview_profile=PreviewProfile.TELEGRAM_MOCK,
+            template_revision_id="template-test",
+            prompt_turn_id="turn_test",
+            generation_mode=GenerationMode.BALANCED,
+            creative_direction={},
+        )
+    finally:
+        service.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS = original_timeout
+        service._resolve_grounded_spec_fast_inner = original_inner  # type: ignore[method-assign]
+        service._build_grounded_spec = original_build  # type: ignore[method-assign]
+
+    assert "spec" in result
+    assert result["model"] is None
+    assert result["warning_kind"] == "fast_spec_timeout_compiler_fallback"
+
+
 def test_workspace_name_is_derived_from_prompt() -> None:
     name = RunService._derive_workspace_name_from_prompt(
         "I need a simple clean mini app for service requests with manager specialist client roles."
     )
     assert name == "Clean Service Requests Manager Specialist"
+
+
+def test_workspace_log_service_creates_platform_api_and_legacy_logs(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    log_service = app.state.container.workspace_log_service
+
+    workspace_id = "ws_logs"
+    log_service.ensure_log_files(workspace_id)
+    log_service.append(workspace_id, source="test", message="platform entry")
+    log_service.append_api(workspace_id, source="test", message="api entry")
+
+    assert log_service.log_path(workspace_id).exists()
+    assert log_service.legacy_log_path(workspace_id).exists()
+    assert log_service.api_log_path(workspace_id).exists()
+    assert any("platform entry" in line for line in log_service.read_lines(workspace_id, kind="platform"))
+    assert any("api entry" in line for line in log_service.read_lines(workspace_id, kind="api"))
+
+
+def test_generation_clusters_grouped_for_safe_parallel_execution() -> None:
+    clusters = [
+        {"cluster_name": "backend_support", "target_files": ["miniapp/app/main.py"]},
+        {"cluster_name": "backend_route_assignments", "target_files": ["miniapp/app/routes/assignments.py"]},
+        {"cluster_name": "backend_route_comments", "target_files": ["miniapp/app/routes/comments.py"]},
+        {"cluster_name": "backend_route_requests", "target_files": ["miniapp/app/routes/requests.py"]},
+        {"cluster_name": "role_manager_ui_root", "target_files": ["miniapp/app/static/manager/index.html"]},
+        {"cluster_name": "role_manager_ui_profile", "target_files": ["miniapp/app/static/manager/profile/index.html"]},
+        {"cluster_name": "role_manager_ui_requests", "target_files": ["miniapp/app/static/manager/requests/index.html"]},
+        {"cluster_name": "role_specialist_ui_root", "target_files": ["miniapp/app/static/specialist/index.html"]},
+        {"cluster_name": "shared_static", "target_files": ["miniapp/app/static/shared/common.js"]},
+    ]
+
+    grouped = GenerationService._group_generation_clusters_for_execution(clusters)
+    names = [[item["cluster_name"] for item in batch] for batch in grouped]
+
+    assert names == [
+        ["backend_support"],
+        ["backend_route_assignments", "backend_route_comments"],
+        ["backend_route_requests"],
+        ["role_manager_ui_root", "role_manager_ui_profile", "role_manager_ui_requests"],
+        ["role_specialist_ui_root"],
+        ["shared_static"],
+    ]
 
 
 def test_create_run_renames_workspace_from_prompt(tmp_path: Path) -> None:
@@ -877,7 +1002,7 @@ def test_backend_contract_target_inference_from_spec_adds_profiles_and_required_
     assert "miniapp/app/schemas.py" in inferred
     assert "miniapp/app/routes/profiles.py" in inferred
     assert "miniapp/app/routes/workload.py" in inferred
-    assert "miniapp/app/routes/specialists.py" in inferred
+    assert "miniapp/app/routes/users.py" in inferred
     assert "miniapp/app/routes/auth.py" not in inferred
 
 
@@ -886,58 +1011,39 @@ def test_route_module_path_for_endpoint_name_uses_snake_case() -> None:
     assert GenerationService._route_module_path_for_endpoint_name("requests") == "miniapp/app/routes/requests.py"
 
 
-def test_fix_strategy_classifies_structural_vs_targeted_and_uses_budgets(tmp_path: Path) -> None:
+def test_fix_loop_uses_single_exact_fix_mode(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     orchestrator = app.state.container.fix_orchestrator
 
-    structural = orchestrator._classify_fix_strategy(
-        raw_error="build.in_memory_route_store in miniapp/app/routes/requests.py",
-        failure_class="route_api_contract_mismatch",
-        root_cause="db.py is missing and route uses REQUESTS = {}",
-        check_results=[],
-        implicated_files=["miniapp/app/routes/requests.py", "miniapp/app/db.py"],
-    )
-    targeted = orchestrator._classify_fix_strategy(
-        raw_error="ImportError in miniapp/app/routes/time_slots.py",
-        failure_class="backend_startup/import/schema",
-        root_cause="cannot import name router",
-        check_results=[],
-        implicated_files=["miniapp/app/routes/time_slots.py"],
-    )
-
-    assert structural == "structural_fix"
-    assert targeted == "targeted_fix"
-    assert orchestrator._attempt_budget_for_strategy("structural_fix") > orchestrator._attempt_budget_for_strategy("targeted_fix")
-
-
-def test_fix_strategy_promotes_generated_test_startup_and_manifest_failures_to_structural(tmp_path: Path) -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
-    orchestrator = app.state.container.fix_orchestrator
-
-    strategy = orchestrator._classify_fix_strategy(
-        raw_error="Generated app tests failed.",
-        failure_class="app/runtime_test",
-        root_cause="NameError: name 'SessionLocal' is not defined",
-        check_results=[
-            RunCheckResult(
-                name="generated_app_python_tests",
-                status="failed",
-                details="Python generated app tests failed.",
-                logs=["NameError: name 'SessionLocal' is not defined"],
-            ),
-            RunCheckResult(
-                name="generated_app_js_tests",
-                status="failed",
-                details="JS generated app tests failed.",
-                logs=["Route /client/profile referenced by miniapp/app/static/client/index.html is not declared in route_manifest.json"],
-            ),
-        ],
-        implicated_files=["miniapp/app/main.py", "miniapp/app/generated/route_manifest.json"],
+    fix_case = orchestrator._build_fix_case(
+        workspace_id="ws_test",
+        run_id="run_test",
+        attempt=1,
+        request=GenerateRequest(
+            prompt="Fix generated tests",
+            mode="fix",
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+        ),
+        check_execution=CheckExecutionRecord(
+            workspace_id="ws_test",
+            run_id="run_test",
+            results=[
+                RunCheckResult(
+                    name="generated_app_python_tests",
+                    status="failed",
+                    details="Python generated app tests failed.",
+                    logs=["NameError: name 'SessionLocal' is not defined"],
+                )
+            ],
+        ),
+        preview_details={},
+        prior_attempts=[],
+        existing_scope=[],
     )
 
-    assert strategy == "structural_fix"
+    assert fix_case.fix_strategy == "exact_fix"
 
 
 def test_fix_implicated_files_include_missing_runtime_and_profile_contract_targets(tmp_path: Path) -> None:
@@ -1006,7 +1112,7 @@ def test_structural_write_scope_keeps_missing_contract_files_editable(tmp_path: 
         ],
         "app/runtime_test",
         [],
-        "structural_fix",
+        "exact_fix",
     )
     scope_paths = {entry.file_path for entry in scope}
 
@@ -1046,7 +1152,7 @@ def test_runtime_fix_scope_excludes_generated_tests_from_write_surface(tmp_path:
         ],
         "backend_startup/import/schema",
         [],
-        "structural_fix",
+        "exact_fix",
     )
     scope_paths = {entry.file_path for entry in scope}
 
@@ -1121,7 +1227,7 @@ def test_route_manifest_prefixes_role_local_paths() -> None:
     )
 
     routes = [page["route_path"] for page in manifest["roles"]["client"]["pages"]]
-    assert routes == ["/client", "/client/new", "/client/profile"]
+    assert routes == ["/client", "/client/create", "/client/profile"]
 
 
 def test_preflight_profile_schema_contract_detects_missing_role_profile(tmp_path: Path) -> None:
@@ -1248,11 +1354,11 @@ def test_preflight_backend_syntax_issues_detect_invalid_python(tmp_path: Path) -
     )
 
 
-def test_fix_prompt_includes_strategy_specific_guidance(tmp_path: Path) -> None:
+def test_fix_prompt_uses_exact_fix_packet(tmp_path: Path) -> None:
     fix_case = FixCase(
         workspace_id="ws_test",
         run_id="run_test",
-        fix_strategy="structural_fix",
+        fix_strategy="exact_fix",
         failure_class="route_api_contract_mismatch",
         failure_signature="sig",
         implicated_files=["miniapp/app/db.py", "miniapp/app/schemas.py"],
@@ -1265,7 +1371,8 @@ def test_fix_prompt_includes_strategy_specific_guidance(tmp_path: Path) -> None:
     )
 
     assert "fix_strategy" in payload
-    assert "structural_fix" in payload
+    assert "exact_fix" in payload
+    assert "exact_failure_packet" in payload
 
 
 def test_edit_gate_allows_loading_copy_when_page_has_real_surface() -> None:
@@ -2084,7 +2191,7 @@ def test_build_generation_clusters_splits_role_ui_by_page_surface() -> None:
     )
 
     assert clusters == [
-        {"cluster_name": "backend_core", "target_files": ["miniapp/app/main.py"]},
+        {"cluster_name": "backend_support", "target_files": ["miniapp/app/main.py"]},
         {
             "cluster_name": "role_manager_ui_root",
             "target_files": [
@@ -2283,11 +2390,11 @@ def test_run_soft_completes_when_generation_returns_validation_failure(tmp_path:
         ),
     )
 
-    assert run.status == "completed"
-    assert run.apply_status == "noop"
+    assert run.status == "failed"
+    assert run.apply_status == "failed"
     assert run.draft_status == "ready"
     assert run.draft_ready is True
-    assert run.current_stage == "completed with warnings"
+    assert run.current_stage == "failed"
     assert run.failure_reason == "Connectivity validators reported unresolved issues."
 
 
@@ -2406,12 +2513,50 @@ def test_run_applies_draft_when_only_preview_warning_remains(tmp_path: Path) -> 
 
     source_readme = workspace_service.source_dir(workspace_id) / "README.md"
 
-    assert run.status == "completed"
-    assert run.apply_status == "applied"
-    assert run.outcome_kind == "warnings"
-    assert run.current_stage == "completed with warnings"
-    assert run.draft_ready is False
-    assert "preview-warning-fix" in source_readme.read_text(encoding="utf-8")
+    assert run.status == "failed"
+    assert run.apply_status == "failed"
+    assert run.current_stage == "failed"
+    assert run.draft_ready is True
+    assert "preview-warning-fix" not in source_readme.read_text(encoding="utf-8")
+
+
+def test_run_keeps_manual_review_draft_when_only_tests_and_preview_warnings_remain(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Manual Review Warning Workspace",
+            description="Manual review should stay available when only tests/preview warnings remain.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_manual_review_warning").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    workspace_service.prepare_draft(workspace.workspace_id, "run_manual_review")
+
+    run = SimpleNamespace(
+        run_id="run_manual_review",
+        workspace_id=workspace.workspace_id,
+        mode="generate",
+        apply_strategy="manual_approve",
+    )
+    job = SimpleNamespace(
+        status="failed",
+        validation_snapshot=ValidationSnapshot(
+            grounded_spec_valid=True,
+            app_ir_valid=True,
+            build_valid=True,
+            blocking=True,
+            issues=[
+                {"code": "tests.python_generated_app", "message": "Tests failed.", "severity": "high", "location": "tests", "blocking": True},
+                {"code": "connectivity.preview_route_unreachable", "message": "Preview failed.", "severity": "high", "location": "preview", "blocking": True},
+            ],
+        ),
+    )
+
+    assert run_service._should_keep_draft_for_manual_review(run, job, meaningful_paths=["miniapp/app/main.py"]) is False
 
 
 def test_run_auto_fix_triggers_for_failed_generate_preview_issue(tmp_path: Path) -> None:
@@ -2734,7 +2879,7 @@ function clearPhoneError() {
 
     app.state.container.preview_service.rebuild = fake_rebuild  # type: ignore[method-assign]
 
-    def fake_plan_patch(*, job, fix_case, file_contexts):
+    def fake_plan_patch(*, job, repair_packet, repair_feedback=None):
         del job
         workspace_service = app.state.container.workspace_service
         operations: list[dict[str, str | None]] = []
@@ -2745,7 +2890,7 @@ function clearPhoneError() {
             "miniapp/app/static/client/profile.js",
         }
         for file_path in target_files:
-            content = workspace_service.read_file(fix_case.workspace_id, file_path, run_id=fix_case.run_id)
+            content = workspace_service.read_file(repair_packet.workspace_id, file_path, run_id=repair_packet.run_id)
             if file_path.endswith("client/app.js"):
                 operations.append(
                     {
@@ -2786,6 +2931,7 @@ function clearPhoneError() {
                 )
                 rationale[file_path] = "Keep the profile error state free of undefined values."
         return {
+            "outcome": "patch_ready",
             "diagnosis": "Apply the smallest targeted fix for the broken avatar helper names and profile state cleanup.",
             "planned_targets": list(target_files),
             "expected_verification": "Static miniapp validation should pass and preview should stay healthy.",
@@ -2897,11 +3043,12 @@ async function loadProfile() {
 
     app.state.container.check_runner._static_check = always_fail
 
-    def fake_plan_patch(*, job, fix_case, file_contexts):
-        del job, fix_case
-        target = next(iter(file_contexts.keys()), "miniapp/app/static/client/app.js")
-        content = str(file_contexts.get(target) or "")
+    def fake_plan_patch(*, job, repair_packet, repair_feedback=None):
+        del job, repair_feedback
+        target = next(iter(repair_packet.file_contexts.keys()), "miniapp/app/static/client/app.js")
+        content = str(repair_packet.file_contexts.get(target) or "")
         return {
+            "outcome": "patch_ready",
             "diagnosis": "Apply a minimal static helper name fix.",
             "planned_targets": [target],
             "expected_verification": "Static miniapp validation should pass.",
@@ -2955,9 +3102,38 @@ async function loadProfile() {
         time.sleep(0.1)
 
     assert final_run["status"] == "failed"
-    assert "same failure repeated twice" in (final_run["failure_reason"] or "").lower()
+    assert "expanded-context and full-bundle retries" in (final_run["failure_reason"] or "").lower()
     artifacts = client.get(f"/runs/{run_id}/artifacts").json()
     assert artifacts["fix_attempts"]["items"]
+
+
+def test_contract_pass_falls_back_without_grounded_spec_artifact(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Fallback Spec Workspace",
+            "description": "Deterministic repair should not require grounded_spec.json to exist in the draft.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
+
+    grounded_spec = app.state.container.generation_service._resolve_grounded_spec_for_contract_pass(
+        workspace_id=workspace_id,
+        draft_run_id="run_missing_grounded_spec",
+        operations=[],
+    )
+
+    assert grounded_spec.product_goal == "Generated role-aware business mini app."
+    assert grounded_spec.target_platform == "telegram_mini_app"
+    assert grounded_spec.preview_profile == "telegram_mock"
+    assert [actor.role for actor in grounded_spec.actors] == ["client", "specialist", "manager"]
 
 
 def test_fix_orchestrator_detects_context_refusal_diagnosis() -> None:
@@ -2969,9 +3145,146 @@ def test_fix_orchestrator_detects_context_refusal_diagnosis() -> None:
     assert FixOrchestrator._looks_like_context_refusal(
         "Without access to the actual file contents, I cannot craft the patch."
     )
+    assert FixOrchestrator._looks_like_context_refusal(
+        "I need to inspect the current route wiring before I can produce a minimal patch."
+    )
+    assert FixOrchestrator._looks_like_context_refusal(
+        "I need the current contents of the implicated files to apply the fix."
+    )
     assert not FixOrchestrator._looks_like_context_refusal(
         "Patch the DOM ids and route wiring in the implicated files."
     )
+
+
+def test_fix_orchestrator_normalizes_planned_targets() -> None:
+    from app.services.fix_orchestrator import FixOrchestrator
+
+    assert FixOrchestrator._planned_target_paths(
+        {
+            "planned_targets": [
+                "./miniapp/app/main.py",
+                "miniapp/app/routes/specialist.py",
+                "miniapp/app/main.py",
+                "",
+                None,
+            ]
+        }
+    ) == [
+        "miniapp/app/main.py",
+        "miniapp/app/routes/specialist.py",
+    ]
+
+
+def test_fix_orchestrator_deterministic_contract_repair_filters_generated_artifacts(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Deterministic Repair Workspace",
+            "description": "Deterministic repair should prefer app code changes over generated artifacts",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
+
+    workspace_service = app.state.container.workspace_service
+    run_id = "run_deterministic_contract_repair"
+    draft_root = workspace_service.prepare_draft(workspace_id, run_id)
+    (draft_root / "artifacts").mkdir(parents=True, exist_ok=True)
+    (draft_root / "artifacts" / "generated_app_graph.json").write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "client": {
+                        "pages": [
+                            {
+                                "page_id": "client_home",
+                                "route_path": "/client",
+                                "file_path": "miniapp/app/static/client/index.html",
+                                "style_path": "miniapp/app/static/client/styles.css",
+                                "script_path": "miniapp/app/static/client/app.js",
+                                "is_entry": True,
+                            }
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_contract_pass(*, workspace_id, draft_run_id, page_graph, role_scope, generation_mode, operations):
+        del workspace_id, draft_run_id, page_graph, role_scope, generation_mode, operations
+        return [
+            DraftFileOperation(
+                file_path="miniapp/app/main.py",
+                operation="replace",
+                content="# deterministic main\n",
+                reason="sync main",
+            ),
+            DraftFileOperation(
+                file_path="miniapp/app/generated/runtime_manifest.json",
+                operation="replace",
+                content="{}",
+                reason="sync manifest",
+            ),
+        ]
+
+    app.state.container.fix_orchestrator.generation_service = SimpleNamespace(
+        _run_pre_apply_contract_pass=fake_contract_pass
+    )
+    orchestrator = app.state.container.fix_orchestrator
+    fix_case = FixCase(
+        workspace_id=workspace_id,
+        run_id=run_id,
+        failure_class="route_api_contract_mismatch",
+        implicated_files=["miniapp/app/main.py"],
+        write_scope=[FixScopeEntry(file_path="miniapp/app/main.py", reason="main runtime mismatch")],
+    )
+
+    operations = orchestrator._deterministic_contract_repair_operations(
+        workspace_id=workspace_id,
+        run_id=run_id,
+        fix_case=fix_case,
+        scope_entries=fix_case.write_scope,
+        generation_mode=GenerationMode.BALANCED,
+    )
+
+    assert [item.file_path for item in operations] == ["miniapp/app/main.py"]
+
+
+def test_fix_orchestrator_detects_missing_content_in_repair_operations() -> None:
+    from app.services.fix_orchestrator import FixOrchestrator
+
+    assert FixOrchestrator._operations_missing_content(
+        [
+            {"file_path": "miniapp/app/main.py", "operation": "replace", "content": None},
+            {"file_path": "miniapp/app/routes/requests.py", "operation": "create", "content": None},
+            {"file_path": "miniapp/app/routes/comments.py", "operation": "delete"},
+        ]
+    ) == [
+        "miniapp/app/main.py",
+        "miniapp/app/routes/requests.py",
+    ]
+
+
+def test_fix_orchestrator_retries_invalid_patch_validation_for_missing_content() -> None:
+    from app.services.fix_orchestrator import FixOrchestrator
+
+    assert FixOrchestrator._should_retry_patch_validation(
+        "Repair returned replace for miniapp/app/main.py without content."
+    ) is True
+    assert FixOrchestrator._should_retry_patch_validation(
+        "Repair touched files outside the allowed evidence-based scope: miniapp/app/routes/runtime.py"
+    ) is False
+    assert FixOrchestrator._should_retry_patch_validation(
+        "Repair attempted to edit generated tests instead of the app surface."
+    ) is False
 
 
 def test_structural_repeated_signature_guard_detects_expandable_scope() -> None:
@@ -2985,6 +3298,49 @@ def test_structural_repeated_signature_guard_detects_expandable_scope() -> None:
 
     assert FixOrchestrator._scope_can_still_expand(current_scope, next_scope) is True
     assert FixOrchestrator._scope_can_still_expand(next_scope, next_scope) is False
+
+
+def test_check_runner_executes_preview_smoke_even_when_generated_tests_fail() -> None:
+    preview = SimpleNamespace(status="running", url="http://preview.local", logs=["preview ok"], draft_run_id="run_test")
+    preview_service = SimpleNamespace(get=lambda _workspace_id: preview)
+    validation_suite = SimpleNamespace(validate_build=lambda _source_dir: [], validate_connectivity=lambda _source_dir: [])
+    runner = check_runner_module.CheckRunner(validation_suite, preview_service)
+    runner._static_check = lambda **_kwargs: RunCheckResult(name="changed_files_static", status="passed", details="static ok", logs=[])  # type: ignore[method-assign]
+    runner._run_python_app_tests = lambda _backend_dir: RunCheckResult(name="generated_app_python_tests", status="failed", details="python tests failed", logs=["python fail"])  # type: ignore[method-assign]
+    runner._run_js_app_tests = lambda _backend_dir: RunCheckResult(name="generated_app_js_tests", status="failed", details="js tests failed", logs=["js fail"])  # type: ignore[method-assign]
+    runner._preview_connectivity_smoke = lambda **_kwargs: RunCheckResult(name="preview_connectivity_smoke", status="passed", details="preview ok", logs=["preview ok"])  # type: ignore[method-assign]
+
+    execution = runner.run(
+        workspace_id="ws_preview",
+        run_id="run_test",
+        source_dir=Path("/tmp"),
+        changed_files=[],
+        preview_run_id="run_test",
+    )
+
+    preview_boot = next(result for result in execution.results if result.name == "preview_boot_smoke")
+    preview_connectivity = next(result for result in execution.results if result.name == "preview_connectivity_smoke")
+    assert preview_boot.status == "passed"
+    assert preview_connectivity.status == "passed"
+
+
+def test_generation_service_route_module_stub_detection_catches_inline_models_and_mutable_stores() -> None:
+    assert GenerationService._route_module_needs_stub(
+        "from fastapi import APIRouter\nfrom pydantic import BaseModel\nrouter = APIRouter()\n@router.get('/')\ndef ok(): return {}"
+    ) is True
+    assert GenerationService._route_module_needs_stub(
+        "from fastapi import APIRouter\nREQUESTS = []\nrouter = APIRouter()\n@router.get('/')\ndef ok(): return {}"
+    ) is True
+    assert GenerationService._route_module_needs_stub(
+        "from fastapi import APIRouter\nrouter = APIRouter()\n@router.get('/')\ndef ok(): return {}"
+    ) is False
+
+
+def test_generation_service_main_runtime_source_includes_runtime_manifest_endpoint() -> None:
+    content = GenerationService._deterministic_main_runtime_source(["requests", "assignments"])
+
+    assert 'RUNTIME_MANIFEST_PATH = GENERATED_DIR / "runtime_manifest.json"' in content
+    assert '@app.get("/api/runtime/{role}/manifest")' in content
 
 
 def test_run_completes_before_async_preview_rebuild_finishes(tmp_path: Path) -> None:
@@ -4498,6 +4854,12 @@ def test_generate_run_auto_switches_to_fix_on_frontend_build_failure(tmp_path: P
         run_id = request.linked_run_id or "run_test"
         draft_root = workspace_service.prepare_draft(workspace_id, run_id)
         client_routes = draft_root / "frontend" / "src" / "roles" / "client" / "ClientRoutes.tsx"
+        client_routes.parent.mkdir(parents=True, exist_ok=True)
+        if not client_routes.exists():
+            client_routes.write_text(
+                "export function ClientRoutes(): JSX.Element {\n  return <div />;\n}\n",
+                encoding="utf-8",
+            )
         client_routes.write_text(
             client_routes.read_text(encoding="utf-8").replace(
                 "export function ClientRoutes(): JSX.Element {",
@@ -4638,6 +5000,7 @@ def test_fix_orchestrator_reuses_existing_generation_draft(tmp_path: Path) -> No
         )
 
     app.state.container.fix_orchestrator._execute_exact_checks = fake_execute_exact_checks  # type: ignore[method-assign]
+    app.state.container.fix_orchestrator._execute_final_checks = fake_execute_exact_checks  # type: ignore[method-assign]
 
     job = app.state.container.fix_orchestrator.generate(
         workspace_id,
@@ -5132,14 +5495,14 @@ def test_mode_profiles_differentiate_fast_balanced_and_quality() -> None:
     assert quality.verification_depth == "deep"
 
 
-def test_task_profiles_use_mini_models_only() -> None:
+def test_task_profiles_use_codex_for_code_paths() -> None:
     for profile in TASK_PROFILES.values():
         routing = profile["routing"]
         assert routing["spec_analysis"] == "gpt-5-mini"
         assert routing["code_plan"] == "gpt-5-mini"
-        assert routing["ir_codegen"] == "gpt-5.1-codex-mini"
-        assert routing["code_edit"] == "gpt-5.1-codex-mini"
-        assert routing["repair"] == "gpt-5.1-codex-mini"
+        assert routing["ir_codegen"] == "gpt-5.3-codex"
+        assert routing["code_edit"] == "gpt-5.3-codex"
+        assert routing["repair"] == "gpt-5.3-codex"
 
 
 def test_context_pack_builder_applies_mode_budget_and_prompt_fingerprint(tmp_path: Path) -> None:
@@ -5603,3 +5966,188 @@ def test_build_validator_flags_invalid_actor_dependency(tmp_path: Path) -> None:
 
     issues = BuildValidator()._validate_route_module_import_safety(workspace_root)
     assert any(issue.code == "build.invalid_actor_dependency" for issue in issues)
+
+
+def test_compile_prompt_to_scaffold_builds_role_local_targets_and_excludes_manifests(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    spec = service._build_grounded_spec(
+        workspace_id="ws_test",
+        prompt="Create a request management app for client, specialist, and manager roles.",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        doc_refs=[],
+        template_revision_id="template",
+        prompt_turn_id="turn_1",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    role_contract, plan_result = service._compile_prompt_to_scaffold(
+        prompt=spec.product_goal,
+        grounded_spec=spec,
+        role_scope=["client", "specialist", "manager"],
+        workspace_tree=[],
+    )
+
+    assert role_contract["source"] == "thin_loop"
+    assert plan_result["scope_mode"] == "whole_file_build"
+    assert "miniapp/app/generated/route_manifest.json" not in plan_result["target_files"]
+    assert "miniapp/app/generated/runtime_manifest.json" not in plan_result["target_files"]
+    assert "miniapp/app/routes/client.py" in plan_result["backend_targets"]
+    assert "miniapp/app/routes/manager.py" in plan_result["backend_targets"]
+    assert any(path == "miniapp/app/static/client/index.html" for path in plan_result["target_files"])
+    assert any(path == "miniapp/app/static/manager/workload/index.html" for path in plan_result["target_files"])
+
+
+def test_thin_backend_targets_stay_on_canonical_workflow_modules(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    spec = service._build_grounded_spec(
+        workspace_id="ws_test",
+        prompt="Clients submit requests, choose time slots, managers assign specialists, specialists leave comments.",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        doc_refs=[],
+        template_revision_id="template",
+        prompt_turn_id="turn_1",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    targets = service._thin_backend_targets_from_spec(
+        prompt=spec.product_goal,
+        grounded_spec=spec,
+        role_scope=["client", "specialist", "manager"],
+    )
+
+    assert "miniapp/app/routes/requests.py" in targets
+    assert "miniapp/app/routes/comments.py" in targets
+    assert "miniapp/app/routes/assignments.py" in targets
+    assert "miniapp/app/routes/users.py" in targets
+    assert "miniapp/app/routes/workload.py" in targets
+    assert "miniapp/app/routes/time_slots.py" in targets
+    assert all("auth" not in item for item in targets)
+    assert all("notification" not in item for item in targets)
+
+
+def test_fix_orchestrator_uses_deterministic_companion_scope_for_page_bundles(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    orchestrator = app.state.container.fix_orchestrator
+
+    companions = orchestrator._deterministic_companion_scope("miniapp/app/static/client/requests/index.html")
+
+    assert companions == [
+        "miniapp/app/static/client/requests/index.html",
+        "miniapp/app/static/client/requests/styles.css",
+        "miniapp/app/static/client/requests/app.js",
+    ]
+
+
+def test_pre_apply_dom_contract_sync_adds_missing_page_ids() -> None:
+    html = """<!doctype html>
+<html lang="en">
+  <body>
+    <main>
+      <section>Profile</section>
+    </main>
+  </body>
+</html>
+"""
+    script = """
+document.getElementById("profile-form");
+document.getElementById("save-button");
+document.getElementById("email-error");
+document.getElementById("preview-name");
+"""
+
+    updated = GenerationService._ensure_html_dom_ids_for_script(html, script)
+
+    assert 'id="profile-form"' in updated
+    assert 'id="save-button"' in updated
+    assert 'id="email-error"' in updated
+    assert 'id="preview-name"' in updated
+
+
+def test_pre_apply_dom_contract_sync_keeps_existing_ids_intact() -> None:
+    html = """<!doctype html>
+<html lang="en">
+  <body>
+    <main>
+      <form id="profile-form"></form>
+      <button id="save-button" type="button"></button>
+    </main>
+  </body>
+</html>
+"""
+    script = """
+document.getElementById("profile-form");
+document.getElementById("save-button");
+"""
+
+    updated = GenerationService._ensure_html_dom_ids_for_script(html, script)
+
+    assert updated.count('id="profile-form"') == 1
+    assert updated.count('id="save-button"') == 1
+
+
+def test_fix_orchestrator_marks_generated_manifests_read_only(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    orchestrator = app.state.container.fix_orchestrator
+
+    assert orchestrator._is_read_only_generated_surface("miniapp/app/generated/route_manifest.json")
+    assert orchestrator._is_read_only_generated_surface("artifacts/generated_app_graph.json")
+    assert not orchestrator._is_read_only_generated_surface("miniapp/app/routes/requests.py")
+
+
+def test_endpoint_aliases_canonicalize_to_requests() -> None:
+    assert GenerationService._route_module_path_for_endpoint_name("submissions") == "miniapp/app/routes/requests.py"
+    assert GenerationService._route_module_path_for_endpoint_name("booking") == "miniapp/app/routes/requests.py"
+
+
+def test_deterministic_main_runtime_source_includes_dynamic_role_pages_and_backend_routers() -> None:
+    source = GenerationService._deterministic_main_runtime_source(["requests", "workload"])
+
+    assert 'from app.routes.requests import router as requests_router' in source
+    assert 'app.include_router(requests_router)' in source
+    assert '@app.get("/{role}/{page_path:path}", include_in_schema=False)' in source
+    assert 'dynamic_candidate = STATIC_DIR / role / f"{slug_parts[0]}_detail" / "index.html"' in source
+
+
+def test_deterministic_main_runtime_source_supports_sample_manifest_and_trailing_slash_routes() -> None:
+    source = GenerationService._deterministic_main_runtime_source(["assignments"])
+
+    assert 'if normalized == "sample":' in source
+    assert '@app.get("/{role}/", include_in_schema=False)' in source
+    assert "requested_role" in source
+    assert "_canonicalize_role_path" in source
+
+
+def test_canonicalize_local_role_links_in_text_strips_trailing_role_slashes() -> None:
+    text = '<a href="/specialist/">Desk</a><script>fetch("/client/?tab=open"); window.location.href="/manager/requests/";</script>'
+
+    normalized = GenerationService._canonicalize_local_role_links_in_text(text)
+
+    assert 'href="/specialist"' in normalized
+    assert 'fetch("/client?tab=open")' in normalized
+    assert '"/manager/requests"' in normalized
+
+
+def test_deterministic_requests_route_source_supports_submission_alias_list_route() -> None:
+    source = GenerationService._deterministic_requests_route_source()
+
+    assert '@router.get("/submissions")' in source
+
+
+def test_best_effort_apply_is_disabled_for_manual_approve_runs(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+    run = SimpleNamespace(mode="generate", apply_strategy="manual_approve")
+    job = SimpleNamespace(status="failed", failure_class="app/runtime_test", validation_snapshot=SimpleNamespace(issues=[{"blocking": True, "location": "tests", "code": "tests.python_generated_app"}]))
+
+    allowed = run_service._should_apply_best_effort_after_failed_repairs(run, job, meaningful_paths=["miniapp/app/main.py"])
+
+    assert allowed is False

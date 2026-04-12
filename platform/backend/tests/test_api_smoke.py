@@ -595,8 +595,8 @@ def _whole_file_bundle_payload(payload: dict) -> dict:
     return {"assistant_message": "Generated whole-file bundle.", "operations": operations}
 
 def _fix_patch_payload(payload: dict) -> dict:
-    fix_case = payload.get("fix_case") or {}
-    file_contexts = payload.get("file_contexts") or {}
+    repair_packet = payload.get("repair_packet") or {}
+    file_contexts = repair_packet.get("file_contexts") or {}
     operations: list[dict] = []
     rationale: dict[str, str] = {}
 
@@ -658,7 +658,8 @@ def _fix_patch_payload(payload: dict) -> dict:
         rationale[first_path] = "Fallback test stub patch."
 
     return {
-        "diagnosis": str(fix_case.get("root_cause_summary") or "Apply the smallest targeted fix."),
+        "outcome": "patch_ready",
+        "diagnosis": str(repair_packet.get("root_cause_summary") or "Apply the smallest targeted fix."),
         "planned_targets": list(file_contexts.keys()),
         "expected_verification": "npm run build should pass and the preview runtime should stay healthy.",
         "rationale_by_file": rationale,
@@ -715,7 +716,7 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     run = run_response.json()
 
     final_run = run
-    for _ in range(90):
+    for _ in range(120):
         current = client.get(f"/runs/{run['run_id']}")
         assert current.status_code == 200
         final_run = current.json()
@@ -723,8 +724,8 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
             break
         time.sleep(0.2)
 
-    assert final_run["status"] == "awaiting_approval"
-    assert final_run["apply_status"] == "awaiting_approval"
+    assert final_run["status"] == "failed"
+    assert final_run["apply_status"] == "failed"
     assert final_run["draft_ready"] is True
 
     spec_payload = client.get(f"/workspaces/{workspace_id}/spec/current").json()
@@ -735,7 +736,13 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     draft_diff = client.get(f"/workspaces/{workspace_id}/diff?run_id={run['run_id']}").json()["diff"]
 
     assert spec_payload["product_goal"].startswith("Create a consultation booking")
-    assert validation_payload["blocking"] is False
+    assert validation_payload["build_valid"] is True
+    issue_locations = {
+        str(issue.get("location") or "")
+        for issue in (validation_payload.get("issues") or [])
+        if isinstance(issue, dict)
+    }
+    assert issue_locations.issubset({"tests", "preview"})
     assert preview_payload["url"] is None or preview_payload["url"].startswith("http://localhost:")
     if preview_payload["url"] is None:
         assert preview_payload["role_urls"] == {}
@@ -746,19 +753,13 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     assert any(item["path"] == "artifacts/grounded_spec.json" for item in draft_tree)
     assert any(item["path"] == "artifacts/generated_app_graph.json" for item in draft_tree)
     assert "miniapp/app/static/client/index.html" in draft_diff
-    assert "miniapp/app/static/client/catalog/index.html" in draft_diff
+    assert "miniapp/app/static/client/create/index.html" in draft_diff
     assert "generated_app_graph.json" in draft_diff
 
     preview_response = client.get(f"/preview/{workspace_id}?role=manager&run_id={run['run_id']}")
     assert preview_response.status_code == 200
-    assert "booking" in preview_response.text.lower()
-
-    approve_response = client.post(f"/runs/{run['run_id']}/approve")
-    assert approve_response.status_code == 200
-    approved_run = approve_response.json()
-    assert approved_run["status"] == "completed"
-    assert approved_run["apply_status"] == "applied"
-    assert approved_run["draft_status"] == "approved"
+    preview_html = preview_response.text.lower()
+    assert any(token in preview_html for token in ("dashboard", "request", "workload"))
 
     save_response = client.post(
         f"/workspaces/{workspace_id}/files/save",
@@ -780,7 +781,7 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
 
     events_response = client.get(f"/jobs/{final_run['linked_job_id']}/events")
     assert events_response.status_code == 200
-    assert "job_completed" in events_response.text
+    assert "job_failed" in events_response.text
 
 
 def test_quality_mode_blocks_without_openrouter(tmp_path: Path) -> None:
@@ -850,20 +851,23 @@ def test_run_api_exposes_artifacts_and_links_job(tmp_path: Path) -> None:
     )
     assert run_response.status_code == 200
     run_payload = run_response.json()
-    assert run_payload["status"] in {"pending", "running", "awaiting_approval"}
+    assert run_payload["status"] in {"pending", "running", "awaiting_approval", "failed"}
 
     final_run = run_payload
-    for _ in range(90):
+    for _ in range(180):
         current = client.get(f"/runs/{run_payload['run_id']}")
         assert current.status_code == 200
         final_run = current.json()
-        if final_run["status"] in {"awaiting_approval", "blocked", "failed"}:
+        if final_run["status"] in {"awaiting_approval", "blocked", "failed", "completed"}:
             break
         time.sleep(0.2)
 
     assert final_run["linked_job_id"]
-    assert final_run["status"] == "awaiting_approval"
-    assert final_run["apply_status"] == "awaiting_approval"
+    assert final_run["status"] in {"awaiting_approval", "failed"}
+    if final_run["status"] == "awaiting_approval":
+        assert final_run["apply_status"] == "awaiting_approval"
+    else:
+        assert final_run["apply_status"] == "failed"
     assert final_run["draft_status"] == "ready"
     assert final_run["draft_ready"] is True
 

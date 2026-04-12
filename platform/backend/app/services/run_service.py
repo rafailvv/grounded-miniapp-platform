@@ -5,6 +5,7 @@ import re
 import threading
 import logging
 import time
+import traceback
 from datetime import datetime, timezone
 from typing import Any
 
@@ -347,6 +348,7 @@ class RunService:
         request = CreateRunRequest.model_validate(request_payload)
         run = self.get_run(run_id)
         workspace = self.workspace_service.get_workspace(run.workspace_id)
+        self.workspace_log_service.ensure_log_files(run.workspace_id)
         effective_generation_mode = self._resolve_generation_mode(workspace, request, run.intent)
         run.status = "running"
         run.generation_mode = effective_generation_mode
@@ -359,6 +361,12 @@ class RunService:
             source="run",
             message="Run started.",
             payload={"run_id": run.run_id, "mode": run.mode, "intent": run.intent},
+        )
+        self.workspace_log_service.append_api(
+            run.workspace_id,
+            source="run",
+            message="API log initialized for run.",
+            payload={"run_id": run.run_id, "mode": run.mode},
         )
         logger.info("run_started run_id=%s workspace_id=%s intent=%s", run.run_id, run.workspace_id, run.intent)
         try:
@@ -499,50 +507,43 @@ class RunService:
                     run=run,
                     change_plan=change_plan,
                 )
-                if self._should_soft_complete_with_warnings(run, job):
-                    self._mark_run_completed_with_warnings(run, job, meaningful_paths=meaningful_paths)
-                elif self._should_apply_best_effort_after_failed_repairs(run, job, meaningful_paths=meaningful_paths):
-                    self._apply_completed_draft(
-                        run,
-                        message="Applying best-effort generated draft after repair attempts were exhausted.",
-                    )
-                    self._mark_run_completed_with_warnings(
-                        run,
-                        job,
-                        meaningful_paths=meaningful_paths,
-                        draft_kept=False,
-                    )
-                elif self._should_apply_draft_with_warnings(run, job, meaningful_paths=meaningful_paths):
-                    self._apply_completed_draft(
-                        run,
-                        message="Applying generated draft despite preview-only validation warnings.",
-                    )
-                    self._mark_run_completed_with_warnings(
-                        run,
-                        job,
-                        meaningful_paths=meaningful_paths,
-                        draft_kept=False,
-                    )
-                elif job.status == "blocked":
+                if job.status == "blocked":
                     run.status = "blocked"
                     run.apply_status = "blocked"
                     run.outcome_kind = "blocked_preview_infra" if str(job.outcome_kind or "") == "blocked_preview_infra" else "blocked_generation"
-                    run.draft_status = "failed"
+                    run.draft_status = "ready" if meaningful_paths and self.workspace_service.draft_exists(run.workspace_id, run.run_id) else "failed"
+                    run.draft_ready = run.draft_status == "ready"
                     if run.current_fix_phase == "completed":
                         run.current_fix_phase = "failed"
                     run.current_stage = "stopped" if self._is_stop_requested(run.run_id) else "blocked"
                     run.progress_percent = max(run.progress_percent, 100)
+                    if run.draft_ready:
+                        run.summary = "Strict-green validation did not pass. Draft was retained for inspection."
                 else:
                     run.status = "failed"
                     run.apply_status = "failed"
                     run.outcome_kind = "blocked_preview_infra" if str(job.outcome_kind or "") == "blocked_preview_infra" else "blocked_generation"
-                    run.draft_status = "failed"
+                    run.draft_status = "ready" if meaningful_paths and self.workspace_service.draft_exists(run.workspace_id, run.run_id) else "failed"
+                    run.draft_ready = run.draft_status == "ready"
                     if run.current_fix_phase == "completed":
                         run.current_fix_phase = "failed"
                     run.current_stage = "failed"
                     run.progress_percent = max(run.progress_percent, 100)
+                    if run.draft_ready:
+                        run.summary = "Strict-green validation did not pass. Draft was retained for inspection."
 
             self._save_run(run)
+            if run.status == "awaiting_approval" and getattr(job, "status", None) != "completed":
+                self._append_job_event(
+                    run.linked_job_id,
+                    "job_completed",
+                    "Draft is ready for review with non-blocking validation warnings.",
+                    {
+                        "run_id": run.run_id,
+                        "status": run.status,
+                        "apply_status": run.apply_status,
+                    },
+                )
             queue_preview_reason: str | None = None
             queue_preview_draft_run_id: str | None = None
             if job.status == "completed" and run.apply_status == "applied":
@@ -583,7 +584,12 @@ class RunService:
                 source="run",
                 level="ERROR",
                 message="Run failed with an unexpected exception.",
-                payload={"run_id": run.run_id, "error": str(exc)},
+                payload={
+                    "run_id": run.run_id,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "traceback": traceback.format_exc(),
+                },
             )
             logger.exception("run_failed run_id=%s workspace_id=%s", run.run_id, run.workspace_id)
 
@@ -1116,94 +1122,20 @@ class RunService:
         )
 
     def _should_soft_complete_with_warnings(self, run: RunRecord, job: Any) -> bool:
-        if run.mode == "fix":
-            return False
-        if getattr(job, "status", None) not in {"blocked", "failed"}:
-            return False
-        failure_class = str(getattr(job, "failure_class", "") or "")
-        if failure_class.startswith("generation."):
-            return False
-        if (
-            failure_class.startswith("generation.edit.plan_not_materialized")
-            or failure_class.startswith("generation.edit.missing_")
-            or failure_class.startswith("generation.edit.fell_back_to_template")
-            or failure_class.startswith("generation.edit.placeholder_surface_detected")
-        ):
-            return False
-        if self._is_stop_requested(run.run_id):
-            return False
-        if str(getattr(job, "failure_class", "") or "") == "stopped_by_user":
-            return False
-        validation_snapshot = getattr(job, "validation_snapshot", None)
-        if validation_snapshot is None:
-            return False
-        issues = [
-            issue
-            for issue in getattr(validation_snapshot, "issues", [])
-            if isinstance(issue, dict) and issue.get("blocking", True)
-        ]
-        if any(str(issue.get("location") or "") in {"preview", "tests"} for issue in issues):
-            return False
-        return True
+        del run, job
+        return False
 
     def _should_apply_draft_with_warnings(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
-        if run.mode == "fix":
-            return False
-        if getattr(job, "status", None) not in {"blocked", "failed"}:
-            return False
-        if not meaningful_paths:
-            return False
-        if not self.workspace_service.draft_exists(run.workspace_id, run.run_id):
-            return False
-        validation_snapshot = getattr(job, "validation_snapshot", None)
-        if validation_snapshot is None:
-            return False
-        if not getattr(validation_snapshot, "build_valid", False):
-            return False
-        issues = [
-            issue
-            for issue in getattr(validation_snapshot, "issues", [])
-            if isinstance(issue, dict) and issue.get("blocking", True)
-        ]
-        if not issues:
-            return False
-        return all(str(issue.get("location") or "") == "preview" for issue in issues)
+        del run, job, meaningful_paths
+        return False
 
     def _should_apply_best_effort_after_failed_repairs(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
-        if run.mode == "fix":
-            return False
-        if getattr(job, "status", None) not in {"blocked", "failed"}:
-            return False
-        if not meaningful_paths:
-            return False
-        if not self.workspace_service.draft_exists(run.workspace_id, run.run_id):
-            return False
-        if self._is_stop_requested(run.run_id):
-            return False
-        failure_class = str(getattr(job, "failure_class", "") or "")
-        if failure_class in {"patch_conflict", "tooling/runtime_misconfiguration", "repair_repeated_signature"}:
-            return False
-        if failure_class.startswith("generation."):
-            return False
-        validation_snapshot = getattr(job, "validation_snapshot", None)
-        if validation_snapshot is None:
-            return False
-        issues = [
-            issue
-            for issue in getattr(validation_snapshot, "issues", [])
-            if isinstance(issue, dict) and issue.get("blocking", True)
-        ]
-        if not issues:
-            return False
-        blocking_codes = {str(issue.get("code") or "") for issue in issues}
-        if any(code.startswith("generation.") for code in blocking_codes):
-            return False
-        if any(code.startswith("preflight.") for code in blocking_codes):
-            return False
-        allowed_locations = {"tests", "preview", "build", "repair"}
-        if any(str(issue.get("location") or "") not in allowed_locations for issue in issues):
-            return False
-        return True
+        del run, job, meaningful_paths
+        return False
+
+    def _should_keep_draft_for_manual_review(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
+        del run, job, meaningful_paths
+        return False
 
     def _apply_completed_draft(self, run: RunRecord, *, message: str) -> None:
         apply_started_at = time.perf_counter()

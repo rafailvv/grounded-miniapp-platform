@@ -27,6 +27,18 @@ PLACEHOLDER_DYNAMIC_MARKERS = (
     "coming soon",
     "placeholder",
 )
+CANONICAL_ROUTE_ALIASES = {
+    "submission": "requests",
+    "submissions": "requests",
+    "booking": "requests",
+    "bookings": "requests",
+    "task": "requests",
+    "tasks": "requests",
+    "note": "comments",
+    "notes": "comments",
+    "specialist": "users",
+    "specialists": "users",
+}
 
 
 class ConnectivityValidator:
@@ -290,7 +302,8 @@ class ConnectivityValidator:
 
     @staticmethod
     def _normalize_route_stem(stem: str) -> str:
-        return stem.strip().lower().replace("-", "_")
+        normalized = stem.strip().lower().replace("-", "_")
+        return CANONICAL_ROUTE_ALIASES.get(normalized, normalized)
 
     @staticmethod
     def _contains_state(content: str, state_text: str, *, state_kind: str) -> bool:

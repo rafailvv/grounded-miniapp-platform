@@ -1,16 +1,20 @@
+PLANNING_MODEL = "gpt-5.4-mini"
+CODE_MODEL = "gpt-5.3-codex"
+SUMMARY_MODEL = "gpt-5.4-mini"
+
 TASK_PROFILES = {
     "openai_code_fast": {
         "label": "OpenAI Code Fast",
         "provider": "openai",
         "description": "Default iterative coding profile tuned for lower cost while keeping solid general coding quality.",
         "routing": {
-            "spec_analysis": "gpt-5-mini",
-            "ir_codegen": "gpt-5-mini",
-            "code_plan": "gpt-5-mini",
-            "code_edit": "gpt-5-mini",
-            "repair": "gpt-5-mini",
-            "summarize": "gpt-5-mini",
-            "cheap_task": "gpt-5-mini",
+            "spec_analysis": PLANNING_MODEL,
+            "ir_codegen": CODE_MODEL,
+            "code_plan": PLANNING_MODEL,
+            "code_edit": CODE_MODEL,
+            "repair": CODE_MODEL,
+            "summarize": SUMMARY_MODEL,
+            "cheap_task": SUMMARY_MODEL,
         },
         "default": True,
     },
@@ -19,13 +23,13 @@ TASK_PROFILES = {
         "provider": "openai",
         "description": "Balanced profile for grounded artifact generation with lower-cost reasoning and edit steps.",
         "routing": {
-            "spec_analysis": "gpt-5-mini",
-            "ir_codegen": "gpt-5-mini",
-            "code_plan": "gpt-5-mini",
-            "code_edit": "gpt-5-mini",
-            "repair": "gpt-5-mini",
-            "summarize": "gpt-5-mini",
-            "cheap_task": "gpt-5-mini",
+            "spec_analysis": PLANNING_MODEL,
+            "ir_codegen": CODE_MODEL,
+            "code_plan": PLANNING_MODEL,
+            "code_edit": CODE_MODEL,
+            "repair": CODE_MODEL,
+            "summarize": SUMMARY_MODEL,
+            "cheap_task": SUMMARY_MODEL,
         },
         "default": False,
     },

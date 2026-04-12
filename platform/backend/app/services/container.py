@@ -113,6 +113,7 @@ class ServiceContainer:
             self.prompt_state_manager,
             self.compaction_service,
             self.artifact_recorder,
+            self.generation_service,
         )
         self.run_service = RunService(
             self.store,
