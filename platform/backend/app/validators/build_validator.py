@@ -183,6 +183,16 @@ class BuildValidator:
                 file_path_raw = page.get("file_path")
                 if not isinstance(file_path_raw, str):
                     continue
+                if not str(file_path_raw).startswith(f"miniapp/app/static/{role}/"):
+                    issues.append(
+                        ValidationIssue(
+                            code="build.page_not_role_local",
+                            message=f"{role} page must live under its own role-local static directory.",
+                            severity="high",
+                            location="artifacts/generated_app_graph.json",
+                        )
+                    )
+                    continue
                 style_path_raw = str(page.get("style_path") or "")
                 script_path_raw = str(page.get("script_path") or "")
                 file_path = workspace_path / file_path_raw
@@ -520,6 +530,15 @@ class BuildValidator:
                     ValidationIssue(
                         code="build.invalid_route_import_root",
                         message=f"Route module {route_file.name} imports from miniapp.app; generated runtime modules must import from app.* inside the workspace.",
+                        severity="high",
+                        location=str(route_file.relative_to(workspace_path)),
+                    )
+                )
+            if re.search(r"Depends\(\s*lambda:\s*get_actor_context\(\)\s*\)", content):
+                issues.append(
+                    ValidationIssue(
+                        code="build.invalid_actor_dependency",
+                        message=f"Route module {route_file.name} wraps get_actor_context in lambda, which breaks FastAPI header injection.",
                         severity="high",
                         location=str(route_file.relative_to(workspace_path)),
                     )

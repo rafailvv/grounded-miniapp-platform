@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait
 from collections import Counter
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -10,6 +11,8 @@ import os
 from pathlib import Path
 import posixpath
 import re
+import shutil
+import subprocess
 import time
 from typing import Any, Callable
 
@@ -189,6 +192,31 @@ CANONICAL_ROLE_PAGES = (
     {"suffix": "workspace", "route_path": "/workspace", "file_name": "workspace.html", "page_kind": "workspace", "navigation_label": "Workspace"},
     {"suffix": "profile", "route_path": "/profile", "file_name": "profile.html", "page_kind": "profile", "navigation_label": "Profile"},
 )
+FORBIDDEN_ROUTE_MODULE_STEMS = {
+    "auth",
+    "auth_telegram",
+    "attachment",
+    "attachments",
+    "event",
+    "events",
+    "login",
+    "me",
+    "notification",
+    "notifications",
+    "polling",
+    "push",
+    "realtime",
+    "session",
+    "sessions",
+    "sse",
+    "telegram_auth",
+    "upload",
+    "uploads",
+    "webhook",
+    "webhooks",
+    "websocket",
+    "worklog",
+}
 logger = logging.getLogger(__name__)
 ACTIVE_LLM_CACHE_CONTEXT: ContextVar[dict[str, str] | None] = ContextVar("active_llm_cache_context", default=None)
 ACTIVE_LLM_CACHE_STATS: ContextVar[dict[str, Any] | None] = ContextVar("active_llm_cache_stats", default=None)
@@ -201,6 +229,13 @@ QUALITY_FIDELITY = {
 
 
 class GenerationService:
+    GROUNDED_SPEC_SECTION_TIMEOUT_SECONDS = 90
+    GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS = 120
+    CODE_PLAN_SECTION_TIMEOUT_SECONDS = 120
+    CODE_PLAN_TOTAL_TIMEOUT_SECONDS = 150
+    WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS = 240
+    STRUCTURED_LLM_TIMEOUT_SECONDS = 180
+    JSON_OBJECT_LLM_TIMEOUT_SECONDS = 120
     def __init__(
         self,
         store: StateStore,
@@ -791,7 +826,9 @@ class GenerationService:
         target_files = [path for path in target_files if path in valid_tree_paths or path.startswith("miniapp/")]
         files_to_read = [path for path in files_to_read if path in valid_tree_paths]
         shared_files = [path for path in shared_files if path in valid_tree_paths]
-        backend_targets = [path for path in backend_targets if path in valid_tree_paths or path.startswith("miniapp/")]
+        backend_targets = self._sanitize_backend_targets(
+            [path for path in backend_targets if path in valid_tree_paths or path.startswith("miniapp/")]
+        )
         plan_result = {
             "page_graph": page_graph,
             "scope_mode": checkpoint.get("scope_mode") or "minimal_patch",
@@ -806,6 +843,11 @@ class GenerationService:
             "generation_clusters": list(checkpoint.get("generation_clusters") or []),
             "require_multi_page": True,
         }
+        plan_result["target_files"] = self._sanitize_planner_target_files(
+            target_files=plan_result["target_files"],
+            backend_targets=plan_result["backend_targets"],
+            page_graph=page_graph,
+        )
         if not plan_result["target_files"]:
             return None
         return {
@@ -840,9 +882,14 @@ class GenerationService:
         self._normalize_runtime_python_paths_in_plan(plan_result)
         self._expand_page_asset_targets_in_plan(plan_result)
         plan_result["target_files"] = list(dict.fromkeys(plan_result.get("target_files") or []))
-        plan_result["backend_targets"] = list(dict.fromkeys(plan_result.get("backend_targets") or []))
+        plan_result["backend_targets"] = self._sanitize_backend_targets(list(dict.fromkeys(plan_result.get("backend_targets") or [])))
         plan_result["files_to_read"] = list(dict.fromkeys(plan_result.get("files_to_read") or []))
         plan_result["shared_files"] = list(dict.fromkeys(plan_result.get("shared_files") or []))
+        plan_result["target_files"] = self._sanitize_planner_target_files(
+            target_files=plan_result["target_files"],
+            backend_targets=plan_result["backend_targets"],
+            page_graph=plan_result["page_graph"],
+        )
         plan_result["generation_clusters"] = self._build_generation_clusters(plan_result["target_files"])
         page_graph_roles = plan_result.get("page_graph", {}).get("roles") if isinstance(plan_result.get("page_graph"), dict) else {}
         if isinstance(page_graph_roles, dict):
@@ -861,11 +908,11 @@ class GenerationService:
         )
         if proactive_contract_targets:
             plan_result["target_files"] = list(dict.fromkeys([*plan_result["target_files"], *proactive_contract_targets]))
-            plan_result["backend_targets"] = list(dict.fromkeys([*plan_result["backend_targets"], *proactive_contract_targets]))
+            plan_result["backend_targets"] = self._sanitize_backend_targets(list(dict.fromkeys([*plan_result["backend_targets"], *proactive_contract_targets])))
             if isinstance(plan_result.get("page_graph"), dict):
                 existing_backend_targets = list(plan_result["page_graph"].get("backend_targets") or [])
-                plan_result["page_graph"]["backend_targets"] = list(
-                    dict.fromkeys([*existing_backend_targets, *proactive_contract_targets])
+                plan_result["page_graph"]["backend_targets"] = self._sanitize_backend_targets(
+                    list(dict.fromkeys([*existing_backend_targets, *proactive_contract_targets]))
                 )
             plan_result["generation_clusters"] = self._build_generation_clusters(plan_result["target_files"])
             self._append_trace(
@@ -873,6 +920,48 @@ class GenerationService:
                 "planner_contract_completed",
                 "Planner targets were proactively expanded to include backend contract files before code generation.",
                 {"added_targets": proactive_contract_targets},
+            )
+        spec_contract_targets = self._detect_missing_backend_contract_targets_from_spec(
+            grounded_spec=grounded_spec,
+            page_graph=plan_result["page_graph"],
+            current_target_files=plan_result["target_files"],
+            backend_targets=plan_result["backend_targets"],
+        )
+        if spec_contract_targets:
+            plan_result["target_files"] = list(dict.fromkeys([*plan_result["target_files"], *spec_contract_targets]))
+            plan_result["backend_targets"] = self._sanitize_backend_targets(list(dict.fromkeys([*plan_result["backend_targets"], *spec_contract_targets])))
+            self._append_trace(
+                workspace_id,
+                "spec_contract_completed",
+                "Grounded spec targets were proactively expanded to include required backend contract files before code generation.",
+                {"added_targets": spec_contract_targets},
+            )
+        plan_result["target_files"] = self._sanitize_planner_target_files(
+            target_files=plan_result["target_files"],
+            backend_targets=plan_result["backend_targets"],
+            page_graph=plan_result["page_graph"],
+        )
+        target_set = set(plan_result["target_files"])
+        plan_result["backend_targets"] = [path for path in plan_result["backend_targets"] if path in target_set]
+        plan_result["shared_files"] = [path for path in plan_result["shared_files"] if path in target_set]
+        plan_result["files_to_read"] = list(
+            dict.fromkeys(
+                [
+                    *[path for path in plan_result["files_to_read"] if path in target_set],
+                    *[path for path in DESIGN_REFERENCE_FILES if path in target_set],
+                ]
+            )
+        )
+        plan_result["generation_clusters"] = self._build_generation_clusters(plan_result["target_files"])
+        page_graph_roles = plan_result.get("page_graph", {}).get("roles") if isinstance(plan_result.get("page_graph"), dict) else {}
+        if isinstance(page_graph_roles, dict):
+            plan_result["execution_plan"] = self._build_execution_plan(
+                role_scope=role_scope,
+                roles=page_graph_roles,
+                shared_files=plan_result["shared_files"],
+                backend_targets=plan_result["backend_targets"],
+                target_files=plan_result["target_files"],
+                generation_clusters=plan_result["generation_clusters"],
             )
         self._append_event(
             job,
@@ -1382,6 +1471,26 @@ class GenerationService:
 
             latest_operations = repair_result["operations"]
             latest_assistant_message = repair_result["assistant_message"] or latest_assistant_message
+            latest_operations = self._ensure_runtime_artifact_operations(
+                grounded_spec=grounded_spec,
+                page_graph=plan_result["page_graph"],
+                role_scope=role_scope,
+                generation_mode=generation_mode,
+                operations=latest_operations,
+            )
+            latest_operations = self._ensure_app_level_test_operations(
+                page_graph=plan_result["page_graph"],
+                role_scope=role_scope,
+                operations=latest_operations,
+            )
+            latest_operations = self._run_pre_apply_contract_pass(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                page_graph=plan_result["page_graph"],
+                role_scope=role_scope,
+                generation_mode=generation_mode,
+                operations=latest_operations,
+            )
             all_operations.extend(latest_operations)
             patch_envelope = self.workspace_service.build_patch_envelope_for_draft(workspace_id, draft_run_id, latest_operations)
             apply_result = self.workspace_service.apply_patch_envelope_to_draft(workspace_id, draft_run_id, patch_envelope)
@@ -1592,7 +1701,8 @@ class GenerationService:
         for attempt in range(attempts):
             planning_prompt = prompt if attempt == 0 else corrective_prompt
             try:
-                payload = self._generate_code_plan_sections(
+                payload = self._generate_code_plan_sections_with_timeout(
+                    timeout_seconds=float(self.CODE_PLAN_TOTAL_TIMEOUT_SECONDS),
                     workspace_id=workspace_id,
                     prompt=planning_prompt,
                     grounded_spec=grounded_spec,
@@ -1630,12 +1740,355 @@ class GenerationService:
                 last_gate_issues = plan_gate_issues
             except Exception as exc:
                 last_error = exc
+                if isinstance(exc, TimeoutError):
+                    try:
+                        payload = self._deterministic_code_plan_payload(
+                            prompt=planning_prompt,
+                            grounded_spec=grounded_spec,
+                            role_scope=role_scope,
+                            scope_mode=scope_mode,
+                            require_multi_page=require_multi_page,
+                        )
+                        normalized = self._normalize_model_payload(payload["payload"])
+                        planned = self._normalize_page_plan(
+                            normalized,
+                            role_scope=role_scope,
+                            scope_mode=scope_mode,
+                            require_multi_page=require_multi_page,
+                            workspace_tree=workspace_tree,
+                        )
+                        plan_gate_issues = self._page_graph_gate_issues(
+                            planned["page_graph"],
+                            role_scope,
+                            scope_mode=scope_mode,
+                            require_multi_page=require_multi_page,
+                            require_business_pages=require_business_pages,
+                        )
+                        planned["write_strategy"] = scope_mode
+                        planned["strategy_reason"] = strategy_reason
+                        planned["model"] = payload["model"]
+                        planned["plan_gate_issues"] = plan_gate_issues
+                        planned["require_business_pages"] = require_business_pages
+                        self._append_trace(
+                            workspace_id,
+                            "planning_fallback_used",
+                            "Deterministic planning fallback was used after planner timeout.",
+                            {"attempt": attempt, "timeout_seconds": self.CODE_PLAN_TOTAL_TIMEOUT_SECONDS},
+                        )
+                        return planned
+                    except Exception:
+                        pass
         if last_error is not None:
             return {"error": f"Page graph planning failed: {last_error}"}
         return {
             "error": "Page graph planning failed the structural readiness checks after retry.",
             "plan_gate_issues": last_gate_issues,
         }
+
+    def _generate_code_plan_sections_with_timeout(
+        self,
+        *,
+        timeout_seconds: float,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="code-plan-total")
+        future = executor.submit(self._generate_code_plan_sections, **kwargs)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FuturesTimeoutError as exc:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError(
+                f"Timed out waiting for code plan generation after {int(timeout_seconds)}s."
+            ) from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=False)
+
+    def _deterministic_code_plan_payload(
+        self,
+        *,
+        prompt: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        scope_mode: str,
+        require_multi_page: bool,
+    ) -> dict[str, Any]:
+        roles_payload: list[dict[str, Any]] = []
+        for role in role_scope:
+            pages = self._deterministic_role_pages(role, require_multi_page=require_multi_page)
+            roles_payload.append(
+                {
+                    "role": role,
+                    "entry_path": "/",
+                    "landing_page_id": pages[0]["page_id"],
+                    "routes_file": self._default_routes_file(role),
+                    "pages": pages,
+                }
+            )
+        backend_targets = [
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/main.py",
+            "miniapp/app/routes/health.py",
+            "miniapp/app/routes/profiles.py",
+            "miniapp/app/routes/requests.py",
+            "miniapp/app/routes/assignments.py",
+            "miniapp/app/routes/comments.py",
+            "miniapp/app/routes/status.py",
+            "miniapp/app/routes/specialists.py",
+            "miniapp/app/routes/workload.py",
+            "miniapp/app/routes/time_slots.py",
+        ]
+        payload = {
+            "summary": grounded_spec.product_goal or prompt[:160],
+            "flow_mode": "multi_page" if require_multi_page else "single_page",
+            "files_to_read": [],
+            "target_files": [],
+            "shared_files": list(SHARED_GENERATED_FILES),
+            "backend_targets": backend_targets,
+            "page_graph": {
+                "app_title": (grounded_spec.product_goal or "Generated mini-app")[:80],
+                "summary": grounded_spec.product_goal or prompt[:160],
+                "flow_mode": "multi_page" if require_multi_page else "single_page",
+                "shared_files": list(SHARED_GENERATED_FILES),
+                "backend_targets": backend_targets,
+                "roles": roles_payload,
+            },
+        }
+        return {"model": "deterministic-planner", "payload": payload}
+
+    def _deterministic_role_pages(self, role: str, *, require_multi_page: bool) -> list[dict[str, Any]]:
+        if not require_multi_page:
+            return self._fallback_page_contract(role, require_multi_page=False)
+        role_pages: dict[str, list[dict[str, Any]]] = {
+            "client": [
+                {
+                    "page_id": "client_home",
+                    "route_path": "/",
+                    "navigation_label": "Home",
+                    "component_name": "ClientHomePage",
+                    "file_path": "miniapp/app/static/client/index.html",
+                    "title": "Requests",
+                    "description": "Track the current status of submitted requests.",
+                    "purpose": "Show the client request queue and current statuses.",
+                    "page_kind": "dashboard",
+                    "primary_actions": ["Open request", "Create request", "Open profile"],
+                    "handoff_paths": ["/requests_new", "/requests_detail", "/profile"],
+                    "data_dependencies": ["/api/requests", "/api/profiles"],
+                    "loading_state": "Render a loading container while client requests are loading.",
+                    "empty_state": "Show an empty-state card when the client has no requests yet.",
+                    "error_state": "Render an error container when the client request list fails to load.",
+                },
+                {
+                    "page_id": "client_request_create",
+                    "route_path": "/requests_new",
+                    "navigation_label": "New request",
+                    "component_name": "ClientRequestCreatePage",
+                    "file_path": "miniapp/app/static/client/requests_new/index.html",
+                    "title": "Create request",
+                    "description": "Submit a new request with task details and preferred time.",
+                    "purpose": "Collect request details, preferred time, and optional notes.",
+                    "page_kind": "form",
+                    "primary_actions": ["Submit request", "Back to requests", "Open profile"],
+                    "handoff_paths": ["/", "/profile"],
+                    "data_dependencies": ["/api/requests", "/api/time-slots"],
+                    "loading_state": "Render a loading container while available time slots are loading.",
+                    "empty_state": "Show an empty-state note when no suggested time slots are available.",
+                    "error_state": "Render an error container when time slot data fails to load.",
+                },
+                {
+                    "page_id": "client_request_detail",
+                    "route_path": "/requests_detail",
+                    "navigation_label": "Request detail",
+                    "component_name": "ClientRequestDetailPage",
+                    "file_path": "miniapp/app/static/client/requests_detail/index.html",
+                    "title": "Request detail",
+                    "description": "Review the assigned specialist, comments, and status history.",
+                    "purpose": "Show a single request with comments, selected time, and current status.",
+                    "page_kind": "workspace",
+                    "primary_actions": ["Back to requests", "Open profile"],
+                    "handoff_paths": ["/", "/profile"],
+                    "data_dependencies": ["/api/requests", "/api/comments"],
+                    "loading_state": "Render a loading container while the request detail is loading.",
+                    "empty_state": "Show an empty-state note when the request detail cannot be found.",
+                    "error_state": "Render an error container when the request detail fails to load.",
+                },
+                {
+                    "page_id": "client_profile_edit",
+                    "route_path": "/profile",
+                    "navigation_label": "Profile",
+                    "component_name": "ClientProfilePage",
+                    "file_path": "miniapp/app/static/client/profile/index.html",
+                    "title": "Profile",
+                    "description": "Manage client profile details and contact info.",
+                    "purpose": "Edit client profile details used in requests.",
+                    "page_kind": "profile",
+                    "primary_actions": ["Save profile", "Back to requests"],
+                    "handoff_paths": ["/"],
+                    "data_dependencies": ["/api/profiles"],
+                    "loading_state": "Render a loading container while the profile is loading.",
+                    "empty_state": "Show an empty-state note when profile data is not available yet.",
+                    "error_state": "Render an error container when the profile fails to load.",
+                },
+            ],
+            "specialist": [
+                {
+                    "page_id": "specialist_home",
+                    "route_path": "/",
+                    "navigation_label": "Assigned work",
+                    "component_name": "SpecialistHomePage",
+                    "file_path": "miniapp/app/static/specialist/index.html",
+                    "title": "Assigned work",
+                    "description": "Review current assigned tasks and statuses.",
+                    "purpose": "Show the specialist queue with new, active, and completed work.",
+                    "page_kind": "dashboard",
+                    "primary_actions": ["Open task", "Open profile"],
+                    "handoff_paths": ["/requests_detail", "/profile"],
+                    "data_dependencies": ["/api/assignments", "/api/requests"],
+                    "loading_state": "Render a loading container while assigned work is loading.",
+                    "empty_state": "Show an empty-state note when there are no assigned tasks.",
+                    "error_state": "Render an error container when assigned work fails to load.",
+                },
+                {
+                    "page_id": "specialist_task_detail",
+                    "route_path": "/requests_detail",
+                    "navigation_label": "Task detail",
+                    "component_name": "SpecialistTaskDetailPage",
+                    "file_path": "miniapp/app/static/specialist/requests_detail/index.html",
+                    "title": "Task detail",
+                    "description": "Update task status, add comments, and review request detail.",
+                    "purpose": "Show a single assigned request with status controls and comment history.",
+                    "page_kind": "workspace",
+                    "primary_actions": ["Update status", "Add comment", "Back to queue", "Open profile"],
+                    "handoff_paths": ["/", "/profile"],
+                    "data_dependencies": ["/api/requests", "/api/comments", "/api/status"],
+                    "loading_state": "Render a loading container while task detail is loading.",
+                    "empty_state": "Show an empty-state note when the task detail is unavailable.",
+                    "error_state": "Render an error container when task detail fails to load.",
+                },
+                {
+                    "page_id": "specialist_profile_edit",
+                    "route_path": "/profile",
+                    "navigation_label": "Profile",
+                    "component_name": "SpecialistProfilePage",
+                    "file_path": "miniapp/app/static/specialist/profile/index.html",
+                    "title": "Profile",
+                    "description": "Manage specialist profile and availability information.",
+                    "purpose": "Edit specialist profile details used for assignments and workload.",
+                    "page_kind": "profile",
+                    "primary_actions": ["Save profile", "Back to queue"],
+                    "handoff_paths": ["/"],
+                    "data_dependencies": ["/api/profiles"],
+                    "loading_state": "Render a loading container while the profile is loading.",
+                    "empty_state": "Show an empty-state note when profile data is unavailable.",
+                    "error_state": "Render an error container when the profile fails to load.",
+                },
+            ],
+            "manager": [
+                {
+                    "page_id": "manager_home",
+                    "route_path": "/",
+                    "navigation_label": "Overview",
+                    "component_name": "ManagerHomePage",
+                    "file_path": "miniapp/app/static/manager/index.html",
+                    "title": "Overview",
+                    "description": "Monitor incoming work, statuses, and workload summary.",
+                    "purpose": "Show the manager summary with workload and pending requests.",
+                    "page_kind": "dashboard",
+                    "primary_actions": ["Open inbox", "Open workload", "Open profile"],
+                    "handoff_paths": ["/inbox", "/workload", "/profile"],
+                    "data_dependencies": ["/api/requests", "/api/workload"],
+                    "loading_state": "Render a loading container while overview metrics are loading.",
+                    "empty_state": "Show an empty-state note when no manager data is available.",
+                    "error_state": "Render an error container when overview data fails to load.",
+                },
+                {
+                    "page_id": "manager_inbox",
+                    "route_path": "/inbox",
+                    "navigation_label": "Inbox",
+                    "component_name": "ManagerInboxPage",
+                    "file_path": "miniapp/app/static/manager/inbox/index.html",
+                    "title": "Inbox",
+                    "description": "Review incoming requests and decide next actions.",
+                    "purpose": "Show the queue of incoming requests awaiting assignment or review.",
+                    "page_kind": "list",
+                    "primary_actions": ["Open request", "Open workload", "Back to overview"],
+                    "handoff_paths": ["/requests_detail", "/workload", "/"],
+                    "data_dependencies": ["/api/requests", "/api/status"],
+                    "loading_state": "Render a loading container while inbox requests are loading.",
+                    "empty_state": "Show an empty-state note when there are no pending requests.",
+                    "error_state": "Render an error container when inbox requests fail to load.",
+                },
+                {
+                    "page_id": "manager_request_detail",
+                    "route_path": "/requests_detail",
+                    "navigation_label": "Request detail",
+                    "component_name": "ManagerRequestDetailPage",
+                    "file_path": "miniapp/app/static/manager/requests_detail/index.html",
+                    "title": "Request detail",
+                    "description": "Review the request, comments, status, and assignment state.",
+                    "purpose": "Show a single request with its specialist assignment and execution history.",
+                    "page_kind": "workspace",
+                    "primary_actions": ["Assign specialist", "Update status", "Back to inbox", "Open profile"],
+                    "handoff_paths": ["/requests_detail_assign", "/inbox", "/profile"],
+                    "data_dependencies": ["/api/requests", "/api/comments", "/api/assignments", "/api/specialists"],
+                    "loading_state": "Render a loading container while request detail is loading.",
+                    "empty_state": "Show an empty-state note when the request detail is unavailable.",
+                    "error_state": "Render an error container when request detail fails to load.",
+                },
+                {
+                    "page_id": "manager_assign_panel",
+                    "route_path": "/requests_detail_assign",
+                    "navigation_label": "Assign",
+                    "component_name": "ManagerAssignPanelPage",
+                    "file_path": "miniapp/app/static/manager/requests_detail_assign/index.html",
+                    "title": "Assign specialist",
+                    "description": "Choose a specialist and confirm the assignment for the current request.",
+                    "purpose": "Select a specialist, confirm schedule, and persist the assignment.",
+                    "page_kind": "form",
+                    "primary_actions": ["Confirm assignment", "Back to request"],
+                    "handoff_paths": ["/requests_detail", "/workload"],
+                    "data_dependencies": ["/api/assignments", "/api/specialists", "/api/time-slots"],
+                    "loading_state": "Render a loading container while assignment options are loading.",
+                    "empty_state": "Show an empty-state note when no specialist options are available.",
+                    "error_state": "Render an error container when assignment options fail to load.",
+                },
+                {
+                    "page_id": "manager_workload",
+                    "route_path": "/workload",
+                    "navigation_label": "Workload",
+                    "component_name": "ManagerWorkloadPage",
+                    "file_path": "miniapp/app/static/manager/workload/index.html",
+                    "title": "Workload",
+                    "description": "Review team workload and capacity by specialist.",
+                    "purpose": "Show workload summaries and capacity for each specialist.",
+                    "page_kind": "workspace",
+                    "primary_actions": ["Open inbox", "Back to overview", "Open profile"],
+                    "handoff_paths": ["/inbox", "/", "/profile"],
+                    "data_dependencies": ["/api/workload", "/api/specialists"],
+                    "loading_state": "Render a loading container while workload data is loading.",
+                    "empty_state": "Show an empty-state note when workload data is unavailable.",
+                    "error_state": "Render an error container when workload data fails to load.",
+                },
+                {
+                    "page_id": "manager_profile_edit",
+                    "route_path": "/profile",
+                    "navigation_label": "Profile",
+                    "component_name": "ManagerProfilePage",
+                    "file_path": "miniapp/app/static/manager/profile/index.html",
+                    "title": "Profile",
+                    "description": "Manage manager profile details used in coordination flows.",
+                    "purpose": "Edit manager profile settings and contact details.",
+                    "page_kind": "profile",
+                    "primary_actions": ["Save profile", "Back to overview"],
+                    "handoff_paths": ["/"],
+                    "data_dependencies": ["/api/profiles"],
+                    "loading_state": "Render a loading container while the profile is loading.",
+                    "empty_state": "Show an empty-state note when profile data is unavailable.",
+                    "error_state": "Render an error container when the profile fails to load.",
+                },
+            ],
+        }
+        return role_pages.get(role) or self._fallback_page_contract(role, require_multi_page=require_multi_page)
 
     def _generate_code_plan_sections(
         self,
@@ -1653,9 +2106,9 @@ class GenerationService:
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
         sections_started = time.perf_counter()
-
-        async def build_sections() -> tuple[dict[str, Any], dict[str, Any]]:
-            graph_task = asyncio.to_thread(
+        executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="code-plan")
+        futures = {
+            "graph": executor.submit(
                 self._generate_structured_with_retry,
                 role="code_plan",
                 schema_name="page_graph_structure_v1",
@@ -1680,8 +2133,8 @@ class GenerationService:
                     generation_mode=generation_mode,
                     creative_direction=creative_direction,
                 ),
-            )
-            targeting_task = asyncio.to_thread(
+            ),
+            "targeting": executor.submit(
                 self._generate_structured_with_retry,
                 role="code_plan",
                 schema_name="page_graph_targeting_v1",
@@ -1706,10 +2159,50 @@ class GenerationService:
                     generation_mode=generation_mode,
                     creative_direction=creative_direction,
                 ),
-            )
-            return await asyncio.gather(graph_task, targeting_task)
+            ),
+        }
+        section_timeout = float(self.CODE_PLAN_SECTION_TIMEOUT_SECONDS)
+        completed, pending = wait(set(futures.values()), timeout=section_timeout, return_when=ALL_COMPLETED)
+        section_payloads: dict[str, dict[str, Any]] = {}
+        section_errors: dict[str, str] = {}
+        try:
+            for section_name, future in futures.items():
+                if future in pending:
+                    section_errors[section_name] = "timeout"
+                    continue
+                try:
+                    section_payloads[section_name] = future.result()
+                except Exception as exc:  # pragma: no cover - defensive aggregation
+                    section_errors[section_name] = str(exc)
+            if pending:
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=False, cancel_futures=False)
+        finally:
+            if pending:
+                for future in pending:
+                    future.cancel()
 
-        graph_payload, targeting_payload = asyncio.run(build_sections())
+        deterministic_payload = None
+        if section_errors:
+            deterministic_payload = self._deterministic_code_plan_payload(
+                prompt=prompt,
+                grounded_spec=grounded_spec,
+                role_scope=role_scope,
+                scope_mode=scope_mode,
+                require_multi_page=require_multi_page,
+            )["payload"]
+            self._append_trace(
+                workspace_id,
+                "planning_section_fallback_used",
+                "Code plan used deterministic fallback for incomplete planning sections.",
+                {
+                    "duration_ms": int((time.perf_counter() - sections_started) * 1000),
+                    "fallback_sections": sorted(section_errors),
+                    "section_errors": section_errors,
+                },
+            )
+
         self._append_trace(
             workspace_id,
             "code_plan_sections_parallel",
@@ -1719,12 +2212,32 @@ class GenerationService:
                 "sections": ["graph", "targeting"],
             },
         )
+        graph_payload_normalized = (
+            self._normalize_model_payload(section_payloads["graph"]["payload"])
+            if "graph" in section_payloads
+            else {
+                key: deterministic_payload[key]
+                for key in ["summary", "flow_mode", "page_graph"]
+            }
+        )
+        targeting_payload_normalized = (
+            self._normalize_model_payload(section_payloads["targeting"]["payload"])
+            if "targeting" in section_payloads
+            else {
+                key: deterministic_payload[key]
+                for key in ["files_to_read", "target_files", "shared_files", "backend_targets"]
+            }
+        )
         merged_payload = {
-            **self._normalize_model_payload(graph_payload["payload"]),
-            **self._normalize_model_payload(targeting_payload["payload"]),
+            **graph_payload_normalized,
+            **targeting_payload_normalized,
         }
         return {
-            "model": targeting_payload["model"],
+            "model": (
+                section_payloads.get("targeting", {}).get("model")
+                or section_payloads.get("graph", {}).get("model")
+                or "deterministic-planner"
+            ),
             "payload": merged_payload,
             "response_mode": "code_plan_sections",
         }
@@ -1855,6 +2368,7 @@ class GenerationService:
         static_contract_gap_targets = self._detect_missing_static_asset_targets(
             generated_page_sources=generated_page_sources,
             current_target_files=effective_target_files,
+            page_graph=page_graph,
         )
         contract_gap_targets = list(dict.fromkeys([*backend_contract_gap_targets, *static_contract_gap_targets]))
         if contract_gap_targets:
@@ -1998,28 +2512,55 @@ class GenerationService:
         if not clusters:
             return {"error": "Whole-file generation requires at least one canonical target file."}
 
-        async def resolve_clusters() -> list[dict[str, Any]]:
-            tasks = [
-                asyncio.to_thread(
-                    self._timed_whole_file_cluster,
-                    cluster_name=str(cluster["cluster_name"]),
-                    cluster_targets=list(cluster["target_files"]),
-                    prompt=prompt,
-                    grounded_spec=grounded_spec,
-                    role_scope=role_scope,
-                    role_contract=role_contract,
-                    page_graph=page_graph,
-                    scope_mode=scope_mode,
-                    intent=intent,
-                    file_contexts=file_contexts,
-                    generation_mode=generation_mode,
-                    creative_direction=creative_direction,
+        results: list[dict[str, Any]] = []
+        for cluster in clusters:
+            cluster_name = str(cluster["cluster_name"])
+            logger.info(
+                "whole_file_cluster_started workspace_id=%s draft_run_id=%s cluster=%s targets=%s",
+                workspace_id,
+                draft_run_id,
+                cluster_name,
+                len(list(cluster["target_files"])),
+            )
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"whole-file-{cluster_name}")
+            future = executor.submit(
+                self._timed_whole_file_cluster,
+                cluster_name=cluster_name,
+                cluster_targets=list(cluster["target_files"]),
+                prompt=prompt,
+                grounded_spec=grounded_spec,
+                role_scope=role_scope,
+                role_contract=role_contract,
+                page_graph=page_graph,
+                scope_mode=scope_mode,
+                intent=intent,
+                file_contexts=file_contexts,
+                generation_mode=generation_mode,
+                creative_direction=creative_direction,
+            )
+            try:
+                cluster_result = future.result(timeout=self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS)
+                logger.info(
+                    "whole_file_cluster_completed workspace_id=%s draft_run_id=%s cluster=%s duration_ms=%s",
+                    workspace_id,
+                    draft_run_id,
+                    cluster_name,
+                    cluster_result.get("duration_ms"),
                 )
-                for cluster in clusters
-            ]
-            return await asyncio.gather(*tasks)
-
-        results = asyncio.run(resolve_clusters())
+                results.append(cluster_result)
+            except FuturesTimeoutError:
+                executor.shutdown(wait=False, cancel_futures=True)
+                return {
+                    "error": (
+                        "Whole-file generation timed out while waiting for cluster result: "
+                        f"{cluster_name}"
+                    )
+                }
+            except Exception as exc:
+                executor.shutdown(wait=False, cancel_futures=True)
+                return {"error": f"Whole-file cluster failed for {cluster_name}: {exc}"}
+            else:
+                executor.shutdown(wait=False, cancel_futures=False)
         operations: list[DraftFileOperation] = [
             DraftFileOperation(
                 file_path="artifacts/generated_app_graph.json",
@@ -2293,6 +2834,8 @@ class GenerationService:
         parts = name.split(".")
         stem = parts[0]
         suffix = f".{'.'.join(parts[1:])}" if len(parts) > 1 else ""
+        if stem.startswith("__") and stem.endswith("__"):
+            return f"{stem.lower()}{suffix.lower()}"
         normalized = re.sub(r"[^a-z0-9]+", "_", stem.lower()).strip("_")
         normalized = re.sub(r"_+", "_", normalized)
         return f"{normalized or 'file'}{suffix.lower()}"
@@ -2360,6 +2903,8 @@ class GenerationService:
             if not candidate or ".." in candidate:
                 continue
             if any(char.isspace() for char in candidate):
+                continue
+            if candidate.startswith(("miniapp/", "artifacts/")) and Path(candidate).suffix == "":
                 continue
             normalized.append(candidate)
         return list(dict.fromkeys(normalized))
@@ -2532,7 +3077,15 @@ class GenerationService:
         raw_files_to_read = self._normalize_path_list(payload.get("files_to_read"), [])
         files_to_read = self._collect_files_to_read(raw_files_to_read, target_files, workspace_tree)
         shared_files = [path for path in shared_files if path in set(target_files)]
-        backend_targets = [path for path in backend_targets if path in set(target_files)]
+        backend_targets = self._sanitize_backend_targets([path for path in backend_targets if path in set(target_files)])
+        target_files = self._sanitize_planner_target_files(
+            target_files=target_files,
+            backend_targets=backend_targets,
+            page_graph={"roles": roles},
+        )
+        target_set = set(target_files)
+        shared_files = [path for path in shared_files if path in target_set]
+        backend_targets = [path for path in backend_targets if path in target_set]
         generation_clusters = self._build_generation_clusters(target_files)
         execution_plan = self._build_execution_plan(
             role_scope=role_scope,
@@ -2601,6 +3154,15 @@ class GenerationService:
             for page in deduped
             if isinstance(page, dict)
         }
+        for page in deduped:
+            if not isinstance(page, dict):
+                continue
+            page_id = str(page.get("page_id") or "").strip().lower()
+            route_path = str(page.get("route_path") or "")
+            if not page_id or not route_path:
+                continue
+            stripped_page_id = re.sub(rf"^{role}[_-]", "", page_id)
+            page_id_to_route.setdefault(stripped_page_id, route_path)
         for page in deduped:
             normalized_handoffs: list[str] = []
             for path in page["handoff_paths"]:
@@ -2681,7 +3243,14 @@ class GenerationService:
         data_dependencies = self._normalize_string_list(payload.get("data_dependencies"))
         default_file_path = self._default_page_file(role, component_name, route_path=route_path)
         file_path = file_path_candidates[0] if file_path_candidates else default_file_path
-        if self._should_rewrite_page_file_for_route(route_path=route_path, file_path=file_path, page_id=str(payload.get("page_id") or "")):
+        if not self._is_role_local_page_file(role=role, file_path=file_path):
+            file_path = default_file_path
+        elif self._should_rewrite_page_file_for_route(
+            role=role,
+            route_path=route_path,
+            file_path=file_path,
+            page_id=str(payload.get("page_id") or ""),
+        ):
             file_path = default_file_path
         elif self._should_canonicalize_page_file_alias(role=role, route_path=route_path, file_path=file_path, default_file_path=default_file_path):
             file_path = default_file_path
@@ -2787,6 +3356,7 @@ class GenerationService:
             normalized = f"/{normalized}"
         role_prefix = f"/{role}"
         compact_prefix = f"/{role}-"
+        underscore_prefix = f"/{role}_"
         if normalized == role_prefix:
             return "/"
         if normalized.startswith(f"{role_prefix}/"):
@@ -2795,6 +3365,17 @@ class GenerationService:
         if normalized.startswith(compact_prefix):
             suffix = normalized[len(compact_prefix):]
             return f"/{suffix}" if suffix else "/"
+        if normalized.startswith(underscore_prefix):
+            suffix = normalized[len(underscore_prefix):]
+            normalized = f"/{suffix}" if suffix else "/"
+        if normalized in {"/home", "/dashboard"}:
+            return "/"
+        if role == "client" and normalized in {"/new", "/request_new", "/request_create"}:
+            return "/create"
+        if role == "specialist" and normalized in {"/tasks", "/assigned", "/queue"}:
+            return "/requests"
+        if role == "manager" and normalized in {"/tasks", "/queue", "/overview"}:
+            return "/requests"
         return normalized
 
     @staticmethod
@@ -2809,20 +3390,28 @@ class GenerationService:
         return f"/{role}{normalized}"
 
     @classmethod
-    def _should_rewrite_page_file_for_route(cls, *, route_path: str, file_path: str, page_id: str) -> bool:
+    @staticmethod
+    def _is_role_local_page_file(*, role: str, file_path: str) -> bool:
+        normalized = file_path.strip().replace("\\", "/").lower()
+        return normalized.startswith(f"miniapp/app/static/{role}/") and normalized.endswith(".html")
+
+    @classmethod
+    def _should_rewrite_page_file_for_route(cls, *, role: str, route_path: str, file_path: str, page_id: str) -> bool:
         normalized_path = file_path.strip()
         normalized_suffix = normalized_path.replace("\\", "/").lower()
         page_id_lower = page_id.lower()
+        if not cls._is_role_local_page_file(role=role, file_path=file_path):
+            return True
         if not normalized_suffix.endswith(".html"):
             return True
         if route_path == "/":
-            return re.fullmatch(r"miniapp/app/static/[^/]+/index\.html", normalized_suffix) is None
+            return re.fullmatch(rf"miniapp/app/static/{role}/index\.html", normalized_suffix) is None
         if route_path.rstrip("/") == "/profile" or "profile" in page_id_lower:
-            return not normalized_suffix.endswith("/profile/index.html")
+            return normalized_suffix != f"miniapp/app/static/{role}/profile/index.html"
         return (
             not normalized_suffix.endswith("/index.html")
-            or re.fullmatch(r"miniapp/app/static/[^/]+/index\.html", normalized_suffix) is not None
-            or normalized_suffix.endswith("/profile/index.html")
+            or re.fullmatch(rf"miniapp/app/static/{role}/index\.html", normalized_suffix) is not None
+            or normalized_suffix.endswith(f"/{role}/profile/index.html")
         )
 
     @staticmethod
@@ -3033,17 +3622,145 @@ class GenerationService:
         return False
 
     def _canonicalize_target_files(self, target_files: list[str], *, scope_mode: str) -> list[str]:
-        canonical = [
-            path
-            for path in target_files
-            if self._is_canonical_target_path(path)
-            and not self._is_legacy_role_entry_file(path)
-            and path not in TEMPLATE_OWNED_SHARED_FILES
-        ]
+        canonical: list[str] = []
+        for path in target_files:
+            if not isinstance(path, str):
+                continue
+            normalized_path = self._canonicalize_static_target_path(path)
+            if not normalized_path:
+                continue
+            if (
+                self._is_canonical_target_path(normalized_path)
+                and not self._is_legacy_role_entry_file(normalized_path)
+                and normalized_path not in TEMPLATE_OWNED_SHARED_FILES
+            ):
+                canonical.append(normalized_path)
         expanded = self._expand_page_triplet_targets(canonical)
         if scope_mode == "minimal_patch":
             return list(dict.fromkeys(expanded))
         return list(dict.fromkeys(expanded))
+
+    @classmethod
+    def _canonicalize_static_target_path(cls, path: str) -> str | None:
+        normalized = cls._normalize_generated_file_path(path)
+        if not normalized:
+            return None
+        if normalized.startswith("miniapp/app/static/shared/"):
+            allowed_shared = {
+                "miniapp/app/static/shared/base.css",
+                "miniapp/app/static/shared/common.js",
+            }
+            return normalized if normalized in allowed_shared else None
+        role_root_match = re.fullmatch(
+            r"miniapp/app/static/(?P<role>client|specialist|manager)/(?P<name>index\.html|styles\.css|app\.js)",
+            normalized,
+        )
+        if role_root_match:
+            return normalized
+        nested_match = re.fullmatch(
+            r"miniapp/app/static/(?P<role>client|specialist|manager)/(?P<rest>.+)",
+            normalized,
+        )
+        if not nested_match:
+            return normalized
+        role = nested_match.group("role")
+        rest = nested_match.group("rest")
+        if re.fullmatch(r"[^/]+/(index\.html|styles\.css|app\.js)", rest):
+            return normalized
+        rest_path = Path(rest)
+        suffix = rest_path.suffix.lower()
+        if suffix not in {".html", ".css", ".js"}:
+            return normalized
+        parent_parts = [part for part in rest_path.parent.parts if part not in {".", ""}]
+        stem = rest_path.stem.lower()
+        slug_parts = [re.sub(r"[^a-z0-9]+", "_", part.lower()).strip("_") for part in parent_parts]
+        if stem not in {"index", "styles", "app"}:
+            slug_parts.append(re.sub(r"[^a-z0-9]+", "_", stem).strip("_"))
+        slug = "_".join(part for part in slug_parts if part)
+        if not slug:
+            return normalized
+        if suffix == ".html":
+            return f"miniapp/app/static/{role}/{slug}/index.html"
+        if suffix == ".css":
+            return f"miniapp/app/static/{role}/{slug}/styles.css"
+        return f"miniapp/app/static/{role}/{slug}/app.js"
+
+    @staticmethod
+    def _planned_page_static_targets(page_graph: dict[str, Any]) -> set[str]:
+        targets: set[str] = set()
+        for role_payload in (page_graph.get("roles") or {}).values():
+            if not isinstance(role_payload, dict):
+                continue
+            for page in role_payload.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                for key in ("file_path", "style_path", "script_path"):
+                    path = page.get(key)
+                    if isinstance(path, str) and path.startswith("miniapp/app/static/"):
+                        targets.add(path)
+        return targets
+
+    @classmethod
+    def _prune_non_page_static_targets(cls, target_files: list[str], *, page_graph: dict[str, Any]) -> list[str]:
+        allowed_page_static = cls._planned_page_static_targets(page_graph)
+        pruned: list[str] = []
+        for path in target_files:
+            if not isinstance(path, str):
+                continue
+            if path.startswith("miniapp/app/static/shared/"):
+                if path in {
+                    "miniapp/app/static/shared/base.css",
+                    "miniapp/app/static/shared/common.js",
+                }:
+                    pruned.append(path)
+                continue
+            if re.match(r"miniapp/app/static/(client|specialist|manager)/", path):
+                if path in allowed_page_static:
+                    pruned.append(path)
+                continue
+            pruned.append(path)
+        return list(dict.fromkeys(pruned))
+
+    @classmethod
+    def _sanitize_backend_targets(cls, backend_targets: list[str]) -> list[str]:
+        sanitized: list[str] = []
+        for path in backend_targets:
+            if not isinstance(path, str):
+                continue
+            normalized = path.strip().replace("\\", "/")
+            if normalized == "miniapp/app/generated/route_manifest.json":
+                continue
+            if normalized.startswith("miniapp/app/routes/") and normalized.endswith(".py"):
+                stem = Path(normalized).stem.lower()
+                if stem in FORBIDDEN_ROUTE_MODULE_STEMS:
+                    continue
+            sanitized.append(normalized)
+        return list(dict.fromkeys(sanitized))
+
+    @classmethod
+    def _sanitize_planner_target_files(
+        cls,
+        *,
+        target_files: list[str],
+        backend_targets: list[str],
+        page_graph: dict[str, Any],
+    ) -> list[str]:
+        sanitized_backend_targets = set(cls._sanitize_backend_targets(backend_targets))
+        pruned_static = set(cls._prune_non_page_static_targets(target_files, page_graph=page_graph))
+        sanitized: list[str] = []
+        for path in target_files:
+            if not isinstance(path, str):
+                continue
+            normalized = path.strip().replace("\\", "/")
+            if normalized == "miniapp/app/generated/route_manifest.json":
+                continue
+            if normalized.startswith("miniapp/app/routes/"):
+                if normalized not in sanitized_backend_targets and normalized != "miniapp/app/routes/profiles.py":
+                    continue
+            if normalized.startswith("miniapp/app/static/") and normalized not in pruned_static:
+                continue
+            sanitized.append(normalized)
+        return list(dict.fromkeys(sanitized))
 
     @classmethod
     def _expand_page_triplet_targets(cls, target_files: list[str]) -> list[str]:
@@ -3064,25 +3781,92 @@ class GenerationService:
 
     @staticmethod
     def _build_generation_clusters(target_files: list[str]) -> list[dict[str, Any]]:
-        groups: dict[str, list[str]] = {name: [] for name in BUNDLE_CLUSTER_ORDER}
+        backend_targets: list[str] = []
+        shared_static_targets: list[str] = []
+        role_page_groups: dict[tuple[str, str], list[str]] = {}
         for path in target_files:
             if path.startswith("miniapp/"):
+                if path.startswith("miniapp/app/static/shared/"):
+                    shared_static_targets.append(path)
+                    continue
                 if path.startswith("miniapp/app/static/manager/"):
-                    groups["role_manager_ui"].append(path)
+                    role = "manager"
+                elif path.startswith("miniapp/app/static/specialist/"):
+                    role = "specialist"
+                elif path.startswith("miniapp/app/static/client/"):
+                    role = "client"
+                else:
+                    backend_targets.append(path)
                     continue
-                if path.startswith("miniapp/app/static/specialist/"):
-                    groups["role_specialist_ui"].append(path)
-                    continue
-                if path.startswith("miniapp/app/static/client/"):
-                    groups["role_client_ui"].append(path)
-                    continue
-                groups["backend_core"].append(path)
+                cluster_suffix = GenerationService._static_cluster_suffix_for_path(path)
+                role_page_groups.setdefault((role, cluster_suffix), []).append(path)
                 continue
-        return [
-            {"cluster_name": name, "target_files": list(dict.fromkeys(paths))}
-            for name, paths in groups.items()
-            if paths
-        ]
+        clusters: list[dict[str, Any]] = []
+        if shared_static_targets:
+            clusters.append(
+                {
+                    "cluster_name": "shared_static",
+                    "target_files": list(dict.fromkeys(shared_static_targets)),
+                }
+            )
+        if backend_targets:
+            backend_groups: dict[str, list[str]] = {}
+            support_targets: list[str] = []
+            for path in list(dict.fromkeys(backend_targets)):
+                cluster_name = GenerationService._backend_cluster_name_for_path(path)
+                if cluster_name == "backend_support":
+                    support_targets.append(path)
+                    continue
+                backend_groups.setdefault(cluster_name, []).append(path)
+            if support_targets:
+                clusters.append({"cluster_name": "backend_support", "target_files": support_targets})
+            for cluster_name in sorted(backend_groups):
+                clusters.append({"cluster_name": cluster_name, "target_files": backend_groups[cluster_name]})
+        role_priority = {"manager": 0, "specialist": 1, "client": 2}
+        for (role, cluster_suffix), paths in sorted(
+            role_page_groups.items(),
+            key=lambda item: (role_priority.get(item[0][0], 99), 0 if item[0][1] == "root" else 1, item[0][1]),
+        ):
+            clusters.append(
+                {
+                    "cluster_name": f"role_{role}_ui_{cluster_suffix}",
+                    "target_files": list(dict.fromkeys(paths)),
+                }
+            )
+        return clusters
+
+    @staticmethod
+    def _backend_cluster_name_for_path(path: str) -> str:
+        normalized = path.strip().replace("\\", "/")
+        if normalized.startswith("miniapp/app/routes/") and normalized.endswith(".py"):
+            stem = Path(normalized).stem.lower()
+            if stem in {"__init__", "profiles"}:
+                return "backend_support"
+            return f"backend_route_{re.sub(r'[^a-z0-9_]+', '_', stem).strip('_') or 'module'}"
+        if normalized in {
+            "miniapp/app/main.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+        }:
+            return "backend_support"
+        return "backend_support"
+
+    @staticmethod
+    def _static_cluster_suffix_for_path(path: str) -> str:
+        normalized = path.strip().replace("\\", "/")
+        root_match = re.fullmatch(
+            r"miniapp/app/static/(client|specialist|manager)/(index\.html|styles\.css|app\.js)",
+            normalized,
+        )
+        if root_match:
+            return "root"
+        page_match = re.fullmatch(
+            r"miniapp/app/static/(client|specialist|manager)/([^/]+)/(index\.html|styles\.css|app\.js)",
+            normalized,
+        )
+        if page_match:
+            return re.sub(r"[^a-z0-9_]+", "_", page_match.group(2).lower()).strip("_") or "page"
+        return "misc"
 
     @classmethod
     def _expand_cluster_targets_for_safe_companions(
@@ -3092,12 +3876,11 @@ class GenerationService:
         cluster_targets: list[str],
         invalid_paths: list[str],
     ) -> list[str] | None:
-        role_prefix_map = {
-            "role_client_ui": "miniapp/app/static/client/",
-            "role_specialist_ui": "miniapp/app/static/specialist/",
-            "role_manager_ui": "miniapp/app/static/manager/",
-        }
-        allowed_prefix = role_prefix_map.get(cluster_name)
+        allowed_prefix = None
+        for role in ("client", "specialist", "manager"):
+            if cluster_name.startswith(f"role_{role}_ui"):
+                allowed_prefix = f"miniapp/app/static/{role}/"
+                break
         if not allowed_prefix:
             return None
         additions: list[str] = []
@@ -4017,6 +4800,11 @@ class GenerationService:
                     "Every planned page must materialize as a page triplet: one HTML, one CSS, and one JS file that share the same stem.",
                     "Do not collapse multiple pages into shared role-level app.js/styles.css files.",
                     "Do not leave page behavior or styling inline when page-level JS/CSS targets exist.",
+                    "For frontend calls to /api/... use window.miniappApiFetch(...) from /static/preview_bridge.js instead of raw fetch(...).",
+                    "For backend dependencies use Depends(get_actor_context), never Depends(lambda: get_actor_context()).",
+                    "When linking to detail routes from JS, keep route templates aligned with route_manifest paths and use dynamic placeholders consistently.",
+                    "Do not render manual Refresh buttons or links; rely on normal loading states and existing actions.",
+                    "Do not pass typing.Literal aliases directly to sqlalchemy.Enum; keep persisted status fields as string-backed columns unless a real Python Enum class is defined.",
                     "If the workspace uses miniapp/app, do not switch to miniapp/src. If the workspace uses miniapp/app/static, do not switch to a separate frontend application unless those exact files are in target_files.",
                     "Do not generate auth/login/me endpoints, auth bootstrap modules, or /api/auth references for the generated app.",
                     "Keep the template profile contract intact: routes/profiles.py stays supported, db.py keeps RoleProfileRecord, and route manifests must retain each role's /profile page.",
@@ -4382,7 +5170,7 @@ class GenerationService:
             if contract_path not in existing_targets:
                 inferred.append(contract_path)
         for endpoint_name in sorted(endpoint_names):
-            if endpoint_name in {"health", "profiles", "auth", "login", "me"}:
+            if GenerationService._is_forbidden_endpoint_name(endpoint_name):
                 continue
             inferred_path = GenerationService._route_module_path_for_endpoint_name(endpoint_name)
             if inferred_path not in existing_targets:
@@ -4396,14 +5184,20 @@ class GenerationService:
         *,
         generated_page_sources: dict[str, str],
         current_target_files: list[str],
+        page_graph: dict[str, Any],
     ) -> list[str]:
         existing_targets = set(current_target_files)
+        allowed_page_assets = GenerationService._planned_page_static_targets(page_graph)
         inferred: list[str] = []
         for source_path, source in generated_page_sources.items():
             if not isinstance(source, str):
                 continue
             for asset_path in GenerationService._extract_static_asset_targets(source, source_path=source_path):
-                if asset_path not in existing_targets:
+                if asset_path.startswith("miniapp/app/static/shared/"):
+                    if asset_path not in existing_targets:
+                        inferred.append(asset_path)
+                    continue
+                if asset_path in allowed_page_assets and asset_path not in existing_targets:
                     inferred.append(asset_path)
         return list(dict.fromkeys(inferred))
 
@@ -4470,13 +5264,50 @@ class GenerationService:
             if contract_path not in existing_targets:
                 inferred.append(contract_path)
         for endpoint_name in sorted(endpoint_names):
-            if endpoint_name in {"health", "profiles", "auth", "login", "me"}:
+            if GenerationService._is_forbidden_endpoint_name(endpoint_name):
                 continue
             inferred_path = GenerationService._route_module_path_for_endpoint_name(endpoint_name)
             if inferred_path not in existing_targets:
                 inferred.append(inferred_path)
             if router_path not in existing_targets:
                 inferred.append(router_path)
+        return list(dict.fromkeys(inferred))
+
+    @staticmethod
+    def _detect_missing_backend_contract_targets_from_spec(
+        *,
+        grounded_spec: GroundedSpecModel,
+        page_graph: dict[str, Any],
+        current_target_files: list[str],
+        backend_targets: list[str],
+    ) -> list[str]:
+        existing_targets = set(current_target_files) | set(backend_targets)
+        inferred: list[str] = []
+        endpoint_names: set[str] = set()
+        for requirement in grounded_spec.api_requirements:
+            path = str(requirement.path or "").strip()
+            if not path:
+                continue
+            for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", path):
+                endpoint_names.add(match.group(1).strip().lower())
+        if grounded_spec.api_requirements:
+            for contract_path in ("miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"):
+                if contract_path not in existing_targets:
+                    inferred.append(contract_path)
+        has_profile_pages = any(
+            isinstance(page, dict) and str(page.get("route_path") or "").rstrip("/") == "/profile"
+            for role_payload in (page_graph.get("roles") or {}).values()
+            if isinstance(role_payload, dict)
+            for page in (role_payload.get("pages") or [])
+        )
+        if has_profile_pages and "miniapp/app/routes/profiles.py" not in existing_targets:
+            inferred.append("miniapp/app/routes/profiles.py")
+        for endpoint_name in sorted(endpoint_names):
+            if GenerationService._is_forbidden_endpoint_name(endpoint_name):
+                continue
+            inferred_path = GenerationService._route_module_path_for_endpoint_name(endpoint_name)
+            if inferred_path not in existing_targets:
+                inferred.append(inferred_path)
         return list(dict.fromkeys(inferred))
 
     @staticmethod
@@ -4502,6 +5333,11 @@ class GenerationService:
     def _route_module_path_for_endpoint_name(cls, endpoint_name: str) -> str:
         filename = cls._snake_case_filename((endpoint_name or "").strip())
         return cls._normalize_runtime_python_path(f"miniapp/app/routes/{filename}.py")
+
+    @classmethod
+    def _is_forbidden_endpoint_name(cls, endpoint_name: str) -> bool:
+        normalized = cls._snake_case_filename((endpoint_name or "").strip()).lower()
+        return normalized in FORBIDDEN_ROUTE_MODULE_STEMS or normalized in {"health", "profiles", "auth", "login", "me"}
 
     @staticmethod
     def _role_contract_gate_issues(role_contract: dict[str, Any], role_scope: list[str], *, scope_mode: str) -> list[str]:
@@ -4904,7 +5740,16 @@ class GenerationService:
             generation_mode=generation_mode,
             operations=operations,
         )
-        return self._synchronize_profile_schema_contract(workspace_id, draft_run_id, ensured)
+        ensured = self._synchronize_profile_schema_contract(workspace_id, draft_run_id, ensured)
+        ensured = self._synchronize_route_schema_contract(workspace_id, draft_run_id, ensured)
+        ensured = self._synchronize_backend_dependency_contract(workspace_id, draft_run_id, ensured)
+        ensured = self._synchronize_frontend_api_contract(workspace_id, draft_run_id, ensured)
+        return self._synchronize_basic_page_state_contract(
+            workspace_id,
+            draft_run_id,
+            page_graph=page_graph,
+            operations=ensured,
+        )
 
     @staticmethod
     def _grounded_spec_from_operations(operations: list[DraftFileOperation]) -> GroundedSpecModel:
@@ -4964,6 +5809,316 @@ class GenerationService:
         )
         return list(operation_map.values())
 
+    def _synchronize_backend_dependency_contract(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        for file_path in list(operation_map):
+            if not (file_path.startswith("miniapp/app/routes/") and file_path.endswith(".py")):
+                continue
+            content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
+            if not content:
+                continue
+            updated = re.sub(
+                r"Depends\(\s*lambda:\s*get_actor_context\(\)\s*\)",
+                "Depends(get_actor_context)",
+                content,
+            )
+            if "Depends(" in updated and "from fastapi import" in updated:
+                updated = self._ensure_fastapi_import_symbol(updated, "Depends")
+            if updated == content:
+                continue
+            operation_map[file_path] = DraftFileOperation(
+                file_path=file_path,
+                operation="replace",
+                content=updated,
+                reason="Pre-apply contract sync: use FastAPI dependency injection directly for get_actor_context.",
+            )
+        return list(operation_map.values())
+
+    def _synchronize_route_schema_contract(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        schemas_path = "miniapp/app/schemas.py"
+        schemas_content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, schemas_path)
+        if not schemas_content:
+            return operations
+
+        imported_names: set[str] = set()
+        for file_path in list(operation_map):
+            if not (file_path.startswith("miniapp/app/routes/") and file_path.endswith(".py")):
+                continue
+            content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
+            if not content:
+                continue
+            for match in re.finditer(r"from\s+app\.schemas\s+import\s+\((.*?)\)", content, flags=re.DOTALL):
+                imported_names.update(
+                    {
+                        part.strip()
+                        for part in match.group(1).replace("\n", " ").split(",")
+                        if part.strip()
+                    }
+                )
+            for match in re.finditer(r"from\s+app\.schemas\s+import\s+([A-Za-z0-9_, ]+)", content):
+                imported_names.update(
+                    {
+                        part.strip()
+                        for part in match.group(1).split(",")
+                        if part.strip()
+                    }
+                )
+
+        updated_schemas = schemas_content
+        if "RequestDetail" in imported_names and "class RequestDetail" not in updated_schemas:
+            if "Field" not in updated_schemas and "from pydantic import" in updated_schemas:
+                updated_schemas = updated_schemas.replace("from pydantic import BaseModel, ConfigDict", "from pydantic import BaseModel, ConfigDict, Field")
+            request_detail_block = (
+                "\n\nclass RequestDetail(RequestSummary):\n"
+                "    client_id: str\n"
+                "    description: str | None = None\n"
+                "    preferred_time_slots: List[TimeSlot] = Field(default_factory=list)\n"
+                "    created_at: datetime | None = None\n"
+                "    attachments: List[AttachmentMeta] = Field(default_factory=list)\n"
+                "    comments: List[CommentOut] = Field(default_factory=list)\n"
+                "    assignments: List[dict] = Field(default_factory=list)\n"
+            )
+            updated_schemas += request_detail_block
+
+        if updated_schemas == schemas_content:
+            return operations
+        operation_map[schemas_path] = DraftFileOperation(
+            file_path=schemas_path,
+            operation="replace",
+            content=updated_schemas,
+            reason="Pre-apply contract sync: keep schemas.py compatible with route imports before full checks.",
+        )
+        return list(operation_map.values())
+
+    def _synchronize_frontend_api_contract(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        for file_path in list(operation_map):
+            if not (file_path.startswith("miniapp/app/static/") and file_path.endswith(".js")):
+                continue
+            content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
+            if not content:
+                continue
+            updated = re.sub(
+                r"(?<![\w.])fetch\(\s*([\"'`])/api/",
+                r"window.miniappApiFetch(\1/api/",
+                content,
+            )
+            updated = re.sub(
+                r"const\s+fetchJson\s*=\s*runtime\.fetchJson\s*\?\?\s*\(window\.fetch\s*\?\s*\(\(url,\s*options\s*=\s*\{\}\)\s*=>\s*window\.fetch\(url,\s*options\)\)\s*:\s*null\);",
+                "const fetchJson = runtime.fetchJson ?? null;",
+                updated,
+            )
+            updated = re.sub(
+                r"const\s+apiFetch\s*=\s*window\.miniappApiFetch\s*\?\?\s*fetchJson\s*\?\?\s*\(window\.fetch\s*\?\s*\(\(url,\s*options\s*=\s*\{\}\)\s*=>\s*window\.fetch\(url,\s*options\)\)\s*:\s*null\);",
+                "const apiFetch = window.miniappApiFetch ?? fetchJson;",
+                updated,
+            )
+            updated = re.sub(
+                r"const\s+runtimeFetch\s*=\s*window\.miniappApiFetch\s*\?\?\s*runtime\.fetchJson\s*\?\?\s*\(window\.fetch\s*\?\s*\(\(url,\s*options\s*=\s*\{\}\)\s*=>\s*window\.fetch\(url,\s*options\)\)\s*:\s*null\);",
+                "const runtimeFetch = window.miniappApiFetch ?? runtime.fetchJson ?? null;",
+                updated,
+            )
+            if updated == content:
+                continue
+            operation_map[file_path] = DraftFileOperation(
+                file_path=file_path,
+                operation="replace",
+                content=updated,
+                reason="Pre-apply contract sync: route frontend API calls through the preview-aware shared fetch helper.",
+            )
+        return list(operation_map.values())
+
+    def _synchronize_basic_page_state_contract(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        *,
+        page_graph: dict[str, Any],
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        page_expectations: dict[str, dict[str, str]] = {}
+        page_assets: dict[str, dict[str, str]] = {}
+        role_routes: dict[str, set[str]] = {}
+        for role_payload in (page_graph.get("roles") or {}).values():
+            if not isinstance(role_payload, dict):
+                continue
+            for page in role_payload.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                file_path = str(page.get("file_path") or "").strip()
+                if not file_path:
+                    continue
+                page_expectations[file_path] = {
+                    "loading_state": str(page.get("loading_state") or "").strip(),
+                    "error_state": str(page.get("error_state") or "").strip(),
+                }
+                page_assets[file_path] = {
+                    "style_path": str(page.get("style_path") or self._default_page_asset_path(file_path, asset_kind="css")).strip(),
+                    "script_path": str(page.get("script_path") or self._default_page_asset_path(file_path, asset_kind="js")).strip(),
+                }
+                role_match = re.match(r"miniapp/app/static/(client|specialist|manager)/", file_path)
+                if role_match:
+                    role = role_match.group(1)
+                    route_path = str(page.get("route_path") or "").strip()
+                    if route_path:
+                        normalized_route = self._absolute_role_route_path(
+                            role,
+                            self._normalize_role_route_path(role, route_path, index=0),
+                        )
+                        role_routes.setdefault(role, set()).add(self._normalize_local_route_ref(normalized_route))
+        for file_path in list(operation_map):
+            if not (file_path.startswith("miniapp/app/static/") and file_path.endswith(".html")):
+                continue
+            script_path = self._default_page_asset_path(file_path, asset_kind="js")
+            html = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
+            script = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, script_path)
+            if not html:
+                continue
+            updated = html
+            role_match = re.match(r"miniapp/app/static/(client|specialist|manager)/", file_path)
+            role = role_match.group(1) if role_match else ""
+            asset_meta = page_assets.get(file_path) or {
+                "style_path": self._default_page_asset_path(file_path, asset_kind="css"),
+                "script_path": self._default_page_asset_path(file_path, asset_kind="js"),
+            }
+            expected_style_href = self._static_asset_href(asset_meta["style_path"])
+            expected_script_src = self._static_asset_href(asset_meta["script_path"])
+            updated = updated.replace("/static/shell.css", "/static/shared/base.css")
+            if "/static/shared/base.css" not in updated:
+                updated = self._inject_head_asset_link(updated, '<link rel="stylesheet" href="/static/shared/base.css" />')
+            updated = self._ensure_head_asset_link(updated, expected_style_href)
+            updated = self._ensure_body_script_ref(updated, expected_script_src)
+            if role:
+                updated = self._normalize_role_local_links(updated, role=role, declared_routes=role_routes.get(role) or set())
+            if 'getElementById("error-state")' in script or "getElementById('error-state')" in script:
+                if 'id="error-state"' not in updated and "id='error-state'" not in updated:
+                    updated = updated.replace(
+                        "</main>",
+                        '        <div id="error-state" class="status-card error" role="alert" hidden></div>\n    </main>',
+                        1,
+                    )
+            if 'getElementById("loading-state")' in script or "getElementById('loading-state')" in script:
+                if 'id="loading-state"' not in updated and "id='loading-state'" not in updated:
+                    updated = updated.replace(
+                        "</main>",
+                        '        <div id="loading-state" class="status-card loading" hidden aria-live="polite"></div>\n    </main>',
+                        1,
+                    )
+            expectation = page_expectations.get(file_path) or {}
+            if expectation.get("loading_state") and 'data-ui-state="loading"' not in updated:
+                updated = updated.replace(
+                    "</main>",
+                    '        <div class="status-card loading" data-ui-state="loading" hidden aria-live="polite"></div>\n    </main>',
+                    1,
+                )
+            if expectation.get("error_state") and 'data-ui-state="error"' not in updated:
+                updated = updated.replace(
+                    "</main>",
+                    '        <div class="status-card error" data-ui-state="error" role="alert" hidden></div>\n    </main>',
+                    1,
+                )
+            updated = re.sub(r">\s*Refresh\s*<", ">Reload<", updated, flags=re.IGNORECASE)
+            if updated == html:
+                continue
+            operation_map[file_path] = DraftFileOperation(
+                file_path=file_path,
+                operation="replace",
+                content=updated,
+                reason="Pre-apply contract sync: ensure page state containers required by page JS exist in the HTML surface.",
+            )
+        return list(operation_map.values())
+
+    @staticmethod
+    def _ensure_fastapi_import_symbol(content: str, symbol: str) -> str:
+        match = re.search(r"from\s+fastapi\s+import\s+([^\n]+)", content)
+        if not match:
+            return content
+        imported = [item.strip() for item in match.group(1).split(",") if item.strip()]
+        if symbol in imported:
+            return content
+        imported.append(symbol)
+        replacement = f"from fastapi import {', '.join(dict.fromkeys(imported))}"
+        return content[: match.start()] + replacement + content[match.end() :]
+
+    @staticmethod
+    def _inject_head_asset_link(html: str, tag: str) -> str:
+        if "</head>" in html:
+            return html.replace("</head>", f"    {tag}\n</head>", 1)
+        return f"{tag}\n{html}"
+
+    @classmethod
+    def _ensure_head_asset_link(cls, html: str, href: str) -> str:
+        if not href or href in html:
+            return html
+        tag = f'<link rel="stylesheet" href="{href}" />'
+        return cls._inject_head_asset_link(html, tag)
+
+    @staticmethod
+    def _ensure_body_script_ref(html: str, src: str) -> str:
+        if not src or src in html:
+            return html
+        tag = f'<script src="{src}" defer></script>'
+        if "</body>" in html:
+            return html.replace("</body>", f"    {tag}\n</body>", 1)
+        return f"{html}\n{tag}"
+
+    @staticmethod
+    def _static_asset_href(asset_path_raw: str) -> str:
+        normalized = str(asset_path_raw or "").strip().replace("\\", "/")
+        if not normalized:
+            return ""
+        prefix = "miniapp/app/"
+        if normalized.startswith(prefix):
+            return "/" + normalized[len(prefix):]
+        if normalized.startswith("app/"):
+            return "/" + normalized
+        if normalized.startswith("/"):
+            return normalized
+        return "/" + normalized
+
+    @classmethod
+    def _normalize_role_local_links(cls, html: str, *, role: str, declared_routes: set[str]) -> str:
+        if not role:
+            return html
+        replacements: dict[str, str] = {}
+        for candidate in declared_routes:
+            if not candidate.startswith(f"/{role}"):
+                continue
+            short = candidate[len(role) + 1 :]
+            short = short or "/"
+            replacements[short] = candidate
+        replacements["/"] = f"/{role}"
+
+        def _replace(match: re.Match[str]) -> str:
+            quote = match.group(1)
+            route = match.group(2)
+            normalized = cls._normalize_local_route_ref(route)
+            replacement = replacements.get(normalized)
+            if replacement is None and not normalized.startswith(f"/{role}"):
+                replacement = replacements.get(normalized.rstrip("/"))
+            if replacement is None:
+                return match.group(0)
+            return f'href={quote}{replacement}{quote}'
+
+        return re.sub(r"""href=(["'])(/(?!api/|static/)[^"']*)\1""", _replace, html)
+
     def _operation_or_workspace_content(
         self,
         workspace_id: str,
@@ -4991,7 +6146,9 @@ class GenerationService:
         issues: list[ValidationIssue] = []
         draft_root = self.workspace_service.draft_source_dir(workspace_id, draft_run_id)
         issues.extend(self._preflight_backend_syntax_issues(draft_root, changed_files))
+        issues.extend(self._preflight_frontend_syntax_issues(draft_root, changed_files))
         issues.extend(self._preflight_profile_schema_issues(draft_root))
+        issues.extend(self._preflight_route_schema_issues(draft_root))
         issues.extend(self._preflight_route_manifest_link_issues(draft_root, page_graph, role_scope))
         deduped: list[ValidationIssue] = []
         seen: set[tuple[str, str]] = set()
@@ -5027,6 +6184,43 @@ class GenerationService:
         return issues
 
     @staticmethod
+    def _preflight_frontend_syntax_issues(draft_root: Path, changed_files: list[str]) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        js_files = [
+            file_path
+            for file_path in changed_files
+            if file_path.startswith("miniapp/app/static/") and file_path.endswith(".js")
+        ]
+        if not js_files:
+            return issues
+        node_bin = shutil.which("node")
+        if not node_bin:
+            return issues
+        for file_path in js_files:
+            absolute = draft_root / file_path
+            if not absolute.exists():
+                continue
+            completed = subprocess.run(
+                [node_bin, "--check", str(absolute)],
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode == 0:
+                continue
+            logs = (completed.stderr or completed.stdout or "").strip().splitlines()
+            message = logs[0] if logs else f"{file_path} has invalid JavaScript syntax before full checks."
+            issues.append(
+                ValidationIssue(
+                    code="preflight.javascript_syntax_error",
+                    message=f"{file_path} has invalid JavaScript syntax before full checks: {message}",
+                    severity="high",
+                    location=file_path,
+                    blocking=True,
+                )
+            )
+        return issues
+
+    @staticmethod
     def _preflight_profile_schema_issues(draft_root: Path) -> list[ValidationIssue]:
         profiles_path = draft_root / "miniapp/app/routes/profiles.py"
         schemas_path = draft_root / "miniapp/app/schemas.py"
@@ -5057,6 +6251,51 @@ class GenerationService:
             )
         return issues
 
+    @staticmethod
+    def _preflight_route_schema_issues(draft_root: Path) -> list[ValidationIssue]:
+        routes_dir = draft_root / "miniapp/app/routes"
+        schemas_path = draft_root / "miniapp/app/schemas.py"
+        if not routes_dir.exists() or not schemas_path.exists():
+            return []
+        schemas_content = schemas_path.read_text(encoding="utf-8")
+        issues: list[ValidationIssue] = []
+        for route_file in routes_dir.glob("*.py"):
+            content = route_file.read_text(encoding="utf-8")
+            imported_names: set[str] = set()
+            for match in re.finditer(r"from\s+app\.schemas\s+import\s+\((.*?)\)", content, flags=re.DOTALL):
+                imported_names.update(
+                    {
+                        part.strip()
+                        for part in match.group(1).replace("\n", " ").split(",")
+                        if part.strip()
+                    }
+                )
+            for match in re.finditer(r"from\s+app\.schemas\s+import\s+([A-Za-z0-9_, ]+)", content):
+                imported_names.update(
+                    {
+                        part.strip()
+                        for part in match.group(1).split(",")
+                        if part.strip()
+                    }
+                )
+            missing = sorted(
+                name
+                for name in imported_names
+                if f"class {name}" not in schemas_content and f"{name} =" not in schemas_content
+            )
+            if not missing:
+                continue
+            issues.append(
+                ValidationIssue(
+                    code="preflight.route_schema_contract",
+                    message=f"{route_file.name} imports schemas that do not exist in schemas.py: {', '.join(missing)}.",
+                    severity="high",
+                    location="miniapp/app/schemas.py",
+                    blocking=True,
+                )
+            )
+        return issues
+
     @classmethod
     def _preflight_route_manifest_link_issues(cls, draft_root: Path, page_graph: dict[str, Any], role_scope: list[str]) -> list[ValidationIssue]:
         manifest_path = draft_root / "miniapp/app/generated/route_manifest.json"
@@ -5072,7 +6311,7 @@ class GenerationService:
                 if isinstance(page, dict):
                     route_path = str(page.get("route_path") or "").strip()
                     if route_path:
-                        declared_routes.add(route_path)
+                        declared_routes.add(cls._normalize_local_route_ref(route_path))
         issues: list[ValidationIssue] = []
         href_pattern = re.compile(r"""href=["']([^"']+)["']""")
         for role in role_scope:
@@ -5090,7 +6329,8 @@ class GenerationService:
                     route_ref = str(route_ref).strip()
                     if not route_ref.startswith("/") or route_ref.startswith("/api/") or route_ref.startswith("/static/"):
                         continue
-                    if route_ref not in declared_routes:
+                    normalized_route_ref = cls._normalize_local_route_ref(route_ref)
+                    if normalized_route_ref not in declared_routes:
                         issues.append(
                             ValidationIssue(
                                 code="preflight.route_manifest_link_mismatch",
@@ -5101,6 +6341,18 @@ class GenerationService:
                             )
                         )
         return issues
+
+    @staticmethod
+    def _normalize_local_route_ref(route_ref: str) -> str:
+        normalized = str(route_ref or "").strip()
+        if not normalized:
+            return normalized
+        normalized = re.sub(r"\$\{[^/]+\}", "sample", normalized)
+        normalized = re.sub(r"\{[^/]+\}", "sample", normalized)
+        normalized = re.sub(r":[^/]+", "sample", normalized)
+        if normalized != "/" and normalized.endswith("/"):
+            normalized = normalized.rstrip("/")
+        return normalized
 
     @staticmethod
     def _preflight_check_results(issues: list[ValidationIssue]) -> list[RunCheckResult]:
@@ -5279,6 +6531,7 @@ def _sample_request_payload(path: str, method: str) -> dict | None:
 
 def _sample_route_path(path: str) -> str:
     normalized = path
+    normalized = re.sub(r"\$\{{[^/]+\}}", "sample", normalized)
     normalized = re.sub(r"{{[^/]+}}", "sample", normalized)
     normalized = re.sub(r":[^/]+", "sample", normalized)
     return normalized
@@ -5289,6 +6542,7 @@ def _resolve_path_params(path: str, replacements: dict[str, str]) -> str:
     for key, value in replacements.items():
         resolved = re.sub(r"{{" + re.escape(key) + r"}}", value, resolved)
         resolved = re.sub(r":" + re.escape(key) + r"\\b", value, resolved)
+    resolved = re.sub(r"\$\{{[^/]+\}}", "sample", resolved)
     resolved = re.sub(r"{{[^/]+}}", "sample", resolved)
     resolved = re.sub(r":[^/]+", "sample", resolved)
     return resolved
@@ -5809,8 +7063,8 @@ function extractApiRefs(content) {{
 function extractLocalRouteRefs(content) {{
   const refs = new Set();
   const patterns = [
-    /(?:href|location(?:\\.href)?)\\s*=\\s*["'](\\/(?!api\\/|static\\/|\\/)[^"'#?]+)["']/g,
-    /["'](\\/(?!api\\/|static\\/|\\/)[a-zA-Z0-9_\\-/:{{}}]+)["']/g,
+    /(?:href|location(?:\\.href)?)\\s*=\\s*["'](\\/(?:client|specialist|manager)(?:\\/[^"'#?]*)?)["']/g,
+    /["'](\\/(?:client|specialist|manager)(?:\\/[a-zA-Z0-9_\\-/:{{}}]*)?)["']/g,
   ];
   for (const pattern of patterns) {{
     for (const match of content.matchAll(pattern)) {{
@@ -5845,6 +7099,7 @@ function extractJsDomIds(content) {{
 
 function normalizeRoutePath(value) {{
   return value
+    .replace(/\\$\\{{[^/]+\\}}/g, 'sample')
     .replace(/\\{{[^/]+\\}}/g, 'sample')
     .replace(/:[^/]+/g, 'sample');
 }}
@@ -6558,66 +7813,88 @@ test('generated javascript files parse', () => {{
         preview_logs: list[str],
         attempt: int,
     ) -> dict[str, Any]:
-        allowed_targets = set(target_files)
-        try:
-            payload = self._generate_structured_with_retry(
-                role="repair",
-                schema_name="composition_bundle_v1",
-                schema=self._code_edit_schema(),
-                system_prompt=self._repair_system_prompt(),
-                user_prompt=self._repair_user_prompt(
-                    prompt=prompt,
-                    grounded_spec=grounded_spec,
-                    role_scope=role_scope,
-                    role_contract=role_contract,
-                    page_graph=page_graph,
-                    scope_mode=scope_mode,
-                    target_files=target_files,
-                    file_contexts=file_contexts,
-                    build_issues=build_issues,
-                    preview_issue=preview_issue,
-                    preview_logs=preview_logs,
-                    attempt=attempt,
-                ),
-            )
-            normalized = self._normalize_model_payload(payload["payload"])
-            raw_operations = normalized.get("operations")
-            if not isinstance(raw_operations, list):
-                raise ValueError("Repair step did not return operations.")
-            operations = self._sanitize_draft_operations(
-                [DraftFileOperation.model_validate(item) for item in raw_operations]
-            )
-            invalid = [
-                operation.file_path
-                for operation in operations
-                if operation.file_path not in allowed_targets or (operation.operation in {"create", "replace"} and operation.content is None)
-            ]
-            if invalid:
-                expanded_targets = self._expand_repair_targets_for_safe_companions(
-                    target_files=target_files,
-                    invalid_paths=invalid,
-                    build_issues=build_issues,
+        last_error: Exception | None = None
+        current_target_files = list(target_files)
+        for expanded_context in (False, True):
+            allowed_targets = set(current_target_files)
+            try:
+                payload = self._generate_structured_with_retry(
+                    role="repair",
+                    schema_name="composition_bundle_v1",
+                    schema=self._code_edit_schema(),
+                    system_prompt=self._repair_system_prompt(),
+                    user_prompt=self._repair_user_prompt(
+                        prompt=prompt,
+                        grounded_spec=grounded_spec,
+                        role_scope=role_scope,
+                        role_contract=role_contract,
+                        page_graph=page_graph,
+                        scope_mode=scope_mode,
+                        target_files=current_target_files,
+                        file_contexts=file_contexts,
+                        build_issues=build_issues,
+                        preview_issue=preview_issue,
+                        preview_logs=preview_logs,
+                        attempt=attempt,
+                        expanded_context=expanded_context,
+                    ),
                 )
-                if expanded_targets is None:
-                    raise ValueError(f"Repair touched files outside the planned scope: {', '.join(invalid[:5])}")
-                allowed_targets = set(expanded_targets)
-                residual_invalid = [
+                normalized = self._normalize_model_payload(payload["payload"])
+                raw_operations = normalized.get("operations")
+                if not isinstance(raw_operations, list):
+                    raise ValueError("Repair step did not return operations.")
+                operations = self._sanitize_draft_operations(
+                    [DraftFileOperation.model_validate(item) for item in raw_operations]
+                )
+                invalid = [
                     operation.file_path
                     for operation in operations
-                    if operation.file_path not in allowed_targets
-                    or (operation.operation in {"create", "replace"} and operation.content is None)
+                    if operation.file_path not in allowed_targets or (operation.operation in {"create", "replace"} and operation.content is None)
                 ]
-                if residual_invalid:
-                    raise ValueError(f"Repair touched files outside the planned scope: {', '.join(residual_invalid[:5])}")
-                target_files = expanded_targets
-            self._validate_targeted_operations(stage_name="repair", target_files=target_files, operations=operations)
-            return {
-                "assistant_message": str(normalized.get("assistant_message") or "").strip(),
-                "operations": operations,
-                "model": payload["model"],
-            }
-        except Exception as exc:
-            return {"error": f"Automatic repair step failed: {exc}"}
+                if invalid:
+                    expanded_targets = self._expand_repair_targets_for_safe_companions(
+                        target_files=current_target_files,
+                        invalid_paths=invalid,
+                        build_issues=build_issues,
+                    )
+                    if expanded_targets is None:
+                        raise ValueError(f"Repair touched files outside the planned scope: {', '.join(invalid[:5])}")
+                    allowed_targets = set(expanded_targets)
+                    residual_invalid = [
+                        operation.file_path
+                        for operation in operations
+                        if operation.file_path not in allowed_targets
+                        or (operation.operation in {"create", "replace"} and operation.content is None)
+                    ]
+                    if residual_invalid:
+                        raise ValueError(f"Repair touched files outside the planned scope: {', '.join(residual_invalid[:5])}")
+                    current_target_files = expanded_targets
+                self._validate_targeted_operations(stage_name="repair", target_files=current_target_files, operations=operations)
+                return {
+                    "assistant_message": str(normalized.get("assistant_message") or "").strip(),
+                    "operations": operations,
+                    "model": payload["model"],
+                }
+            except Exception as exc:
+                last_error = exc
+                if expanded_context or not self._should_retry_repair_with_expanded_context(str(exc)):
+                    break
+        return {"error": f"Automatic repair step failed: {last_error}"}
+
+    @staticmethod
+    def _should_retry_repair_with_expanded_context(message: str) -> bool:
+        lowered = message.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "no file operations for the requested target_files",
+                "can't access",
+                "cannot access",
+                "unable to inspect",
+                "unable to access",
+                "did not return operations",
+            )
+        )
 
     @classmethod
     def _expand_repair_targets_for_safe_companions(
@@ -6692,13 +7969,17 @@ test('generated javascript files parse', () => {{
         preview_issue: ValidationIssue | None,
         preview_logs: list[str],
         attempt: int,
+        expanded_context: bool = False,
     ) -> str:
         structural_failure = self._is_structural_contract_failure(build_issues)
-        compact_target_files = target_files[:18] if structural_failure else target_files[:10]
+        if expanded_context:
+            compact_target_files = list(target_files)
+        else:
+            compact_target_files = target_files[:28] if structural_failure else target_files[:12]
         compact_file_contexts = self._compact_file_contexts_for_repair(
             file_contexts,
-            max_file_chars=3600 if structural_failure else 2200,
-            max_total_chars=18000 if structural_failure else 9000,
+            max_file_chars=5600 if expanded_context else (4200 if structural_failure else 2200),
+            max_total_chars=32000 if expanded_context else (22000 if structural_failure else 9000),
         )
         return json_dumps(
             {
@@ -6730,11 +8011,16 @@ test('generated javascript files parse', () => {{
                     "Move inline Pydantic request/response models out of routes into schemas.py whenever the failing surface is a workflow backend.",
                     "Keep SQLAlchemy engine/session/model logic in db.py and import it from routes instead of duplicating persistence logic across route files.",
                     "Preserve the template profile contract: role home pages can link to /<role>/profile, routes/profiles.py must remain compatible with db.py, and db.py must keep RoleProfileRecord when profiles.py imports it.",
+                    "For frontend /api/... calls use window.miniappApiFetch(...) from /static/preview_bridge.js instead of raw fetch(...).",
+                    "For FastAPI actor context injection use Depends(get_actor_context) directly and never Depends(lambda: get_actor_context()).",
+                    "Do not render manual Refresh actions; use loading/error states instead.",
+                    "Do not pass typing.Literal aliases directly into sqlalchemy.Enum columns; persist workflow statuses as string-backed columns unless a real Python Enum class exists.",
                     "Do not introduce auth/login/me APIs or /api/auth references in generated app code; use explicit workflow routes and profile routes instead.",
                     "If target_files is non-empty, operations must include at least one create/replace/delete for one of those files.",
                     "For connectivity missing_ui_loading_state or missing_ui_error_state, satisfy the validator with real loading/error containers, ids, or data-ui-state markers that match the current page contract.",
                     "When a failure points to route or navigation mismatch, repair the page graph contract and the route-linked HTML files consistently.",
                     "Do not invent magic validator-only classes when the current validator contract does not require them.",
+                    "You already have the relevant file excerpts in file_contexts; do not claim you lack repository access.",
                     "Do not return a prose repair plan instead of file operations.",
                     "Do not leave operations empty when target_files is non-empty.",
                 ],
@@ -7226,7 +8512,11 @@ test('generated javascript files parse', () => {{
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                result = self.openrouter_client.generate_structured(**request_kwargs)
+                result = self._invoke_llm_with_timeout(
+                    self.openrouter_client.generate_structured,
+                    timeout_seconds=float(self.STRUCTURED_LLM_TIMEOUT_SECONDS),
+                    **request_kwargs,
+                )
                 self._record_llm_cache_stats(result)
                 return result
             except Exception as exc:
@@ -7245,7 +8535,11 @@ test('generated javascript files parse', () => {{
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                result = self.openrouter_client.generate_json_object(**request_kwargs)
+                result = self._invoke_llm_with_timeout(
+                    self.openrouter_client.generate_json_object,
+                    timeout_seconds=float(self.JSON_OBJECT_LLM_TIMEOUT_SECONDS),
+                    **request_kwargs,
+                )
                 self._record_llm_cache_stats(result)
                 return result
             except Exception as exc:
@@ -7258,6 +8552,27 @@ test('generated javascript files parse', () => {{
                 time.sleep(0.8 * (attempt + 1))
         assert last_error is not None
         raise last_error
+
+    @staticmethod
+    def _invoke_llm_with_timeout(
+        func: Any,
+        *,
+        timeout_seconds: float,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        role = str(kwargs.get("role") or "llm")
+        schema_name = str(kwargs.get("schema_name") or "request")
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"llm-{role}")
+        future = executor.submit(func, **kwargs)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FuturesTimeoutError as exc:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError(
+                f"Timed out waiting for {role} structured generation ({schema_name}) after {int(timeout_seconds)}s."
+            ) from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=False)
 
     @staticmethod
     def _should_tighten_json_retry(error: Exception) -> bool:
@@ -7297,7 +8612,8 @@ test('generated javascript files parse', () => {{
                 creative_direction=creative_direction,
             )
         try:
-            outline_payload, payload, outline = self._generate_grounded_spec_pair(
+            outline_payload, payload, outline = self._generate_grounded_spec_pair_with_timeout(
+                timeout_seconds=float(self.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS),
                 workspace_id=workspace_id,
                 prompt=prompt,
                 doc_refs=doc_refs,
@@ -7312,9 +8628,30 @@ test('generated javascript files parse', () => {{
             model_path = [str(outline_payload["model"]), str(payload["model"])]
             return {"spec": spec, "model": payload["model"], "model_sequence": model_path}
         except Exception as strict_exc:
+            if isinstance(strict_exc, TimeoutError):
+                fallback_spec = self._build_grounded_spec(
+                    workspace_id=workspace_id,
+                    prompt=prompt,
+                    target_platform=target_platform,
+                    preview_profile=preview_profile,
+                    doc_refs=doc_refs,
+                    template_revision_id=template_revision_id,
+                    prompt_turn_id=prompt_turn_id,
+                    generation_mode=generation_mode,
+                )
+                return {
+                    "spec": fallback_spec,
+                    "model": None,
+                    "model_sequence": [],
+                    "warning_kind": "spec_timeout_compiler_fallback",
+                    "warning_stage": "spec_timeout_fallback_used",
+                    "warning_title": "GroundedSpec timed out and used compiler fallback.",
+                    "warning": f"GroundedSpec section generation timed out and compiler fallback was used: {strict_exc}",
+                }
             if self._is_retryable_llm_error(strict_exc):
                 try:
-                    outline_payload, payload, outline = self._generate_grounded_spec_pair(
+                    outline_payload, payload, outline = self._generate_grounded_spec_pair_with_timeout(
+                        timeout_seconds=float(self.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS),
                         workspace_id=workspace_id,
                         prompt=prompt,
                         doc_refs=doc_refs,
@@ -7343,7 +8680,8 @@ test('generated javascript files parse', () => {{
                         f"{strict_exc}; compact retry error: {provider_recovery_exc}"
                     )
             try:
-                outline_payload, payload, outline = self._generate_grounded_spec_pair(
+                outline_payload, payload, outline = self._generate_grounded_spec_pair_with_timeout(
+                    timeout_seconds=float(self.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS),
                     workspace_id=workspace_id,
                     prompt=prompt,
                     doc_refs=doc_refs,
@@ -7373,6 +8711,24 @@ test('generated javascript files parse', () => {{
                         f"strict mode error: {strict_exc}; relaxed mode error: {relaxed_exc}"
                     )
                 }
+
+    def _generate_grounded_spec_pair_with_timeout(
+        self,
+        *,
+        timeout_seconds: float,
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grounded-spec-total")
+        future = executor.submit(self._generate_grounded_spec_pair, **kwargs)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FuturesTimeoutError as exc:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError(
+                f"Timed out waiting for grounded spec generation after {int(timeout_seconds)}s."
+            ) from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=False)
 
     def _resolve_grounded_spec_fast(
         self,
@@ -7483,7 +8839,7 @@ test('generated javascript files parse', () => {{
                 system_prompt=self._grounded_spec_outline_system_prompt(),
                 user_prompt=outline_user_prompt,
             )
-        outline = self._normalize_model_payload(outline_payload["payload"])
+        outline = self._sanitize_grounded_spec_outline(self._normalize_model_payload(outline_payload["payload"]))
         core_fields = ["product_goal", "actors", "domain_entities", "user_flows"]
         requirements_fields = [
             "ui_requirements",
@@ -7497,8 +8853,9 @@ test('generated javascript files parse', () => {{
         governance_fields = ["assumptions", "unknowns", "contradictions"]
         sections_started = time.perf_counter()
 
-        async def build_sections() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-            core_task = asyncio.to_thread(
+        executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="grounded-spec")
+        futures = {
+            "core": executor.submit(
                 self._generate_grounded_spec_section,
                 section_id="core",
                 section_title="Core domain and workflow",
@@ -7513,8 +8870,8 @@ test('generated javascript files parse', () => {{
                 outline=outline,
                 relaxed=relaxed,
                 compact=compact,
-            )
-            requirements_task = asyncio.to_thread(
+            ),
+            "requirements": executor.submit(
                 self._generate_grounded_spec_section,
                 section_id="requirements",
                 section_title="Runtime requirements",
@@ -7529,8 +8886,8 @@ test('generated javascript files parse', () => {{
                 outline=outline,
                 relaxed=relaxed,
                 compact=compact,
-            )
-            governance_task = asyncio.to_thread(
+            ),
+            "governance": executor.submit(
                 self._generate_grounded_spec_section,
                 section_id="governance",
                 section_title="Assumptions and gaps",
@@ -7545,10 +8902,52 @@ test('generated javascript files parse', () => {{
                 outline=outline,
                 relaxed=relaxed,
                 compact=compact,
-            )
-            return await asyncio.gather(core_task, requirements_task, governance_task)
+            ),
+        }
+        section_timeout = float(self.GROUNDED_SPEC_SECTION_TIMEOUT_SECONDS)
+        completed, pending = wait(set(futures.values()), timeout=section_timeout, return_when=ALL_COMPLETED)
+        section_payloads: dict[str, dict[str, Any]] = {}
+        section_errors: dict[str, str] = {}
+        try:
+            for section_name, future in futures.items():
+                if future in pending:
+                    section_errors[section_name] = "timeout"
+                    continue
+                try:
+                    section_payloads[section_name] = future.result()
+                except Exception as exc:  # pragma: no cover - defensive aggregation
+                    section_errors[section_name] = str(exc)
+            if pending:
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=False, cancel_futures=False)
+        finally:
+            if pending:
+                for future in pending:
+                    future.cancel()
 
-        core_payload, requirements_payload, governance_payload = asyncio.run(build_sections())
+        fallback_spec_payload = None
+        if section_errors:
+            fallback_spec_payload = self._build_grounded_spec(
+                workspace_id=workspace_id,
+                prompt=prompt,
+                target_platform=target_platform,
+                preview_profile=preview_profile,
+                doc_refs=doc_refs,
+                template_revision_id=template_revision_id,
+                prompt_turn_id=prompt_turn_id,
+                generation_mode=GenerationMode.BALANCED,
+            ).model_dump(mode="json")
+            self._append_trace(
+                workspace_id,
+                "spec_section_fallback_used",
+                "GroundedSpec used compiler fallback for incomplete spec sections.",
+                {
+                    "duration_ms": int((time.perf_counter() - sections_started) * 1000),
+                    "fallback_sections": sorted(section_errors),
+                    "section_errors": section_errors,
+                },
+            )
         self._append_trace(
             workspace_id,
             "spec_sections_parallel",
@@ -7557,6 +8956,22 @@ test('generated javascript files parse', () => {{
                 "duration_ms": int((time.perf_counter() - sections_started) * 1000),
                 "sections": ["core", "requirements", "governance"],
             },
+        )
+
+        core_payload_normalized = (
+            self._normalize_model_payload(section_payloads["core"]["payload"])
+            if "core" in section_payloads
+            else {key: fallback_spec_payload[key] for key in core_fields}
+        )
+        requirements_payload_normalized = (
+            self._normalize_model_payload(section_payloads["requirements"]["payload"])
+            if "requirements" in section_payloads
+            else {key: fallback_spec_payload[key] for key in requirements_fields}
+        )
+        governance_payload_normalized = (
+            self._normalize_model_payload(section_payloads["governance"]["payload"])
+            if "governance" in section_payloads
+            else {key: fallback_spec_payload[key] for key in governance_fields}
         )
 
         merged_payload = {
@@ -7575,12 +8990,17 @@ test('generated javascript files parse', () => {{
                 item.model_dump(mode="json") if hasattr(item, "model_dump") else item
                 for item in doc_refs
             ],
-            **self._normalize_model_payload(core_payload["payload"]),
-            **self._normalize_model_payload(requirements_payload["payload"]),
-            **self._normalize_model_payload(governance_payload["payload"]),
+            **core_payload_normalized,
+            **requirements_payload_normalized,
+            **governance_payload_normalized,
         }
         payload = {
-            "model": governance_payload["model"],
+            "model": (
+                section_payloads.get("governance", {}).get("model")
+                or section_payloads.get("requirements", {}).get("model")
+                or section_payloads.get("core", {}).get("model")
+                or "compiler-fallback"
+            ),
             "payload": merged_payload,
             "response_mode": "grounded_spec_sections",
         }
@@ -7840,10 +9260,59 @@ test('generated javascript files parse', () => {{
         return 0
 
     def _stabilize_grounded_spec(self, spec: GroundedSpecModel) -> GroundedSpecModel:
-        assumptions = list(spec.assumptions)
+        product_goal = str(spec.product_goal or "").strip()
+        if self._is_forbidden_spec_governance_text(product_goal):
+            product_goal = re.sub(
+                r"\b(auth(?:entication)?|login|sign in|session|token|websocket|realtime|push|webhook|initdata)\b",
+                "",
+                product_goal,
+                flags=re.IGNORECASE,
+            )
+            product_goal = re.sub(r"\s{2,}", " ", product_goal).strip(" ,.;:-")
+        assumptions = [
+            assumption
+            for assumption in spec.assumptions
+            if not self._is_forbidden_spec_governance_text(
+                " ".join(
+                    part
+                    for part in (
+                        assumption.text,
+                        assumption.rationale,
+                    )
+                    if part
+                )
+            )
+        ]
         unresolved_unknowns: list[Unknown] = []
+        contradictions = [
+            contradiction
+            for contradiction in spec.contradictions
+            if not self._is_forbidden_spec_governance_text(
+                " ".join(
+                    part
+                    for part in (
+                        contradiction.description,
+                        contradiction.left_side,
+                        contradiction.right_side,
+                        contradiction.resolution_hint,
+                    )
+                    if part
+                )
+            )
+        ]
 
         for unknown in spec.unknowns:
+            if self._is_forbidden_spec_governance_text(
+                " ".join(
+                    part
+                    for part in (
+                        unknown.question,
+                        unknown.suggested_resolution,
+                    )
+                    if part
+                )
+            ):
+                continue
             question = unknown.question.lower()
             suggested_resolution = unknown.suggested_resolution or "Resolved through canonical template defaults."
             if any(
@@ -7935,10 +9404,12 @@ test('generated javascript files parse', () => {{
 
         return spec.model_copy(
             update={
+                "product_goal": product_goal or spec.product_goal,
                 "actors": actors,
                 "user_flows": user_flows,
                 "assumptions": assumptions,
                 "unknowns": unresolved_unknowns,
+                "contradictions": contradictions,
                 "api_requirements": api_requirements,
             }
         )
@@ -7952,15 +9423,122 @@ test('generated javascript files parse', () => {{
             return True
         if any(marker in path for marker in ("/events", "/stream", "/sse", "/ws", "/websocket")):
             return True
-        if any(marker in name for marker in ("login", "sign in", "auth", "session bootstrap")):
+        if any(marker in name for marker in ("login", "sign in", "auth", "session bootstrap", "user profile endpoint")):
             return True
-        if any(marker in name for marker in ("websocket", "server-sent events", "sse", "push endpoint", "realtime")):
+        if any(marker in name for marker in ("websocket", "server-sent events", "sse", "push endpoint", "realtime", "push updates", "notifications/push", "webhook")):
             return True
-        if any(marker in purpose for marker in ("auth/login", "role-based session bootstrap", "session bootstrap")):
+        if any(marker in purpose for marker in ("auth/login", "role-based session bootstrap", "session bootstrap", "user profile endpoint", "role-aware bootstrapping")):
             return True
-        if any(marker in purpose for marker in ("role-aware session token", "telegram init data", "websocket", "server-sent events", "sse", "push endpoint", "realtime updates")):
+        if any(marker in purpose for marker in ("role-aware session token", "telegram init data", "websocket", "server-sent events", "sse", "push endpoint", "realtime updates", "push updates", "webhook", "notifications/push")):
             return True
         return False
+
+    @staticmethod
+    def _is_forbidden_outline_api_need(item: str) -> bool:
+        lowered = str(item or "").strip().lower()
+        if not lowered:
+            return False
+        if any(
+            marker in lowered
+            for marker in (
+                "auth / user profile",
+                "auth/user profile",
+                "auth / session",
+                "auth/session",
+                "auth:",
+                "session:",
+                "login",
+                "sign in",
+                "session bootstrap",
+                "session token",
+                "app session",
+                "role-aware bootstrapping",
+                "user profile endpoint",
+                "/api/auth",
+                "/api/me",
+                "telegram auth",
+                "telegram token",
+                "telegram initdata",
+                "initdata",
+            )
+        ):
+            return True
+        if any(
+            marker in lowered
+            for marker in (
+                "push/realtime",
+                "realtime",
+                "real-time",
+                "websocket",
+                "server-sent events",
+                "sse",
+                "push endpoint",
+                "push updates",
+                "push notifications",
+                "notifications",
+                "long-poll",
+                "long poll",
+                "polling endpoint",
+                "notifications/push",
+                "webhook",
+            )
+        ):
+            return True
+        return False
+
+    @classmethod
+    def _sanitize_grounded_spec_outline(cls, outline: dict[str, Any]) -> dict[str, Any]:
+        sanitized = dict(outline)
+        api_needs = sanitized.get("api_needs")
+        if isinstance(api_needs, list):
+            sanitized["api_needs"] = [
+                item
+                for item in api_needs
+                if isinstance(item, str) and not cls._is_forbidden_outline_api_need(item)
+            ]
+        risks = sanitized.get("risks")
+        if isinstance(risks, list):
+            sanitized["risks"] = [
+                item
+                for item in risks
+                if isinstance(item, str) and not cls._is_forbidden_spec_governance_text(item)
+            ]
+        return sanitized
+
+    @staticmethod
+    def _is_forbidden_spec_governance_text(text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return False
+        auth_markers = (
+            "auth / user profile",
+            "auth/user profile",
+            "telegram initdata",
+            "initdata",
+            "role-aware session",
+            "session bootstrap",
+            "session token",
+            "login",
+            "sign in",
+            "/api/auth",
+            "/api/me",
+        )
+        realtime_markers = (
+            "push/realtime",
+            "realtime",
+            "websocket",
+            "server-sent events",
+            "sse",
+            "push endpoint",
+            "periodic polling",
+            "polling endpoint",
+            "foreground polling",
+            "poll intervals",
+            "push notifications",
+            "notifications can be implemented",
+            "manual refresh",
+        )
+        return any(marker in lowered for marker in (*auth_markers, *realtime_markers))
 
     def _stabilize_app_ir(
         self,

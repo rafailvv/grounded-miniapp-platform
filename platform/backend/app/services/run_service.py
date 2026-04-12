@@ -501,6 +501,17 @@ class RunService:
                 )
                 if self._should_soft_complete_with_warnings(run, job):
                     self._mark_run_completed_with_warnings(run, job, meaningful_paths=meaningful_paths)
+                elif self._should_apply_best_effort_after_failed_repairs(run, job, meaningful_paths=meaningful_paths):
+                    self._apply_completed_draft(
+                        run,
+                        message="Applying best-effort generated draft after repair attempts were exhausted.",
+                    )
+                    self._mark_run_completed_with_warnings(
+                        run,
+                        job,
+                        meaningful_paths=meaningful_paths,
+                        draft_kept=False,
+                    )
                 elif self._should_apply_draft_with_warnings(run, job, meaningful_paths=meaningful_paths):
                     self._apply_completed_draft(
                         run,
@@ -1110,6 +1121,8 @@ class RunService:
         if getattr(job, "status", None) not in {"blocked", "failed"}:
             return False
         failure_class = str(getattr(job, "failure_class", "") or "")
+        if failure_class.startswith("generation."):
+            return False
         if (
             failure_class.startswith("generation.edit.plan_not_materialized")
             or failure_class.startswith("generation.edit.missing_")
@@ -1155,6 +1168,42 @@ class RunService:
         if not issues:
             return False
         return all(str(issue.get("location") or "") == "preview" for issue in issues)
+
+    def _should_apply_best_effort_after_failed_repairs(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
+        if run.mode == "fix":
+            return False
+        if getattr(job, "status", None) not in {"blocked", "failed"}:
+            return False
+        if not meaningful_paths:
+            return False
+        if not self.workspace_service.draft_exists(run.workspace_id, run.run_id):
+            return False
+        if self._is_stop_requested(run.run_id):
+            return False
+        failure_class = str(getattr(job, "failure_class", "") or "")
+        if failure_class in {"patch_conflict", "tooling/runtime_misconfiguration", "repair_repeated_signature"}:
+            return False
+        if failure_class.startswith("generation."):
+            return False
+        validation_snapshot = getattr(job, "validation_snapshot", None)
+        if validation_snapshot is None:
+            return False
+        issues = [
+            issue
+            for issue in getattr(validation_snapshot, "issues", [])
+            if isinstance(issue, dict) and issue.get("blocking", True)
+        ]
+        if not issues:
+            return False
+        blocking_codes = {str(issue.get("code") or "") for issue in issues}
+        if any(code.startswith("generation.") for code in blocking_codes):
+            return False
+        if any(code.startswith("preflight.") for code in blocking_codes):
+            return False
+        allowed_locations = {"tests", "preview", "build", "repair"}
+        if any(str(issue.get("location") or "") not in allowed_locations for issue in issues):
+            return False
+        return True
 
     def _apply_completed_draft(self, run: RunRecord, *, message: str) -> None:
         apply_started_at = time.perf_counter()

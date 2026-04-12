@@ -21,6 +21,11 @@ ACTIVE_WORKSPACE_LOG_CONTEXT: ContextVar[str | None] = ContextVar("active_worksp
 
 
 class OpenRouterClient:
+    _LOG_STRING_LIMIT = 4000
+    _LOG_LIST_LIMIT = 12
+    _LOG_DICT_LIMIT = 40
+    _LOG_MAX_DEPTH = 5
+
     def __init__(self, settings: Settings, workspace_log_service: WorkspaceLogService | None = None) -> None:
         self.settings = settings
         self.workspace_log_service = workspace_log_service
@@ -347,17 +352,57 @@ class OpenRouterClient:
         except Exception:
             return str(payload)
 
+    @classmethod
+    def _truncate_log_text(cls, text: str, *, limit: int | None = None) -> str:
+        max_len = limit or cls._LOG_STRING_LIMIT
+        if len(text) <= max_len:
+            return text
+        head = max_len // 2
+        tail = max_len - head
+        return f"{text[:head]}\n...[truncated {len(text) - max_len} chars]...\n{text[-tail:]}"
+
+    @classmethod
+    def _compact_for_log(cls, value: Any, *, depth: int = 0) -> Any:
+        if isinstance(value, str):
+            return cls._truncate_log_text(value)
+        if depth >= cls._LOG_MAX_DEPTH:
+            return f"<truncated depth={depth} type={type(value).__name__}>"
+        if isinstance(value, list):
+            items = [cls._compact_for_log(item, depth=depth + 1) for item in value[: cls._LOG_LIST_LIMIT]]
+            if len(value) > cls._LOG_LIST_LIMIT:
+                items.append(f"<truncated {len(value) - cls._LOG_LIST_LIMIT} more items>")
+            return items
+        if isinstance(value, tuple):
+            items = [cls._compact_for_log(item, depth=depth + 1) for item in value[: cls._LOG_LIST_LIMIT]]
+            if len(value) > cls._LOG_LIST_LIMIT:
+                items.append(f"<truncated {len(value) - cls._LOG_LIST_LIMIT} more items>")
+            return tuple(items)
+        if isinstance(value, dict):
+            compacted: dict[str, Any] = {}
+            items = list(value.items())
+            for key, item in items[: cls._LOG_DICT_LIMIT]:
+                compacted[str(key)] = cls._compact_for_log(item, depth=depth + 1)
+            if len(items) > cls._LOG_DICT_LIMIT:
+                compacted["__truncated_keys__"] = len(items) - cls._LOG_DICT_LIMIT
+            return compacted
+        return value
+
+    @classmethod
+    def _compact_log_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        return cls._compact_for_log(payload, depth=0)
+
     def _log_request(self, *, endpoint: str, model: str, payload: dict[str, Any]) -> None:
+        compact_payload = self._compact_log_payload(payload)
         logger.info(
             "LLM request endpoint=%s model=%s payload=%s",
             endpoint,
             model,
-            self._dump_for_log(payload),
+            self._dump_for_log(compact_payload),
         )
         self._append_workspace_api_log(
             source="llm.request",
             message=f"OpenAI request sent to {endpoint}.",
-            payload={"endpoint": endpoint, "model": model, "payload": payload},
+            payload={"endpoint": endpoint, "model": model, "payload": compact_payload},
         )
 
     def _log_prompt_bundle(
@@ -370,36 +415,38 @@ class OpenRouterClient:
         system_prompt: str,
         user_prompt: str,
     ) -> None:
+        compact_payload = {
+            "role": role,
+            "schema_name": schema_name,
+            "endpoint": endpoint,
+            "model": model,
+            "system_prompt": self._truncate_log_text(system_prompt),
+            "user_prompt": self._truncate_log_text(user_prompt),
+        }
         logger.info(
             "LLM prompt role=%s schema=%s endpoint=%s model=%s\nSYSTEM PROMPT:\n%s\nUSER PROMPT:\n%s",
             role,
             schema_name,
             endpoint,
             model,
-            system_prompt,
-            user_prompt,
+            compact_payload["system_prompt"],
+            compact_payload["user_prompt"],
         )
         self._append_workspace_api_log(
             source="llm.prompt",
             message=f"OpenAI prompt prepared for {role}.",
-            payload={
-                "role": role,
-                "schema_name": schema_name,
-                "endpoint": endpoint,
-                "model": model,
-                "system_prompt": system_prompt,
-                "user_prompt": user_prompt,
-            },
+            payload=compact_payload,
         )
 
     def _log_response(self, *, endpoint: str, model: str, response: httpx.Response) -> None:
         usage_summary = self._extract_usage_summary(response)
+        response_body = self._truncate_log_text(response.text, limit=6000)
         logger.info(
             "LLM response endpoint=%s model=%s status=%s body=%s",
             endpoint,
             model,
             response.status_code,
-            response.text,
+            response_body,
         )
         self._append_workspace_api_log(
             source="llm.response",
@@ -408,22 +455,23 @@ class OpenRouterClient:
                 "endpoint": endpoint,
                 "model": model,
                 "status_code": response.status_code,
-                "body": response.text,
+                "body": response_body,
                 "usage": usage_summary,
             },
         )
 
     def _log_parsed_text(self, *, endpoint: str, model: str, text: str) -> None:
+        compact_text = self._truncate_log_text(text, limit=4000)
         logger.info(
             "LLM parsed-text endpoint=%s model=%s text=%s",
             endpoint,
             model,
-            text,
+            compact_text,
         )
         self._append_workspace_api_log(
             source="llm.parsed_text",
             message=f"OpenAI parsed text extracted from {endpoint}.",
-            payload={"endpoint": endpoint, "model": model, "text": text},
+            payload={"endpoint": endpoint, "model": model, "text": compact_text},
         )
 
     def _append_workspace_api_log(self, *, source: str, message: str, payload: dict[str, Any]) -> None:
