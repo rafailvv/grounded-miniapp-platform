@@ -7,7 +7,7 @@ from app.models.common import GenerationMode
 from app.models.grounded_spec import GroundedSpecModel
 from app.models.domain import CodeChunkRecord, ContextPack, WorkspaceRecord
 from app.services.code_index_service import CodeIndexService
-from app.services.workspace_service import WorkspaceService
+from app.services.workspace.service import WorkspaceService
 
 
 class ContextPackBuilder:

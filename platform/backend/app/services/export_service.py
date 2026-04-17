@@ -7,7 +7,7 @@ from pathlib import Path
 from app.core.config import Settings
 from app.models.domain import ExportRecord
 from app.repositories.state_store import StateStore
-from app.services.workspace_service import WorkspaceService
+from app.services.workspace.service import WorkspaceService
 
 
 class ExportService:
@@ -51,4 +51,3 @@ class ExportService:
         if not payload:
             raise KeyError(f"Export not found: {export_id}")
         return ExportRecord.model_validate(payload)
-

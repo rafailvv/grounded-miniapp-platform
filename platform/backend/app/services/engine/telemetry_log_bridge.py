@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.services.workspace_log_service import WorkspaceLogService
+from app.services.workspace.log_service import WorkspaceLogService
 
 
 class TelemetryLogBridge:

@@ -22,13 +22,14 @@ from app.services.engine import (
     TelemetryLogBridge,
 )
 from app.services.fix_orchestrator import FixOrchestrator
-from app.services.generation_service import GenerationService
+from app.services.miniapp_generation.service import GenerationService
 from app.services.patch_service import PatchService
-from app.services.preview_service import PreviewService
-from app.services.runtime_manager import PreviewRuntimeManager
-from app.services.run_service import RunService
-from app.services.workspace_log_service import WorkspaceLogService
-from app.services.workspace_service import WorkspaceService
+from app.services.workspace.preview_service import PreviewService
+from app.services.workspace.run_service import RunService
+from app.services.workspace.runtime_manager import PreviewRuntimeManager
+from app.services.miniapp_generation.workspace_loop_engine import WorkspaceLoopEngine
+from app.services.workspace.log_service import WorkspaceLogService
+from app.services.workspace.service import WorkspaceService
 from app.validators.suite import ValidationSuite
 from app.ai.openrouter_client import OpenRouterClient
 
@@ -49,6 +50,11 @@ class ServiceContainer:
             self.store,
             self.workspace_service,
             self.runtime_manager,
+            self.workspace_log_service,
+        )
+        self.workspace_loop_engine = WorkspaceLoopEngine(
+            self.store,
+            self.workspace_service,
             self.workspace_log_service,
         )
         self.validation_suite = ValidationSuite()
@@ -98,6 +104,7 @@ class ServiceContainer:
             self.prompt_state_manager,
             self.compaction_service,
             self.artifact_recorder,
+            self.workspace_loop_engine,
         )
         self.fix_orchestrator = FixOrchestrator(
             self.store,
@@ -114,6 +121,7 @@ class ServiceContainer:
             self.compaction_service,
             self.artifact_recorder,
             self.generation_service,
+            self.workspace_loop_engine,
         )
         self.run_service = RunService(
             self.store,

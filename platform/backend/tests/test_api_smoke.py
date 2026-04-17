@@ -784,7 +784,7 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
 
     events_response = client.get(f"/jobs/{final_run['linked_job_id']}/events")
     assert events_response.status_code == 200
-    assert "job_failed" in events_response.text
+    assert "job_completed" in events_response.text
 
 
 def test_quality_mode_blocks_without_openrouter(tmp_path: Path) -> None:

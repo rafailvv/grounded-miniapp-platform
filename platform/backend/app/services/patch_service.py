@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.models.artifacts import ApplyPatchResult, PatchEnvelope, PatchOperationModel
-from app.services.workspace_service import WorkspaceService
+from app.services.workspace.service import WorkspaceService
 
 
 class PatchService:

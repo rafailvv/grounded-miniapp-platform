@@ -14,7 +14,7 @@ import httpx
 
 from app.ai.model_registry import MODEL_REGISTRY, TASK_PROFILES
 from app.core.config import Settings
-from app.services.workspace_log_service import WorkspaceLogService
+from app.services.workspace.log_service import WorkspaceLogService
 
 logger = logging.getLogger(__name__)
 ACTIVE_WORKSPACE_LOG_CONTEXT: ContextVar[str | None] = ContextVar("active_workspace_log_context", default=None)
@@ -195,6 +195,26 @@ class OpenRouterClient:
     ) -> dict[str, Any]:
         return self.generate_structured(
             role="repair",
+            schema_name=schema_name,
+            schema=schema,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            prompt_cache_key=prompt_cache_key,
+            stable_prefix=stable_prefix,
+        )
+
+    def generate_workspace_edits(
+        self,
+        *,
+        schema_name: str,
+        schema: dict[str, Any],
+        system_prompt: str,
+        user_prompt: str,
+        prompt_cache_key: str | None = None,
+        stable_prefix: str | None = None,
+    ) -> dict[str, Any]:
+        return self.generate_structured(
+            role="code_edit",
             schema_name=schema_name,
             schema=schema,
             system_prompt=system_prompt,

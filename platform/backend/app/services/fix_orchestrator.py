@@ -42,15 +42,21 @@ from app.services.engine import (
     SessionEngine,
     TaskRouter,
 )
-from app.services.preview_service import PreviewService
-from app.services.runtime_manager import PreviewRuntimeManager
-from app.services.workspace_log_service import WorkspaceLogService
-from app.services.workspace_service import WorkspaceService
+from app.services.workspace.preview_service import PreviewService
+from app.services.workspace.runtime_manager import PreviewRuntimeManager
+from app.services.miniapp_generation.workspace_loop_engine import (
+    WorkspaceLoopCallbacks,
+    WorkspaceLoopEngine,
+    WorkspaceLoopResult,
+    WorkspaceLoopTurnPlan,
+)
+from app.services.workspace.log_service import WorkspaceLogService
+from app.services.workspace.service import WorkspaceService
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from app.services.generation_service import GenerationService
+    from app.services.miniapp_generation.service import GenerationService
 
 
 class FixOrchestrator:
@@ -75,6 +81,7 @@ class FixOrchestrator:
         compaction_service: CompactionService | None = None,
         artifact_recorder: ArtifactRecorder | None = None,
         generation_service: "GenerationService | None" = None,
+        workspace_loop_engine: WorkspaceLoopEngine | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -90,6 +97,7 @@ class FixOrchestrator:
         self.compaction_service = compaction_service
         self.artifact_recorder = artifact_recorder
         self.generation_service = generation_service
+        self.workspace_loop_engine = workspace_loop_engine
 
     def generate(
         self,
@@ -196,78 +204,84 @@ class FixOrchestrator:
                 {"run_id": run_id},
             )
 
+        if self.workspace_loop_engine is None:
+            raise RuntimeError("Workspace loop engine is required for fix mode.")
+        return self._generate_with_workspace_loop(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            request=request,
+            job=job,
+            draft_source=draft_source,
+            started_at=started_at,
+            role_scope=list(request.target_role_scope),
+            effective_mode=effective_mode,
+            memory_context=(self.store.get("reports", f"project_memory_context:{workspace_id}") or {}).get("summary"),
+            should_stop=should_stop,
+        )
+
+    def _generate_with_workspace_loop(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        request: GenerateRequest,
+        job: JobRecord,
+        draft_source: Path,
+        started_at: float,
+        role_scope: list[str],
+        effective_mode: GenerationMode,
+        memory_context: str | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> JobRecord:
         scope_entries: list[FixScopeEntry] = []
         scope_expansions: list[dict[str, Any]] = []
-        fix_attempts: list[FixAttemptRecord] = []
-        repair_iterations: list[RepairIterationRecord] = []
-        previous_progress_snapshot: dict[str, Any] | None = None
-        previous_failure_signature: str | None = None
-        repeated_signature_without_progress = 0
-        latest_check_execution: CheckExecutionRecord | None = None
-        latest_preview_details: dict[str, Any] = {}
-        latest_apply_result: dict[str, Any] | None = None
-        memory_context = (self.store.get("reports", f"project_memory_context:{workspace_id}") or {}).get("summary")
-        active_strategy = "exact_fix"
 
-        for attempt in range(1, self.MAX_ATTEMPTS + 1):
-            if should_stop and should_stop():
-                job.status = "blocked"
-                job.failure_reason = "Fix run stopped before completion."
-                job.summary = "Fix run stopped before completion."
-                job.current_fix_phase = "stopped"
-                self._append_event(job, "job_failed", "Fix run was stopped before completion.")
-                return self._finalize_job(
-                    job,
-                    fix_attempts=fix_attempts,
-                    repair_iterations=repair_iterations,
-                    scope_expansions=scope_expansions,
-                    latest_execution=latest_check_execution,
-                    latest_preview_details=latest_preview_details,
-                    latest_apply_result=latest_apply_result,
-                    elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                )
-
-            job.current_fix_phase = "running_checks"
-            self._append_event(job, "triage_started", f"Triage attempt {attempt} started.", {"attempt": attempt})
-            self._append_trace(workspace_id, "triage", "Running exact fix verification checks.", {"attempt": attempt})
-            latest_check_execution, latest_preview_details = self._execute_exact_checks(
+        def _execute_checks(changed_files: list[str]) -> tuple[CheckExecutionRecord, dict[str, Any]]:
+            return self._execute_exact_checks(
                 job=job,
                 workspace_id=workspace_id,
                 run_id=run_id,
                 draft_source=draft_source,
-                changed_files=[entry.file_path for entry in scope_entries] or ["frontend", "miniapp"],
-            )
-            job.executed_checks = [result.model_dump(mode="json") for result in latest_check_execution.results]
-            job.container_statuses = latest_preview_details.get("containers", [])
-            job.current_failing_command = self._first_failing_command(latest_check_execution.results)
-            job.current_exit_code = self._first_failing_exit_code(latest_check_execution.results)
-            job.validation_snapshot = self._validation_snapshot_from_execution(latest_check_execution)
-            self._store_report(
-                f"check_results:{workspace_id}",
-                {
-                    "workspace_id": workspace_id,
-                    "items": [item.model_dump(mode="json") for item in latest_check_execution.results],
-                    "duration_ms": latest_check_execution.duration_ms,
-                },
+                changed_files=changed_files or ["miniapp", "frontend"],
             )
 
+        def _plan_turn(
+            *,
+            attempt: int,
+            latest_execution: CheckExecutionRecord,
+            latest_preview_details: dict[str, Any],
+            validation_snapshot: ValidationSnapshot,
+            context_mode: str,
+            repeated_no_progress: int,
+            last_turn_summary: str | None,
+            latest_diff_summary: str | None,
+        ) -> WorkspaceLoopTurnPlan:
+            del validation_snapshot
             fix_case = self._build_fix_case(
                 workspace_id=workspace_id,
                 run_id=run_id,
                 attempt=attempt,
                 request=request,
-                check_execution=latest_check_execution,
+                check_execution=latest_execution,
                 preview_details=latest_preview_details,
-                prior_attempts=fix_attempts,
+                prior_attempts=[],
                 existing_scope=scope_entries,
                 memory_context=memory_context,
             )
+            next_scope = self._build_write_scope(
+                workspace_id,
+                run_id,
+                fix_case.implicated_files,
+                fix_case.failure_class or "build/runtime",
+                scope_entries,
+                "exact_fix",
+            )
+            scope_entries[:] = self._merge_scope(scope_entries, next_scope, scope_expansions)
             job.failure_class = fix_case.failure_class
             job.failure_signature = fix_case.failure_signature
-            active_strategy = fix_case.fix_strategy or active_strategy
             job.root_cause_summary = fix_case.root_cause_summary
             job.fix_targets = list(fix_case.implicated_files)
-            job.current_fix_phase = "collecting_state"
+            job.validation_snapshot = self._validation_snapshot_from_execution(latest_execution)
             self._store_report(f"fix_case:{workspace_id}", fix_case.model_dump(mode="json"))
             self._append_event(
                 job,
@@ -276,241 +290,12 @@ class FixOrchestrator:
                 {
                     "attempt": attempt,
                     "failure_class": fix_case.failure_class,
-                    "fix_strategy": fix_case.fix_strategy,
                     "failure_signature": fix_case.failure_signature,
                     "implicated_files": fix_case.implicated_files,
+                    "context_mode": context_mode,
+                    "repeated_no_progress": repeated_no_progress,
                 },
             )
-
-            completion_state = self._completion_state_from_results(
-                latest_check_execution.results,
-                latest_preview_details,
-                validation_snapshot=job.validation_snapshot,
-            )
-            if completion_state["strict_green"]:
-                latest_check_execution, latest_preview_details = self._execute_final_checks(
-                    job=job,
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                    draft_source=draft_source,
-                    changed_files=self._final_check_changed_files(latest_apply_result, fix_case, scope_entries),
-                )
-                completion_state = self._completion_state_from_results(
-                    latest_check_execution.results,
-                    latest_preview_details,
-                    validation_snapshot=self._validation_snapshot_from_execution(latest_check_execution),
-                )
-                if not completion_state["strict_green"]:
-                    continue
-                success_attempt = FixAttemptRecord(
-                    run_id=run_id,
-                    attempt=attempt,
-                    diagnosis=fix_case.root_cause_summary or "Fix verification passed.",
-                    commands=[result.command for result in latest_check_execution.results if result.command],
-                    exit_codes={result.name: result.exit_code for result in latest_check_execution.results},
-                    files_changed=[],
-                    implicated_files=fix_case.implicated_files,
-                    failure_signature=fix_case.failure_signature,
-                    result="green",
-                    expected_verification="Draft compiles and preview runtime is healthy.",
-                )
-                fix_attempts.append(success_attempt)
-                job.status = "completed"
-                job.outcome_kind = "applied"
-                job.summary = "Fix completed successfully after exact verification."
-                job.failure_reason = None
-                job.current_fix_phase = "completed"
-                job.remaining_issues = []
-                job.validation_snapshot = ValidationSnapshot(
-                    grounded_spec_valid=True,
-                    app_ir_valid=True,
-                    build_valid=True,
-                    blocking=False,
-                    issues=[],
-                )
-                self._append_event(job, "checks_completed", "Fix checks passed and preview is healthy.", {"attempt": attempt})
-                self._append_event(job, "job_completed", "Fix completed successfully.")
-                return self._finalize_job(
-                    job,
-                    fix_attempts=fix_attempts,
-                    repair_iterations=repair_iterations,
-                    scope_expansions=scope_expansions,
-                    latest_execution=latest_check_execution,
-                    latest_preview_details=latest_preview_details,
-                    latest_apply_result=latest_apply_result,
-                    elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                )
-
-            if completion_state["optimistic_complete"]:
-                latest_check_execution, latest_preview_details = self._execute_final_checks(
-                    job=job,
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                    draft_source=draft_source,
-                    changed_files=self._final_check_changed_files(latest_apply_result, fix_case, scope_entries),
-                )
-                completion_state = self._completion_state_from_results(
-                    latest_check_execution.results,
-                    latest_preview_details,
-                    validation_snapshot=self._validation_snapshot_from_execution(latest_check_execution),
-                )
-                if completion_state["strict_green"] or completion_state["optimistic_complete"]:
-                    success_attempt = FixAttemptRecord(
-                        run_id=run_id,
-                        attempt=attempt,
-                        diagnosis=(
-                            "Fix verification passed with non-blocking residual issues."
-                            if completion_state["remaining_issues"]
-                            else "Fix verification passed."
-                        ),
-                        commands=[result.command for result in latest_check_execution.results if result.command],
-                        exit_codes={result.name: result.exit_code for result in latest_check_execution.results},
-                        files_changed=[],
-                        implicated_files=fix_case.implicated_files,
-                        failure_signature=fix_case.failure_signature,
-                        result="green",
-                        expected_verification="Backend and preview remain usable after the repair loop.",
-                    )
-                    fix_attempts.append(success_attempt)
-                    job.status = "completed"
-                    job.outcome_kind = "warnings" if completion_state["remaining_issues"] else "applied"
-                    job.summary = (
-                        "Fix completed with a working draft. Remaining issues were recorded for follow-up."
-                        if completion_state["remaining_issues"]
-                        else "Fix completed successfully after exact verification."
-                    )
-                    job.failure_reason = None
-                    job.current_fix_phase = "completed"
-                    job.remaining_issues = list(completion_state["remaining_issues"])
-                    job.validation_snapshot = ValidationSnapshot(
-                        grounded_spec_valid=True,
-                        app_ir_valid=True,
-                        build_valid=True,
-                        blocking=False,
-                        issues=[],
-                    )
-                    self._append_event(
-                        job,
-                        "checks_completed",
-                        "Fix reached a usable completed state.",
-                        {
-                            "attempt": attempt,
-                            "remaining_issue_count": len(job.remaining_issues),
-                        },
-                    )
-                    self._append_event(
-                        job,
-                        "job_completed",
-                        "Fix completed with remaining non-blocking issues." if job.remaining_issues else "Fix completed successfully.",
-                    )
-                    return self._finalize_job(
-                        job,
-                        fix_attempts=fix_attempts,
-                        repair_iterations=repair_iterations,
-                        scope_expansions=scope_expansions,
-                        latest_execution=latest_check_execution,
-                        latest_preview_details=latest_preview_details,
-                        latest_apply_result=latest_apply_result,
-                        elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                    )
-
-            if CheckRunner.has_tooling_failure(latest_check_execution.results):
-                job.status = "failed"
-                job.failure_reason = fix_case.root_cause_summary or "Platform/tooling misconfiguration prevents exact verification."
-                job.summary = "Fix stopped because the platform runtime cannot execute required checks."
-                job.current_fix_phase = "failed"
-                self._append_event(job, "job_failed", job.failure_reason)
-                return self._finalize_job(
-                    job,
-                    fix_attempts=fix_attempts,
-                    repair_iterations=repair_iterations,
-                    scope_expansions=scope_expansions,
-                    latest_execution=latest_check_execution,
-                    latest_preview_details=latest_preview_details,
-                    latest_apply_result=latest_apply_result,
-                    elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                )
-
-            signature = fix_case.failure_signature or ""
-            current_progress_snapshot = self._repair_progress_snapshot(
-                latest_check_execution.results,
-                latest_preview_details,
-                fix_case,
-            )
-            made_progress = self._repair_snapshot_improved(previous_progress_snapshot, current_progress_snapshot)
-            if signature and previous_failure_signature == signature and not made_progress:
-                repeated_signature_without_progress += 1
-            else:
-                repeated_signature_without_progress = 0
-            if signature and repeated_signature_without_progress >= 3:
-                job.status = "failed"
-                job.failure_reason = (
-                    "Fix loop stopped after expanded-context and full-bundle retries failed to improve the same failure signature."
-                )
-                job.summary = "Fix loop stopped because repeated repair attempts did not improve the same root-cause cluster."
-                job.current_fix_phase = "failed"
-                self._append_event(
-                    job,
-                    "job_failed",
-                    job.failure_reason,
-                    {
-                        "failure_signature": signature,
-                        "repeated_without_progress": repeated_signature_without_progress,
-                        "progress_snapshot": current_progress_snapshot,
-                    },
-                )
-                return self._finalize_job(
-                    job,
-                    fix_attempts=fix_attempts,
-                    repair_iterations=repair_iterations,
-                    scope_expansions=scope_expansions,
-                    latest_execution=latest_check_execution,
-                    latest_preview_details=latest_preview_details,
-                    latest_apply_result=latest_apply_result,
-                    elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                )
-            previous_failure_signature = signature or previous_failure_signature
-            previous_progress_snapshot = current_progress_snapshot
-
-            strategy_budget = self.MAX_ATTEMPTS
-            if attempt >= strategy_budget:
-                job.status = "failed"
-                job.failure_reason = "Fix loop reached the repair attempt budget without reaching a green build and preview."
-                job.summary = "Fix loop reached the repair attempt budget."
-                job.current_fix_phase = "failed"
-                self._append_event(
-                    job,
-                    "job_failed",
-                    job.failure_reason,
-                    {"fix_strategy": active_strategy, "attempt_budget": strategy_budget},
-                )
-                return self._finalize_job(
-                    job,
-                    fix_attempts=fix_attempts,
-                    repair_iterations=repair_iterations,
-                    scope_expansions=scope_expansions,
-                    latest_execution=latest_check_execution,
-                    latest_preview_details=latest_preview_details,
-                    latest_apply_result=latest_apply_result,
-                    elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                )
-
-            expanded_scope = self._merge_scope(scope_entries, fix_case.write_scope, scope_expansions)
-            if expanded_scope != scope_entries:
-                added_paths = [entry.file_path for entry in expanded_scope if entry.file_path not in {item.file_path for item in scope_entries}]
-                if added_paths:
-                    scope_expansions.append(
-                        {
-                            "attempt": attempt,
-                            "files": added_paths,
-                            "reason": "Evidence-based scope expansion from fix case.",
-                        }
-                    )
-                    self._append_event(job, "scope_expanded", "Expanded fix scope based on new evidence.", {"attempt": attempt, "files": added_paths})
-                scope_entries = expanded_scope
-            elif not scope_entries:
-                scope_entries = fix_case.write_scope
-
             deterministic_operations = self._deterministic_contract_repair_operations(
                 workspace_id=workspace_id,
                 run_id=run_id,
@@ -519,96 +304,37 @@ class FixOrchestrator:
                 generation_mode=effective_mode,
             )
             if deterministic_operations:
-                self._append_event(
-                    job,
-                    "repair_planned",
-                    "Applying deterministic contract repair before model patching.",
-                    {"attempt": attempt, "scope": [operation.file_path for operation in deterministic_operations]},
+                return WorkspaceLoopTurnPlan(
+                    outcome="patch_ready",
+                    assistant_message="Applied deterministic contract repair before model editing.",
+                    diagnosis="Applied deterministic contract repair before model editing.",
+                    operations=deterministic_operations,
+                    files_read=[entry.file_path for entry in scope_entries],
+                    failure_class=fix_case.failure_class,
+                    failure_signature=fix_case.failure_signature,
+                    root_cause_summary=fix_case.root_cause_summary,
+                    fix_targets=list(fix_case.implicated_files),
+                    metadata={"source": "deterministic_contract_repair"},
                 )
-                envelope = self.workspace_service.build_patch_envelope_for_draft(workspace_id, run_id, deterministic_operations)
-                apply_result = self.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
-                latest_apply_result = apply_result.model_dump(mode="json")
-                if apply_result.status != "applied":
-                    job.status = "failed"
-                    job.failure_reason = apply_result.conflict_reason or "Deterministic contract repair could not be applied."
-                    job.summary = "Fix failed while applying deterministic contract repair."
-                    job.current_fix_phase = "syncing_contract"
-                    self._append_event(job, "job_failed", job.failure_reason)
-                    return self._finalize_job(
-                        job,
-                        fix_attempts=fix_attempts,
-                        repair_iterations=repair_iterations,
-                        scope_expansions=scope_expansions,
-                        latest_execution=latest_check_execution,
-                        latest_preview_details=latest_preview_details,
-                        latest_apply_result=latest_apply_result,
-                        elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                    )
-                diff_text = self.workspace_service.diff(workspace_id, run_id=run_id)
-                self._store_report(f"candidate_diff:{workspace_id}", {"workspace_id": workspace_id, "diff": diff_text})
-                self._append_event(
-                    job,
-                    "patch_apply_completed",
-                    "Deterministic contract repair applied to the draft.",
-                    {"attempt": attempt, "changed_files": apply_result.changed_files},
-                )
-                self._append_trace(
-                    workspace_id,
-                    "patch_apply",
-                    "Deterministic contract repair applied to the draft.",
-                    {"attempt": attempt, "changed_files": apply_result.changed_files},
-                )
-                fix_attempts.append(
-                    FixAttemptRecord(
-                        run_id=run_id,
-                        attempt=attempt,
-                        diagnosis="Applied deterministic contract repair before model patching.",
-                        commands=[result.command for result in latest_check_execution.results if result.command],
-                        exit_codes={result.name: result.exit_code for result in latest_check_execution.results},
-                        files_changed=list(apply_result.changed_files),
-                        implicated_files=fix_case.implicated_files,
-                        failure_signature=fix_case.failure_signature,
-                        result="patched",
-                        expected_verification="Deterministic contract repair should reduce route/runtime drift before the next verification pass.",
-                    )
-                )
-                repair_iterations.append(
-                    RepairIterationRecord(
-                        run_id=run_id,
-                        attempt=attempt,
-                        files_read=[entry.file_path for entry in scope_entries],
-                        files_changed=list(apply_result.changed_files),
-                        failure_class=fix_case.failure_class,
-                        check_results=latest_check_execution.results,
-                        latency_breakdown={"attempt_ms": 0},
-                        token_usage={},
-                    )
-                )
-                continue
 
-            job.current_fix_phase = "generating_edits"
-            repair_context_mode = self._repair_context_mode(fix_case, repeated_signature_without_progress)
             repair_packet = self._build_repair_packet(
                 workspace_id=workspace_id,
                 run_id=run_id,
                 fix_case=fix_case,
                 scope_entries=scope_entries,
-                context_mode=repair_context_mode,
+                context_mode=str(context_mode),
             )
+            if last_turn_summary or latest_diff_summary:
+                repair_packet = repair_packet.model_copy(
+                    update={
+                        "previous_attempt_summary": last_turn_summary or repair_packet.previous_attempt_summary,
+                        "previous_diff_summary": latest_diff_summary or repair_packet.previous_diff_summary,
+                    }
+                )
             self._append_event(
                 job,
                 "repair_planned",
                 "Prepared repair packet for the current failure bundle.",
-                {
-                    "attempt": attempt,
-                    "scope": [entry.file_path for entry in scope_entries],
-                    "context_mode": repair_packet.context_mode,
-                },
-            )
-            self._append_trace(
-                workspace_id,
-                "repair_planned",
-                "Prepared repair packet.",
                 {
                     "attempt": attempt,
                     "scope": [entry.file_path for entry in scope_entries],
@@ -622,256 +348,73 @@ class FixOrchestrator:
                 fix_case=fix_case,
                 scope_expansions=scope_expansions,
             )
-            if repair_outcome.outcome == "needs_more_context":
-                next_context_mode = "full_bundle" if repair_packet.context_mode == "expanded" else "expanded"
-                if repair_packet.context_mode == "full_bundle":
-                    repair_outcome = FixAttemptOutcome(
-                        outcome="no_progress",
-                        diagnosis=repair_outcome.diagnosis,
-                        planned_targets=repair_outcome.planned_targets,
-                        validation_error=repair_outcome.validation_error or "Repair requested more context after receiving the full bundle.",
-                        expected_verification=repair_outcome.expected_verification,
-                        rationale_by_file=repair_outcome.rationale_by_file,
-                        raw_response=repair_outcome.raw_response,
-                    )
-                else:
-                    retry_feedback = (
-                        "The previous repair response did not return a valid executable patch. "
-                        "The full current contents for the requested files are now included. "
-                        "Return only concrete create/replace/delete operations for generated app code."
-                    )
-                    expanded_packet = self._build_repair_packet(
-                        workspace_id=workspace_id,
-                        run_id=run_id,
-                        fix_case=fix_case,
-                        scope_entries=scope_entries,
-                        context_mode=next_context_mode,
-                        additional_paths=repair_outcome.planned_targets,
-                    )
-                    self._append_event(
-                        job,
-                        "repair_scope_expanded",
-                        "Retrying repair planning with a larger repair packet.",
-                        {
-                            "attempt": attempt,
-                            "from_context_mode": repair_packet.context_mode,
-                            "to_context_mode": expanded_packet.context_mode,
-                            "planned_targets": repair_outcome.planned_targets,
-                            "validation_error": repair_outcome.validation_error,
-                        },
-                    )
-                    llm_result = self._plan_patch(
-                        job=job,
-                        repair_packet=expanded_packet,
-                        repair_feedback=retry_feedback,
-                    )
-                    repair_outcome = self._repair_outcome_from_response(
-                        llm_result=llm_result,
-                        repair_packet=expanded_packet,
-                        fix_case=fix_case,
-                        scope_expansions=scope_expansions,
-                    )
-                    repair_packet = expanded_packet
-            if repair_outcome.outcome != "patch_ready":
-                attempt_record = FixAttemptRecord(
-                    run_id=run_id,
-                    attempt=attempt,
-                    diagnosis=str(repair_outcome.diagnosis or "Repair turn did not produce executable edits."),
-                    commands=[result.command for result in latest_check_execution.results if result.command],
-                    exit_codes={result.name: result.exit_code for result in latest_check_execution.results},
-                    files_changed=[],
-                    implicated_files=fix_case.implicated_files,
-                    failure_signature=fix_case.failure_signature,
-                    result="failed",
-                    rationale_by_file=dict(repair_outcome.rationale_by_file),
-                    expected_verification=repair_outcome.expected_verification,
-                )
-                fix_attempts.append(attempt_record)
-                repair_iterations.append(
-                    RepairIterationRecord(
-                        run_id=run_id,
-                        attempt=attempt,
-                        files_read=[entry.file_path for entry in scope_entries],
-                        files_changed=[],
-                        failure_class=fix_case.failure_class,
-                        check_results=latest_check_execution.results,
-                        latency_breakdown={"attempt_ms": 0},
-                        token_usage={},
-                    )
-                )
-                self._append_event(
-                    job,
-                    "repair_iteration",
-                    "Repair turn produced no executable patch. Retrying with the updated loop policy.",
-                    {
-                        "attempt": attempt,
-                        "repair_outcome": repair_outcome.outcome,
-                        "planned_targets": repair_outcome.planned_targets,
-                        "validation_error": repair_outcome.validation_error,
-                    },
-                )
-                self._append_trace(
-                    workspace_id,
-                    "repair_iteration",
-                    "Repair turn produced no executable patch.",
-                    {
-                        "attempt": attempt,
-                        "repair_outcome": repair_outcome.outcome,
-                        "planned_targets": repair_outcome.planned_targets,
-                        "validation_error": repair_outcome.validation_error,
-                    },
-                )
-                continue
-            operations = list(repair_outcome.operations)
-
-            job.current_fix_phase = "applying_edits"
-            self._append_event(job, "patch_apply_started", "Applying minimal repair patch.", {"attempt": attempt, "files": [operation.file_path for operation in operations]})
-            envelope = self.workspace_service.build_patch_envelope_for_draft(workspace_id, run_id, operations)
-            apply_result = self.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
-            latest_apply_result = apply_result.model_dump(mode="json")
-            self._store_report(
-                f"patch:{workspace_id}",
-                {
-                    "workspace_id": workspace_id,
-                    "envelope": envelope.model_dump(mode="json"),
-                    "apply_result": latest_apply_result,
-                },
-            )
-            if apply_result.status != "applied":
-                attempt_record = FixAttemptRecord(
-                    run_id=run_id,
-                    attempt=attempt,
-                    diagnosis=str(repair_outcome.diagnosis or "Patch conflict while applying the repair."),
-                    commands=[result.command for result in latest_check_execution.results if result.command],
-                    exit_codes={result.name: result.exit_code for result in latest_check_execution.results},
-                    files_changed=[],
-                    implicated_files=fix_case.implicated_files,
-                    failure_signature=fix_case.failure_signature,
-                    result="conflict",
-                    rationale_by_file=dict(repair_outcome.rationale_by_file),
-                    expected_verification=repair_outcome.expected_verification,
-                )
-                fix_attempts.append(attempt_record)
-                job.status = "failed"
-                job.failure_reason = apply_result.conflict_reason or "Repair patch conflicted with the current draft."
-                job.summary = "Fix stopped because the repair patch could not be applied safely."
-                job.current_fix_phase = "failed"
-                self._append_event(job, "job_failed", job.failure_reason)
-                return self._finalize_job(
-                    job,
-                    fix_attempts=fix_attempts,
-                    repair_iterations=repair_iterations,
-                    scope_expansions=scope_expansions,
-                    latest_execution=latest_check_execution,
-                    latest_preview_details=latest_preview_details,
-                    latest_apply_result=latest_apply_result,
-                    elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                )
-
-            diff_text = self.workspace_service.diff(workspace_id, run_id=run_id)
-            self._store_report(f"candidate_diff:{workspace_id}", {"workspace_id": workspace_id, "diff": diff_text})
-            self._append_event(job, "patch_apply_completed", "Repair patch applied to the draft.", {"attempt": attempt, "changed_files": apply_result.changed_files})
-            self._append_event(job, "repair_iteration", f"Repair attempt {attempt} applied. Re-running verification.", {"attempt": attempt})
-            self._append_trace(
-                workspace_id,
-                "patch_apply",
-                "Repair patch applied to the draft.",
-                {"attempt": attempt, "changed_files": apply_result.changed_files},
-            )
-
-            attempt_record = FixAttemptRecord(
-                run_id=run_id,
-                attempt=attempt,
-                diagnosis=str(repair_outcome.diagnosis or "Applied a minimal repair patch."),
-                commands=[result.command for result in latest_check_execution.results if result.command],
-                exit_codes={result.name: result.exit_code for result in latest_check_execution.results},
-                files_changed=list(apply_result.changed_files),
-                implicated_files=fix_case.implicated_files,
-                failure_signature=fix_case.failure_signature,
-                result="patched",
-                rationale_by_file=dict(repair_outcome.rationale_by_file),
-                expected_verification=repair_outcome.expected_verification,
-            )
-            fix_attempts.append(attempt_record)
-
-            repair_iterations.append(
-                RepairIterationRecord(
-                    run_id=run_id,
-                    attempt=attempt,
-                    files_read=[entry.file_path for entry in scope_entries],
-                    files_changed=list(apply_result.changed_files),
+            mapped_outcome = repair_outcome.outcome
+            if mapped_outcome == "fatal_invalid_response":
+                return WorkspaceLoopTurnPlan(
+                    outcome="fatal_invalid_response",
+                    assistant_message=str(repair_outcome.diagnosis or ""),
+                    diagnosis=repair_outcome.validation_error or repair_outcome.diagnosis,
+                    files_read=list(repair_packet.file_contexts.keys()),
                     failure_class=fix_case.failure_class,
-                    check_results=latest_check_execution.results,
-                    latency_breakdown={"attempt_ms": 0},
-                    token_usage={},
+                    failure_signature=fix_case.failure_signature,
+                    root_cause_summary=fix_case.root_cause_summary,
+                    fix_targets=list(fix_case.implicated_files),
+                    metadata={"raw_response": repair_outcome.raw_response},
                 )
-            )
-            if self.session_engine is not None:
-                diminishing = self.session_engine.should_stop_for_diminishing_returns(
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                    phase="fix_repair",
-                    generation_mode=effective_mode.value,
-                    metrics={
-                        "attempt": attempt,
-                        "changed_files_count": len(apply_result.changed_files),
-                        "diff_chars": len(diff_text),
-                        "failure_signature": fix_case.failure_signature,
-                        "total_tokens": int(job.cache_stats.get("total_tokens", 0) or 0),
-                    },
-                )
-                if diminishing.get("should_stop"):
-                    job.status = "failed"
-                    job.failure_reason = str(diminishing.get("reason") or "Fix stopped due to diminishing returns.")
-                    job.summary = "Fix loop stopped because additional iterations were no longer producing meaningful changes."
-                    job.current_fix_phase = "failed"
-                    self._append_event(job, "job_failed", job.failure_reason)
-                    return self._finalize_job(
-                        job,
-                        fix_attempts=fix_attempts,
-                        repair_iterations=repair_iterations,
-                        scope_expansions=scope_expansions,
-                        latest_execution=latest_check_execution,
-                        latest_preview_details=latest_preview_details,
-                        latest_apply_result=latest_apply_result,
-                        elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                    )
-            run_iteration = RunIterationRecord(
-                run_id=run_id,
-                assistant_message=attempt_record.diagnosis,
-                files_read=[entry.file_path for entry in scope_entries],
-                operations=[
-                    RunIterationOperation(
-                        file_path=operation.file_path,
-                        operation=operation.operation,
-                        reason=operation.reason,
-                    )
-                    for operation in operations
-                ],
-                check_results=latest_check_execution.results,
-                diff_summary=self._diff_summary(diff_text),
-                role_scope=request.target_role_scope,
-                latency_breakdown={},
-                token_usage={},
+            return WorkspaceLoopTurnPlan(
+                outcome="patch_ready" if mapped_outcome == "patch_ready" else ("needs_context" if mapped_outcome == "needs_more_context" else "no_op"),
+                assistant_message=str(repair_outcome.diagnosis or ""),
+                diagnosis=repair_outcome.validation_error or repair_outcome.diagnosis,
+                operations=list(repair_outcome.operations),
+                files_read=list(repair_packet.file_contexts.keys()),
                 failure_class=fix_case.failure_class,
+                failure_signature=fix_case.failure_signature,
+                root_cause_summary=fix_case.root_cause_summary,
+                fix_targets=list(fix_case.implicated_files),
+                expected_verification=repair_outcome.expected_verification,
+                rationale_by_file=dict(repair_outcome.rationale_by_file),
+                metadata={"planned_targets": list(repair_outcome.planned_targets)},
             )
-            self._append_iteration_report(workspace_id, run_iteration)
-            self._store_report(f"fix_attempts:{workspace_id}", {"workspace_id": workspace_id, "items": [item.model_dump(mode="json") for item in fix_attempts]})
-            self._store_report(f"scope_expansions:{workspace_id}", {"workspace_id": workspace_id, "items": scope_expansions})
 
-        job.status = "failed"
-        job.failure_reason = "Fix loop reached the repair attempt budget without reaching a green build and preview."
-        job.summary = "Fix stopped after exhausting the repair budget."
-        job.current_fix_phase = "failed"
-        self._append_event(job, "job_failed", job.failure_reason)
-        return self._finalize_job(
-            job,
-            fix_attempts=fix_attempts,
-            repair_iterations=repair_iterations,
+        callbacks = WorkspaceLoopCallbacks(
+            execute_checks=_execute_checks,
+            build_validation_snapshot=self._validation_snapshot_from_execution,
+            completion_state=self._completion_state_from_results,
+            has_tooling_failure=CheckRunner.has_tooling_failure,
+            plan_turn=_plan_turn,
+            apply_contract_sync=lambda operations: self.generation_service._run_pre_apply_contract_pass(
+                workspace_id=workspace_id,
+                draft_run_id=run_id,
+                page_graph=self._page_graph_for_deterministic_repair(workspace_id, run_id),
+                role_scope=self._role_scope_for_fix_request(workspace_id, run_id, request),
+                generation_mode=effective_mode,
+                operations=list(operations),
+            )
+            if self.generation_service is not None
+            else list(operations),
+            append_event=self._append_event,
+            append_trace=self._append_trace,
+            store_report=self._store_report,
+            stop_if_requested=should_stop,
+        )
+        loop_result = self.workspace_loop_engine.run(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            job=job,
+            draft_source=draft_source,
+            role_scope=self._role_scope_for_fix_request(workspace_id, run_id, request),
+            generation_mode=effective_mode,
+            max_attempts=self.MAX_ATTEMPTS,
+            initial_operations=[],
+            initial_assistant_message="Fix workspace loop initialized.",
+            initial_files_read=[],
+            initial_changed_files=["miniapp", "frontend"],
+            callbacks=callbacks,
+        )
+        return self._finalize_loop_job(
+            job=job,
+            loop_result=loop_result,
             scope_expansions=scope_expansions,
-            latest_execution=latest_check_execution,
-            latest_preview_details=latest_preview_details,
-            latest_apply_result=latest_apply_result,
             elapsed_ms=int((time.perf_counter() - started_at) * 1000),
         )
 
@@ -1012,6 +555,81 @@ class FixOrchestrator:
         if fix_case.implicated_files:
             return list(fix_case.implicated_files)
         return [entry.file_path for entry in scope_entries]
+
+    def _role_scope_for_fix_request(
+        self,
+        workspace_id: str,
+        run_id: str,
+        request: GenerateRequest,
+    ) -> list[str]:
+        explicit_scope = [role for role in request.target_role_scope if role in {"client", "specialist", "manager"}]
+        if explicit_scope:
+            return explicit_scope
+        page_graph = self._page_graph_for_deterministic_repair(workspace_id, run_id)
+        graph_scope = [
+            str(role)
+            for role in (page_graph.get("roles") or {}).keys()
+            if role in {"client", "specialist", "manager"}
+        ]
+        return graph_scope or ["client", "specialist", "manager"]
+
+    def _finalize_loop_job(
+        self,
+        *,
+        job: JobRecord,
+        loop_result: WorkspaceLoopResult,
+        scope_expansions: list[dict[str, Any]],
+        elapsed_ms: int,
+    ) -> JobRecord:
+        job.status = loop_result.status
+        job.outcome_kind = loop_result.outcome_kind
+        job.summary = loop_result.summary
+        job.failure_reason = loop_result.failure_reason
+        job.failure_class = loop_result.failure_class
+        job.failure_signature = loop_result.failure_signature
+        job.root_cause_summary = loop_result.root_cause_summary
+        job.current_fix_phase = loop_result.current_phase
+        job.remaining_issues = list(loop_result.remaining_issues)
+        if loop_result.latest_execution is not None:
+            job.validation_snapshot = self._validation_snapshot_from_execution(loop_result.latest_execution)
+        if loop_result.status == "completed" and not job.remaining_issues:
+            job.validation_snapshot = ValidationSnapshot(
+                grounded_spec_valid=True,
+                app_ir_valid=True,
+                build_valid=True,
+                blocking=False,
+                issues=[],
+            )
+        fix_attempts: list[FixAttemptRecord] = []
+        for turn in loop_result.turn_history:
+            fix_attempts.append(
+                FixAttemptRecord(
+                    run_id=job.linked_run_id or "",
+                    attempt=int(turn.get("attempt") or 0),
+                    diagnosis=str(turn.get("diagnosis") or turn.get("assistant_message") or ""),
+                    commands=[result.command for result in (loop_result.latest_execution.results if loop_result.latest_execution else []) if result.command],
+                    exit_codes={
+                        result.name: result.exit_code
+                        for result in (loop_result.latest_execution.results if loop_result.latest_execution else [])
+                    },
+                    files_changed=[str(path) for path in turn.get("files_changed") or []],
+                    implicated_files=[str(path) for path in turn.get("fix_targets") or []],
+                    failure_signature=str(turn.get("failure_signature") or "") or None,
+                    result="patched" if str(turn.get("result")) == "patched" else "failed",
+                    rationale_by_file={str(k): str(v) for k, v in dict(turn.get("metadata") or {}).items() if isinstance(v, str)},
+                    expected_verification=None,
+                )
+            )
+        return self._finalize_job(
+            job,
+            fix_attempts=fix_attempts,
+            repair_iterations=loop_result.repair_iterations,
+            scope_expansions=scope_expansions,
+            latest_execution=loop_result.latest_execution,
+            latest_preview_details=loop_result.latest_preview_details,
+            latest_apply_result=loop_result.latest_apply_result,
+            elapsed_ms=elapsed_ms,
+        )
 
     def _build_fix_case(
         self,
@@ -1441,7 +1059,7 @@ class FixOrchestrator:
         self._save_job(job)
         prompt_cache_key = self._prompt_cache_key(repair_packet)
         try:
-            payload = self.openrouter_client.generate_repair(
+            payload = self.openrouter_client.generate_workspace_edits(
                 schema_name="fix_patch_v1",
                 schema=self._repair_schema(),
                 system_prompt=self._repair_system_prompt(),
@@ -2180,7 +1798,6 @@ class FixOrchestrator:
             for result in results
             if result.status == "failed" and result.name not in {"generated_app_python_tests", "generated_app_js_tests"}
         ]
-        blocking_validation = bool(validation_snapshot.blocking) if validation_snapshot is not None else False
         remaining_issues = cls._remaining_issues_from_results(
             app_test_failures=app_test_failures,
             validation_snapshot=validation_snapshot,
@@ -2192,7 +1809,6 @@ class FixOrchestrator:
             and build_ok
             and preview_ok
             and not non_test_failures
-            and not blocking_validation
             and bool(remaining_issues)
         )
         return {
@@ -2213,6 +1829,8 @@ class FixOrchestrator:
             remaining.append(
                 {
                     "kind": "generated_test_failure",
+                    "location": "tests",
+                    "blocking": False,
                     "check": result.name,
                     "details": result.details,
                     "logs": result.logs[-8:],

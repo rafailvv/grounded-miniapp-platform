@@ -6304,6 +6304,60 @@ def manifest(role: str):
     assert "role = _validate_role(role)" in updated
 
 
+def test_normalize_runtime_route_module_source_is_idempotent() -> None:
+    content = """from fastapi import APIRouter, HTTPException
+
+router = APIRouter(tags=["runtime"])
+ALLOWED_ROLES = {"client", "specialist", "manager"}
+
+def _validate_role(role: str) -> None:
+    if role not in ALLOWED_ROLES:
+        raise HTTPException(status_code=404, detail="Role not supported")
+
+@router.get("/api/runtime/{role}/manifest")
+def manifest(role: str):
+    _validate_role(role)
+    return {"role": role}
+"""
+
+    once = GenerationService._normalize_runtime_route_module_source(content)
+    twice = GenerationService._normalize_runtime_route_module_source(once)
+
+    assert twice == once
+    assert twice.count("def _validate_role(role: str) -> str:") == 1
+    assert twice.count("role = _validate_role(role)") == 1
+
+
+def test_whole_file_cluster_allows_no_op_when_targets_already_exist() -> None:
+    generation_service = GenerationService.__new__(GenerationService)
+    generation_service._whole_file_cluster_system_prompt = lambda _cluster_name: "system"
+    generation_service._whole_file_cluster_user_prompt = lambda **_kwargs: "user"
+    generation_service._generate_structured_with_retry = lambda **_kwargs: {  # type: ignore[method-assign]
+        "payload": {"assistant_message": "No changes needed.", "operations": []},
+        "model": "gpt-5.2",
+    }
+    generation_service._normalize_model_payload = lambda payload: payload  # type: ignore[method-assign]
+    generation_service._sanitize_draft_operations = lambda operations: operations  # type: ignore[method-assign]
+
+    result = generation_service._resolve_whole_file_cluster(
+        cluster_name="backend_route_assignments",
+        cluster_targets=["miniapp/app/routes/assignments.py"],
+        prompt="Keep the assignments route as is.",
+        grounded_spec=None,
+        role_scope=["manager"],
+        role_contract={},
+        page_graph={},
+        scope_mode="whole_file_build",
+        intent="edit",
+        file_contexts={"miniapp/app/routes/assignments.py": "from fastapi import APIRouter\nrouter = APIRouter()\n"},
+        generation_mode=GenerationMode.BALANCED,
+        creative_direction={},
+    )
+
+    assert result["outcome"] == "no_op"
+    assert result["operations"] == []
+
+
 def test_canonicalize_local_role_links_in_text_strips_trailing_role_slashes() -> None:
     text = '<a href="/specialist/">Desk</a><script>fetch("/client/?tab=open"); window.location.href="/manager/requests/";</script>'
 

@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 
 from app.models.artifacts import ValidationIssue
 from app.models.domain import CheckExecutionRecord, RunCheckResult, utc_now
-from app.services.preview_service import PreviewService
+from app.services.workspace.preview_service import PreviewService
 from app.validators.suite import ValidationSuite
 
 
