@@ -179,7 +179,7 @@ class BuildValidator:
                     location="miniapp/app/generated/route_manifest.json",
                 )
             )
-        if execution_class != "shell_app" and not runtime_manifest_path.exists():
+        if not runtime_manifest_path.exists():
             issues.append(
                 ValidationIssue(
                     code="build.missing_runtime_manifest",
@@ -188,7 +188,7 @@ class BuildValidator:
                     location="miniapp/app/generated/runtime_manifest.json",
                 )
             )
-        if execution_class != "shell_app" and backend_targets:
+        if backend_targets:
             missing_backend_targets = [path for path in backend_targets if not (workspace_path / path).exists()]
             if missing_backend_targets:
                 issues.append(
@@ -438,22 +438,21 @@ class BuildValidator:
                     location="artifacts/generated_app_graph.json",
                 )
             )
-        if execution_class != "shell_app":
-            default_only = []
-            for role, role_payload in roles.items():
-                pages = role_payload.get("pages") or []
-                route_paths = {str(page.get("route_path") or "") for page in pages if isinstance(page, dict)}
-                if route_paths and route_paths.issubset({"/", "/profile", f"/{role}", f"/{role}/profile"}):
-                    default_only.append(role)
-            if default_only:
-                issues.append(
-                    ValidationIssue(
-                        code="build.workflow_shell_collapse",
-                        message=f"Workflow app collapsed back to root/profile shell for: {', '.join(default_only)}.",
-                        severity="high",
-                        location="artifacts/generated_app_graph.json",
-                    )
+        default_only = []
+        for role, role_payload in roles.items():
+            pages = role_payload.get("pages") or []
+            route_paths = {str(page.get("route_path") or "") for page in pages if isinstance(page, dict)}
+            if route_paths and route_paths.issubset({"/", "/profile", f"/{role}", f"/{role}/profile"}):
+                default_only.append(role)
+        if default_only:
+            issues.append(
+                ValidationIssue(
+                    code="build.workflow_shell_collapse",
+                    message=f"Workflow app collapsed back to root/profile shell for: {', '.join(default_only)}.",
+                    severity="high",
+                    location="artifacts/generated_app_graph.json",
                 )
+            )
         return issues
 
     def _validate_route_manifest_only(self, workspace_path: Path, route_manifest: dict | list | None) -> list[ValidationIssue]:
@@ -689,7 +688,7 @@ class BuildValidator:
             persistence_count = len(raw_spec.get("persistence_requirements") or [])
             api_count = len(raw_spec.get("api_requirements") or [])
         execution_class = self._execution_class_for_spec(grounded_spec)
-        requires_persistence_contract = execution_class != "shell_app" or persistence_count > 0 or api_count > 0
+        requires_persistence_contract = True
         if not requires_persistence_contract:
             return issues
 
@@ -833,7 +832,7 @@ class BuildValidator:
     @staticmethod
     def _execution_class_for_spec(spec: GroundedSpecModel | None) -> str:
         if spec is None:
-            return "shell_app"
+            return "entity_workflow_app"
         entity_count = len(spec.domain_entities)
         flow_count = len(spec.user_flows)
         api_count = len(spec.api_requirements)
@@ -844,7 +843,7 @@ class BuildValidator:
             return "workflow_dashboard_app"
         if flow_count > 1 or entity_count > 1 or api_count > 0 or persistence_count > 0:
             return "entity_workflow_app"
-        return "shell_app"
+        return "entity_workflow_app"
 
     def _validate_contract_drift(self, workspace_path: Path) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []

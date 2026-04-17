@@ -44,9 +44,9 @@ from app.services.engine import (
 )
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
-from app.services.miniapp_generation.workspace_loop_engine import (
+from app.modules.miniapp_agent_loop.engine import WorkspaceLoopEngine
+from app.modules.miniapp_agent_loop.types import (
     WorkspaceLoopCallbacks,
-    WorkspaceLoopEngine,
     WorkspaceLoopResult,
     WorkspaceLoopTurnPlan,
 )
@@ -242,7 +242,7 @@ class FixOrchestrator:
                 workspace_id=workspace_id,
                 run_id=run_id,
                 draft_source=draft_source,
-                changed_files=changed_files or ["miniapp", "frontend"],
+                changed_files=changed_files or ["miniapp"],
             )
 
         def _plan_turn(
@@ -408,7 +408,7 @@ class FixOrchestrator:
             initial_operations=[],
             initial_assistant_message="Fix workspace loop initialized.",
             initial_files_read=[],
-            initial_changed_files=["miniapp", "frontend"],
+            initial_changed_files=["miniapp"],
             callbacks=callbacks,
         )
         return self._finalize_loop_job(
@@ -598,10 +598,11 @@ class FixOrchestrator:
         )
         job.failure_class = self._prefer_failure_class(job.failure_class, baseline_failure_class)
         job.current_fix_phase = loop_result.current_phase
-        job.remaining_issues = list(loop_result.remaining_issues)
+        job.remaining_issues = [] if loop_result.status == "completed" else list(loop_result.remaining_issues)
         if loop_result.latest_execution is not None:
             job.validation_snapshot = self._validation_snapshot_from_execution(loop_result.latest_execution)
-        if loop_result.status == "completed" and not job.remaining_issues:
+        if loop_result.status == "completed":
+            job.outcome_kind = "applied"
             job.validation_snapshot = ValidationSnapshot(
                 grounded_spec_valid=True,
                 app_ir_valid=True,
@@ -711,6 +712,7 @@ class FixOrchestrator:
         priority = {
             "runtime_manifest_route_missing": 100,
             "db_dependency_export_missing": 95,
+            "backend_framework_mismatch": 94,
             "loading_first_root_surface": 92,
             "frontend_link_route_mismatch": 90,
             "router_not_registered": 88,
@@ -850,6 +852,7 @@ class FixOrchestrator:
     @staticmethod
     def _repair_context_mode(fix_case: FixCase, repeated_signature_without_progress: int) -> str:
         route_runtime_failure = str(fix_case.failure_class or "") in {
+            "backend_framework_mismatch",
             "runtime_manifest_route_missing",
             "router_not_registered",
             "api_endpoint_missing",
@@ -866,6 +869,7 @@ class FixOrchestrator:
     @staticmethod
     def _needs_full_context_first(fix_case: FixCase) -> bool:
         return str(fix_case.failure_class or "") in {
+            "backend_framework_mismatch",
             "runtime_manifest_route_missing",
             "router_not_registered",
             "api_endpoint_missing",
@@ -984,6 +988,11 @@ class FixOrchestrator:
         issue_codes = {issue.code for issue in CheckRunner.failing_issues(results)}
         if {"build.loading_first_root_surface", "build.root_page_missing_business_surface"} & issue_codes:
             return "loading_first_root_surface"
+        if (
+            ("no module named 'flask'" in lowered or 'no module named "flask"' in lowered or "from flask import" in lowered)
+            and any(path.startswith("miniapp/app/routes/") and path.endswith(".py") for path in implicated_files)
+        ):
+            return "backend_framework_mismatch"
         if "/api/runtime/" in lowered and "manifest" in lowered and ("404" in lowered or "not found" in lowered):
             return "runtime_manifest_route_missing"
         if ("cannot import name 'get_db'" in lowered or 'cannot import name "get_db"' in lowered or "import get_db" in lowered) and any(
@@ -1140,6 +1149,9 @@ class FixOrchestrator:
                 raise ValueError(
                     f"Repair returned {operation.operation} for {operation.file_path} without content."
                 )
+            framework_validation_error = self._backend_framework_validation_error(operation)
+            if framework_validation_error:
+                raise ValueError(framework_validation_error)
             if operation.file_path.startswith("miniapp/tests/") and not self._allow_test_file_writes(fix_case):
                 raise ValueError(f"Repair attempted to edit generated tests instead of the app surface: {operation.file_path}")
             if self._is_read_only_generated_surface(operation.file_path):
@@ -1582,8 +1594,26 @@ class FixOrchestrator:
                 "without content",
                 "did not return any patch operations",
                 "did not return any file operations",
+                "flask/blueprint",
+                "must stay on fastapi",
+                "must define router = apirouter",
             )
         )
+
+    @staticmethod
+    def _backend_framework_validation_error(operation: DraftFileOperation) -> str | None:
+        file_path = str(operation.file_path or "").replace("\\", "/")
+        if not (file_path.startswith("miniapp/app/routes/") and file_path.endswith(".py")):
+            return None
+        content = str(operation.content or "")
+        lowered = content.lower()
+        if "from flask import" in lowered or "blueprint(" in lowered:
+            return f"{file_path} must stay on FastAPI APIRouter, not Flask/Blueprint."
+        if "apirouter" not in lowered:
+            return f"{file_path} must stay on FastAPI APIRouter."
+        if re.search(r"(?m)^\s*router\s*=\s*APIRouter\(", content) is None:
+            return f"{file_path} must define router = APIRouter(...)."
+        return None
 
     @staticmethod
     def _repair_support_files(fix_case: FixCase | None) -> list[str]:
@@ -1873,17 +1903,9 @@ class FixOrchestrator:
                 }
                 for issue in validation_failures
             )
-        optimistic_complete = (
-            not strict_green
-            and validators_ok
-            and build_ok
-            and preview_ok
-            and not non_test_failures
-            and bool(remaining_issues)
-        )
         return {
             "strict_green": strict_green,
-            "optimistic_complete": optimistic_complete,
+            "optimistic_complete": False,
             "remaining_issues": remaining_issues,
         }
 

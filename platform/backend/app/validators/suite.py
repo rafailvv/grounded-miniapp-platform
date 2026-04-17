@@ -5,8 +5,8 @@ from pathlib import Path
 from app.models.app_ir import AppIRModel
 from app.models.artifacts import AppIRValidatorResult, GroundedSpecValidatorResult
 from app.models.grounded_spec import GroundedSpecModel
+from app.modules.miniapp_validation.build_validator import BuildValidator
 from app.validators.app_ir_validator import AppIRValidator
-from app.validators.build_validator import BuildValidator
 from app.validators.connectivity_validator import ConnectivityValidator
 from app.validators.grounded_spec_validator import GroundedSpecValidator
 from app.validators.platform_validator import PlatformValidator

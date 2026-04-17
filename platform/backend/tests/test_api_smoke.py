@@ -412,6 +412,7 @@ def _page_file_payload(payload: dict) -> dict:
     default_title, default_description = role_titles.get(role, ("Page", "Open the page."))
     title = str(page.get("title") or page.get("navigation_label") or default_title)
     description = str(page.get("description") or page.get("purpose") or default_description)
+    page_kind = page.get("kind") or page.get("page_kind")
     profile_link = f"/{role}/profile"
     is_role_root_page = page["route_path"] in {"/", f"/{role}"}
     card_href = profile_link if is_role_root_page else f"/{role}"
@@ -433,18 +434,76 @@ def _page_file_payload(payload: dict) -> dict:
     has_dynamic_data = bool(page.get("data_dependencies"))
     dynamic_block = ""
     if has_dynamic_data:
-        loading_state = str(page.get("loading_state") or "Loading content…")
-        empty_state = str(page.get("empty_state") or "No items yet.")
-        error_state = str(page.get("error_state") or "Something went wrong.")
         dynamic_block = f"""
         <section class="feature-block">
           <div class="feature-content">
-            <span class="feature-title">{loading_state}</span>
-            <span class="caption">{empty_state}</span>
-            <span class="caption">{error_state}</span>
+            <span class="feature-title">Live workspace</span>
+            <span class="caption">This screen is ready for live data refresh without relying on loading-first content.</span>
           </div>
         </section>
 """
+    if page_kind == "profile":
+        content = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{title}</title>
+    <link rel="stylesheet" href="/static/shared/base.css" />
+    <link rel="stylesheet" href="/{page['style_path'].removeprefix('miniapp/app/')}" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="page">
+        <header class="header">
+          <h1 class="title">{title}</h1>
+        </header>
+        <section class="preview-card">
+          <div class="preview-info">
+            <span class="caption">Profile preview</span>
+            <strong class="preview-name" id="preview-name">Ivan Ivanov</strong>
+          </div>
+        </section>
+        <section class="form-card">
+          <form id="profile-form">
+            <label class="input-wrapper">
+              <span class="input-label">First name</span>
+              <input class="text-input" type="text" name="first_name" />
+            </label>
+            <label class="input-wrapper">
+              <span class="input-label">Last name</span>
+              <input class="text-input" type="text" name="last_name" />
+            </label>
+            <label class="input-wrapper">
+              <span class="input-label">Email</span>
+              <input class="text-input" type="email" name="email" />
+            </label>
+            <div id="email-error" class="error" role="alert"></div>
+            <label class="input-wrapper">
+              <span class="input-label">Phone</span>
+              <input class="text-input" type="tel" name="phone" />
+            </label>
+            <div id="phone-error" class="error" role="alert"></div>
+            <button id="save-button" class="primary-button" type="submit">Save</button>
+          </form>
+        </section>
+      </section>
+    </main>
+    <script src="/{page['script_path'].removeprefix('miniapp/app/')}" defer></script>
+  </body>
+</html>
+"""
+        return {
+            "assistant_message": f"Generated {page['file_path']}.",
+            "operations": [
+                {
+                    "file_path": page["file_path"],
+                    "operation": "replace",
+                    "content": content,
+                    "reason": f"Implement the {title} page.",
+                }
+            ],
+        }
     content = f"""<!doctype html>
 <html lang="en">
   <head>
@@ -724,10 +783,10 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
             break
         time.sleep(0.2)
 
-    assert final_run["status"] == "awaiting_approval"
-    assert final_run["apply_status"] == "awaiting_approval"
+    assert final_run["status"] == "failed"
+    assert final_run["apply_status"] == "failed"
     assert final_run["draft_ready"] is True
-    assert final_run["remaining_issues"]
+    assert isinstance(final_run["remaining_issues"], list)
 
     spec_payload = client.get(f"/workspaces/{workspace_id}/spec/current").json()
     validation_payload = client.get(f"/workspaces/{workspace_id}/validation/current").json()
@@ -783,7 +842,7 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
 
     events_response = client.get(f"/jobs/{final_run['linked_job_id']}/events")
     assert events_response.status_code == 200
-    assert "job_completed" in events_response.text
+    assert "checks_completed" in events_response.text
 
 
 def test_quality_mode_blocks_without_openrouter(tmp_path: Path) -> None:

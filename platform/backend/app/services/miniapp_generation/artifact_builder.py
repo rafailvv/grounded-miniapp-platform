@@ -21,13 +21,11 @@ class MiniappArtifactBuilder:
         normalize_role_route_path: Callable[[str, str], str],
         absolute_role_route_path: Callable[[str, str], str],
         default_page_asset_path: Callable[[str, str], str],
-        fallback_page_contract: Callable[[str, bool], list[dict[str, str]]],
         normalize_runtime_python_path: Callable[[str], str],
     ) -> None:
         self._normalize_role_route_path = normalize_role_route_path
         self._absolute_role_route_path = absolute_role_route_path
         self._default_page_asset_path = default_page_asset_path
-        self._fallback_page_contract = fallback_page_contract
         self._normalize_runtime_python_path = normalize_runtime_python_path
 
     def ensure_runtime_artifact_operations(
@@ -129,23 +127,28 @@ def _load_json(path: Path) -> dict:
 
 
 def _extract_static_asset_refs(html: str) -> list[str]:
-    return re.findall(r'(?:src|href)=["\\'](/static/[^"\\']+)["\\']', html)
+    return re.findall(r"(?:src|href)=[\"\\'](/static/[^\"\\']+)[\"\\']", html)
+
+
+def _strip_route_template_expressions(content: str) -> str:
+    return re.sub(r"\$\{[^}]+\}", "sample", str(content or ""))
 
 
 def _extract_local_route_refs(content: str) -> set[str]:
+    content = _strip_route_template_expressions(content)
     refs: set[str] = set()
-    for match in re.finditer(r'(?:href|location(?:\\.href)?)\\s*=\\s*["\\'](/(?!api/|static/|/)[^"\\'#?]*)', content):
+    for match in re.finditer(r"(?:href|location(?:\\.href)?)\\s*=\\s*[\"\\'](/(?!api/|static/|/)[^\"\\'#?]*)", content):
         refs.add(match.group(1))
-    for match in re.finditer(r'["\\'](/(?!api/|static/|/)[a-zA-Z0-9_\\-/{{}}:]+)["\\']', content):
+    for match in re.finditer(r"[\"\\'](/(?:client|specialist|manager)[^\"\\'#?]*)[\"\\']", content):
         refs.add(match.group(1))
     return refs
 
 
 def _extract_js_dom_ids(source: str) -> set[str]:
     ids: set[str] = set()
-    for match in re.finditer(r'getElementById\(\s*["\\\']([^"\\\']+)["\\\']\s*\)', source):
+    for match in re.finditer(r"getElementById\(\s*[\"\\']([^\"\\']+)[\"\\']\s*\)", source):
         ids.add(match.group(1))
-    for match in re.finditer(r'querySelector\(\s*["\\\']#([^"\\\']+)["\\\']\s*\)', source):
+    for match in re.finditer(r"querySelector\(\s*[\"\\']#([^\"\\']+)[\"\\']\s*\)", source):
         ids.add(match.group(1))
     return ids
 
@@ -192,6 +195,12 @@ def _sample_route_path(path: str) -> str:
     normalized = re.sub(r"{{[^/]+}}", "sample", normalized)
     normalized = re.sub(r":[^/]+", "sample", normalized)
     return normalized
+
+
+def _route_pattern_matches(pattern: str, actual: str) -> bool:
+    normalized_pattern = re.sub(r"\{[^/]+\}", "[^/]+", pattern)
+    normalized_pattern = re.sub(r":[^/]+", "[^/]+", normalized_pattern)
+    return re.fullmatch(normalized_pattern, actual) is not None
 
 
 def _resolve_path_params(path: str, replacements: dict[str, str]) -> str:
@@ -301,7 +310,7 @@ class GeneratedMiniAppTests(unittest.TestCase):
         from app.main import app
 
         cls._client_context = TestClient(app)
-        cls.client = cls._client_context
+        cls.client = cls._client_context.__enter__()
         cls.route_manifest = _load_json(MINIAPP_DIR / "app" / "generated" / "route_manifest.json")
         cls.runtime_manifest = _load_json(MINIAPP_DIR / "app" / "generated" / "runtime_manifest.json")
         cls.grounded_spec = _load_json(MINIAPP_DIR.parent / "artifacts" / "grounded_spec.json") if (MINIAPP_DIR.parent / "artifacts" / "grounded_spec.json").exists() else {}
@@ -382,11 +391,15 @@ print(json.dumps(routes))
                     absolute_path = MINIAPP_DIR / str(target_path or "").removeprefix("miniapp/")
                     if not absolute_path.exists():
                         continue
-                    for api_ref in re.findall(r'["\\'](/api/[a-zA-Z0-9_\\-/:{}]+)', absolute_path.read_text(encoding="utf-8")):
+                    for api_ref in re.findall(r"[\"\\'](/api/[a-zA-Z0-9_/:{}-]+)", absolute_path.read_text(encoding="utf-8")):
                         expected_api_paths.add(api_ref)
         for api_path in expected_api_paths:
-            normalized = _sample_route_path(api_path)
-            matches = [item for item in registered_routes if _sample_route_path(str(item.get("path") or "")) == normalized]
+            matches = [
+                item
+                for item in registered_routes
+                if _route_pattern_matches(str(item.get("path") or ""), api_path)
+                or _sample_route_path(str(item.get("path") or "")) == _sample_route_path(api_path)
+            ]
             self.assertTrue(matches, f"No registered backend route matches planned API path {api_path}")
 
     def test_local_page_links_render(self) -> None:
@@ -624,11 +637,16 @@ function extractApiRefs(content) {
   return refs;
 }
 
+function stripRouteTemplateExpressions(content) {
+  return String(content ?? '').replace(/\$\{[^}]+\}/g, 'sample');
+}
+
 function extractLocalRouteRefs(content) {
+  content = stripRouteTemplateExpressions(content);
   const refs = new Set();
   const patterns = [
     /(?:href|location(?:\.href)?)\s*=\s*["'](\/(?:client|specialist|manager)(?:\/[^"'#?]*)?)["']/g,
-    /["'](\/(?:client|specialist|manager)(?:\/[a-zA-Z0-9_\-/:{}]*)?)["']/g,
+    /["'](\/(?:client|specialist|manager)[^"'#?]*)["']/g,
   ];
   for (const pattern of patterns) {
     for (const match of content.matchAll(pattern)) {
@@ -662,10 +680,18 @@ function extractJsDomIds(content) {
 }
 
 function normalizeRoutePath(value) {
-  return value
+  return String(value ?? '')
     .replace(/[$][{][^/]+[}]/g, 'sample')
+    .replace(/\$\{[^}]+\}/g, 'sample')
     .replace(/\{[^/]+\}/g, 'sample')
     .replace(/:[^/]+/g, 'sample');
+}
+
+function routePatternMatches(pattern, actual) {
+  const normalizedPattern = String(pattern ?? '')
+    .replace(/\{[^/]+\}/g, '[^/]+')
+    .replace(/:[^/]+/g, '[^/]+');
+  return new RegExp(`^${normalizedPattern}$`).test(actual);
 }
 
 function collectRegisteredRoutes() {
@@ -761,7 +787,10 @@ test('planned api references map to registered backend routes', () => {
   const registeredRoutes = collectRegisteredRoutes();
   for (const apiPath of expectedApiPaths) {
     const normalized = normalizeRoutePath(apiPath);
-    const matches = registeredRoutes.filter((item) => normalizeRoutePath(String(item.path ?? '')) === normalized);
+    const matches = registeredRoutes.filter((item) => {
+      const pattern = String(item.path ?? '');
+      return routePatternMatches(pattern, apiPath) || normalizeRoutePath(pattern) === normalized;
+    });
     assert.ok(matches.length > 0, `No registered backend route matches planned API path ${apiPath}`);
   }
 });
@@ -858,11 +887,6 @@ test('generated javascript files parse', () => {
                         "is_entry": bool(page.get("is_entry") or normalized_route == f"/{role}"),
                     }
                 )
-            if not pages:
-                pages = self._fallback_page_contract(role, False)
-                for page in pages:
-                    page["route_path"] = str(page.get("route_path") or f"/{role}")
-                    page["is_entry"] = str(page["route_path"]).rstrip("/") == f"/{role}"
             roles[role] = {"entry_path": str(payload.get("entry_path") or f"/{role}"), "pages": pages}
         return {"roles": roles}
 
@@ -1096,14 +1120,14 @@ test('generated javascript files parse', () => {
             duplicates = sorted(path for path, count in Counter(role_pages).items() if count > 1 and path)
             if duplicates:
                 duplicate_page_file_roles[role] = duplicates
-        backend_surface_ok = not missing_backend_files if expected_backend_files else execution_class == "shell_app"
+        backend_surface_ok = bool(expected_backend_files) and not missing_backend_files
         page_surface_ok = (
             not missing_files
             and not duplicate_page_file_roles
             and all(count >= 2 for count in role_page_counts.values())
-        ) if execution_class != "shell_app" else all(count >= 1 for count in role_page_counts.values())
+        )
         manifest_surface_ok = all(path in normalized_realized_paths for path in expected_manifests)
-        fell_back_to_template = execution_class != "shell_app" and not page_surface_ok and all(count <= 2 for count in role_page_counts.values())
+        fell_back_to_template = not page_surface_ok and all(count <= 2 for count in role_page_counts.values())
         return MaterializationReport(
             execution_class=execution_class,  # type: ignore[arg-type]
             planned_files=sorted(dict.fromkeys(planned_pages)),

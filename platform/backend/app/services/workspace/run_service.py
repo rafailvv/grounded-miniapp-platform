@@ -31,7 +31,6 @@ from app.services.workspace.service import WorkspaceService
 ROLE_SCOPE = {"client", "specialist", "manager"}
 MEANINGFUL_DIFF_IGNORED_PARTS = {
     ".git",
-    "frontend",
     "node_modules",
     "dist",
     "build",
@@ -508,24 +507,7 @@ class RunService:
                     run=run,
                     change_plan=change_plan,
                 )
-                optimistic_remaining_issues = self._optimistic_remaining_issues_for_job(job)
-                if meaningful_paths and optimistic_remaining_issues:
-                    run.remaining_issues = optimistic_remaining_issues
-                    run.summary = "Run completed with a working draft. Remaining non-blocking issues were recorded."
-                    run.outcome_kind = "warnings"
-                    if run.apply_strategy == "manual_approve":
-                        run.status = "awaiting_approval"
-                        run.apply_status = "awaiting_approval"
-                        run.draft_status = "ready"
-                        run.draft_ready = True
-                        run.current_stage = "awaiting review"
-                        run.progress_percent = 99
-                    else:
-                        self._apply_completed_draft(
-                            run,
-                            message="Applying working draft with remaining non-blocking issues to the source workspace.",
-                        )
-                elif job.status == "blocked":
+                if job.status == "blocked":
                     run.status = "blocked"
                     run.apply_status = "blocked"
                     run.outcome_kind = "blocked_preview_infra" if str(job.outcome_kind or "") == "blocked_preview_infra" else "blocked_generation"
@@ -559,7 +541,7 @@ class RunService:
                 self._append_job_event(
                     run.linked_job_id,
                     "job_completed",
-                    "Draft is ready for review with non-blocking validation warnings.",
+                    "Draft is ready for review after strict-green validation failed.",
                     {
                         "run_id": run.run_id,
                         "status": run.status,
@@ -567,12 +549,8 @@ class RunService:
                     },
                 )
             queue_preview_reason: str | None = None
-            queue_preview_draft_run_id: str | None = None
             if run.status == "completed" and run.apply_status == "applied":
                 queue_preview_reason = "run completion"
-            elif run.status == "completed" and run.apply_status == "noop" and run.draft_ready:
-                queue_preview_reason = "draft completion with warnings"
-                queue_preview_draft_run_id = run.run_id
             self._store_run_artifacts(run, change_plan, job, preview)
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
             logger.info(
@@ -589,7 +567,7 @@ class RunService:
                 payload={"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status},
             )
             if queue_preview_reason is not None:
-                self._queue_preview_refresh(run, reason=queue_preview_reason, draft_run_id=queue_preview_draft_run_id)
+                self._queue_preview_refresh(run, reason=queue_preview_reason, draft_run_id=None)
         except Exception as exc:
             run.status = "failed"
             run.apply_status = "failed"
@@ -1122,94 +1100,6 @@ class RunService:
         job.failure_reason = message
         self.generation_service._append_event(job, "job_failed", message, {"reason": "no_meaningful_diff"})
 
-    def _mark_run_completed_with_warnings(
-        self,
-        run: RunRecord,
-        job: Any,
-        *,
-        meaningful_paths: list[str],
-        draft_kept: bool = True,
-    ) -> None:
-        del meaningful_paths
-        message = (
-            "Run completed with validation warnings. Draft was kept for review."
-            if draft_kept
-            else "Run completed with validation warnings after applying the draft to source."
-        )
-        run.summary = message
-        run.status = "completed"
-        if run.apply_status != "applied":
-            run.apply_status = "noop"
-        run.outcome_kind = "warnings"
-        has_draft = self.workspace_service.draft_exists(run.workspace_id, run.run_id)
-        if run.apply_status == "applied":
-            run.draft_status = "approved"
-            run.draft_ready = False
-        else:
-            run.draft_status = "ready" if has_draft else "none"
-            run.draft_ready = run.draft_status == "ready"
-        run.current_stage = "completed"
-        run.progress_percent = max(run.progress_percent, 100)
-        run.current_fix_phase = job.current_fix_phase
-        run.remaining_issues = list(getattr(job, "remaining_issues", []) or [])
-        self._append_job_event(
-            run.linked_job_id,
-            "job_completed",
-            message,
-        )
-
-    def _should_soft_complete_with_warnings(self, run: RunRecord, job: Any) -> bool:
-        del run, job
-        return False
-
-    def _optimistic_remaining_issues_for_job(self, job: Any) -> list[dict[str, Any]]:
-        blocking_failure_classes = {
-            "runtime_manifest_route_missing",
-            "route_api_contract_mismatch",
-            "loading_first_root_surface",
-        }
-        if str(getattr(job, "failure_class", "") or "") in blocking_failure_classes:
-            return []
-        executed_checks = list(getattr(job, "executed_checks", []) or [])
-        if not executed_checks:
-            return []
-        failed_checks = [
-            item
-            for item in executed_checks
-            if isinstance(item, dict) and str(item.get("status") or "") == "failed"
-        ]
-        if not failed_checks:
-            return []
-        allowed = {"generated_app_python_tests", "generated_app_js_tests"}
-        if any(str(item.get("name") or "") not in allowed for item in failed_checks):
-            return []
-        blocking_route_markers = (
-            "No registered FastAPI route matches",
-            "No registered backend route matches",
-            "Workflow list route missing at runtime",
-        )
-        for item in failed_checks:
-            logs = [str(entry) for entry in (item.get("logs") or [])]
-            details = str(item.get("details") or "")
-            haystack = "\n".join([details, *logs])
-            if any(marker in haystack for marker in blocking_route_markers):
-                return []
-        remaining: list[dict[str, Any]] = []
-        for item in failed_checks:
-            remaining.append(
-                {
-                    "kind": "generated_test_failure",
-                    "check": item.get("name"),
-                    "details": item.get("details"),
-                    "logs": list(item.get("logs") or [])[-8:],
-                }
-            )
-        return remaining
-
-    def _should_apply_draft_with_warnings(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
-        del run, job, meaningful_paths
-        return False
-
     def _should_apply_best_effort_after_failed_repairs(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
         del run, job, meaningful_paths
         return False
@@ -1231,7 +1121,8 @@ class RunService:
         run.candidate_revision_id = revision.revision_id
         run.status = "completed"
         run.apply_status = "applied"
-        run.outcome_kind = "warnings" if run.remaining_issues else "applied"
+        run.outcome_kind = "applied"
+        run.remaining_issues = []
         run.draft_status = "approved"
         run.draft_ready = False
         run.current_stage = "completed"
@@ -1240,9 +1131,7 @@ class RunService:
         self._append_job_event(
             run.linked_job_id,
             "apply_completed",
-            "Generated draft was applied successfully."
-            if not run.remaining_issues
-            else "Generated draft was applied with remaining non-blocking issues recorded.",
+            "Generated draft was applied successfully.",
         )
 
     def _meaningful_paths_for_run(

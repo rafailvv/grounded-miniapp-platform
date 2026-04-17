@@ -23,11 +23,11 @@ from app.services.engine import (
 )
 from app.services.fix_orchestrator import FixOrchestrator
 from app.services.miniapp_generation.service import GenerationService
+from app.modules.miniapp_agent_loop.engine import WorkspaceLoopEngine
 from app.services.patch_service import PatchService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.run_service import RunService
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
-from app.services.miniapp_generation.workspace_loop_engine import WorkspaceLoopEngine
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.service import WorkspaceService
 from app.validators.suite import ValidationSuite

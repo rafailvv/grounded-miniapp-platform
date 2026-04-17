@@ -36,8 +36,11 @@ services:
     environment:
       VITE_PLATFORM_NAME: ${VITE_PLATFORM_NAME}
       VITE_API_PROXY_TARGET: http://platform-backend:8000
+    depends_on:
+      - platform-backend
     command: >
       sh -c "npm install &&
+             node -e \"const http=require('node:http'); const url='http://platform-backend:8000/health'; const wait=()=>http.get(url,res=>{res.resume(); if(res.statusCode===200){process.exit(0)} setTimeout(wait,2000)}).on('error',()=>setTimeout(wait,2000)); wait();\" &&
              npm run dev -- --host 0.0.0.0 --port 5173"
     ports:
       - "${PLATFORM_FRONTEND_PORT}:5173"

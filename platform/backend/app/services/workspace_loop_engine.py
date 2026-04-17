@@ -1,1 +1,1 @@
-from app.services.miniapp_generation.workspace_loop_engine import *  # noqa: F401,F403
+from app.modules.miniapp_agent_loop import *  # noqa: F401,F403

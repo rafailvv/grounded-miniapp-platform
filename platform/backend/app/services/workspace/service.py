@@ -218,7 +218,6 @@ class WorkspaceService:
             shutil.rmtree(draft_source)
         draft_source.parent.mkdir(parents=True, exist_ok=True)
         self._copy_tree(self.source_dir(workspace_id), draft_source)
-        (draft_source / "frontend").mkdir(parents=True, exist_ok=True)
         return draft_source
 
     def ensure_draft(self, workspace_id: str, run_id: str) -> Path:

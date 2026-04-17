@@ -46,7 +46,7 @@ from app.models.grounded_spec import (
     FlowStep,
 )
 from app.validators.app_ir_validator import AppIRValidator
-from app.validators.build_validator import BuildValidator
+from app.modules.miniapp_validation.build_validator import BuildValidator
 from app.validators.connectivity_validator import ConnectivityValidator
 from app.validators.grounded_spec_validator import GroundedSpecValidator
 

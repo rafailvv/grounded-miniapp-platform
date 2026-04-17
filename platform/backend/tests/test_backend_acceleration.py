@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import app.services.check_runner as check_runner_module
 from fastapi.testclient import TestClient
+import pytest
 
 from app.ai.model_registry import TASK_PROFILES
 from app.ai.openrouter_client import ACTIVE_WORKSPACE_LOG_CONTEXT, OpenRouterClient
@@ -24,7 +25,7 @@ from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
 from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES, GenerationService
 from app.services.run_service import RunService
-from app.validators.build_validator import BuildValidator
+from app.modules.miniapp_validation.build_validator import BuildValidator
 
 
 def _install_llm_stub(app) -> None:
@@ -149,25 +150,20 @@ def test_submit_with_context_preserves_workspace_log_context() -> None:
     assert result["workspace_id"] == "ws_context_submit"
 
 
-def test_fast_grounded_spec_times_out_to_compiler_fallback(tmp_path: Path) -> None:
+def test_fast_grounded_spec_timeout_returns_error_without_compiler_fallback(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
 
     original_timeout = service.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS
     original_inner = service._resolve_grounded_spec_fast_inner
-    original_build = service._build_grounded_spec
 
     def _hung_fast_inner(**_kwargs):
         time.sleep(0.2)
         return {"spec": "unreachable"}
 
-    def _fallback_spec(**_kwargs):
-        return original_build(**_kwargs)
-
     service.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS = 0.01
     service._resolve_grounded_spec_fast_inner = _hung_fast_inner  # type: ignore[method-assign]
-    service._build_grounded_spec = _fallback_spec  # type: ignore[method-assign]
     try:
         result = service._resolve_grounded_spec_fast(
             workspace_id="ws_timeout",
@@ -183,11 +179,8 @@ def test_fast_grounded_spec_times_out_to_compiler_fallback(tmp_path: Path) -> No
     finally:
         service.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS = original_timeout
         service._resolve_grounded_spec_fast_inner = original_inner  # type: ignore[method-assign]
-        service._build_grounded_spec = original_build  # type: ignore[method-assign]
-
-    assert "spec" in result
-    assert result["model"] is None
-    assert result["warning_kind"] == "fast_spec_timeout_compiler_fallback"
+    assert "error" in result
+    assert "No compiler fallback was used" in result["error"]
 
 
 def test_workspace_name_is_derived_from_prompt() -> None:
@@ -2045,7 +2038,7 @@ def test_page_definition_canonicalizes_alias_folder_names_from_route_path(tmp_pa
     assert detail_page["script_path"] == "miniapp/app/static/specialist/requests_detail/app.js"
 
 
-def test_finalize_role_pages_reinserts_required_profile_page(tmp_path: Path) -> None:
+def test_finalize_role_pages_does_not_reinsert_profile_page(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service = app.state.container.generation_service
@@ -2065,10 +2058,8 @@ def test_finalize_role_pages_reinserts_required_profile_page(tmp_path: Path) -> 
     )
 
     route_paths = {page["route_path"] for page in pages}
-    profile_page = next(page for page in pages if page["route_path"] == "/profile")
     assert "/" in route_paths
-    assert "/profile" in route_paths
-    assert profile_page["file_path"] == "miniapp/app/static/client/profile/index.html"
+    assert "/profile" not in route_paths
 
 
 def test_endpoint_names_from_dependency_text_supports_non_api_paths() -> None:
@@ -2424,7 +2415,7 @@ def test_run_does_not_soft_complete_when_only_preview_issue_remains(tmp_path: Pa
         ),
     )
 
-    assert run_service._should_soft_complete_with_warnings(run, job) is False
+    assert not hasattr(run_service, "_should_soft_complete_with_warnings")
 
 
 def test_run_applies_draft_when_only_preview_warning_remains(tmp_path: Path) -> None:
@@ -3107,7 +3098,7 @@ async function loadProfile() {
     assert artifacts["fix_attempts"]["items"]
 
 
-def test_contract_pass_falls_back_without_grounded_spec_artifact(tmp_path: Path) -> None:
+def test_contract_pass_requires_grounded_spec_artifact(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     client = TestClient(app)
@@ -3124,16 +3115,12 @@ def test_contract_pass_falls_back_without_grounded_spec_artifact(tmp_path: Path)
     workspace_id = workspace["workspace_id"]
     assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
 
-    grounded_spec = app.state.container.generation_service._resolve_grounded_spec_for_contract_pass(
-        workspace_id=workspace_id,
-        draft_run_id="run_missing_grounded_spec",
-        operations=[],
-    )
-
-    assert grounded_spec.product_goal == "Generated role-aware business mini app."
-    assert grounded_spec.target_platform == "telegram_mini_app"
-    assert grounded_spec.preview_profile == "telegram_mock"
-    assert [actor.role for actor in grounded_spec.actors] == ["client", "specialist", "manager"]
+    with pytest.raises(ValueError, match="grounded_spec.json is required"):
+        app.state.container.generation_service._resolve_grounded_spec_for_contract_pass(
+            workspace_id=workspace_id,
+            draft_run_id="run_missing_grounded_spec",
+            operations=[],
+        )
 
 
 def test_fix_orchestrator_detects_context_refusal_diagnosis() -> None:
@@ -3287,6 +3274,75 @@ def test_fix_orchestrator_retries_invalid_patch_validation_for_missing_content()
     ) is False
 
 
+def test_fix_orchestrator_retries_backend_framework_validation_errors() -> None:
+    from app.services.fix_orchestrator import FixOrchestrator
+
+    assert FixOrchestrator._should_retry_patch_validation(
+        "miniapp/app/routes/client.py must stay on FastAPI APIRouter, not Flask/Blueprint."
+    ) is True
+    assert FixOrchestrator._should_retry_patch_validation(
+        "miniapp/app/routes/client.py must define router = APIRouter(...)."
+    ) is True
+
+
+def test_generation_service_rejects_flask_route_modules_in_targeted_operations() -> None:
+    with pytest.raises(RuntimeError, match="FastAPI APIRouter"):
+        GenerationService._validate_targeted_operations(
+            stage_name="backend_route_client",
+            target_files=["miniapp/app/routes/client.py"],
+            operations=[
+                DraftFileOperation(
+                    file_path="miniapp/app/routes/client.py",
+                    operation="replace",
+                    content=(
+                        "from flask import Blueprint, current_app, send_from_directory\n\n"
+                        "client_router = Blueprint('client', __name__, url_prefix='/client')\n"
+                    ),
+                    reason="bad framework drift",
+                )
+            ],
+        )
+
+
+def test_fix_orchestrator_classifies_flask_import_trace_as_backend_framework_mismatch(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    orchestrator = app.state.container.fix_orchestrator
+
+    failure_class = orchestrator._specialized_failure_class(
+        workspace_id="ws_fix",
+        run_id="run_fix",
+        results=[],
+        combined_text=(
+            "ImportError: Failed to import test module\n"
+            "ModuleNotFoundError: No module named 'flask'\n"
+            "from flask import Blueprint"
+        ),
+        implicated_files=["miniapp/app/routes/client.py"],
+    )
+
+    assert failure_class == "backend_framework_mismatch"
+
+
+def test_generated_app_test_templates_strip_route_template_expressions() -> None:
+    from app.services.miniapp_generation.artifact_builder import MiniappArtifactBuilder
+
+    builder = MiniappArtifactBuilder(
+        normalize_role_route_path=lambda role, path: path,
+        absolute_role_route_path=lambda role, path: path,
+        default_page_asset_path=lambda path, kind: path,
+        normalize_runtime_python_path=lambda path: path,
+    )
+
+    python_test = builder.python_app_level_test_content(page_graph={}, role_scope=["client"])
+    js_test = builder.js_app_level_test_content(page_graph={}, role_scope=["client"])
+
+    assert "_strip_route_template_expressions" in python_test
+    assert r"\$\{[^}]+\}" in python_test
+    assert "stripRouteTemplateExpressions" in js_test
+    assert r"\$\{[^}]+\}" in js_test
+
+
 def test_fix_orchestrator_treats_empty_repair_patch_as_no_progress(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -3343,7 +3399,7 @@ def test_fix_orchestrator_allows_optimistic_completion_for_generated_test_tail()
     )
 
     assert completion["strict_green"] is False
-    assert completion["optimistic_complete"] is True
+    assert completion["optimistic_complete"] is False
     assert completion["remaining_issues"]
 
 
@@ -5915,7 +5971,7 @@ def test_pre_apply_contract_pass_rewrites_actor_dependency_and_api_fetch_and_inj
     operation_map = {operation.file_path: operation for operation in result}
     assert "Depends(get_actor_context)" in (operation_map["miniapp/app/routes/requests.py"].content or "")
     assert 'window.miniappApiFetch("/api/requests")' in (operation_map["miniapp/app/static/client/app.js"].content or "")
-    assert 'id="error-state"' in (operation_map["miniapp/app/static/client/index.html"].content or "")
+    assert 'id="error-state"' not in (operation_map["miniapp/app/static/client/index.html"].content or "")
 
 
 def test_basic_page_contract_normalizes_shell_assets_and_role_local_links_and_depends_import(tmp_path: Path) -> None:
@@ -6237,7 +6293,7 @@ def test_fix_orchestrator_uses_deterministic_companion_scope_for_page_bundles(tm
     ]
 
 
-def test_pre_apply_dom_contract_sync_adds_missing_page_ids() -> None:
+def test_pre_apply_dom_contract_sync_does_not_inject_missing_page_ids() -> None:
     html = """<!doctype html>
 <html lang="en">
   <body>
@@ -6256,10 +6312,7 @@ document.getElementById("preview-name");
 
     updated = GenerationService._ensure_html_dom_ids_for_script(html, script)
 
-    assert 'id="profile-form"' in updated
-    assert 'id="save-button"' in updated
-    assert 'id="email-error"' in updated
-    assert 'id="preview-name"' in updated
+    assert updated == html
 
 
 def test_pre_apply_dom_contract_sync_keeps_existing_ids_intact() -> None:
@@ -6280,8 +6333,7 @@ document.getElementById("save-button");
 
     updated = GenerationService._ensure_html_dom_ids_for_script(html, script)
 
-    assert updated.count('id="profile-form"') == 1
-    assert updated.count('id="save-button"') == 1
+    assert updated == html
 
 
 def test_fix_orchestrator_marks_generated_manifests_read_only(tmp_path: Path) -> None:
