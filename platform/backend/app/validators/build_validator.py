@@ -33,6 +33,106 @@ class BuildValidator:
         issues.extend(self._validate_persistent_storage_contract(workspace_path))
         return issues
 
+    @staticmethod
+    def _is_role_root_page(role: str, page: dict) -> bool:
+        route_path = str(page.get("route_path") or "").strip()
+        file_path = str(page.get("file_path") or "").strip()
+        page_kind = str(page.get("page_kind") or "").strip().lower()
+        return bool(
+            page.get("is_entry")
+            or route_path in {"/", f"/{role}"}
+            or file_path == f"miniapp/app/static/{role}/index.html"
+            or page_kind in {"home", "dashboard", "landing"}
+        )
+
+    @staticmethod
+    def _has_visible_loading_surface(content: str) -> bool:
+        lowered = str(content or "").lower()
+        scrubbed = re.sub(
+            r"<(?P<tag>div|section|article|aside|p|span)[^>]*(?:hidden|aria-hidden=['\"]true['\"])[^>]*>.*?</(?P=tag)>",
+            "",
+            lowered,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        markers = (
+            "loading your workspace",
+            "loading queue",
+            "loading dashboard",
+            "syncing",
+            "pulling",
+            "please wait",
+            "loading...",
+        )
+        return any(marker in scrubbed for marker in markers)
+
+    @staticmethod
+    def _has_business_surface(content: str) -> bool:
+        lowered = str(content or "").lower()
+        markers = (
+            "metric-card",
+            "summary-card",
+            "stat-card",
+            "request-list",
+            "queue-list",
+            "workload-list",
+            "approval-list",
+            "availability-list",
+            "conflict-list",
+            "empty-state",
+            "empty-panel",
+            "empty-card",
+            "primary-actions",
+            "quick request",
+            "recent requests",
+            "next requests",
+            "live overview",
+        )
+        structural_hits = sum(1 for marker in markers if marker in lowered)
+        semantic_hits = sum(lowered.count(tag) for tag in ("<section", "<article", "<button", "href="))
+        return structural_hits >= 2 or (structural_hits >= 1 and semantic_hits >= 4)
+
+    @staticmethod
+    def _empty_business_container_count(content: str) -> int:
+        pattern = re.compile(
+            r"<(?:div|section|article)[^>]+(?:id|class)=['\"][^'\"]*(?:metrics|summary|requests|queue|availability|conflict|approval|workload)[^'\"]*['\"][^>]*>\s*</(?:div|section|article)>",
+            flags=re.IGNORECASE,
+        )
+        return len(pattern.findall(str(content or "")))
+
+    def _validate_root_page_first_paint(
+        self,
+        *,
+        role: str,
+        page: dict,
+        content: str,
+        location: str,
+    ) -> list[ValidationIssue]:
+        if not self._is_role_root_page(role, page):
+            return []
+        dependency_count = len(page.get("data_dependencies") or [])
+        if dependency_count <= 0:
+            return []
+        issues: list[ValidationIssue] = []
+        if self._has_visible_loading_surface(content):
+            issues.append(
+                ValidationIssue(
+                    code="build.loading_first_root_surface",
+                    message=f"{Path(location).name} still renders loading-first copy as the primary role root surface.",
+                    severity="high",
+                    location=location,
+                )
+            )
+        if not self._has_business_surface(content) and self._empty_business_container_count(content) > 0:
+            issues.append(
+                ValidationIssue(
+                    code="build.root_page_missing_business_surface",
+                    message=f"{Path(location).name} does not render a real first-paint business surface for the role root page.",
+                    severity="high",
+                    location=location,
+                )
+            )
+        return issues
+
     def _validate_generated_app_shape(self, workspace_path: Path) -> list[ValidationIssue]:
         graph_path = workspace_path / "artifacts" / "generated_app_graph.json"
         route_manifest_path = workspace_path / "miniapp" / "app" / "generated" / "route_manifest.json"
@@ -238,6 +338,14 @@ class BuildValidator:
                         )
 
                 content = file_path.read_text(encoding="utf-8")
+                issues.extend(
+                    self._validate_root_page_first_paint(
+                        role=role,
+                        page=page,
+                        content=content,
+                        location=file_path_raw,
+                    )
+                )
                 if "RoleCabinetHomePage" in content:
                     issues.append(
                         ValidationIssue(
@@ -439,6 +547,14 @@ class BuildValidator:
                             )
                         )
                 content = file_path.read_text(encoding="utf-8")
+                issues.extend(
+                    self._validate_root_page_first_paint(
+                        role=role,
+                        page=page,
+                        content=content,
+                        location=file_path_raw,
+                    )
+                )
                 if "/static/shared/base.css" not in content:
                     issues.append(
                         ValidationIssue(

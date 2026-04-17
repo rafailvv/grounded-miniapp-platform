@@ -2534,8 +2534,9 @@ class GenerationService:
                     "Stay inside the canonical roots miniapp/app, miniapp/app/routes, miniapp/app/static, and miniapp/app/generated.",
                     "Use English-only control text and code comments.",
                     "For every HTML page in cluster_targets, make it reference its own page-local styles.css and app.js companions when those files are also in cluster_targets.",
-                    "Render loading and error state containers in the first draft for pages with data_dependencies; do not wait for repair.",
-                    "Do not render manual Refresh buttons or loading-only placeholder shells as the primary surface.",
+                    "For role root pages with data_dependencies, render a complete business surface on first paint with real sections, actions, and honest empty states instead of loading-first shells.",
+                    "Do not force dedicated loading or error containers on role root pages; add state UI only when a real post-render fetch path needs it, and never as the primary visible surface.",
+                    "Do not render manual Refresh buttons, pseudo-data rows, or loading-only placeholder shells as the primary surface.",
                     "Do not introduce flat role entry files like miniapp/app/static/client/index.html unless that exact path is listed in cluster_targets.",
                     "Use the template runtime conventions for API access instead of raw authless fetch patterns.",
                     "Do not invent auth/login/me endpoints, auth bootstrap modules, or /api/auth references in generated app code.",
@@ -4024,7 +4025,8 @@ class GenerationService:
             "Do not collapse the app into role landing pages. "
             "Use dashboard, workbench, workspace, and profile only as fallback patterns when the prompt does not imply a better structure. "
             "Differentiate the roles through page purpose, actions, and handoffs instead of mirrored wording. "
-            "Minimize loading-first UI and use loading states only when post-load data is required."
+            "Role root pages must feel complete on first render without fake records: render real sections, actions, and honest empty states immediately. "
+            "Do not make loading or error UI the primary visible surface on first render."
         )
         return f"{prompt.rstrip()}\n\n{corrective}"
 
@@ -4036,6 +4038,44 @@ class GenerationService:
             f"miniapp/app/static/{role}/index.html",
             f"miniapp/app/static/{role}/profile/index.html",
         } and route_path not in {f"/{role}", f"/{role}/profile", "/", "/profile"}
+
+    @staticmethod
+    def _is_role_root_page(role: str, page: dict[str, Any]) -> bool:
+        route_path = str(page.get("route_path") or "").strip()
+        file_path = str(page.get("file_path") or "").strip()
+        page_kind = str(page.get("page_kind") or "").strip().lower()
+        return bool(
+            page.get("is_entry")
+            or route_path in {"/", f"/{role}"}
+            or file_path == f"miniapp/app/static/{role}/index.html"
+            or page_kind in {"home", "dashboard", "landing"}
+        )
+
+    @staticmethod
+    def _first_paint_required_sections(role: str) -> list[str]:
+        section_map = {
+            "client": ["profile_card", "summary_metrics", "primary_actions", "requests_preview"],
+            "specialist": ["profile_card", "summary_metrics", "queue_preview", "availability_preview", "conflict_preview"],
+            "manager": ["profile_card", "oversight_metrics", "availability_preview", "conflict_preview", "approval_preview"],
+        }
+        return list(section_map.get(role, ["summary_metrics", "primary_actions"]))
+
+    def _first_paint_contract_for_page(
+        self,
+        *,
+        role: str,
+        page: dict[str, Any],
+        grounded_spec: GroundedSpecModel,
+    ) -> dict[str, Any]:
+        dependency_count = len(page.get("data_dependencies") or [])
+        product_goal = str(getattr(grounded_spec, "product_goal", "") or "").strip()
+        return {
+            "content_first_required": self._is_role_root_page(role, page) and dependency_count > 0,
+            "loading_policy": "do_not_force_dedicated_loading_blocks_on_role_roots" if dependency_count > 0 else "secondary_only",
+            "required_surface_sections": self._first_paint_required_sections(role),
+            "empty_state_policy": "show honest business empty states instead of pseudo-records",
+            "product_goal": product_goal,
+        }
 
     @staticmethod
     def _looks_like_fix_request(prompt: str) -> bool:
@@ -4433,7 +4473,8 @@ class GenerationService:
                     "Size the route tree to the actual workflow instead of forcing a fixed page count.",
                     "Do not collapse workflow-heavy apps into index.html plus profile.html only.",
                     "Return distinct role page purposes, primary actions, and handoff paths instead of mirrored copies across roles.",
-                    "For pages with dynamic data dependencies, plan semantic loading/error states that downstream codegen can realize with real containers, ids, or data-ui-state markers.",
+                    "For role root pages with dynamic data dependencies, require real first-paint sections and actions with honest empty states instead of loading-first shells or pseudo-records.",
+                    "For pages with dynamic data dependencies, plan only the minimum loading/error behavior that remains necessary after first paint; do not force dedicated loading shells on role root pages.",
                     "For pages that reference /api endpoints in data dependencies, include the matching miniapp route modules in backend_targets from the start.",
                     "For workflow or stateful apps, plan miniapp/app/db.py and miniapp/app/schemas.py as canonical backend contract files from the start.",
                     "Any mutable business data must persist through SQLAlchemy models in db.py, not route-level lists, dicts, or module globals.",
@@ -4489,7 +4530,8 @@ class GenerationService:
                     "Keep three-role preview compatibility.",
                     "Use the existing shared shell and profile design language as a style anchor.",
                     "Use dashboard/workbench/workspace/profile as fallback references only when the prompt does not imply another information architecture.",
-                    "For pages with dynamic data dependencies, include loading_state and error_state contracts that can be rendered as semantic HTML containers.",
+                    "For role root pages with dynamic data dependencies, require content-first first paint with real sections and honest empty states instead of loading-first shells or pseudo-records.",
+                    "For pages with dynamic data dependencies, include loading_state and error_state only when they remain truly necessary after first paint.",
                     "For pages that reference /api endpoints in data dependencies, include matching backend route modules in backend_targets instead of deferring this to repair.",
                     "For workflow or stateful apps, include miniapp/app/db.py and miniapp/app/schemas.py in the backend contract from the start.",
                     "Plan persisted business entities through SQLAlchemy models in db.py, never through route-level dict/list stores.",
@@ -4602,6 +4644,11 @@ class GenerationService:
                     "empty_state": page.get("empty_state"),
                     "error_state": page.get("error_state"),
                 },
+                "first_paint_contract": self._first_paint_contract_for_page(
+                    role=role,
+                    page=page,
+                    grounded_spec=grounded_spec,
+                ),
                 "current_file": self._limit_text(file_contexts.get(page["file_path"], ""), 6000 if compact else 12000),
                 "creative_direction": creative_direction,
                 "rules": [
@@ -4609,10 +4656,12 @@ class GenerationService:
                     "Respect the requested role and make the actions specific to that role.",
                     "Honor the page purpose, primary actions, and handoff_paths from the page graph.",
                     "Only add loading, empty, and error states when the page depends on data fetched after page load.",
-                    "If the page has data_dependencies, emit semantic loading and error containers that are discoverable via ids, query selectors, or data-ui-state markers.",
+                    "If the page has data_dependencies, add only the minimum state UI needed for real post-render refresh paths.",
                     "Use loading/error ids or data-ui-state markers that match the page contract instead of decorative prose only.",
                     "Static or mostly static pages should render immediately without spinner-first UX.",
+                    "Role root pages with data dependencies must render a complete business surface on first paint without pseudo-data: use real sections, actions, and honest empty states immediately.",
                     "Keep dashboard pages complete on first paint and move business flows into separate workbench/workspace pages when the page graph requires them.",
+                    "Do not rely on dedicated loading or error blocks to make role root pages function; the main surface must already be complete on first render.",
                     "If scope_mode is minimal_patch, preserve unrelated behavior and keep the diff minimal.",
                     "Return exactly one operation for the requested page file path.",
                 ],
@@ -4693,6 +4742,14 @@ class GenerationService:
                     max_file_chars=1600 if compact else 2800,
                     max_total_chars=3600 if compact else 7200,
                 ),
+                "first_paint_contracts": {
+                    role: [
+                        self._first_paint_contract_for_page(role=role, page=page, grounded_spec=grounded_spec)
+                        for page in ((page_graph.get("roles", {}).get(role, {}) or {}).get("pages") or [])
+                        if isinstance(page, dict) and self._is_role_root_page(role, page)
+                    ]
+                    for role in role_scope
+                },
                 "creative_direction": creative_direction,
                 "rules": [
                     "Only touch files listed in target_files.",
@@ -4702,11 +4759,13 @@ class GenerationService:
                     "For any workflow or stateful backend, use miniapp/app/db.py plus miniapp/app/schemas.py as the canonical persistence contract.",
                     "Persist mutable business entities through SQLAlchemy models and sessions from db.py; do not keep route-level dict/list stores for app data.",
                     "Define request/response models in schemas.py and import them from route modules instead of declaring inline Pydantic BaseModel classes inside routes.",
-                    "When planned pages have dynamic dependencies, generate validator-compatible loading/error containers and wiring in the first draft instead of waiting for repair.",
+                    "When planned pages have dynamic dependencies, generate only the minimum state wiring needed for real refresh paths instead of defaulting to loading-first shells.",
+                    "For role root pages, the first visible surface must already be a usable business page with real sections and honest empty states.",
                     "When generated sources reference /api endpoints, include the matching miniapp route modules and router wiring from the first draft whenever those files are in target_files.",
                     "Generate role routes that expose the page graph as real separate pages when routes are targeted.",
                     "Generate shared app chrome/state files that support the pages instead of rendering placeholder dashboards.",
                     "Keep role pages usable without waiting on client-side hydration for basic navigation and structure.",
+                    "Do not fill role root pages with pseudo-records or invented live metrics just to avoid an empty screen.",
                     "Do not collapse business flows back into index.html when workbench/workspace pages are in target_files or page_graph.",
                     "For minimal_patch, preserve unrelated behavior and keep the diff minimal.",
                     "Do not touch page files unless they are included in target_files.",
@@ -5531,12 +5590,21 @@ class GenerationService:
                     loading_hits = content.count("loading")
                     dependency_count = len(page.get("data_dependencies") or [])
                     has_real_surface = GenerationService._has_real_interactive_surface(content)
+                    has_business_surface = GenerationService._has_business_surface(content)
+                    is_role_root = GenerationService._is_role_root_page(role, page)
+                    visible_loading_surface = GenerationService._has_visible_loading_surface(content)
+                    empty_business_containers = GenerationService._empty_business_container_count(content)
                     if is_profile_page:
                         for handoff_path in page.get("handoff_paths") or []:
                             if isinstance(handoff_path, str) and handoff_path.strip() and handoff_path != route_path:
                                 if handoff_path not in known_handoff_paths:
                                     issues.append(f"{file_path} references a non-canonical handoff path: {handoff_path}.")
                         continue
+                    if is_role_root and dependency_count > 0:
+                        if visible_loading_surface:
+                            issues.append(f"{file_path} still renders loading-first copy as the primary role root surface.")
+                        if not has_business_surface and empty_business_containers > 0:
+                            issues.append(f"{file_path} does not render an honest business surface for first paint on a role root page.")
                     if dependency_count == 0 and loading_hits > 0 and not has_real_surface:
                         issues.append(f"{file_path} still uses loading-first copy even though the page has no declared data dependencies.")
                     if loading_hits >= 3 and len(content) < 2500 and not has_real_surface:
@@ -5586,6 +5654,60 @@ class GenerationService:
             "form-card",
         )
         return sum(1 for marker in markers if marker in content) >= 4
+
+    @staticmethod
+    def _has_visible_loading_surface(content: str) -> bool:
+        lowered = str(content or "").lower()
+        scrubbed = re.sub(
+            r"<(?P<tag>div|section|article|aside|p|span)[^>]*(?:hidden|aria-hidden=['\"]true['\"])[^>]*>.*?</(?P=tag)>",
+            "",
+            lowered,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        markers = (
+            "loading your workspace",
+            "loading queue",
+            "loading dashboard",
+            "syncing",
+            "pulling",
+            "please wait",
+            "loading...",
+        )
+        return any(marker in scrubbed for marker in markers)
+
+    @staticmethod
+    def _has_business_surface(content: str) -> bool:
+        lowered = str(content or "").lower()
+        markers = (
+            "metric-card",
+            "summary-card",
+            "stat-card",
+            "request-list",
+            "queue-list",
+            "workload-list",
+            "approval-list",
+            "availability-list",
+            "conflict-list",
+            "empty-state",
+            "empty-panel",
+            "empty-card",
+            "primary-actions",
+            "quick request",
+            "recent requests",
+            "next requests",
+            "live overview",
+        )
+        structural_hits = sum(1 for marker in markers if marker in lowered)
+        semantic_hits = sum(lowered.count(tag) for tag in ("<section", "<article", "<button", "href="))
+        return structural_hits >= 2 or (structural_hits >= 1 and semantic_hits >= 4)
+
+    @staticmethod
+    def _empty_business_container_count(content: str) -> int:
+        pattern = re.compile(
+            r"<(?:div|section|article)[^>]+(?:id|class)=['\"][^'\"]*(?:metrics|summary|requests|queue|availability|conflict|approval|workload)[^'\"]*['\"][^>]*>\s*</(?:div|section|article)>",
+            flags=re.IGNORECASE,
+        )
+        return len(pattern.findall(str(content or "")))
 
     def _ensure_runtime_artifact_operations(
         self,

@@ -4670,6 +4670,64 @@ def test_edit_gate_rejects_loading_first_static_page_without_dependencies(tmp_pa
     assert any("loading-first copy" in issue for issue in issues)
 
 
+def test_edit_gate_accepts_content_first_root_page_with_honest_empty_state(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    page_graph = {
+        "roles": {
+            "client": {
+                "routes_file": "miniapp/app/static/client/index.html",
+                "pages": [
+                    {
+                        "route_path": "/client",
+                        "file_path": "miniapp/app/static/client/index.html",
+                        "data_dependencies": ["requests"],
+                    },
+                    {
+                        "route_path": "/client/profile",
+                        "file_path": "miniapp/app/static/client/profile.html",
+                        "data_dependencies": [],
+                    },
+                ],
+            }
+        }
+    }
+    operations = [
+        DraftFileOperation(
+            file_path="miniapp/app/static/client/index.html",
+            operation="replace",
+            content=(
+                "<html><body><main class=\"page-shell\">"
+                "<section class=\"summary-card\"><h1>Requests</h1><p>Track approvals and returns.</p></section>"
+                "<section class=\"primary-actions\"><a href=\"/client/create\">Create request</a></section>"
+                "<section class=\"empty-state\"><h2>No requests yet</h2><p>Create the first request to start the workflow.</p></section>"
+                "</main></body></html>"
+            ),
+            reason="Content-first root page",
+        ),
+        DraftFileOperation(
+            file_path="miniapp/app/static/client/profile.html",
+            operation="replace",
+            content="<html><body><main><h1>Profile</h1></main></body></html>",
+            reason="Profile page",
+        ),
+    ]
+
+    issues = service._edit_gate_issues(
+        page_graph,
+        operations,
+        ["client"],
+        scope_mode="whole_file_build",
+        target_files=[item.file_path for item in operations],
+        require_business_pages=False,
+    )
+
+    assert not any("primary role root surface" in issue for issue in issues)
+    assert not any("honest business surface for first paint" in issue for issue in issues)
+
+
 def test_preview_get_does_not_collect_runtime_logs_for_preview_url_polling(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")

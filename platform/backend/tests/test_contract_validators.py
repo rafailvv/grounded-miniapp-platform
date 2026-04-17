@@ -700,6 +700,60 @@ def test_build_validator_flags_placeholder_and_identical_role_pages(tmp_path: Pa
     assert "build.identical_role_pages" in issue_codes
 
 
+def test_build_validator_flags_loading_first_role_root_surface(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    graph = _multi_page_graph()
+    for role_payload in graph["roles"].values():
+        pages = role_payload.get("pages") or []
+        if pages:
+            pages[0]["data_dependencies"] = ["requests"]
+    _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/route_manifest.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/runtime_manifest.json", json.dumps({"roles": {}}))
+    _write_workspace_file(workspace_root, "miniapp/app/static/shared/base.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/index.html",
+        '<html><head><link rel="stylesheet" href="/static/shared/base.css" /><link rel="stylesheet" href="/static/client/styles.css" /></head><body><main class="page-shell"><section>Loading your workspace...</section><div id="requests-panel"></div></main><script src="/static/preview_bridge.js" defer></script><script src="/static/client/app.js" defer></script></body></html>\n',
+    )
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/styles.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/app.js", "console.log('client');\n")
+
+    issues = BuildValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+
+    assert "build.loading_first_root_surface" in issue_codes
+    assert "build.root_page_missing_business_surface" in issue_codes
+
+
+def test_build_validator_accepts_content_first_root_surface_without_pseudo_data(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    graph = _multi_page_graph()
+    for role_payload in graph["roles"].values():
+        pages = role_payload.get("pages") or []
+        if pages:
+            pages[0]["data_dependencies"] = ["requests"]
+    _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/route_manifest.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/runtime_manifest.json", json.dumps({"roles": {}}))
+    _write_workspace_file(workspace_root, "miniapp/app/static/shared/base.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/index.html",
+        '<html><head><link rel="stylesheet" href="/static/shared/base.css" /><link rel="stylesheet" href="/static/client/styles.css" /></head><body><main class="page-shell"><section class="summary-card"><h1>Requests</h1><p>Track approvals and returns.</p></section><section class="primary-actions"><a href="/client/create">Create request</a></section><section class="empty-state"><h2>No requests yet</h2><p>Create the first request to start the workflow.</p></section></main><script src="/static/preview_bridge.js" defer></script><script src="/static/client/app.js" defer></script></body></html>\n',
+    )
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/styles.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/app.js", "console.log('client');\n")
+
+    issues = BuildValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+
+    assert "build.loading_first_root_surface" not in issue_codes
+    assert "build.root_page_missing_business_surface" not in issue_codes
+
+
 def test_build_validator_flags_route_self_import(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
     _create_workspace_scaffold(workspace_root)

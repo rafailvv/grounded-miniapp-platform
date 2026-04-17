@@ -1166,6 +1166,7 @@ class RunService:
         blocking_failure_classes = {
             "runtime_manifest_route_missing",
             "route_api_contract_mismatch",
+            "loading_first_root_surface",
         }
         if str(getattr(job, "failure_class", "") or "") in blocking_failure_classes:
             return []

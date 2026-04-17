@@ -711,6 +711,7 @@ class FixOrchestrator:
         priority = {
             "runtime_manifest_route_missing": 100,
             "db_dependency_export_missing": 95,
+            "loading_first_root_surface": 92,
             "frontend_link_route_mismatch": 90,
             "router_not_registered": 88,
             "api_endpoint_missing": 86,
@@ -826,6 +827,11 @@ class FixOrchestrator:
             required_exports.append("get_db")
         return {
             "strict_green": True,
+            "content_first_role_roots": {
+                "client": ["profile_card", "summary_metrics", "primary_actions", "requests_empty_state"],
+                "specialist": ["profile_card", "summary_metrics", "queue_empty_state", "availability_panel"],
+                "manager": ["profile_card", "oversight_metrics", "approval_panel", "conflict_panel"],
+            },
             "runtime_manifest_aliases": {"sample": "client"},
             "canonical_api_aliases": {
                 "submission": "requests",
@@ -849,6 +855,7 @@ class FixOrchestrator:
             "api_endpoint_missing",
             "frontend_link_route_mismatch",
             "db_dependency_export_missing",
+            "loading_first_root_surface",
         }
         if repeated_signature_without_progress >= 2:
             return "full_bundle"
@@ -864,6 +871,7 @@ class FixOrchestrator:
             "api_endpoint_missing",
             "frontend_link_route_mismatch",
             "db_dependency_export_missing",
+            "loading_first_root_surface",
         }
 
     @staticmethod
@@ -973,6 +981,9 @@ class FixOrchestrator:
         implicated_files: list[str],
     ) -> str | None:
         lowered = combined_text.lower()
+        issue_codes = {issue.code for issue in CheckRunner.failing_issues(results)}
+        if {"build.loading_first_root_surface", "build.root_page_missing_business_surface"} & issue_codes:
+            return "loading_first_root_surface"
         if "/api/runtime/" in lowered and "manifest" in lowered and ("404" in lowered or "not found" in lowered):
             return "runtime_manifest_route_missing"
         if ("cannot import name 'get_db'" in lowered or 'cannot import name "get_db"' in lowered or "import get_db" in lowered) and any(
