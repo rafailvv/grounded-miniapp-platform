@@ -256,6 +256,24 @@ class BuildValidator:
                             location=file_path_raw,
                         )
                     )
+                if "/static/preview_bridge.js" not in content:
+                    issues.append(
+                        ValidationIssue(
+                            code="build.page_missing_preview_bridge",
+                            message=f"{Path(file_path_raw).name} does not reference the preview bridge runtime.",
+                            severity="high",
+                            location=file_path_raw,
+                        )
+                    )
+                if "page-shell" not in content:
+                    issues.append(
+                        ValidationIssue(
+                            code="build.page_missing_shell_root",
+                            message=f"{Path(file_path_raw).name} does not include a page-shell root container with top safe-area spacing.",
+                            severity="high",
+                            location=file_path_raw,
+                        )
+                    )
                 expected_style_href = self._static_asset_href(style_path_raw)
                 expected_script_src = self._static_asset_href(script_path_raw)
                 if style_path_raw and expected_style_href and expected_style_href not in content:

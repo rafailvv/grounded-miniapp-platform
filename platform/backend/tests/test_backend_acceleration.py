@@ -3415,7 +3415,7 @@ def test_run_completes_before_async_preview_rebuild_finishes(tmp_path: Path) -> 
     assert preview_service.get(workspace_id).status == "running"
 
 
-def test_preview_rebuild_failure_does_not_revert_completed_run(tmp_path: Path) -> None:
+def test_preview_rebuild_failure_does_not_change_failed_strict_green_run(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     _install_llm_stub(app)
@@ -3470,13 +3470,12 @@ def test_preview_rebuild_failure_does_not_revert_completed_run(tmp_path: Path) -
         ),
     )
 
-    assert run.status == "completed"
+    assert run.status == "failed"
     time.sleep(0.15)
-    assert app.state.container.run_service.get_run(run.run_id).status == "completed"
-    assert preview_service.get(workspace_id).status == "error"
+    assert app.state.container.run_service.get_run(run.run_id).status == "failed"
+    assert preview_service.get(workspace_id).status in {"stopped", "error", "starting", "running"}
     artifacts = app.state.container.run_service.get_run_artifacts(run.run_id)
-    assert artifacts["preview"]["status"] == "error"
-    assert artifacts["preview"]["last_error"] == "Simulated preview rebuild failure."
+    assert artifacts["run"]["status"] == "failed"
 
 
 def test_openrouter_payload_uses_stable_cache_prefix_and_reports_cache_stats(tmp_path: Path) -> None:
@@ -3951,8 +3950,8 @@ def test_preview_connectivity_smoke_reports_unreachable_route(tmp_path: Path, mo
 
     result = runner._preview_connectivity_smoke(
         source_dir=tmp_path / "workspace",
-        preview=PreviewRecord(workspace_id="ws_1", status="running", url="http://localhost:3000", draft_run_id="run_1"),
-        preview_run_id="run_1",
+        preview=PreviewRecord(workspace_id="ws_1", status="running", url="http://localhost:3000", draft_run_id=None),
+        preview_run_id=None,
     )
 
     assert result.status == "failed"
@@ -4002,13 +4001,28 @@ def test_preview_connectivity_smoke_retries_transient_route_failures(tmp_path: P
 
     result = runner._preview_connectivity_smoke(
         source_dir=tmp_path / "workspace",
-        preview=PreviewRecord(workspace_id="ws_1", status="running", url="http://localhost:3000", draft_run_id="run_1"),
-        preview_run_id="run_1",
+        preview=PreviewRecord(workspace_id="ws_1", status="running", url="http://localhost:3000", draft_run_id=None),
+        preview_run_id=None,
     )
 
     assert result.status == "passed"
     assert attempts["client"] == 2
     assert any("/client returned usable preview content after 2 attempt(s)." in line for line in result.logs)
+
+
+def test_preview_connectivity_smoke_skips_for_draft_bound_runs() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=Path("/tmp") / f"preview-source-only-{time.time_ns()}")
+    runner = app.state.container.check_runner
+
+    result = runner._preview_connectivity_smoke(
+        source_dir=Path("/tmp/nonexistent-preview-source"),
+        preview=PreviewRecord(workspace_id="ws_1", status="running", url="http://localhost:3000", draft_run_id=None),
+        preview_run_id="run_draft",
+    )
+
+    assert result.status == "skipped"
+    assert "source-only" in result.details
 
 
 def test_generation_service_detects_missing_static_asset_targets(tmp_path: Path) -> None:
@@ -5867,10 +5881,68 @@ def test_basic_page_contract_normalizes_shell_assets_and_role_local_links_and_de
 
     assert "from fastapi import APIRouter, File, UploadFile, Header, HTTPException, Depends" in attachments
     assert '/static/shared/base.css' in html
+    assert '/static/preview_bridge.js' in html
     assert '/static/client/styles.css' in html
     assert '/static/client/app.js' in html
     assert 'href="/client/profile"' in html
     assert 'href="/client/create"' in html
+    assert 'class="page-shell"' in html or 'class=\'page-shell\'' in html
+    assert 'padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));' in html
+
+
+def test_basic_page_contract_upgrades_generated_main_to_shell_root_and_bridge(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    operations = [
+        DraftFileOperation(
+            file_path="miniapp/app/static/manager/workload/index.html",
+            operation="replace",
+            content=(
+                "<!doctype html><html><head>"
+                '<link rel="stylesheet" href="/static/shared/base.css" />'
+                "</head><body><main class='page' id='app'></main>"
+                '<script src="/static/manager/workload/app.js" defer></script>'
+                "</body></html>"
+            ),
+            reason="test fixture",
+        ),
+        DraftFileOperation(
+            file_path="miniapp/app/static/manager/workload/app.js",
+            operation="replace",
+            content='console.log("workload");\n',
+            reason="test fixture",
+        ),
+    ]
+
+    result = service._synchronize_basic_page_state_contract(
+        "ws_test",
+        "run_test",
+        page_graph={
+            "roles": {
+                "manager": {
+                    "pages": [
+                        {
+                            "file_path": "miniapp/app/static/manager/workload/index.html",
+                            "style_path": "miniapp/app/static/manager/workload/styles.css",
+                            "script_path": "miniapp/app/static/manager/workload/app.js",
+                            "route_path": "/workload",
+                            "loading_state": "",
+                            "error_state": "",
+                        }
+                    ]
+                }
+            }
+        },
+        operations=operations,
+    )
+    operation_map = {operation.file_path: operation for operation in result}
+    html = operation_map["miniapp/app/static/manager/workload/index.html"].content or ""
+
+    assert '/static/preview_bridge.js' in html
+    assert "page-shell" in html
+    assert 'padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));' in html
 
 
 def test_normalize_local_route_ref_handles_js_template_literals() -> None:

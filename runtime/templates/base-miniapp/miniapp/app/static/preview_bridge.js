@@ -1,8 +1,15 @@
 let currentRole = "client";
+let bridgeInitialized = false;
 
 function setupPreviewBridge(role) {
-  currentRole = role;
+  currentRole = inferRole(role);
   const rootPath = `/${role}`;
+
+  if (bridgeInitialized) {
+    notifyParent(window.location.pathname);
+    return;
+  }
+  bridgeInitialized = true;
 
   notifyParent(window.location.pathname);
   window.addEventListener("pageshow", () => notifyParent(window.location.pathname));
@@ -33,6 +40,14 @@ function setupPreviewBridge(role) {
       window.location.href = rootPath;
     }
   });
+}
+
+function inferRole(role) {
+  if (typeof role === "string" && role) {
+    return role;
+  }
+  const match = window.location.pathname.match(/^\/(client|specialist|manager)(?:\/|$)/);
+  return match ? match[1] : "client";
 }
 
 function notifyParent(path) {
@@ -76,3 +91,5 @@ function miniappApiFetch(input, init = {}, role = currentRole) {
 window.setupPreviewBridge = setupPreviewBridge;
 window.buildPreviewHeaders = buildPreviewHeaders;
 window.miniappApiFetch = miniappApiFetch;
+
+setupPreviewBridge();

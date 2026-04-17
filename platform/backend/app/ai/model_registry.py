@@ -1,5 +1,5 @@
 PLANNING_MODEL = "gpt-5.4-mini"
-CODE_MODEL = "gpt-5.3-codex"
+CODE_MODEL = "gpt-5.2-codex"
 SUMMARY_MODEL = "gpt-5.4-mini"
 
 TASK_PROFILES = {

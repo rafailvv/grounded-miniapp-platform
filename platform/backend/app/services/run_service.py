@@ -678,12 +678,10 @@ class RunService:
             run.linked_job_id,
             "preview_rebuild_started",
             f"Queued preview rebuild after {reason}.",
-            {"reason": reason, "run_id": run.run_id, "draft_run_id": draft_run_id},
+            {"reason": reason, "run_id": run.run_id, "draft_run_id": None},
         )
 
-        source_dir = None
-        if draft_run_id and self.workspace_service.draft_exists(run.workspace_id, draft_run_id):
-            source_dir = self.workspace_service.draft_source_dir(run.workspace_id, draft_run_id)
+        source_dir = self.workspace_service.source_dir(run.workspace_id)
 
         def on_complete(preview: Any) -> None:
             if preview.status == "running":
@@ -722,7 +720,7 @@ class RunService:
         preview = self.preview_service.rebuild_async(
             run.workspace_id,
             source_dir=source_dir,
-            draft_run_id=draft_run_id,
+            draft_run_id=None,
             on_complete=on_complete,
         )
         run.latency_breakdown["preview_enqueue_ms"] = int((time.perf_counter() - queue_started_at) * 1000)

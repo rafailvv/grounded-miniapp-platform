@@ -52,7 +52,7 @@ class PreviewService:
         source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
         runtime_mode = self.runtime_manager.preferred_mode()
         preview.runtime_mode = runtime_mode
-        preview.draft_run_id = draft_run_id
+        preview.draft_run_id = None
         preview.status = "starting"
         preview.stage = "starting"
         preview.progress_percent = max(preview.progress_percent, 8)
@@ -146,7 +146,7 @@ class PreviewService:
         source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
         runtime_mode = self.runtime_manager.preferred_mode()
         preview.runtime_mode = runtime_mode
-        preview.draft_run_id = draft_run_id
+        preview.draft_run_id = None
         preview.status = "starting"
         preview.stage = "rebuilding"
         preview.progress_percent = max(preview.progress_percent, 12)
@@ -204,7 +204,7 @@ class PreviewService:
     ) -> PreviewRecord:
         preview = self._get_or_create(workspace_id)
         preview.runtime_mode = self.runtime_manager.preferred_mode()
-        preview.draft_run_id = draft_run_id
+        preview.draft_run_id = None
         preview.status = "starting"
         preview.stage = "rebuilding"
         preview.progress_percent = 10
@@ -214,7 +214,7 @@ class PreviewService:
 
         worker = threading.Thread(
             target=self._rebuild_worker,
-            args=(workspace_id, source_dir, draft_run_id, on_complete),
+            args=(workspace_id, source_dir, None, on_complete),
             daemon=True,
         )
         worker.start()
@@ -805,8 +805,6 @@ class PreviewService:
         return preview
 
     def _runtime_source_dir(self, workspace_id: str, preview: PreviewRecord) -> Path:
-        if preview.draft_run_id and self.workspace_service.draft_exists(workspace_id, preview.draft_run_id):
-            return self.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
         return self.workspace_service.source_dir(workspace_id)
 
     def _reserved_preview_ports(self, workspace_id: str) -> set[int]:

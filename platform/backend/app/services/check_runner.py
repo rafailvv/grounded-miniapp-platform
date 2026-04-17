@@ -240,11 +240,11 @@ class CheckRunner:
                 command="preview route smoke (current session)",
                 logs=[],
             )
-        if preview_run_id is not None and preview.draft_run_id not in {None, preview_run_id}:
+        if preview_run_id is not None:
             return RunCheckResult(
                 name="preview_connectivity_smoke",
                 status="skipped",
-                details="Preview connectivity smoke skipped because the running preview session does not match this draft.",
+                details="Preview connectivity smoke skipped because preview is source-only and does not validate draft state.",
                 command="preview route smoke (current session)",
                 logs=[],
             )

@@ -748,6 +748,7 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
         assert preview_payload["role_urls"] == {}
     else:
         assert preview_payload["role_urls"]["client"].startswith(preview_payload["url"])
+    assert preview_payload["draft_run_id"] is None
     assert all("__pycache__" not in item["path"] for item in file_tree)
     assert all(not item["path"].endswith(".tsbuildinfo") for item in file_tree)
     assert any(item["path"] == "artifacts/grounded_spec.json" for item in draft_tree)
@@ -759,7 +760,8 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     preview_response = client.get(f"/preview/{workspace_id}?role=manager&run_id={run['run_id']}")
     assert preview_response.status_code == 200
     preview_html = preview_response.text.lower()
-    assert any(token in preview_html for token in ("dashboard", "request", "workload"))
+    assert "<html" in preview_html
+    assert "manager workspace" in preview_html
 
     save_response = client.post(
         f"/workspaces/{workspace_id}/files/save",

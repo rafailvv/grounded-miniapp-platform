@@ -50,11 +50,7 @@ def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(ge
     preview = container.preview_service.peek(workspace_id)
     container_logs: dict[str, list[str]] = {}
     if preview.runtime_mode == "docker" and preview.proxy_port is not None:
-        source_dir = (
-            container.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
-            if preview.draft_run_id and container.workspace_service.draft_exists(workspace_id, preview.draft_run_id)
-            else container.workspace_service.source_dir(workspace_id)
-        )
+        source_dir = container.workspace_service.source_dir(workspace_id)
         container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
     return {"logs": preview.logs, "mini_app_logs": container_logs}
 
@@ -67,11 +63,7 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
     api_log = container.workspace_log_service.read_lines(workspace_id, kind="api")
     container_logs: dict[str, list[str]] = {}
     if preview.runtime_mode == "docker" and preview.proxy_port is not None:
-        source_dir = (
-            container.workspace_service.draft_source_dir(workspace_id, preview.draft_run_id)
-            if preview.draft_run_id and container.workspace_service.draft_exists(workspace_id, preview.draft_run_id)
-            else container.workspace_service.source_dir(workspace_id)
-        )
+        source_dir = container.workspace_service.source_dir(workspace_id)
         container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
     workspace_event_lines = [
         (
@@ -151,11 +143,8 @@ def render_preview(
     container: ServiceContainer = Depends(get_container),
 ) -> HTMLResponse:
     try:
-        source_dir = (
-            container.workspace_service.draft_source_dir(workspace_id, run_id)
-            if run_id and container.workspace_service.draft_exists(workspace_id, run_id)
-            else container.workspace_service.source_dir(workspace_id)
-        )
+        del run_id
+        source_dir = container.workspace_service.source_dir(workspace_id)
         html = container.preview_service.render_html(workspace_id, source_dir, role)
     except (KeyError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
