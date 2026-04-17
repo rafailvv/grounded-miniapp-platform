@@ -5881,6 +5881,7 @@ class GenerationService:
         ensured = self._synchronize_profile_schema_contract(workspace_id, draft_run_id, ensured)
         ensured = self._synchronize_route_schema_contract(workspace_id, draft_run_id, ensured)
         ensured = self._synchronize_db_session_contract(workspace_id, draft_run_id, ensured)
+        ensured = self._synchronize_runtime_route_contract(workspace_id, draft_run_id, ensured)
         ensured = self._synchronize_main_runtime_contract(workspace_id, draft_run_id, ensured)
         ensured = self._synchronize_minimal_workflow_route_contracts(workspace_id, draft_run_id, ensured)
         ensured = self._synchronize_backend_dependency_contract(workspace_id, draft_run_id, ensured)
@@ -6083,6 +6084,34 @@ class GenerationService:
             )
             return list(operation_map.values())
         return operations
+
+    def _synchronize_runtime_route_contract(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        for file_path in list(operation_map):
+            if not (file_path.startswith("miniapp/app/routes/") and file_path.endswith(".py")):
+                continue
+            content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
+            if not content or "/api/runtime/" not in content:
+                continue
+            updated = content
+            if file_path == "miniapp/app/routes/runtime.py":
+                updated = self._normalize_runtime_route_module_source(updated)
+            else:
+                updated = self._strip_noncanonical_runtime_route_handlers(updated)
+            if updated == content:
+                continue
+            operation_map[file_path] = DraftFileOperation(
+                file_path=file_path,
+                operation="replace",
+                content=updated,
+                reason="Pre-apply contract sync: keep runtime manifest endpoints global and sample-aware.",
+            )
+        return list(operation_map.values())
 
     def _synchronize_backend_dependency_contract(
         self,
@@ -6361,6 +6390,76 @@ class GenerationService:
         return False
 
     @staticmethod
+    def _strip_noncanonical_runtime_route_handlers(content: str) -> str:
+        lines = str(content or "").splitlines()
+        if not lines:
+            return str(content or "")
+        runtime_decorator = re.compile(r'^\s*@router\.(?:get|post|put|patch|delete)\(["\']/api/runtime/')
+        definition_line = re.compile(r'^\s*(?:async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*\(')
+        kept: list[str] = []
+        index = 0
+        removed_any = False
+        while index < len(lines):
+            line = lines[index]
+            if runtime_decorator.match(line):
+                removed_any = True
+                while index < len(lines) and runtime_decorator.match(lines[index]):
+                    index += 1
+                if index < len(lines) and definition_line.match(lines[index]):
+                    index += 1
+                    while index < len(lines):
+                        current = lines[index]
+                        if current.strip() == "":
+                            index += 1
+                            continue
+                        if not current.startswith((" ", "\t")):
+                            break
+                        index += 1
+                    continue
+            kept.append(line)
+            index += 1
+        updated = "\n".join(kept)
+        if str(content or "").endswith("\n"):
+            updated += "\n"
+        if removed_any:
+            updated = re.sub(r"\n{3,}", "\n\n", updated)
+        return updated
+
+    @staticmethod
+    def _normalize_runtime_route_module_source(content: str) -> str:
+        updated = str(content or "")
+        if "/api/runtime/" not in updated:
+            return updated
+        helper_block = (
+            '\n\ndef _normalize_runtime_role(role: str) -> str:\n'
+            '    normalized = str(role or "").strip().strip("/")\n'
+            '    if normalized == "sample":\n'
+            '        return "client"\n'
+            '    return normalized\n'
+        )
+        if "_normalize_runtime_role" not in updated:
+            if "ALLOWED_ROLES = {" in updated:
+                updated = re.sub(r"(ALLOWED_ROLES\s*=\s*\{[^\n]+\}\n)", r"\1" + helper_block, updated, count=1)
+            else:
+                updated = helper_block.lstrip("\n") + "\n" + updated
+        validation_pattern = re.compile(
+            r"def _validate_role\(role: str\) -> (?:None|str):\n"
+            r"(?:    .+\n)+?",
+            flags=re.MULTILINE,
+        )
+        replacement = (
+            'def _validate_role(role: str) -> str:\n'
+            '    normalized = _normalize_runtime_role(role)\n'
+            '    if normalized not in ALLOWED_ROLES:\n'
+            '        raise HTTPException(status_code=404, detail="Role not supported")\n'
+            '    return normalized\n'
+        )
+        if validation_pattern.search(updated):
+            updated = validation_pattern.sub(replacement, updated, count=1)
+        updated = re.sub(r"(?m)^(\s*)_validate_role\(role\)\s*$", r"\1role = _validate_role(role)", updated)
+        return updated
+
+    @staticmethod
     def _deterministic_main_runtime_source(route_modules: list[str]) -> str:
         route_import_lines = "\n".join(
             f"from app.routes.{module} import router as {module}_router"
@@ -6430,6 +6529,24 @@ def _normalize_runtime_role(role: str) -> str:
     if normalized == "sample":
         return "client"
     return normalized
+
+
+def _runtime_manifest_response(role: str, requested_role: str | None = None) -> JSONResponse:
+    requested_role = requested_role or role
+    role = _normalize_runtime_role(role)
+    if role not in ROLES:
+        return JSONResponse(status_code=404, content={{"detail": f"unknown role: {{requested_role}}"}})
+    runtime_manifest_payload = _load_runtime_manifest()
+    route_manifest_payload = _load_route_manifest()
+    return JSONResponse(
+        content={{
+            "role": role,
+            "requested_role": requested_role,
+            "runtime": ((runtime_manifest_payload.get("roles") or {{}}).get(role) or {{}}),
+            "routes": ((route_manifest_payload.get("roles") or {{}}).get(role) or {{}}),
+            "version": runtime_manifest_payload.get("version") or "generated",
+        }}
+    )
 
 
 def _canonicalize_role_path(path: str) -> str:
@@ -6512,23 +6629,29 @@ def role_nested_page(role: str, page_path: str) -> FileResponse:
     return FileResponse(_resolve_role_page(role, f"/{{role}}/{{page_path}}"))
 
 
+@app.get("/api/runtime/client/manifest")
+def runtime_manifest_client() -> JSONResponse:
+    return _runtime_manifest_response("client", "client")
+
+
+@app.get("/api/runtime/specialist/manifest")
+def runtime_manifest_specialist() -> JSONResponse:
+    return _runtime_manifest_response("specialist", "specialist")
+
+
+@app.get("/api/runtime/manager/manifest")
+def runtime_manifest_manager() -> JSONResponse:
+    return _runtime_manifest_response("manager", "manager")
+
+
+@app.get("/api/runtime/sample/manifest")
+def runtime_manifest_sample() -> JSONResponse:
+    return _runtime_manifest_response("client", "sample")
+
+
 @app.get("/api/runtime/{{role}}/manifest")
 def runtime_manifest(role: str) -> JSONResponse:
-    requested_role = role
-    role = _normalize_runtime_role(role)
-    if role not in ROLES:
-        return JSONResponse(status_code=404, content={{"detail": f"unknown role: {{requested_role}}"}})
-    runtime_manifest_payload = _load_runtime_manifest()
-    route_manifest_payload = _load_route_manifest()
-    return JSONResponse(
-        content={{
-            "role": role,
-            "requested_role": requested_role,
-            "runtime": ((runtime_manifest_payload.get("roles") or {{}}).get(role) or {{}}),
-            "routes": ((route_manifest_payload.get("roles") or {{}}).get(role) or {{}}),
-            "version": runtime_manifest_payload.get("version") or "generated",
-        }}
-    )
+    return _runtime_manifest_response(role, role)
 
 
 @app.exception_handler(KeyError)

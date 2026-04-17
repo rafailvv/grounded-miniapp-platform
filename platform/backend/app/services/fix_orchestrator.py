@@ -141,7 +141,7 @@ class FixOrchestrator:
             error_context=request.error_context,
             failure_class=self._classify_failure_text(request.error_context.raw_error if request.error_context else request.prompt),
             root_cause_summary=(request.error_context.raw_error.strip() if request.error_context and request.error_context.raw_error.strip() else None),
-            current_fix_phase="triaging",
+            current_fix_phase="collecting_state",
         )
         source_run_id = str(request.resume_from_run_id or "").strip()
         cloned_source_draft = False
@@ -227,6 +227,7 @@ class FixOrchestrator:
                     elapsed_ms=int((time.perf_counter() - started_at) * 1000),
                 )
 
+            job.current_fix_phase = "running_checks"
             self._append_event(job, "triage_started", f"Triage attempt {attempt} started.", {"attempt": attempt})
             self._append_trace(workspace_id, "triage", "Running exact fix verification checks.", {"attempt": attempt})
             latest_check_execution, latest_preview_details = self._execute_exact_checks(
@@ -266,7 +267,7 @@ class FixOrchestrator:
             active_strategy = fix_case.fix_strategy or active_strategy
             job.root_cause_summary = fix_case.root_cause_summary
             job.fix_targets = list(fix_case.implicated_files)
-            job.current_fix_phase = "triaging"
+            job.current_fix_phase = "collecting_state"
             self._store_report(f"fix_case:{workspace_id}", fix_case.model_dump(mode="json"))
             self._append_event(
                 job,
@@ -281,7 +282,12 @@ class FixOrchestrator:
                 },
             )
 
-            if self._is_fix_success(latest_check_execution.results, latest_preview_details):
+            completion_state = self._completion_state_from_results(
+                latest_check_execution.results,
+                latest_preview_details,
+                validation_snapshot=job.validation_snapshot,
+            )
+            if completion_state["strict_green"]:
                 latest_check_execution, latest_preview_details = self._execute_final_checks(
                     job=job,
                     workspace_id=workspace_id,
@@ -289,7 +295,12 @@ class FixOrchestrator:
                     draft_source=draft_source,
                     changed_files=self._final_check_changed_files(latest_apply_result, fix_case, scope_entries),
                 )
-                if not self._is_fix_success(latest_check_execution.results, latest_preview_details):
+                completion_state = self._completion_state_from_results(
+                    latest_check_execution.results,
+                    latest_preview_details,
+                    validation_snapshot=self._validation_snapshot_from_execution(latest_check_execution),
+                )
+                if not completion_state["strict_green"]:
                     continue
                 success_attempt = FixAttemptRecord(
                     run_id=run_id,
@@ -305,9 +316,11 @@ class FixOrchestrator:
                 )
                 fix_attempts.append(success_attempt)
                 job.status = "completed"
+                job.outcome_kind = "applied"
                 job.summary = "Fix completed successfully after exact verification."
                 job.failure_reason = None
                 job.current_fix_phase = "completed"
+                job.remaining_issues = []
                 job.validation_snapshot = ValidationSnapshot(
                     grounded_spec_valid=True,
                     app_ir_valid=True,
@@ -328,11 +341,84 @@ class FixOrchestrator:
                     elapsed_ms=int((time.perf_counter() - started_at) * 1000),
                 )
 
+            if completion_state["optimistic_complete"]:
+                latest_check_execution, latest_preview_details = self._execute_final_checks(
+                    job=job,
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    draft_source=draft_source,
+                    changed_files=self._final_check_changed_files(latest_apply_result, fix_case, scope_entries),
+                )
+                completion_state = self._completion_state_from_results(
+                    latest_check_execution.results,
+                    latest_preview_details,
+                    validation_snapshot=self._validation_snapshot_from_execution(latest_check_execution),
+                )
+                if completion_state["strict_green"] or completion_state["optimistic_complete"]:
+                    success_attempt = FixAttemptRecord(
+                        run_id=run_id,
+                        attempt=attempt,
+                        diagnosis=(
+                            "Fix verification passed with non-blocking residual issues."
+                            if completion_state["remaining_issues"]
+                            else "Fix verification passed."
+                        ),
+                        commands=[result.command for result in latest_check_execution.results if result.command],
+                        exit_codes={result.name: result.exit_code for result in latest_check_execution.results},
+                        files_changed=[],
+                        implicated_files=fix_case.implicated_files,
+                        failure_signature=fix_case.failure_signature,
+                        result="green",
+                        expected_verification="Backend and preview remain usable after the repair loop.",
+                    )
+                    fix_attempts.append(success_attempt)
+                    job.status = "completed"
+                    job.outcome_kind = "warnings" if completion_state["remaining_issues"] else "applied"
+                    job.summary = (
+                        "Fix completed with a working draft. Remaining issues were recorded for follow-up."
+                        if completion_state["remaining_issues"]
+                        else "Fix completed successfully after exact verification."
+                    )
+                    job.failure_reason = None
+                    job.current_fix_phase = "completed"
+                    job.remaining_issues = list(completion_state["remaining_issues"])
+                    job.validation_snapshot = ValidationSnapshot(
+                        grounded_spec_valid=True,
+                        app_ir_valid=True,
+                        build_valid=True,
+                        blocking=False,
+                        issues=[],
+                    )
+                    self._append_event(
+                        job,
+                        "checks_completed",
+                        "Fix reached a usable completed state.",
+                        {
+                            "attempt": attempt,
+                            "remaining_issue_count": len(job.remaining_issues),
+                        },
+                    )
+                    self._append_event(
+                        job,
+                        "job_completed",
+                        "Fix completed with remaining non-blocking issues." if job.remaining_issues else "Fix completed successfully.",
+                    )
+                    return self._finalize_job(
+                        job,
+                        fix_attempts=fix_attempts,
+                        repair_iterations=repair_iterations,
+                        scope_expansions=scope_expansions,
+                        latest_execution=latest_check_execution,
+                        latest_preview_details=latest_preview_details,
+                        latest_apply_result=latest_apply_result,
+                        elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                    )
+
             if CheckRunner.has_tooling_failure(latest_check_execution.results):
                 job.status = "failed"
                 job.failure_reason = fix_case.root_cause_summary or "Platform/tooling misconfiguration prevents exact verification."
                 job.summary = "Fix stopped because the platform runtime cannot execute required checks."
-                job.current_fix_phase = "stopped"
+                job.current_fix_phase = "failed"
                 self._append_event(job, "job_failed", job.failure_reason)
                 return self._finalize_job(
                     job,
@@ -362,7 +448,7 @@ class FixOrchestrator:
                     "Fix loop stopped after expanded-context and full-bundle retries failed to improve the same failure signature."
                 )
                 job.summary = "Fix loop stopped because repeated repair attempts did not improve the same root-cause cluster."
-                job.current_fix_phase = "stopped"
+                job.current_fix_phase = "failed"
                 self._append_event(
                     job,
                     "job_failed",
@@ -391,7 +477,7 @@ class FixOrchestrator:
                 job.status = "failed"
                 job.failure_reason = "Fix loop reached the repair attempt budget without reaching a green build and preview."
                 job.summary = "Fix loop reached the repair attempt budget."
-                job.current_fix_phase = "stopped"
+                job.current_fix_phase = "failed"
                 self._append_event(
                     job,
                     "job_failed",
@@ -446,7 +532,7 @@ class FixOrchestrator:
                     job.status = "failed"
                     job.failure_reason = apply_result.conflict_reason or "Deterministic contract repair could not be applied."
                     job.summary = "Fix failed while applying deterministic contract repair."
-                    job.current_fix_phase = "patching"
+                    job.current_fix_phase = "syncing_contract"
                     self._append_event(job, "job_failed", job.failure_reason)
                     return self._finalize_job(
                         job,
@@ -500,6 +586,7 @@ class FixOrchestrator:
                 )
                 continue
 
+            job.current_fix_phase = "generating_edits"
             repair_context_mode = self._repair_context_mode(fix_case, repeated_signature_without_progress)
             repair_packet = self._build_repair_packet(
                 workspace_id=workspace_id,
@@ -539,7 +626,7 @@ class FixOrchestrator:
                 next_context_mode = "full_bundle" if repair_packet.context_mode == "expanded" else "expanded"
                 if repair_packet.context_mode == "full_bundle":
                     repair_outcome = FixAttemptOutcome(
-                        outcome="fatal_invalid_response",
+                        outcome="no_progress",
                         diagnosis=repair_outcome.diagnosis,
                         planned_targets=repair_outcome.planned_targets,
                         validation_error=repair_outcome.validation_error or "Repair requested more context after receiving the full bundle.",
@@ -586,31 +673,58 @@ class FixOrchestrator:
                     )
                     repair_packet = expanded_packet
             if repair_outcome.outcome != "patch_ready":
-                job.status = "failed"
-                job.failure_reason = repair_outcome.validation_error or "Repair model did not return a valid executable patch."
-                job.summary = "Fix failed because the repair response was incomplete, invalid, or out of scope."
-                job.current_fix_phase = "patching"
+                attempt_record = FixAttemptRecord(
+                    run_id=run_id,
+                    attempt=attempt,
+                    diagnosis=str(repair_outcome.diagnosis or "Repair turn did not produce executable edits."),
+                    commands=[result.command for result in latest_check_execution.results if result.command],
+                    exit_codes={result.name: result.exit_code for result in latest_check_execution.results},
+                    files_changed=[],
+                    implicated_files=fix_case.implicated_files,
+                    failure_signature=fix_case.failure_signature,
+                    result="failed",
+                    rationale_by_file=dict(repair_outcome.rationale_by_file),
+                    expected_verification=repair_outcome.expected_verification,
+                )
+                fix_attempts.append(attempt_record)
+                repair_iterations.append(
+                    RepairIterationRecord(
+                        run_id=run_id,
+                        attempt=attempt,
+                        files_read=[entry.file_path for entry in scope_entries],
+                        files_changed=[],
+                        failure_class=fix_case.failure_class,
+                        check_results=latest_check_execution.results,
+                        latency_breakdown={"attempt_ms": 0},
+                        token_usage={},
+                    )
+                )
                 self._append_event(
                     job,
-                    "job_failed",
-                    job.failure_reason,
+                    "repair_iteration",
+                    "Repair turn produced no executable patch. Retrying with the updated loop policy.",
                     {
+                        "attempt": attempt,
                         "repair_outcome": repair_outcome.outcome,
                         "planned_targets": repair_outcome.planned_targets,
+                        "validation_error": repair_outcome.validation_error,
                     },
                 )
-                return self._finalize_job(
-                    job,
-                    fix_attempts=fix_attempts,
-                    repair_iterations=repair_iterations,
-                    scope_expansions=scope_expansions,
-                    latest_execution=latest_check_execution,
-                    latest_preview_details=latest_preview_details,
-                    latest_apply_result=latest_apply_result,
-                    elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                self._append_trace(
+                    workspace_id,
+                    "repair_iteration",
+                    "Repair turn produced no executable patch.",
+                    {
+                        "attempt": attempt,
+                        "repair_outcome": repair_outcome.outcome,
+                        "planned_targets": repair_outcome.planned_targets,
+                        "validation_error": repair_outcome.validation_error,
+                    },
                 )
+                continue
             operations = list(repair_outcome.operations)
 
+            job.current_fix_phase = "applying_edits"
             self._append_event(job, "patch_apply_started", "Applying minimal repair patch.", {"attempt": attempt, "files": [operation.file_path for operation in operations]})
             envelope = self.workspace_service.build_patch_envelope_for_draft(workspace_id, run_id, operations)
             apply_result = self.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
@@ -641,7 +755,7 @@ class FixOrchestrator:
                 job.status = "failed"
                 job.failure_reason = apply_result.conflict_reason or "Repair patch conflicted with the current draft."
                 job.summary = "Fix stopped because the repair patch could not be applied safely."
-                job.current_fix_phase = "patching"
+                job.current_fix_phase = "failed"
                 self._append_event(job, "job_failed", job.failure_reason)
                 return self._finalize_job(
                     job,
@@ -710,7 +824,7 @@ class FixOrchestrator:
                     job.status = "failed"
                     job.failure_reason = str(diminishing.get("reason") or "Fix stopped due to diminishing returns.")
                     job.summary = "Fix loop stopped because additional iterations were no longer producing meaningful changes."
-                    job.current_fix_phase = "stopped"
+                    job.current_fix_phase = "failed"
                     self._append_event(job, "job_failed", job.failure_reason)
                     return self._finalize_job(
                         job,
@@ -748,7 +862,7 @@ class FixOrchestrator:
         job.status = "failed"
         job.failure_reason = "Fix loop reached the repair attempt budget without reaching a green build and preview."
         job.summary = "Fix stopped after exhausting the repair budget."
-        job.current_fix_phase = "stopped"
+        job.current_fix_phase = "failed"
         self._append_event(job, "job_failed", job.failure_reason)
         return self._finalize_job(
             job,
@@ -992,6 +1106,8 @@ class FixOrchestrator:
                 extra_paths,
                 budget_override=budget,
             )
+        previous_attempt_summary = self._previous_attempt_summary(fix_case)
+        previous_diff_summary = self._current_diff_summary(workspace_id, run_id)
         return RepairPacket(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -1011,11 +1127,14 @@ class FixOrchestrator:
                 for item in fix_case.executed_checks
                 if item.status == "failed"
             ],
+            normalized_critical_issues=self._normalized_critical_issues(fix_case.executed_checks, fix_case),
             failing_file_paths=list(fix_case.implicated_files),
             deterministic_companions=[entry.file_path for entry in scope_entries],
             expected_contract=self._expected_contract_snapshot(fix_case),
             file_contexts=file_contexts,
             read_only_surfaces=self._read_only_surfaces(),
+            previous_attempt_summary=previous_attempt_summary,
+            previous_diff_summary=previous_diff_summary,
         )
 
     @staticmethod
@@ -1098,6 +1217,53 @@ class FixOrchestrator:
         }
 
     @staticmethod
+    def _previous_attempt_summary(fix_case: FixCase) -> str | None:
+        history = list(fix_case.attempt_history or [])
+        if not history:
+            return None
+        tail = history[-2:]
+        fragments: list[str] = []
+        for item in tail:
+            attempt = item.get("attempt")
+            result = item.get("result")
+            diagnosis = str(item.get("diagnosis") or "").strip()
+            changed = len(item.get("files_changed") or [])
+            parts = [f"attempt={attempt}", f"result={result}", f"changed_files={changed}"]
+            if diagnosis:
+                parts.append(f"diagnosis={diagnosis}")
+            fragments.append(", ".join(parts))
+        return " | ".join(fragments) if fragments else None
+
+    def _current_diff_summary(self, workspace_id: str, run_id: str) -> str | None:
+        diff_report = self.store.get("reports", f"candidate_diff:{workspace_id}") or {}
+        diff_text = str(diff_report.get("diff") or "")
+        if not diff_text and self.workspace_service.draft_exists(workspace_id, run_id):
+            diff_text = self.workspace_service.diff(workspace_id, run_id=run_id)
+        summary = self._diff_summary(diff_text)
+        return None if summary == "No diff recorded." else summary
+
+    @staticmethod
+    def _normalized_critical_issues(results: list[RunCheckResult], fix_case: FixCase | None = None) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for result in results:
+            if result.status != "failed":
+                continue
+            marker = (result.name, str(result.details or ""), str(result.command or ""))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            issues.append(
+                {
+                    "check": result.name,
+                    "details": result.details,
+                    "command": result.command,
+                    "failure_class": fix_case.failure_class if fix_case is not None else None,
+                }
+            )
+        return issues[:16]
+
+    @staticmethod
     def _repair_progress_snapshot(
         results: list[RunCheckResult],
         preview_details: dict[str, Any],
@@ -1124,6 +1290,8 @@ class FixOrchestrator:
             "failed_checks": sorted(result.name for result in results if result.status == "failed"),
             "blocking_issue_codes": sorted(issue.code for issue in issues if issue.blocking),
             "route_markers": route_markers[:20],
+            "preview_status": str(preview_details.get("status") or ""),
+            "preview_stage": str(preview_details.get("stage") or ""),
         }
 
     @staticmethod
@@ -1232,7 +1400,7 @@ class FixOrchestrator:
                     raw_response=llm_result,
                 )
             return FixAttemptOutcome(
-                outcome="fatal_invalid_response",
+                outcome="no_progress",
                 diagnosis=diagnosis_text,
                 planned_targets=planned_targets,
                 validation_error=str(exc),
@@ -1242,7 +1410,7 @@ class FixOrchestrator:
             )
         if not operations:
             return FixAttemptOutcome(
-                outcome="fatal_invalid_response",
+                outcome="no_progress",
                 diagnosis=diagnosis_text,
                 planned_targets=planned_targets,
                 validation_error="Repair model did not return any patch operations.",
@@ -1983,6 +2151,94 @@ class FixOrchestrator:
         )
         return validators_ok and build_ok and app_tests_ok and (preview_ok or preview_deferred)
 
+    @classmethod
+    def _completion_state_from_results(
+        cls,
+        results: list[RunCheckResult],
+        preview_details: dict[str, Any],
+        *,
+        validation_snapshot: ValidationSnapshot | None,
+    ) -> dict[str, Any]:
+        strict_green = cls._is_fix_success(results, preview_details)
+        preview_result = next((result for result in results if result.name == "preview_boot_smoke"), None)
+        preview_connectivity_result = next((result for result in results if result.name == "preview_connectivity_smoke"), None)
+        preview_ok = (
+            preview_result is not None
+            and preview_connectivity_result is not None
+            and preview_result.status != "failed"
+            and preview_connectivity_result.status != "failed"
+        )
+        validators_ok = all(result.status != "failed" for result in results if result.name in {"schema_validators", "connectivity_validators"})
+        build_ok = all(result.status != "failed" for result in results if result.name == "changed_files_static")
+        app_test_failures = [
+            result
+            for result in results
+            if result.name in {"generated_app_python_tests", "generated_app_js_tests"} and result.status == "failed"
+        ]
+        non_test_failures = [
+            result
+            for result in results
+            if result.status == "failed" and result.name not in {"generated_app_python_tests", "generated_app_js_tests"}
+        ]
+        blocking_validation = bool(validation_snapshot.blocking) if validation_snapshot is not None else False
+        remaining_issues = cls._remaining_issues_from_results(
+            app_test_failures=app_test_failures,
+            validation_snapshot=validation_snapshot,
+            preview_details=preview_details,
+        )
+        optimistic_complete = (
+            not strict_green
+            and validators_ok
+            and build_ok
+            and preview_ok
+            and not non_test_failures
+            and not blocking_validation
+            and bool(remaining_issues)
+        )
+        return {
+            "strict_green": strict_green,
+            "optimistic_complete": optimistic_complete,
+            "remaining_issues": remaining_issues,
+        }
+
+    @staticmethod
+    def _remaining_issues_from_results(
+        *,
+        app_test_failures: list[RunCheckResult],
+        validation_snapshot: ValidationSnapshot | None,
+        preview_details: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        remaining: list[dict[str, Any]] = []
+        for result in app_test_failures:
+            remaining.append(
+                {
+                    "kind": "generated_test_failure",
+                    "check": result.name,
+                    "details": result.details,
+                    "logs": result.logs[-8:],
+                }
+            )
+        if validation_snapshot is not None:
+            for issue in validation_snapshot.issues:
+                if not isinstance(issue, dict) or issue.get("blocking", False):
+                    continue
+                remaining.append(
+                    {
+                        "kind": "validation_issue",
+                        "code": issue.get("code"),
+                        "message": issue.get("message"),
+                        "location": issue.get("location"),
+                    }
+                )
+        if preview_details.get("status") == "error" and preview_details.get("last_error"):
+            remaining.append(
+                {
+                    "kind": "preview_warning",
+                    "message": preview_details.get("last_error"),
+                }
+            )
+        return remaining
+
     @staticmethod
     def _first_failing_command(results: list[RunCheckResult]) -> str | None:
         for result in results:
@@ -2099,6 +2355,10 @@ class FixOrchestrator:
             )
         self._store_report(f"fix_attempts:{job.workspace_id}", {"workspace_id": job.workspace_id, "items": job.fix_attempts})
         self._store_report(f"scope_expansions:{job.workspace_id}", {"workspace_id": job.workspace_id, "items": scope_expansions})
+        self._store_report(
+            f"remaining_issues:{job.workspace_id}",
+            {"workspace_id": job.workspace_id, "items": list(job.remaining_issues)},
+        )
         if job.validation_snapshot is not None:
             self._store_report(
                 f"validation:{job.workspace_id}",
@@ -2129,7 +2389,7 @@ class FixOrchestrator:
             "properties": {
                 "outcome": {
                     "type": "string",
-                    "enum": ["patch_ready", "needs_more_context", "fatal_invalid_response"],
+                    "enum": ["patch_ready", "needs_more_context", "no_progress", "fatal_invalid_response"],
                 },
                 "diagnosis": {"type": "string"},
                 "planned_targets": {"type": "array", "items": {"type": "string"}},
@@ -2173,7 +2433,7 @@ class FixOrchestrator:
     ) -> str:
         return json.dumps(
             {
-                "task": "Patch the draft workspace to resolve the current failing bundle and get the checks green.",
+                "task": "Patch the draft workspace to resolve the current failing bundle and converge the checks toward a working app state.",
                 "repair_packet": repair_packet.model_dump(mode="json"),
                 "repair_feedback": repair_feedback,
                 "rules": [
@@ -2185,12 +2445,13 @@ class FixOrchestrator:
                     "Do not modify miniapp/tests/*; default to repairing app code instead of test code.",
                     "Do not modify generated manifests such as route_manifest.json or generated_app_graph.json; repair the application bundle so the deterministic manifest builder stays correct.",
                     "Do not replace route modules with placeholder text/html responses to satisfy navigation tests; repair real route wiring and page surfaces.",
-                    "The fix is considered successful only if validators, generated tests, and preview runtime are all green.",
+                    "Strict-green is the ideal target, but the immediate goal is to remove blocking runtime, compile, routing, and preview failures first.",
                     "Preserve existing endpoints, router wiring, and static file serving unless the evidence shows they are broken.",
                     "Do not replace main.py, route modules, or backend services with placeholder HTML stubs or hard-coded pages.",
                     "Every create or replace operation must include the full resulting file content.",
-                    "Always return outcome=patch_ready, outcome=needs_more_context, or outcome=fatal_invalid_response.",
+                    "Always return outcome=patch_ready, outcome=needs_more_context, outcome=no_progress, or outcome=fatal_invalid_response.",
                     "If you need more context, return outcome=needs_more_context with planned_targets and no operations.",
+                    "If you understand the issue but cannot yet produce a safe patch, return outcome=no_progress and explain exactly what contract is still unresolved.",
                     "Do not return diagnosis-only responses without an explicit outcome and executable patch state.",
                 ],
             },
@@ -2329,6 +2590,7 @@ class FixOrchestrator:
         payload["current_failing_command"] = job.current_failing_command
         payload["current_exit_code"] = job.current_exit_code
         payload["fix_targets"] = list(job.fix_targets)
+        payload["remaining_issues"] = list(job.remaining_issues)
         payload["repair_iterations"] = list(job.repair_iterations)
         payload["fix_attempts"] = list(job.fix_attempts)
         payload["scope_expansions"] = list(job.scope_expansions)

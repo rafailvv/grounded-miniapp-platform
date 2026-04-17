@@ -192,6 +192,7 @@ class JobRecord(StrictModel):
     traceability_report_id: str | None = None
     validation_snapshot: ValidationSnapshot | None = None
     artifacts: dict[str, str] = Field(default_factory=dict)
+    remaining_issues: list[dict[str, Any]] = Field(default_factory=list)
     latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
     retrieval_stats: dict[str, Any] = Field(default_factory=dict)
     cache_stats: dict[str, Any] = Field(default_factory=dict)
@@ -446,11 +447,14 @@ class RepairPacket(StrictModel):
     exact_error_excerpt: str | None = None
     context_mode: Literal["minimal", "expanded", "full_bundle"] = "minimal"
     failing_checks: list[dict[str, Any]] = Field(default_factory=list)
+    normalized_critical_issues: list[dict[str, Any]] = Field(default_factory=list)
     failing_file_paths: list[str] = Field(default_factory=list)
     deterministic_companions: list[str] = Field(default_factory=list)
     expected_contract: dict[str, Any] = Field(default_factory=dict)
     file_contexts: dict[str, str] = Field(default_factory=dict)
     read_only_surfaces: list[str] = Field(default_factory=list)
+    previous_attempt_summary: str | None = None
+    previous_diff_summary: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -550,6 +554,7 @@ class RunRecord(StrictModel):
     checks_summary: RunChecksSummary = Field(default_factory=RunChecksSummary)
     touched_files: list[str] = Field(default_factory=list)
     artifacts: dict[str, str] = Field(default_factory=dict)
+    remaining_issues: list[dict[str, Any]] = Field(default_factory=list)
     latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
     repair_iterations: list[dict[str, Any]] = Field(default_factory=list)
     fix_attempts: list[dict[str, Any]] = Field(default_factory=list)

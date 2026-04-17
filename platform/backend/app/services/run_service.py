@@ -452,6 +452,7 @@ class RunService:
             run.current_failing_command = job.current_failing_command
             run.current_exit_code = job.current_exit_code
             run.fix_targets = list(job.fix_targets)
+            run.remaining_issues = list(getattr(job, "remaining_issues", []) or [])
             run.handoff_from_failed_generate = dict(job.handoff_from_failed_generate or {}) or None
             run.checks_summary = self._build_checks_summary(job.validation_snapshot, preview.status)
             run.touched_files = self._resolve_touched_files(
@@ -507,7 +508,24 @@ class RunService:
                     run=run,
                     change_plan=change_plan,
                 )
-                if job.status == "blocked":
+                optimistic_remaining_issues = self._optimistic_remaining_issues_for_job(job)
+                if meaningful_paths and optimistic_remaining_issues:
+                    run.remaining_issues = optimistic_remaining_issues
+                    run.summary = "Run completed with a working draft. Remaining non-blocking issues were recorded."
+                    run.outcome_kind = "warnings"
+                    if run.apply_strategy == "manual_approve":
+                        run.status = "awaiting_approval"
+                        run.apply_status = "awaiting_approval"
+                        run.draft_status = "ready"
+                        run.draft_ready = True
+                        run.current_stage = "awaiting review"
+                        run.progress_percent = 99
+                    else:
+                        self._apply_completed_draft(
+                            run,
+                            message="Applying working draft with remaining non-blocking issues to the source workspace.",
+                        )
+                elif job.status == "blocked":
                     run.status = "blocked"
                     run.apply_status = "blocked"
                     run.outcome_kind = "blocked_preview_infra" if str(job.outcome_kind or "") == "blocked_preview_infra" else "blocked_generation"
@@ -546,7 +564,7 @@ class RunService:
                 )
             queue_preview_reason: str | None = None
             queue_preview_draft_run_id: str | None = None
-            if job.status == "completed" and run.apply_status == "applied":
+            if run.status == "completed" and run.apply_status == "applied":
                 queue_preview_reason = "run completion"
             elif run.status == "completed" and run.apply_status == "noop" and run.draft_ready:
                 queue_preview_reason = "draft completion with warnings"
@@ -1110,9 +1128,10 @@ class RunService:
         else:
             run.draft_status = "ready" if has_draft else "none"
             run.draft_ready = run.draft_status == "ready"
-        run.current_stage = "completed with warnings"
+        run.current_stage = "completed"
         run.progress_percent = max(run.progress_percent, 100)
         run.current_fix_phase = job.current_fix_phase
+        run.remaining_issues = list(getattr(job, "remaining_issues", []) or [])
         self._append_job_event(
             run.linked_job_id,
             "job_completed",
@@ -1122,6 +1141,32 @@ class RunService:
     def _should_soft_complete_with_warnings(self, run: RunRecord, job: Any) -> bool:
         del run, job
         return False
+
+    def _optimistic_remaining_issues_for_job(self, job: Any) -> list[dict[str, Any]]:
+        executed_checks = list(getattr(job, "executed_checks", []) or [])
+        if not executed_checks:
+            return []
+        failed_checks = [
+            item
+            for item in executed_checks
+            if isinstance(item, dict) and str(item.get("status") or "") == "failed"
+        ]
+        if not failed_checks:
+            return []
+        allowed = {"generated_app_python_tests", "generated_app_js_tests"}
+        if any(str(item.get("name") or "") not in allowed for item in failed_checks):
+            return []
+        remaining: list[dict[str, Any]] = []
+        for item in failed_checks:
+            remaining.append(
+                {
+                    "kind": "generated_test_failure",
+                    "check": item.get("name"),
+                    "details": item.get("details"),
+                    "logs": list(item.get("logs") or [])[-8:],
+                }
+            )
+        return remaining
 
     def _should_apply_draft_with_warnings(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
         del run, job, meaningful_paths
@@ -1148,13 +1193,19 @@ class RunService:
         run.candidate_revision_id = revision.revision_id
         run.status = "completed"
         run.apply_status = "applied"
-        run.outcome_kind = "applied"
+        run.outcome_kind = "warnings" if run.remaining_issues else "applied"
         run.draft_status = "approved"
         run.draft_ready = False
         run.current_stage = "completed"
         run.progress_percent = 100
         run.latency_breakdown["apply_ms"] = int((time.perf_counter() - apply_started_at) * 1000)
-        self._append_job_event(run.linked_job_id, "apply_completed", "Generated draft was applied successfully.")
+        self._append_job_event(
+            run.linked_job_id,
+            "apply_completed",
+            "Generated draft was applied successfully."
+            if not run.remaining_issues
+            else "Generated draft was applied with remaining non-blocking issues recorded.",
+        )
 
     def _meaningful_paths_for_run(
         self,

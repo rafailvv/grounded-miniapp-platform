@@ -18,7 +18,7 @@ from app.ai.openrouter_client import ACTIVE_WORKSPACE_LOG_CONTEXT, OpenRouterCli
 from app.main import create_app
 from app.models.common import PreviewProfile, TargetPlatform
 from app.models.artifacts import ValidationIssue
-from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixCase, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RunCheckResult, ValidationSnapshot, WorkspaceRecord
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixCase, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RepairPacket, RunCheckResult, ValidationSnapshot, WorkspaceRecord
 from app.models.grounded_spec import APIRequirement
 from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
@@ -3287,6 +3287,66 @@ def test_fix_orchestrator_retries_invalid_patch_validation_for_missing_content()
     ) is False
 
 
+def test_fix_orchestrator_treats_empty_repair_patch_as_no_progress(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    orchestrator = app.state.container.fix_orchestrator
+
+    repair_packet = RepairPacket(
+        workspace_id="ws_fix",
+        run_id="run_fix",
+        attempt=1,
+        deterministic_companions=["miniapp/app/main.py"],
+    )
+    fix_case = FixCase(
+        workspace_id="ws_fix",
+        run_id="run_fix",
+        failure_class="api_endpoint_missing",
+        implicated_files=["miniapp/app/main.py"],
+        write_scope=[FixScopeEntry(file_path="miniapp/app/main.py", reason="missing route contract")],
+    )
+
+    outcome = orchestrator._repair_outcome_from_response(
+        llm_result={"diagnosis": "I need a retry, no concrete edits yet.", "operations": []},
+        repair_packet=repair_packet,
+        fix_case=fix_case,
+        scope_expansions=[],
+    )
+
+    assert outcome.outcome == "no_progress"
+    assert "patch operations" in str(outcome.validation_error or "").lower()
+
+
+def test_fix_orchestrator_allows_optimistic_completion_for_generated_test_tail() -> None:
+    from app.services.fix_orchestrator import FixOrchestrator
+
+    results = [
+        RunCheckResult(name="schema_validators", status="passed", details="ok"),
+        RunCheckResult(name="connectivity_validators", status="passed", details="ok"),
+        RunCheckResult(name="changed_files_static", status="passed", details="ok"),
+        RunCheckResult(name="generated_app_python_tests", status="failed", details="python test tail", logs=["assert route alias"]),
+        RunCheckResult(name="generated_app_js_tests", status="passed", details="ok"),
+        RunCheckResult(name="preview_boot_smoke", status="passed", details="preview ok"),
+        RunCheckResult(name="preview_connectivity_smoke", status="passed", details="preview ok"),
+    ]
+
+    completion = FixOrchestrator._completion_state_from_results(
+        results,
+        {"status": "running", "stage": "running"},
+        validation_snapshot=ValidationSnapshot(
+            grounded_spec_valid=True,
+            app_ir_valid=True,
+            build_valid=True,
+            blocking=False,
+            issues=[],
+        ),
+    )
+
+    assert completion["strict_green"] is False
+    assert completion["optimistic_complete"] is True
+    assert completion["remaining_issues"]
+
+
 def test_structural_repeated_signature_guard_detects_expandable_scope() -> None:
     from app.services.fix_orchestrator import FixOrchestrator
 
@@ -3341,6 +3401,8 @@ def test_generation_service_main_runtime_source_includes_runtime_manifest_endpoi
 
     assert 'RUNTIME_MANIFEST_PATH = GENERATED_DIR / "runtime_manifest.json"' in content
     assert '@app.get("/api/runtime/{role}/manifest")' in content
+    assert '@app.get("/api/runtime/client/manifest")' in content
+    assert '@app.get("/api/runtime/sample/manifest")' in content
 
 
 def test_run_completes_before_async_preview_rebuild_finishes(tmp_path: Path) -> None:
@@ -3415,7 +3477,7 @@ def test_run_completes_before_async_preview_rebuild_finishes(tmp_path: Path) -> 
     assert preview_service.get(workspace_id).status == "running"
 
 
-def test_preview_rebuild_failure_does_not_change_failed_strict_green_run(tmp_path: Path) -> None:
+def test_preview_rebuild_failure_does_not_change_completed_optimistic_run(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     _install_llm_stub(app)
@@ -3470,12 +3532,12 @@ def test_preview_rebuild_failure_does_not_change_failed_strict_green_run(tmp_pat
         ),
     )
 
-    assert run.status == "failed"
+    assert run.status == "completed"
     time.sleep(0.15)
-    assert app.state.container.run_service.get_run(run.run_id).status == "failed"
+    assert app.state.container.run_service.get_run(run.run_id).status == "completed"
     assert preview_service.get(workspace_id).status in {"stopped", "error", "starting", "running"}
     artifacts = app.state.container.run_service.get_run_artifacts(run.run_id)
-    assert artifacts["run"]["status"] == "failed"
+    assert artifacts["run"]["status"] == "completed"
 
 
 def test_openrouter_payload_uses_stable_cache_prefix_and_reports_cache_stats(tmp_path: Path) -> None:
@@ -6192,9 +6254,54 @@ def test_deterministic_main_runtime_source_supports_sample_manifest_and_trailing
     source = GenerationService._deterministic_main_runtime_source(["assignments"])
 
     assert 'if normalized == "sample":' in source
+    assert "def _runtime_manifest_response" in source
     assert '@app.get("/{role}/", include_in_schema=False)' in source
     assert "requested_role" in source
     assert "_canonicalize_role_path" in source
+
+
+def test_strip_noncanonical_runtime_route_handlers_removes_prefixed_runtime_aliases() -> None:
+    content = """from fastapi import APIRouter
+
+router = APIRouter(prefix="/client")
+
+@router.get("/")
+def index():
+    return {}
+
+@router.get("/api/runtime/client/manifest")
+def runtime_manifest():
+    return {"ok": True}
+"""
+
+    updated = GenerationService._strip_noncanonical_runtime_route_handlers(content)
+
+    assert '@router.get("/api/runtime/client/manifest")' not in updated
+    assert "def runtime_manifest" not in updated
+    assert '@router.get("/")' in updated
+
+
+def test_normalize_runtime_route_module_source_supports_sample_alias() -> None:
+    content = """from fastapi import APIRouter, HTTPException
+
+router = APIRouter(tags=["runtime"])
+ALLOWED_ROLES = {"client", "specialist", "manager"}
+
+def _validate_role(role: str) -> None:
+    if role not in ALLOWED_ROLES:
+        raise HTTPException(status_code=404, detail="Role not supported")
+
+@router.get("/api/runtime/{role}/manifest")
+def manifest(role: str):
+    _validate_role(role)
+    return {"role": role}
+"""
+
+    updated = GenerationService._normalize_runtime_route_module_source(content)
+
+    assert 'if normalized == "sample":' in updated
+    assert "def _validate_role(role: str) -> str:" in updated
+    assert "role = _validate_role(role)" in updated
 
 
 def test_canonicalize_local_role_links_in_text_strips_trailing_role_slashes() -> None:

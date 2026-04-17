@@ -724,9 +724,10 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
             break
         time.sleep(0.2)
 
-    assert final_run["status"] == "failed"
-    assert final_run["apply_status"] == "failed"
+    assert final_run["status"] == "awaiting_approval"
+    assert final_run["apply_status"] == "awaiting_approval"
     assert final_run["draft_ready"] is True
+    assert final_run["remaining_issues"]
 
     spec_payload = client.get(f"/workspaces/{workspace_id}/spec/current").json()
     validation_payload = client.get(f"/workspaces/{workspace_id}/validation/current").json()
