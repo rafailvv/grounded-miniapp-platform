@@ -718,9 +718,10 @@ def test_runtime_artifacts_are_synthesized_from_page_graph(tmp_path: Path) -> No
 
     assert "miniapp/app/generated/route_manifest.json" in ensured_paths
     assert "miniapp/app/generated/runtime_manifest.json" in ensured_paths
-    assert "miniapp/app/generated/static_runtime_manifest.json" in ensured_paths
-    assert "miniapp/app/generated/role_seed.json" in ensured_paths
-    assert "miniapp/app/generated/role_experience.json" in ensured_paths
+    assert "miniapp/app/generated/runtime_state.json" not in ensured_paths
+    assert "miniapp/app/generated/static_runtime_manifest.json" not in ensured_paths
+    assert "miniapp/app/generated/role_seed.json" not in ensured_paths
+    assert "miniapp/app/generated/role_experience.json" not in ensured_paths
 
 
 def test_generated_app_tests_cover_shell_styles_dom_contracts_and_local_routes(tmp_path: Path) -> None:
@@ -752,6 +753,9 @@ def test_generated_app_tests_cover_shell_styles_dom_contracts_and_local_routes(t
     assert "test_local_page_links_render" in python_test
     assert "test_detected_workflow_lifecycle_executes" in python_test
     assert "_workflow_api_requirements" in python_test
+    assert 'not str(item.get("path") or "").startswith("/api/runtime/")' in python_test
+    assert 'TemporaryDirectory' in python_test
+    assert 'os.environ["DATABASE_URL"]' in python_test
     assert 'asset_path = MINIAPP_DIR / "app" / "static" / asset.removeprefix("/static/")' in python_test
     assert "extractJsDomIds" in js_test
     assert "page-local navigation targets resolve to declared routes" in js_test
@@ -2311,7 +2315,6 @@ def test_materialization_report_rejects_duplicate_page_file_mappings() -> None:
             "miniapp/app/static/manager/profile.html",
             "miniapp/app/generated/route_manifest.json",
             "miniapp/app/generated/runtime_manifest.json",
-            "miniapp/app/generated/static_runtime_manifest.json",
             "artifacts/generated_app_graph.json",
         },
     )

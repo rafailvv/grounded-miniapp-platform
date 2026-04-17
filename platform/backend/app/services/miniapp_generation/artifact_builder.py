@@ -39,25 +39,9 @@ class MiniappArtifactBuilder:
     ) -> list[DraftFileOperation]:
         route_manifest = self.route_manifest_from_page_graph(page_graph, role_scope)
         runtime_manifest = self.runtime_manifest_from_page_graph(route_manifest, grounded_spec, generation_mode)
-        runtime_state = self.runtime_state_from_route_manifest(route_manifest, grounded_spec, generation_mode)
-        role_seed = self.role_seed_from_route_manifest(route_manifest, runtime_manifest, runtime_state, grounded_spec)
-        role_experience = {
-            role: {
-                "title": payload["title"],
-                "featureText": payload["feature_text"],
-                "routeTree": payload["route_tree"],
-                "primaryPages": payload["pages"],
-            }
-            for role, payload in (role_seed.get("roles") or {}).items()
-            if isinstance(payload, dict)
-        }
         required_artifacts = {
             "miniapp/app/generated/route_manifest.json": (route_manifest, "Persist the canonical route manifest for the generated role pages."),
             "miniapp/app/generated/runtime_manifest.json": (runtime_manifest, "Persist the lightweight runtime manifest for the generated role pages."),
-            "miniapp/app/generated/static_runtime_manifest.json": (runtime_manifest, "Provide the static runtime manifest used by generated role pages."),
-            "miniapp/app/generated/runtime_state.json": (runtime_state, "Seed the generated runtime state for demo interactions."),
-            "miniapp/app/generated/role_seed.json": (role_seed, "Persist role summaries and route metadata for generated pages."),
-            "miniapp/app/generated/role_experience.json": (role_experience, "Persist role experience descriptors for previews."),
         }
         ensured_operations = [operation for operation in operations if operation.file_path not in required_artifacts]
         for file_path, (payload, reason) in required_artifacts.items():
@@ -106,10 +90,12 @@ class MiniappArtifactBuilder:
 
 import importlib
 import json
+import os
 import re
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 
@@ -300,13 +286,20 @@ def _workflow_api_requirements(grounded_spec: dict) -> list[dict]:
     return [
         item
         for item in grounded_spec.get("api_requirements", [])
-        if isinstance(item, dict) and str(item.get("path") or "").startswith("/api/")
+        if isinstance(item, dict)
+        and str(item.get("path") or "").startswith("/api/")
+        and not str(item.get("path") or "").startswith("/api/runtime/")
     ]
 
 
 class GeneratedMiniAppTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        cls._test_db_dir = TemporaryDirectory()
+        cls._original_database_url = os.environ.get("DATABASE_URL")
+        os.environ["DATABASE_URL"] = f"sqlite:///{(Path(cls._test_db_dir.name) / 'generated_test.db').as_posix()}"
+        for module_name in [name for name in list(sys.modules) if name == "app" or name.startswith("app.")]:
+            sys.modules.pop(module_name, None)
         from app.main import app
 
         cls._client_context = TestClient(app)
@@ -321,6 +314,14 @@ class GeneratedMiniAppTests(unittest.TestCase):
         client_context = getattr(cls, "_client_context", None)
         if client_context is not None:
             client_context.__exit__(None, None, None)
+        original_database_url = getattr(cls, "_original_database_url", None)
+        if original_database_url:
+            os.environ["DATABASE_URL"] = original_database_url
+        else:
+            os.environ.pop("DATABASE_URL", None)
+        test_db_dir = getattr(cls, "_test_db_dir", None)
+        if test_db_dir is not None:
+            test_db_dir.cleanup()
 
     def test_generated_manifests_exist(self) -> None:
         self.assertIsInstance(self.route_manifest.get("roles"), dict)
@@ -951,71 +952,11 @@ test('generated javascript files parse', () => {
                 "layout_variant": "stacked",
                 "theme": {"accent": "#2d7ff9", "surface": "#ffffff", "card": "#f8fbff", "border": "#d8e4f7"},
                 "platform": grounded_spec.target_platform,
-                "preview_profile": grounded_spec.preview_profile,
                 "route_count": sum(len(role_payload["routes"]) for role_payload in roles.values()),
                 "screen_count": sum(len(role_payload["screens"]) for role_payload in roles.values()),
             },
             "roles": roles,
         }
-
-    @staticmethod
-    def runtime_state_from_route_manifest(
-        route_manifest: dict[str, Any],
-        grounded_spec: GroundedSpecModel,
-        generation_mode: GenerationMode,
-    ) -> dict[str, Any]:
-        return {
-            "metadata": {
-                "generated_at": utc_now().isoformat(),
-                "generation_mode": generation_mode.value,
-                "goal": grounded_spec.product_goal,
-            },
-            "records": [],
-            "roles": {
-                role: {
-                    "profile": {"first_name": "Ivan", "last_name": "Ivanov", "email": "", "phone": "", "photo_url": None},
-                    "metrics": [{"metric_id": "pages", "label": "Pages", "value": str(len(((route_manifest.get("roles") or {}).get(role) or {}).get("pages") or []))}],
-                }
-                for role in ROLE_ORDER
-            },
-            "activity": [],
-        }
-
-    @staticmethod
-    def role_seed_from_route_manifest(
-        route_manifest: dict[str, Any],
-        runtime_manifest: dict[str, Any],
-        runtime_state: dict[str, Any],
-        grounded_spec: GroundedSpecModel,
-    ) -> dict[str, Any]:
-        role_seed = {"roles": {}}
-        for role in ROLE_ORDER:
-            role_payload = ((route_manifest.get("roles") or {}).get(role) or {})
-            pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
-            home_page = next((page for page in pages if page.get("is_entry")), pages[0] if pages else {"title": role.title(), "route_path": f"/{role}"})
-            secondary_page = next((page for page in pages if not page.get("is_entry")), home_page)
-            role_seed["roles"][role] = {
-                "title": str(home_page.get("title") or role.title()),
-                "description": grounded_spec.product_goal[:160],
-                "feature_text": grounded_spec.product_goal[:160],
-                "primary_action_label": str(home_page.get("navigation_label") or home_page.get("title") or "Open"),
-                "secondary_action_label": str(secondary_page.get("navigation_label") or secondary_page.get("title") or "Explore"),
-                "route_tree": list((((runtime_manifest.get("roles") or {}).get(role) or {}).get("route_tree") or [])),
-                "pages": [
-                    {
-                        "screen_id": str(page.get("page_id") or f"{role}_page"),
-                        "path": str(page.get("route_path") or f"/{role}"),
-                        "kind": str(page.get("page_kind") or "page"),
-                        "title": str(page.get("title") or page.get("navigation_label") or role.title()),
-                        "page_purpose": str(page.get("title") or page.get("navigation_label") or role.title()),
-                        "handoff_paths": list(page.get("handoff_paths") or []),
-                    }
-                    for page in pages
-                ],
-                "metrics": list((((runtime_state.get("roles") or {}).get(role) or {}).get("metrics") or [])),
-                "profile": dict((((runtime_state.get("roles") or {}).get(role) or {}).get("profile") or {})),
-            }
-        return role_seed
 
     def build_stage_reports(
         self,
@@ -1038,8 +979,6 @@ test('generated javascript files parse', () => {
         required_manifests = {
             "miniapp/app/generated/route_manifest.json",
             "miniapp/app/generated/runtime_manifest.json",
-            "miniapp/app/generated/static_runtime_manifest.json",
-            "miniapp/app/generated/role_seed.json",
             "artifacts/generated_app_graph.json",
         }
         backend_hits = sorted(path for path in planned_backend if path in realized_paths)
@@ -1094,7 +1033,6 @@ test('generated javascript files parse', () => {
         expected_manifests = [
             "miniapp/app/generated/route_manifest.json",
             "miniapp/app/generated/runtime_manifest.json",
-            "miniapp/app/generated/static_runtime_manifest.json",
             "artifacts/generated_app_graph.json",
         ]
         missing_files = [path for path in planned_pages if path not in normalized_realized_paths]

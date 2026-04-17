@@ -163,7 +163,6 @@ class ContextPackBuilder:
                     "miniapp/app/schemas.py",
                     "miniapp/app/generated/route_manifest.json",
                     "miniapp/app/generated/runtime_manifest.json",
-                    "miniapp/app/generated/static_runtime_manifest.json",
                 ]
             )
             anchors.extend(path for path in target_files if path.startswith("miniapp/app/routes/"))

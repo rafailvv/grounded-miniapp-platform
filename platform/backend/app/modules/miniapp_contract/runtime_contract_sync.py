@@ -316,12 +316,13 @@ class MiniappRuntimeContractSync:
         return f"""from __future__ import annotations
 
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 
 from app.db import Base, engine
 from app.routes.health import router as health_router
@@ -330,13 +331,60 @@ from app.routes.profiles import router as profiles_router
 STATIC_DIR = BASE_DIR / "static"
 GENERATED_DIR = BASE_DIR / "generated"
 ROUTE_MANIFEST_PATH = GENERATED_DIR / "route_manifest.json"
-RUNTIME_MANIFEST_PATH = GENERATED_DIR / "runtime_manifest.json"
 ROLES = ("client", "specialist", "manager")
 
 app = FastAPI()
 app.include_router(health_router)
 app.include_router(profiles_router)
 {include_lines}app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+def _ensure_table_columns(conn, table_name: str, columns: dict[str, str]) -> None:
+    existing = {{row[1] for row in conn.execute(text(f"PRAGMA table_info({{table_name}})")).fetchall()}}
+    for column_name, column_type in columns.items():
+        if column_name in existing:
+            continue
+        conn.execute(text(f"ALTER TABLE {{table_name}} ADD COLUMN {{column_name}} {{column_type}}"))
+
+
+def _ensure_generated_schema() -> None:
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY)"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, request_id TEXT, comment TEXT, author_role TEXT, created_at TEXT)"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS role_profiles (role TEXT PRIMARY KEY)"))
+        _ensure_table_columns(
+            conn,
+            "requests",
+            {{
+                "title": "TEXT",
+                "description": "TEXT",
+                "client_name": "TEXT",
+                "phone": "TEXT",
+                "preferred_time": "TEXT",
+                "comment": "TEXT",
+                "status": "TEXT",
+                "assigned_specialist": "TEXT",
+                "equipment_type": "TEXT",
+                "start_date": "TEXT",
+                "end_date": "TEXT",
+                "reason": "TEXT",
+                "specialist_notes": "TEXT",
+                "created_at": "TEXT",
+                "updated_at": "TEXT",
+            }},
+        )
+        _ensure_table_columns(
+            conn,
+            "role_profiles",
+            {{
+                "first_name": "TEXT",
+                "last_name": "TEXT",
+                "email": "TEXT",
+                "phone": "TEXT",
+                "photo_url": "TEXT",
+                "updated_at": "TEXT",
+            }},
+        )
 
 
 @app.middleware("http")
@@ -352,6 +400,7 @@ async def disable_preview_caching(request: Request, call_next):
 @app.on_event("startup")
 def startup() -> None:
     Base.metadata.create_all(bind=engine)
+    _ensure_generated_schema()
 
 
 @app.get("/", include_in_schema=False)
@@ -366,40 +415,6 @@ def _load_route_manifest() -> dict:
         return json.loads(ROUTE_MANIFEST_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {{}}
-
-
-def _load_runtime_manifest() -> dict:
-    if not RUNTIME_MANIFEST_PATH.exists():
-        return {{}}
-    try:
-        return json.loads(RUNTIME_MANIFEST_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {{}}
-
-
-def _normalize_runtime_role(role: str) -> str:
-    normalized = (role or "").strip().strip("/")
-    if normalized == "sample":
-        return "client"
-    return normalized
-
-
-def _runtime_manifest_response(role: str, requested_role: str | None = None) -> JSONResponse:
-    requested_role = requested_role or role
-    role = _normalize_runtime_role(role)
-    if role not in ROLES:
-        return JSONResponse(status_code=404, content={{"detail": f"unknown role: {{requested_role}}"}})
-    runtime_manifest_payload = _load_runtime_manifest()
-    route_manifest_payload = _load_route_manifest()
-    return JSONResponse(
-        content={{
-            "role": role,
-            "requested_role": requested_role,
-            "runtime": ((runtime_manifest_payload.get("roles") or {{}}).get(role) or {{}}),
-            "routes": ((route_manifest_payload.get("roles") or {{}}).get(role) or {{}}),
-            "version": runtime_manifest_payload.get("version") or "generated",
-        }}
-    )
 
 
 def _canonicalize_role_path(path: str) -> str:
@@ -465,31 +480,6 @@ def _resolve_role_page(role: str, actual_path: str) -> Path:
         if dynamic_candidate.exists():
             return dynamic_candidate
     raise KeyError(actual_path)
-
-
-@app.get("/api/runtime/client/manifest")
-def runtime_manifest_client() -> JSONResponse:
-    return _runtime_manifest_response("client", "client")
-
-
-@app.get("/api/runtime/specialist/manifest")
-def runtime_manifest_specialist() -> JSONResponse:
-    return _runtime_manifest_response("specialist", "specialist")
-
-
-@app.get("/api/runtime/manager/manifest")
-def runtime_manifest_manager() -> JSONResponse:
-    return _runtime_manifest_response("manager", "manager")
-
-
-@app.get("/api/runtime/sample/manifest")
-def runtime_manifest_sample() -> JSONResponse:
-    return _runtime_manifest_response("client", "sample")
-
-
-@app.get("/api/runtime/{{role}}/manifest")
-def runtime_manifest(role: str) -> JSONResponse:
-    return _runtime_manifest_response(role, role)
 
 
 @app.get("/{{role}}", include_in_schema=False)

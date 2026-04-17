@@ -796,7 +796,6 @@ class FixOrchestrator:
             "miniapp/tests/",
             "miniapp/app/generated/route_manifest.json",
             "miniapp/app/generated/runtime_manifest.json",
-            "miniapp/app/generated/static_runtime_manifest.json",
             "artifacts/generated_app_graph.json",
         ]
 
@@ -1184,7 +1183,6 @@ class FixOrchestrator:
         return normalized in {
             "miniapp/app/generated/route_manifest.json",
             "miniapp/app/generated/runtime_manifest.json",
-            "miniapp/app/generated/static_runtime_manifest.json",
             "artifacts/generated_app_graph.json",
         }
 
@@ -1286,7 +1284,6 @@ class FixOrchestrator:
             "miniapp/app/routes/profiles.py",
             "miniapp/app/generated/route_manifest.json",
             "miniapp/app/generated/runtime_manifest.json",
-            "miniapp/app/generated/static_runtime_manifest.json",
             "miniapp/tests/test_generated_app.py",
             "miniapp/tests/generated_app.test.mjs",
             "artifacts/generated_app_graph.json",

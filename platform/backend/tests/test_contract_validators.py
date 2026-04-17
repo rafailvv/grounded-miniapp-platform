@@ -912,6 +912,71 @@ def test_build_validator_flags_unexpected_auth_reference(tmp_path: Path) -> None
     assert any(issue.code == "build.unexpected_auth_reference" for issue in issues)
 
 
+def test_build_validator_flags_duplicate_runtime_route_owners(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/routes/runtime.py",
+        'from fastapi import APIRouter\nrouter = APIRouter(prefix="/api/runtime")\n@router.get("/{role}/manifest")\ndef runtime_manifest(role: str):\n    return {"role": role}\n',
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/routes/workload.py",
+        'from fastapi import APIRouter\nrouter = APIRouter(prefix="/api/runtime")\n@router.get("/{role}/manifest")\ndef workload_manifest(role: str):\n    return {"role": role}\n',
+    )
+
+    issues = BuildValidator().validate(workspace_root)
+
+    assert any(issue.code == "build.duplicate_runtime_route_provider" for issue in issues)
+
+
+def test_build_validator_flags_runtime_action_writes_and_seeded_artifacts(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/app.js",
+        'fetch("/api/runtime/client/actions/approve_request", { method: "POST" });\n',
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/generated/role_seed.json",
+        json.dumps({"roles": {"client": {"profile": {"first_name": "Ivan", "last_name": "Ivanov"}}}}),
+    )
+
+    issues = BuildValidator().validate(workspace_root)
+
+    assert any(issue.code == "build.runtime_action_write_contract" for issue in issues)
+    assert any(issue.code == "build.seeded_generated_artifact" for issue in issues)
+
+
+def test_build_validator_flags_placeholder_persistence_handlers(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/routes/requests.py",
+        "def get_request():\n    placeholder = {'id': 'sample'}\n    return placeholder\n",
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/routes/assignments.py",
+        "INSERT OR IGNORE INTO requests\n",
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/routes/profiles.py",
+        "DEFAULT_PROFILES = {'client': {'first_name': 'Ivan'}}\n",
+    )
+
+    issues = BuildValidator().validate(workspace_root)
+
+    assert any(issue.code == "build.placeholder_request_read" for issue in issues)
+    assert any(issue.code == "build.placeholder_assignment_write" for issue in issues)
+    assert any(issue.code == "build.placeholder_profile_seed" for issue in issues)
+
+
 def test_build_validator_flags_missing_shell_style_and_dom_contract_drift(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
     _create_workspace_scaffold(workspace_root)

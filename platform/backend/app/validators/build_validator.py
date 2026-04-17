@@ -31,6 +31,8 @@ class BuildValidator:
         issues.extend(self._validate_contract_drift(workspace_path))
         issues.extend(self._validate_route_module_import_safety(workspace_path))
         issues.extend(self._validate_persistent_storage_contract(workspace_path))
+        issues.extend(self._validate_runtime_provider_contract(workspace_path))
+        issues.extend(self._validate_mock_and_fallback_contract(workspace_path))
         return issues
 
     @staticmethod
@@ -792,6 +794,128 @@ class BuildValidator:
                     )
                 )
                 continue
+        return issues
+
+    def _validate_runtime_provider_contract(self, workspace_path: Path) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        routes_dir = workspace_path / "miniapp" / "app" / "routes"
+        runtime_owners: list[str] = []
+        if routes_dir.exists():
+            for route_file in routes_dir.glob("*.py"):
+                try:
+                    content = route_file.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if 'APIRouter(prefix="/api/runtime"' in content or "/api/runtime/" in content:
+                    runtime_owners.append(str(route_file.relative_to(workspace_path)))
+        if len(runtime_owners) > 1:
+            issues.append(
+                ValidationIssue(
+                    code="build.duplicate_runtime_route_provider",
+                    message=f"More than one route module owns /api/runtime/*: {', '.join(sorted(runtime_owners))}",
+                    severity="high",
+                    location=runtime_owners[0],
+                )
+            )
+
+        runtime_writes: list[str] = []
+        static_dir = workspace_path / "miniapp" / "app" / "static"
+        if static_dir.exists():
+            for asset in static_dir.rglob("*.js"):
+                try:
+                    content = asset.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if re.search(r"/api/runtime/(?:[a-zA-Z0-9_{}-]+)/actions/", content):
+                    runtime_writes.append(str(asset.relative_to(workspace_path)))
+        if runtime_writes:
+            issues.append(
+                ValidationIssue(
+                    code="build.runtime_action_write_contract",
+                    message=f"Generated UI still writes through /api/runtime/*/actions/* instead of explicit CRUD endpoints: {', '.join(sorted(runtime_writes)[:5])}",
+                    severity="high",
+                    location=runtime_writes[0],
+                )
+            )
+        return issues
+
+    def _validate_mock_and_fallback_contract(self, workspace_path: Path) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        mock_markers = (
+            "DEMO_REQUESTS",
+            "DEFAULT_PROFILES",
+            "Ivan Ivanov",
+            "Иван Иванов",
+            "telegram_mock",
+            "fallbackData",
+            "demoData",
+        )
+        placeholder_patterns = (
+            ("miniapp/app/routes/requests.py", "placeholder =", "build.placeholder_request_read"),
+            ("miniapp/app/routes/requests.py", "return create_request(", "build.placeholder_request_update"),
+            ("miniapp/app/routes/assignments.py", "INSERT OR IGNORE INTO requests", "build.placeholder_assignment_write"),
+            ("miniapp/app/routes/profiles.py", "DEFAULT_PROFILES", "build.placeholder_profile_seed"),
+        )
+        for rel_path, marker, code in placeholder_patterns:
+            absolute = workspace_path / rel_path
+            if not absolute.exists():
+                continue
+            try:
+                content = absolute.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if marker in content:
+                issues.append(
+                    ValidationIssue(
+                        code=code,
+                        message=f"{Path(rel_path).name} still contains placeholder-creating persistence logic.",
+                        severity="high",
+                        location=rel_path,
+                    )
+                )
+
+        for generated_path in (
+            "miniapp/app/generated/static_runtime_manifest.json",
+            "miniapp/app/generated/role_seed.json",
+            "miniapp/app/generated/role_experience.json",
+            "miniapp/app/generated/runtime_state.json",
+        ):
+            if (workspace_path / generated_path).exists():
+                issues.append(
+                    ValidationIssue(
+                        code="build.seeded_generated_artifact",
+                        message=f"{Path(generated_path).name} should not be materialized for DB-backed generated apps.",
+                        severity="high",
+                        location=generated_path,
+                    )
+                )
+
+        scan_roots = [
+            workspace_path / "miniapp" / "app" / "routes",
+            workspace_path / "miniapp" / "app" / "static",
+            workspace_path / "miniapp" / "app" / "generated",
+        ]
+        for root in scan_roots:
+            if not root.exists():
+                continue
+            for path in root.rglob("*"):
+                if not path.is_file() or path.suffix not in {".py", ".js", ".html", ".json"}:
+                    continue
+                try:
+                    content = path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                hit = next((marker for marker in mock_markers if marker in content), None)
+                if hit is None:
+                    continue
+                issues.append(
+                    ValidationIssue(
+                        code="build.mock_business_data",
+                        message=f"{path.name} still contains mock or fallback business data marker: {hit}.",
+                        severity="high",
+                        location=str(path.relative_to(workspace_path)),
+                    )
+                )
         return issues
 
     @staticmethod

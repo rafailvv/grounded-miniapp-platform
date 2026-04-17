@@ -5362,10 +5362,6 @@ class GenerationService:
         generated_manifest_paths = {
             "miniapp/app/generated/route_manifest.json",
             "miniapp/app/generated/runtime_manifest.json",
-            "miniapp/app/generated/static_runtime_manifest.json",
-            "miniapp/app/generated/role_seed.json",
-            "miniapp/app/generated/role_experience.json",
-            "miniapp/app/generated/runtime_state.json",
             "miniapp/app/generated/app_ir.json",
         }
         generated_test_paths = {
@@ -5789,6 +5785,8 @@ class GenerationService:
             "miniapp/app/routes/requests.py": self._deterministic_requests_route_source(),
             "miniapp/app/routes/comments.py": self._deterministic_comments_route_source(),
             "miniapp/app/routes/assignments.py": self._deterministic_assignments_route_source(),
+            "miniapp/app/routes/profiles.py": self._deterministic_profiles_route_source(),
+            "miniapp/app/routes/runtime.py": self._deterministic_runtime_route_source(),
             "miniapp/app/routes/users.py": self._deterministic_users_route_source(),
             "miniapp/app/routes/workload.py": self._deterministic_workload_route_source(),
             "miniapp/app/routes/time_slots.py": self._deterministic_time_slots_route_source(),
@@ -5796,14 +5794,24 @@ class GenerationService:
         for file_path, template in route_templates.items():
             content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
             if content is None:
+                if file_path in {"miniapp/app/routes/comments.py", "miniapp/app/routes/runtime.py"}:
+                    operation_map[file_path] = DraftFileOperation(
+                        file_path=file_path,
+                        operation="replace",
+                        content=template,
+                        reason="Pre-apply contract sync: materialize the canonical DB-backed workflow route module.",
+                    )
                 continue
-            if not self._route_module_needs_stub(content):
+            if not (
+                self._route_module_needs_stub(content)
+                or self._route_module_requires_db_backed_repair(file_path, content)
+            ):
                 continue
             operation_map[file_path] = DraftFileOperation(
                 file_path=file_path,
                 operation="replace",
                 content=template,
-                reason="Pre-apply contract sync: replace empty canonical route module with deterministic workflow runtime stub.",
+                reason="Pre-apply contract sync: replace invalid workflow route module with the canonical DB-backed contract.",
             )
         return list(operation_map.values())
 
@@ -5964,6 +5972,24 @@ class GenerationService:
         return False
 
     @staticmethod
+    def _route_module_requires_db_backed_repair(file_path: str, content: str) -> bool:
+        normalized_path = str(file_path or "").strip().replace("\\", "/")
+        normalized = str(content or "")
+        if normalized_path.endswith("/requests.py"):
+            return "placeholder =" in normalized or "return create_request(" in normalized
+        if normalized_path.endswith("/assignments.py"):
+            return "INSERT OR IGNORE INTO requests" in normalized
+        if normalized_path.endswith("/profiles.py"):
+            return "DEFAULT_PROFILES" in normalized
+        if normalized_path.endswith("/runtime.py"):
+            return any(marker in normalized for marker in ("DEMO_REQUESTS", "/actions/{action_id}", "runtime_action("))
+        if normalized_path.endswith("/workload.py"):
+            return "/api/runtime/" in normalized
+        if normalized_path.endswith("/users.py"):
+            return any(marker in normalized for marker in ("Alex Specialist", "Nina Specialist", "Maria Manager"))
+        return False
+
+    @staticmethod
     def _strip_noncanonical_runtime_route_handlers(content: str) -> str:
         return MiniappRuntimeContractSync.strip_noncanonical_runtime_route_handlers(content)
 
@@ -5992,7 +6018,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, HTTPException
 from sqlalchemy import text
 
 from app.db import engine
@@ -6013,6 +6039,11 @@ def _ensure_tables() -> None:
             "comment TEXT, "
             "status TEXT, "
             "assigned_specialist TEXT, "
+            "equipment_type TEXT, "
+            "start_date TEXT, "
+            "end_date TEXT, "
+            "reason TEXT, "
+            "specialist_notes TEXT, "
             "created_at TEXT, "
             "updated_at TEXT)"
         ))
@@ -6028,19 +6059,68 @@ def _ensure_tables() -> None:
 
 def _serialize_request(row: Any) -> dict[str, Any]:
     mapping = getattr(row, "_mapping", row)
+    start_date = mapping.get("start_date") or ""
+    end_date = mapping.get("end_date") or ""
     return {
         "request_id": mapping["id"],
+        "id": mapping["id"],
+        "submission_id": mapping["id"],
         "title": mapping["title"] or "Request",
         "description": mapping["description"] or "",
         "client_name": mapping["client_name"] or "",
         "phone": mapping["phone"] or "",
         "preferred_time": mapping["preferred_time"] or "",
         "comment": mapping["comment"] or "",
-        "status": mapping["status"] or "new",
+        "status": mapping["status"] or "pending_review",
         "assigned_specialist": mapping["assigned_specialist"],
+        "specialist": mapping["assigned_specialist"] or "",
+        "equipment_type": mapping.get("equipment_type") or "",
+        "equipment": mapping.get("equipment_type") or mapping["title"] or "Equipment request",
+        "item_type": mapping.get("equipment_type") or mapping["title"] or "Equipment request",
+        "start_date": start_date,
+        "end_date": end_date,
+        "date_range": f"{start_date} → {end_date}" if start_date and end_date else start_date or end_date or "Dates to be confirmed",
+        "reason": mapping.get("reason") or mapping["description"] or mapping["comment"] or "",
+        "specialist_notes": mapping.get("specialist_notes") or "",
+        "availability": "Availability is based on active bookings in the shared queue.",
+        "conflict": "No conflicts reported yet.",
         "created_at": mapping["created_at"],
         "updated_at": mapping["updated_at"],
     }
+
+
+def _fetch_request(conn: Any, request_id: str) -> Any | None:
+    return conn.execute(text("SELECT * FROM requests WHERE id = :id"), {"id": request_id}).first()
+
+
+def _fetch_comments(conn: Any, request_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        text("SELECT id, request_id, comment, author_role, created_at FROM comments WHERE request_id = :request_id ORDER BY created_at ASC"),
+        {"request_id": request_id},
+    ).fetchall()
+    return [
+        {
+            "comment_id": row._mapping["id"],
+            "request_id": row._mapping["request_id"],
+            "comment": row._mapping["comment"] or "",
+            "author_role": row._mapping["author_role"] or "",
+            "created_at": row._mapping["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def _timeline_for_request(request: dict[str, Any], comments: list[dict[str, Any]]) -> list[dict[str, str]]:
+    timeline = [
+        {"title": "Submitted", "note": request.get("created_at") or "Created"},
+        {"title": "Current status", "note": request.get("status") or "pending_review"},
+    ]
+    for item in comments[-3:]:
+        note = (item.get("comment") or "").strip()
+        if not note:
+            continue
+        timeline.append({"title": f"{item.get('author_role') or 'team'} note", "note": note})
+    return timeline
 
 
 @router.get("/requests")
@@ -6060,24 +6140,29 @@ def create_request(payload: dict[str, Any] = Body(default_factory=dict)) -> dict
     now = datetime.now(timezone.utc).isoformat()
     record = {
         "id": request_id,
-        "title": str(payload.get("title") or payload.get("task") or payload.get("subject") or "Request"),
-        "description": str(payload.get("description") or payload.get("comment") or payload.get("details") or ""),
-        "client_name": str(payload.get("name") or payload.get("client_name") or ""),
+        "title": str(payload.get("title") or payload.get("equipment_type") or payload.get("item_type") or payload.get("task") or payload.get("subject") or "Request"),
+        "description": str(payload.get("description") or payload.get("details") or payload.get("reason") or ""),
+        "client_name": str(payload.get("requested_by") or payload.get("name") or payload.get("client_name") or ""),
         "phone": str(payload.get("phone") or ""),
-        "preferred_time": str(payload.get("preferred_time") or payload.get("date") or payload.get("slot") or ""),
-        "comment": str(payload.get("comment") or ""),
-        "status": str(payload.get("status") or "new"),
+        "preferred_time": str(payload.get("preferred_time") or payload.get("date") or payload.get("slot") or payload.get("start_date") or ""),
+        "comment": str(payload.get("comment") or payload.get("notes") or ""),
+        "status": str(payload.get("status") or "pending_review"),
         "assigned_specialist": payload.get("assigned_specialist"),
+        "equipment_type": str(payload.get("equipment_type") or payload.get("item_type") or payload.get("title") or ""),
+        "start_date": str(payload.get("start_date") or ""),
+        "end_date": str(payload.get("end_date") or ""),
+        "reason": str(payload.get("reason") or payload.get("purpose") or payload.get("description") or ""),
+        "specialist_notes": str(payload.get("specialist_notes") or ""),
         "created_at": now,
         "updated_at": now,
     }
     with engine.begin() as conn:
         conn.execute(text(
             "INSERT OR REPLACE INTO requests "
-            "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, created_at, updated_at) "
-            "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :created_at, :updated_at)"
+            "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, equipment_type, start_date, end_date, reason, specialist_notes, created_at, updated_at) "
+            "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :equipment_type, :start_date, :end_date, :reason, :specialist_notes, :created_at, :updated_at)"
         ), record)
-        row = conn.execute(text("SELECT * FROM requests WHERE id = :id"), {"id": request_id}).first()
+        row = _fetch_request(conn, request_id)
     return _serialize_request(row)
 
 
@@ -6086,40 +6171,63 @@ def create_request(payload: dict[str, Any] = Body(default_factory=dict)) -> dict
 def get_request(request_id: str) -> dict[str, Any]:
     _ensure_tables()
     with engine.begin() as conn:
-        row = conn.execute(text("SELECT * FROM requests WHERE id = :id"), {"id": request_id}).first()
+        row = _fetch_request(conn, request_id)
         if row is None:
-            placeholder = {
-                "id": request_id,
-                "title": "Request",
-                "description": "",
-                "client_name": "",
-                "phone": "",
-                "preferred_time": "",
-                "comment": "",
-                "status": "new",
-                "assigned_specialist": None,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            conn.execute(text(
-                "INSERT OR REPLACE INTO requests "
-                "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, created_at, updated_at) "
-                "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :created_at, :updated_at)"
-            ), placeholder)
-            row = conn.execute(text("SELECT * FROM requests WHERE id = :id"), {"id": request_id}).first()
-    return _serialize_request(row)
+            raise HTTPException(status_code=404, detail="Request not found")
+        payload = _serialize_request(row)
+        comments = _fetch_comments(conn, request_id)
+    payload["comments"] = comments
+    payload["timeline"] = _timeline_for_request(payload, comments)
+    return payload
+
+
+@router.patch("/requests/{request_id}")
+def update_request(request_id: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    _ensure_tables()
+    now = datetime.now(timezone.utc).isoformat()
+    with engine.begin() as conn:
+        row = _fetch_request(conn, request_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Request not found")
+        current = _serialize_request(row)
+        record = {
+            "id": request_id,
+            "title": str(payload.get("title") or current.get("title") or "Request"),
+            "description": str(payload.get("description") or current.get("description") or ""),
+            "client_name": str(payload.get("client_name") or current.get("client_name") or ""),
+            "phone": str(payload.get("phone") or current.get("phone") or ""),
+            "preferred_time": str(payload.get("preferred_time") or current.get("preferred_time") or ""),
+            "comment": str(payload.get("comment") or current.get("comment") or ""),
+            "status": str(payload.get("status") or current.get("status") or "pending_review"),
+            "assigned_specialist": payload.get("assigned_specialist") if payload.get("assigned_specialist") is not None else current.get("assigned_specialist"),
+            "equipment_type": str(payload.get("equipment_type") or current.get("equipment_type") or ""),
+            "start_date": str(payload.get("start_date") or current.get("start_date") or ""),
+            "end_date": str(payload.get("end_date") or current.get("end_date") or ""),
+            "reason": str(payload.get("reason") or current.get("reason") or ""),
+            "specialist_notes": str(payload.get("specialist_notes") or current.get("specialist_notes") or ""),
+            "created_at": current.get("created_at") or now,
+            "updated_at": now,
+        }
+        conn.execute(text(
+            "INSERT OR REPLACE INTO requests "
+            "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, equipment_type, start_date, end_date, reason, specialist_notes, created_at, updated_at) "
+            "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :equipment_type, :start_date, :end_date, :reason, :specialist_notes, :created_at, :updated_at)"
+        ), record)
+        updated = _fetch_request(conn, request_id)
+    return _serialize_request(updated)
 
 
 @router.patch("/requests/{request_id}/status")
 def update_request_status(request_id: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     _ensure_tables()
-    status = str(payload.get("status") or "in_progress")
+    status = str(payload.get("status") or "approved")
     now = datetime.now(timezone.utc).isoformat()
     with engine.begin() as conn:
+        row = _fetch_request(conn, request_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Request not found")
         conn.execute(text("UPDATE requests SET status = :status, updated_at = :updated_at WHERE id = :id"), {"id": request_id, "status": status, "updated_at": now})
-        row = conn.execute(text("SELECT * FROM requests WHERE id = :id"), {"id": request_id}).first()
-    if row is None:
-        return create_request({"request_id": request_id, "status": status})
+        row = _fetch_request(conn, request_id)
     return _serialize_request(row)
 """
 
@@ -6131,7 +6239,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, HTTPException
 from sqlalchemy import text
 
 from app.db import engine
@@ -6141,7 +6249,52 @@ router = APIRouter(prefix="/api/comments", tags=["comments"])
 
 def _ensure_tables() -> None:
     with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS requests ("
+            "id TEXT PRIMARY KEY, "
+            "title TEXT, "
+            "description TEXT, "
+            "client_name TEXT, "
+            "phone TEXT, "
+            "preferred_time TEXT, "
+            "comment TEXT, "
+            "status TEXT, "
+            "assigned_specialist TEXT, "
+            "equipment_type TEXT, "
+            "start_date TEXT, "
+            "end_date TEXT, "
+            "reason TEXT, "
+            "specialist_notes TEXT, "
+            "created_at TEXT, "
+            "updated_at TEXT)"
+        ))
         conn.execute(text("CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, request_id TEXT, comment TEXT, author_role TEXT, created_at TEXT)"))
+
+
+@router.get("")
+@router.get("/")
+def list_comments(request_id: str | None = None) -> dict[str, list[dict[str, Any]]]:
+    _ensure_tables()
+    query = "SELECT id, request_id, comment, author_role, created_at FROM comments"
+    params: dict[str, Any] = {}
+    if request_id:
+        query += " WHERE request_id = :request_id"
+        params["request_id"] = request_id
+    query += " ORDER BY created_at ASC"
+    with engine.begin() as conn:
+        rows = conn.execute(text(query), params).fetchall()
+    return {
+        "items": [
+            {
+                "comment_id": row._mapping["id"],
+                "request_id": row._mapping["request_id"],
+                "comment": row._mapping["comment"] or "",
+                "author_role": row._mapping["author_role"] or "",
+                "created_at": row._mapping["created_at"],
+            }
+            for row in rows
+        ]
+    }
 
 
 @router.post("")
@@ -6150,14 +6303,19 @@ def create_comment(payload: dict[str, Any] = Body(default_factory=dict)) -> dict
     _ensure_tables()
     comment_id = uuid4().hex[:12]
     request_id = str(payload.get("request_id") or payload.get("id") or "")
+    if not request_id:
+        raise HTTPException(status_code=400, detail="request_id required")
     record = {
         "id": comment_id,
         "request_id": request_id,
-        "comment": str(payload.get("comment") or payload.get("note") or "Workflow comment"),
+        "comment": str(payload.get("comment") or payload.get("note") or ""),
         "author_role": str(payload.get("author_role") or "specialist"),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     with engine.begin() as conn:
+        request_row = conn.execute(text("SELECT id FROM requests WHERE id = :id"), {"id": request_id}).first()
+        if request_row is None:
+            raise HTTPException(status_code=404, detail="Request not found")
         conn.execute(text("INSERT INTO comments (id, request_id, comment, author_role, created_at) VALUES (:id, :request_id, :comment, :author_role, :created_at)"), record)
     return {"comment_id": comment_id, **record}
 """
@@ -6169,7 +6327,7 @@ def create_comment(payload: dict[str, Any] = Body(default_factory=dict)) -> dict
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, HTTPException
 from sqlalchemy import text
 
 from app.db import engine
@@ -6177,21 +6335,106 @@ from app.db import engine
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
 
 
+def _ensure_tables() -> None:
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS requests ("
+            "id TEXT PRIMARY KEY, "
+            "title TEXT, "
+            "description TEXT, "
+            "client_name TEXT, "
+            "phone TEXT, "
+            "preferred_time TEXT, "
+            "comment TEXT, "
+            "status TEXT, "
+            "assigned_specialist TEXT, "
+            "equipment_type TEXT, "
+            "start_date TEXT, "
+            "end_date TEXT, "
+            "reason TEXT, "
+            "specialist_notes TEXT, "
+            "created_at TEXT, "
+            "updated_at TEXT)"
+        ))
+
+
 @router.post("")
 @router.patch("/{request_id}")
 def assign_request(request_id: str | None = None, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     assignment_request_id = str(request_id or payload.get("request_id") or payload.get("id") or "")
-    specialist = str(payload.get("specialist_id") or payload.get("assignee_id") or payload.get("assigned_specialist") or "specialist-1")
+    specialist = str(payload.get("specialist_id") or payload.get("assignee_id") or payload.get("assigned_specialist") or "")
     now = datetime.now(timezone.utc).isoformat()
+    _ensure_tables()
     with engine.begin() as conn:
-        conn.execute(text(
-            "CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, title TEXT, description TEXT, client_name TEXT, phone TEXT, preferred_time TEXT, comment TEXT, status TEXT, assigned_specialist TEXT, created_at TEXT, updated_at TEXT)"
-        ))
-        conn.execute(text(
-            "INSERT OR IGNORE INTO requests (id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, created_at, updated_at) VALUES (:id, 'Request', '', '', '', '', '', 'new', NULL, :now, :now)"
-        ), {"id": assignment_request_id, "now": now})
+        row = conn.execute(text("SELECT id FROM requests WHERE id = :id"), {"id": assignment_request_id}).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Request not found")
         conn.execute(text("UPDATE requests SET assigned_specialist = :specialist, updated_at = :updated_at WHERE id = :id"), {"id": assignment_request_id, "specialist": specialist, "updated_at": now})
     return {"request_id": assignment_request_id, "assigned_specialist": specialist, "updated_at": now}
+"""
+
+    @staticmethod
+    def _deterministic_profiles_route_source() -> str:
+        return """from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from fastapi import APIRouter
+
+from app.db import RoleProfileRecord, SessionLocal
+from app.schemas import AppRole, RoleProfile
+
+router = APIRouter(prefix="/api/profiles", tags=["profiles"])
+
+
+def _empty_profile() -> RoleProfile:
+    return RoleProfile(first_name="", last_name="", email="", phone="", photo_url=None, updated_at=None)
+
+
+def _to_schema(record: RoleProfileRecord) -> RoleProfile:
+    return RoleProfile(
+        first_name=record.first_name,
+        last_name=record.last_name,
+        email=record.email,
+        phone=record.phone,
+        photo_url=record.photo_url,
+        updated_at=record.updated_at,
+    )
+
+
+def load_role_profile(role: AppRole) -> RoleProfile:
+    with SessionLocal() as session:
+        record = session.get(RoleProfileRecord, role)
+        if record is None:
+            return _empty_profile()
+        return _to_schema(record)
+
+
+def save_role_profile(role: AppRole, profile: RoleProfile) -> RoleProfile:
+    with SessionLocal() as session:
+        record = session.get(RoleProfileRecord, role)
+        if record is None:
+            record = RoleProfileRecord(role=role)
+            session.add(record)
+        record.first_name = profile.first_name
+        record.last_name = profile.last_name
+        record.email = profile.email
+        record.phone = profile.phone
+        record.photo_url = profile.photo_url
+        record.updated_at = datetime.now(timezone.utc)
+        session.commit()
+        session.refresh(record)
+        return _to_schema(record)
+
+
+@router.get("/{role}", response_model=RoleProfile)
+def get_profile(role: AppRole) -> RoleProfile:
+    return load_role_profile(role)
+
+
+@router.put("/{role}", response_model=RoleProfile)
+def update_profile(role: AppRole, profile: RoleProfile) -> RoleProfile:
+    return save_role_profile(role, profile)
 """
 
     @staticmethod
@@ -6199,6 +6442,9 @@ def assign_request(request_id: str | None = None, payload: dict[str, Any] = Body
         return """from __future__ import annotations
 
 from fastapi import APIRouter
+from sqlalchemy import text
+
+from app.db import engine
 
 router = APIRouter(prefix="/api", tags=["users"])
 
@@ -6208,11 +6454,21 @@ router = APIRouter(prefix="/api", tags=["users"])
 @router.get("/specialists")
 @router.get("/specialists/")
 def list_users() -> dict[str, list[dict[str, str]]]:
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS role_profiles (role TEXT PRIMARY KEY, first_name TEXT, last_name TEXT, email TEXT, phone TEXT, photo_url TEXT, updated_at TEXT)"
+        ))
+        rows = conn.execute(text(
+            "SELECT role, first_name, last_name FROM role_profiles WHERE role IN ('specialist', 'manager') ORDER BY role ASC"
+        )).fetchall()
     return {
         "items": [
-            {"user_id": "specialist-1", "role": "specialist", "name": "Alex Specialist"},
-            {"user_id": "specialist-2", "role": "specialist", "name": "Nina Specialist"},
-            {"user_id": "manager-1", "role": "manager", "name": "Maria Manager"},
+            {
+                "user_id": row._mapping["role"],
+                "role": row._mapping["role"],
+                "name": " ".join(part for part in [row._mapping["first_name"], row._mapping["last_name"]] if part).strip(),
+            }
+            for row in rows
         ]
     }
 """
@@ -6234,12 +6490,201 @@ router = APIRouter(prefix="/api/workload", tags=["workload"])
 def get_workload() -> dict[str, list[dict[str, object]]]:
     with engine.begin() as conn:
         conn.execute(text(
-            "CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, title TEXT, description TEXT, client_name TEXT, phone TEXT, preferred_time TEXT, comment TEXT, status TEXT, assigned_specialist TEXT, created_at TEXT, updated_at TEXT)"
+            "CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, title TEXT, description TEXT, client_name TEXT, phone TEXT, preferred_time TEXT, comment TEXT, status TEXT, assigned_specialist TEXT, equipment_type TEXT, start_date TEXT, end_date TEXT, reason TEXT, specialist_notes TEXT, created_at TEXT, updated_at TEXT)"
         ))
         rows = conn.execute(text(
             "SELECT COALESCE(assigned_specialist, 'unassigned') AS assignee, COUNT(*) AS total FROM requests GROUP BY COALESCE(assigned_specialist, 'unassigned') ORDER BY total DESC"
         )).fetchall()
     return {"items": [{"assignee": row._mapping["assignee"], "total": row._mapping["total"]} for row in rows]}
+"""
+
+    @staticmethod
+    def _deterministic_runtime_route_source() -> str:
+        return """from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from fastapi import APIRouter, HTTPException
+from sqlalchemy import text
+
+from app.db import engine
+
+router = APIRouter(prefix="/api/runtime", tags=["runtime"])
+ALLOWED_ROLES = {"client", "specialist", "manager"}
+EQUIPMENT_CATALOG = (
+    ("Laptop", 8),
+    ("Projector", 4),
+    ("Monitor", 6),
+    ("Tablet", 5),
+    ("Other", 10),
+)
+
+
+def _normalize_runtime_role(role: str) -> str:
+    normalized = str(role or "").strip().strip("/")
+    if normalized == "sample":
+        return "client"
+    return normalized
+
+
+def _validate_role(role: str) -> str:
+    normalized = _normalize_runtime_role(role)
+    if normalized not in ALLOWED_ROLES:
+        raise HTTPException(status_code=404, detail="Role not supported")
+    return normalized
+
+
+def _ensure_tables() -> None:
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS requests ("
+            "id TEXT PRIMARY KEY, "
+            "title TEXT, "
+            "description TEXT, "
+            "client_name TEXT, "
+            "phone TEXT, "
+            "preferred_time TEXT, "
+            "comment TEXT, "
+            "status TEXT, "
+            "assigned_specialist TEXT, "
+            "equipment_type TEXT, "
+            "start_date TEXT, "
+            "end_date TEXT, "
+            "reason TEXT, "
+            "specialist_notes TEXT, "
+            "created_at TEXT, "
+            "updated_at TEXT)"
+        ))
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, request_id TEXT, comment TEXT, author_role TEXT, created_at TEXT)"
+        ))
+
+
+def _serialize_request(row: Any) -> dict[str, Any]:
+    mapping = getattr(row, "_mapping", row)
+    start_date = mapping.get("start_date") or ""
+    end_date = mapping.get("end_date") or ""
+    return {
+        "request_id": mapping["id"],
+        "id": mapping["id"],
+        "title": mapping["title"] or "Request",
+        "equipment": mapping.get("equipment_type") or mapping["title"] or "Equipment request",
+        "equipment_type": mapping.get("equipment_type") or "",
+        "employee_name": mapping.get("client_name") or "",
+        "client_name": mapping.get("client_name") or "",
+        "start_date": start_date,
+        "end_date": end_date,
+        "date_range": f"{start_date} → {end_date}" if start_date and end_date else start_date or end_date or "Dates to be confirmed",
+        "reason": mapping.get("reason") or mapping.get("description") or mapping.get("comment") or "",
+        "status": mapping.get("status") or "pending_review",
+        "assigned_specialist": mapping.get("assigned_specialist") or "",
+        "specialist_notes": mapping.get("specialist_notes") or "",
+    }
+
+
+def _fetch_requests() -> list[dict[str, Any]]:
+    _ensure_tables()
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT * FROM requests ORDER BY created_at DESC")).fetchall()
+    return [_serialize_request(row) for row in rows]
+
+
+def _availability(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    active_statuses = {"pending_review", "approved", "issued"}
+    usage: dict[str, int] = {}
+    for item in items:
+        equipment = str(item.get("equipment_type") or item.get("equipment") or "Other")
+        if str(item.get("status") or "") in active_statuses:
+            usage[equipment] = usage.get(equipment, 0) + 1
+    result: list[dict[str, Any]] = []
+    for equipment, total in EQUIPMENT_CATALOG:
+        in_use = usage.get(equipment, 0)
+        available = max(total - in_use, 0)
+        result.append(
+            {
+                "name": equipment,
+                "item": equipment,
+                "equipment_type": equipment,
+                "in_use": in_use,
+                "total": total,
+                "available": available,
+                "status": "Available" if available > 0 else "Fully booked",
+                "detail": f"{available} of {total} available",
+                "note": f"{available} of {total} available",
+            }
+        )
+    return result
+
+
+def _summary(items: list[dict[str, Any]]) -> dict[str, int]:
+    pending = sum(1 for item in items if item.get("status") == "pending_review")
+    approved = sum(1 for item in items if item.get("status") == "approved")
+    issued = sum(1 for item in items if item.get("status") == "issued")
+    returns_due = sum(1 for item in items if item.get("status") == "issued")
+    return {
+        "pending": pending,
+        "issued_today": issued,
+        "returns_due": returns_due,
+        "in_review": pending,
+        "active": approved + issued,
+        "conflicts": 0,
+    }
+
+
+def _manager_conflicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    by_equipment: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        equipment = str(item.get("equipment_type") or item.get("equipment") or "Other")
+        by_equipment.setdefault(equipment, []).append(item)
+    for equipment, equipment_items in by_equipment.items():
+        if len(equipment_items) < 2:
+            continue
+        conflicts.append(
+            {
+                "title": f"{equipment} overlap risk",
+                "detail": f"{len(equipment_items)} requests currently reference the same equipment type.",
+            }
+        )
+    return conflicts
+
+
+@router.get("/{role}/manifest")
+async def runtime_manifest(role: str) -> dict[str, Any]:
+    role = _validate_role(role)
+    requests = _fetch_requests()
+    availability = _availability(requests)
+    summary = _summary(requests)
+    if role == "client":
+        return {
+            "role": role,
+            "metrics": {"total": len(requests), "active": summary["active"]},
+            "requests": requests,
+            "availability": availability,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+        }
+    if role == "specialist":
+        queue = [item for item in requests if item.get("status") in {"pending_review", "approved", "issued"}]
+        return {
+            "role": role,
+            "summary": summary,
+            "queue": queue,
+            "availability": availability,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+        }
+    return {
+        "role": role,
+        "metrics": {
+            "in_review": summary["in_review"],
+            "active": summary["active"],
+            "conflicts": len(_manager_conflicts(requests)),
+        },
+        "conflicts": _manager_conflicts(requests),
+        "approvals": [item for item in requests if item.get("status") == "pending_review"],
+        "availability": availability,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
 """
 
     @staticmethod
@@ -6775,23 +7220,6 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
         generation_mode: GenerationMode,
     ) -> dict[str, Any]:
         return GenerationService._artifact_builder().runtime_manifest_from_page_graph(route_manifest, grounded_spec, generation_mode)
-
-    @staticmethod
-    def _runtime_state_from_route_manifest(
-        route_manifest: dict[str, Any],
-        grounded_spec: GroundedSpecModel,
-        generation_mode: GenerationMode,
-    ) -> dict[str, Any]:
-        return GenerationService._artifact_builder().runtime_state_from_route_manifest(route_manifest, grounded_spec, generation_mode)
-
-    @staticmethod
-    def _role_seed_from_route_manifest(
-        route_manifest: dict[str, Any],
-        runtime_manifest: dict[str, Any],
-        runtime_state: dict[str, Any],
-        grounded_spec: GroundedSpecModel,
-    ) -> dict[str, Any]:
-        return GenerationService._artifact_builder().role_seed_from_route_manifest(route_manifest, runtime_manifest, runtime_state, grounded_spec)
 
     @staticmethod
     def _build_stage_reports(
@@ -7792,9 +8220,6 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
                     "miniapp/app/static/shared/base.css",
                     "miniapp/app/generated/route_manifest.json",
                     "miniapp/app/generated/runtime_manifest.json",
-                    "miniapp/app/generated/static_runtime_manifest.json",
-                    "miniapp/app/generated/role_seed.json",
-                    "miniapp/app/generated/role_experience.json",
                 ):
                     if candidate not in expanded:
                         expanded.append(candidate)
@@ -8451,7 +8876,6 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
                 "created_at": utc_now().isoformat(),
             },
             "target_platform": target_platform.value,
-            "preview_profile": preview_profile.value,
             "doc_refs": [
                 item.model_dump(mode="json") if hasattr(item, "model_dump") else item
                 for item in doc_refs
@@ -9186,17 +9610,6 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
                     existing_in_template=False,
                 ),
                 APIRequirement(
-                    api_req_id="api_runtime_action",
-                    name="Runtime action executor",
-                    method="POST",
-                    path="/api/runtime/{role}/actions/{action_id}",
-                    purpose="Execute workflow actions, mutate state, and navigate.",
-                    request_fields=[APIField(name="payload", type="object", required=False)],
-                    response_fields=[APIField(name="next_path", type="string", required=False)],
-                    evidence=evidence,
-                    existing_in_template=False,
-                ),
-                APIRequirement(
                     api_req_id="api_submission_create",
                     name="Create request",
                     method="POST",
@@ -9233,17 +9646,7 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
                     evidence=evidence,
                 ),
             ],
-            integration_requirements=[
-                IntegrationRequirement(
-                    integration_req_id="integration_runtime_actions",
-                    system_name="template_runtime_backend",
-                    direction="bidirectional",
-                    purpose="Drive live workflow actions and preview state transitions.",
-                    auth_type="telegram_initdata" if target_platform == TargetPlatform.TELEGRAM else "custom",
-                    contract_ref="/api/runtime/{role}/actions/{action_id}",
-                    evidence=evidence,
-                )
-            ],
+            integration_requirements=[],
             security_requirements=[
                 SecurityRequirement(
                     security_req_id="security_initdata",
@@ -9467,17 +9870,6 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
     ) -> ArtifactPlanModel:
         runtime_manifest = self._build_runtime_manifest(spec, ir, generation_mode)
         route_manifest = self._build_route_manifest(runtime_manifest)
-        runtime_state = self._build_runtime_state(spec, ir, generation_mode)
-        role_seed = self._build_role_seed(runtime_manifest, runtime_state)
-        role_experience = {
-            role: {
-                "title": payload["title"],
-                "featureText": payload["feature_text"],
-                "routeTree": payload["route_tree"],
-                "primaryPages": payload["pages"],
-            }
-            for role, payload in role_seed["roles"].items()
-        }
         operations = [
             PatchOperationModel(
                 operation_id="op_grounded_spec",
@@ -9509,38 +9901,6 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
                 file_path="miniapp/app/generated/runtime_manifest.json",
                 content=json_dumps(runtime_manifest),
                 explanation="Compile a role-aware runtime manifest for miniapp APIs.",
-                trace_refs=["prompt-source"],
-            ),
-            PatchOperationModel(
-                operation_id="op_runtime_state",
-                op="update",
-                file_path="miniapp/app/generated/runtime_state.json",
-                content=json_dumps(runtime_state),
-                explanation="Seed mutable runtime state for live preview actions and list/detail flows.",
-                trace_refs=["prompt-source"],
-            ),
-            PatchOperationModel(
-                operation_id="op_static_runtime_manifest",
-                op="update",
-                file_path="miniapp/app/generated/static_runtime_manifest.json",
-                content=json_dumps(runtime_manifest),
-                explanation="Provide a static UI/runtime manifest for generated miniapp-served pages.",
-                trace_refs=["prompt-source"],
-            ),
-            PatchOperationModel(
-                operation_id="op_preview_payload",
-                op="update",
-                file_path="miniapp/app/generated/role_experience.json",
-                content=json_dumps(role_experience),
-                explanation="Compile role-aware descriptors for miniapp-served preview pages.",
-                trace_refs=["prompt-source"],
-            ),
-            PatchOperationModel(
-                operation_id="op_role_seed",
-                op="update",
-                file_path="miniapp/app/generated/role_seed.json",
-                content=json_dumps(role_seed),
-                explanation="Compile role-aware summaries and metrics for inline preview fallback.",
                 trace_refs=["prompt-source"],
             ),
             PatchOperationModel(
@@ -9667,7 +10027,6 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
                 "layout_variant": layout_variant,
                 "theme": theme_palette,
                 "platform": spec.target_platform,
-                "preview_profile": spec.preview_profile,
                 "route_count": sum(len(payload["routes"]) for payload in roles.values()),
                 "screen_count": sum(len(payload["screens"]) for payload in roles.values()),
             },
@@ -9744,98 +10103,6 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
         seed = f"{prompt}|{ui_variant}|{datetime.now(timezone.utc).isoformat(timespec='microseconds')}"
         index = sum(ord(ch) for ch in seed) % len(palettes)
         return palettes[index]
-
-    def _build_runtime_state(
-        self,
-        spec: GroundedSpecModel,
-        ir: AppIRModel,
-        generation_mode: GenerationMode,
-    ) -> dict[str, Any]:
-        entity = spec.domain_entities[0]
-        records = self._sample_records(entity, spec.product_goal)
-        counts = Counter(record["status"] for record in records)
-        return {
-            "metadata": {
-                "generated_at": utc_now().isoformat(),
-                "generation_mode": generation_mode.value,
-                "goal": spec.product_goal,
-            },
-            "records": records,
-            "roles": {
-                "client": {
-                    "profile": {
-                        "first_name": "Иван",
-                        "last_name": "Иванов",
-                        "email": "",
-                        "phone": "",
-                        "photo_url": None,
-                    },
-                    "metrics": [
-                        {"metric_id": "client_total", "label": "Requests", "value": str(len(records))},
-                        {"metric_id": "client_active", "label": "Active", "value": str(counts.get("in_progress", 0) + counts.get("new", 0))},
-                    ],
-                },
-                "specialist": {
-                    "profile": {
-                        "first_name": "Иван",
-                        "last_name": "Иванов",
-                        "email": "",
-                        "phone": "",
-                        "photo_url": None,
-                    },
-                    "metrics": [
-                        {"metric_id": "queue_size", "label": "Queue", "value": str(counts.get("new", 0))},
-                        {"metric_id": "in_progress", "label": "In progress", "value": str(counts.get("in_progress", 0))},
-                    ],
-                },
-                "manager": {
-                    "profile": {
-                        "first_name": "Иван",
-                        "last_name": "Иванов",
-                        "email": "",
-                        "phone": "",
-                        "photo_url": None,
-                    },
-                    "metrics": [
-                        {"metric_id": "completed", "label": "Completed", "value": str(counts.get("completed", 0))},
-                        {"metric_id": "sla", "label": "SLA", "value": "96%"},
-                    ],
-                    "alerts": [],
-                },
-            },
-            "activity": [],
-        }
-
-    def _build_role_seed(self, runtime_manifest: dict[str, Any], runtime_state: dict[str, Any]) -> dict[str, Any]:
-        role_seed = {"roles": {}}
-        for role in ROLE_ORDER:
-            role_manifest = runtime_manifest["roles"][role]
-            screen_items = list(role_manifest["screens"].values())
-            home_screen = next((screen for screen in screen_items if screen.get("path") == "/"), screen_items[0])
-            extra_routes = [route for route in role_manifest.get("routes", []) if route.get("path") != "/"]
-            role_state = runtime_state["roles"][role]
-            role_seed["roles"][role] = {
-                "title": home_screen["title"],
-                "description": home_screen["subtitle"] or runtime_manifest["app"]["goal"],
-                "feature_text": self._seed_feature_text(home_screen, runtime_manifest["app"]["goal"]),
-                "primary_action_label": home_screen["actions"][0]["label"] if home_screen["actions"] else "Open",
-                "secondary_action_label": str(extra_routes[0].get("label") or "Explore") if extra_routes else "Explore",
-                "route_tree": list(role_manifest.get("route_tree") or []),
-                "pages": [
-                    {
-                        "screen_id": screen["screen_id"],
-                        "path": screen["path"],
-                        "kind": screen["kind"],
-                        "title": screen["title"],
-                        "page_purpose": screen.get("page_purpose"),
-                        "handoff_paths": list(screen.get("handoff_paths") or []),
-                    }
-                    for screen in role_manifest["screens"].values()
-                ],
-                "metrics": role_state["metrics"],
-                "profile": role_state["profile"],
-            }
-        return role_seed
 
     @staticmethod
     def _runtime_screen_kind(screen: Screen, route_path: str) -> str:
@@ -10148,16 +10415,7 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
             actions = []
             if has_workbench:
                 actions.append({"action_id": f"{role}_back_to_workbench", "type": "navigate", "target_screen_id": f"{role}_workbench"})
-            if role == "client":
-                actions.append({"action_id": "client_workspace_continue", "type": "call_api", "integration_id": "integration_runtime_action"})
-            elif role == "specialist":
-                actions.extend(
-                    [
-                        {"action_id": "specialist_mark_in_progress", "type": "call_api", "integration_id": "integration_runtime_action"},
-                        {"action_id": "specialist_complete_request", "type": "call_api", "integration_id": "integration_runtime_action"},
-                    ]
-                )
-            elif has_profile:
+            if has_profile:
                 actions.append({"action_id": f"{role}_open_profile", "type": "navigate", "target_screen_id": f"{role}_profile"})
             return actions
         return [{"action_id": f"{role}_profile_save", "type": "call_api", "integration_id": "integration_save_profile"}]
@@ -10243,19 +10501,6 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
                 response_schema=[
                     DataField(name="submission_id", type="uuid", required=True),
                     DataField(name="status", type="string", required=True),
-                ],
-                auth_type="telegram_initdata" if target_platform == TargetPlatform.TELEGRAM else "custom",
-            ),
-            Integration(
-                integration_id="integration_runtime_action",
-                name="Runtime action",
-                type="rest",
-                method="POST",
-                path="/api/runtime/{role}/actions/{action_id}",
-                request_schema=[],
-                response_schema=[
-                    DataField(name="next_path", type="string", required=False),
-                    DataField(name="message", type="string", required=False),
                 ],
                 auth_type="telegram_initdata" if target_platform == TargetPlatform.TELEGRAM else "custom",
             ),
@@ -10671,7 +10916,7 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
                     "type": "form",
                     "title": "Quick checkout",
                     "fields": [
-                        {"field_id": "customer_name", "name": "customer_name", "label": "Full name", "field_type": "text", "required": True, "placeholder": "Ivan Ivanov"},
+                        {"field_id": "customer_name", "name": "customer_name", "label": "Full name", "field_type": "text", "required": True, "placeholder": "Full name"},
                         {"field_id": "phone", "name": "phone", "label": "Phone", "field_type": "text", "required": True, "placeholder": "+43 660 123 4567"},
                         {"field_id": "product_name", "name": "product_name", "label": "Product", "field_type": "text", "required": True, "placeholder": "Essential Hoodie"},
                         {"field_id": "quantity", "name": "quantity", "label": "Quantity", "field_type": "text", "required": True, "placeholder": "1"},

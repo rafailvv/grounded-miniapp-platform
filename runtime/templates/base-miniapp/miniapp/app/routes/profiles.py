@@ -9,11 +9,9 @@ from app.schemas import AppRole, RoleProfile
 
 router = APIRouter(prefix="/api/profiles", tags=["profiles"])
 
-DEFAULT_PROFILES: dict[AppRole, dict[str, str | None]] = {
-    "client": {"first_name": "Ivan", "last_name": "Ivanov", "email": "", "phone": "", "photo_url": None},
-    "specialist": {"first_name": "Ivan", "last_name": "Ivanov", "email": "", "phone": "", "photo_url": None},
-    "manager": {"first_name": "Ivan", "last_name": "Ivanov", "email": "", "phone": "", "photo_url": None},
-}
+
+def _empty_profile() -> RoleProfile:
+    return RoleProfile(first_name="", last_name="", email="", phone="", photo_url=None, updated_at=None)
 
 
 def _to_schema(record: RoleProfileRecord) -> RoleProfile:
@@ -27,26 +25,23 @@ def _to_schema(record: RoleProfileRecord) -> RoleProfile:
     )
 
 
-def _get_or_create(role: AppRole) -> RoleProfileRecord:
+def _get(role: AppRole) -> RoleProfileRecord | None:
     with SessionLocal() as session:
-        record = session.get(RoleProfileRecord, role)
-        if record is None:
-            record = RoleProfileRecord(role=role, **DEFAULT_PROFILES[role])
-            session.add(record)
-            session.commit()
-            session.refresh(record)
-        return record
+        return session.get(RoleProfileRecord, role)
 
 
 def load_role_profile(role: AppRole) -> RoleProfile:
-    return _to_schema(_get_or_create(role))
+    record = _get(role)
+    if record is None:
+        return _empty_profile()
+    return _to_schema(record)
 
 
 def save_role_profile(role: AppRole, profile: RoleProfile) -> RoleProfile:
     with SessionLocal() as session:
         record = session.get(RoleProfileRecord, role)
         if record is None:
-            record = RoleProfileRecord(role=role, **DEFAULT_PROFILES[role])
+            record = RoleProfileRecord(role=role)
             session.add(record)
         record.first_name = profile.first_name
         record.last_name = profile.last_name

@@ -19,9 +19,6 @@ SHARED_GENERATED_FILES = (
     "miniapp/app/db.py",
     "miniapp/app/generated/route_manifest.json",
     "miniapp/app/generated/runtime_manifest.json",
-    "miniapp/app/generated/static_runtime_manifest.json",
-    "miniapp/app/generated/role_seed.json",
-    "miniapp/app/generated/role_experience.json",
 )
 WRITE_STRATEGIES = ("minimal_patch", "whole_file_build")
 CANONICAL_FRONTEND_ROOTS = (

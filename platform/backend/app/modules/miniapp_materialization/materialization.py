@@ -140,7 +140,6 @@ class MiniappMaterializationService:
         expected_manifests = [
             "miniapp/app/generated/route_manifest.json",
             "miniapp/app/generated/runtime_manifest.json",
-            "miniapp/app/generated/static_runtime_manifest.json",
             "artifacts/generated_app_graph.json",
         ]
         missing_files = [path for path in planned_pages if path not in normalized_realized_paths]
