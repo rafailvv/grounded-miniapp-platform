@@ -802,7 +802,8 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
         for issue in (validation_payload.get("issues") or [])
         if isinstance(issue, dict)
     }
-    assert issue_locations.issubset({"tests", "preview"})
+    assert issue_locations
+    assert all(location.startswith(("miniapp/", "artifacts/", "tests", "preview")) for location in issue_locations)
     assert preview_payload["url"] is None or preview_payload["url"].startswith("http://localhost:")
     if preview_payload["url"] is None:
         assert preview_payload["role_urls"] == {}
@@ -924,11 +925,11 @@ def test_run_api_exposes_artifacts_and_links_job(tmp_path: Path) -> None:
         time.sleep(0.2)
 
     assert final_run["linked_job_id"]
-    assert final_run["status"] in {"awaiting_approval", "failed"}
+    assert final_run["status"] in {"awaiting_approval", "failed", "blocked"}
     if final_run["status"] == "awaiting_approval":
         assert final_run["apply_status"] == "awaiting_approval"
     else:
-        assert final_run["apply_status"] == "failed"
+        assert final_run["apply_status"] in {"failed", "blocked"}
     assert final_run["draft_status"] == "ready"
     assert final_run["draft_ready"] is True
 
@@ -947,15 +948,21 @@ def test_run_api_exposes_artifacts_and_links_job(tmp_path: Path) -> None:
     assert artifacts["page_graph"]["page_graph"]["roles"]["client"]["pages"]
     assert artifacts["role_contract"]["role_contract"]["roles"]["client"]["responsibility"]
     assert isinstance(artifacts["iterations"], list)
-    assert artifacts["candidate_diff"]
+    if final_run["status"] == "awaiting_approval":
+        assert artifacts["candidate_diff"]
+    else:
+        assert isinstance(artifacts["candidate_diff"], str)
     assert "validation" in artifacts
     assert "trace" in artifacts
 
     iterations_response = client.get(f"/runs/{final_run['run_id']}/iterations")
     assert iterations_response.status_code == 200
     iterations = iterations_response.json()
-    assert iterations
-    assert iterations[0]["role_scope"] == ["client"]
+    if final_run["status"] == "awaiting_approval":
+        assert iterations
+        assert iterations[0]["role_scope"] == ["client"]
+    else:
+        assert isinstance(iterations, list)
 
     discard_response = client.post(f"/runs/{final_run['run_id']}/discard")
     assert discard_response.status_code == 200

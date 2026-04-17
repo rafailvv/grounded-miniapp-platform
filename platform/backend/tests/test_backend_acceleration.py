@@ -19,8 +19,9 @@ from app.ai.openrouter_client import ACTIVE_WORKSPACE_LOG_CONTEXT, OpenRouterCli
 from app.main import create_app
 from app.models.common import PreviewProfile, TargetPlatform
 from app.models.artifacts import ValidationIssue
-from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixCase, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RepairPacket, RunCheckResult, ValidationSnapshot, WorkspaceRecord
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RunCheckResult, ValidationSnapshot, WorkspaceRecord
 from app.models.grounded_spec import APIRequirement
+from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
 from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
 from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES, GenerationService
@@ -1008,7 +1009,7 @@ def test_route_module_path_for_endpoint_name_uses_snake_case() -> None:
     assert GenerationService._route_module_path_for_endpoint_name("requests") == "miniapp/app/routes/requests.py"
 
 
-def test_fix_loop_uses_single_exact_fix_mode(tmp_path: Path) -> None:
+def test_fix_loop_builds_turn_context_without_fix_strategy(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     orchestrator = app.state.container.fix_orchestrator
@@ -1040,7 +1041,8 @@ def test_fix_loop_uses_single_exact_fix_mode(tmp_path: Path) -> None:
         existing_scope=[],
     )
 
-    assert fix_case.fix_strategy == "exact_fix"
+    assert fix_case.failure_class is not None
+    assert not hasattr(fix_case, "fix_strategy")
 
 
 def test_fix_implicated_files_include_missing_runtime_and_profile_contract_targets(tmp_path: Path) -> None:
@@ -1109,7 +1111,6 @@ def test_structural_write_scope_keeps_missing_contract_files_editable(tmp_path: 
         ],
         "app/runtime_test",
         [],
-        "exact_fix",
     )
     scope_paths = {entry.file_path for entry in scope}
 
@@ -1149,7 +1150,6 @@ def test_runtime_fix_scope_excludes_generated_tests_from_write_surface(tmp_path:
         ],
         "backend_startup/import/schema",
         [],
-        "exact_fix",
     )
     scope_paths = {entry.file_path for entry in scope}
 
@@ -1351,25 +1351,24 @@ def test_preflight_backend_syntax_issues_detect_invalid_python(tmp_path: Path) -
     )
 
 
-def test_fix_prompt_uses_exact_fix_packet(tmp_path: Path) -> None:
-    fix_case = FixCase(
+def test_fix_prompt_uses_turn_packet_without_fix_strategy(tmp_path: Path) -> None:
+    prompt_context = FixPromptContext(
         workspace_id="ws_test",
         run_id="run_test",
-        fix_strategy="exact_fix",
+        attempt=1,
         failure_class="route_api_contract_mismatch",
         failure_signature="sig",
-        implicated_files=["miniapp/app/db.py", "miniapp/app/schemas.py"],
-        write_scope=[FixScopeEntry(file_path="miniapp/app/db.py", reason="bundle")],
+        deterministic_companions=["miniapp/app/db.py"],
+        file_contexts={"miniapp/app/db.py": "engine = create_engine(...)"},
     )
 
     payload = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data").state.container.fix_orchestrator._repair_user_prompt(
-        fix_case,
-        {"miniapp/app/db.py": "engine = create_engine(...)"},
+        prompt_context,
     )
 
-    assert "fix_strategy" in payload
-    assert "exact_fix" in payload
-    assert "exact_failure_packet" in payload
+    assert "repair_packet" in payload
+    assert "fix_strategy" not in payload
+    assert "\"deterministic_companions\"" in payload
 
 
 def test_edit_gate_allows_loading_copy_when_page_has_real_surface() -> None:
@@ -3229,7 +3228,7 @@ def test_fix_orchestrator_deterministic_contract_repair_filters_generated_artifa
         _run_pre_apply_contract_pass=fake_contract_pass
     )
     orchestrator = app.state.container.fix_orchestrator
-    fix_case = FixCase(
+    fix_turn = FixTurnContext(
         workspace_id=workspace_id,
         run_id=run_id,
         failure_class="route_api_contract_mismatch",
@@ -3240,8 +3239,8 @@ def test_fix_orchestrator_deterministic_contract_repair_filters_generated_artifa
     operations = orchestrator._deterministic_contract_repair_operations(
         workspace_id=workspace_id,
         run_id=run_id,
-        fix_case=fix_case,
-        scope_entries=fix_case.write_scope,
+        fix_turn=fix_turn,
+        scope_entries=fix_turn.write_scope,
         generation_mode=GenerationMode.BALANCED,
     )
 
@@ -3351,13 +3350,13 @@ def test_fix_orchestrator_treats_empty_repair_patch_as_no_progress(tmp_path: Pat
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     orchestrator = app.state.container.fix_orchestrator
 
-    repair_packet = RepairPacket(
+    prompt_context = FixPromptContext(
         workspace_id="ws_fix",
         run_id="run_fix",
         attempt=1,
         deterministic_companions=["miniapp/app/main.py"],
     )
-    fix_case = FixCase(
+    fix_turn = FixTurnContext(
         workspace_id="ws_fix",
         run_id="run_fix",
         failure_class="api_endpoint_missing",
@@ -3367,8 +3366,8 @@ def test_fix_orchestrator_treats_empty_repair_patch_as_no_progress(tmp_path: Pat
 
     outcome = orchestrator._repair_outcome_from_response(
         llm_result={"diagnosis": "I need a retry, no concrete edits yet.", "operations": []},
-        repair_packet=repair_packet,
-        fix_case=fix_case,
+        prompt_context=prompt_context,
+        fix_turn=fix_turn,
         scope_expansions=[],
     )
 
@@ -5289,7 +5288,7 @@ def test_fix_context_includes_generated_app_graph_for_connectivity_state_failure
         workspace.workspace_id,
         draft_run_id,
         scope_entries,
-        fix_case=fix_case,
+        fix_turn=fix_case,
     )
 
     assert "artifacts/generated_app_graph.json" in contexts

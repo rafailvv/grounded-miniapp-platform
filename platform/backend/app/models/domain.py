@@ -415,49 +415,6 @@ class FixScopeEntry(StrictModel):
     reason: str
 
 
-class FixCase(StrictModel):
-    fix_case_id: str = Field(default_factory=lambda: new_id("fix_case"))
-    workspace_id: str
-    run_id: str
-    attempt: int = 1
-    failure_class: str | None = None
-    failure_signature: str | None = None
-    fix_strategy: str | None = None
-    failing_command: str | None = None
-    root_cause_summary: str | None = None
-    exact_error_excerpt: str | None = None
-    implicated_files: list[str] = Field(default_factory=list)
-    container_statuses: list[ContainerStatusRecord] = Field(default_factory=list)
-    container_logs: dict[str, list[str]] = Field(default_factory=dict)
-    write_scope: list[FixScopeEntry] = Field(default_factory=list)
-    attempt_history: list[dict[str, Any]] = Field(default_factory=list)
-    executed_checks: list[RunCheckResult] = Field(default_factory=list)
-    memory_context: str | None = None
-    created_at: datetime = Field(default_factory=utc_now)
-
-
-class RepairPacket(StrictModel):
-    repair_packet_id: str = Field(default_factory=lambda: new_id("repair_packet"))
-    workspace_id: str
-    run_id: str
-    attempt: int
-    failure_class: str | None = None
-    failure_signature: str | None = None
-    root_cause_summary: str | None = None
-    exact_error_excerpt: str | None = None
-    context_mode: Literal["minimal", "expanded", "full_bundle"] = "minimal"
-    failing_checks: list[dict[str, Any]] = Field(default_factory=list)
-    normalized_critical_issues: list[dict[str, Any]] = Field(default_factory=list)
-    failing_file_paths: list[str] = Field(default_factory=list)
-    deterministic_companions: list[str] = Field(default_factory=list)
-    expected_contract: dict[str, Any] = Field(default_factory=dict)
-    file_contexts: dict[str, str] = Field(default_factory=dict)
-    read_only_surfaces: list[str] = Field(default_factory=list)
-    previous_attempt_summary: str | None = None
-    previous_diff_summary: str | None = None
-    created_at: datetime = Field(default_factory=utc_now)
-
-
 class FixAttemptOutcome(StrictModel):
     outcome: Literal["patch_ready", "needs_more_context", "no_progress", "fatal_invalid_response"]
     diagnosis: str | None = None

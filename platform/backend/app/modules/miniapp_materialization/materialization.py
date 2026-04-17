@@ -172,7 +172,7 @@ class MiniappMaterializationService:
             and all(count >= 2 for count in role_page_counts.values())
         )
         manifest_surface_ok = all(path in normalized_realized_paths for path in expected_manifests)
-        fell_back_to_template = not page_surface_ok and all(count <= 2 for count in role_page_counts.values())
+        collapsed_surface = not page_surface_ok and all(count <= 2 for count in role_page_counts.values())
         return MaterializationReport(
             execution_class=execution_class,  # type: ignore[arg-type]
             planned_files=sorted(dict.fromkeys(planned_pages)),
@@ -183,7 +183,7 @@ class MiniappMaterializationService:
             backend_surface_ok=backend_surface_ok,
             page_surface_ok=page_surface_ok,
             manifest_surface_ok=manifest_surface_ok,
-            fell_back_to_template=fell_back_to_template,
+            collapsed_surface=collapsed_surface,
             role_page_counts=role_page_counts,
             role_unique_page_counts=role_unique_page_counts,
             duplicate_page_file_roles=duplicate_page_file_roles,
@@ -201,10 +201,10 @@ class MiniappMaterializationService:
         if scope_mode == "minimal_patch":
             return None
         fast_mode = generation_mode == GenerationMode.FAST
-        if report.fell_back_to_template:
+        if report.collapsed_surface:
             return (
-                "generation.edit.fell_back_to_template",
-                ["Draft collapsed back to the shell template instead of materializing the planned workflow pages."],
+                "generation.edit.collapsed_surface",
+                ["Draft collapsed back to a minimal shell instead of materializing the planned workflow pages."],
             )
         if report.missing_backend_files:
             return (

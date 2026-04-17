@@ -1065,7 +1065,7 @@ test('generated javascript files parse', () => {
             and all(count >= 2 for count in role_page_counts.values())
         )
         manifest_surface_ok = all(path in normalized_realized_paths for path in expected_manifests)
-        fell_back_to_template = not page_surface_ok and all(count <= 2 for count in role_page_counts.values())
+        collapsed_surface = not page_surface_ok and all(count <= 2 for count in role_page_counts.values())
         return MaterializationReport(
             execution_class=execution_class,  # type: ignore[arg-type]
             planned_files=sorted(dict.fromkeys(planned_pages)),
@@ -1076,7 +1076,7 @@ test('generated javascript files parse', () => {
             backend_surface_ok=backend_surface_ok,
             page_surface_ok=page_surface_ok,
             manifest_surface_ok=manifest_surface_ok,
-            fell_back_to_template=fell_back_to_template,
+            collapsed_surface=collapsed_surface,
             role_page_counts=role_page_counts,
             role_unique_page_counts=role_unique_page_counts,
             duplicate_page_file_roles=duplicate_page_file_roles,

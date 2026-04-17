@@ -74,14 +74,6 @@ class ApplyPatchResult(StrictModel):
     applied_at: datetime = Field(default_factory=utc_now)
 
 
-class ArtifactPlanModel(StrictModel):
-    plan_id: str
-    workspace_id: str
-    summary: str
-    operations: list[PatchOperationModel]
-    patch_envelope: PatchEnvelope | None = None
-
-
 class TraceabilityReportEntry(StrictModel):
     trace_id: str
     source_ref: str
@@ -112,7 +104,7 @@ class MaterializationReport(StrictModel):
     backend_surface_ok: bool = False
     page_surface_ok: bool = False
     manifest_surface_ok: bool = False
-    fell_back_to_template: bool = False
+    collapsed_surface: bool = False
     role_page_counts: dict[str, int] = Field(default_factory=dict)
     role_unique_page_counts: dict[str, int] = Field(default_factory=dict)
     duplicate_page_file_roles: dict[str, list[str]] = Field(default_factory=dict)

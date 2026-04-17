@@ -14,16 +14,13 @@ from app.models.artifacts import ValidationIssue
 from app.models.common import GenerationMode
 from app.models.domain import (
     CheckExecutionRecord,
-    ContainerStatusRecord,
     DraftFileOperation,
     FixAttemptOutcome,
     FixAttemptRecord,
-    FixCase,
     FixScopeEntry,
     GenerateRequest,
     JobEvent,
     JobRecord,
-    RepairPacket,
     RepairIterationRecord,
     RunCheckResult,
     RunIterationOperation,
@@ -45,6 +42,10 @@ from app.services.engine import (
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
 from app.modules.miniapp_agent_loop.engine import WorkspaceLoopEngine
+from app.modules.miniapp_agent_loop.fix_prompt_builder import FixPromptBuilder
+from app.modules.miniapp_agent_loop.fix_scope_builder import FixScopeBuilder
+from app.modules.miniapp_agent_loop.fix_turn_builder import FixTurnBuilder
+from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
 from app.modules.miniapp_agent_loop.types import (
     WorkspaceLoopCallbacks,
     WorkspaceLoopResult,
@@ -98,6 +99,9 @@ class FixOrchestrator:
         self.artifact_recorder = artifact_recorder
         self.generation_service = generation_service
         self.workspace_loop_engine = workspace_loop_engine
+        self.fix_prompt_builder = FixPromptBuilder()
+        self.fix_scope_builder = FixScopeBuilder(file_exists=self._file_exists)
+        self.fix_turn_builder = FixTurnBuilder(prompt_builder=self.fix_prompt_builder)
 
     def generate(
         self,
@@ -257,7 +261,7 @@ class FixOrchestrator:
             latest_diff_summary: str | None,
         ) -> WorkspaceLoopTurnPlan:
             del validation_snapshot
-            fix_case = self._build_fix_case(
+            fix_turn = self.fix_turn_builder.build_turn_context(
                 workspace_id=workspace_id,
                 run_id=run_id,
                 attempt=attempt,
@@ -267,31 +271,59 @@ class FixOrchestrator:
                 prior_attempts=[],
                 existing_scope=scope_entries,
                 memory_context=memory_context,
+                augment_failure_evidence=self._augment_failure_evidence_from_test_results,
+                implicated_files=self._implicated_files,
+                specialized_failure_class=self._specialized_failure_class,
+                classify_failure_text=lambda text: self._classify_failure_text(text) or CheckRunner.classify_failure(latest_execution.results) or "build/runtime",
+                root_cause_summary=self._root_cause_summary,
+                failure_signature=self._failure_signature,
+                error_excerpt=self._error_excerpt,
+                first_failing_command=self._first_failing_command,
+                write_scope=lambda ws_id, current_run_id, implicated, failure_class, existing: self._build_write_scope(
+                    ws_id,
+                    current_run_id,
+                    implicated,
+                    failure_class,
+                    existing,
+                ),
             )
             next_scope = self._build_write_scope(
                 workspace_id,
                 run_id,
-                fix_case.implicated_files,
-                fix_case.failure_class or "build/runtime",
+                fix_turn.implicated_files,
+                fix_turn.failure_class or "build/runtime",
                 scope_entries,
-                "exact_fix",
             )
-            scope_entries[:] = self._merge_scope(scope_entries, next_scope, scope_expansions)
-            job.failure_class = self._prefer_failure_class(job.failure_class, fix_case.failure_class)
-            job.failure_signature = fix_case.failure_signature
-            job.root_cause_summary = fix_case.root_cause_summary
-            job.fix_targets = list(fix_case.implicated_files)
+            scope_entries[:] = self.fix_scope_builder.merge_scope(
+                scope_entries,
+                next_scope,
+                scope_expansions,
+                max_scope_expansions=self.MAX_SCOPE_EXPANSIONS,
+            )
+            job.failure_class = self._prefer_failure_class(job.failure_class, fix_turn.failure_class)
+            job.failure_signature = fix_turn.failure_signature
+            job.root_cause_summary = fix_turn.root_cause_summary
+            job.fix_targets = list(fix_turn.implicated_files)
             job.validation_snapshot = self._validation_snapshot_from_execution(latest_execution)
-            self._store_report(f"fix_case:{workspace_id}", fix_case.model_dump(mode="json"))
+            self._store_report(f"fix_case:{workspace_id}", {
+                "workspace_id": fix_turn.workspace_id,
+                "run_id": fix_turn.run_id,
+                "attempt": fix_turn.attempt,
+                "failure_class": fix_turn.failure_class,
+                "failure_signature": fix_turn.failure_signature,
+                "root_cause_summary": fix_turn.root_cause_summary,
+                "implicated_files": list(fix_turn.implicated_files),
+                "write_scope": [entry.model_dump(mode="json") for entry in fix_turn.write_scope],
+            })
             self._append_event(
                 job,
                 "triage_completed",
-                fix_case.root_cause_summary or "Fix evidence packet prepared.",
+                fix_turn.root_cause_summary or "Fix evidence packet prepared.",
                 {
                     "attempt": attempt,
-                    "failure_class": fix_case.failure_class,
-                    "failure_signature": fix_case.failure_signature,
-                    "implicated_files": fix_case.implicated_files,
+                    "failure_class": fix_turn.failure_class,
+                    "failure_signature": fix_turn.failure_signature,
+                    "implicated_files": fix_turn.implicated_files,
                     "context_mode": context_mode,
                     "repeated_no_progress": repeated_no_progress,
                 },
@@ -299,7 +331,7 @@ class FixOrchestrator:
             deterministic_operations = self._deterministic_contract_repair_operations(
                 workspace_id=workspace_id,
                 run_id=run_id,
-                fix_case=fix_case,
+                fix_turn=fix_turn,
                 scope_entries=scope_entries,
                 generation_mode=effective_mode,
             )
@@ -310,27 +342,27 @@ class FixOrchestrator:
                     diagnosis="Applied deterministic contract repair before model editing.",
                     operations=deterministic_operations,
                     files_read=[entry.file_path for entry in scope_entries],
-                    failure_class=fix_case.failure_class,
-                    failure_signature=fix_case.failure_signature,
-                    root_cause_summary=fix_case.root_cause_summary,
-                    fix_targets=list(fix_case.implicated_files),
+                    failure_class=fix_turn.failure_class,
+                    failure_signature=fix_turn.failure_signature,
+                    root_cause_summary=fix_turn.root_cause_summary,
+                    fix_targets=list(fix_turn.implicated_files),
                     metadata={"source": "deterministic_contract_repair"},
                 )
 
-            repair_packet = self._build_repair_packet(
+            prompt_context = self.fix_turn_builder.build_prompt_context(
                 workspace_id=workspace_id,
                 run_id=run_id,
-                fix_case=fix_case,
+                fix_turn=fix_turn,
                 scope_entries=scope_entries,
                 context_mode=str(context_mode),
+                collect_file_contexts=self._collect_file_contexts,
+                merge_additional_context_paths=self._merge_additional_context_paths,
+                deterministic_contract_seed_paths=self._deterministic_contract_seed_paths,
+                current_diff_summary=self._current_diff_summary,
             )
             if last_turn_summary or latest_diff_summary:
-                repair_packet = repair_packet.model_copy(
-                    update={
-                        "previous_attempt_summary": last_turn_summary or repair_packet.previous_attempt_summary,
-                        "previous_diff_summary": latest_diff_summary or repair_packet.previous_diff_summary,
-                    }
-                )
+                prompt_context.previous_attempt_summary = last_turn_summary or prompt_context.previous_attempt_summary
+                prompt_context.previous_diff_summary = latest_diff_summary or prompt_context.previous_diff_summary
             self._append_event(
                 job,
                 "repair_planned",
@@ -338,14 +370,14 @@ class FixOrchestrator:
                 {
                     "attempt": attempt,
                     "scope": [entry.file_path for entry in scope_entries],
-                    "context_mode": repair_packet.context_mode,
+                    "context_mode": prompt_context.context_mode,
                 },
             )
-            llm_result = self._plan_patch(job=job, repair_packet=repair_packet)
+            llm_result = self._plan_patch(job=job, prompt_context=prompt_context)
             repair_outcome = self._repair_outcome_from_response(
                 llm_result=llm_result,
-                repair_packet=repair_packet,
-                fix_case=fix_case,
+                prompt_context=prompt_context,
+                fix_turn=fix_turn,
                 scope_expansions=scope_expansions,
             )
             mapped_outcome = repair_outcome.outcome
@@ -354,11 +386,11 @@ class FixOrchestrator:
                     outcome="fatal_invalid_response",
                     assistant_message=str(repair_outcome.diagnosis or ""),
                     diagnosis=repair_outcome.validation_error or repair_outcome.diagnosis,
-                    files_read=list(repair_packet.file_contexts.keys()),
-                    failure_class=fix_case.failure_class,
-                    failure_signature=fix_case.failure_signature,
-                    root_cause_summary=fix_case.root_cause_summary,
-                    fix_targets=list(fix_case.implicated_files),
+                    files_read=list(prompt_context.file_contexts.keys()),
+                    failure_class=fix_turn.failure_class,
+                    failure_signature=fix_turn.failure_signature,
+                    root_cause_summary=fix_turn.root_cause_summary,
+                    fix_targets=list(fix_turn.implicated_files),
                     metadata={"raw_response": repair_outcome.raw_response},
                 )
             return WorkspaceLoopTurnPlan(
@@ -366,11 +398,11 @@ class FixOrchestrator:
                 assistant_message=str(repair_outcome.diagnosis or ""),
                 diagnosis=repair_outcome.validation_error or repair_outcome.diagnosis,
                 operations=list(repair_outcome.operations),
-                files_read=list(repair_packet.file_contexts.keys()),
-                failure_class=fix_case.failure_class,
-                failure_signature=fix_case.failure_signature,
-                root_cause_summary=fix_case.root_cause_summary,
-                fix_targets=list(fix_case.implicated_files),
+                files_read=list(prompt_context.file_contexts.keys()),
+                failure_class=fix_turn.failure_class,
+                failure_signature=fix_turn.failure_signature,
+                root_cause_summary=fix_turn.root_cause_summary,
+                fix_targets=list(fix_turn.implicated_files),
                 expected_verification=repair_outcome.expected_verification,
                 rationale_by_file=dict(repair_outcome.rationale_by_file),
                 metadata={"planned_targets": list(repair_outcome.planned_targets)},
@@ -547,7 +579,7 @@ class FixOrchestrator:
     @staticmethod
     def _final_check_changed_files(
         latest_apply_result: dict[str, Any] | None,
-        fix_case: FixCase,
+        fix_turn: FixTurnContext,
         scope_entries: list[FixScopeEntry],
     ) -> list[str]:
         if latest_apply_result and latest_apply_result.get("changed_files"):
@@ -653,54 +685,32 @@ class FixOrchestrator:
         prior_attempts: list[FixAttemptRecord],
         existing_scope: list[FixScopeEntry],
         memory_context: str | None = None,
-    ) -> FixCase:
-        raw_error = request.error_context.raw_error if request.error_context else request.prompt
-        combined_text = "\n".join(
-            [
-                raw_error,
-                *[item.details or "" for item in check_execution.results],
-                *[line for result in check_execution.results for line in result.logs],
-                *(preview_details.get("logs") or []),
-            ]
-        )
-        combined_text = self._augment_failure_evidence_from_test_results(combined_text, check_execution.results)
-        implicated_files = self._implicated_files(workspace_id, run_id, combined_text, existing_scope)
-        failure_class = self._specialized_failure_class(
-            workspace_id=workspace_id,
-            run_id=run_id,
-            results=check_execution.results,
-            combined_text=combined_text,
-            implicated_files=implicated_files,
-        )
-        if not failure_class:
-            failure_class = self._classify_failure_text(combined_text) or CheckRunner.classify_failure(check_execution.results) or "build/runtime"
-        root_cause = self._root_cause_summary(check_execution.results, preview_details, raw_error)
-        failure_signature = self._failure_signature(failure_class, root_cause)
-        fix_strategy = "exact_fix"
-        write_scope = self._build_write_scope(workspace_id, run_id, implicated_files, failure_class, existing_scope, fix_strategy)
-        excerpt = self._error_excerpt(check_execution.results, preview_details, raw_error)
-        container_statuses = [
-            ContainerStatusRecord.model_validate(item)
-            for item in preview_details.get("containers", [])
-            if isinstance(item, dict)
-        ]
-        return FixCase(
+    ) -> FixTurnContext:
+        return self.fix_turn_builder.build_turn_context(
             workspace_id=workspace_id,
             run_id=run_id,
             attempt=attempt,
-            failure_class=failure_class,
-            failure_signature=failure_signature,
-            fix_strategy=fix_strategy,
-            failing_command=self._first_failing_command(check_execution.results),
-            root_cause_summary=root_cause,
-            exact_error_excerpt=excerpt,
-            implicated_files=implicated_files,
-            container_statuses=container_statuses,
-            container_logs=preview_details.get("container_logs", {}),
-            write_scope=write_scope,
-            attempt_history=[item.model_dump(mode="json") for item in prior_attempts[-4:]],
-            executed_checks=check_execution.results,
+            request=request,
+            check_execution=check_execution,
+            preview_details=preview_details,
+            prior_attempts=prior_attempts,
+            existing_scope=existing_scope,
             memory_context=memory_context,
+            augment_failure_evidence=self._augment_failure_evidence_from_test_results,
+            implicated_files=self._implicated_files,
+            specialized_failure_class=self._specialized_failure_class,
+            classify_failure_text=lambda text: self._classify_failure_text(text) or CheckRunner.classify_failure(check_execution.results) or "build/runtime",
+            root_cause_summary=self._root_cause_summary,
+            failure_signature=self._failure_signature,
+            error_excerpt=self._error_excerpt,
+            first_failing_command=self._first_failing_command,
+            write_scope=lambda ws_id, current_run_id, implicated, failure_class, existing: self._build_write_scope(
+                ws_id,
+                current_run_id,
+                implicated,
+                failure_class,
+                existing,
+            ),
         )
 
     @staticmethod
@@ -733,167 +743,41 @@ class FixOrchestrator:
         *,
         workspace_id: str,
         run_id: str,
-        fix_case: FixCase,
+        fix_turn: FixTurnContext,
         scope_entries: list[FixScopeEntry],
         context_mode: str,
         additional_paths: list[str] | None = None,
-    ) -> RepairPacket:
-        full_files = context_mode in {"expanded", "full_bundle"} or self._needs_full_context_first(fix_case)
-        budget = self.MAX_CONTEXT_CHARS_EXPANDED if full_files else self.MAX_CONTEXT_CHARS
-        file_contexts = self._collect_file_contexts(
-            workspace_id,
-            run_id,
-            scope_entries,
-            fix_case=fix_case,
-            budget_override=budget,
-            full_files=full_files,
-        )
-        extra_paths = list(additional_paths or [])
-        if context_mode == "full_bundle":
-            extra_paths.extend(self._deterministic_contract_seed_paths(workspace_id, run_id, fix_case, scope_entries))
-        if extra_paths:
-            file_contexts = self._merge_additional_context_paths(
-                workspace_id,
-                run_id,
-                file_contexts,
-                extra_paths,
-                budget_override=budget,
-            )
-        previous_attempt_summary = self._previous_attempt_summary(fix_case)
-        previous_diff_summary = self._current_diff_summary(workspace_id, run_id)
-        return RepairPacket(
+    ) -> FixPromptContext:
+        return self.fix_turn_builder.build_prompt_context(
             workspace_id=workspace_id,
             run_id=run_id,
-            attempt=fix_case.attempt,
-            failure_class=fix_case.failure_class,
-            failure_signature=fix_case.failure_signature,
-            root_cause_summary=fix_case.root_cause_summary,
-            exact_error_excerpt=fix_case.exact_error_excerpt,
+            fix_turn=fix_turn,
+            scope_entries=scope_entries,
             context_mode=context_mode,
-            failing_checks=[
-                {
-                    "name": item.name,
-                    "status": item.status,
-                    "details": item.details,
-                    "logs": item.logs[-12:],
-                }
-                for item in fix_case.executed_checks
-                if item.status == "failed"
-            ],
-            normalized_critical_issues=self._normalized_critical_issues(fix_case.executed_checks, fix_case),
-            failing_file_paths=list(fix_case.implicated_files),
-            deterministic_companions=[entry.file_path for entry in scope_entries],
-            expected_contract=self._expected_contract_snapshot(fix_case),
-            file_contexts=file_contexts,
-            read_only_surfaces=self._read_only_surfaces(),
-            previous_attempt_summary=previous_attempt_summary,
-            previous_diff_summary=previous_diff_summary,
+            collect_file_contexts=self._collect_file_contexts,
+            merge_additional_context_paths=self._merge_additional_context_paths,
+            deterministic_contract_seed_paths=self._deterministic_contract_seed_paths,
+            current_diff_summary=self._current_diff_summary,
+            additional_paths=additional_paths,
         )
 
-    @staticmethod
-    def _read_only_surfaces() -> list[str]:
-        return [
-            "miniapp/tests/",
-            "miniapp/app/generated/route_manifest.json",
-            "miniapp/app/generated/runtime_manifest.json",
-            "artifacts/generated_app_graph.json",
-        ]
+    def _read_only_surfaces(self) -> list[str]:
+        return self.fix_prompt_builder.read_only_surfaces()
 
-    @classmethod
-    def _expected_contract_snapshot(cls, fix_case: FixCase) -> dict[str, Any]:
-        evidence = "\n".join(
-            [
-                str(fix_case.root_cause_summary or ""),
-                str(fix_case.exact_error_excerpt or ""),
-                *[item.details or "" for item in fix_case.executed_checks],
-                *[line for item in fix_case.executed_checks for line in item.logs],
-            ]
-        )
-        required_api_routes = sorted(
-            {
-                endpoint
-                for endpoint in re.findall(r"/api/([a-zA-Z0-9_-]+)", evidence)
-                if endpoint
-            }
-        )
-        required_role_routes = sorted(
-            {
-                route
-                for route in re.findall(r"(/(?:client|specialist|manager)(?:/[A-Za-z0-9_{}:-]+)*/?)", evidence)
-                if route
-            }
-        )
-        required_exports: list[str] = []
-        if "get_db" in evidence:
-            required_exports.append("get_db")
-        return {
-            "strict_green": True,
-            "content_first_role_roots": {
-                "client": ["profile_card", "summary_metrics", "primary_actions", "requests_empty_state"],
-                "specialist": ["profile_card", "summary_metrics", "queue_empty_state", "availability_panel"],
-                "manager": ["profile_card", "oversight_metrics", "approval_panel", "conflict_panel"],
-            },
-            "runtime_manifest_aliases": {"sample": "client"},
-            "canonical_api_aliases": {
-                "submission": "requests",
-                "submissions": "requests",
-                "booking": "requests",
-                "bookings": "requests",
-                "specialist": "users",
-                "specialists": "users",
-            },
-            "required_api_routes": required_api_routes,
-            "required_role_routes": required_role_routes,
-            "required_exports": required_exports,
-            "read_only_surfaces": cls._read_only_surfaces(),
-        }
+    def _expected_contract_snapshot(self, fix_turn: FixTurnContext) -> dict[str, Any]:
+        return self.fix_prompt_builder.expected_contract_snapshot(fix_turn)
 
     @staticmethod
-    def _repair_context_mode(fix_case: FixCase, repeated_signature_without_progress: int) -> str:
-        route_runtime_failure = str(fix_case.failure_class or "") in {
-            "backend_framework_mismatch",
-            "runtime_manifest_route_missing",
-            "router_not_registered",
-            "api_endpoint_missing",
-            "frontend_link_route_mismatch",
-            "db_dependency_export_missing",
-            "loading_first_root_surface",
-        }
-        if repeated_signature_without_progress >= 2:
-            return "full_bundle"
-        if repeated_signature_without_progress >= 1 or route_runtime_failure:
-            return "expanded"
-        return "minimal"
+    def _repair_context_mode(fix_turn: FixTurnContext, repeated_signature_without_progress: int) -> str:
+        return FixPromptBuilder.repair_context_mode(fix_turn, repeated_signature_without_progress)
 
     @staticmethod
-    def _needs_full_context_first(fix_case: FixCase) -> bool:
-        return str(fix_case.failure_class or "") in {
-            "backend_framework_mismatch",
-            "runtime_manifest_route_missing",
-            "router_not_registered",
-            "api_endpoint_missing",
-            "frontend_link_route_mismatch",
-            "db_dependency_export_missing",
-            "loading_first_root_surface",
-        }
+    def _needs_full_context_first(fix_turn: FixTurnContext) -> bool:
+        return FixPromptBuilder.needs_full_context_first(fix_turn)
 
     @staticmethod
-    def _previous_attempt_summary(fix_case: FixCase) -> str | None:
-        history = list(fix_case.attempt_history or [])
-        if not history:
-            return None
-        tail = history[-2:]
-        fragments: list[str] = []
-        for item in tail:
-            attempt = item.get("attempt")
-            result = item.get("result")
-            diagnosis = str(item.get("diagnosis") or "").strip()
-            changed = len(item.get("files_changed") or [])
-            parts = [f"attempt={attempt}", f"result={result}", f"changed_files={changed}"]
-            if diagnosis:
-                parts.append(f"diagnosis={diagnosis}")
-            fragments.append(", ".join(parts))
-        return " | ".join(fragments) if fragments else None
+    def _previous_attempt_summary(fix_turn: FixTurnContext) -> str | None:
+        return FixPromptBuilder.previous_attempt_summary(fix_turn)
 
     def _current_diff_summary(self, workspace_id: str, run_id: str) -> str | None:
         diff_report = self.store.get("reports", f"candidate_diff:{workspace_id}") or {}
@@ -904,37 +788,20 @@ class FixOrchestrator:
         return None if summary == "No diff recorded." else summary
 
     @staticmethod
-    def _normalized_critical_issues(results: list[RunCheckResult], fix_case: FixCase | None = None) -> list[dict[str, Any]]:
-        issues: list[dict[str, Any]] = []
-        seen: set[tuple[str, str, str]] = set()
-        for result in results:
-            if result.status != "failed":
-                continue
-            marker = (result.name, str(result.details or ""), str(result.command or ""))
-            if marker in seen:
-                continue
-            seen.add(marker)
-            issues.append(
-                {
-                    "check": result.name,
-                    "details": result.details,
-                    "command": result.command,
-                    "failure_class": fix_case.failure_class if fix_case is not None else None,
-                }
-            )
-        return issues[:16]
+    def _normalized_critical_issues(results: list[RunCheckResult], fix_turn: FixTurnContext | None = None) -> list[dict[str, Any]]:
+        return FixPromptBuilder.normalized_critical_issues(results, failure_class=fix_turn.failure_class if fix_turn is not None else None)
 
     @staticmethod
     def _repair_progress_snapshot(
         results: list[RunCheckResult],
         preview_details: dict[str, Any],
-        fix_case: FixCase,
+        fix_turn: FixTurnContext,
     ) -> dict[str, Any]:
         issues = CheckRunner.failing_issues(results)
         evidence = "\n".join(
             [
-                str(fix_case.root_cause_summary or ""),
-                str(fix_case.exact_error_excerpt or ""),
+                str(fix_turn.root_cause_summary or ""),
+                str(fix_turn.exact_error_excerpt or ""),
                 *[item.details or "" for item in results],
                 *[line for item in results for line in item.logs],
                 *(preview_details.get("logs") or []),
@@ -1018,8 +885,8 @@ class FixOrchestrator:
         self,
         *,
         llm_result: dict[str, Any],
-        repair_packet: RepairPacket,
-        fix_case: FixCase,
+        prompt_context: FixPromptContext,
+        fix_turn: FixTurnContext,
         scope_expansions: list[dict[str, Any]],
     ) -> FixAttemptOutcome:
         if "error" in llm_result:
@@ -1053,8 +920,8 @@ class FixOrchestrator:
         try:
             operations = self._coerce_operations(
                 raw_operations,
-                [FixScopeEntry(file_path=path, reason="Repair packet companion scope.") for path in repair_packet.deterministic_companions],
-                fix_case,
+                [FixScopeEntry(file_path=path, reason="Repair packet companion scope.") for path in prompt_context.deterministic_companions],
+                fix_turn,
                 scope_expansions,
             )
         except Exception as exc:
@@ -1101,20 +968,20 @@ class FixOrchestrator:
         self,
         *,
         job: JobRecord,
-        repair_packet: RepairPacket,
+        prompt_context: FixPromptContext,
         repair_feedback: str | None = None,
     ) -> dict[str, Any]:
         if not self.openrouter_client.enabled:
             return {"error": "Fix mode requires an enabled LLM provider or a deterministic local repair path."}
         job.current_fix_phase = "patching"
         self._save_job(job)
-        prompt_cache_key = self._prompt_cache_key(repair_packet)
+        prompt_cache_key = self._prompt_cache_key(prompt_context)
         try:
             payload = self.openrouter_client.generate_workspace_edits(
                 schema_name="fix_patch_v1",
                 schema=self._repair_schema(),
                 system_prompt=self._repair_system_prompt(),
-                user_prompt=self._repair_user_prompt(repair_packet, repair_feedback=repair_feedback),
+                user_prompt=self._repair_user_prompt(prompt_context, repair_feedback=repair_feedback),
                 prompt_cache_key=prompt_cache_key,
                 stable_prefix=self._repair_system_prompt(),
             )
@@ -1128,8 +995,8 @@ class FixOrchestrator:
         except Exception as exc:
             logger.exception(
                 "fix_patch_generation_failed workspace_id=%s run_id=%s",
-                repair_packet.workspace_id,
-                repair_packet.run_id,
+                prompt_context.workspace_id,
+                prompt_context.run_id,
             )
             return {"error": f"Repair patch generation failed: {exc}"}
 
@@ -1137,7 +1004,7 @@ class FixOrchestrator:
         self,
         raw_operations: list[Any],
         scope_entries: list[FixScopeEntry],
-        fix_case: FixCase,
+        fix_turn: FixTurnContext,
         scope_expansions: list[dict[str, Any]],
     ) -> list[DraftFileOperation]:
         scope_paths = {entry.file_path for entry in scope_entries}
@@ -1151,16 +1018,16 @@ class FixOrchestrator:
             framework_validation_error = self._backend_framework_validation_error(operation)
             if framework_validation_error:
                 raise ValueError(framework_validation_error)
-            if operation.file_path.startswith("miniapp/tests/") and not self._allow_test_file_writes(fix_case):
+            if operation.file_path.startswith("miniapp/tests/") and not self._allow_test_file_writes(fix_turn):
                 raise ValueError(f"Repair attempted to edit generated tests instead of the app surface: {operation.file_path}")
             if self._is_read_only_generated_surface(operation.file_path):
                 raise ValueError(f"Repair attempted to edit a generated manifest surface instead of the app bundle: {operation.file_path}")
             if operation.file_path not in scope_paths:
-                if len(scope_expansions) >= self.MAX_SCOPE_EXPANSIONS or not self._can_expand_for_file(operation.file_path, fix_case.implicated_files):
+                if len(scope_expansions) >= self.MAX_SCOPE_EXPANSIONS or not self._can_expand_for_file(operation.file_path, fix_turn.implicated_files):
                     raise ValueError(f"Repair touched files outside the allowed evidence-based scope: {operation.file_path}")
                 scope_expansions.append(
                     {
-                        "attempt": fix_case.attempt,
+                        "attempt": fix_turn.attempt,
                         "files": [operation.file_path],
                         "reason": "Repair model requested an adjacent evidence-based file.",
                     }
@@ -1204,70 +1071,22 @@ class FixOrchestrator:
         implicated_files: list[str],
         failure_class: str,
         existing_scope: list[FixScopeEntry],
-        fix_strategy: str,
     ) -> list[FixScopeEntry]:
-        entries = {entry.file_path: entry for entry in existing_scope}
-        for file_path in implicated_files:
-            entries.setdefault(file_path, FixScopeEntry(file_path=file_path, reason="Directly implicated by the current failure evidence."))
-            for companion in self._deterministic_companion_scope(file_path):
-                if self._file_exists(workspace_id, run_id, companion) or self._allow_missing_scope_path(companion):
-                    entries.setdefault(companion, FixScopeEntry(file_path=companion, reason="Included as a deterministic companion of the failing bundle."))
-        for candidate in self._structural_scope_bundle(workspace_id, run_id, implicated_files, failure_class):
-            entries.setdefault(candidate, FixScopeEntry(file_path=candidate, reason="Included as part of the deterministic contract bundle."))
-        if failure_class.startswith("preview_runtime") or failure_class.startswith("runtime") or failure_class.startswith("tooling"):
-            for candidate in ("docker/docker-compose.yml", "miniapp/requirements.txt", "miniapp/app/main.py"):
-                if self._file_exists(workspace_id, run_id, candidate) or self._allow_missing_scope_path(candidate):
-                    entries.setdefault(candidate, FixScopeEntry(file_path=candidate, reason="Runtime or preview glue may be involved in the current failure."))
+        entries = self.fix_scope_builder.build_write_scope(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            implicated_files=implicated_files,
+            failure_class=failure_class,
+            existing_scope=existing_scope,
+            allow_missing_scope_path=self._allow_missing_scope_path,
+        )
         if not self._allow_test_file_writes_for_failure(failure_class):
-            entries = {path: entry for path, entry in entries.items() if not path.startswith("miniapp/tests/")}
-        if not entries:
-            for fallback in ("miniapp/app/static", "miniapp/app"):
-                entries.setdefault(fallback, FixScopeEntry(file_path=fallback, reason="Fallback repair surface for the current failure cluster."))
-        return list(entries.values())
+            entries = [entry for entry in entries if not entry.file_path.startswith("miniapp/tests/")]
+        return entries
 
     @staticmethod
     def _deterministic_companion_scope(file_path: str) -> list[str]:
-        normalized = str(file_path or "").strip().replace("\\", "/")
-        companions: list[str] = []
-        if normalized.startswith("miniapp/app/static/"):
-            path_obj = Path(normalized)
-            if normalized.endswith("/index.html") or normalized.endswith("/styles.css") or normalized.endswith("/app.js"):
-                base_dir = path_obj.parent
-                companions.extend(
-                    [
-                        str(base_dir / "index.html").replace("\\", "/"),
-                        str(base_dir / "styles.css").replace("\\", "/"),
-                        str(base_dir / "app.js").replace("\\", "/"),
-                    ]
-                )
-            elif normalized.endswith("/index.html") is False and path_obj.suffix in {".html", ".css", ".js"}:
-                base = path_obj.with_suffix("")
-                companions.extend(
-                    [
-                        f"{base}.html",
-                        f"{base}.css",
-                        f"{base}.js",
-                    ]
-                )
-        elif normalized in {"miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py", "miniapp/app/routes/profiles.py"}:
-            companions.extend(
-                [
-                    "miniapp/app/main.py",
-                    "miniapp/app/db.py",
-                    "miniapp/app/schemas.py",
-                    "miniapp/app/routes/profiles.py",
-                ]
-            )
-        elif normalized.startswith("miniapp/app/routes/") and normalized.endswith(".py"):
-            companions.extend(
-                [
-                    normalized,
-                    "miniapp/app/main.py",
-                    "miniapp/app/db.py",
-                    "miniapp/app/schemas.py",
-                ]
-            )
-        return list(dict.fromkeys(path for path in companions if path))
+        return FixScopeBuilder.deterministic_companion_scope(file_path)
 
     def _structural_scope_bundle(
         self,
@@ -1276,32 +1095,13 @@ class FixOrchestrator:
         implicated_files: list[str],
         failure_class: str,
     ) -> list[str]:
-        bundle: list[str] = []
-        for candidate in (
-            "miniapp/app/db.py",
-            "miniapp/app/schemas.py",
-            "miniapp/app/main.py",
-            "miniapp/app/routes/profiles.py",
-            "miniapp/app/generated/route_manifest.json",
-            "miniapp/app/generated/runtime_manifest.json",
-            "miniapp/tests/test_generated_app.py",
-            "miniapp/tests/generated_app.test.mjs",
-            "artifacts/generated_app_graph.json",
-        ):
-            if self._file_exists(workspace_id, run_id, candidate) or self._allow_missing_scope_path(candidate):
-                bundle.append(candidate)
-        for file_path in implicated_files:
-            if file_path.startswith("miniapp/app/routes/"):
-                bundle.append(file_path)
-            if file_path.startswith("miniapp/app/static/") and file_path.endswith((".html", ".css", ".js")):
-                parent = str(Path(file_path).parent)
-                if self._file_exists(workspace_id, run_id, parent) or self._allow_missing_scope_path(file_path):
-                    bundle.append(parent)
-        if "route" in failure_class or "contract" in failure_class:
-            routes_dir = "miniapp/app/routes"
-            if self._file_exists(workspace_id, run_id, routes_dir):
-                bundle.append(routes_dir)
-        return list(dict.fromkeys(bundle))
+        return self.fix_scope_builder.structural_scope_bundle(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            implicated_files=implicated_files,
+            failure_class=failure_class,
+            allow_missing_scope_path=self._allow_missing_scope_path,
+        )
 
     def _feature_scope_bundle(self, workspace_id: str, run_id: str, implicated_files: list[str]) -> list[str]:
         bundle: list[str] = []
@@ -1320,12 +1120,12 @@ class FixOrchestrator:
         next_scope: list[FixScopeEntry],
         scope_expansions: list[dict[str, Any]],
     ) -> list[FixScopeEntry]:
-        merged = {entry.file_path: entry for entry in current_scope}
-        for entry in next_scope:
-            merged.setdefault(entry.file_path, entry)
-        if len(scope_expansions) > FixOrchestrator.MAX_SCOPE_EXPANSIONS:
-            return current_scope
-        return list(merged.values())
+        return FixScopeBuilder.merge_scope(
+            current_scope,
+            next_scope,
+            scope_expansions,
+            max_scope_expansions=FixOrchestrator.MAX_SCOPE_EXPANSIONS,
+        )
 
     def _collect_file_contexts(
         self,
@@ -1333,7 +1133,7 @@ class FixOrchestrator:
         run_id: str,
         scope_entries: list[FixScopeEntry],
         *,
-        fix_case: FixCase | None = None,
+        fix_turn: FixTurnContext | None = None,
         budget_override: int | None = None,
         full_files: bool = False,
     ) -> dict[str, str]:
@@ -1353,7 +1153,7 @@ class FixOrchestrator:
                 excerpt = excerpt[:budget]
             contexts[entry.file_path] = excerpt
             budget -= len(excerpt)
-        for support_path in self._repair_support_files(fix_case):
+        for support_path in self._repair_support_files(fix_turn):
             if budget <= 0 or support_path in contexts or not self._file_exists(workspace_id, run_id, support_path):
                 continue
             content = self.workspace_service.read_file(workspace_id, support_path, run_id=run_id)
@@ -1369,7 +1169,7 @@ class FixOrchestrator:
         *,
         workspace_id: str,
         run_id: str,
-        fix_case: FixCase,
+        fix_turn: FixTurnContext,
         scope_entries: list[FixScopeEntry],
         generation_mode: GenerationMode,
     ) -> list[DraftFileOperation]:
@@ -1379,7 +1179,7 @@ class FixOrchestrator:
         role_scope = [role for role in ((page_graph.get("roles") or {}).keys()) if role in {"client", "specialist", "manager"}]
         if not role_scope:
             role_scope = ["client", "specialist", "manager"]
-        seed_paths = self._deterministic_contract_seed_paths(workspace_id, run_id, fix_case, scope_entries)
+        seed_paths = self._deterministic_contract_seed_paths(workspace_id, run_id, fix_turn, scope_entries)
         if not seed_paths:
             return []
         seed_operations: list[DraftFileOperation] = []
@@ -1466,7 +1266,7 @@ class FixOrchestrator:
         self,
         workspace_id: str,
         run_id: str,
-        fix_case: FixCase,
+        fix_turn: FixTurnContext,
         scope_entries: list[FixScopeEntry],
     ) -> list[str]:
         del workspace_id
@@ -1477,7 +1277,7 @@ class FixOrchestrator:
             "miniapp/app/routes/profiles.py",
         ]
         candidates = list(base_paths)
-        route_root = self.workspace_service.draft_source_dir(fix_case.workspace_id, run_id) / "miniapp/app/routes"
+        route_root = self.workspace_service.draft_source_dir(fix_turn.workspace_id, run_id) / "miniapp/app/routes"
         if route_root.exists():
             for route_file in sorted(route_root.glob("*.py")):
                 relative = f"miniapp/app/routes/{route_file.name}"
@@ -1486,7 +1286,7 @@ class FixOrchestrator:
         for entry in scope_entries:
             if entry.file_path not in candidates:
                 candidates.append(entry.file_path)
-        for file_path in fix_case.implicated_files:
+        for file_path in fix_turn.implicated_files:
             if file_path not in candidates:
                 candidates.append(file_path)
         unique: list[str] = []
@@ -1494,7 +1294,7 @@ class FixOrchestrator:
             normalized = str(candidate or "").strip().lstrip("./")
             if not normalized or normalized in unique:
                 continue
-            if self._file_exists(fix_case.workspace_id, run_id, normalized):
+            if self._file_exists(fix_turn.workspace_id, run_id, normalized):
                 unique.append(normalized)
         return unique[:48]
 
@@ -1613,8 +1413,8 @@ class FixOrchestrator:
         return None
 
     @staticmethod
-    def _repair_support_files(fix_case: FixCase | None) -> list[str]:
-        if fix_case is None:
+    def _repair_support_files(fix_turn: FixTurnContext | None) -> list[str]:
+        if fix_turn is None:
             return []
         connectivity_codes = {
             "connectivity.missing_ui_loading_state",
@@ -1623,11 +1423,11 @@ class FixOrchestrator:
         }
         evidence = "\n".join(
             [
-                str(fix_case.failure_class or ""),
-                str(fix_case.root_cause_summary or ""),
-                str(fix_case.exact_error_excerpt or ""),
-                *[result.details or "" for result in fix_case.executed_checks],
-                *[line for result in fix_case.executed_checks for line in result.logs],
+                str(fix_turn.failure_class or ""),
+                str(fix_turn.root_cause_summary or ""),
+                str(fix_turn.exact_error_excerpt or ""),
+                *[result.details or "" for result in fix_turn.executed_checks],
+                *[line for result in fix_turn.executed_checks for line in result.logs],
             ]
         ).lower()
         if any(code in evidence for code in connectivity_codes):
@@ -2120,66 +1920,16 @@ class FixOrchestrator:
             "required": ["diagnosis", "planned_targets", "expected_verification", "rationale_by_file", "operations"],
         }
 
-    @staticmethod
-    def _repair_system_prompt() -> str:
-        return (
-            "You are a focused software repair agent. "
-            "Diagnose the current failure packet, patch only the generated app files justified by the evidence, "
-            "keep the diff minimal, and aim for strict-green validation: validators, generated tests, and preview runtime all passing. "
-            "Do not redesign the app. Fix the current root-cause cluster only. "
-            "Preserve the existing backend architecture, routers, and static mounting unless the evidence explicitly implicates them. "
-            "Never replace a functioning FastAPI backend or route module with placeholder HTML handlers, stub pages, or a simplified demo app. "
-            "Do not rewrite generated tests or generated manifests to make the app pass; repair the application code and runtime contract instead."
-        )
+    def _repair_system_prompt(self) -> str:
+        return self.fix_prompt_builder.repair_system_prompt()
 
-    @staticmethod
     def _repair_user_prompt(
-        repair_packet: RepairPacket | FixCase,
-        file_contexts: dict[str, str] | None = None,
+        self,
+        repair_packet: FixPromptContext,
         *,
         repair_feedback: str | None = None,
     ) -> str:
-        if isinstance(repair_packet, FixCase):
-            return json.dumps(
-                {
-                    "task": "Patch the draft workspace to resolve the exact failure packet.",
-                    "fix_strategy": repair_packet.fix_strategy,
-                    "exact_failure_packet": {
-                        "failure_class": repair_packet.failure_class,
-                        "failure_signature": repair_packet.failure_signature,
-                        "implicated_files": list(repair_packet.implicated_files),
-                        "write_scope": [entry.model_dump(mode="json") for entry in repair_packet.write_scope],
-                        "file_contexts": dict(file_contexts or {}),
-                    },
-                },
-                ensure_ascii=False,
-            )
-        return json.dumps(
-            {
-                "task": "Patch the draft workspace to resolve the current failing bundle and converge the checks toward a working app state.",
-                "repair_packet": repair_packet.model_dump(mode="json"),
-                "repair_feedback": repair_feedback,
-                "rules": [
-                    "Fix only the current root-cause cluster before moving on.",
-                    "Return the smallest safe patch.",
-                    "Prefer editing the failing file and its deterministic bundle companions over broad refactors.",
-                    "Treat repair_packet.expected_contract and deterministic_companions as the source of truth for repair scope.",
-                    "Only change generated app code. Generated tests, generated manifests, and platform runtime assets are read-only.",
-                    "Do not modify miniapp/tests/*; default to repairing app code instead of test code.",
-                    "Do not modify generated manifests such as route_manifest.json or generated_app_graph.json; repair the application bundle so the deterministic manifest builder stays correct.",
-                    "Do not replace route modules with placeholder text/html responses to satisfy navigation tests; repair real route wiring and page surfaces.",
-                    "Strict-green is the ideal target, but the immediate goal is to remove blocking runtime, compile, routing, and preview failures first.",
-                    "Preserve existing endpoints, router wiring, and static file serving unless the evidence shows they are broken.",
-                    "Do not replace main.py, route modules, or backend services with placeholder HTML stubs or hard-coded pages.",
-                    "Every create or replace operation must include the full resulting file content.",
-                    "Always return outcome=patch_ready, outcome=needs_more_context, outcome=no_progress, or outcome=fatal_invalid_response.",
-                    "If you need more context, return outcome=needs_more_context with planned_targets and no operations.",
-                    "If you understand the issue but cannot yet produce a safe patch, return outcome=no_progress and explain exactly what contract is still unresolved.",
-                    "Do not return diagnosis-only responses without an explicit outcome and executable patch state.",
-                ],
-            },
-            ensure_ascii=False,
-        )
+        return self.fix_prompt_builder.repair_user_prompt(repair_packet, repair_feedback=repair_feedback)
 
     @staticmethod
     def _allow_test_file_writes_for_failure(failure_class: str | None) -> bool:
@@ -2187,23 +1937,13 @@ class FixOrchestrator:
         return False
 
     @classmethod
-    def _allow_test_file_writes(cls, fix_case: FixCase) -> bool:
-        del fix_case
+    def _allow_test_file_writes(cls, fix_turn: FixTurnContext) -> bool:
+        del fix_turn
         return False
 
     @staticmethod
-    def _prompt_cache_key(repair_packet: RepairPacket) -> str:
-        digest = hashlib.sha1(
-            "|".join(
-                [
-                    repair_packet.failure_class or "unknown",
-                    repair_packet.failure_signature or "unknown",
-                    repair_packet.context_mode,
-                    ",".join(sorted(repair_packet.deterministic_companions)),
-                ]
-            ).encode("utf-8")
-        ).hexdigest()
-        return f"fix:{digest}"
+    def _prompt_cache_key(repair_packet: FixPromptContext) -> str:
+        return FixPromptBuilder.prompt_cache_key(repair_packet)
 
     @staticmethod
     def _merge_cache_stats(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
