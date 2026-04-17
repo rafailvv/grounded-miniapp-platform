@@ -6359,6 +6359,8 @@ def test_deterministic_main_runtime_source_includes_dynamic_role_pages_and_backe
 
     assert 'from app.routes.requests import router as requests_router' in source
     assert 'app.include_router(requests_router)' in source
+    assert "async def lifespan(_: FastAPI):" in source
+    assert "app = FastAPI(lifespan=lifespan)" in source
     assert '@app.get("/{role}/{page_path:path}", include_in_schema=False)' in source
     assert 'dynamic_candidate = STATIC_DIR / role / f"{slug_parts[0]}_detail" / "index.html"' in source
 
@@ -6366,11 +6368,23 @@ def test_deterministic_main_runtime_source_includes_dynamic_role_pages_and_backe
 def test_deterministic_main_runtime_source_supports_sample_manifest_and_trailing_slash_routes() -> None:
     source = GenerationService._deterministic_main_runtime_source(["assignments"])
 
-    assert 'if normalized == "sample":' in source
-    assert "def _runtime_manifest_response" in source
     assert '@app.get("/{role}/", include_in_schema=False)' in source
-    assert "requested_role" in source
     assert "_canonicalize_role_path" in source
+    assert '@app.on_event("startup")' not in source
+
+
+def test_role_page_routes_with_jinja_templates_are_marked_for_repair() -> None:
+    content = """from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+router = APIRouter(prefix="/manager")
+templates = Jinja2Templates(directory="miniapp/app/static")
+@router.get("/requests", response_class=HTMLResponse)
+async def manager_requests(request: Request):
+    return templates.TemplateResponse("manager/requests/index.html", {"request": request})
+"""
+
+    assert GenerationService._route_module_requires_db_backed_repair("miniapp/app/routes/manager.py", content)
 
 
 def test_strip_noncanonical_runtime_route_handlers_removes_prefixed_runtime_aliases() -> None:

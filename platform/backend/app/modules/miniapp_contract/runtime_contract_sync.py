@@ -317,6 +317,7 @@ class MiniappRuntimeContractSync:
 
 import json
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -332,11 +333,6 @@ STATIC_DIR = BASE_DIR / "static"
 GENERATED_DIR = BASE_DIR / "generated"
 ROUTE_MANIFEST_PATH = GENERATED_DIR / "route_manifest.json"
 ROLES = ("client", "specialist", "manager")
-
-app = FastAPI()
-app.include_router(health_router)
-app.include_router(profiles_router)
-{include_lines}app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 def _ensure_table_columns(conn, table_name: str, columns: dict[str, str]) -> None:
@@ -387,6 +383,19 @@ def _ensure_generated_schema() -> None:
         )
 
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    _ensure_generated_schema()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+app.include_router(health_router)
+app.include_router(profiles_router)
+{include_lines}app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
 @app.middleware("http")
 async def disable_preview_caching(request: Request, call_next):
     response = await call_next(request)
@@ -395,12 +404,6 @@ async def disable_preview_caching(request: Request, call_next):
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
     return response
-
-
-@app.on_event("startup")
-def startup() -> None:
-    Base.metadata.create_all(bind=engine)
-    _ensure_generated_schema()
 
 
 @app.get("/", include_in_schema=False)

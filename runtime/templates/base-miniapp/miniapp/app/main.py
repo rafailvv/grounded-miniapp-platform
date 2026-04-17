@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 import re
 
@@ -18,7 +19,14 @@ GENERATED_DIR = BASE_DIR / "generated"
 ROUTE_MANIFEST_PATH = GENERATED_DIR / "route_manifest.json"
 ROLES = ("client", "specialist", "manager")
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 app.include_router(health_router)
 app.include_router(profiles_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -32,11 +40,6 @@ async def disable_preview_caching(request: Request, call_next):
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
     return response
-
-
-@app.on_event("startup")
-def startup() -> None:
-    Base.metadata.create_all(bind=engine)
 
 
 @app.get("/", include_in_schema=False)
