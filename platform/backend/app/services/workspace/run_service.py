@@ -529,7 +529,9 @@ class RunService:
                     run.status = "blocked"
                     run.apply_status = "blocked"
                     run.outcome_kind = "blocked_preview_infra" if str(job.outcome_kind or "") == "blocked_preview_infra" else "blocked_generation"
-                    run.draft_status = "ready" if meaningful_paths and self.workspace_service.draft_exists(run.workspace_id, run.run_id) else "failed"
+                    has_draft = self.workspace_service.draft_exists(run.workspace_id, run.run_id)
+                    draft_diff = self.workspace_service.diff(run.workspace_id, run_id=run.run_id) if has_draft else ""
+                    run.draft_status = "ready" if has_draft and (meaningful_paths or draft_diff.strip()) else "failed"
                     run.draft_ready = run.draft_status == "ready"
                     if run.current_fix_phase == "completed":
                         run.current_fix_phase = "failed"
@@ -541,7 +543,9 @@ class RunService:
                     run.status = "failed"
                     run.apply_status = "failed"
                     run.outcome_kind = "blocked_preview_infra" if str(job.outcome_kind or "") == "blocked_preview_infra" else "blocked_generation"
-                    run.draft_status = "ready" if meaningful_paths and self.workspace_service.draft_exists(run.workspace_id, run.run_id) else "failed"
+                    has_draft = self.workspace_service.draft_exists(run.workspace_id, run.run_id)
+                    draft_diff = self.workspace_service.diff(run.workspace_id, run_id=run.run_id) if has_draft else ""
+                    run.draft_status = "ready" if has_draft and (meaningful_paths or draft_diff.strip()) else "failed"
                     run.draft_ready = run.draft_status == "ready"
                     if run.current_fix_phase == "completed":
                         run.current_fix_phase = "failed"
@@ -850,6 +854,17 @@ class RunService:
         else:
             effective_diff = self.workspace_service.diff(workspace_id)
         preview_payload = self._preview_snapshot(workspace_id, preview)
+        patch_payload = self.generation_service.current_report(workspace_id, "patch")
+        if not patch_payload and effective_diff.strip():
+            patch_paths = self._paths_from_diff(effective_diff)
+            if not patch_paths:
+                patch_paths = [target.file_path for target in change_plan.targets if target.file_path]
+            patch_payload = {
+                "envelope": {
+                    "ops": [{"file_path": path, "operation": "replace"} for path in patch_paths],
+                },
+                "apply_result": job.apply_result,
+            }
         payload = {
             "run": run.model_dump(mode="json"),
             "job": job.model_dump(mode="json"),
@@ -865,11 +880,16 @@ class RunService:
             "candidate_diff": candidate_diff,
             "check_results": (self.generation_service.current_report(workspace_id, "check_results") or {}).get("items", []),
             "checks": self.generation_service.current_report(workspace_id, "check_results"),
-            "patch": self.generation_service.current_report(workspace_id, "patch"),
+            "patch": patch_payload,
             "materialization_report": self.generation_service.current_report(workspace_id, "materialization_report"),
             "stage_reports": self.generation_service.current_report(workspace_id, "stage_reports"),
             "retrieval_anchor_report": self.generation_service.current_report(workspace_id, "retrieval_anchor_report"),
             "execution_class": self.generation_service.current_report(workspace_id, "execution_class"),
+            "context_budget": self.generation_service.current_report(workspace_id, "context_budget"),
+            "prompt_fingerprint": self.generation_service.current_report(workspace_id, "prompt_fingerprint"),
+            "mode_profile_snapshot": self.generation_service.current_report(workspace_id, "mode_profile_snapshot"),
+            "phase_metrics": self.generation_service.current_report(workspace_id, "phase_metrics"),
+            "engine_trace": self.generation_service.current_report(workspace_id, "engine_trace"),
             "diff": effective_diff,
             "preview": preview_payload,
             "draft_preview": {
@@ -1143,6 +1163,12 @@ class RunService:
         return False
 
     def _optimistic_remaining_issues_for_job(self, job: Any) -> list[dict[str, Any]]:
+        blocking_failure_classes = {
+            "runtime_manifest_route_missing",
+            "route_api_contract_mismatch",
+        }
+        if str(getattr(job, "failure_class", "") or "") in blocking_failure_classes:
+            return []
         executed_checks = list(getattr(job, "executed_checks", []) or [])
         if not executed_checks:
             return []
@@ -1156,6 +1182,17 @@ class RunService:
         allowed = {"generated_app_python_tests", "generated_app_js_tests"}
         if any(str(item.get("name") or "") not in allowed for item in failed_checks):
             return []
+        blocking_route_markers = (
+            "No registered FastAPI route matches",
+            "No registered backend route matches",
+            "Workflow list route missing at runtime",
+        )
+        for item in failed_checks:
+            logs = [str(entry) for entry in (item.get("logs") or [])]
+            details = str(item.get("details") or "")
+            haystack = "\n".join([details, *logs])
+            if any(marker in haystack for marker in blocking_route_markers):
+                return []
         remaining: list[dict[str, Any]] = []
         for item in failed_checks:
             remaining.append(

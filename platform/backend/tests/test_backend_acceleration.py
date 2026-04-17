@@ -5571,14 +5571,14 @@ def test_mode_profiles_differentiate_fast_balanced_and_quality() -> None:
     assert quality.verification_depth == "deep"
 
 
-def test_task_profiles_use_codex_for_code_paths() -> None:
-    for profile in TASK_PROFILES.values():
-        routing = profile["routing"]
-        assert routing["spec_analysis"] == "gpt-5-mini"
-        assert routing["code_plan"] == "gpt-5-mini"
-        assert routing["ir_codegen"] == "gpt-5.3-codex"
-        assert routing["code_edit"] == "gpt-5.3-codex"
-        assert routing["repair"] == "gpt-5.3-codex"
+    def test_task_profiles_use_codex_for_code_paths() -> None:
+        for profile in TASK_PROFILES.values():
+            routing = profile["routing"]
+            assert routing["spec_analysis"] == "gpt-5-mini"
+            assert routing["code_plan"] == "gpt-5-mini"
+            assert routing["ir_codegen"] == "gpt-5.2-codex"
+            assert routing["code_edit"] == "gpt-5.2-codex"
+            assert routing["repair"] == "gpt-5.2-codex"
 
 
 def test_context_pack_builder_applies_mode_budget_and_prompt_fingerprint(tmp_path: Path) -> None:

@@ -141,6 +141,15 @@ def _extract_local_route_refs(content: str) -> set[str]:
     return refs
 
 
+def _extract_js_dom_ids(source: str) -> set[str]:
+    ids: set[str] = set()
+    for match in re.finditer(r'getElementById\(\s*["\\\']([^"\\\']+)["\\\']\s*\)', source):
+        ids.add(match.group(1))
+    for match in re.finditer(r'querySelector\(\s*["\\\']#([^"\\\']+)["\\\']\s*\)', source):
+        ids.add(match.group(1))
+    return ids
+
+
 def _normalize_route_ref(route_ref: str) -> str:
     normalized = route_ref.strip()
     normalized = re.sub(r"\$\{[^/]+\}", "sample", normalized)
@@ -278,20 +287,31 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
     return payload
 
 
-class GeneratedAppTests(unittest.TestCase):
+def _workflow_api_requirements(grounded_spec: dict) -> list[dict]:
+    return [
+        item
+        for item in grounded_spec.get("api_requirements", [])
+        if isinstance(item, dict) and str(item.get("path") or "").startswith("/api/")
+    ]
+
+
+class GeneratedMiniAppTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         from app.main import app
 
-        cls.client = TestClient(app)
+        cls._client_context = TestClient(app)
+        cls.client = cls._client_context
         cls.route_manifest = _load_json(MINIAPP_DIR / "app" / "generated" / "route_manifest.json")
         cls.runtime_manifest = _load_json(MINIAPP_DIR / "app" / "generated" / "runtime_manifest.json")
         cls.grounded_spec = _load_json(MINIAPP_DIR.parent / "artifacts" / "grounded_spec.json") if (MINIAPP_DIR.parent / "artifacts" / "grounded_spec.json").exists() else {}
-        cls.workflow_api_requirements = [
-            item
-            for item in cls.grounded_spec.get("api_requirements", [])
-            if isinstance(item, dict) and str(item.get("path") or "").startswith("/api/")
-        ]
+        cls.workflow_api_requirements = _workflow_api_requirements(cls.grounded_spec)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        client_context = getattr(cls, "_client_context", None)
+        if client_context is not None:
+            client_context.__exit__(None, None, None)
 
     def test_generated_manifests_exist(self) -> None:
         self.assertIsInstance(self.route_manifest.get("roles"), dict)
@@ -323,9 +343,12 @@ class GeneratedAppTests(unittest.TestCase):
                 self.assertIn("/" + style_path.removeprefix("miniapp/app/").replace("\\", "/"), html, f"Page {file_path} must reference its own CSS file")
                 self.assertIn("/" + script_path.removeprefix("miniapp/app/").replace("\\", "/"), html, f"Page {file_path} must reference its own JS file")
                 self.assertNotRegex(html, r">\\s*Refresh\\s*<", f"Page {file_path} should not render a manual refresh action")
+                script_text = (MINIAPP_DIR / script_path.removeprefix("miniapp/")).read_text(encoding="utf-8")
+                for dom_id in _extract_js_dom_ids(script_text):
+                    self.assertIn(f'id="{dom_id}"', html, f"Page {file_path} is missing DOM id {dom_id} referenced by {script_path}")
                 for asset in _extract_static_asset_refs(html):
-                    absolute_asset_path = MINIAPP_DIR / "app" / asset.removeprefix("/static/")
-                    self.assertTrue(absolute_asset_path.exists(), f"Missing referenced asset {asset} from {file_path}")
+                    asset_path = MINIAPP_DIR / "app" / "static" / asset.removeprefix("/static/")
+                    self.assertTrue(asset_path.exists(), f"Missing referenced asset {asset} from {file_path}")
 
     def test_planned_api_refs_map_to_runtime_routes(self) -> None:
         expected_api_paths = {
@@ -366,7 +389,7 @@ print(json.dumps(routes))
             matches = [item for item in registered_routes if _sample_route_path(str(item.get("path") or "")) == normalized]
             self.assertTrue(matches, f"No registered backend route matches planned API path {api_path}")
 
-    def test_page_local_navigation_targets_exist(self) -> None:
+    def test_local_page_links_render(self) -> None:
         declared_routes = set()
         for role in ROLES:
             pages = ((self.route_manifest.get("roles") or {}).get(role) or {}).get("pages") or []
@@ -408,7 +431,7 @@ print(json.dumps(routes))
                 pages = ((self.route_manifest.get("roles") or {}).get(role) or {}).get("pages") or []
                 self.assertTrue(pages, f"Workflow role {role} from flow {flow.get('name') or flow.get('flow_id') or 'unknown'} has no declared pages")
 
-    def test_workflow_routes_support_crud_style_interaction(self) -> None:
+    def test_detected_workflow_lifecycle_executes(self) -> None:
         resource = None
         list_api = next(
             (

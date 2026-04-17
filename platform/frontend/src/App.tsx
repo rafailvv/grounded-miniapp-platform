@@ -1724,9 +1724,7 @@ export default function App() {
             setRunArtifacts(null);
           }
           if (currentRun.status === "completed") {
-            setStatusMessage("Run completed. Automatically rebuilding the full preview.");
             await rebuildWorkspacePreview(workspaceId);
-            setStatusMessage("Run completed. The full preview was rebuilt automatically.");
           }
           return;
         }

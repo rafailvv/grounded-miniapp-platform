@@ -1,6 +1,6 @@
-PLANNING_MODEL = "gpt-5.4-mini"
+PLANNING_MODEL = "gpt-5-mini"
 CODE_MODEL = "gpt-5.2-codex"
-SUMMARY_MODEL = "gpt-5.4-mini"
+SUMMARY_MODEL = "gpt-5-mini"
 
 TASK_PROFILES = {
     "openai_code_fast": {

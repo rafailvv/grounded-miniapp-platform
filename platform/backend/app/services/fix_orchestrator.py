@@ -277,7 +277,7 @@ class FixOrchestrator:
                 "exact_fix",
             )
             scope_entries[:] = self._merge_scope(scope_entries, next_scope, scope_expansions)
-            job.failure_class = fix_case.failure_class
+            job.failure_class = self._prefer_failure_class(job.failure_class, fix_case.failure_class)
             job.failure_signature = fix_case.failure_signature
             job.root_cause_summary = fix_case.root_cause_summary
             job.fix_targets = list(fix_case.implicated_files)
@@ -585,9 +585,18 @@ class FixOrchestrator:
         job.outcome_kind = loop_result.outcome_kind
         job.summary = loop_result.summary
         job.failure_reason = loop_result.failure_reason
-        job.failure_class = loop_result.failure_class
-        job.failure_signature = loop_result.failure_signature
-        job.root_cause_summary = loop_result.root_cause_summary
+        if loop_result.failure_class is not None:
+            job.failure_class = loop_result.failure_class
+        if loop_result.failure_signature is not None:
+            job.failure_signature = loop_result.failure_signature
+        if loop_result.root_cause_summary is not None:
+            job.root_cause_summary = loop_result.root_cause_summary
+        baseline_failure_class = (
+            self._classify_failure_text(job.error_context.raw_error)
+            if job.error_context and job.error_context.raw_error
+            else None
+        )
+        job.failure_class = self._prefer_failure_class(job.failure_class, baseline_failure_class)
         job.current_fix_phase = loop_result.current_phase
         job.remaining_issues = list(loop_result.remaining_issues)
         if loop_result.latest_execution is not None:
@@ -692,6 +701,29 @@ class FixOrchestrator:
             executed_checks=check_execution.results,
             memory_context=memory_context,
         )
+
+    @staticmethod
+    def _prefer_failure_class(existing: str | None, candidate: str | None) -> str | None:
+        if not candidate:
+            return existing
+        if not existing:
+            return candidate
+        priority = {
+            "runtime_manifest_route_missing": 100,
+            "db_dependency_export_missing": 95,
+            "frontend_link_route_mismatch": 90,
+            "router_not_registered": 88,
+            "api_endpoint_missing": 86,
+            "frontend_compile/type/import": 80,
+            "backend_startup/import/schema": 78,
+            "preview_runtime/docker_orchestration": 72,
+            "route_api_contract_mismatch": 68,
+            "runtime_preview_boot": 40,
+            "build/runtime": 10,
+        }
+        existing_rank = priority.get(existing, 50)
+        candidate_rank = priority.get(candidate, 50)
+        return candidate if candidate_rank >= existing_rank else existing
 
     def _build_repair_packet(
         self,
@@ -1786,7 +1818,18 @@ class FixOrchestrator:
             and preview_result.status != "failed"
             and preview_connectivity_result.status != "failed"
         )
+        non_blocking_validation_codes = {"build.identical_role_pages"}
+        validation_failures = [
+            issue
+            for issue in (validation_snapshot.issues if validation_snapshot is not None else [])
+            if isinstance(issue, dict) and issue.get("blocking", False)
+        ]
+        only_non_blocking_validator_tail = bool(validation_failures) and all(
+            str(issue.get("code") or "") in non_blocking_validation_codes for issue in validation_failures
+        )
         validators_ok = all(result.status != "failed" for result in results if result.name in {"schema_validators", "connectivity_validators"})
+        if only_non_blocking_validator_tail:
+            validators_ok = True
         build_ok = all(result.status != "failed" for result in results if result.name == "changed_files_static")
         app_test_failures = [
             result
@@ -1796,13 +1839,29 @@ class FixOrchestrator:
         non_test_failures = [
             result
             for result in results
-            if result.status == "failed" and result.name not in {"generated_app_python_tests", "generated_app_js_tests"}
+            if result.status == "failed"
+            and result.name not in {"generated_app_python_tests", "generated_app_js_tests"}
+            and not (
+                only_non_blocking_validator_tail
+                and result.name == "schema_validators"
+            )
         ]
         remaining_issues = cls._remaining_issues_from_results(
             app_test_failures=app_test_failures,
             validation_snapshot=validation_snapshot,
             preview_details=preview_details,
         )
+        if only_non_blocking_validator_tail:
+            remaining_issues.extend(
+                {
+                    "kind": "validation_issue",
+                    "code": issue.get("code"),
+                    "message": issue.get("message"),
+                    "location": issue.get("location"),
+                    "blocking": False,
+                }
+                for issue in validation_failures
+            )
         optimistic_complete = (
             not strict_green
             and validators_ok
@@ -2045,10 +2104,26 @@ class FixOrchestrator:
 
     @staticmethod
     def _repair_user_prompt(
-        repair_packet: RepairPacket,
+        repair_packet: RepairPacket | FixCase,
+        file_contexts: dict[str, str] | None = None,
         *,
         repair_feedback: str | None = None,
     ) -> str:
+        if isinstance(repair_packet, FixCase):
+            return json.dumps(
+                {
+                    "task": "Patch the draft workspace to resolve the exact failure packet.",
+                    "fix_strategy": repair_packet.fix_strategy,
+                    "exact_failure_packet": {
+                        "failure_class": repair_packet.failure_class,
+                        "failure_signature": repair_packet.failure_signature,
+                        "implicated_files": list(repair_packet.implicated_files),
+                        "write_scope": [entry.model_dump(mode="json") for entry in repair_packet.write_scope],
+                        "file_contexts": dict(file_contexts or {}),
+                    },
+                },
+                ensure_ascii=False,
+            )
         return json.dumps(
             {
                 "task": "Patch the draft workspace to resolve the current failing bundle and converge the checks toward a working app state.",

@@ -7,6 +7,7 @@ from app.models.common import GenerationMode
 from app.models.grounded_spec import GroundedSpecModel
 from app.models.domain import CodeChunkRecord, ContextPack, WorkspaceRecord
 from app.services.code_index_service import CodeIndexService
+from app.services.engine.mode_profiles import ModeProfiles
 from app.services.workspace.service import WorkspaceService
 
 
@@ -63,7 +64,27 @@ class ContextPackBuilder:
             if content is None:
                 continue
             targeted_files[file_path] = content
+        stable_prefix = self.stable_prefix(workspace, model_profile)
         retrieval_stats = dict(retrieval["stats"])  # type: ignore[arg-type]
+        budget = (
+            self.context_budget_manager.build_budget(
+                generation_mode=generation_mode,
+                target_file_count=len(file_targets),
+                run_mode="generate",
+            )
+            if self.context_budget_manager is not None
+            else {}
+        )
+        mode_profile = ModeProfiles.resolve(generation_mode).to_dict()
+        prompt_fingerprint = (
+            self.prompt_state_manager.fingerprint(
+                prompt=prompt,
+                stable_prefix=stable_prefix,
+                cache_key=self.prompt_cache_key(workspace, model_profile, stable_prefix),
+            ).to_dict()
+            if self.prompt_state_manager is not None
+            else {}
+        )
         retrieval_stats["anchor_report"] = {
             "execution_class": execution_class or "shell_app",
             "preferred_anchor_paths": preferred_paths,
@@ -71,7 +92,9 @@ class ContextPackBuilder:
             "selected_code_paths": [chunk["path"] for chunk in retrieval["code"]],  # type: ignore[index]
             "target_file_sample": file_targets[:12],
         }
-        stable_prefix = self.stable_prefix(workspace, model_profile)
+        retrieval_stats["budget"] = budget
+        retrieval_stats["mode_profile"] = mode_profile
+        retrieval_stats["prompt_fingerprint"] = prompt_fingerprint
         return ContextPack(
             workspace_id=workspace.workspace_id,
             revision_id=workspace.current_revision_id,

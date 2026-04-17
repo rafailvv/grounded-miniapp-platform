@@ -339,6 +339,17 @@ class GenerationService:
         }
         ACTIVE_LLM_CACHE_CONTEXT.set(cache_context)
         ACTIVE_LLM_CACHE_STATS.set(cache_stats_sink)
+        if self.session_engine is not None:
+            self.session_engine.bootstrap(
+                workspace_id=workspace_id,
+                prompt=request.prompt,
+                generation_mode=generation_mode.value,
+                model_profile=request.model_profile,
+                run_mode=request.mode,
+                stable_prefix=cache_context["stable_prefix"],
+                cache_key=cache_context["prompt_cache_key"],
+                target_file_count=0,
+            )
         resume_bundle = self._load_resume_checkpoint_bundle(workspace_id, request.resume_from_run_id)
 
         job = JobRecord(
@@ -2152,11 +2163,19 @@ class GenerationService:
             assert page_result is not None
             if "error" in page_result:
                 return page_result
-            for operation in page_result.get("operations", []):
+            raw_operations = list(page_result.get("operations") or [])
+            if not raw_operations and page_result.get("operation") is not None:
+                raw_operations = [page_result["operation"]]
+            for raw_operation in raw_operations:
+                operation = (
+                    raw_operation
+                    if isinstance(raw_operation, DraftFileOperation)
+                    else DraftFileOperation.model_validate(raw_operation)
+                )
                 page_operations.append(operation)
                 if operation.content is not None:
                     generated_page_sources[operation.file_path] = operation.content
-            page_messages.append(page_result["assistant_message"])
+            page_messages.append(str(page_result.get("assistant_message") or "").strip())
 
         effective_target_files = list(target_files)
         backend_targets = self._backend_composition_targets(target_files, selected_pages)
@@ -2759,7 +2778,25 @@ class GenerationService:
         for item in value:
             if not isinstance(item, str):
                 continue
-            candidate = cls._normalize_generated_file_path(item)
+            candidate_raw = item.strip().lstrip("/")
+            flat_static_match = re.fullmatch(
+                r"miniapp/app/static/(?P<role>client|specialist|manager)/(?P<name>[^/]+)\.(?P<ext>html|css|js)",
+                candidate_raw,
+            )
+            if flat_static_match:
+                role = flat_static_match.group("role")
+                name = cls._snake_case_filename(flat_static_match.group("name"))
+                ext = flat_static_match.group("ext")
+                if name == "index" and ext == "html":
+                    candidate = f"miniapp/app/static/{role}/index.html"
+                elif name in {"index", "styles"} and ext == "css":
+                    candidate = f"miniapp/app/static/{role}/styles.css"
+                elif name in {"index", "app"} and ext == "js":
+                    candidate = f"miniapp/app/static/{role}/app.js"
+                else:
+                    candidate = f"miniapp/app/static/{role}/{name}.{ext}"
+            else:
+                candidate = cls._normalize_generated_file_path(item)
             if not candidate or ".." in candidate:
                 continue
             if any(char.isspace() for char in candidate):
@@ -3094,14 +3131,19 @@ class GenerationService:
         if not isinstance(payload, dict):
             raise ValueError(f"Page definition #{index + 1} for {role} is invalid.")
         component_name = self._component_name(role, payload, index)
+        raw_route_path = str(payload.get("route_path") or "").strip() or ("/" if index == 0 else f"/page-{index + 1}")
         route_path = self._normalize_role_route_path(
             role,
-            str(payload.get("route_path") or "").strip() or ("/" if index == 0 else f"/page-{index + 1}"),
+            raw_route_path,
             index=index,
         )
         file_path_candidates = self._normalize_path_list([payload.get("file_path")], [])
         data_dependencies = self._normalize_string_list(payload.get("data_dependencies"))
-        default_file_path = self._default_page_file(role, component_name, route_path=route_path)
+        default_file_path = self._default_page_file(
+            role,
+            component_name,
+            route_path=self._page_file_route_path(role=role, raw_route_path=raw_route_path, normalized_route_path=route_path),
+        )
         file_path = file_path_candidates[0] if file_path_candidates else default_file_path
         if not self._is_role_local_page_file(role=role, file_path=file_path):
             file_path = default_file_path
@@ -3165,6 +3207,21 @@ class GenerationService:
         }
 
     @staticmethod
+    def _page_file_route_path(*, role: str, raw_route_path: str, normalized_route_path: str) -> str:
+        raw = str(raw_route_path or "").strip() or normalized_route_path
+        normalized = str(normalized_route_path or "").strip() or "/"
+        role_prefix = f"/{role}"
+        if raw.startswith((role_prefix, f"{role_prefix}/", f"/{role}-", f"/{role}_")):
+            return normalized
+        if raw in {"/dashboard", "/home"}:
+            return normalized
+        if normalized in {"/", "/profile"}:
+            return normalized
+        if raw and raw != normalized:
+            return raw
+        return normalized
+
+    @staticmethod
     def _should_canonicalize_page_file_alias(*, role: str, route_path: str, file_path: str, default_file_path: str) -> bool:
         if file_path == default_file_path:
             return False
@@ -3211,7 +3268,8 @@ class GenerationService:
 
     @staticmethod
     def _normalize_role_route_path(role: str, route_path: str, *, index: int) -> str:
-        normalized = route_path.strip() or ("/" if index == 0 else f"/page-{index + 1}")
+        raw_normalized = route_path.strip() or ("/" if index == 0 else f"/page-{index + 1}")
+        normalized = raw_normalized
         if not normalized.startswith("/"):
             normalized = f"/{normalized}"
         role_prefix = f"/{role}"
@@ -3227,7 +3285,7 @@ class GenerationService:
             return f"/{suffix}" if suffix else "/"
         if normalized.startswith(underscore_prefix):
             suffix = normalized[len(underscore_prefix):]
-            normalized = f"/{suffix}" if suffix else "/"
+            return f"/{suffix}" if suffix else "/"
         if normalized in {"/home", "/dashboard"}:
             return "/"
         if role == "client" and normalized in {"/new", "/request_new", "/request_create"}:
@@ -4751,11 +4809,18 @@ class GenerationService:
                     for operation in operations
                     if operation.file_path in allowed_paths and operation.operation in {"create", "replace"} and operation.content is not None
                 }
-                if set(valid_operations) != allowed_paths:
-                    raise ValueError(f"{page['file_path']} did not produce the required HTML/CSS/JS triplet.")
+                primary_operation = valid_operations.get(page["file_path"])
+                if primary_operation is None:
+                    raise ValueError(f"{page['file_path']} did not produce the required page HTML operation.")
+                ordered_operations = [primary_operation]
+                for companion_path in sorted(path for path in allowed_paths if path != page["file_path"]):
+                    operation = valid_operations.get(companion_path)
+                    if operation is not None:
+                        ordered_operations.append(operation)
                 return {
                     "assistant_message": str(normalized.get("assistant_message") or "").strip(),
-                    "operations": [valid_operations[path] for path in sorted(allowed_paths)],
+                    "operation": primary_operation,
+                    "operations": ordered_operations,
                     "model": payload["model"],
                 }
             except Exception as exc:
@@ -5044,10 +5109,10 @@ class GenerationService:
         *,
         generated_page_sources: dict[str, str],
         current_target_files: list[str],
-        page_graph: dict[str, Any],
+        page_graph: dict[str, Any] | None = None,
     ) -> list[str]:
         existing_targets = set(current_target_files)
-        allowed_page_assets = GenerationService._planned_page_static_targets(page_graph)
+        allowed_page_assets = GenerationService._planned_page_static_targets(page_graph or {}) if page_graph is not None else None
         inferred: list[str] = []
         for source_path, source in generated_page_sources.items():
             if not isinstance(source, str):
@@ -5057,7 +5122,7 @@ class GenerationService:
                     if asset_path not in existing_targets:
                         inferred.append(asset_path)
                     continue
-                if asset_path in allowed_page_assets and asset_path not in existing_targets:
+                if asset_path not in existing_targets and (allowed_page_assets is None or asset_path in allowed_page_assets):
                     inferred.append(asset_path)
         return list(dict.fromkeys(inferred))
 
@@ -5531,7 +5596,8 @@ class GenerationService:
         generation_mode: GenerationMode,
         operations: list[DraftFileOperation],
     ) -> list[DraftFileOperation]:
-        return self.artifact_builder.ensure_runtime_artifact_operations(
+        builder = getattr(self, "artifact_builder", None) or self._artifact_builder()
+        return builder.ensure_runtime_artifact_operations(
             grounded_spec=grounded_spec,
             page_graph=page_graph,
             role_scope=role_scope,
@@ -5546,7 +5612,8 @@ class GenerationService:
         role_scope: list[str],
         operations: list[DraftFileOperation],
     ) -> list[DraftFileOperation]:
-        return self.artifact_builder.ensure_app_level_test_operations(
+        builder = getattr(self, "artifact_builder", None) or self._artifact_builder()
+        return builder.ensure_app_level_test_operations(
             page_graph=page_graph,
             role_scope=role_scope,
             operations=operations,

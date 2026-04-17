@@ -68,11 +68,14 @@ class SessionEngine:
         self.artifact_recorder.store_workspace_report(workspace_id, "prompt_fingerprint", fingerprint.to_dict())
         self.artifact_recorder.store_workspace_report(workspace_id, "context_budget", {"workspace_id": workspace_id, "budget": budget})
         self.artifact_recorder.store_workspace_report(workspace_id, "mode_profile_snapshot", {"workspace_id": workspace_id, **mode_snapshot})
-        self.telemetry_log_bridge.phase(
-            workspace_id,
-            "bootstrap",
-            "Session engine bootstrap completed.",
-            payload={
+        self.record_phase(
+            workspace_id=workspace_id,
+            phase="bootstrap",
+            generation_mode=generation_mode,
+            model_profile=model_profile,
+            run_mode=run_mode,
+            target_file_count=target_file_count,
+            details={
                 "generation_mode": generation_mode,
                 "run_mode": run_mode,
                 "target_file_count": target_file_count,

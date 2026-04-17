@@ -1,14 +1,7 @@
-from app.services.workspace.log_service import WorkspaceLogService
-from app.services.workspace.preview_service import PreviewService
-from app.services.workspace.run_service import RunService
-from app.services.workspace.runtime_manager import PreviewRuntimeManager
-from app.services.workspace.service import WorkspaceService, json_dumps
+"""Workspace service package.
 
-__all__ = [
-    "WorkspaceLogService",
-    "PreviewService",
-    "PreviewRuntimeManager",
-    "RunService",
-    "WorkspaceService",
-    "json_dumps",
-]
+Keep this package initializer intentionally light. Importing concrete services
+from here causes circular imports during application startup.
+"""
+
+__all__: list[str] = []

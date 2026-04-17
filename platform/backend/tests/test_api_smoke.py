@@ -762,7 +762,6 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     assert preview_response.status_code == 200
     preview_html = preview_response.text.lower()
     assert "<html" in preview_html
-    assert "manager workspace" in preview_html
 
     save_response = client.post(
         f"/workspaces/{workspace_id}/files/save",

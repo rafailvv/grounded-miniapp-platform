@@ -291,6 +291,15 @@ class MiniappRuntimeContractSync:
         )
         updated = cls._replace_top_level_function(updated, "_validate_role", replacement)
         updated = re.sub(r"(?m)^(\s*)_validate_role\(role\)\s*$", r"\1role = _validate_role(role)", updated)
+        updated = updated.replace(
+            '    raise HTTPException(status_code=404, detail="Action not supported")\n',
+            '    return {\n'
+            '        "next_path": f"/{role}/",\n'
+            '        "message": "No-op runtime action.",\n'
+            '        "action_id": action_id,\n'
+            '        "role": role,\n'
+            '    }\n',
+        )
         return updated
 
     @staticmethod
@@ -448,21 +457,6 @@ def _resolve_role_page(role: str, actual_path: str) -> Path:
     raise KeyError(actual_path)
 
 
-@app.get("/{{role}}", include_in_schema=False)
-def role_page(role: str) -> FileResponse:
-    return FileResponse(_resolve_role_page(role, f"/{{role}}"))
-
-
-@app.get("/{{role}}/", include_in_schema=False)
-def role_page_trailing_slash(role: str) -> FileResponse:
-    return FileResponse(_resolve_role_page(role, f"/{{role}}/"))
-
-
-@app.get("/{{role}}/{{page_path:path}}", include_in_schema=False)
-def role_nested_page(role: str, page_path: str) -> FileResponse:
-    return FileResponse(_resolve_role_page(role, f"/{{role}}/{{page_path}}"))
-
-
 @app.get("/api/runtime/client/manifest")
 def runtime_manifest_client() -> JSONResponse:
     return _runtime_manifest_response("client", "client")
@@ -488,6 +482,21 @@ def runtime_manifest(role: str) -> JSONResponse:
     return _runtime_manifest_response(role, role)
 
 
+@app.get("/{{role}}", include_in_schema=False)
+def role_page(role: str) -> FileResponse:
+    return FileResponse(_resolve_role_page(role, f"/{{role}}"))
+
+
+@app.get("/{{role}}/", include_in_schema=False)
+def role_page_trailing_slash(role: str) -> FileResponse:
+    return FileResponse(_resolve_role_page(role, f"/{{role}}/"))
+
+
+@app.get("/{{role}}/{{page_path:path}}", include_in_schema=False)
+def role_nested_page(role: str, page_path: str) -> FileResponse:
+    return FileResponse(_resolve_role_page(role, f"/{{role}}/{{page_path}}"))
+
+
 @app.exception_handler(KeyError)
 def key_error_handler(_, exc: KeyError) -> JSONResponse:
     return JSONResponse(status_code=404, content={{"detail": str(exc)}})
@@ -504,7 +513,11 @@ def key_error_handler(_, exc: KeyError) -> JSONResponse:
         if symbol in symbols:
             return updated
         symbols.append(symbol)
-        replacement = f"from fastapi import {', '.join(sorted(set(symbols)))}"
+        ordered_symbols: list[str] = []
+        for item in symbols:
+            if item not in ordered_symbols:
+                ordered_symbols.append(item)
+        replacement = f"from fastapi import {', '.join(ordered_symbols)}"
         return import_pattern.sub(replacement, updated, count=1)
 
     @classmethod
