@@ -43,6 +43,40 @@ FORBIDDEN_ROUTE_MODULE_STEMS = {
 
 
 class MiniappGenerationTargeting(MiniappGenerationRuntimeOwner):
+    @staticmethod
+    def _is_canonical_role_local_static_path(path: str) -> bool:
+        normalized = str(path or "").strip().replace("\\", "/")
+        if not normalized.startswith("miniapp/app/static/"):
+            return False
+        return bool(
+            re.fullmatch(
+                r"miniapp/app/static/(client|specialist|manager)/(index\.html|styles\.css|app\.js)",
+                normalized,
+            )
+            or re.fullmatch(
+                r"miniapp/app/static/(client|specialist|manager)/[^/]+/(index\.html|styles\.css|app\.js)",
+                normalized,
+            )
+        )
+
+    @classmethod
+    def _has_explicit_triplet_targets(cls, path: str, target_files: list[str]) -> bool:
+        normalized = str(path or "").strip().replace("\\", "/")
+        if not cls._is_canonical_role_local_static_path(normalized):
+            return False
+        if normalized.endswith("/index.html") or re.fullmatch(r"miniapp/app/static/(client|specialist|manager)/(index\.html)", normalized):
+            html_path = normalized
+        elif normalized.endswith("/styles.css") or re.fullmatch(r"miniapp/app/static/(client|specialist|manager)/(styles\.css)", normalized):
+            html_path = normalized[: -len("styles.css")] + "index.html"
+        elif normalized.endswith("/app.js") or re.fullmatch(r"miniapp/app/static/(client|specialist|manager)/(app\.js)", normalized):
+            html_path = normalized[: -len("app.js")] + "index.html"
+        else:
+            return False
+        css_path = MiniappGenerationPaths._default_page_asset_path(html_path, asset_kind="css")
+        js_path = MiniappGenerationPaths._default_page_asset_path(html_path, asset_kind="js")
+        target_set = {str(item or "").strip().replace("\\", "/") for item in target_files if isinstance(item, str)}
+        return {html_path, css_path, js_path}.issubset(target_set)
+
     def _collect_files_to_read(
         self,
         files_to_read: list[str],
@@ -169,7 +203,7 @@ class MiniappGenerationTargeting(MiniappGenerationRuntimeOwner):
                     pruned.append(path)
                 continue
             if re.match(r"miniapp/app/static/(client|specialist|manager)/", path):
-                if path in allowed_page_static:
+                if path in allowed_page_static or cls._has_explicit_triplet_targets(path, target_files):
                     pruned.append(path)
                 continue
             pruned.append(path)
@@ -209,7 +243,11 @@ class MiniappGenerationTargeting(MiniappGenerationRuntimeOwner):
             if normalized == "miniapp/app/generated/route_manifest.json":
                 continue
             if normalized.startswith("miniapp/app/routes/"):
-                if normalized not in sanitized_backend_targets and normalized != "miniapp/app/routes/profiles.py":
+                stem = Path(normalized).stem.lower()
+                if stem in FORBIDDEN_ROUTE_MODULE_STEMS:
+                    continue
+                if normalized.endswith(".py") and cls._is_canonical_target_path(normalized):
+                    sanitized.append(normalized)
                     continue
             if normalized.startswith("miniapp/app/static/") and normalized not in pruned_static:
                 continue

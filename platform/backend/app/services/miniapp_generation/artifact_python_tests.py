@@ -154,6 +154,34 @@ def _resource_slug(path: str) -> str:
     return api_parts[0] if api_parts else ""
 
 
+def _extract_record_id(payload):
+    if isinstance(payload, dict):
+        for key in ("id", "request_id", "submission_id", "task_id", "item_id", "record_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in payload.values():
+            candidate = _extract_record_id(value)
+            if candidate:
+                return candidate
+    if isinstance(payload, list):
+        for item in payload:
+            candidate = _extract_record_id(item)
+            if candidate:
+                return candidate
+    return None
+
+
+def _contains_status(payload, expected_status: str) -> bool:
+    if payload == expected_status:
+        return True
+    if isinstance(payload, dict):
+        return any(_contains_status(value, expected_status) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_contains_status(item, expected_status) for item in payload)
+    return False
+
+
 def _pick_workflow_api(requirements, *, methods, tokens_any, preferred_resource=None):
     methods = {method.upper() for method in methods}
     tokens_any = {token.lower() for token in tokens_any}
@@ -286,6 +314,103 @@ class GeneratedMiniAppTests(unittest.TestCase):
                 for asset in _extract_static_asset_refs(html):
                     asset_path = MINIAPP_DIR / "app" / "static" / asset.removeprefix("/static/")
                     self.assertTrue(asset_path.exists(), f"Missing referenced asset {asset} from {file_path}")
+
+    def test_declared_role_routes_render_shell_contract(self) -> None:
+        for role in ROLES:
+            pages = ((self.route_manifest.get("roles") or {}).get(role) or {}).get("pages") or []
+            self.assertTrue(pages, f"No declared pages for role {role}")
+            for page in pages:
+                if not isinstance(page, dict):
+                    continue
+                route_path = _sample_route_path(str(page.get("route_path") or "").strip())
+                self.assertTrue(route_path.startswith("/"), f"Route path must be absolute: {route_path}")
+                response = self.client.get(route_path)
+                self.assertEqual(response.status_code, 200, f"{route_path} did not render successfully")
+                content = response.text
+                self.assertIn("/static/shared/base.css", content, f"{route_path} must keep the shared shell stylesheet")
+                self.assertIn("/static/preview_bridge.js", content, f"{route_path} must keep the preview bridge runtime")
+                self.assertIn("page-shell", content, f"{route_path} must render the shared page-shell root")
+                self.assertIn("padding-top: max(76px", content, f"{route_path} must preserve the 76px shell safe-area baseline")
+
+    def test_local_route_refs_resolve_inside_generated_route_manifest(self) -> None:
+        declared_paths = {
+            _normalize_route_ref(str(page.get("route_path") or ""))
+            for role in ROLES
+            for page in (((self.route_manifest.get("roles") or {}).get(role) or {}).get("pages") or [])
+            if isinstance(page, dict)
+        }
+        for role in ROLES:
+            pages = ((self.route_manifest.get("roles") or {}).get(role) or {}).get("pages") or []
+            for page in pages:
+                if not isinstance(page, dict):
+                    continue
+                file_path = str(page.get("file_path") or "")
+                if not file_path:
+                    continue
+                html = (MINIAPP_DIR / file_path.removeprefix("miniapp/")).read_text(encoding="utf-8")
+                for route_ref in _extract_local_route_refs(html):
+                    normalized = _normalize_route_ref(route_ref)
+                    self.assertTrue(
+                        any(_route_pattern_matches(candidate, normalized) for candidate in declared_paths),
+                        f"{file_path} links to undeclared local route {route_ref}",
+                    )
+                    response = self.client.get(normalized)
+                    self.assertLess(response.status_code, 400, f"{file_path} links to local route {route_ref} that does not resolve")
+
+    def test_role_journey_round_trip_persists_shared_record(self) -> None:
+        workflow_tokens = {"request", "requests", "record", "records", "order", "orders", "task", "tasks", "submission", "submissions", "item", "items"}
+        create_requirement = _pick_workflow_api(self.workflow_api_requirements, methods={"POST"}, tokens_any=workflow_tokens)
+        self.assertIsNotNone(create_requirement, "Generated app must expose a POST workflow API for creating persisted records.")
+        preferred_resource = _resource_slug(str(create_requirement.get("path") or ""))
+        list_requirement = _pick_workflow_api(
+            self.workflow_api_requirements,
+            methods={"GET"},
+            tokens_any=workflow_tokens,
+            preferred_resource=preferred_resource,
+        )
+        update_requirement = _pick_workflow_api(
+            self.workflow_api_requirements,
+            methods={"PUT", "PATCH"},
+            tokens_any=workflow_tokens,
+            preferred_resource=preferred_resource,
+        )
+        self.assertIsNotNone(list_requirement, "Generated app must expose a GET workflow API for reading persisted records.")
+        self.assertIsNotNone(update_requirement, "Generated app must expose a PUT or PATCH workflow API for updating persisted records.")
+
+        create_path = _sample_route_path(str(create_requirement.get("path") or ""))
+        create_payload = _payload_for_api(create_requirement, create_path, str(create_requirement.get("method") or "POST")) or {}
+        create_payload.update({"title": "Generated request", "status": "new", "comment": "Created from generated app test"})
+        create_response = _request_and_assert(self.client, str(create_requirement.get("method") or "POST"), create_path, create_payload)
+        self.assertLess(create_response.status_code, 400, f"Create API failed: {create_path} -> {create_response.status_code}")
+        created_payload = _response_json(create_response)
+        created_id = _extract_record_id(created_payload)
+        self.assertTrue(created_id, f"Create API {create_path} must return a persisted record id. Payload: {created_payload}")
+
+        list_path = _sample_route_path(str(list_requirement.get("path") or ""))
+        list_response = _request_and_assert(self.client, "GET", list_path)
+        self.assertLess(list_response.status_code, 400, f"List API failed: {list_path} -> {list_response.status_code}")
+        listed_payload = _response_json(list_response)
+        self.assertTrue(_payload_contains_value(listed_payload, created_id), f"List API {list_path} did not expose the created record id {created_id}. Payload: {listed_payload}")
+
+        update_path = _resolve_path_params(str(update_requirement.get("path") or ""), {"id": created_id, "request_id": created_id, "record_id": created_id, "item_id": created_id})
+        update_payload = _payload_for_api(update_requirement, update_path, str(update_requirement.get("method") or "PATCH"), created_id=created_id) or {}
+        update_payload.update({"status": "in_progress", "comment": "Updated by specialist"})
+        update_response = _request_and_assert(self.client, str(update_requirement.get("method") or "PATCH"), update_path, update_payload)
+        self.assertLess(update_response.status_code, 400, f"Update API failed: {update_path} -> {update_response.status_code}")
+        updated_payload = _response_json(update_response)
+        self.assertTrue(
+            _payload_contains_value(updated_payload, created_id) or _contains_status(updated_payload, "in_progress"),
+            f"Update API {update_path} did not acknowledge the persisted record update. Payload: {updated_payload}",
+        )
+
+        post_update_list_response = _request_and_assert(self.client, "GET", list_path)
+        self.assertLess(post_update_list_response.status_code, 400, f"Post-update list API failed: {list_path} -> {post_update_list_response.status_code}")
+        post_update_payload = _response_json(post_update_list_response)
+        self.assertTrue(_payload_contains_value(post_update_payload, created_id), f"Updated record {created_id} disappeared from list API {list_path}. Payload: {post_update_payload}")
+        self.assertTrue(
+            _contains_status(post_update_payload, "in_progress") or _payload_contains_value(post_update_payload, "Updated by specialist"),
+            f"Updated record {created_id} did not reflect specialist changes in shared state. Payload: {post_update_payload}",
+        )
 
     def test_backend_route_modules_import(self) -> None:
         for file_path in EXPECTED_BACKEND_TARGETS:

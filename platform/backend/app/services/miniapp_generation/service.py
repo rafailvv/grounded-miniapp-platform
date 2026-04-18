@@ -44,7 +44,6 @@ from app.modules.miniapp_generation_runtime import (
     MiniappGenerationContractRoutes,
     MiniappGenerationContractSchema,
     MiniappGenerationCodePlan,
-    MiniappGenerationCodePlanDefaults,
     MiniappGenerationCodePlanNormalization,
     MiniappGenerationCodePlanPrompts,
     MiniappGenerationCodegen,
@@ -124,7 +123,6 @@ class GenerationService(
             "generation_plan_runtime": MiniappGenerationPlanRuntime,
             "generation_role_contract": MiniappGenerationRoleContract,
             "generation_code_plan": MiniappGenerationCodePlan,
-            "generation_code_plan_defaults": MiniappGenerationCodePlanDefaults,
             "generation_code_plan_prompts": MiniappGenerationCodePlanPrompts,
             "generation_code_plan_normalization": MiniappGenerationCodePlanNormalization,
             "generation_codegen": MiniappGenerationCodegen,
@@ -203,7 +201,6 @@ class GenerationService(
         self.generation_plan_runtime = MiniappGenerationPlanRuntime(self)
         self.generation_role_contract = MiniappGenerationRoleContract(self)
         self.generation_code_plan = MiniappGenerationCodePlan(self)
-        self.generation_code_plan_defaults = MiniappGenerationCodePlanDefaults(self)
         self.generation_code_plan_prompts = MiniappGenerationCodePlanPrompts(self)
         self.generation_code_plan_normalization = MiniappGenerationCodePlanNormalization(self)
         self.generation_codegen = MiniappGenerationCodegen(self)

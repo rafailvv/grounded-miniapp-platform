@@ -70,29 +70,44 @@ class MiniappGenerationPlanRuntime:
     ) -> dict[str, Any]:
         service = self.service
         service._normalize_runtime_python_paths_in_plan(plan_result)
-        service._expand_page_asset_targets_in_plan(plan_result)
         plan_result["target_files"] = list(dict.fromkeys(plan_result.get("target_files") or []))
         plan_result["backend_targets"] = service._sanitize_backend_targets(
             list(dict.fromkeys(plan_result.get("backend_targets") or []))
         )
+        inferred_backend_targets = list(
+            dict.fromkeys(
+                [
+                    *self.detect_missing_backend_contract_targets_from_page_graph(
+                        page_graph=plan_result.get("page_graph") or {},
+                        current_target_files=plan_result["target_files"],
+                        backend_targets=plan_result["backend_targets"],
+                    ),
+                    *self.detect_missing_backend_contract_targets_from_spec(
+                        grounded_spec=grounded_spec,
+                        page_graph=plan_result.get("page_graph") or {},
+                        current_target_files=plan_result["target_files"],
+                        backend_targets=plan_result["backend_targets"],
+                    ),
+                ]
+            )
+        )
+        if inferred_backend_targets:
+            plan_result["backend_targets"] = service._sanitize_backend_targets(
+                [
+                    *plan_result["backend_targets"],
+                    *inferred_backend_targets,
+                ]
+            )
+            plan_result["target_files"] = list(
+                dict.fromkeys(
+                    [
+                        *plan_result["target_files"],
+                        *plan_result["backend_targets"],
+                    ]
+                )
+            )
         plan_result["files_to_read"] = list(dict.fromkeys(plan_result.get("files_to_read") or []))
         plan_result["shared_files"] = list(dict.fromkeys(plan_result.get("shared_files") or []))
-        plan_result["target_files"] = service._sanitize_planner_target_files(
-            target_files=plan_result["target_files"],
-            backend_targets=plan_result["backend_targets"],
-            page_graph=plan_result["page_graph"],
-        )
-        plan_result["generation_clusters"] = service._build_generation_clusters(plan_result["target_files"])
-        page_graph_roles = plan_result.get("page_graph", {}).get("roles") if isinstance(plan_result.get("page_graph"), dict) else {}
-        if isinstance(page_graph_roles, dict):
-            plan_result["execution_plan"] = service._build_execution_plan(
-                role_scope=role_scope,
-                roles=page_graph_roles,
-                shared_files=plan_result["shared_files"],
-                backend_targets=plan_result["backend_targets"],
-                target_files=plan_result["target_files"],
-                generation_clusters=plan_result["generation_clusters"],
-            )
         plan_result["target_files"] = service._sanitize_planner_target_files(
             target_files=plan_result["target_files"],
             backend_targets=plan_result["backend_targets"],

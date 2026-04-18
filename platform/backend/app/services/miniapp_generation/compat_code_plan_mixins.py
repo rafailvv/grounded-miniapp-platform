@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from app.modules.miniapp_generation_runtime import (
-    MiniappGenerationCodePlanDefaults,
     MiniappGenerationCodePlanNormalization,
     MiniappGenerationCodePlanPrompts,
     MiniappGenerationRoleContract,
@@ -14,8 +13,6 @@ class CompatCodePlanMixins:
         base = super()._compat_class_owner_map()
         return {
             **base,
-            "_deterministic_code_plan_payload": MiniappGenerationCodePlanDefaults,
-            "_deterministic_role_pages": MiniappGenerationCodePlanDefaults,
             "_code_plan_schema": MiniappGenerationCodePlanPrompts,
             "_code_plan_system_prompt": MiniappGenerationCodePlanPrompts,
             "_code_plan_section_system_prompt": MiniappGenerationCodePlanPrompts,

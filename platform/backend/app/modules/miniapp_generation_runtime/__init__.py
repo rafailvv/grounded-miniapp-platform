@@ -8,7 +8,6 @@ from app.modules.miniapp_generation_runtime.generation_contract_pass import Mini
 from app.modules.miniapp_generation_runtime.generation_contract_routes import MiniappGenerationContractRoutes
 from app.modules.miniapp_generation_runtime.generation_contract_schema import MiniappGenerationContractSchema
 from app.modules.miniapp_generation_runtime.generation_code_plan import MiniappGenerationCodePlan
-from app.modules.miniapp_generation_runtime.generation_code_plan_defaults import MiniappGenerationCodePlanDefaults
 from app.modules.miniapp_generation_runtime.generation_code_plan_normalization import MiniappGenerationCodePlanNormalization
 from app.modules.miniapp_generation_runtime.generation_code_plan_prompts import MiniappGenerationCodePlanPrompts
 from app.modules.miniapp_generation_runtime.generation_codegen import MiniappGenerationCodegen
@@ -55,7 +54,6 @@ __all__ = [
     "MiniappGenerationContractRoutes",
     "MiniappGenerationContractSchema",
     "MiniappGenerationCodePlan",
-    "MiniappGenerationCodePlanDefaults",
     "MiniappGenerationCodePlanNormalization",
     "MiniappGenerationCodePlanPrompts",
     "MiniappGenerationCodegen",

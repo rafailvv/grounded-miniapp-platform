@@ -102,7 +102,7 @@ class MiniappGenerationEntry:
             )
         self.service._append_event(job, "scaffold_ready", "Role guidance compiled as advisory input for file-first generation.")
 
-        plan_result = self.service._resolve_code_plan(
+        advisory_plan_result = self.service._resolve_code_plan(
             workspace_id=workspace_id,
             prompt=effective_prompt,
             grounded_spec=grounded_spec,
@@ -113,66 +113,38 @@ class MiniappGenerationEntry:
             generation_mode=generation_mode,
             creative_direction=creative_direction,
         )
-        plan_error = str(plan_result.get("error") or "").strip()
         inferred_role_contract, inferred_plan_result = self.service._compile_prompt_to_scaffold(
             prompt=effective_prompt,
             grounded_spec=grounded_spec,
             role_scope=role_scope,
             workspace_tree=workspace_tree,
         )
-        if plan_error or not plan_result.get("page_graph"):
-            merged_roles = dict((role_contract.get("roles") or {}))
-            for role, payload in (inferred_role_contract.get("roles") or {}).items():
-                merged_roles.setdefault(role, payload)
-            role_contract = {
-                **inferred_role_contract,
-                **role_contract,
-                "roles": merged_roles,
-            }
-            plan_result = inferred_plan_result
-            self.service._append_event(job, "scaffold_ready", "Prompt and template affordances filled the minimal executable route surface.")
+        role_contract, plan_result = self._merge_advisory_generation_inputs(
+            role_contract=role_contract,
+            inferred_role_contract=inferred_role_contract,
+            advisory_plan_result=advisory_plan_result,
+            inferred_plan_result=inferred_plan_result,
+        )
+        plan_error = str(advisory_plan_result.get("error") or "").strip()
+        self.service._append_event(job, "scaffold_ready", "Bootstrap targets and advisory generation hints are ready.")
+        self.service._append_trace(
+            workspace_id,
+            "generation_plan_advisory",
+            "Normal generation merged prompt/template inference with advisory planner hints before tool-owned code generation.",
+            {
+                "planner_error": plan_error or None,
+                "target_files": len(plan_result["target_files"]),
+                "backend_targets": len(plan_result["backend_targets"]),
+                "generation_clusters": plan_result["generation_clusters"],
+            },
+        )
+        if plan_result.get("plan_gate_issues"):
             self.service._append_trace(
                 workspace_id,
-                "generation_plan_inferred",
-                "Generation inferred the minimal executable route surface from prompt and template affordances.",
-                {"reason": plan_error or "missing_page_graph", "inferred_target_files": len(plan_result["target_files"])},
+                "generation_plan_soft_issues",
+                "Advisory planning produced soft issues; generation continues code-first.",
+                {"issues": list(plan_result.get("plan_gate_issues") or [])},
             )
-        else:
-            self.service._append_event(job, "scaffold_ready", "Advisory generation targets and route surfaces are ready.")
-            self.service._append_trace(
-                workspace_id,
-                "generation_plan_advisory",
-                "Advisory generation targets were compiled before code generation.",
-                {
-                    "target_files": len(plan_result["target_files"]),
-                    "backend_targets": len(plan_result["backend_targets"]),
-                    "generation_clusters": plan_result["generation_clusters"],
-                },
-            )
-            if plan_result.get("plan_gate_issues"):
-                self.service._append_trace(
-                    workspace_id,
-                    "generation_plan_soft_issues",
-                    "Advisory planning produced soft issues; generation continues code-first.",
-                    {"issues": list(plan_result.get("plan_gate_issues") or [])},
-                )
-        if inferred_plan_result.get("page_graph"):
-            inferred_targets = list(inferred_plan_result.get("target_files") or [])
-            inferred_backend_targets = list(inferred_plan_result.get("backend_targets") or [])
-            inferred_shared_files = list(inferred_plan_result.get("shared_files") or [])
-            inferred_files_to_read = list(inferred_plan_result.get("files_to_read") or [])
-            current_graph = dict(plan_result.get("page_graph") or {})
-            current_roles = dict(current_graph.get("roles") or {})
-            for role, inferred_role_payload in ((inferred_plan_result.get("page_graph") or {}).get("roles") or {}).items():
-                existing_role_payload = current_roles.get(role)
-                if not isinstance(existing_role_payload, dict) or not (existing_role_payload.get("pages") or []):
-                    current_roles[role] = inferred_role_payload
-            current_graph["roles"] = current_roles
-            plan_result["page_graph"] = current_graph
-            plan_result["target_files"] = list(dict.fromkeys([*(plan_result.get("target_files") or []), *inferred_targets]))
-            plan_result["backend_targets"] = list(dict.fromkeys([*(plan_result.get("backend_targets") or []), *inferred_backend_targets]))
-            plan_result["shared_files"] = list(dict.fromkeys([*(plan_result.get("shared_files") or []), *inferred_shared_files]))
-            plan_result["files_to_read"] = list(dict.fromkeys([*(plan_result.get("files_to_read") or []), *inferred_files_to_read]))
         self.service._store_report(f"role_contract:{workspace_id}", {"run_id": draft_run_id, "role_contract": role_contract})
         self.service._append_trace(
             workspace_id,
@@ -210,6 +182,80 @@ class MiniappGenerationEntry:
             started_at=started_at,
             should_stop=should_stop,
         )
+
+    def _merge_advisory_generation_inputs(
+        self,
+        *,
+        role_contract: dict[str, Any],
+        inferred_role_contract: dict[str, Any],
+        advisory_plan_result: dict[str, Any],
+        inferred_plan_result: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        merged_roles = dict(inferred_role_contract.get("roles") or {})
+        merged_roles.update(role_contract.get("roles") or {})
+        merged_role_contract = {
+            **inferred_role_contract,
+            **role_contract,
+            "roles": merged_roles,
+        }
+        merged_plan = dict(inferred_plan_result)
+        current_graph = dict((merged_plan.get("page_graph") or {}))
+        current_roles = dict((current_graph.get("roles") or {}))
+        advisory_graph = dict(advisory_plan_result.get("page_graph") or {})
+        for role, advisory_role_payload in (advisory_graph.get("roles") or {}).items():
+            existing_role_payload = current_roles.get(role)
+            if not isinstance(existing_role_payload, dict) or not (existing_role_payload.get("pages") or []):
+                current_roles[role] = advisory_role_payload
+        current_graph["roles"] = current_roles
+        merged_plan["page_graph"] = current_graph
+        merged_plan["target_files"] = list(
+            dict.fromkeys(
+                [
+                    *(inferred_plan_result.get("target_files") or []),
+                    *[
+                        path
+                        for path in (advisory_plan_result.get("target_files") or [])
+                        if not str(path).startswith("miniapp/app/static/")
+                    ],
+                ]
+            )
+        )
+        for key in ("backend_targets", "shared_files", "files_to_read"):
+            merged_plan[key] = list(
+                dict.fromkeys(
+                    [
+                        *(inferred_plan_result.get(key) or []),
+                        *(advisory_plan_result.get(key) or []),
+                    ]
+                )
+            )
+        merged_plan["plan_gate_issues"] = list(advisory_plan_result.get("plan_gate_issues") or [])
+        merged_plan["model"] = advisory_plan_result.get("model") or inferred_plan_result.get("model")
+        merged_plan["strategy_reason"] = (
+            str(advisory_plan_result.get("strategy_reason") or "").strip()
+            or str(inferred_plan_result.get("strategy_reason") or "").strip()
+            or "Prompt and template affordances shaped the writable surface before tool-owned generation."
+        )
+        merged_plan["write_strategy"] = advisory_plan_result.get("write_strategy") or inferred_plan_result.get("write_strategy") or "whole_file_build"
+        merged_plan["scope_mode"] = advisory_plan_result.get("scope_mode") or inferred_plan_result.get("scope_mode") or "whole_file_build"
+        merged_plan["flow_mode"] = advisory_plan_result.get("flow_mode") or inferred_plan_result.get("flow_mode") or "multi_page"
+        merged_plan["require_multi_page"] = bool(
+            advisory_plan_result.get("require_multi_page")
+            if "require_multi_page" in advisory_plan_result
+            else inferred_plan_result.get("require_multi_page")
+        )
+        merged_plan["require_business_pages"] = False
+        merged_plan["generation_clusters"] = list(
+            advisory_plan_result.get("generation_clusters")
+            or inferred_plan_result.get("generation_clusters")
+            or []
+        )
+        merged_plan["execution_plan"] = dict(
+            advisory_plan_result.get("execution_plan")
+            or inferred_plan_result.get("execution_plan")
+            or {}
+        )
+        return merged_role_contract, merged_plan
 
     def continue_generation_from_plan(
         self,

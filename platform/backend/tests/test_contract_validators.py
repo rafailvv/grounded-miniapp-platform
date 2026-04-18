@@ -975,6 +975,90 @@ def test_build_validator_flags_placeholder_persistence_handlers(tmp_path: Path) 
     assert any(issue.code == "build.placeholder_profile_seed" for issue in issues)
 
 
+def test_build_validator_flags_fake_persistence_form_without_api_write(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    graph = _multi_page_graph()
+    _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/route_manifest.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/runtime_manifest.json", json.dumps({"roles": {}}))
+    _write_workspace_file(workspace_root, "miniapp/app/static/shared/base.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/index.html",
+        '<html><head><link rel="stylesheet" href="/static/shared/base.css" /><link rel="stylesheet" href="/static/client/styles.css" /></head><body><main class="page-shell" style="padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));"><form id="request-form"><button type="submit">Create</button></form></main><script src="/static/preview_bridge.js" defer></script><script src="/static/client/app.js" defer></script></body></html>\n',
+    )
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/styles.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/app.js",
+        'document.getElementById("request-form")?.addEventListener("submit", (event) => { event.preventDefault(); console.log("saved"); });\n',
+    )
+
+    issues = BuildValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+
+    assert "build.fake_persistence_flow" in issue_codes
+
+
+def test_build_validator_flags_hardcoded_live_list_without_api_read(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    graph = _multi_page_graph()
+    _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/route_manifest.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/runtime_manifest.json", json.dumps({"roles": {}}))
+    _write_workspace_file(workspace_root, "miniapp/app/static/shared/base.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/index.html",
+        '<html><head><link rel="stylesheet" href="/static/shared/base.css" /><link rel="stylesheet" href="/static/client/styles.css" /></head><body><main class="page-shell" style="padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));"><section id="request-list"></section></main><script src="/static/preview_bridge.js" defer></script><script src="/static/client/app.js" defer></script></body></html>\n',
+    )
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/styles.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/app.js",
+        'const requests = [{ id: "req_1", title: "Hardcoded request", status: "open" }];\nconst list = document.getElementById("request-list"); if (list) { list.textContent = requests.map((item) => item.title).join(", "); }\n',
+    )
+
+    issues = BuildValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+
+    assert "build.hardcoded_live_list" in issue_codes
+
+
+def test_build_validator_accepts_profile_persistence_via_template_literal_api_contract(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    graph = _multi_page_graph()
+    client_pages = graph["roles"]["client"]["pages"]
+    client_pages[0]["route_path"] = "/profile"
+    client_pages[0]["page_kind"] = "profile"
+    client_pages[0]["file_path"] = "miniapp/app/static/client/profile/index.html"
+    client_pages[0]["script_path"] = "miniapp/app/static/client/profile/app.js"
+    client_pages[0]["style_path"] = "miniapp/app/static/client/profile/styles.css"
+    _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/route_manifest.json", json.dumps(graph))
+    _write_workspace_file(workspace_root, "miniapp/app/generated/runtime_manifest.json", json.dumps({"roles": {}}))
+    _write_workspace_file(workspace_root, "miniapp/app/static/shared/base.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/profile/index.html",
+        '<html><head><link rel="stylesheet" href="/static/shared/base.css" /><link rel="stylesheet" href="/static/client/profile/styles.css" /></head><body><main class="page-shell" style="padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));"><form id="profile-form"><button id="save-button" type="submit">Save</button></form></main><script src="/static/preview_bridge.js" defer></script><script src="/static/client/profile/app.js" defer></script></body></html>\n',
+    )
+    _write_workspace_file(workspace_root, "miniapp/app/static/client/profile/styles.css", ".page-shell { padding-top: 76px; }\n")
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/profile/app.js",
+        "const role = 'client';\nfetch(`/api/profiles/${role}`).then((response) => response.json());\ndocument.getElementById('profile-form')?.addEventListener('submit', async (event) => { event.preventDefault(); await fetch(`/api/profiles/${role}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ first_name: 'Ada', last_name: 'Lovelace', email: 'ada@example.com', phone: '+70000000000', photo_url: null }) }); });\n",
+    )
+
+    issues = BuildValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+
+    assert "build.fake_persistence_flow" not in issue_codes
+
+
 def test_build_validator_flags_missing_shell_style_and_dom_contract_drift(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
     _create_workspace_scaffold(workspace_root)

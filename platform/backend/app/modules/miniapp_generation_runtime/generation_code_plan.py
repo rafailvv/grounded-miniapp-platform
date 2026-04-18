@@ -65,7 +65,33 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             planned["require_business_pages"] = False
             return planned
         except Exception as exc:
-            return {"error": f"Page graph planning failed: {exc}"}
+            self._append_trace(
+                workspace_id,
+                "code_plan_advisory_failed",
+                "Advisory code plan failed; generation will continue from prompt, template affordances, and tool exploration.",
+                {"error": str(exc)},
+            )
+            return {
+                "summary": "",
+                "flow_mode": "multi_page" if require_multi_page else "single_page",
+                "files_to_read": [],
+                "target_files": [],
+                "shared_files": [],
+                "backend_targets": [],
+                "generation_clusters": [],
+                "active_role_scope": [],
+                "execution_plan": {},
+                "planner_contract_enrichment": {"proactive_backend_targets": []},
+                "page_graph": {"roles": {}},
+                "scope_mode": scope_mode,
+                "require_multi_page": require_multi_page,
+                "write_strategy": scope_mode,
+                "strategy_reason": strategy_reason,
+                "model": "code-plan-advisory-missing",
+                "plan_gate_issues": [],
+                "require_business_pages": False,
+                "error": f"Page graph planning failed: {exc}",
+            }
 
     def _generate_code_plan_sections_with_timeout(
         self,

@@ -6,6 +6,11 @@ import re
 
 from app.models.grounded_spec import GroundedSpecModel
 from app.models.artifacts import ValidationIssue
+from app.services.miniapp_generation.shell_contract import (
+    BASE_STYLESHEET_HREF,
+    PAGE_SHELL_CLASS,
+    PREVIEW_BRIDGE_SRC,
+)
 
 
 class BuildValidator:
@@ -345,7 +350,7 @@ class BuildValidator:
                             location=file_path_raw,
                         )
                     )
-                if "/static/shared/base.css" not in content:
+                if BASE_STYLESHEET_HREF not in content:
                     issues.append(
                         ValidationIssue(
                             code="build.page_missing_shell_style_link",
@@ -354,7 +359,7 @@ class BuildValidator:
                             location=file_path_raw,
                         )
                     )
-                if "/static/preview_bridge.js" not in content:
+                if PREVIEW_BRIDGE_SRC not in content:
                     issues.append(
                         ValidationIssue(
                             code="build.page_missing_preview_bridge",
@@ -363,7 +368,7 @@ class BuildValidator:
                             location=file_path_raw,
                         )
                     )
-                if "page-shell" not in content:
+                if PAGE_SHELL_CLASS not in content:
                     issues.append(
                         ValidationIssue(
                             code="build.page_missing_shell_root",
@@ -516,7 +521,7 @@ class BuildValidator:
                         location=file_path_raw,
                     )
                 )
-                if "/static/shared/base.css" not in content:
+                if BASE_STYLESHEET_HREF not in content:
                     issues.append(
                         ValidationIssue(
                             code="build.page_missing_shell_style_link",
@@ -865,7 +870,122 @@ class BuildValidator:
                         location=str(path.relative_to(workspace_path)),
                     )
                 )
+        route_manifest = self._read_json(workspace_path / "miniapp" / "app" / "generated" / "route_manifest.json")
+        if isinstance(route_manifest, dict):
+            for role, role_payload in (route_manifest.get("roles") or {}).items():
+                if not isinstance(role_payload, dict):
+                    continue
+                for page in role_payload.get("pages") or []:
+                    if not isinstance(page, dict):
+                        continue
+                    file_path_raw = str(page.get("file_path") or "")
+                    script_path_raw = str(page.get("script_path") or "")
+                    if not file_path_raw or not script_path_raw:
+                        continue
+                    html_path = workspace_path / file_path_raw
+                    script_path = workspace_path / script_path_raw
+                    if not html_path.exists() or not script_path.exists():
+                        continue
+                    try:
+                        html_content = html_path.read_text(encoding="utf-8")
+                        script_content = script_path.read_text(encoding="utf-8")
+                    except OSError:
+                        continue
+                    if (
+                        self._looks_like_persisted_form_surface(html_content)
+                        and not self._contains_real_api_write(script_content)
+                        and not self._uses_canonical_profile_contract(page, script_content)
+                    ):
+                        issues.append(
+                            ValidationIssue(
+                                code="build.fake_persistence_flow",
+                                message=f"{Path(file_path_raw).name} renders a create/update form without a real API-backed write path.",
+                                severity="high",
+                                location=file_path_raw,
+                            )
+                        )
+                    if self._looks_like_live_collection_surface(html_content) and self._contains_hardcoded_live_collection(script_content) and not self._contains_real_api_read(script_content):
+                        issues.append(
+                            ValidationIssue(
+                                code="build.hardcoded_live_list",
+                                message=f"{Path(file_path_raw).name} renders a live workflow list from hardcoded in-memory data instead of reading persisted records through the API.",
+                                severity="high",
+                                location=script_path_raw,
+                            )
+                        )
         return issues
+
+    @staticmethod
+    def _looks_like_persisted_form_surface(html_content: str) -> bool:
+        lowered = str(html_content or "").lower()
+        return (
+            "<form" in lowered
+            or "type=\"submit\"" in lowered
+            or "type='submit'" in lowered
+            or ">create<" in lowered
+            or ">save<" in lowered
+            or ">update<" in lowered
+            or ">assign<" in lowered
+        )
+
+    @staticmethod
+    def _looks_like_live_collection_surface(html_content: str) -> bool:
+        lowered = str(html_content or "").lower()
+        markers = (
+            "request-list",
+            "records-list",
+            "orders-list",
+            "tasks-list",
+            "queue-list",
+            "workload-list",
+            "comments-list",
+            "data-list",
+            "<table",
+            "<tbody",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _contains_real_api_read(script_content: str) -> bool:
+        content = str(script_content or "")
+        return bool(
+            "miniappApiFetch(" in content
+            or "window.miniappApiFetch(" in content
+            or re.search(r"fetch\(\s*[\"'`]/api/", content)
+        )
+
+    @staticmethod
+    def _contains_real_api_write(script_content: str) -> bool:
+        content = str(script_content or "")
+        has_api_call = bool(
+            "miniappApiFetch(" in content
+            or "window.miniappApiFetch(" in content
+            or re.search(r"fetch\(\s*[\"'`]/api/", content)
+        )
+        has_write_method = bool(re.search(r"method\s*:\s*[\"'](?:POST|PUT|PATCH|DELETE)[\"']", content, flags=re.IGNORECASE))
+        return has_api_call and has_write_method
+
+    @staticmethod
+    def _uses_canonical_profile_contract(page: dict, script_content: str) -> bool:
+        route_path = str(page.get("route_path") or "").rstrip("/")
+        page_kind = str(page.get("page_kind") or "").lower()
+        if route_path != "/profile" and page_kind != "profile":
+            return False
+        content = str(script_content or "")
+        if "profileStore" in content or "@/lib/profile/" in content:
+            return True
+        if "/api/profiles/" not in content:
+            return False
+        return BuildValidator._contains_real_api_read(content) and BuildValidator._contains_real_api_write(content)
+
+    @staticmethod
+    def _contains_hardcoded_live_collection(script_content: str) -> bool:
+        content = str(script_content or "")
+        collection_pattern = re.compile(
+            r"\b(?:const|let|var)\s+(?:requests|records|orders|tasks|items|queue|workload|comments|entries)\s*=\s*\[\s*\{",
+            flags=re.IGNORECASE,
+        )
+        return bool(collection_pattern.search(content))
 
     @staticmethod
     def _read_json(path: Path) -> dict | list | None:

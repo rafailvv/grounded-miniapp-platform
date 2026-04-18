@@ -20,7 +20,7 @@ class ServiceContractMaterializationMixins:
         for source in generated_page_sources.values():
             if not isinstance(source, str):
                 continue
-            for match in re.finditer(r"['\"](/api/([a-zA-Z0-9_-]+))([/'\"?]|$)", source):
+            for match in re.finditer(r"[\"'`](/api/([a-zA-Z0-9_-]+))([/'\"`?]|$)", source):
                 endpoint_names.add(match.group(2))
         if not endpoint_names:
             return []

@@ -232,21 +232,6 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             scope_mode=plan_result["scope_mode"],
             generation_mode=generation_mode,
         )
-        if materialization_gate is not None:
-            failure_code, failure_messages = materialization_gate
-            service._append_trace(
-                workspace_id,
-                "materialization_blocked",
-                "Code editing did not materialize the planned workflow surface.",
-                {"messages": failure_messages, "materialization_report": materialization_report.model_dump(mode="json")},
-            )
-            return service._block_with_messages(
-                job,
-                failure_messages,
-                code=failure_code,
-                event_type="validation_failed",
-                failure_reason="Code editing did not materialize the planned workflow surface.",
-            )
         edit_gate_issues = service._edit_gate_issues(
             plan_result["page_graph"],
             operations,
@@ -255,20 +240,46 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             target_files=plan_result["target_files"],
             require_business_pages=bool(plan_result.get("require_business_pages")),
         )
+        initial_loop_diagnostics: list[str] = []
+        if materialization_gate is not None:
+            failure_code, failure_messages = materialization_gate
+            service._append_trace(
+                workspace_id,
+                "materialization_needs_iteration",
+                "Initial code generation did not fully materialize the intended workflow surface and will continue through exact-check iteration.",
+                {
+                    "code": failure_code,
+                    "messages": failure_messages,
+                    "materialization_report": materialization_report.model_dump(mode="json"),
+                },
+            )
+            service._append_event(
+                job,
+                "materialization_needs_iteration",
+                "Initial generation produced a partial workflow surface. Continuing through exact-check iteration instead of blocking early.",
+                {"messages": failure_messages},
+            )
+            initial_loop_diagnostics.extend(failure_messages)
         if edit_gate_issues:
             service._append_trace(
                 workspace_id,
-                "editing_blocked",
-                "Code editing was blocked because the draft still collapses into placeholder surfaces.",
+                "editing_needs_iteration",
+                "Initial code generation left placeholder or structural issues that will be handled by the workspace loop.",
                 {"issues": edit_gate_issues, "materialization_report": materialization_report.model_dump(mode="json")},
             )
-            return service._block_with_messages(
+            service._append_event(
                 job,
-                edit_gate_issues,
-                code="generation.edit.placeholder_surface_detected",
-                event_type="validation_failed",
-                failure_reason="Code editing did not produce the required page-based app structure.",
+                "editing_needs_iteration",
+                "Initial generation left placeholder or structural issues. Continuing through exact-check iteration.",
+                {"issues": edit_gate_issues},
             )
+            initial_loop_diagnostics.extend(edit_gate_issues)
+        loop_seed_message = edit_result["assistant_message"]
+        if initial_loop_diagnostics:
+            loop_seed_message = (
+                f"{loop_seed_message}\n\nInitial iteration diagnostics:\n- "
+                + "\n- ".join(dict.fromkeys(initial_loop_diagnostics))
+            ).strip()
         job.latency_breakdown["patch_apply_ms"] = max(0, int((time.perf_counter() - started_at) * 1000) - retrieval_ms)
         loop_result = service.generation_repair.run_generation_workspace_loop(
             workspace_id=workspace_id,
@@ -286,7 +297,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             creative_direction=creative_direction,
             files_read=files_read,
             initial_operations=list(operations),
-            initial_assistant_message=edit_result["assistant_message"],
+            initial_assistant_message=loop_seed_message,
             should_stop=should_stop,
         )
         latest_preview = service.preview_service.get(workspace_id)

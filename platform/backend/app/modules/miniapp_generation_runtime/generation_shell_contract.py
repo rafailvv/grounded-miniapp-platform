@@ -3,15 +3,23 @@ from __future__ import annotations
 import re
 
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
+from app.services.miniapp_generation.shell_contract import (
+    BASE_STYLESHEET_HREF,
+    BASE_STYLESHEET_PATH,
+    PAGE_SHELL_CLASS,
+    PAGE_SHELL_INLINE_STYLE,
+    PREVIEW_BRIDGE_PATH,
+    PREVIEW_BRIDGE_SRC,
+)
 
 
 class MiniappGenerationShellContract(MiniappGenerationRuntimeOwner):
-    BASE_STYLESHEET_PATH = "miniapp/app/static/shared/base.css"
-    BASE_STYLESHEET_HREF = "/static/shared/base.css"
-    PREVIEW_BRIDGE_PATH = "miniapp/app/static/preview_bridge.js"
-    PREVIEW_BRIDGE_SRC = "/static/preview_bridge.js"
-    PAGE_SHELL_CLASS = "page-shell"
-    PAGE_SHELL_INLINE_STYLE = "padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));"
+    BASE_STYLESHEET_PATH = BASE_STYLESHEET_PATH
+    BASE_STYLESHEET_HREF = BASE_STYLESHEET_HREF
+    PREVIEW_BRIDGE_PATH = PREVIEW_BRIDGE_PATH
+    PREVIEW_BRIDGE_SRC = PREVIEW_BRIDGE_SRC
+    PAGE_SHELL_CLASS = PAGE_SHELL_CLASS
+    PAGE_SHELL_INLINE_STYLE = PAGE_SHELL_INLINE_STYLE
 
     @classmethod
     def shared_base_link_tag(cls) -> str:

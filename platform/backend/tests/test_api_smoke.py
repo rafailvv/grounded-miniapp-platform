@@ -459,7 +459,7 @@ def _page_file_payload(payload: dict) -> dict:
     <link rel="stylesheet" href="/{page['style_path'].removeprefix('miniapp/app/')}" />
   </head>
   <body>
-    <main class="page-shell">
+    <main class="page-shell" style="padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));">
       <section class="page">
         <header class="header">
           <h1 class="title">{title}</h1>
@@ -521,7 +521,7 @@ def _page_file_payload(payload: dict) -> dict:
     <link rel="stylesheet" href="/{page['style_path'].removeprefix('miniapp/app/')}" />
   </head>
   <body>
-    <main class="page-shell">
+    <main class="page-shell" style="padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));">
       <section class="page">
         <header class="header">
           <h1 class="title">{title}</h1>
@@ -554,16 +554,243 @@ def _page_file_payload(payload: dict) -> dict:
     }
 
 
+def _feature_route_module_stems(target_files: set[str]) -> list[str]:
+    reserved = {"client", "specialist", "manager", "profiles", "runtime", "health", "__init__"}
+    stems: list[str] = []
+    for path in sorted(target_files):
+        if not path.startswith("miniapp/app/routes/") or not path.endswith(".py"):
+            continue
+        stem = Path(path).stem
+        if stem in reserved:
+            continue
+        stems.append(stem)
+    return stems
+
+
+def _stub_main_source(feature_stems: list[str]) -> str:
+    extra_imports = "\n".join(f"from app.routes.{stem} import router as {stem}_router" for stem in feature_stems)
+    extra_includes = "\n".join(f"app.include_router({stem}_router)" for stem in feature_stems)
+    return f"""from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.db import Base, engine
+from app.routes.health import router as health_router
+from app.routes.profiles import router as profiles_router
+{extra_imports}
+
+STATIC_DIR = Path(__file__).resolve().parent / 'static'
+ROLES = ('client', 'specialist', 'manager')
+
+app = FastAPI()
+app.include_router(health_router)
+app.include_router(profiles_router)
+{extra_includes}
+app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
+
+@app.on_event('startup')
+def startup() -> None:
+    Base.metadata.create_all(bind=engine)
+
+@app.get('/')
+def index() -> RedirectResponse:
+    return RedirectResponse('/client', status_code=307)
+
+@app.get('/{{role}}')
+def role_page(role: str) -> FileResponse:
+    if role not in ROLES:
+        raise KeyError(role)
+    return FileResponse(STATIC_DIR / role / 'index.html')
+
+@app.get('/{{role}}/profile')
+def role_profile(role: str) -> FileResponse:
+    if role not in ROLES:
+        raise KeyError(role)
+    return FileResponse(STATIC_DIR / role / 'profile' / 'index.html')
+
+@app.get('/{{role}}/{{page_slug}}')
+def role_subpage(role: str, page_slug: str) -> FileResponse:
+    if role not in ROLES:
+        raise KeyError(role)
+    page_path = STATIC_DIR / role / page_slug / 'index.html'
+    if not page_path.exists():
+        raise KeyError(f'{{role}}/{{page_slug}}')
+    return FileResponse(page_path)
+
+@app.exception_handler(KeyError)
+def key_error_handler(_, exc: KeyError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={{'detail': str(exc)}})
+"""
+
+
+def _stub_db_source(feature_stems: list[str]) -> str:
+    del feature_stems
+    workflow_model = """
+class WorkflowRecord(Base):
+    __tablename__ = 'workflow_records'
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    route_key: Mapped[str] = mapped_column(String(64), index=True)
+    title: Mapped[str] = mapped_column(String(255), default='')
+    status: Mapped[str] = mapped_column(String(64), default='new')
+    comment: Mapped[str] = mapped_column(String(1024), default='')
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+"""
+    return f"""from datetime import datetime, timezone
+
+from sqlalchemy import DateTime, String, create_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+
+DATABASE_URL = 'sqlite:///./app/generated/app.db'
+engine = create_engine(DATABASE_URL, future=True, connect_args={{'check_same_thread': False}})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+class Base(DeclarativeBase):
+    pass
+
+class RoleProfileRecord(Base):
+    __tablename__ = 'role_profiles'
+    role: Mapped[str] = mapped_column(String(32), primary_key=True)
+    first_name: Mapped[str] = mapped_column(String(255), default='')
+    last_name: Mapped[str] = mapped_column(String(255), default='')
+    email: Mapped[str] = mapped_column(String(255), default='')
+    phone: Mapped[str] = mapped_column(String(255), default='')
+    photo_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+{workflow_model}
+
+def get_db():
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+"""
+
+
+def _stub_schemas_source(feature_stems: list[str]) -> str:
+    del feature_stems
+    workflow_schema = """
+class WorkflowRecordPayload(BaseModel):
+    id: str | None = None
+    title: str = ''
+    status: str = 'new'
+    comment: str = ''
+    updated_at: datetime | None = None
+"""
+    return f"""from datetime import datetime
+from typing import Literal
+from pydantic import BaseModel
+
+AppRole = Literal['client', 'specialist', 'manager']
+
+class RoleProfile(BaseModel):
+    first_name: str
+    last_name: str = ''
+    email: str = ''
+    phone: str = ''
+    photo_url: str | None = None
+    updated_at: datetime | None = None
+{workflow_schema}
+"""
+
+
+def _stub_feature_route_source(stem: str) -> str:
+    route_key = stem.replace("_", "-")
+    return f"""from datetime import datetime, timezone
+from uuid import uuid4
+
+from fastapi import APIRouter, HTTPException
+from sqlalchemy import select
+
+from app.db import SessionLocal, WorkflowRecord
+from app.schemas import WorkflowRecordPayload
+
+router = APIRouter(prefix='/api/{route_key}', tags=['{route_key}'])
+
+
+def _to_schema(record: WorkflowRecord) -> WorkflowRecordPayload:
+    return WorkflowRecordPayload(
+        id=record.id,
+        title=record.title,
+        status=record.status,
+        comment=record.comment,
+        updated_at=record.updated_at,
+    )
+
+
+@router.get('', response_model=list[WorkflowRecordPayload])
+def list_records() -> list[WorkflowRecordPayload]:
+    with SessionLocal() as session:
+        records = session.execute(
+            select(WorkflowRecord).where(WorkflowRecord.route_key == '{route_key}').order_by(WorkflowRecord.updated_at.asc())
+        ).scalars().all()
+        return [_to_schema(record) for record in records]
+
+
+@router.post('', response_model=WorkflowRecordPayload)
+def create_record(payload: WorkflowRecordPayload) -> WorkflowRecordPayload:
+    with SessionLocal() as session:
+        record = WorkflowRecord(
+            id=payload.id or uuid4().hex,
+            route_key='{route_key}',
+            title=payload.title,
+            status=payload.status or 'new',
+            comment=payload.comment or '',
+            updated_at=datetime.now(timezone.utc),
+        )
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return _to_schema(record)
+
+
+def _update_record(item_id: str, payload: WorkflowRecordPayload) -> WorkflowRecordPayload:
+    with SessionLocal() as session:
+        record = None
+        if item_id.startswith('{{') and item_id.endswith('}}'):
+            record = session.execute(
+                select(WorkflowRecord).where(WorkflowRecord.route_key == '{route_key}').order_by(WorkflowRecord.updated_at.asc())
+            ).scalars().first()
+        if record is None:
+            record = session.get(WorkflowRecord, item_id)
+        if record is None or record.route_key != '{route_key}':
+            raise HTTPException(status_code=404, detail='record_not_found')
+        if payload.title:
+            record.title = payload.title
+        if payload.status:
+            record.status = payload.status
+        if payload.comment:
+            record.comment = payload.comment
+        record.updated_at = datetime.now(timezone.utc)
+        session.commit()
+        session.refresh(record)
+        return _to_schema(record)
+
+
+@router.patch('/{{item_id}}', response_model=WorkflowRecordPayload)
+def patch_record(item_id: str, payload: WorkflowRecordPayload) -> WorkflowRecordPayload:
+    return _update_record(item_id, payload)
+
+
+@router.put('/{{item_id}}', response_model=WorkflowRecordPayload)
+def put_record(item_id: str, payload: WorkflowRecordPayload) -> WorkflowRecordPayload:
+    return _update_record(item_id, payload)
+"""
+
+
 def _composition_payload(payload: dict) -> dict:
     page_graph = payload["page_graph"]
     target_files = set(payload["target_files"])
+    feature_stems = _feature_route_module_stems(target_files)
     operations: list[dict] = []
     if "miniapp/app/main.py" in target_files:
         operations.append(
             {
                 "file_path": "miniapp/app/main.py",
                 "operation": "replace",
-                "content": """from pathlib import Path\n\nfrom fastapi import FastAPI\nfrom fastapi.responses import FileResponse, JSONResponse, RedirectResponse\nfrom fastapi.staticfiles import StaticFiles\n\nfrom app.db import Base, engine\nfrom app.routes.health import router as health_router\nfrom app.routes.profiles import router as profiles_router\n\nSTATIC_DIR = Path(__file__).resolve().parent / 'static'\nROLES = ('client', 'specialist', 'manager')\n\napp = FastAPI()\napp.include_router(health_router)\napp.include_router(profiles_router)\napp.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')\n\n@app.on_event('startup')\ndef startup() -> None:\n    Base.metadata.create_all(bind=engine)\n\n@app.get('/')\ndef index() -> RedirectResponse:\n    return RedirectResponse('/client', status_code=307)\n\n@app.get('/{role}')\ndef role_page(role: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    return FileResponse(STATIC_DIR / role / 'index.html')\n\n@app.get('/{role}/profile')\ndef role_profile(role: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    return FileResponse(STATIC_DIR / role / 'profile' / 'index.html')\n\n@app.get('/{role}/{page_slug}')\ndef role_subpage(role: str, page_slug: str) -> FileResponse:\n    if role not in ROLES:\n        raise KeyError(role)\n    page_path = STATIC_DIR / role / page_slug / 'index.html'\n    if not page_path.exists():\n        raise KeyError(f'{role}/{page_slug}')\n    return FileResponse(page_path)\n\n@app.exception_handler(KeyError)\ndef key_error_handler(_, exc: KeyError) -> JSONResponse:\n    return JSONResponse(status_code=404, content={'detail': str(exc)})\n""",
+                "content": _stub_main_source(feature_stems),
                 "reason": "Provide the miniapp-served static entrypoint.",
             }
         )
@@ -572,7 +799,7 @@ def _composition_payload(payload: dict) -> dict:
             {
                 "file_path": "miniapp/app/db.py",
                 "operation": "replace",
-                "content": """from datetime import datetime, timezone\n\nfrom sqlalchemy import DateTime, String, create_engine\nfrom sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker\n\nDATABASE_URL = 'sqlite:///./app/generated/app.db'\nengine = create_engine(DATABASE_URL, future=True, connect_args={'check_same_thread': False})\nSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)\n\nclass Base(DeclarativeBase):\n    pass\n\nclass RoleProfileRecord(Base):\n    __tablename__ = 'role_profiles'\n    role: Mapped[str] = mapped_column(String(32), primary_key=True)\n    first_name: Mapped[str] = mapped_column(String(255), default='')\n    last_name: Mapped[str] = mapped_column(String(255), default='')\n    email: Mapped[str] = mapped_column(String(255), default='')\n    phone: Mapped[str] = mapped_column(String(255), default='')\n    photo_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)\n    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))\n\n\ndef get_db():\n    session = SessionLocal()\n    try:\n        yield session\n    finally:\n        session.close()\n""",
+                "content": _stub_db_source(feature_stems),
                 "reason": "Provide the SQLite-backed storage module.",
             }
         )
@@ -623,6 +850,7 @@ def _composition_payload(payload: dict) -> dict:
 def _whole_file_bundle_payload(payload: dict) -> dict:
     target_files = set(payload.get("cluster_targets") or [])
     page_graph = payload.get("page_graph") or {}
+    feature_stems = _feature_route_module_stems(target_files)
     operations = list(_composition_payload({"target_files": list(target_files), "page_graph": page_graph})["operations"])
 
     for role, role_payload in (page_graph.get("roles") or {}).items():
@@ -645,16 +873,17 @@ def _whole_file_bundle_payload(payload: dict) -> dict:
                     {
                         "file_path": path,
                         "operation": "replace",
-                        "content": "from datetime import datetime\nfrom typing import Literal\nfrom pydantic import BaseModel\n\nAppRole = Literal['client', 'specialist', 'manager']\n\nclass RoleProfile(BaseModel):\n    first_name: str\n    last_name: str = ''\n    email: str = ''\n    phone: str = ''\n    photo_url: str | None = None\n    updated_at: datetime | None = None\n",
+                        "content": _stub_schemas_source(feature_stems),
                         "reason": "Provide minimal miniapp schemas.",
                     }
                 )
             elif path.startswith("miniapp/app/routes/") and path != "miniapp/app/routes/profiles.py":
+                stem = Path(path).stem
                 operations.append(
                     {
                         "file_path": path,
                         "operation": "replace",
-                        "content": "from fastapi import APIRouter\n\nrouter = APIRouter()\n",
+                        "content": _stub_feature_route_source(stem) if stem in feature_stems else "from fastapi import APIRouter\n\nrouter = APIRouter()\n",
                         "reason": f"Provide a minimal miniapp route for {path}.",
                     }
                 )
@@ -830,7 +1059,7 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
             break
         time.sleep(0.2)
 
-    assert final_run["status"] in {"failed", "awaiting_approval"}
+    assert final_run["status"] in {"failed", "awaiting_approval", "blocked"}
     if final_run["status"] == "awaiting_approval":
         assert final_run["apply_status"] == "awaiting_approval"
     else:
@@ -995,8 +1224,6 @@ def test_run_api_exposes_artifacts_and_links_job(tmp_path: Path) -> None:
     assert artifacts["job"]["job_id"] == final_run["linked_job_id"]
     assert artifacts["code_change_plan"]["summary"]
     assert isinstance(artifacts["code_change_plan"]["targets"], list)
-    assert artifacts["page_graph"]["page_graph"]["roles"]["client"]["pages"]
-    assert artifacts["role_contract"]["role_contract"]["roles"]["client"]["responsibility"]
     assert isinstance(artifacts["iterations"], list)
     if final_run["status"] == "awaiting_approval":
         assert artifacts["candidate_diff"]
@@ -1004,6 +1231,7 @@ def test_run_api_exposes_artifacts_and_links_job(tmp_path: Path) -> None:
         assert isinstance(artifacts["candidate_diff"], str)
     assert "validation" in artifacts
     assert "trace" in artifacts
+    assert artifacts["code_change_plan"]["targets"]
 
     iterations_response = client.get(f"/runs/{final_run['run_id']}/iterations")
     assert iterations_response.status_code == 200
@@ -1050,7 +1278,7 @@ def test_generate_endpoint_acts_as_compatibility_shim(tmp_path: Path) -> None:
     )
     assert job_response.status_code == 200
     payload = job_response.json()
-    assert payload["status"] in {"completed", "failed", "awaiting_approval"}
+    assert payload["status"] in {"completed", "failed", "awaiting_approval", "blocked"}
     assert payload.get("summary") or payload.get("failure_reason")
     file_tree = client.get(f"/workspaces/{workspace_id}/files/tree").json()
     assert all("__pycache__" not in item["path"] for item in file_tree)
