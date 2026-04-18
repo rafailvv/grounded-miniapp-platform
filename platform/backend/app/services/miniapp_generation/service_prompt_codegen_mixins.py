@@ -4,6 +4,7 @@ from typing import Any
 
 from app.models.common import GenerationMode
 from app.models.grounded_spec import GroundedSpecModel
+from app.modules.miniapp_agent_loop.tool_agent_runtime import tool_patch_schema
 from app.modules.miniapp_generation_runtime import (
     MiniappGenerationCodePlanPrompts,
     MiniappGenerationCodegenPrompts,
@@ -24,28 +25,7 @@ class ServicePromptCodegenMixins:
 
     @staticmethod
     def _code_edit_schema() -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "assistant_message": {"type": "string"},
-                "operations": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "operation": {"type": "string", "enum": ["create", "replace", "delete"]},
-                            "content": {"type": ["string", "null"]},
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["file_path", "operation", "reason"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["assistant_message", "operations"],
-            "additionalProperties": False,
-        }
+        return tool_patch_schema()
 
     @staticmethod
     def _role_contract_system_prompt() -> str:
@@ -103,6 +83,10 @@ class ServicePromptCodegenMixins:
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
         recovery_mode: str = "default",
+        workspace_id: str | None = None,
+        draft_run_id: str | None = None,
+        workspace_tree: list[dict[str, str]] | None = None,
+        draft_source=None,
     ) -> dict[str, Any]:
         return self.generation_codegen_selection._resolve_page_file_edit(
             prompt=prompt,
@@ -117,6 +101,10 @@ class ServicePromptCodegenMixins:
             generation_mode=generation_mode,
             creative_direction=creative_direction,
             recovery_mode=recovery_mode,
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
+            workspace_tree=workspace_tree,
+            draft_source=draft_source,
         )
 
     def _resolve_composition_edit(self, **kwargs: Any) -> dict[str, Any]:

@@ -52,6 +52,7 @@ from app.modules.miniapp_generation_runtime import (
     MiniappGenerationCodegenPrompts,
     MiniappGenerationCodegenSelection,
     MiniappGenerationEntry,
+    MiniappGenerationNormalLoop,
     MiniappGenerationPageGraphRuntime,
     MiniappGenerationPlanRuntime,
     MiniappGenerationReporting,
@@ -61,6 +62,7 @@ from app.modules.miniapp_generation_runtime import (
     MiniappGenerationRoleContract,
     MiniappGenerationTargeting,
     MiniappGenerationRepair,
+    MiniappGenerationShellContract,
     MiniappGroundedSpecBuilder,
     compile_prompt_to_scaffold,
     mentions_schedule_or_time,
@@ -117,6 +119,7 @@ class GenerationService(
             "generation_completion": MiniappGenerationCompletion,
             "generation_repair": MiniappGenerationRepair,
             "generation_entry": MiniappGenerationEntry,
+            "generation_normal_loop": MiniappGenerationNormalLoop,
             "generation_resume": MiniappGenerationResume,
             "generation_plan_runtime": MiniappGenerationPlanRuntime,
             "generation_role_contract": MiniappGenerationRoleContract,
@@ -140,6 +143,7 @@ class GenerationService(
             "generation_contract_schema": MiniappGenerationContractSchema,
             "generation_contract_routes": MiniappGenerationContractRoutes,
             "generation_contract_frontend": MiniappGenerationContractFrontend,
+            "generation_shell_contract": MiniappGenerationShellContract,
         }
 
     def __init__(
@@ -187,12 +191,14 @@ class GenerationService(
         self.generation_contract_schema = MiniappGenerationContractSchema(self)
         self.generation_contract_routes = MiniappGenerationContractRoutes(self)
         self.generation_contract_frontend = MiniappGenerationContractFrontend(self)
+        self.generation_shell_contract = MiniappGenerationShellContract(self)
         self.runtime_contract_sync = MiniappRuntimeContractSync(workspace_service=self.workspace_service, read_content=self._operation_or_workspace_content)
         self.grounded_spec_builder = MiniappGroundedSpecBuilder(self)
         self.grounded_spec_orchestration = GroundedSpecOrchestrationRuntime(self)
         self.generation_completion = MiniappGenerationCompletion()
         self.generation_repair = MiniappGenerationRepair(self)
         self.generation_entry = MiniappGenerationEntry(self)
+        self.generation_normal_loop = MiniappGenerationNormalLoop(self)
         self.generation_resume = MiniappGenerationResume(self)
         self.generation_plan_runtime = MiniappGenerationPlanRuntime(self)
         self.generation_role_contract = MiniappGenerationRoleContract(self)

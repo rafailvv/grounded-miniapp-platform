@@ -6,6 +6,7 @@ from typing import Any
 from app.models.artifacts import ValidationIssue
 from app.models.common import GenerationMode
 from app.models.domain import DraftFileOperation, RunCheckResult
+from app.modules.miniapp_agent_loop.tool_agent_runtime import tool_patch_schema
 from app.services.workspace.service import json_dumps
 from app.modules.miniapp_generation_runtime import MiniappGenerationReporting, MiniappGenerationReportingCompaction, MiniappGenerationReportingRepair
 
@@ -91,12 +92,15 @@ class ServiceRepairReportingMixins:
             raise RuntimeError(f"{file_path} must define router = APIRouter(...).")
 
     @staticmethod
+    def _repair_schema() -> dict[str, Any]:
+        return tool_patch_schema()
+
+    @staticmethod
     def _repair_system_prompt() -> str:
         prompt = (
-            "You repair an existing draft workspace after build or preview failure. "
-            "Return only the smallest safe set of file operations needed to make the draft compile and boot. "
-            "Do not expand scope, do not redesign the app, and do not touch files outside the provided target list. "
-            "Return executable file operations, not a repair plan."
+            "You repair an existing generated draft workspace after build or preview failure. "
+            "Work like a tool-using coding agent inside the existing miniapp template: inspect evidence first, then patch only the smallest safe set of files needed to restore a working three-role DB-backed app. "
+            "Preserve the current template shell, keep the 76px top safe-area contract, keep preview bridge wiring, and keep the canonical FastAPI/runtime structure unless the evidence explicitly shows it is broken."
         )
         from app.services.miniapp_generation.service import GenerationService
         GenerationService._assert_english_control_text(prompt)
@@ -125,6 +129,24 @@ class ServiceRepairReportingMixins:
             "preview_logs": kwargs["preview_logs"][-6:],
             "previous_turn_summary": kwargs.get("previous_turn_summary"),
             "previous_diff_summary": kwargs.get("previous_diff_summary"),
+            "tool_results": kwargs.get("tool_results") or [],
+            "read_only_surfaces": [
+                "miniapp/tests/",
+                "miniapp/app/generated/route_manifest.json",
+                "miniapp/app/generated/runtime_manifest.json",
+                "artifacts/generated_app_graph.json",
+            ],
+            "rules": [
+                "Use the tool-owned repair loop when evidence is insufficient: request list_files, read_files, search_files, run_command, or run_checks before editing.",
+                "Treat build_issues, preview_issue, target_files, file_contexts, and hard invariants as the source of truth.",
+                "Preserve the three-role DB-backed runtime and linked flows for client, specialist, and manager.",
+                "Preserve the shared shell contract, including the current 76px top safe-area baseline and preview bridge references.",
+                "Generated tests and generated manifests are read-only; repair application code instead.",
+                "Do not redesign the app or synthesize a new business flow. Fix the current failing cluster only.",
+                "If you return outcome=tool_request, return tool_requests and no operations.",
+                "Use run_checks mode=exact for focused verification and mode=final when you need the full final snapshot before patching.",
+                "run_command is diagnostic-only: destructive shell, git reset/discard, network fetches, package installs, and docker rebuild commands are blocked.",
+            ],
         })
 
     @staticmethod

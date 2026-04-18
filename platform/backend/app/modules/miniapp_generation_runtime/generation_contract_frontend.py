@@ -6,6 +6,7 @@ from typing import Any
 from app.modules.miniapp_contract.runtime_contract_sync import MiniappRuntimeContractSync
 from app.models.domain import DraftFileOperation
 
+from app.modules.miniapp_generation_runtime.generation_shell_contract import MiniappGenerationShellContract
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
 
 CANONICAL_ENDPOINT_ALIASES: dict[str, str] = {}
@@ -39,15 +40,15 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         updated = cls._strip_mock_profile_names(html)
         if updated != html:
             return True
-        if "/static/shared/base.css" not in updated:
+        if MiniappGenerationShellContract.BASE_STYLESHEET_HREF not in updated:
             return True
         if expected_style_href and expected_style_href not in updated:
             return True
         if expected_script_src and expected_script_src not in updated:
             return True
-        if "/static/preview_bridge.js" not in updated:
+        if MiniappGenerationShellContract.PREVIEW_BRIDGE_SRC not in updated:
             return True
-        if "page-shell" not in updated:
+        if MiniappGenerationShellContract.PAGE_SHELL_CLASS not in updated:
             return True
         if role:
             normalized_links = cls._normalize_role_local_links(updated, role=role, declared_routes=declared_routes)
@@ -212,13 +213,12 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
                 expected_script_src=expected_script_src,
             ):
                 continue
-            updated = updated.replace("/static/shell.css", "/static/shared/base.css")
-            if "/static/shared/base.css" not in updated:
-                updated = self._inject_head_asset_link(updated, '<link rel="stylesheet" href="/static/shared/base.css" />')
-            updated = self._ensure_preview_bridge_ref(updated)
+            updated = updated.replace("/static/shell.css", MiniappGenerationShellContract.BASE_STYLESHEET_HREF)
+            updated = self.generation_shell_contract.ensure_base_stylesheet_ref(updated)
+            updated = self.generation_shell_contract.ensure_preview_bridge_ref(updated)
             updated = self._ensure_head_asset_link(updated, expected_style_href)
             updated = self._ensure_body_script_ref(updated, expected_script_src)
-            updated = self._ensure_page_shell_contract(updated)
+            updated = self.generation_shell_contract.ensure_page_shell_contract(updated)
             if role:
                 updated = self._normalize_role_local_links(updated, role=role, declared_routes=role_routes.get(role) or set())
             expectation = page_expectations.get(file_path) or {}
@@ -270,46 +270,11 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
 
     @staticmethod
     def _ensure_preview_bridge_ref(html: str) -> str:
-        src = "/static/preview_bridge.js"
-        if src in html:
-            return html
-        tag = f'<script src="{src}" defer></script>'
-        body_match = re.search(r"</body>", html, flags=re.IGNORECASE)
-        if not body_match:
-            return f"{html}\n{tag}"
-        script_match = re.search(r"<script[^>]+src=[\"'][^\"']+[\"'][^>]*></script>", html, flags=re.IGNORECASE)
-        if script_match:
-            return html[: script_match.start()] + f"    {tag}\n" + html[script_match.start() :]
-        return html.replace("</body>", f"    {tag}\n</body>", 1)
+        return MiniappGenerationShellContract.ensure_preview_bridge_ref(html)
 
     @staticmethod
     def _ensure_page_shell_contract(html: str) -> str:
-        main_match = re.search(r"<main\b([^>]*)>", html, flags=re.IGNORECASE)
-        if not main_match:
-            return html
-        attributes = main_match.group(1)
-        updated_attrs = attributes
-        class_match = re.search(r"""class=(["'])([^"']*)\1""", attributes, flags=re.IGNORECASE)
-        if class_match:
-            classes = [item for item in re.split(r"\s+", class_match.group(2).strip()) if item]
-            if "page-shell" not in classes:
-                classes.append("page-shell")
-            replacement = f'class={class_match.group(1)}{" ".join(classes)}{class_match.group(1)}'
-            updated_attrs = updated_attrs[: class_match.start()] + replacement + updated_attrs[class_match.end() :]
-        else:
-            updated_attrs += ' class="page-shell"'
-        style_match = re.search(r"""style=(["'])([^"']*)\1""", updated_attrs, flags=re.IGNORECASE)
-        shell_style = "padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));"
-        if style_match:
-            style_content = style_match.group(2)
-            if "padding-top" not in style_content:
-                suffix = "" if style_content.rstrip().endswith(";") or not style_content.strip() else ";"
-                style_content = f"{style_content}{suffix} {shell_style}".strip()
-                replacement = f'style={style_match.group(1)}{style_content}{style_match.group(1)}'
-                updated_attrs = updated_attrs[: style_match.start()] + replacement + updated_attrs[style_match.end() :]
-        else:
-            updated_attrs += f' style="{shell_style}"'
-        return html[: main_match.start()] + f"<main{updated_attrs}>" + html[main_match.end() :]
+        return MiniappGenerationShellContract.ensure_page_shell_contract(html)
 
     @classmethod
     def _ensure_html_dom_ids_for_script(cls, html: str, script: str | None) -> str:

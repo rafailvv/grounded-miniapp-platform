@@ -39,6 +39,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
         file_contexts: dict[str, str],
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
+        tool_results: list[dict[str, Any]] | None = None,
     ) -> str:
         compact = generation_mode == GenerationMode.FAST
         bounded_contexts = self._bounded_file_contexts(
@@ -59,8 +60,11 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "role_contract": self._compact_role_contract_for_codegen(role_contract, role_scope),
                 "page_graph": self._compact_page_graph_for_codegen(page_graph, role_scope),
                 "file_contexts": bounded_contexts,
+                "tool_results": list(tool_results or []),
                 "creative_direction": creative_direction,
                 "rules": [
+                    "If context is insufficient, return outcome=tool_request with tool_requests and no operations.",
+                    "You may use list_files, read_files, search_files, run_command, and run_checks before editing.",
                     "Return only create/replace operations for files listed in cluster_targets.",
                     "Every returned file must contain the complete final file body.",
                     "Prefer larger coherent role/domain files over micro-modules.",
@@ -106,6 +110,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
         file_contexts: dict[str, str],
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
+        tool_results: list[dict[str, Any]] | None = None,
     ) -> str:
         compact = generation_mode == GenerationMode.FAST
         sibling_pages = [
@@ -145,8 +150,11 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 },
                 "first_paint_contract": self._first_paint_contract_for_page(role=role, page=page, grounded_spec=grounded_spec),
                 "current_file": self._limit_text(file_contexts.get(page["file_path"], ""), 6000 if compact else 12000),
+                "tool_results": list(tool_results or []),
                 "creative_direction": creative_direction,
                 "rules": [
+                    "If context is insufficient, return outcome=tool_request with tool_requests and no operations.",
+                    "You may use list_files, read_files, search_files, run_command, and run_checks before editing.",
                     "Create a real page, not a generic stats card screen.",
                     "Respect the requested role and make the actions specific to that role.",
                     "Honor the page purpose, primary actions, and handoff_paths from the page graph.",
@@ -201,6 +209,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
         generated_support_sources: dict[str, str],
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
+        tool_results: list[dict[str, Any]] | None = None,
     ) -> str:
         compact = generation_mode == GenerationMode.FAST
         trimmed_targets = self._bounded_file_contexts(
@@ -238,6 +247,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     max_file_chars=1600 if compact else 2800,
                     max_total_chars=3600 if compact else 7200,
                 ),
+                "tool_results": list(tool_results or []),
                 "first_paint_contracts": {
                     role: [
                         self._first_paint_contract_for_page(role=role, page=page, grounded_spec=grounded_spec)
@@ -248,6 +258,8 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 },
                 "creative_direction": creative_direction,
                 "rules": [
+                    "If context is insufficient, return outcome=tool_request with tool_requests and no operations.",
+                    "You may use list_files, read_files, search_files, run_command, and run_checks before editing.",
                     "Only touch files listed in target_files.",
                     "If stage_name is miniapp, generate only miniapp/server/shared contract files required by the request.",
                     "If stage_name is frontend, wire pages, routes, and shared UI/state to the already planned miniapp surface.",

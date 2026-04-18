@@ -28,58 +28,44 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         require_multi_page = self._requires_multi_page(prompt, grounded_spec, role_scope, intent)
         strategy_reason = self._strategy_reason(intent, prompt, role_scope, require_multi_page=require_multi_page)
         workspace_tree = self.workspace_service.file_tree(workspace_id)
-        corrective_prompt = self._planning_retry_prompt(prompt)
-        last_error: Exception | None = None
-        last_gate_issues: list[str] = []
-        attempts = 2 if scope_mode == "whole_file_build" and require_multi_page else 1
-        for attempt in range(attempts):
-            planning_prompt = prompt if attempt == 0 else corrective_prompt
-            try:
-                payload = self._generate_code_plan_sections_with_timeout(
-                    timeout_seconds=float(self.CODE_PLAN_TOTAL_TIMEOUT_SECONDS),
-                    workspace_id=workspace_id,
-                    prompt=planning_prompt,
-                    grounded_spec=grounded_spec,
-                    doc_refs=doc_refs,
-                    role_scope=role_scope,
-                    role_contract=role_contract,
-                    scope_mode=scope_mode,
-                    require_multi_page=require_multi_page,
-                    workspace_tree=workspace_tree,
-                    generation_mode=generation_mode,
-                    creative_direction=creative_direction,
-                )
-                normalized = self._normalize_model_payload(payload["payload"])
-                planned = self._normalize_page_plan(
-                    normalized,
-                    role_scope=role_scope,
-                    scope_mode=scope_mode,
-                    require_multi_page=require_multi_page,
-                    workspace_tree=workspace_tree,
-                )
-                plan_gate_issues = self._page_graph_gate_issues(
-                    planned["page_graph"],
-                    role_scope,
-                    scope_mode=scope_mode,
-                    require_multi_page=require_multi_page,
-                    require_business_pages=False,
-                )
-                planned["write_strategy"] = scope_mode
-                planned["strategy_reason"] = strategy_reason
-                planned["model"] = payload["model"]
-                planned["plan_gate_issues"] = plan_gate_issues
-                planned["require_business_pages"] = False
-                if not plan_gate_issues or attempt + 1 >= attempts:
-                    return planned
-                last_gate_issues = plan_gate_issues
-            except Exception as exc:
-                last_error = exc
-        if last_error is not None:
-            return {"error": f"Page graph planning failed: {last_error}"}
-        return {
-            "error": "Page graph planning failed the structural readiness checks after retry.",
-            "plan_gate_issues": last_gate_issues,
-        }
+        try:
+            payload = self._generate_code_plan_sections_with_timeout(
+                timeout_seconds=float(self.CODE_PLAN_TOTAL_TIMEOUT_SECONDS),
+                workspace_id=workspace_id,
+                prompt=prompt,
+                grounded_spec=grounded_spec,
+                doc_refs=doc_refs,
+                role_scope=role_scope,
+                role_contract=role_contract,
+                scope_mode=scope_mode,
+                require_multi_page=require_multi_page,
+                workspace_tree=workspace_tree,
+                generation_mode=generation_mode,
+                creative_direction=creative_direction,
+            )
+            normalized = self._normalize_model_payload(payload["payload"])
+            planned = self._normalize_page_plan(
+                normalized,
+                role_scope=role_scope,
+                scope_mode=scope_mode,
+                require_multi_page=require_multi_page,
+                workspace_tree=workspace_tree,
+            )
+            plan_gate_issues = self._page_graph_gate_issues(
+                planned["page_graph"],
+                role_scope,
+                scope_mode=scope_mode,
+                require_multi_page=require_multi_page,
+                require_business_pages=False,
+            )
+            planned["write_strategy"] = scope_mode
+            planned["strategy_reason"] = strategy_reason
+            planned["model"] = payload["model"]
+            planned["plan_gate_issues"] = plan_gate_issues
+            planned["require_business_pages"] = False
+            return planned
+        except Exception as exc:
+            return {"error": f"Page graph planning failed: {exc}"}
 
     def _generate_code_plan_sections_with_timeout(
         self,
@@ -247,7 +233,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             "model": (
                 section_payloads.get("targeting", {}).get("model")
                 or section_payloads.get("graph", {}).get("model")
-                or "deterministic-planner"
+                or "code-plan-sections"
             ),
             "payload": merged_payload,
             "response_mode": "code_plan_sections",

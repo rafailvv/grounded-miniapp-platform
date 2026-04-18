@@ -57,6 +57,12 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
         generated_backend_sources: dict[str, str] = {}
         trace_payloads: dict[str, dict[str, Any]] = {}
         latency_breakdown: dict[str, int] = {}
+        draft_source = self.workspace_service.draft_source_dir(workspace_id, draft_run_id)
+        workspace_tree = (
+            self.workspace_service.file_tree(workspace_id, run_id=draft_run_id)
+            if self.workspace_service.draft_exists(workspace_id, draft_run_id)
+            else []
+        )
         selected_pages = self._selected_pages_for_edit(page_graph, target_set)
         resolve_page_file_edit = getattr(self.service, "_resolve_page_file_edit", self._resolve_page_file_edit)
         resolve_page_file_edits_async = getattr(self.service, "_resolve_page_file_edits_async", self._resolve_page_file_edits_async)
@@ -74,6 +80,10 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     file_contexts=file_contexts,
                     generation_mode=generation_mode,
                     creative_direction=creative_direction,
+                    workspace_id=workspace_id,
+                    draft_run_id=draft_run_id,
+                    workspace_tree=workspace_tree,
+                    draft_source=draft_source,
                 )
                 for role, page in selected_pages
             ]
@@ -90,6 +100,10 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     file_contexts=file_contexts,
                     generation_mode=generation_mode,
                     creative_direction=creative_direction,
+                    workspace_id=workspace_id,
+                    draft_run_id=draft_run_id,
+                    workspace_tree=workspace_tree,
+                    draft_source=draft_source,
                 )
             )
             if any("error" in result and (result.get("retryable") or self._is_recoverable_page_error_message(str(result.get("error") or ""))) for result in ordered_page_results):
@@ -112,6 +126,10 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                         generation_mode=GenerationMode.FAST,
                         creative_direction=creative_direction,
                         recovery_mode="serial_compact_retry",
+                        workspace_id=workspace_id,
+                        draft_run_id=draft_run_id,
+                        workspace_tree=workspace_tree,
+                        draft_source=draft_source,
                     )
         for page_result in ordered_page_results:
             if "error" in page_result:
@@ -173,6 +191,10 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                         generated_support_sources={},
                         generation_mode=generation_mode,
                         creative_direction=creative_direction,
+                        workspace_id=workspace_id,
+                        draft_run_id=draft_run_id,
+                        workspace_tree=workspace_tree,
+                        draft_source=draft_source,
                     )
                     for cluster_name, stage_name, cluster_targets in composition_clusters
                 ]
@@ -230,6 +252,12 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
         total_target_files = max(1, sum(len(list(cluster["target_files"])) for cluster in clusters))
         completed_target_files = 0
         results: list[dict[str, Any]] = []
+        workspace_tree = (
+            self.workspace_service.file_tree(kwargs["workspace_id"], run_id=kwargs["draft_run_id"])
+            if self.workspace_service.draft_exists(kwargs["workspace_id"], kwargs["draft_run_id"])
+            else []
+        )
+        draft_source = self.workspace_service.draft_source_dir(kwargs["workspace_id"], kwargs["draft_run_id"])
         for batch in self._group_generation_clusters_for_execution(clusters):
             self._sync_generation_batch_started(
                 linked_run_id=kwargs["draft_run_id"],
@@ -259,6 +287,10 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     file_contexts=kwargs["file_contexts"],
                     generation_mode=kwargs["generation_mode"],
                     creative_direction=kwargs["creative_direction"],
+                    workspace_id=kwargs["workspace_id"],
+                    draft_run_id=kwargs["draft_run_id"],
+                    workspace_tree=workspace_tree,
+                    draft_source=draft_source,
                 )
                 future_map[future] = (cluster_name, cluster_target_count)
             done, not_done = wait(future_map.keys(), timeout=self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS, return_when=ALL_COMPLETED)
@@ -345,5 +377,9 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     file_contexts=kwargs["file_contexts"],
                     generation_mode=kwargs["generation_mode"],
                     creative_direction=kwargs["creative_direction"],
+                    workspace_id=kwargs.get("workspace_id"),
+                    draft_run_id=kwargs.get("draft_run_id"),
+                    workspace_tree=kwargs.get("workspace_tree"),
+                    draft_source=kwargs.get("draft_source"),
                 )
         return list(await asyncio.gather(*[run_one(role, page) for role, page in selected_pages]))

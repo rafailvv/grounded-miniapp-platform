@@ -52,17 +52,6 @@ class MiniappGenerationRoleContract:
                 "fallback_reason": f"Role architecture analysis failed: {exc}",
             }
 
-    def should_use_compiled_role_contract(
-        self,
-        *,
-        prompt: str,
-        role_scope: list[str],
-        intent: str,
-        generation_mode: GenerationMode,
-    ) -> bool:
-        del prompt, role_scope, intent, generation_mode
-        return False
-
     def normalize_role_contract(self, payload: dict[str, Any], role_scope: list[str]) -> dict[str, Any]:
         roles_raw = payload.get("roles")
         if not isinstance(roles_raw, list):
@@ -118,23 +107,20 @@ class MiniappGenerationRoleContract:
             roles[role] = {
                 "role": role,
                 "responsibility": getattr(actor, "description", None) or f"{role.capitalize()} workflow execution.",
-                "entry_goal": primary_jobs[0] if primary_jobs else f"Open the {role} workspace and continue the main flow.",
+                "entry_goal": primary_jobs[0] if primary_jobs else f"Open the {role} surface and continue the main flow.",
                 "primary_jobs": primary_jobs or [f"Handle the main {role} flow."],
                 "key_entities": key_entities,
-                "ui_style_notes": ui_style_notes or [f"Keep {role}-specific actions visible above generic metrics."],
+                "ui_style_notes": ui_style_notes or [f"Keep {role}-specific actions visible above generic status blocks."],
                 "success_states": success_states or [f"{role.capitalize()} completes the intended task without cross-role confusion."],
                 "must_differ_from": [candidate for candidate in ROLE_ORDER if candidate in role_scope and candidate != role],
             }
         return {
             "app_title": grounded_spec.product_goal[:80] if grounded_spec.product_goal else "Generated mini-app",
-            "app_summary": grounded_spec.product_goal or "Generated role-aware mini-app workspace.",
+            "app_summary": grounded_spec.product_goal or "Generated role-aware mini-app.",
             "shared_entities": entities[:6],
             "shared_logic": [flow.name for flow in flows[:4] if flow.name],
             "roles": roles,
         }
-
-    def compiled_role_contract(self, grounded_spec: GroundedSpecModel, role_scope: list[str]) -> dict[str, Any]:
-        return self.minimal_role_contract(grounded_spec, role_scope)
 
     @staticmethod
     def role_contract_schema() -> dict[str, Any]:

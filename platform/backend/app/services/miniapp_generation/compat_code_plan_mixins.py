@@ -29,9 +29,8 @@ class CompatCodePlanMixins:
         return {
             **base,
             "_resolve_role_contract": "generation_role_contract",
-            "_should_use_compiled_role_contract": "generation_role_contract",
             "_normalize_role_contract": "generation_role_contract",
-            "_compiled_role_contract": "generation_role_contract",
+            "_minimal_role_contract": "generation_role_contract",
             "_role_contract_user_prompt": "generation_role_contract",
             "_role_contract_gate_issues": "generation_role_contract",
             "_resolve_code_plan": "generation_code_plan",

@@ -16,6 +16,7 @@ from app.modules.miniapp_generation_runtime.generation_codegen_clusters import M
 from app.modules.miniapp_generation_runtime.generation_codegen_prompts import MiniappGenerationCodegenPrompts
 from app.modules.miniapp_generation_runtime.generation_codegen_selection import MiniappGenerationCodegenSelection
 from app.modules.miniapp_generation_runtime.generation_entry import MiniappGenerationEntry
+from app.modules.miniapp_generation_runtime.generation_normal_loop import MiniappGenerationNormalLoop
 from app.modules.miniapp_generation_runtime.generation_page_graph_runtime import MiniappGenerationPageGraphRuntime
 from app.modules.miniapp_generation_runtime.generation_plan_runtime import MiniappGenerationPlanRuntime
 from app.modules.miniapp_generation_runtime.generation_progress_reporting import GenerationProgressReportingRuntime
@@ -30,6 +31,7 @@ from app.modules.miniapp_generation_runtime.grounded_spec_orchestration import G
 from app.modules.miniapp_generation_runtime.grounded_spec_payloads import GroundedSpecPayloadsRuntime
 from app.modules.miniapp_generation_runtime.grounded_spec_prompts import GroundedSpecPromptsRuntime
 from app.modules.miniapp_generation_runtime.generation_repair import MiniappGenerationRepair
+from app.modules.miniapp_generation_runtime.generation_shell_contract import MiniappGenerationShellContract
 from app.modules.miniapp_generation_runtime.generation_targeting import MiniappGenerationTargeting
 from app.modules.miniapp_generation_runtime.generation_scaffold import (
     build_route_manifest,
@@ -61,6 +63,7 @@ __all__ = [
     "MiniappGenerationCodegenPrompts",
     "MiniappGenerationCodegenSelection",
     "MiniappGenerationEntry",
+    "MiniappGenerationNormalLoop",
     "MiniappGenerationPageGraphRuntime",
     "MiniappGenerationPlanRuntime",
     "GenerationProgressReportingRuntime",
@@ -75,6 +78,7 @@ __all__ = [
     "GroundedSpecPayloadsRuntime",
     "GroundedSpecPromptsRuntime",
     "MiniappGenerationRepair",
+    "MiniappGenerationShellContract",
     "MiniappGenerationTargeting",
     "build_route_manifest",
     "compile_prompt_to_scaffold",

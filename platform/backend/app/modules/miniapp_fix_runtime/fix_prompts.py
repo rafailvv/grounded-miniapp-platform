@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 from app.modules.miniapp_agent_loop.fix_prompt_builder import FixPromptBuilder
 from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
+from app.modules.miniapp_agent_loop.tool_agent_runtime import tool_patch_schema
 
 if TYPE_CHECKING:
     from app.services.fix_orchestrator import FixOrchestrator
@@ -44,50 +45,7 @@ class FixPromptRuntime:
         )
 
     def repair_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "outcome": {
-                    "type": "string",
-                    "enum": ["patch_ready", "tool_request", "no_progress", "fatal_invalid_response"],
-                },
-                "diagnosis": {"type": "string"},
-                "tool_requests": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "tool": {"type": "string", "enum": ["list_files", "read_files", "run_checks", "search_files", "run_command"]},
-                            "mode": {"type": "string", "enum": ["exact", "final"]},
-                            "targets": {"type": "array", "items": {"type": "string"}},
-                            "pattern": {"type": "string"},
-                            "command": {"type": "string"},
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["tool", "targets", "reason"],
-                    },
-                },
-                "expected_verification": {"type": "string"},
-                "rationale_by_file": {"type": "object", "additionalProperties": {"type": "string"}},
-                "operations": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "operation": {"type": "string", "enum": ["create", "replace", "delete"]},
-                            "content": {"type": ["string", "null"]},
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["file_path", "operation", "reason"],
-                    },
-                },
-            },
-            "required": ["diagnosis", "tool_requests", "expected_verification", "rationale_by_file", "operations"],
-        }
+        return tool_patch_schema()
 
     def repair_system_prompt(self) -> str:
         return self.service.fix_prompt_builder.repair_system_prompt()

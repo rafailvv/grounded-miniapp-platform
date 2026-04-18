@@ -95,6 +95,7 @@ def _install_llm_stub(app) -> None:
             return {
                 "model": "openai/gpt-5-mini",
                 "payload": _page_graph_payload(
+                    prompt=str(payload.get("prompt") or ""),
                     role_scope=payload.get("role_scope") or [],
                     scope_mode=str(payload.get("scope_mode") or "whole_file_build"),
                 ),
@@ -103,6 +104,8 @@ def _install_llm_stub(app) -> None:
             return {"model": "openai/gpt-5.1-codex-mini", "payload": _page_file_payload(payload)}
         if schema_name == "composition_bundle_v1":
             return {"model": "openai/gpt-5.1-codex-mini", "payload": _composition_payload(payload)}
+        if schema_name == "generation_repair_patch_v1":
+            return {"model": "openai/gpt-5.1-codex-mini", "payload": _generation_repair_payload(payload)}
         if schema_name.startswith("whole_file_bundle_v1_"):
             return {"model": "openai/gpt-5.1-codex-mini", "payload": _whole_file_bundle_payload(payload)}
         if schema_name == "fix_patch_v1":
@@ -138,11 +141,25 @@ def _grounded_spec_payload(prompt: str) -> dict:
         "actors": [
             {
                 "actor_id": "actor_client",
-                "name": "Shopper",
+                "name": "Client",
                 "role": "client",
-                "description": "Primary customer flow.",
+                "description": "Creates and tracks the primary record flow.",
                 "evidence": [{"doc_ref_id": "prompt-source", "evidence_type": "explicit"}],
-            }
+            },
+            {
+                "actor_id": "actor_specialist",
+                "name": "Specialist",
+                "role": "specialist",
+                "description": "Reviews and updates the same persisted record.",
+                "evidence": [{"doc_ref_id": "prompt-source", "evidence_type": "explicit"}],
+            },
+            {
+                "actor_id": "actor_manager",
+                "name": "Manager",
+                "role": "manager",
+                "description": "Sees the aggregated shared state across roles.",
+                "evidence": [{"doc_ref_id": "prompt-source", "evidence_type": "explicit"}],
+            },
         ],
         "domain_entities": [
             {
@@ -159,7 +176,10 @@ def _grounded_spec_payload(prompt: str) -> dict:
                 "name": "Primary flow",
                 "goal": "Move through the main app journey.",
                 "steps": [{"step_id": "step_1", "order": 1, "actor_id": "actor_client", "action": "Open the app"}],
-                "acceptance_criteria": ["The generated app exposes real routes and pages."],
+                "acceptance_criteria": [
+                    "The generated app exposes real routed pages.",
+                    "The same record persists across client, specialist, and manager views.",
+                ],
                 "evidence": [{"doc_ref_id": "prompt-source", "evidence_type": "explicit"}],
             }
         ],
@@ -172,8 +192,34 @@ def _grounded_spec_payload(prompt: str) -> dict:
                 "evidence": [{"doc_ref_id": "prompt-source", "evidence_type": "explicit"}],
             }
         ],
-        "api_requirements": [],
-        "persistence_requirements": [],
+        "api_requirements": [
+            {
+                "api_req_id": "api_records_create",
+                "name": "Create record",
+                "method": "POST",
+                "path": "/api/orders",
+                "purpose": "Persist the primary record from the client flow.",
+            },
+            {
+                "api_req_id": "api_records_list",
+                "name": "List records",
+                "method": "GET",
+                "path": "/api/orders",
+                "purpose": "Read the persisted records across role dashboards.",
+            },
+            {
+                "api_req_id": "api_records_update",
+                "name": "Update record",
+                "method": "PUT",
+                "path": "/api/orders/{item_id}",
+                "purpose": "Update the persisted record from specialist and manager actions.",
+            },
+        ],
+        "persistence_requirements": [
+            {"persistence_req_id": "persist_create", "entity_id": "entity_order", "operation": "create", "storage_type": "sqlite"},
+            {"persistence_req_id": "persist_list", "entity_id": "entity_order", "operation": "list", "storage_type": "sqlite"},
+            {"persistence_req_id": "persist_update", "entity_id": "entity_order", "operation": "update", "storage_type": "sqlite"},
+        ],
         "integration_requirements": [],
         "security_requirements": [
             {
@@ -219,21 +265,21 @@ def _grounded_spec_payload(prompt: str) -> dict:
 def _role_contract_payload(role_scope: list[str]) -> dict:
     templates = {
         "client": {
-            "responsibility": "Own the end-user workspace and complete the primary journey.",
-            "entry_goal": "Start from a real landing screen and continue into the user flow.",
-            "primary_jobs": ["Review workspace", "Open details", "Submit data", "Track status"],
+            "responsibility": "Own the end-user journey and complete the primary shared flow.",
+            "entry_goal": "Start from a real landing screen and continue into the main user flow.",
+            "primary_jobs": ["Review records", "Open details", "Submit data", "Track status"],
             "key_entities": ["Request", "Profile", "Status"],
             "ui_style_notes": ["Use clear entry language", "Make primary actions obvious"],
             "success_states": ["Action submitted", "Status visible"],
             "must_differ_from": ["specialist", "manager"],
         },
         "specialist": {
-            "responsibility": "Handle incoming work items, progress them, and resolve blockers.",
-            "entry_goal": "Surface the active queue and the next task to process.",
-            "primary_jobs": ["Review queue", "Open work item", "Change status", "Resolve blockers"],
+            "responsibility": "Handle incoming shared records, progress them, and resolve blockers.",
+            "entry_goal": "Surface the active queue and the next record to process.",
+            "primary_jobs": ["Review queue", "Open record", "Change status", "Resolve blockers"],
             "key_entities": ["Queue", "Task", "Issue"],
-            "ui_style_notes": ["Keep workspace dense but readable", "Expose action context quickly"],
-            "success_states": ["Work item updated", "Queue pressure reduced"],
+            "ui_style_notes": ["Keep the desk dense but readable", "Expose action context quickly"],
+            "success_states": ["Record updated", "Queue pressure reduced"],
             "must_differ_from": ["client", "manager"],
         },
         "manager": {
@@ -247,7 +293,7 @@ def _role_contract_payload(role_scope: list[str]) -> dict:
         },
     }
     return {
-        "app_title": "Operations workspace",
+        "app_title": "Operations app",
         "app_summary": "A routed multi-role mini app with separate client, specialist, and manager flows.",
         "shared_entities": ["Request", "Status", "Profile"],
         "shared_logic": ["Routing", "Role-aware navigation", "Action feedback"],
@@ -255,19 +301,23 @@ def _role_contract_payload(role_scope: list[str]) -> dict:
     }
 
 
-def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
+def _page_graph_payload(*, prompt: str, role_scope: list[str], scope_mode: str) -> dict:
+    feature_slug = "orders" if "book" in prompt.lower() or "order" in prompt.lower() or "consult" in prompt.lower() else "records"
     route_templates = {
         "client": [
-            _page("client_home", "/client", "Home", "client_index", "miniapp/app/static/client/index.html", "Client workspace", "Role-distinct landing page for the client journey."),
+            _page("client_home", "/client", "Home", "client_index", "miniapp/app/static/client/index.html", "Client home", "Role-distinct landing page for the client journey."),
             _page("client_profile", "/client/profile", "Profile", "client_profile", "miniapp/app/static/client/profile/index.html", "Profile", "Client profile editing page."),
+            _page("client_feature", f"/client/{feature_slug}", feature_slug.title(), "client_feature", f"miniapp/app/static/client/{feature_slug}/index.html", f"Client {feature_slug.title()}", f"Client view for the shared {feature_slug} flow."),
         ],
         "specialist": [
             _page("specialist_home", "/specialist", "Desk", "specialist_index", "miniapp/app/static/specialist/index.html", "Specialist desk", "Role-distinct landing page for specialist work."),
             _page("specialist_profile", "/specialist/profile", "Profile", "specialist_profile", "miniapp/app/static/specialist/profile/index.html", "Profile", "Specialist profile editing page."),
+            _page("specialist_feature", f"/specialist/{feature_slug}", feature_slug.title(), "specialist_feature", f"miniapp/app/static/specialist/{feature_slug}/index.html", f"Specialist {feature_slug.title()}", f"Specialist view for the shared {feature_slug} flow."),
         ],
         "manager": [
             _page("manager_home", "/manager", "Overview", "manager_index", "miniapp/app/static/manager/index.html", "Manager overview", "Role-distinct landing page for oversight."),
             _page("manager_profile", "/manager/profile", "Profile", "manager_profile", "miniapp/app/static/manager/profile/index.html", "Profile", "Manager profile editing page."),
+            _page("manager_feature", f"/manager/{feature_slug}", feature_slug.title(), "manager_feature", f"miniapp/app/static/manager/{feature_slug}/index.html", f"Manager {feature_slug.title()}", f"Manager view for the shared {feature_slug} flow."),
         ],
     }
     roles = []
@@ -294,11 +344,12 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
         target_files.extend(page["script_path"] for page in role_pages)
         target_files.append(f"miniapp/app/routes/{role}.py")
     return {
-        "summary": "Create a prompt-shaped role-based workspace with distinct root and profile surfaces.",
+        "summary": "Create a prompt-shaped role-based app with distinct root, profile, and shared workflow surfaces.",
         "flow_mode": "multi_page",
         "files_to_read": [
             "miniapp/app/static/client/index.html",
             "miniapp/app/static/client/styles.css",
+            "miniapp/app/static/preview_bridge.js",
         ],
         "target_files": target_files,
         "shared_files": [
@@ -317,8 +368,8 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
             *[f"miniapp/app/routes/{role}.py" for role in role_scope],
         ],
         "page_graph": {
-            "app_title": "Operations workspace",
-            "summary": "A routed multi-role mini app with prompt-driven role roots and profiles.",
+            "app_title": "Operations app",
+            "summary": "A routed multi-role mini app with prompt-driven role roots, profiles, and shared workflow surfaces.",
             "flow_mode": "multi_page",
             "roles": roles,
         },
@@ -534,7 +585,7 @@ def _composition_payload(payload: dict) -> dict:
                 "reason": "Provide the shared profile persistence API.",
             }
         )
-    base_css = ":root { --app-max-width: 620px; --surface-page: #f5f7fb; --surface-card: #f8fafd; --surface-primary: #ffffff; --text-primary: #16263d; --text-secondary: #4d607d; --text-tertiary: #7386a3; --accent: #2d7ff9; --accent-contrast: #ffffff; --accent-soft: #e6f0ff; --border-subtle: #dde6f3; --shadow-soft: 0 14px 38px rgba(22, 49, 95, 0.12); }\n* { box-sizing: border-box; }\nhtml, body { margin: 0; min-height: 100%; }\nbody { font-family: 'Inter', 'Segoe UI', sans-serif; background: var(--surface-page); color: var(--text-primary); }\n.page-shell { max-width: var(--app-max-width); min-height: 100vh; margin: 0 auto; padding: 60px 16px 20px; }\n.page { display: flex; flex-direction: column; gap: 12px; }\n.feature-block, .preview-card, .form-card, .card { border: 1px solid var(--border-subtle); border-radius: 24px; background: var(--surface-primary); box-shadow: var(--shadow-soft); }\n.card { padding: 14px; display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; text-decoration: none; color: inherit; }\n.avatar-wrap, .avatar-large-wrap { width: 74px; height: 74px; border-radius: 50%; overflow: hidden; }\n.avatar-large-wrap { width: 96px; height: 96px; }\n.avatar, .avatar-large { width: 100%; height: 100%; object-fit: cover; }\n.avatar-fallback, .avatar-large-fallback { width: 100%; height: 100%; display: grid; place-items: center; border-radius: 50%; background: var(--accent-soft); font-weight: 700; }\n.info, .preview-info, .feature-content, .form-card { display: flex; flex-direction: column; }\n.name, .preview-name, .title, .feature-title { font-weight: 700; }\n.preview-card, .form-card, .feature-block { padding: 16px; }\n.input-wrapper { position: relative; margin-top: 6px; }\n.input-label { position: absolute; top: -8px; left: 10px; padding: 0 5px; background: var(--surface-primary); font-size: 14px; font-weight: 700; }\n.text-input { width: 100%; min-height: 50px; padding: 12px 14px; border: 1px solid var(--border-subtle); border-radius: 10px; }\n.error { display: none; margin-top: 4px; padding-left: 2px; font-size: 12px; color: #ef4444; }\n.error:not(:empty) { display: block; }\n.primary-button { margin-top: 8px; height: 48px; border: none; border-radius: 12px; background: var(--accent); color: var(--accent-contrast); }\n"
+    base_css = ":root { --app-max-width: 620px; --surface-page: #f5f7fb; --surface-card: #f8fafd; --surface-primary: #ffffff; --text-primary: #16263d; --text-secondary: #4d607d; --text-tertiary: #7386a3; --accent: #2d7ff9; --accent-contrast: #ffffff; --accent-soft: #e6f0ff; --border-subtle: #dde6f3; --shadow-soft: 0 14px 38px rgba(22, 49, 95, 0.12); }\n* { box-sizing: border-box; }\nhtml, body { margin: 0; min-height: 100%; }\nbody { font-family: 'Inter', 'Segoe UI', sans-serif; background: var(--surface-page); color: var(--text-primary); }\n.page-shell { max-width: var(--app-max-width); min-height: 100vh; margin: 0 auto; padding: 76px 16px 20px; }\n.page { display: flex; flex-direction: column; gap: 12px; }\n.feature-block, .preview-card, .form-card, .card { border: 1px solid var(--border-subtle); border-radius: 24px; background: var(--surface-primary); box-shadow: var(--shadow-soft); }\n.card { padding: 14px; display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; text-decoration: none; color: inherit; }\n.avatar-wrap, .avatar-large-wrap { width: 74px; height: 74px; border-radius: 50%; overflow: hidden; }\n.avatar-large-wrap { width: 96px; height: 96px; }\n.avatar, .avatar-large { width: 100%; height: 100%; object-fit: cover; }\n.avatar-fallback, .avatar-large-fallback { width: 100%; height: 100%; display: grid; place-items: center; border-radius: 50%; background: var(--accent-soft); font-weight: 700; }\n.info, .preview-info, .feature-content, .form-card { display: flex; flex-direction: column; }\n.name, .preview-name, .title, .feature-title { font-weight: 700; }\n.preview-card, .form-card, .feature-block { padding: 16px; }\n.input-wrapper { position: relative; margin-top: 6px; }\n.input-label { position: absolute; top: -8px; left: 10px; padding: 0 5px; background: var(--surface-primary); font-size: 14px; font-weight: 700; }\n.text-input { width: 100%; min-height: 50px; padding: 12px 14px; border: 1px solid var(--border-subtle); border-radius: 10px; }\n.error { display: none; margin-top: 4px; padding-left: 2px; font-size: 12px; color: #ef4444; }\n.error:not(:empty) { display: block; }\n.primary-button { margin-top: 8px; height: 48px; border: none; border-radius: 12px; background: var(--accent); color: var(--accent-contrast); }\n"
     for role, role_payload in (page_graph.get("roles") or {}).items():
         for page in role_payload.get("pages") or []:
             page = _page_with_assets(page)
@@ -680,6 +731,45 @@ def _fix_patch_payload(payload: dict) -> dict:
         "expected_verification": "npm run build should pass and the preview runtime should stay healthy.",
         "rationale_by_file": rationale,
         "operations": operations,
+    }
+
+
+def _generation_repair_payload(payload: dict) -> dict:
+    target_files = list(payload.get("target_files") or [])
+    file_contexts = payload.get("file_contexts") or {}
+    if not file_contexts and target_files:
+        return {
+            "outcome": "tool_request",
+            "diagnosis": "Read the implicated files before patching the generated draft.",
+            "tool_requests": [
+                {
+                    "tool": "read_files",
+                    "targets": target_files[:2],
+                    "reason": "Inspect the implicated generated draft files before patching.",
+                }
+            ],
+            "operations": [],
+        }
+    first_path = next(iter(file_contexts), None)
+    if first_path is None:
+        return {
+            "outcome": "no_progress",
+            "diagnosis": "No file context was available for the generated repair step.",
+            "tool_requests": [],
+            "operations": [],
+        }
+    return {
+        "outcome": "patch_ready",
+        "diagnosis": "Apply the smallest generated-draft repair.",
+        "tool_requests": [],
+        "operations": [
+            {
+                "file_path": first_path,
+                "operation": "replace",
+                "content": str(file_contexts[first_path]),
+                "reason": "No-op repair payload for generation repair stubs.",
+            }
+        ],
     }
 
 

@@ -20,9 +20,9 @@ class ServicePageDefaultsMixins:
         if normalized_kind in {"dashboard", "landing"}:
             return f"{role_label} dashboard with overview metrics, prepared blocks, and route-based next actions."
         if normalized_kind in {"list", "queue"}:
-            return f"{role_label} workbench for queue, record, or list-based coordination."
-        if normalized_kind in {"workspace", "details", "detail"}:
-            return f"{role_label} workspace for focused detail work, module actions, and decision handoffs."
+            return f"{role_label} list surface for queue, record, or list-based coordination."
+        if normalized_kind in {"workspace", "details", "detail", "feature"}:
+            return f"{role_label} detail surface for focused work, module actions, and decision handoffs."
         if normalized_kind == "form":
             return f"{role_label} form page for collecting, updating, or validating workflow data."
         if normalized_kind in {"profile", "info"} or normalized_route.endswith("/profile"):
@@ -34,11 +34,11 @@ class ServicePageDefaultsMixins:
         normalized_kind = page_kind.strip().lower()
         normalized_route = (route_path or "").strip().lower()
         if normalized_kind in {"dashboard", "landing"}:
-            return [f"{role}_open_workbench", f"{role}_open_workspace", f"{role}_open_profile"]
+            return [f"{role}_open_list", f"{role}_open_detail", f"{role}_open_profile"]
         if normalized_kind in {"list", "queue"}:
-            return [f"{role}_open_workspace_from_workbench", f"{role}_open_profile"]
-        if normalized_kind in {"workspace", "details", "detail"}:
-            return [f"{role}_back_to_workbench", f"{role}_open_profile"]
+            return [f"{role}_open_detail_from_list", f"{role}_open_profile"]
+        if normalized_kind in {"workspace", "details", "detail", "feature"}:
+            return [f"{role}_back_to_list", f"{role}_open_profile"]
         if normalized_kind == "form":
             return [f"{role}_submit_form"]
         if normalized_kind in {"profile", "info"} or normalized_route.endswith("/profile"):
@@ -114,7 +114,7 @@ class ServicePageDefaultsMixins:
             return []
         if normalized in {"list", "queue"}:
             return ["/"]
-        if normalized in {"workspace", "details", "detail"}:
+        if normalized in {"workspace", "details", "detail", "feature"}:
             return ["/"]
         return ["/"]
 
@@ -126,7 +126,7 @@ class ServicePageDefaultsMixins:
         slug = " ".join([route_path.lower(), file_path.lower(), page_id.lower()])
         if "/profile" in slug or slug.endswith("/profile/index.html") or "profile" in page_id.lower():
             return "profile"
-        if any(token in slug for token in ("/workspace", "workspace.html", "detail", "details")):
+        if any(token in slug for token in ("/workspace", "workspace.html", "detail", "details", "feature")):
             return "workspace"
         if any(token in slug for token in ("/workbench", "workbench.html", "queue", "list", "records", "orders")):
             return "list"
@@ -300,6 +300,10 @@ class ServicePageDefaultsMixins:
         file_contexts: dict[str, str],
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
+        workspace_id: str | None = None,
+        draft_run_id: str | None = None,
+        workspace_tree: list[dict[str, str]] | None = None,
+        draft_source=None,
     ) -> list[dict[str, Any]]:
         return await self.generation_codegen._resolve_page_file_edits_async(
             selected_pages=selected_pages,
@@ -312,4 +316,8 @@ class ServicePageDefaultsMixins:
             file_contexts=file_contexts,
             generation_mode=generation_mode,
             creative_direction=creative_direction,
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
+            workspace_tree=workspace_tree,
+            draft_source=draft_source,
         )

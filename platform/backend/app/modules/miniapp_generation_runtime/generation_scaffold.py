@@ -6,13 +6,6 @@ from typing import Any
 
 from app.models.grounded_spec import GroundedSpecModel
 
-
-ROLE_ROOT_RESPONSIBILITIES = {
-    "client": "Own the end-user workspace and complete the primary journey.",
-    "specialist": "Own the specialist workspace and act on shared DB-backed state.",
-    "manager": "Own the oversight workspace and coordinate shared DB-backed state.",
-}
-
 MINIMAL_BOOTSTRAP_TARGETS = (
     "miniapp/app/main.py",
     "miniapp/app/db.py",
@@ -262,12 +255,11 @@ def thin_role_responsibility(role: str, grounded_spec: GroundedSpecModel) -> str
     actor = next((item for item in grounded_spec.actors if item.role == role), None)
     if actor is not None and getattr(actor, "description", None):
         return str(actor.description)
-    return ROLE_ROOT_RESPONSIBILITIES.get(role, grounded_spec.product_goal)
+    return grounded_spec.product_goal
 
 
 def _derive_role_route_specs(*, role: str, prompt: str, grounded_spec: GroundedSpecModel) -> list[dict[str, Any]]:
-    del prompt, grounded_spec
-    return [
+    route_specs: list[dict[str, Any]] = [
         {
             "route_path": "/",
             "page_kind": "landing",
@@ -281,10 +273,18 @@ def _derive_role_route_specs(*, role: str, prompt: str, grounded_spec: GroundedS
             "page_kind": "profile",
             "navigation_label": "Profile",
             "title": "Profile",
-            "purpose": f"Profile and settings for the {role} workspace.",
+            "purpose": f"Profile and settings for the {role} experience.",
             "data_dependencies": ["/api/profiles"],
         },
     ]
+    seen_paths = {spec["route_path"] for spec in route_specs}
+    for feature in _prompt_feature_routes(role=role, prompt=prompt, grounded_spec=grounded_spec):
+        route_path = str(feature["route_path"])
+        if route_path in seen_paths:
+            continue
+        seen_paths.add(route_path)
+        route_specs.append(feature)
+    return route_specs
 
 
 def _role_evidence(*, role: str, prompt: str, grounded_spec: GroundedSpecModel) -> str:
@@ -319,6 +319,84 @@ def _dependencies_for_route(role: str, route_path: str) -> list[str]:
     if route_path == "/profile":
         return ["/api/profiles"]
     return []
+
+
+def _prompt_feature_routes(*, role: str, prompt: str, grounded_spec: GroundedSpecModel) -> list[dict[str, Any]]:
+    candidates: list[tuple[str, str, str]] = []
+    for requirement in grounded_spec.api_requirements:
+        path = str(requirement.path or "").strip()
+        if not path:
+            continue
+        slug = _route_slug_from_text(path)
+        if not slug or slug in {"profiles", "runtime", "health"}:
+            continue
+        title = str(requirement.name or slug.replace("_", " ").title()).strip()
+        candidates.append((slug, title, str(requirement.purpose or "").strip()))
+    for item in grounded_spec.ui_requirements:
+        screen_hint = str(item.screen_hint or "").strip()
+        if not screen_hint:
+            continue
+        slug = _route_slug_from_text(screen_hint)
+        if not slug or slug in {"profile", "home", role}:
+            continue
+        candidates.append((slug, str(item.description or slug.replace("_", " ").title()).strip(), str(item.description or "").strip()))
+    for flow in grounded_spec.user_flows:
+        flow_text = " ".join([str(flow.name or ""), str(flow.goal or "")])
+        slug = _route_slug_from_text(flow_text)
+        if not slug or slug in {"profile", "dashboard", "home", role}:
+            continue
+        candidates.append((slug, str(flow.name or slug.replace("_", " ").title()).strip(), str(flow.goal or "").strip()))
+
+    feature_routes: list[dict[str, Any]] = []
+    seen_slugs: set[str] = set()
+    prompt_text = prompt.lower()
+    role_evidence = _role_evidence(role=role, prompt=prompt, grounded_spec=grounded_spec)
+    for slug, title, purpose in candidates:
+        if slug in seen_slugs:
+            continue
+        if slug not in prompt_text and slug not in role_evidence:
+            continue
+        seen_slugs.add(slug)
+        route_path = f"/{slug}"
+        feature_routes.append(
+            {
+                "route_path": route_path,
+                "page_kind": "feature",
+                "navigation_label": title.split()[0] if title else slug.replace("_", " ").title(),
+                "title": title or slug.replace("_", " ").title(),
+                "purpose": purpose or f"{role.capitalize()} feature flow for {slug.replace('_', ' ')}.",
+                "data_dependencies": _dependencies_for_prompt_feature(slug, grounded_spec),
+            }
+        )
+        if len(feature_routes) >= 2:
+            break
+    return feature_routes
+
+
+def _route_slug_from_text(text: str) -> str:
+    lowered = str(text or "").lower()
+    lowered = re.sub(r"^/api/", "", lowered)
+    lowered = re.sub(r"^/+", "", lowered)
+    lowered = re.sub(r"/+", "_", lowered)
+    parts = [part for part in re.split(r"[^a-z0-9]+", lowered) if part and part not in {"api", "role", "client", "specialist", "manager"}]
+    if not parts:
+        return ""
+    slug = "_".join(parts[:3]).strip("_")
+    if slug in {"profile", "profiles", "runtime", "health", "dashboard", "landing"}:
+        return ""
+    return slug
+
+
+def _dependencies_for_prompt_feature(slug: str, grounded_spec: GroundedSpecModel) -> list[str]:
+    dependencies: list[str] = []
+    normalized_slug = slug.replace("_", "-")
+    for requirement in grounded_spec.api_requirements:
+        path = str(requirement.path or "").strip()
+        if not path:
+            continue
+        if normalized_slug in path or slug in path.replace("-", "_"):
+            dependencies.append(path)
+    return list(dict.fromkeys(dependencies[:3]))
 
 
 def _handoff_paths_for_route(

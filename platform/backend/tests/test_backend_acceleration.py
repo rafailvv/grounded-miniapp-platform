@@ -908,7 +908,7 @@ def test_codegen_prompts_require_db_and_schemas_for_stateful_apps(tmp_path: Path
     assert "db.py" in repair_prompt and "schemas.py" in repair_prompt
 
 
-def test_backend_contract_target_inference_adds_db_and_schemas() -> None:
+def test_backend_contract_target_inference_helpers_remain_available_for_invariant_repairs() -> None:
     page_graph = {
         "roles": {
             "client": {
@@ -929,8 +929,6 @@ def test_backend_contract_target_inference_adds_db_and_schemas() -> None:
         backend_targets=["miniapp/app/main.py"],
     )
 
-    assert "miniapp/app/db.py" in inferred
-    assert "miniapp/app/schemas.py" in inferred
     assert "miniapp/app/routes/requests.py" in inferred
     assert "miniapp/app/routes/comments.py" in inferred
 
@@ -960,7 +958,7 @@ def test_backend_contract_target_inference_normalizes_hyphenated_api_stems() -> 
     assert "miniapp/app/routes/time-slots.py" not in inferred
 
 
-def test_backend_contract_target_inference_from_spec_adds_profiles_and_required_routes() -> None:
+def test_backend_contract_target_inference_from_spec_helper_normalizes_required_routes() -> None:
     grounded_spec = SimpleNamespace(
         api_requirements=[
             APIRequirement(
@@ -1015,9 +1013,6 @@ def test_backend_contract_target_inference_from_spec_adds_profiles_and_required_
         backend_targets=[],
     )
 
-    assert "miniapp/app/main.py" in inferred
-    assert "miniapp/app/db.py" in inferred
-    assert "miniapp/app/schemas.py" in inferred
     assert "miniapp/app/routes/profiles.py" in inferred
     assert "miniapp/app/routes/workload.py" in inferred
     assert "miniapp/app/routes/users.py" in inferred
@@ -3490,6 +3485,122 @@ def test_fix_mode_uses_search_and_command_tool_actions_before_patching(tmp_path:
     assert any(any(item.get("tool") == "run_command" and "open-tool-fix" in str(item.get("stdout") or "") for item in batch) for batch in observed_tool_results[1:])
 
 
+def test_fix_mode_blocks_unsafe_shell_commands(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    _install_llm_stub(app)
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Safe Shell Fix Workspace",
+            "description": "Fix loop should block unsafe shell commands and keep the repair tool-owned.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
+
+    save_response = client.post(
+        f"/workspaces/{workspace_id}/files/save",
+        json={
+            "relative_path": "miniapp/app/static/client/profile.js",
+            "content": 'const profileStatus = "broken";\n',
+        },
+    )
+    assert save_response.status_code == 200
+
+    observed_tool_results: list[list[dict[str, object]]] = []
+
+    def fake_plan_patch(*, job, repair_packet, repair_feedback=None):
+        del job, repair_feedback
+        observed_tool_results.append(list(repair_packet.tool_results))
+        target = "miniapp/app/static/client/profile.js"
+        if not repair_packet.tool_results:
+            return {
+                "outcome": "tool_request",
+                "diagnosis": "Try a shell command first, then inspect the target file.",
+                "tool_requests": [
+                    {
+                        "tool": "run_command",
+                        "command": "rm -rf miniapp/app/static/client",
+                        "targets": [],
+                        "reason": "Unsafe shell should be blocked.",
+                    },
+                    {
+                        "tool": "read_files",
+                        "targets": [target],
+                        "reason": "Load the implicated profile helper file before patching.",
+                    },
+                ],
+                "expected_verification": "Unsafe commands should be rejected while the file evidence stays available.",
+                "rationale_by_file": {},
+                "operations": [],
+            }
+        assert any(
+            item.get("tool") == "run_command"
+            and "blocked" in str(item.get("error") or "").lower()
+            for item in repair_packet.tool_results
+        )
+        content = repair_packet.file_contexts[target]
+        return {
+            "outcome": "patch_ready",
+            "diagnosis": "Patch the client profile helper after the blocked shell command result.",
+            "tool_requests": [],
+            "expected_verification": "Static validation should pass after replacing the broken state value.",
+            "rationale_by_file": {target: "Unsafe shell was blocked, so patch the implicated file directly."},
+            "operations": [
+                {
+                    "file_path": target,
+                    "operation": "replace",
+                    "content": content.replace('"broken"', '"healthy"'),
+                    "reason": "Replace the broken profile helper state with the repaired value.",
+                }
+            ],
+        }
+
+    app.state.container.fix_orchestrator._plan_patch = fake_plan_patch  # type: ignore[method-assign]
+
+    run_response = client.post(
+        f"/workspaces/{workspace_id}/runs",
+        json={
+            "prompt": "Use the fix tool loop, but block unsafe shell commands and repair the implicated client file directly.",
+            "mode": "fix",
+            "intent": "auto",
+            "apply_strategy": "manual_approve",
+            "target_role_scope": ["client"],
+            "model_profile": "openai_code_fast",
+            "generation_mode": "balanced",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+            "error_context": {
+                "raw_error": "Client profile helper is failing because profileStatus is broken.",
+                "source": "frontend",
+                "failing_target": "miniapp static runtime",
+            },
+        },
+    )
+    assert run_response.status_code == 200
+    run_id = run_response.json()["run_id"]
+
+    final_run = run_response.json()
+    for _ in range(60):
+        current = client.get(f"/runs/{run_id}")
+        assert current.status_code == 200
+        final_run = current.json()
+        if final_run["status"] in {"awaiting_approval", "completed", "blocked", "failed"}:
+            break
+        time.sleep(0.1)
+
+    assert final_run["status"] in {"awaiting_approval", "completed"}
+    assert any(
+        any(item.get("tool") == "run_command" and "blocked" in str(item.get("error") or "").lower() for item in batch)
+        for batch in observed_tool_results[1:]
+    )
+
+
 def test_fix_mode_can_list_workspace_files_before_reading_and_patching(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -4296,6 +4407,244 @@ def test_generation_repair_retries_with_expanded_context_when_first_patch_is_emp
     assert result["operations"][0].file_path == "miniapp/app/static/client/index.html"
 
 
+def test_generation_repair_uses_tool_requests_before_patching(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+    service: GenerationService = app.state.container.generation_service
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Generation Repair Tool Workspace",
+            "description": "Generation repair should use tool requests before patching.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
+
+    run_id = "run_generation_tool_repair"
+    draft_source = app.state.container.workspace_service.prepare_draft(workspace_id, run_id)
+    target = "miniapp/app/static/client/profile.js"
+    target_path = draft_source / target
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text('const profileStatus = "broken";\n', encoding="utf-8")
+
+    seen_payloads: list[dict[str, object]] = []
+
+    def _stub_generate(**kwargs):
+        payload = json.loads(kwargs["user_prompt"])
+        seen_payloads.append(payload)
+        file_contexts = payload.get("file_contexts") or {}
+        tool_results = payload.get("tool_results") or []
+        if not tool_results:
+            assert target not in file_contexts
+            return {
+                "model": "stub",
+                "payload": {
+                    "outcome": "tool_request",
+                    "diagnosis": "Inspect the workspace tree, then read the implicated profile helper.",
+                    "tool_requests": [
+                        {
+                            "tool": "list_files",
+                            "targets": ["miniapp/app/static/client"],
+                            "reason": "Inspect the client static tree before patching.",
+                        },
+                        {
+                            "tool": "read_files",
+                            "targets": [target],
+                            "reason": "Load the implicated profile helper source before patching.",
+                        },
+                    ],
+                    "operations": [],
+                },
+            }
+        assert any(item.get("tool") == "list_files" for item in tool_results)
+        assert target in file_contexts
+        return {
+            "model": "stub",
+            "payload": {
+                "outcome": "patch_ready",
+                "diagnosis": "Patch the implicated profile helper after using tool actions.",
+                "tool_requests": [],
+                "operations": [
+                    {
+                        "file_path": target,
+                        "operation": "replace",
+                        "content": str(file_contexts[target]).replace('"broken"', '"healthy"'),
+                        "reason": "Replace the broken profile helper state with the repaired value.",
+                    }
+                ],
+            },
+        }
+
+    service._generate_structured_with_retry = _stub_generate
+
+    result = service._repair_draft_after_failure(
+        workspace_id=workspace_id,
+        draft_run_id=run_id,
+        prompt="Fix the generated app through the tool-owned repair loop.",
+        grounded_spec=SimpleNamespace(product_goal="Fix app", api_requirements=[], assumptions=[]),
+        role_scope=["client", "specialist", "manager"],
+        role_contract={},
+        page_graph={},
+        scope_mode="whole_file_build",
+        target_files=["miniapp/app/static/client/index.html"],
+        file_contexts={},
+        build_issues=[
+            ValidationIssue(
+                code="build.page_script_dom_contract",
+                message="Client profile helper state is invalid and requires inspection.",
+                severity="high",
+                location="miniapp/app/static/client/profile.js",
+            )
+        ],
+        preview_issue=None,
+        preview_logs=[],
+        attempt=1,
+    )
+
+    assert "error" not in result
+    assert result["operations"][0].file_path == target
+
+
+def test_initial_codegen_uses_tool_requests_before_page_patch(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+    service: GenerationService = app.state.container.generation_service
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Initial Codegen Tool Workspace",
+            "description": "Initial codegen should use tool requests before patching page files.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
+
+    run_id = "run_initial_codegen_tool_request"
+    draft_source = app.state.container.workspace_service.prepare_draft(workspace_id, run_id)
+    target = "miniapp/app/static/client/orders.html"
+    target_path = draft_source / target
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text("<main>stale orders</main>\n", encoding="utf-8")
+
+    spec = service._build_grounded_spec(
+        workspace_id=workspace_id,
+        prompt="Create a three-role order workflow app.",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        doc_refs=[],
+        template_revision_id="rev_test",
+        prompt_turn_id="turn_test",
+        generation_mode=GenerationMode.FAST,
+    )
+    role_contract = service._minimal_role_contract(spec, ["client", "specialist", "manager"])
+    page_graph = {
+        "roles": {
+            "client": {
+                "pages": [
+                    {
+                        "page_id": "client_orders",
+                        "route_path": "/client/orders",
+                        "file_path": target,
+                        "page_kind": "feature",
+                        "navigation_label": "Orders",
+                        "title": "Client Orders",
+                        "description": "Track and create shared orders.",
+                        "purpose": "Create and inspect orders.",
+                        "primary_actions": ["Create order"],
+                        "handoff_paths": ["/specialist/orders"],
+                        "data_dependencies": ["orders"],
+                    }
+                ]
+            }
+        }
+    }
+
+    seen_payloads: list[dict[str, object]] = []
+
+    def _stub_generate(**kwargs):
+        if not kwargs["schema_name"].startswith("page_file_v1_"):
+            return {"model": "stub", "payload": {"outcome": "patch_ready", "diagnosis": "No-op", "tool_requests": [], "operations": []}}
+        payload = json.loads(kwargs["user_prompt"])
+        seen_payloads.append(payload)
+        tool_results = payload.get("tool_results") or []
+        file_contexts = payload.get("file_contexts") or {}
+        current_file = str(payload.get("current_file") or "")
+        if not tool_results:
+            assert target not in file_contexts
+            return {
+                "model": "stub",
+                "payload": {
+                    "outcome": "tool_request",
+                    "diagnosis": "Inspect the client static workspace and read the targeted page before editing.",
+                    "tool_requests": [
+                        {
+                            "tool": "list_files",
+                            "targets": ["miniapp/app/static/client"],
+                            "reason": "Inspect the client static workspace before editing the page.",
+                        },
+                        {
+                            "tool": "read_files",
+                            "targets": [target],
+                            "reason": "Read the targeted page source before patching it.",
+                        },
+                    ],
+                    "operations": [],
+                },
+            }
+        assert any(item.get("tool") == "list_files" for item in tool_results)
+        assert "stale orders" in current_file
+        return {
+            "model": "stub",
+            "payload": {
+                "outcome": "patch_ready",
+                "diagnosis": "Patch the role page after tool-driven workspace inspection.",
+                "tool_requests": [],
+                "operations": [
+                    {
+                        "file_path": target,
+                        "operation": "replace",
+                        "content": "<main>healthy orders</main>\n",
+                        "reason": "Replace the stale role page with the repaired order surface.",
+                    }
+                ],
+            },
+        }
+
+    service._generate_structured_with_retry = _stub_generate
+
+    result = service._resolve_code_edits(
+        workspace_id=workspace_id,
+        draft_run_id=run_id,
+        prompt="Create a three-role order workflow app.",
+        grounded_spec=spec,
+        role_scope=["client", "specialist", "manager"],
+        file_contexts={},
+        target_files=[target],
+        role_contract=role_contract,
+        page_graph=page_graph,
+        intent="create",
+        scope_mode="patch",
+        generation_mode=GenerationMode.FAST,
+        creative_direction={},
+    )
+
+    assert "error" not in result
+    assert len(seen_payloads) == 2
+    assert any(operation.file_path == target for operation in result["operations"])
+    assert len(seen_payloads) >= 2
+    assert seen_payloads[0]["tool_results"] == []
+    assert any(item.get("tool") == "list_files" for item in seen_payloads[1]["tool_results"])
+
+
 def test_clone_template_skips_heavy_frontend_artifacts(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -4928,7 +5277,7 @@ def test_scope_mode_prefers_minimal_patch_for_small_local_edits(tmp_path: Path) 
     assert scope_mode == "minimal_patch"
 
 
-def test_normalize_page_plan_proactively_adds_backend_targets_from_page_graph_dependencies(tmp_path: Path) -> None:
+def test_normalize_page_plan_keeps_backend_targets_advisory(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service = app.state.container.generation_service
@@ -4978,11 +5327,8 @@ def test_normalize_page_plan_proactively_adds_backend_targets_from_page_graph_de
         workspace_tree=[],
     )
 
-    assert "miniapp/app/routes/catalog.py" in planned["backend_targets"]
-    assert "miniapp/app/routes/orders.py" in planned["backend_targets"]
-    assert "miniapp/app/main.py" in planned["backend_targets"]
-    assert "miniapp/app/routes/catalog.py" in planned["target_files"]
-    assert planned["planner_contract_enrichment"]["proactive_backend_targets"]
+    assert planned["backend_targets"] == []
+    assert planned["planner_contract_enrichment"]["proactive_backend_targets"] == []
 
 
 def test_normalize_page_plan_infers_semantic_state_contract_for_dynamic_pages(tmp_path: Path) -> None:
@@ -6612,6 +6958,42 @@ def test_basic_page_contract_upgrades_generated_main_to_shell_root_and_bridge(tm
 
     assert '/static/preview_bridge.js' in html
     assert "page-shell" in html
+    assert 'padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));' in html
+
+
+def test_selected_pages_for_edit_infers_minimal_pages_from_target_files(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    selected = service.generation_codegen_selection._selected_pages_for_edit(
+        {},
+        {
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/profile/index.html",
+        },
+    )
+
+    assert [role for role, _page in selected] == ["client", "client"]
+    assert selected[0][1]["route_path"] == "/"
+    assert selected[1][1]["route_path"] == "/profile"
+    assert selected[1][1]["style_path"] == "miniapp/app/static/client/profile/styles.css"
+    assert selected[1][1]["script_path"] == "miniapp/app/static/client/profile/app.js"
+
+
+def test_generation_shell_contract_owner_enforces_shared_shell_markers(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    html = "<html><head></head><body><main id='app'></main></body></html>"
+    html = service.generation_shell_contract.ensure_base_stylesheet_ref(html)
+    html = service.generation_shell_contract.ensure_preview_bridge_ref(html)
+    html = service.generation_shell_contract.ensure_page_shell_contract(html)
+
+    assert '/static/shared/base.css' in html
+    assert '/static/preview_bridge.js' in html
+    assert 'page-shell' in html
     assert 'padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));' in html
 
 

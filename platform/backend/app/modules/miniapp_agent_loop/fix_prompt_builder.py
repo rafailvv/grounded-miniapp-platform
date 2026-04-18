@@ -172,6 +172,7 @@ class FixPromptBuilder:
                     "Use tool=list_files to inspect the workspace tree, tool=read_files to request specific additional files, tool=search_files to search the workspace, tool=run_command to execute a diagnostic workspace command, and tool=run_checks when you need a fresh validation snapshot before patching.",
                     "For run_checks, choose mode=exact for focused fix verification and mode=final when you need the full final verification snapshot.",
                     "For run_command, provide a shell command that can run inside the draft workspace root and use it for real diagnostics, not for speculative rewrites.",
+                    "run_command is diagnostic-only: destructive shell, git reset/discard, network fetches, package installs, and docker rebuild commands are blocked.",
                     "If you use outcome=tool_request, return tool_requests and no operations.",
                     "If you understand the issue but cannot yet produce a safe patch, return outcome=no_progress and explain exactly what contract is still unresolved.",
                     "Do not return diagnosis-only responses without an explicit outcome and executable patch state.",

@@ -11,12 +11,14 @@ from app.models.domain import (
     JobRecord,
     utc_now,
 )
+from app.modules.miniapp_agent_loop.tool_agent_runtime import normalize_tool_requests
 from app.modules.miniapp_agent_loop.types import (
     RepairTurnContext,
     WorkspaceLoopCallbacks,
     WorkspaceLoopResult,
     WorkspaceLoopTurnPlan,
 )
+from app.modules.miniapp_generation_runtime.generation_repair_tools import GenerationRepairToolRuntime
 from app.services.check_runner import CheckRunner
 
 if TYPE_CHECKING:
@@ -24,8 +26,12 @@ if TYPE_CHECKING:
 
 
 class MiniappGenerationRepair:
+    MAX_TOOL_ROUNDS = 5
+    COMMAND_TIMEOUT_SECONDS = 20
+
     def __init__(self, service: "GenerationService") -> None:
         self.service = service
+        self.tool_runtime = GenerationRepairToolRuntime(service)
 
     def _execute_generation_checks(
         self,
@@ -266,6 +272,7 @@ class MiniappGenerationRepair:
             failure_signature=turn_context.failure_signature,
             root_cause_summary=turn_context.root_cause_summary,
             fix_targets=list(turn_context.implicated_files),
+            metadata={"tool_results": list(repair_result.get("tool_results") or [])},
         )
 
     def run_generation_workspace_loop(
@@ -394,78 +401,126 @@ class MiniappGenerationRepair:
         previous_turn_summary: str | None = None,
         previous_diff_summary: str | None = None,
     ) -> dict[str, Any]:
-        del workspace_id, draft_run_id
         last_error: Exception | None = None
         current_target_files = list(target_files)
+        draft_source = self.service.workspace_service.draft_source_dir(workspace_id, draft_run_id)
+        workspace_tree = (
+            self.service.workspace_service.file_tree(workspace_id, run_id=draft_run_id)
+            if self.service.workspace_service.draft_exists(workspace_id, draft_run_id)
+            else []
+        )
+
         for expanded_context in (False, True):
             allowed_targets = set(current_target_files)
+            current_file_contexts = dict(file_contexts)
+            tool_results_for_attempt: list[dict[str, object]] = []
             try:
-                payload = self.service._generate_structured_with_retry(
-                    role="code_edit",
-                    schema_name="composition_bundle_v1",
-                    schema=self.service._code_edit_schema(),
-                    system_prompt=self.service._repair_system_prompt(),
-                    user_prompt=self.service._repair_user_prompt(
-                        prompt=prompt,
-                        grounded_spec=grounded_spec,
-                        role_scope=role_scope,
-                        role_contract=role_contract,
-                        page_graph=page_graph,
-                        scope_mode=scope_mode,
-                        target_files=current_target_files,
-                        file_contexts=file_contexts,
-                        build_issues=build_issues,
-                        preview_issue=preview_issue,
-                        preview_logs=preview_logs,
-                        attempt=attempt,
-                        expanded_context=expanded_context,
-                        previous_turn_summary=previous_turn_summary,
-                        previous_diff_summary=previous_diff_summary,
-                    ),
-                )
-                normalized = self.service._normalize_model_payload(payload["payload"])
-                raw_operations = normalized.get("operations")
-                if not isinstance(raw_operations, list):
-                    raise ValueError("Repair step did not return operations.")
-                operations = self.service._sanitize_draft_operations(
-                    [DraftFileOperation.model_validate(item) for item in raw_operations]
-                )
-                invalid = [
-                    operation.file_path
-                    for operation in operations
-                    if operation.file_path not in allowed_targets
-                    or (operation.operation in {"create", "replace"} and operation.content is None)
-                ]
-                if invalid:
-                    expanded_targets = self.service._expand_repair_targets_for_safe_companions(
-                        target_files=current_target_files,
-                        invalid_paths=invalid,
-                        build_issues=build_issues,
+                for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
+                    payload = self.service._generate_structured_with_retry(
+                        role="code_edit",
+                        schema_name="generation_repair_patch_v1",
+                        schema=self.service._repair_schema(),
+                        system_prompt=self.service._repair_system_prompt(),
+                        user_prompt=self.service._repair_user_prompt(
+                            prompt=prompt,
+                            grounded_spec=grounded_spec,
+                            role_scope=role_scope,
+                            role_contract=role_contract,
+                            page_graph=page_graph,
+                            scope_mode=scope_mode,
+                            target_files=current_target_files,
+                            file_contexts=current_file_contexts,
+                            build_issues=build_issues,
+                            preview_issue=preview_issue,
+                            preview_logs=preview_logs,
+                            attempt=attempt,
+                            expanded_context=expanded_context,
+                            previous_turn_summary=previous_turn_summary,
+                            previous_diff_summary=previous_diff_summary,
+                            tool_results=tool_results_for_attempt,
+                        ),
                     )
-                    if expanded_targets is None:
-                        raise ValueError(f"Repair touched files outside the planned scope: {', '.join(invalid[:5])}")
-                    allowed_targets = set(expanded_targets)
-                    residual_invalid = [
+                    normalized = self.service._normalize_model_payload(payload["payload"])
+                    tool_requests = normalize_tool_requests(normalized.get("tool_requests") or [])
+                    outcome_hint = str(normalized.get("outcome") or "").strip().lower()
+                    raw_operations = normalized.get("operations")
+                    if outcome_hint == "tool_request" or tool_requests:
+                        requested_targets, executed_tool_results, extra_contexts = self.tool_runtime.execute_tool_requests(
+                            workspace_id=workspace_id,
+                            draft_run_id=draft_run_id,
+                            workspace_tree=workspace_tree,
+                            draft_source=draft_source,
+                            tool_requests=tool_requests,
+                            fallback_targets=current_target_files,
+                            execute_checks=lambda requested_changed_files: self._execute_generation_checks(
+                                workspace_id=workspace_id,
+                                draft_run_id=draft_run_id,
+                                draft_source=draft_source,
+                                changed_files=requested_changed_files,
+                                fallback_changed_files=current_target_files,
+                                page_graph=page_graph,
+                                role_scope=role_scope,
+                                scope_mode=scope_mode,
+                            ),
+                            command_timeout_seconds=self.COMMAND_TIMEOUT_SECONDS,
+                        )
+                        for path in requested_targets:
+                            if path not in current_target_files:
+                                current_target_files.append(path)
+                        current_file_contexts.update(extra_contexts)
+                        allowed_targets = set(current_target_files)
+                        tool_results_for_attempt.extend(executed_tool_results)
+                        if tool_round < self.MAX_TOOL_ROUNDS and (requested_targets or executed_tool_results):
+                            continue
+                        raise ValueError("Repair step exhausted the tool-request budget without returning operations.")
+                    if not isinstance(raw_operations, list):
+                        raise ValueError("Repair step did not return operations.")
+                    operations = self.service._sanitize_draft_operations(
+                        [DraftFileOperation.model_validate(item) for item in raw_operations]
+                    )
+                    if not operations and self.service._should_retry_repair_with_expanded_context(
+                        str(normalized.get("diagnosis") or normalized.get("assistant_message") or "")
+                    ):
+                        raise ValueError(
+                            str(normalized.get("diagnosis") or normalized.get("assistant_message") or "Repair step did not return operations.")
+                        )
+                    invalid = [
                         operation.file_path
                         for operation in operations
                         if operation.file_path not in allowed_targets
                         or (operation.operation in {"create", "replace"} and operation.content is None)
                     ]
-                    if residual_invalid:
-                        raise ValueError(
-                            f"Repair touched files outside the planned scope: {', '.join(residual_invalid[:5])}"
+                    if invalid:
+                        expanded_targets = self.service._expand_repair_targets_for_safe_companions(
+                            target_files=current_target_files,
+                            invalid_paths=invalid,
+                            build_issues=build_issues,
                         )
-                    current_target_files = expanded_targets
-                self.service._validate_targeted_operations(
-                    stage_name="repair",
-                    target_files=current_target_files,
-                    operations=operations,
-                )
-                return {
-                    "assistant_message": str(normalized.get("assistant_message") or "").strip(),
-                    "operations": operations,
-                    "model": payload["model"],
-                }
+                        if expanded_targets is None:
+                            raise ValueError(f"Repair touched files outside the planned scope: {', '.join(invalid[:5])}")
+                        allowed_targets = set(expanded_targets)
+                        residual_invalid = [
+                            operation.file_path
+                            for operation in operations
+                            if operation.file_path not in allowed_targets
+                            or (operation.operation in {"create", "replace"} and operation.content is None)
+                        ]
+                        if residual_invalid:
+                            raise ValueError(
+                                f"Repair touched files outside the planned scope: {', '.join(residual_invalid[:5])}"
+                            )
+                        current_target_files = expanded_targets
+                    self.service._validate_targeted_operations(
+                        stage_name="repair",
+                        target_files=current_target_files,
+                        operations=operations,
+                    )
+                    return {
+                        "assistant_message": str(normalized.get("diagnosis") or normalized.get("assistant_message") or "").strip(),
+                        "operations": operations,
+                        "model": payload["model"],
+                        "tool_results": list(tool_results_for_attempt),
+                    }
             except Exception as exc:
                 last_error = exc
                 if expanded_context or not self.service._should_retry_repair_with_expanded_context(str(exc)):

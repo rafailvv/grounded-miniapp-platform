@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from app.models.domain import DraftFileOperation, FixAttemptOutcome
 from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
+from app.modules.miniapp_agent_loop.tool_agent_runtime import normalize_tool_requests
 
 logger = logging.getLogger(__name__)
 
@@ -122,38 +123,7 @@ class FixPatchingRuntime:
 
     @staticmethod
     def _coerce_tool_requests(raw_tool_requests: list[Any]) -> list[dict[str, Any]]:
-        normalized: list[dict[str, Any]] = []
-        if not isinstance(raw_tool_requests, list):
-            return normalized
-        for item in raw_tool_requests:
-            if not isinstance(item, dict):
-                continue
-            tool = str(item.get("tool") or "").strip().lower()
-            if tool not in {"list_files", "read_files", "run_checks", "search_files", "run_command"}:
-                continue
-            raw_targets = item.get("targets") or []
-            if not isinstance(raw_targets, list):
-                raw_targets = []
-            targets: list[str] = []
-            for target in raw_targets:
-                value = str(target or "").strip().lstrip("./")
-                if not value or value in targets:
-                    continue
-                targets.append(value)
-            mode = str(item.get("mode") or ("exact" if tool == "run_checks" else "")).strip().lower()
-            if tool == "run_checks" and mode not in {"exact", "final"}:
-                mode = "exact"
-            normalized.append(
-                {
-                    "tool": tool,
-                    "mode": mode,
-                    "targets": targets[:12],
-                    "pattern": str(item.get("pattern") or "").strip(),
-                    "command": str(item.get("command") or "").strip(),
-                    "reason": str(item.get("reason") or "").strip(),
-                }
-            )
-        return normalized
+        return normalize_tool_requests(raw_tool_requests)
 
     def plan_patch(
         self,

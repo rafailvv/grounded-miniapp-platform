@@ -62,12 +62,7 @@ class MiniappGenerationCodePlanNormalization(MiniappGenerationRuntimeOwner):
             }
             graph_page_targets.extend(page["file_path"] for page in pages)
 
-        proactive_backend_targets = self._detect_missing_backend_contract_targets_from_page_graph(
-            page_graph={"roles": roles},
-            current_target_files=[*shared_files, *backend_targets, *graph_page_targets],
-            backend_targets=backend_targets,
-        )
-        backend_targets = list(dict.fromkeys([*backend_targets, *proactive_backend_targets]))
+        proactive_backend_targets: list[str] = []
 
         computed_targets = list(
             dict.fromkeys(

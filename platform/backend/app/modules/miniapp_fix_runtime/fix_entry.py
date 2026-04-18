@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import subprocess
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -9,6 +8,11 @@ from typing import TYPE_CHECKING, Callable
 from app.models.common import GenerationMode
 from app.models.domain import GenerateRequest, JobRecord, ValidationSnapshot
 from app.modules.miniapp_agent_loop.types import WorkspaceLoopCallbacks, WorkspaceLoopTurnPlan
+from app.modules.miniapp_agent_loop.tool_agent_runtime import (
+    list_workspace_files,
+    run_workspace_command,
+    search_workspace_files,
+)
 from app.services.check_runner import CheckRunner
 
 if TYPE_CHECKING:
@@ -17,7 +21,6 @@ if TYPE_CHECKING:
 
 class FixEntryRuntime:
     MAX_TOOL_ROUNDS = 5
-    MAX_TOOL_OUTPUT_CHARS = 6000
     COMMAND_TIMEOUT_SECONDS = 20
 
     def __init__(self, service: "FixOrchestrator") -> None:
@@ -72,83 +75,32 @@ class FixEntryRuntime:
                 )
             return _execute_checks(changed_files)
 
-        def _truncate_tool_text(value: str) -> str:
-            text = str(value or "")
-            if len(text) <= self.MAX_TOOL_OUTPUT_CHARS:
-                return text
-            head = text[: self.MAX_TOOL_OUTPUT_CHARS // 2]
-            tail = text[-(self.MAX_TOOL_OUTPUT_CHARS // 2) :]
-            omitted = len(text) - len(head) - len(tail)
-            return f"{head}\n...[truncated {omitted} chars]...\n{tail}"
-
         def _search_workspace(*, pattern: str, targets: list[str]) -> dict[str, object]:
             source_dir = self.service.workspace_service.draft_source_dir(workspace_id, run_id)
-            tree = self.service.workspace_service.file_tree(workspace_id, run_id)
-            candidate_files = [
-                item["path"]
-                for item in tree
-                if item.get("type") == "file"
-                and (
-                    not targets
-                    or any(str(item["path"]).startswith(target.rstrip("/") + "/") or str(item["path"]) == target.rstrip("/") for target in targets)
-                )
-            ]
-            matches: list[dict[str, object]] = []
-            for relative_path in candidate_files[:200]:
-                content = self.service.workspace_service.try_read_text_file(workspace_id, relative_path, run_id=run_id)
-                if not content or pattern not in content:
-                    continue
-                line_hits = []
-                for line_no, line in enumerate(content.splitlines(), start=1):
-                    if pattern in line:
-                        line_hits.append({"line": line_no, "text": line[:240]})
-                    if len(line_hits) >= 5:
-                        break
-                matches.append({"file_path": relative_path, "hits": line_hits})
-                if len(matches) >= 20:
-                    break
-            return {
-                "tool": "search_files",
-                "pattern": pattern,
-                "targets": list(targets),
-                "matches": matches,
-                "workspace_root": str(source_dir),
-            }
+            result = search_workspace_files(
+                workspace_tree=self.service.workspace_service.file_tree(workspace_id, run_id),
+                read_text_file=lambda relative_path: self.service.workspace_service.try_read_text_file(
+                    workspace_id,
+                    relative_path,
+                    run_id=run_id,
+                ),
+                pattern=pattern,
+                targets=targets,
+            )
+            return {**result, "workspace_root": str(source_dir)}
 
         def _list_workspace_files(*, targets: list[str]) -> dict[str, object]:
-            tree = self.service.workspace_service.file_tree(workspace_id, run_id)
-            selected_paths = [
-                item["path"]
-                for item in tree
-                if (
-                    not targets
-                    or any(str(item["path"]).startswith(target.rstrip("/") + "/") or str(item["path"]) == target.rstrip("/") for target in targets)
-                )
-            ]
-            return {
-                "tool": "list_files",
-                "targets": list(targets),
-                "paths": selected_paths[:200],
-            }
+            return list_workspace_files(
+                workspace_tree=self.service.workspace_service.file_tree(workspace_id, run_id),
+                targets=targets,
+            )
 
         def _run_workspace_command(*, command: str) -> dict[str, object]:
-            if not str(command or "").strip():
-                return {"tool": "run_command", "command": command, "error": "Empty command."}
-            completed = subprocess.run(
-                ["/bin/zsh", "-lc", command],
-                cwd=draft_source,
-                capture_output=True,
-                text=True,
-                timeout=self.COMMAND_TIMEOUT_SECONDS,
+            return run_workspace_command(
+                draft_source=draft_source,
+                command=command,
+                timeout_seconds=self.COMMAND_TIMEOUT_SECONDS,
             )
-            return {
-                "tool": "run_command",
-                "command": command,
-                "exit_code": completed.returncode,
-                "stdout": _truncate_tool_text(completed.stdout),
-                "stderr": _truncate_tool_text(completed.stderr),
-                "cwd": str(draft_source),
-            }
 
         def _adopt_requested_scope(
             requested_paths: list[str],
