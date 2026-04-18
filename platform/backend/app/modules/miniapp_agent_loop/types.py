@@ -35,6 +35,19 @@ class WorkspaceLoopTurnPlan:
 
 
 @dataclass
+class RepairTurnContext:
+    failure_class: str | None = None
+    failure_signature: str | None = None
+    root_cause_summary: str | None = None
+    failing_checks: list[Any] = field(default_factory=list)
+    implicated_files: list[str] = field(default_factory=list)
+    file_contexts: dict[str, str] = field(default_factory=dict)
+    previous_turn_summary: str | None = None
+    previous_diff_summary: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class WorkspaceLoopResult:
     status: Literal["completed", "failed", "blocked"]
     outcome_kind: str | None
@@ -72,9 +85,9 @@ class WorkspaceLoopCallbacks:
 __all__ = [
     "LoopContextMode",
     "LoopOutcome",
+    "RepairTurnContext",
     "WorkspaceLoopCallbacks",
     "WorkspaceLoopResult",
     "WorkspaceLoopTurnPlan",
     "GenerationMode",
 ]
-

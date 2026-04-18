@@ -151,7 +151,7 @@ def test_submit_with_context_preserves_workspace_log_context() -> None:
     assert result["workspace_id"] == "ws_context_submit"
 
 
-def test_fast_grounded_spec_timeout_returns_error_without_compiler_fallback(tmp_path: Path) -> None:
+def test_fast_grounded_spec_timeout_returns_error_without_legacy_fallback_wording(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
@@ -181,7 +181,8 @@ def test_fast_grounded_spec_timeout_returns_error_without_compiler_fallback(tmp_
         service.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS = original_timeout
         service._resolve_grounded_spec_fast_inner = original_inner  # type: ignore[method-assign]
     assert "error" in result
-    assert "No compiler fallback was used" in result["error"]
+    assert "timed out without a valid result" in result["error"]
+    assert "compiler fallback" not in result["error"].lower()
 
 
 def test_workspace_name_is_derived_from_prompt() -> None:
@@ -571,7 +572,7 @@ def test_code_plan_sections_fall_back_when_one_section_times_out(tmp_path: Path,
     assert normalized["summary"]
 
 
-def test_grounded_spec_sections_fall_back_when_one_section_times_out(tmp_path: Path, monkeypatch) -> None:
+def test_grounded_spec_sections_fail_when_one_section_times_out(tmp_path: Path, monkeypatch) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
@@ -619,25 +620,19 @@ def test_grounded_spec_sections_fall_back_when_one_section_times_out(tmp_path: P
     monkeypatch.setattr(service, "_generate_structured_with_retry", _stub_generate_structured_with_retry)
     monkeypatch.setattr(service, "_generate_grounded_spec_section", _stub_generate_grounded_spec_section)
 
-    outline_payload, payload, _outline = service._generate_grounded_spec_pair(
-        workspace_id="ws_grounded_spec_partial",
-        prompt="Create a workflow app for clients, specialists, and managers.",
-        doc_refs=[],
-        target_platform=TargetPlatform.TELEGRAM,
-        preview_profile=PreviewProfile.TELEGRAM_MOCK,
-        template_revision_id="rev_test",
-        prompt_turn_id="turn_test",
-        creative_direction={},
-        relaxed=False,
-        compact=True,
-    )
-
-    normalized = payload["payload"]
-    assert outline_payload["model"]
-    assert payload["model"] == "fake-gov"
-    assert normalized["product_goal"]
-    assert "actors" in normalized
-    assert "ui_requirements" in normalized
+    with pytest.raises(RuntimeError, match="incomplete sections without a valid agent response"):
+        service._generate_grounded_spec_pair(
+            workspace_id="ws_grounded_spec_partial",
+            prompt="Create a workflow app for clients, specialists, and managers.",
+            doc_refs=[],
+            target_platform=TargetPlatform.TELEGRAM,
+            preview_profile=PreviewProfile.TELEGRAM_MOCK,
+            template_revision_id="rev_test",
+            prompt_turn_id="turn_test",
+            creative_direction={},
+            relaxed=False,
+            compact=True,
+        )
 
 
 def test_build_generation_clusters_splits_backend_and_shared_static_targets() -> None:

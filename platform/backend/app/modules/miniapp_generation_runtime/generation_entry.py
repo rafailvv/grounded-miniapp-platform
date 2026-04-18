@@ -144,94 +144,13 @@ class MiniappGenerationEntry:
         should_stop: Callable[[], bool] | None,
     ) -> JobRecord:
         service = self.service
-        service._normalize_runtime_python_paths_in_plan(plan_result)
-        service._expand_page_asset_targets_in_plan(plan_result)
-        plan_result["target_files"] = list(dict.fromkeys(plan_result.get("target_files") or []))
-        plan_result["backend_targets"] = service._sanitize_backend_targets(list(dict.fromkeys(plan_result.get("backend_targets") or [])))
-        plan_result["files_to_read"] = list(dict.fromkeys(plan_result.get("files_to_read") or []))
-        plan_result["shared_files"] = list(dict.fromkeys(plan_result.get("shared_files") or []))
-        plan_result["target_files"] = service._sanitize_planner_target_files(
-            target_files=plan_result["target_files"],
-            backend_targets=plan_result["backend_targets"],
-            page_graph=plan_result["page_graph"],
-        )
-        plan_result["generation_clusters"] = service._build_generation_clusters(plan_result["target_files"])
-        page_graph_roles = plan_result.get("page_graph", {}).get("roles") if isinstance(plan_result.get("page_graph"), dict) else {}
-        if isinstance(page_graph_roles, dict):
-            plan_result["execution_plan"] = service._build_execution_plan(
-                role_scope=role_scope,
-                roles=page_graph_roles,
-                shared_files=plan_result["shared_files"],
-                backend_targets=plan_result["backend_targets"],
-                target_files=plan_result["target_files"],
-                generation_clusters=plan_result["generation_clusters"],
-            )
-        proactive_contract_targets = service._detect_missing_backend_contract_targets_from_page_graph(
-            page_graph=plan_result["page_graph"],
-            current_target_files=plan_result["target_files"],
-            backend_targets=plan_result["backend_targets"],
-        )
-        if proactive_contract_targets:
-            plan_result["target_files"] = list(dict.fromkeys([*plan_result["target_files"], *proactive_contract_targets]))
-            plan_result["backend_targets"] = service._sanitize_backend_targets(list(dict.fromkeys([*plan_result["backend_targets"], *proactive_contract_targets])))
-            if isinstance(plan_result.get("page_graph"), dict):
-                existing_backend_targets = list(plan_result["page_graph"].get("backend_targets") or [])
-                plan_result["page_graph"]["backend_targets"] = service._sanitize_backend_targets(
-                    list(dict.fromkeys([*existing_backend_targets, *proactive_contract_targets]))
-                )
-            plan_result["generation_clusters"] = service._build_generation_clusters(plan_result["target_files"])
-            service._append_trace(
-                workspace_id,
-                "planner_contract_completed",
-                "Planner targets were proactively expanded to include backend contract files before code generation.",
-                {"added_targets": proactive_contract_targets},
-            )
-        spec_contract_targets = service._detect_missing_backend_contract_targets_from_spec(
+        plan_result = service.generation_plan_runtime.prepare_runtime_plan(
+            workspace_id=workspace_id,
+            draft_source=draft_source,
             grounded_spec=grounded_spec,
-            page_graph=plan_result["page_graph"],
-            current_target_files=plan_result["target_files"],
-            backend_targets=plan_result["backend_targets"],
+            role_scope=role_scope,
+            plan_result=plan_result,
         )
-        if spec_contract_targets:
-            plan_result["target_files"] = list(dict.fromkeys([*plan_result["target_files"], *spec_contract_targets]))
-            plan_result["backend_targets"] = service._sanitize_backend_targets(list(dict.fromkeys([*plan_result["backend_targets"], *spec_contract_targets])))
-            service._append_trace(
-                workspace_id,
-                "spec_contract_completed",
-                "Grounded spec targets were proactively expanded to include required backend contract files before code generation.",
-                {"added_targets": spec_contract_targets},
-            )
-        plan_result["target_files"] = service._sanitize_planner_target_files(
-            target_files=plan_result["target_files"],
-            backend_targets=plan_result["backend_targets"],
-            page_graph=plan_result["page_graph"],
-        )
-        target_set = set(plan_result["target_files"])
-        plan_result["backend_targets"] = [path for path in plan_result["backend_targets"] if path in target_set]
-        plan_result["shared_files"] = [path for path in plan_result["shared_files"] if path in target_set]
-        plan_result["files_to_read"] = list(
-            dict.fromkeys(
-                [
-                    *[
-                        path
-                        for path in plan_result["files_to_read"]
-                        if path in target_set or path in DESIGN_REFERENCE_FILES
-                    ],
-                    *[path for path in DESIGN_REFERENCE_FILES if (draft_source / path).exists()],
-                ]
-            )
-        )
-        plan_result["generation_clusters"] = service._build_generation_clusters(plan_result["target_files"])
-        page_graph_roles = plan_result.get("page_graph", {}).get("roles") if isinstance(plan_result.get("page_graph"), dict) else {}
-        if isinstance(page_graph_roles, dict):
-            plan_result["execution_plan"] = service._build_execution_plan(
-                role_scope=role_scope,
-                roles=page_graph_roles,
-                shared_files=plan_result["shared_files"],
-                backend_targets=plan_result["backend_targets"],
-                target_files=plan_result["target_files"],
-                generation_clusters=plan_result["generation_clusters"],
-            )
         service._append_event(
             job,
             "context_pack_started",

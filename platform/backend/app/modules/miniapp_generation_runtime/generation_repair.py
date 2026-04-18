@@ -12,6 +12,7 @@ from app.models.domain import (
     utc_now,
 )
 from app.modules.miniapp_agent_loop.types import (
+    RepairTurnContext,
     WorkspaceLoopCallbacks,
     WorkspaceLoopResult,
     WorkspaceLoopTurnPlan,
@@ -25,6 +26,237 @@ if TYPE_CHECKING:
 class MiniappGenerationRepair:
     def __init__(self, service: "GenerationService") -> None:
         self.service = service
+
+    def _execute_generation_checks(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        draft_source,
+        changed_files: list[str],
+        fallback_changed_files: list[str],
+        page_graph: dict[str, Any],
+        role_scope: list[str],
+        scope_mode: str,
+    ) -> tuple[CheckExecutionRecord, dict[str, Any]]:
+        changed = sorted(set(changed_files or fallback_changed_files))
+        preflight_issues = self.service._preflight_generation_issues(
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
+            changed_files=changed,
+            page_graph=page_graph,
+            role_scope=role_scope,
+        )
+        if preflight_issues:
+            preview = self.service.preview_service.get(workspace_id)
+            execution = CheckExecutionRecord(
+                workspace_id=workspace_id,
+                run_id=draft_run_id,
+                results=self.service._preflight_check_results(preflight_issues),
+                duration_ms=0,
+                started_at=utc_now(),
+                completed_at=utc_now(),
+            )
+            preview_details = {
+                "status": preview.status,
+                "stage": preview.stage,
+                "progress_percent": preview.progress_percent,
+                "logs": list(preview.logs),
+                "last_error": preview.last_error,
+                "containers": [],
+                "container_logs": {},
+            }
+            return execution, preview_details
+        execution = self.service.check_runner.run(
+            workspace_id=workspace_id,
+            run_id=draft_run_id,
+            source_dir=draft_source,
+            changed_files=changed,
+            preview_run_id=draft_run_id,
+            scope_mode=scope_mode,
+        )
+        preview = self.service.preview_service.get(workspace_id)
+        preview_details = {
+            "status": preview.status,
+            "stage": preview.stage,
+            "progress_percent": preview.progress_percent,
+            "logs": list(preview.logs),
+            "last_error": preview.last_error,
+            "containers": [],
+            "container_logs": {},
+        }
+        return execution, preview_details
+
+    def _build_generation_repair_turn_context(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        latest_execution: CheckExecutionRecord,
+        latest_preview_details: dict[str, Any],
+        active_repair_targets: list[str],
+        scope_mode: str,
+        attempt: int,
+        repeated_no_progress: int,
+        last_turn_summary: str | None,
+        latest_diff_summary: str | None,
+    ) -> tuple[RepairTurnContext, ValidationIssue | None]:
+        check_issues = CheckRunner.failing_issues(latest_execution.results)
+        build_issues = [issue for issue in check_issues if issue.location != "preview"]
+        preview_issue = next((issue for issue in check_issues if issue.location == "preview"), None)
+        failure_class = self.service.check_runner.classify_failure(latest_execution.results)
+        failure_signature = self.service._failure_signature_for_issues(build_issues, preview_issue)
+        structural_failure = self.service._is_structural_contract_failure(build_issues)
+        causal_surface = self.service._causal_surface_for_issues(
+            build_issues=build_issues,
+            check_results=latest_execution.results,
+            active_targets=active_repair_targets,
+        )
+        if structural_failure and repeated_no_progress >= 1:
+            expanded_targets, _added_targets = self.service._expand_structural_repair_targets(
+                active_targets=active_repair_targets,
+                build_issues=build_issues,
+            )
+            active_repair_targets[:] = expanded_targets
+        repair_target_files = self.service._repair_targets_for_attempt(
+            active_targets=active_repair_targets,
+            check_results=latest_execution.results,
+            attempt=attempt,
+            causal_surface=causal_surface,
+            scope_mode=scope_mode,
+            structural_failure=structural_failure,
+        )
+        file_contexts = self.service._collect_existing_file_contexts(
+            workspace_id,
+            draft_run_id,
+            repair_target_files,
+        )
+        return (
+            RepairTurnContext(
+                failure_class=failure_class,
+                failure_signature=failure_signature,
+                root_cause_summary=self.service._summarize_failed_checks(build_issues, preview_issue),
+                failing_checks=build_issues,
+                implicated_files=list(repair_target_files),
+                file_contexts=file_contexts,
+                previous_turn_summary=last_turn_summary,
+                previous_diff_summary=latest_diff_summary,
+                metadata={
+                    "preview_issue": preview_issue,
+                    "preview_logs": list(latest_preview_details.get("logs") or []),
+                },
+            ),
+            preview_issue,
+        )
+
+    def _plan_generation_repair_turn(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        prompt: str,
+        grounded_spec,
+        role_scope: list[str],
+        role_contract: dict[str, Any],
+        page_graph: dict[str, Any],
+        plan_result: dict[str, Any],
+        generation_mode: GenerationMode,
+        latest_execution: CheckExecutionRecord,
+        latest_preview_details: dict[str, Any],
+        attempt: int,
+        context_mode: str,
+        repeated_no_progress: int,
+        active_repair_targets: list[str],
+        last_turn_summary: str | None,
+        latest_diff_summary: str | None,
+    ) -> WorkspaceLoopTurnPlan:
+        turn_context, preview_issue = self._build_generation_repair_turn_context(
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
+            latest_execution=latest_execution,
+            latest_preview_details=latest_preview_details,
+            active_repair_targets=active_repair_targets,
+            scope_mode=plan_result["scope_mode"],
+            attempt=attempt,
+            repeated_no_progress=repeated_no_progress,
+            last_turn_summary=last_turn_summary,
+            latest_diff_summary=latest_diff_summary,
+        )
+        repair_result = self.repair_draft_after_failure(
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
+            prompt=prompt,
+            grounded_spec=grounded_spec,
+            role_scope=role_scope,
+            role_contract=role_contract,
+            page_graph=page_graph,
+            scope_mode=plan_result["scope_mode"],
+            target_files=turn_context.implicated_files,
+            file_contexts=turn_context.file_contexts,
+            build_issues=list(turn_context.failing_checks),
+            preview_issue=preview_issue,
+            preview_logs=list(turn_context.metadata.get("preview_logs") or []),
+            attempt=attempt,
+            previous_turn_summary=turn_context.previous_turn_summary,
+            previous_diff_summary=turn_context.previous_diff_summary,
+        )
+        if "error" in repair_result:
+            message = str(repair_result["error"])
+            lowered = message.lower()
+            if any(
+                marker in lowered
+                for marker in (
+                    "no file operations",
+                    "did not return operations",
+                    "unable to inspect",
+                    "cannot access",
+                    "can't access",
+                )
+            ):
+                return WorkspaceLoopTurnPlan(
+                    outcome="needs_context" if context_mode != "full_bundle" else "no_op",
+                    assistant_message=message,
+                    diagnosis=message,
+                    files_read=sorted(turn_context.file_contexts.keys()),
+                    failure_class=turn_context.failure_class,
+                    failure_signature=turn_context.failure_signature,
+                    root_cause_summary=turn_context.root_cause_summary,
+                    fix_targets=list(turn_context.implicated_files),
+                )
+            return WorkspaceLoopTurnPlan(
+                outcome="fatal_invalid_response",
+                assistant_message=message,
+                diagnosis=message,
+                files_read=sorted(turn_context.file_contexts.keys()),
+                failure_class=turn_context.failure_class,
+                failure_signature=turn_context.failure_signature,
+                root_cause_summary=turn_context.root_cause_summary,
+                fix_targets=list(turn_context.implicated_files),
+            )
+        operations = list(repair_result["operations"])
+        operations = self.service._ensure_runtime_artifact_operations(
+            grounded_spec=grounded_spec,
+            page_graph=page_graph,
+            role_scope=role_scope,
+            generation_mode=generation_mode,
+            operations=operations,
+        )
+        operations = self.service._ensure_app_level_test_operations(
+            page_graph=page_graph,
+            role_scope=role_scope,
+            operations=operations,
+        )
+        return WorkspaceLoopTurnPlan(
+            outcome="patch_ready",
+            assistant_message=str(repair_result.get("assistant_message") or ""),
+            diagnosis=str(repair_result.get("assistant_message") or ""),
+            operations=operations,
+            files_read=sorted(turn_context.file_contexts.keys()),
+            failure_class=turn_context.failure_class,
+            failure_signature=turn_context.failure_signature,
+            root_cause_summary=turn_context.root_cause_summary,
+            fix_targets=list(turn_context.implicated_files),
+        )
 
     def run_generation_workspace_loop(
         self,
@@ -47,57 +279,23 @@ class MiniappGenerationRepair:
         initial_assistant_message: str,
         should_stop: Callable[[], bool] | None,
     ) -> WorkspaceLoopResult:
+        del creative_direction
         if self.service.workspace_loop_engine is None:
             raise RuntimeError("Workspace loop engine is required for generation mode.")
         active_repair_targets = list(plan_result["target_files"])
+        fallback_changed_files = [operation.file_path for operation in initial_operations]
 
         def _execute_checks(changed_files: list[str]) -> tuple[CheckExecutionRecord, dict[str, Any]]:
-            preflight_issues = self.service._preflight_generation_issues(
+            return self._execute_generation_checks(
                 workspace_id=workspace_id,
                 draft_run_id=draft_run_id,
-                changed_files=sorted(set(changed_files or [operation.file_path for operation in initial_operations])),
+                draft_source=draft_source,
+                changed_files=changed_files,
+                fallback_changed_files=fallback_changed_files,
                 page_graph=page_graph,
                 role_scope=role_scope,
-            )
-            if preflight_issues:
-                preview = self.service.preview_service.get(workspace_id)
-                execution = CheckExecutionRecord(
-                    workspace_id=workspace_id,
-                    run_id=draft_run_id,
-                    results=self.service._preflight_check_results(preflight_issues),
-                    duration_ms=0,
-                    started_at=utc_now(),
-                    completed_at=utc_now(),
-                )
-                preview_details = {
-                    "status": preview.status,
-                    "stage": preview.stage,
-                    "progress_percent": preview.progress_percent,
-                    "logs": list(preview.logs),
-                    "last_error": preview.last_error,
-                    "containers": [],
-                    "container_logs": {},
-                }
-                return execution, preview_details
-            execution = self.service.check_runner.run(
-                workspace_id=workspace_id,
-                run_id=draft_run_id,
-                source_dir=draft_source,
-                changed_files=sorted(set(changed_files or [operation.file_path for operation in initial_operations])),
-                preview_run_id=draft_run_id,
                 scope_mode=plan_result["scope_mode"],
             )
-            preview = self.service.preview_service.get(workspace_id)
-            preview_details = {
-                "status": preview.status,
-                "stage": preview.stage,
-                "progress_percent": preview.progress_percent,
-                "logs": list(preview.logs),
-                "last_error": preview.last_error,
-                "containers": [],
-                "container_logs": {},
-            }
-            return execution, preview_details
 
         def _plan_turn(
             *,
@@ -111,35 +309,7 @@ class MiniappGenerationRepair:
             latest_diff_summary: str | None,
         ) -> WorkspaceLoopTurnPlan:
             del validation_snapshot
-            del last_turn_summary
-            del latest_diff_summary
-            check_issues = CheckRunner.failing_issues(latest_execution.results)
-            build_issues = [issue for issue in check_issues if issue.location != "preview"]
-            preview_issue = next((issue for issue in check_issues if issue.location == "preview"), None)
-            check_failure = self.service.check_runner.classify_failure(latest_execution.results)
-            failure_signature = self.service._failure_signature_for_issues(build_issues, preview_issue)
-            structural_failure = self.service._is_structural_contract_failure(build_issues)
-            causal_surface = self.service._causal_surface_for_issues(
-                build_issues=build_issues,
-                check_results=latest_execution.results,
-                active_targets=active_repair_targets,
-            )
-            if structural_failure and repeated_no_progress >= 1:
-                expanded_targets, _added_targets = self.service._expand_structural_repair_targets(
-                    active_targets=active_repair_targets,
-                    build_issues=build_issues,
-                )
-                active_repair_targets[:] = expanded_targets
-            repair_target_files = self.service._repair_targets_for_attempt(
-                active_targets=active_repair_targets,
-                check_results=latest_execution.results,
-                attempt=attempt,
-                causal_surface=causal_surface,
-                scope_mode=plan_result["scope_mode"],
-                structural_failure=structural_failure,
-            )
-            repair_contexts = self.service._collect_existing_file_contexts(workspace_id, draft_run_id, repair_target_files)
-            repair_result = self.repair_draft_after_failure(
+            return self._plan_generation_repair_turn(
                 workspace_id=workspace_id,
                 draft_run_id=draft_run_id,
                 prompt=prompt,
@@ -147,61 +317,16 @@ class MiniappGenerationRepair:
                 role_scope=role_scope,
                 role_contract=role_contract,
                 page_graph=page_graph,
-                scope_mode=plan_result["scope_mode"],
-                target_files=repair_target_files,
-                file_contexts=repair_contexts,
-                build_issues=build_issues,
-                preview_issue=preview_issue,
-                preview_logs=list(latest_preview_details.get("logs") or []),
-                attempt=attempt,
-            )
-            if "error" in repair_result:
-                message = str(repair_result["error"])
-                lowered = message.lower()
-                if any(marker in lowered for marker in ("no file operations", "did not return operations", "unable to inspect", "cannot access", "can't access")):
-                    return WorkspaceLoopTurnPlan(
-                        outcome="needs_context" if context_mode != "full_bundle" else "no_op",
-                        assistant_message=message,
-                        diagnosis=message,
-                        files_read=sorted(repair_contexts.keys()),
-                        failure_class=check_failure,
-                        failure_signature=failure_signature,
-                        root_cause_summary=self.service._summarize_failed_checks(build_issues, preview_issue),
-                        fix_targets=list(repair_target_files),
-                    )
-                return WorkspaceLoopTurnPlan(
-                    outcome="fatal_invalid_response",
-                    assistant_message=message,
-                    diagnosis=message,
-                    files_read=sorted(repair_contexts.keys()),
-                    failure_class=check_failure,
-                    failure_signature=failure_signature,
-                    root_cause_summary=self.service._summarize_failed_checks(build_issues, preview_issue),
-                    fix_targets=list(repair_target_files),
-                )
-            operations = list(repair_result["operations"])
-            operations = self.service._ensure_runtime_artifact_operations(
-                grounded_spec=grounded_spec,
-                page_graph=page_graph,
-                role_scope=role_scope,
+                plan_result=plan_result,
                 generation_mode=generation_mode,
-                operations=operations,
-            )
-            operations = self.service._ensure_app_level_test_operations(
-                page_graph=page_graph,
-                role_scope=role_scope,
-                operations=operations,
-            )
-            return WorkspaceLoopTurnPlan(
-                outcome="patch_ready",
-                assistant_message=str(repair_result.get("assistant_message") or ""),
-                diagnosis=str(repair_result.get("assistant_message") or ""),
-                operations=operations,
-                files_read=sorted(repair_contexts.keys()),
-                failure_class=check_failure,
-                failure_signature=failure_signature,
-                root_cause_summary=self.service._summarize_failed_checks(build_issues, preview_issue),
-                fix_targets=list(repair_target_files),
+                latest_execution=latest_execution,
+                latest_preview_details=latest_preview_details,
+                attempt=attempt,
+                context_mode=context_mode,
+                repeated_no_progress=repeated_no_progress,
+                active_repair_targets=active_repair_targets,
+                last_turn_summary=last_turn_summary,
+                latest_diff_summary=latest_diff_summary,
             )
 
         callbacks = WorkspaceLoopCallbacks(
@@ -255,7 +380,10 @@ class MiniappGenerationRepair:
         preview_issue: ValidationIssue | None,
         preview_logs: list[str],
         attempt: int,
+        previous_turn_summary: str | None = None,
+        previous_diff_summary: str | None = None,
     ) -> dict[str, Any]:
+        del workspace_id, draft_run_id
         last_error: Exception | None = None
         current_target_files = list(target_files)
         for expanded_context in (False, True):
@@ -280,6 +408,8 @@ class MiniappGenerationRepair:
                         preview_logs=preview_logs,
                         attempt=attempt,
                         expanded_context=expanded_context,
+                        previous_turn_summary=previous_turn_summary,
+                        previous_diff_summary=previous_diff_summary,
                     ),
                 )
                 normalized = self.service._normalize_model_payload(payload["payload"])
@@ -292,7 +422,8 @@ class MiniappGenerationRepair:
                 invalid = [
                     operation.file_path
                     for operation in operations
-                    if operation.file_path not in allowed_targets or (operation.operation in {"create", "replace"} and operation.content is None)
+                    if operation.file_path not in allowed_targets
+                    or (operation.operation in {"create", "replace"} and operation.content is None)
                 ]
                 if invalid:
                     expanded_targets = self.service._expand_repair_targets_for_safe_companions(
@@ -310,9 +441,15 @@ class MiniappGenerationRepair:
                         or (operation.operation in {"create", "replace"} and operation.content is None)
                     ]
                     if residual_invalid:
-                        raise ValueError(f"Repair touched files outside the planned scope: {', '.join(residual_invalid[:5])}")
+                        raise ValueError(
+                            f"Repair touched files outside the planned scope: {', '.join(residual_invalid[:5])}"
+                        )
                     current_target_files = expanded_targets
-                self.service._validate_targeted_operations(stage_name="repair", target_files=current_target_files, operations=operations)
+                self.service._validate_targeted_operations(
+                    stage_name="repair",
+                    target_files=current_target_files,
+                    operations=operations,
+                )
                 return {
                     "assistant_message": str(normalized.get("assistant_message") or "").strip(),
                     "operations": operations,
