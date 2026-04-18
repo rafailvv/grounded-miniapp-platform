@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.models.domain import FixScopeEntry
@@ -12,6 +11,12 @@ if TYPE_CHECKING:
 
 
 class FixScopeRuntime:
+    _READ_ONLY_CONTEXT_SURFACES = {
+        "miniapp/app/generated/route_manifest.json",
+        "miniapp/app/generated/runtime_manifest.json",
+        "artifacts/generated_app_graph.json",
+    }
+
     def __init__(self, service: "FixOrchestrator") -> None:
         self.service = service
 
@@ -31,6 +36,7 @@ class FixScopeRuntime:
             existing_scope=existing_scope,
             allow_missing_scope_path=self.allow_missing_scope_path,
         )
+        entries = [entry for entry in entries if entry.file_path not in self._READ_ONLY_CONTEXT_SURFACES]
         if not self.service._allow_test_file_writes_for_failure(failure_class):
             entries = [entry for entry in entries if not entry.file_path.startswith("miniapp/tests/")]
         return entries
@@ -51,15 +57,8 @@ class FixScopeRuntime:
         )
 
     def feature_scope_bundle(self, workspace_id: str, run_id: str, implicated_files: list[str]) -> list[str]:
-        bundle: list[str] = []
-        for file_path in implicated_files:
-            if file_path.startswith("miniapp/app/static/") and file_path.endswith((".html", ".css", ".js")):
-                parent = Path(file_path).parent
-                for sibling in (parent / "index.html", parent / "styles.css", parent / "app.js"):
-                    normalized = sibling.as_posix()
-                    if self.service._file_exists(workspace_id, run_id, normalized) or self.allow_missing_scope_path(normalized):
-                        bundle.append(normalized)
-        return list(dict.fromkeys(bundle))
+        del workspace_id, run_id
+        return list(dict.fromkeys(implicated_files))
 
     @staticmethod
     def merge_scope(

@@ -1096,10 +1096,10 @@ def test_fix_implicated_files_include_missing_runtime_and_profile_contract_targe
 
     assert "miniapp/app/main.py" in implicated
     assert "miniapp/app/db.py" in implicated
-    assert "miniapp/app/generated/route_manifest.json" in implicated
+    assert "miniapp/app/routes/client.py" in implicated
     assert "miniapp/app/static/client/profile/index.html" in implicated
-    assert "miniapp/app/static/client/profile/styles.css" in implicated
-    assert "miniapp/app/static/client/profile/app.js" in implicated
+    assert "miniapp/app/static/client/profile/styles.css" not in implicated
+    assert "miniapp/app/static/client/profile/app.js" not in implicated
 
 
 def test_structural_write_scope_keeps_missing_contract_files_editable(tmp_path: Path) -> None:
@@ -1134,9 +1134,11 @@ def test_structural_write_scope_keeps_missing_contract_files_editable(tmp_path: 
     )
     scope_paths = {entry.file_path for entry in scope}
 
-    assert "miniapp/app/routes/profiles.py" in scope_paths
+    assert "miniapp/app/routes/profiles.py" not in scope_paths
+    assert "miniapp/app/generated/route_manifest.json" not in scope_paths
     assert "miniapp/tests/test_generated_app.py" not in scope_paths
     assert "miniapp/tests/generated_app.test.mjs" not in scope_paths
+    assert "miniapp/app/main.py" in scope_paths
     assert "miniapp/app/static/client/profile/index.html" in scope_paths
     assert "miniapp/app/static/client/profile/styles.css" in scope_paths
     assert "miniapp/app/static/client/profile/app.js" in scope_paths
@@ -1174,7 +1176,7 @@ def test_runtime_fix_scope_excludes_generated_tests_from_write_surface(tmp_path:
     scope_paths = {entry.file_path for entry in scope}
 
     assert "miniapp/app/main.py" in scope_paths
-    assert "miniapp/app/generated/route_manifest.json" in scope_paths
+    assert "miniapp/app/generated/route_manifest.json" not in scope_paths
     assert "miniapp/tests/test_generated_app.py" not in scope_paths
     assert "miniapp/tests/generated_app.test.mjs" not in scope_paths
 
@@ -6272,18 +6274,32 @@ def test_thin_backend_targets_do_not_infer_business_routes_from_prompt_tokens(tm
     assert targets == []
 
 
-def test_fix_scope_builder_keeps_page_triplet_scope_internal_only(tmp_path: Path) -> None:
+def test_fix_scope_builder_does_not_auto_expand_page_triplet_scope(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
-    scope_builder = app.state.container.fix_orchestrator.fix_scope_builder
+    workspace_service = app.state.container.workspace_service
+    orchestrator = app.state.container.fix_orchestrator
 
-    companions = scope_builder.deterministic_companion_scope("miniapp/app/static/client/profile/index.html")
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Evidence Scope Workspace",
+            description="Frontend fixes should stay on the directly implicated file unless evidence expands them.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_evidence_scope").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    draft_run_id = "run_evidence_scope"
+    workspace_service.prepare_draft(workspace.workspace_id, draft_run_id)
 
-    assert companions == [
-        "miniapp/app/static/client/profile/index.html",
-        "miniapp/app/static/client/profile/styles.css",
-        "miniapp/app/static/client/profile/app.js",
-    ]
+    scope = orchestrator._build_write_scope(
+        workspace.workspace_id,
+        draft_run_id,
+        ["miniapp/app/static/client/profile/index.html"],
+        "frontend_compile/type/import",
+        [],
+    )
+
+    assert {entry.file_path for entry in scope} == {"miniapp/app/static/client/profile/index.html"}
 
 
 def test_pre_apply_dom_contract_sync_does_not_inject_missing_page_ids() -> None:

@@ -169,8 +169,8 @@ class FixClassificationRuntime:
                     "miniapp/tests/test_generated_app.py",
                 ]
             )
-        if "route_manifest.json" in lowered or "not declared in route_manifest.json" in lowered:
-            candidates.extend(["miniapp/app/generated/route_manifest.json", "miniapp/tests/generated_app.test.mjs"])
+        if any(marker in lowered for marker in ("docker compose", "container", "preview rebuild", "connection refused", "npm run build", "preview runtime")):
+            candidates.extend(["docker/docker-compose.yml", "miniapp/requirements.txt", "miniapp/app/main.py"])
         route_refs = re.findall(r"Route\s+([/A-Za-z0-9_{}:-]+)\s+referenced", text)
         route_refs.extend(match for _, match in re.findall(r"(['\"])(/[^'\"]+)\1", text))
         normalized_routes: list[str] = []
@@ -199,11 +199,9 @@ class FixClassificationRuntime:
             return []
         page_segments = segments[1:]
         if not page_segments:
-            base = f"miniapp/app/static/{role}"
-            return [f"{base}/index.html", f"{base}/styles.css", f"{base}/app.js"]
+            return [f"miniapp/app/static/{role}/index.html"]
         folder = "_".join(segment.replace("-", "_") for segment in page_segments)
-        base = f"miniapp/app/static/{role}/{folder}"
-        return [f"{base}/index.html", f"{base}/styles.css", f"{base}/app.js"]
+        return [f"miniapp/app/static/{role}/{folder}/index.html"]
 
     @staticmethod
     def failure_signature(failure_class: str, root_cause_summary: str) -> str:
