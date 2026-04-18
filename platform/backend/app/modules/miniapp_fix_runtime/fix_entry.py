@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import subprocess
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -15,6 +16,10 @@ if TYPE_CHECKING:
 
 
 class FixEntryRuntime:
+    MAX_TOOL_ROUNDS = 5
+    MAX_TOOL_OUTPUT_CHARS = 6000
+    COMMAND_TIMEOUT_SECONDS = 20
+
     def __init__(self, service: "FixOrchestrator") -> None:
         self.service = service
 
@@ -35,6 +40,7 @@ class FixEntryRuntime:
         del role_scope
         scope_entries = []
         scope_expansions: list[dict[str, object]] = []
+        pending_scope_requests: list[str] = []
 
         def _call_plan_patch(*, prompt_context):
             planner = self.service._plan_patch
@@ -53,6 +59,215 @@ class FixEntryRuntime:
                 draft_source=draft_source,
                 changed_files=changed_files or ["miniapp"],
             )
+
+        def _execute_check_action(mode: str, changed_files: list[str]):
+            normalized_mode = str(mode or "exact").strip().lower()
+            if normalized_mode == "final":
+                return self.service._execute_final_checks(
+                    job=job,
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    draft_source=draft_source,
+                    changed_files=changed_files or ["miniapp"],
+                )
+            return _execute_checks(changed_files)
+
+        def _truncate_tool_text(value: str) -> str:
+            text = str(value or "")
+            if len(text) <= self.MAX_TOOL_OUTPUT_CHARS:
+                return text
+            head = text[: self.MAX_TOOL_OUTPUT_CHARS // 2]
+            tail = text[-(self.MAX_TOOL_OUTPUT_CHARS // 2) :]
+            omitted = len(text) - len(head) - len(tail)
+            return f"{head}\n...[truncated {omitted} chars]...\n{tail}"
+
+        def _search_workspace(*, pattern: str, targets: list[str]) -> dict[str, object]:
+            source_dir = self.service.workspace_service.draft_source_dir(workspace_id, run_id)
+            tree = self.service.workspace_service.file_tree(workspace_id, run_id)
+            candidate_files = [
+                item["path"]
+                for item in tree
+                if item.get("type") == "file"
+                and (
+                    not targets
+                    or any(str(item["path"]).startswith(target.rstrip("/") + "/") or str(item["path"]) == target.rstrip("/") for target in targets)
+                )
+            ]
+            matches: list[dict[str, object]] = []
+            for relative_path in candidate_files[:200]:
+                content = self.service.workspace_service.try_read_text_file(workspace_id, relative_path, run_id=run_id)
+                if not content or pattern not in content:
+                    continue
+                line_hits = []
+                for line_no, line in enumerate(content.splitlines(), start=1):
+                    if pattern in line:
+                        line_hits.append({"line": line_no, "text": line[:240]})
+                    if len(line_hits) >= 5:
+                        break
+                matches.append({"file_path": relative_path, "hits": line_hits})
+                if len(matches) >= 20:
+                    break
+            return {
+                "tool": "search_files",
+                "pattern": pattern,
+                "targets": list(targets),
+                "matches": matches,
+                "workspace_root": str(source_dir),
+            }
+
+        def _list_workspace_files(*, targets: list[str]) -> dict[str, object]:
+            tree = self.service.workspace_service.file_tree(workspace_id, run_id)
+            selected_paths = [
+                item["path"]
+                for item in tree
+                if (
+                    not targets
+                    or any(str(item["path"]).startswith(target.rstrip("/") + "/") or str(item["path"]) == target.rstrip("/") for target in targets)
+                )
+            ]
+            return {
+                "tool": "list_files",
+                "targets": list(targets),
+                "paths": selected_paths[:200],
+            }
+
+        def _run_workspace_command(*, command: str) -> dict[str, object]:
+            if not str(command or "").strip():
+                return {"tool": "run_command", "command": command, "error": "Empty command."}
+            completed = subprocess.run(
+                ["/bin/zsh", "-lc", command],
+                cwd=draft_source,
+                capture_output=True,
+                text=True,
+                timeout=self.COMMAND_TIMEOUT_SECONDS,
+            )
+            return {
+                "tool": "run_command",
+                "command": command,
+                "exit_code": completed.returncode,
+                "stdout": _truncate_tool_text(completed.stdout),
+                "stderr": _truncate_tool_text(completed.stderr),
+                "cwd": str(draft_source),
+            }
+
+        def _adopt_requested_scope(
+            requested_paths: list[str],
+            *,
+            fix_turn,
+            reason: str,
+        ) -> list[str]:
+            approved: list[str] = []
+            for path in requested_paths:
+                normalized = str(path or "").strip().lstrip("./")
+                if not normalized or normalized in pending_scope_requests:
+                    continue
+                if self.service._is_read_only_generated_surface(normalized):
+                    continue
+                if normalized.startswith("miniapp/tests/") and not self.service._allow_test_file_writes_for_failure(fix_turn.failure_class or ""):
+                    continue
+                if not (
+                    self.service._can_expand_for_file(normalized, fix_turn.implicated_files)
+                    or self.service._file_exists(workspace_id, run_id, normalized)
+                    or self.service._allow_missing_scope_path(normalized)
+                ):
+                    continue
+                approved.append(normalized)
+            if not approved:
+                return []
+            pending_scope_requests.extend(approved)
+            scope_expansions.append(
+                {
+                    "attempt": fix_turn.attempt,
+                    "files": list(approved),
+                    "reason": reason,
+                }
+            )
+            return approved
+
+        def _execute_tool_requests(
+            *,
+            fix_turn,
+            tool_requests: list[dict[str, object]],
+        ) -> tuple[list[str], list[dict[str, object]]]:
+            additional_paths: list[str] = []
+            tool_results: list[dict[str, object]] = []
+            for request_item in tool_requests:
+                tool_name = str(request_item.get("tool") or "").strip().lower()
+                targets = [
+                    str(item or "").strip().lstrip("./")
+                    for item in list(request_item.get("targets") or [])
+                    if str(item or "").strip()
+                ]
+                reason = str(request_item.get("reason") or "").strip()
+                if tool_name == "read_files":
+                    approved = _adopt_requested_scope(
+                        targets,
+                        fix_turn=fix_turn,
+                        reason=reason or "Repair agent requested additional file reads.",
+                    )
+                    for path in approved:
+                        if path not in additional_paths:
+                            additional_paths.append(path)
+                    tool_results.append(
+                        {
+                            "tool": "read_files",
+                            "targets": list(targets),
+                            "approved_targets": list(approved),
+                            "reason": reason,
+                        }
+                    )
+                    continue
+                if tool_name == "list_files":
+                    tool_results.append(
+                        {
+                            **_list_workspace_files(targets=targets),
+                            "reason": reason,
+                        }
+                    )
+                    continue
+                if tool_name == "run_checks":
+                    requested_changed_files = list(targets or ["miniapp"])
+                    mode = str(request_item.get("mode") or "exact").strip().lower()
+                    execution, preview_details = _execute_check_action(mode, requested_changed_files)
+                    failed_checks = [
+                        {
+                            "name": result.name,
+                            "details": result.details,
+                            "command": result.command,
+                            "logs": result.logs[-8:],
+                        }
+                        for result in execution.results
+                        if result.status == "failed"
+                    ]
+                    tool_results.append(
+                        {
+                            "tool": "run_checks",
+                            "mode": mode,
+                            "targets": requested_changed_files,
+                            "reason": reason,
+                            "failed_checks": failed_checks,
+                            "preview_logs": list((preview_details.get("logs") or [])[-8:]),
+                        }
+                    )
+                    continue
+                if tool_name == "search_files":
+                    pattern = str(request_item.get("pattern") or "").strip()
+                    tool_results.append(
+                        {
+                            **_search_workspace(pattern=pattern, targets=targets),
+                            "reason": reason,
+                        }
+                    )
+                    continue
+                if tool_name == "run_command":
+                    command = str(request_item.get("command") or "").strip()
+                    tool_results.append(
+                        {
+                            **_run_workspace_command(command=command),
+                            "reason": reason,
+                        }
+                    )
+            return additional_paths, tool_results
 
         def _plan_turn(
             *,
@@ -80,7 +295,7 @@ class FixEntryRuntime:
             next_scope = self.service._build_write_scope(
                 workspace_id,
                 run_id,
-                fix_turn.implicated_files,
+                list(dict.fromkeys([*fix_turn.implicated_files, *pending_scope_requests])),
                 fix_turn.failure_class or "build/runtime",
                 scope_entries,
             )
@@ -116,56 +331,110 @@ class FixEntryRuntime:
                     "repeated_no_progress": repeated_no_progress,
                 },
             )
-            prompt_context = self.service._build_repair_packet(
-                workspace_id=workspace_id,
-                run_id=run_id,
-                fix_turn=fix_turn,
-                scope_entries=scope_entries,
-                context_mode=context_mode,
-            )
-            if last_turn_summary or latest_diff_summary:
-                prompt_context.previous_attempt_summary = last_turn_summary or prompt_context.previous_attempt_summary
-                prompt_context.previous_diff_summary = latest_diff_summary or prompt_context.previous_diff_summary
-            self.service._append_event(
-                job,
-                "repair_planned",
-                "Prepared repair packet for the current failure bundle.",
-                {"attempt": attempt, "scope": [entry.file_path for entry in scope_entries], "context_mode": prompt_context.context_mode},
-            )
-            llm_result = _call_plan_patch(prompt_context=prompt_context)
-            repair_outcome = self.service._repair_outcome_from_response(
-                llm_result=llm_result,
-                prompt_context=prompt_context,
-                fix_turn=fix_turn,
-                scope_entries=scope_entries,
-                scope_expansions=scope_expansions,
-            )
-            mapped_outcome = repair_outcome.outcome
-            if mapped_outcome == "fatal_invalid_response":
+            extra_paths_for_attempt: list[str] = []
+            tool_results_for_attempt: list[dict[str, object]] = []
+            last_prompt_context = None
+            for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
+                prompt_context = self.service._build_repair_packet(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    fix_turn=fix_turn,
+                    scope_entries=scope_entries,
+                    context_mode=context_mode,
+                    additional_paths=extra_paths_for_attempt,
+                    tool_results=tool_results_for_attempt,
+                )
+                last_prompt_context = prompt_context
+                if last_turn_summary or latest_diff_summary:
+                    prompt_context.previous_attempt_summary = last_turn_summary or prompt_context.previous_attempt_summary
+                    prompt_context.previous_diff_summary = latest_diff_summary or prompt_context.previous_diff_summary
+                self.service._append_event(
+                    job,
+                    "repair_planned",
+                    "Prepared repair packet for the current failure bundle.",
+                    {
+                        "attempt": attempt,
+                        "scope": [entry.file_path for entry in scope_entries],
+                        "context_mode": prompt_context.context_mode,
+                        "tool_round": tool_round,
+                    },
+                )
+                llm_result = _call_plan_patch(prompt_context=prompt_context)
+                repair_outcome = self.service._repair_outcome_from_response(
+                    llm_result=llm_result,
+                    prompt_context=prompt_context,
+                    fix_turn=fix_turn,
+                    scope_entries=scope_entries,
+                    scope_expansions=scope_expansions,
+                )
+                if repair_outcome.outcome == "tool_request":
+                    requested_paths, executed_tool_results = _execute_tool_requests(
+                        fix_turn=fix_turn,
+                        tool_requests=list(repair_outcome.tool_requests),
+                    )
+                    for path in requested_paths:
+                        if path not in extra_paths_for_attempt:
+                            extra_paths_for_attempt.append(path)
+                    tool_results_for_attempt.extend(executed_tool_results)
+                    self.service._append_event(
+                        job,
+                        "scope_expanded",
+                        repair_outcome.diagnosis or "Repair agent requested explicit tool actions.",
+                        {
+                            "attempt": attempt,
+                            "tool_round": tool_round,
+                            "tool_requests": list(repair_outcome.tool_requests),
+                        },
+                    )
+                    if tool_round < self.MAX_TOOL_ROUNDS and (requested_paths or executed_tool_results):
+                        continue
+                    return WorkspaceLoopTurnPlan(
+                        outcome="needs_context",
+                        assistant_message=str(repair_outcome.diagnosis or ""),
+                        diagnosis=repair_outcome.validation_error or repair_outcome.diagnosis,
+                        files_read=list(prompt_context.file_contexts.keys()),
+                        failure_class=fix_turn.failure_class,
+                        failure_signature=fix_turn.failure_signature,
+                        root_cause_summary=fix_turn.root_cause_summary,
+                        fix_targets=list(fix_turn.implicated_files),
+                        metadata={"tool_requests": list(repair_outcome.tool_requests)},
+                    )
+                if repair_outcome.outcome == "fatal_invalid_response":
+                    return WorkspaceLoopTurnPlan(
+                        outcome="fatal_invalid_response",
+                        assistant_message=str(repair_outcome.diagnosis or ""),
+                        diagnosis=repair_outcome.validation_error or repair_outcome.diagnosis,
+                        files_read=list(prompt_context.file_contexts.keys()),
+                        failure_class=fix_turn.failure_class,
+                        failure_signature=fix_turn.failure_signature,
+                        root_cause_summary=fix_turn.root_cause_summary,
+                        fix_targets=list(fix_turn.implicated_files),
+                        metadata={"raw_response": repair_outcome.raw_response},
+                    )
                 return WorkspaceLoopTurnPlan(
-                    outcome="fatal_invalid_response",
+                    outcome="patch_ready" if repair_outcome.outcome == "patch_ready" else "no_op",
                     assistant_message=str(repair_outcome.diagnosis or ""),
                     diagnosis=repair_outcome.validation_error or repair_outcome.diagnosis,
+                    operations=list(repair_outcome.operations),
                     files_read=list(prompt_context.file_contexts.keys()),
                     failure_class=fix_turn.failure_class,
                     failure_signature=fix_turn.failure_signature,
                     root_cause_summary=fix_turn.root_cause_summary,
                     fix_targets=list(fix_turn.implicated_files),
-                    metadata={"raw_response": repair_outcome.raw_response},
+                    expected_verification=repair_outcome.expected_verification,
+                    rationale_by_file=dict(repair_outcome.rationale_by_file),
+                    metadata={"tool_results": list(tool_results_for_attempt)},
                 )
             return WorkspaceLoopTurnPlan(
-                outcome="patch_ready" if mapped_outcome == "patch_ready" else ("needs_context" if mapped_outcome == "needs_more_context" else "no_op"),
-                assistant_message=str(repair_outcome.diagnosis or ""),
-                diagnosis=repair_outcome.validation_error or repair_outcome.diagnosis,
-                operations=list(repair_outcome.operations),
-                files_read=list(prompt_context.file_contexts.keys()),
+                outcome="no_op",
+                assistant_message="Repair agent exhausted the tool-request budget without producing a patch.",
+                diagnosis="Repair agent exhausted the tool-request budget without producing a patch.",
+                files_read=list(last_prompt_context.file_contexts.keys()) if last_prompt_context is not None else [],
                 failure_class=fix_turn.failure_class,
                 failure_signature=fix_turn.failure_signature,
                 root_cause_summary=fix_turn.root_cause_summary,
                 fix_targets=list(fix_turn.implicated_files),
-                expected_verification=repair_outcome.expected_verification,
-                rationale_by_file=dict(repair_outcome.rationale_by_file),
-                metadata={"planned_targets": list(repair_outcome.planned_targets)},
+                metadata={"tool_results": list(tool_results_for_attempt)},
             )
 
         callbacks = WorkspaceLoopCallbacks(

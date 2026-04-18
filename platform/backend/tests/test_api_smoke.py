@@ -676,7 +676,7 @@ def _fix_patch_payload(payload: dict) -> dict:
     return {
         "outcome": "patch_ready",
         "diagnosis": str(repair_packet.get("root_cause_summary") or "Apply the smallest targeted fix."),
-        "planned_targets": list(file_contexts.keys()),
+        "tool_requests": [],
         "expected_verification": "npm run build should pass and the preview runtime should stay healthy.",
         "rationale_by_file": rationale,
         "operations": operations,

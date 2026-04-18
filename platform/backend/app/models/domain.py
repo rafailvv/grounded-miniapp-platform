@@ -416,10 +416,10 @@ class FixScopeEntry(StrictModel):
 
 
 class FixAttemptOutcome(StrictModel):
-    outcome: Literal["patch_ready", "needs_more_context", "no_progress", "fatal_invalid_response"]
+    outcome: Literal["patch_ready", "tool_request", "no_progress", "fatal_invalid_response"]
     diagnosis: str | None = None
     operations: list[DraftFileOperation] = Field(default_factory=list)
-    planned_targets: list[str] = Field(default_factory=list)
+    tool_requests: list[dict[str, Any]] = Field(default_factory=list)
     validation_error: str | None = None
     expected_verification: str | None = None
     rationale_by_file: dict[str, str] = Field(default_factory=dict)

@@ -117,7 +117,17 @@ class FixContextRuntime:
 
     @staticmethod
     def planned_target_paths(llm_result: dict[str, Any]) -> list[str]:
-        raw_targets = llm_result.get("planned_targets") or []
+        raw_targets = []
+        tool_requests = llm_result.get("tool_requests") or []
+        if isinstance(tool_requests, list):
+            for item in tool_requests:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("tool") or "").strip().lower() != "read_files":
+                    continue
+                raw_targets = item.get("targets") or []
+                if raw_targets:
+                    break
         if not isinstance(raw_targets, list):
             return []
         normalized: list[str] = []

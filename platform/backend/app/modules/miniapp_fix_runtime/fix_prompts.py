@@ -50,10 +50,25 @@ class FixPromptRuntime:
             "properties": {
                 "outcome": {
                     "type": "string",
-                    "enum": ["patch_ready", "needs_more_context", "no_progress", "fatal_invalid_response"],
+                    "enum": ["patch_ready", "tool_request", "no_progress", "fatal_invalid_response"],
                 },
                 "diagnosis": {"type": "string"},
-                "planned_targets": {"type": "array", "items": {"type": "string"}},
+                "tool_requests": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "tool": {"type": "string", "enum": ["list_files", "read_files", "run_checks", "search_files", "run_command"]},
+                            "mode": {"type": "string", "enum": ["exact", "final"]},
+                            "targets": {"type": "array", "items": {"type": "string"}},
+                            "pattern": {"type": "string"},
+                            "command": {"type": "string"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["tool", "targets", "reason"],
+                    },
+                },
                 "expected_verification": {"type": "string"},
                 "rationale_by_file": {"type": "object", "additionalProperties": {"type": "string"}},
                 "operations": {
@@ -71,7 +86,7 @@ class FixPromptRuntime:
                     },
                 },
             },
-            "required": ["diagnosis", "planned_targets", "expected_verification", "rationale_by_file", "operations"],
+            "required": ["diagnosis", "tool_requests", "expected_verification", "rationale_by_file", "operations"],
         }
 
     def repair_system_prompt(self) -> str:

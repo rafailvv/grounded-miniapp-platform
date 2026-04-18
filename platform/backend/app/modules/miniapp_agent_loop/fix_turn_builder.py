@@ -92,6 +92,7 @@ class FixTurnBuilder:
         merge_additional_context_paths,
         current_diff_summary,
         additional_paths: list[str] | None = None,
+        tool_results: list[dict[str, Any]] | None = None,
     ) -> FixPromptContext:
         full_files = context_mode in {"expanded", "full_bundle"} or self.prompt_builder.needs_full_context_first(fix_turn)
         budget = 32000 if full_files else 12000
@@ -138,6 +139,7 @@ class FixTurnBuilder:
             failing_file_paths=list(fix_turn.implicated_files),
             expected_contract=self.prompt_builder.expected_contract_snapshot(fix_turn),
             file_contexts=file_contexts,
+            tool_results=list(tool_results or []),
             read_only_surfaces=self.prompt_builder.read_only_surfaces(),
             previous_attempt_summary=self.prompt_builder.previous_attempt_summary(fix_turn),
             previous_diff_summary=current_diff_summary(workspace_id, run_id),

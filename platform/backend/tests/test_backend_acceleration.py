@@ -2949,7 +2949,7 @@ function clearPhoneError() {
         return {
             "outcome": "patch_ready",
             "diagnosis": "Apply the smallest targeted fix for the broken avatar helper names and profile state cleanup.",
-            "planned_targets": list(target_files),
+            "tool_requests": [],
             "expected_verification": "Static miniapp validation should pass and preview should stay healthy.",
             "rationale_by_file": rationale,
             "operations": operations,
@@ -3066,7 +3066,7 @@ async function loadProfile() {
         return {
             "outcome": "patch_ready",
             "diagnosis": "Apply a minimal static helper name fix.",
-            "planned_targets": [target],
+            "tool_requests": [],
             "expected_verification": "Static miniapp validation should pass.",
             "rationale_by_file": {target: "Attempt the smallest possible helper patch before retrying."},
             "operations": [
@@ -3123,6 +3123,492 @@ async function loadProfile() {
     assert artifacts["fix_attempts"]["items"]
 
 
+def test_fix_mode_uses_tool_requests_to_expand_context_between_turns(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    _install_llm_stub(app)
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Tool First Fix Workspace",
+            "description": "Fix loop should adopt model-requested files between turns.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
+
+    client.post(
+        f"/workspaces/{workspace_id}/files/save",
+        json={
+            "relative_path": "miniapp/app/static/client/profile.js",
+            "content": 'const profileStatus = "broken";\n',
+        },
+    )
+
+    def fake_static_check(*, source_dir, changed_files):
+        del changed_files
+        profile_script = (source_dir / "miniapp/app/static/client/profile.js").read_text(encoding="utf-8")
+        if '"broken"' in profile_script:
+            return check_runner_module.RunCheckResult(
+                name="changed_files_static",
+                status="failed",
+                details="Profile helper state is invalid in the current draft.",
+                command="python -m py_compile miniapp/app/main.py",
+                exit_code=2,
+                logs=["Profile helper state is invalid in the current draft."],
+            )
+        return check_runner_module.RunCheckResult(
+            name="changed_files_static",
+            status="passed",
+            details="Static checks passed after the profile helper repair.",
+            command="python -m py_compile miniapp/app/main.py",
+            exit_code=0,
+            logs=["Static checks passed after the profile helper repair."],
+        )
+
+    app.state.container.check_runner._static_check = fake_static_check
+
+    seen_contexts: list[set[str]] = []
+
+    def fake_plan_patch(*, job, repair_packet, repair_feedback=None):
+        del job, repair_feedback
+        current_paths = set(repair_packet.file_contexts.keys())
+        seen_contexts.append(current_paths)
+        target = "miniapp/app/static/client/profile.js"
+        if target not in current_paths:
+            return {
+                "outcome": "tool_request",
+                "diagnosis": "Need the profile helper source before applying the fix.",
+                "tool_requests": [
+                    {
+                        "tool": "read_files",
+                        "targets": [target],
+                        "reason": "Inspect the profile helper source before patching.",
+                    }
+                ],
+                "operations": [],
+            }
+        content = repair_packet.file_contexts[target]
+        return {
+            "outcome": "patch_ready",
+            "diagnosis": "Repair the profile helper state constant.",
+            "tool_requests": [],
+            "operations": [
+                {
+                    "file_path": target,
+                    "operation": "replace",
+                    "content": content.replace('"broken"', '"healthy"'),
+                    "reason": "Replace the broken profile helper state with the repaired value.",
+                }
+            ],
+        }
+
+    app.state.container.fix_orchestrator._plan_patch = fake_plan_patch  # type: ignore[method-assign]
+
+    run_response = client.post(
+        f"/workspaces/{workspace_id}/runs",
+        json={
+            "prompt": "Inspect the failing runtime and fix the broken profile helper.",
+            "mode": "fix",
+            "intent": "auto",
+            "apply_strategy": "manual_approve",
+            "target_role_scope": ["client"],
+            "model_profile": "openai_code_fast",
+            "generation_mode": "balanced",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+            "error_context": {
+                "raw_error": "Client runtime is failing in miniapp/app/static/client/app.js and needs more inspection.",
+                "source": "frontend",
+                "failing_target": "miniapp static runtime",
+            },
+        },
+    )
+    assert run_response.status_code == 200
+    run_id = run_response.json()["run_id"]
+
+    final_run = run_response.json()
+    for _ in range(60):
+        current = client.get(f"/runs/{run_id}")
+        assert current.status_code == 200
+        final_run = current.json()
+        if final_run["status"] in {"awaiting_approval", "completed", "blocked", "failed"}:
+            break
+        time.sleep(0.1)
+
+    assert final_run["status"] in {"awaiting_approval", "completed"}
+    assert seen_contexts
+    assert "miniapp/app/static/client/profile.js" not in seen_contexts[0]
+    assert any("miniapp/app/static/client/profile.js" in paths for paths in seen_contexts[1:])
+
+
+def test_fix_mode_uses_explicit_final_check_tool_action(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    _install_llm_stub(app)
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Tool Check Fix Workspace",
+            "description": "Fix loop should let the model choose an explicit final check action.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
+
+    final_check_invocations: list[list[str]] = []
+    original_execute_final_checks = app.state.container.fix_orchestrator._execute_final_checks
+
+    def fake_execute_final_checks(**kwargs):
+        final_check_invocations.append(list(kwargs.get("changed_files") or []))
+        return original_execute_final_checks(**kwargs)
+
+    app.state.container.fix_orchestrator._execute_final_checks = fake_execute_final_checks  # type: ignore[method-assign]
+
+    seen_tool_results: list[list[dict[str, object]]] = []
+
+    def fake_plan_patch(*, job, repair_packet, repair_feedback=None):
+        del job, repair_feedback
+        seen_tool_results.append(list(repair_packet.tool_results))
+        target = "miniapp/app/static/client/app.js"
+        if not repair_packet.tool_results:
+            return {
+                "outcome": "tool_request",
+                "diagnosis": "Run the full final verification snapshot before deciding on the patch.",
+                "tool_requests": [
+                    {
+                        "tool": "run_checks",
+                        "mode": "final",
+                        "targets": [target],
+                        "reason": "Need the final verification snapshot for the implicated client app file.",
+                    }
+                ],
+                "expected_verification": "Final verification should report the remaining blocking checks.",
+                "rationale_by_file": {},
+                "operations": [],
+            }
+        assert any(item.get("tool") == "run_checks" and item.get("mode") == "final" for item in repair_packet.tool_results)
+        content = repair_packet.file_contexts[target]
+        return {
+            "outcome": "patch_ready",
+            "diagnosis": "Apply the smallest helper repair after the explicit final check action.",
+            "tool_requests": [],
+            "expected_verification": "Static validation should pass after the helper rename.",
+            "rationale_by_file": {target: "Use the final-check result before applying the direct fix."},
+            "operations": [
+                {
+                    "file_path": target,
+                    "operation": "replace",
+                    "content": content.replace("renderBrokenAvatar", "renderAvatar"),
+                    "reason": "Repair the broken helper name in the implicated client file.",
+                }
+            ],
+        }
+
+    app.state.container.fix_orchestrator._plan_patch = fake_plan_patch  # type: ignore[method-assign]
+
+    save_response = client.post(
+        f"/workspaces/{workspace_id}/files/save",
+        json={
+            "relative_path": "miniapp/app/static/client/app.js",
+            "content": """const role = "client";
+window.setupPreviewBridge?.(role);
+loadProfile();
+
+async function loadProfile() {
+  const response = await fetch(`/api/profiles/${role}`);
+  const profile = await response.json();
+  const avatar = document.getElementById("profile-avatar");
+  avatar.innerHTML = renderBrokenAvatar(profile.photo_url, "CI", "avatar", "avatar-fallback");
+}
+""",
+        },
+    )
+    assert save_response.status_code == 200
+
+    run_response = client.post(
+        f"/workspaces/{workspace_id}/runs",
+        json={
+            "prompt": "Inspect the failing client runtime and fix the broken helper only after you run a final check action.",
+            "mode": "fix",
+            "intent": "auto",
+            "apply_strategy": "manual_approve",
+            "target_role_scope": ["client"],
+            "model_profile": "openai_code_fast",
+            "generation_mode": "balanced",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+            "error_context": {
+                "raw_error": "Client runtime is failing because renderBrokenAvatar is not defined in miniapp/app/static/client/app.js.",
+                "source": "frontend",
+                "failing_target": "miniapp static runtime",
+            },
+        },
+    )
+    assert run_response.status_code == 200
+    run_id = run_response.json()["run_id"]
+
+    final_run = run_response.json()
+    for _ in range(60):
+        current = client.get(f"/runs/{run_id}")
+        assert current.status_code == 200
+        final_run = current.json()
+        if final_run["status"] in {"awaiting_approval", "completed", "blocked", "failed"}:
+            break
+        time.sleep(0.1)
+
+    assert final_run["status"] in {"awaiting_approval", "completed"}
+    assert final_check_invocations
+    assert any("miniapp/app/static/client/app.js" in item for item in final_check_invocations)
+    assert seen_tool_results
+    assert any(any(tool_result.get("tool") == "run_checks" and tool_result.get("mode") == "final" for tool_result in tool_results) for tool_results in seen_tool_results[1:])
+
+
+def test_fix_mode_uses_search_and_command_tool_actions_before_patching(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    _install_llm_stub(app)
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Open Tool Fix Workspace",
+            "description": "Fix loop should support search and shell command actions before patching.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
+
+    save_response = client.post(
+        f"/workspaces/{workspace_id}/files/save",
+        json={
+            "relative_path": "miniapp/app/static/client/profile.js",
+            "content": 'const profileStatus = "broken";\n',
+        },
+    )
+    assert save_response.status_code == 200
+
+    observed_tool_results: list[list[dict[str, object]]] = []
+
+    def fake_plan_patch(*, job, repair_packet, repair_feedback=None):
+        del job, repair_feedback
+        observed_tool_results.append(list(repair_packet.tool_results))
+        target = "miniapp/app/static/client/profile.js"
+        if not repair_packet.tool_results:
+            return {
+                "outcome": "tool_request",
+                "diagnosis": "Search the workspace and run a shell diagnostic before patching.",
+                "tool_requests": [
+                    {
+                        "tool": "search_files",
+                        "targets": ["miniapp/app/static/client"],
+                        "pattern": "broken",
+                        "reason": "Locate the broken helper state in the client static files.",
+                    },
+                    {
+                        "tool": "run_command",
+                        "command": "printf open-tool-fix",
+                        "targets": [],
+                        "reason": "Verify shell command execution inside the draft workspace.",
+                    },
+                    {
+                        "tool": "read_files",
+                        "targets": [target],
+                        "reason": "Load the implicated profile helper file before patching.",
+                    },
+                ],
+                "expected_verification": "The shell and search results should identify the correct file to patch.",
+                "rationale_by_file": {},
+                "operations": [],
+            }
+        assert any(item.get("tool") == "search_files" for item in repair_packet.tool_results)
+        assert any(item.get("tool") == "run_command" and "open-tool-fix" in str(item.get("stdout") or "") for item in repair_packet.tool_results)
+        content = repair_packet.file_contexts[target]
+        return {
+            "outcome": "patch_ready",
+            "diagnosis": "Patch the located broken helper state after open tool actions completed.",
+            "tool_requests": [],
+            "expected_verification": "Static validation should pass after replacing the broken state value.",
+            "rationale_by_file": {target: "Use the search and shell results to confirm the implicated file before patching."},
+            "operations": [
+                {
+                    "file_path": target,
+                    "operation": "replace",
+                    "content": content.replace('"broken"', '"healthy"'),
+                    "reason": "Replace the broken profile helper state with the repaired value.",
+                }
+            ],
+        }
+
+    app.state.container.fix_orchestrator._plan_patch = fake_plan_patch  # type: ignore[method-assign]
+
+    run_response = client.post(
+        f"/workspaces/{workspace_id}/runs",
+        json={
+            "prompt": "Use open tool actions to inspect the failing client profile helper and fix it.",
+            "mode": "fix",
+            "intent": "auto",
+            "apply_strategy": "manual_approve",
+            "target_role_scope": ["client"],
+            "model_profile": "openai_code_fast",
+            "generation_mode": "balanced",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+            "error_context": {
+                "raw_error": "Client profile helper is failing because profileStatus is broken.",
+                "source": "frontend",
+                "failing_target": "miniapp static runtime",
+            },
+        },
+    )
+    assert run_response.status_code == 200
+    run_id = run_response.json()["run_id"]
+
+    final_run = run_response.json()
+    for _ in range(60):
+        current = client.get(f"/runs/{run_id}")
+        assert current.status_code == 200
+        final_run = current.json()
+        if final_run["status"] in {"awaiting_approval", "completed", "blocked", "failed"}:
+            break
+        time.sleep(0.1)
+
+    assert final_run["status"] in {"awaiting_approval", "completed"}
+    assert observed_tool_results
+    assert any(any(item.get("tool") == "search_files" for item in batch) for batch in observed_tool_results[1:])
+    assert any(any(item.get("tool") == "run_command" and "open-tool-fix" in str(item.get("stdout") or "") for item in batch) for batch in observed_tool_results[1:])
+
+
+def test_fix_mode_can_list_workspace_files_before_reading_and_patching(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    _install_llm_stub(app)
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "List Files Fix Workspace",
+            "description": "Fix loop should allow list-files exploration before reading and patching.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
+
+    save_response = client.post(
+        f"/workspaces/{workspace_id}/files/save",
+        json={
+            "relative_path": "miniapp/app/static/client/profile.js",
+            "content": 'const profileStatus = "broken";\n',
+        },
+    )
+    assert save_response.status_code == 200
+
+    seen_tool_results: list[list[dict[str, object]]] = []
+
+    def fake_plan_patch(*, job, repair_packet, repair_feedback=None):
+        del job, repair_feedback
+        seen_tool_results.append(list(repair_packet.tool_results))
+        target = "miniapp/app/static/client/profile.js"
+        if not repair_packet.tool_results:
+            return {
+                "outcome": "tool_request",
+                "diagnosis": "Inspect the client static tree before reading the implicated file.",
+                "tool_requests": [
+                    {
+                        "tool": "list_files",
+                        "targets": ["miniapp/app/static/client"],
+                        "reason": "Inspect the client static tree.",
+                    }
+                ],
+                "expected_verification": "The client static tree should reveal the implicated profile helper file.",
+                "rationale_by_file": {},
+                "operations": [],
+            }
+        if not repair_packet.file_contexts.get(target):
+            assert any(item.get("tool") == "list_files" and target in list(item.get("paths") or []) for item in repair_packet.tool_results)
+            return {
+                "outcome": "tool_request",
+                "diagnosis": "Now read the implicated profile helper file.",
+                "tool_requests": [
+                    {
+                        "tool": "read_files",
+                        "targets": [target],
+                        "reason": "Load the profile helper after listing the client static tree.",
+                    }
+                ],
+                "expected_verification": "The implicated profile helper source should now be available for patching.",
+                "rationale_by_file": {},
+                "operations": [],
+            }
+        content = repair_packet.file_contexts[target]
+        return {
+            "outcome": "patch_ready",
+            "diagnosis": "Patch the listed and inspected profile helper.",
+            "tool_requests": [],
+            "expected_verification": "Static validation should pass after fixing the profile helper state.",
+            "rationale_by_file": {target: "Patch only after listing the tree and reading the implicated file."},
+            "operations": [
+                {
+                    "file_path": target,
+                    "operation": "replace",
+                    "content": content.replace('"broken"', '"healthy"'),
+                    "reason": "Replace the broken profile helper state with the repaired value.",
+                }
+            ],
+        }
+
+    app.state.container.fix_orchestrator._plan_patch = fake_plan_patch  # type: ignore[method-assign]
+
+    run_response = client.post(
+        f"/workspaces/{workspace_id}/runs",
+        json={
+            "prompt": "Explore the client static tree, inspect the implicated file, and then repair the broken profile helper.",
+            "mode": "fix",
+            "intent": "auto",
+            "apply_strategy": "manual_approve",
+            "target_role_scope": ["client"],
+            "model_profile": "openai_code_fast",
+            "generation_mode": "balanced",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+            "error_context": {
+                "raw_error": "Client profile helper is failing because profileStatus is broken.",
+                "source": "frontend",
+                "failing_target": "miniapp static runtime",
+            },
+        },
+    )
+    assert run_response.status_code == 200
+    run_id = run_response.json()["run_id"]
+
+    final_run = run_response.json()
+    for _ in range(60):
+        current = client.get(f"/runs/{run_id}")
+        assert current.status_code == 200
+        final_run = current.json()
+        if final_run["status"] in {"awaiting_approval", "completed", "blocked", "failed"}:
+            break
+        time.sleep(0.1)
+
+    assert final_run["status"] in {"awaiting_approval", "completed"}
+    assert seen_tool_results
+    assert any(any(item.get("tool") == "list_files" for item in batch) for batch in seen_tool_results[1:])
+
+
 def test_contract_pass_requires_grounded_spec_artifact(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -3168,17 +3654,23 @@ def test_fix_orchestrator_detects_context_refusal_diagnosis() -> None:
     )
 
 
-def test_fix_orchestrator_normalizes_planned_targets() -> None:
+def test_fix_orchestrator_normalizes_tool_request_targets() -> None:
     from app.services.fix_orchestrator import FixOrchestrator
 
     assert FixOrchestrator._planned_target_paths(
         {
-            "planned_targets": [
-                "./miniapp/app/main.py",
-                "miniapp/app/routes/specialist.py",
-                "miniapp/app/main.py",
-                "",
-                None,
+            "tool_requests": [
+                {
+                    "tool": "read_files",
+                    "targets": [
+                        "./miniapp/app/main.py",
+                        "miniapp/app/routes/specialist.py",
+                        "miniapp/app/main.py",
+                        "",
+                        None,
+                    ],
+                    "reason": "Inspect the backend runtime files.",
+                }
             ]
         }
     ) == [

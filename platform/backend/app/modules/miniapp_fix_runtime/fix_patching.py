@@ -36,21 +36,39 @@ class FixPatchingRuntime:
         raw_operations = llm_result.get("operations") or []
         diagnosis_text = str(llm_result.get("diagnosis") or "")
         planned_targets = self.service._planned_target_paths(llm_result)
+        tool_requests = self._coerce_tool_requests(llm_result.get("tool_requests") or [])
         outcome_hint = str(llm_result.get("outcome") or "").strip().lower()
-        if outcome_hint == "needs_more_context":
+        if outcome_hint == "tool_request" or tool_requests:
+            if not planned_targets:
+                for request in tool_requests:
+                    if request.get("tool") == "read_files":
+                        planned_targets.extend(
+                            target
+                            for target in request.get("targets") or []
+                            if isinstance(target, str) and target not in planned_targets
+                        )
             return FixAttemptOutcome(
-                outcome="needs_more_context",
+                outcome="tool_request",
                 diagnosis=diagnosis_text,
-                planned_targets=planned_targets,
+                tool_requests=tool_requests,
                 expected_verification=str(llm_result.get("expected_verification") or ""),
                 rationale_by_file=dict(llm_result.get("rationale_by_file") or {}),
                 raw_response=llm_result,
             )
         if not raw_operations and (self.service._looks_like_context_refusal(diagnosis_text) or planned_targets):
+            synthesized_requests = list(tool_requests)
+            if planned_targets and not synthesized_requests:
+                synthesized_requests.append(
+                    {
+                        "tool": "read_files",
+                        "targets": list(planned_targets),
+                        "reason": diagnosis_text or "Additional file evidence is required before patching.",
+                    }
+                )
             return FixAttemptOutcome(
-                outcome="needs_more_context",
+                outcome="tool_request",
                 diagnosis=diagnosis_text,
-                planned_targets=planned_targets,
+                tool_requests=synthesized_requests,
                 expected_verification=str(llm_result.get("expected_verification") or ""),
                 rationale_by_file=dict(llm_result.get("rationale_by_file") or {}),
                 raw_response=llm_result,
@@ -65,9 +83,9 @@ class FixPatchingRuntime:
         except Exception as exc:
             if self.should_retry_patch_validation(str(exc)):
                 return FixAttemptOutcome(
-                    outcome="needs_more_context",
+                    outcome="tool_request",
                     diagnosis=diagnosis_text,
-                    planned_targets=planned_targets,
+                    tool_requests=tool_requests,
                     validation_error=str(exc),
                     expected_verification=str(llm_result.get("expected_verification") or ""),
                     rationale_by_file=dict(llm_result.get("rationale_by_file") or {}),
@@ -76,7 +94,7 @@ class FixPatchingRuntime:
             return FixAttemptOutcome(
                 outcome="no_progress",
                 diagnosis=diagnosis_text,
-                planned_targets=planned_targets,
+                tool_requests=tool_requests,
                 validation_error=str(exc),
                 expected_verification=str(llm_result.get("expected_verification") or ""),
                 rationale_by_file=dict(llm_result.get("rationale_by_file") or {}),
@@ -86,7 +104,7 @@ class FixPatchingRuntime:
             return FixAttemptOutcome(
                 outcome="no_progress",
                 diagnosis=diagnosis_text,
-                planned_targets=planned_targets,
+                tool_requests=tool_requests,
                 validation_error="Repair model did not return any patch operations.",
                 expected_verification=str(llm_result.get("expected_verification") or ""),
                 rationale_by_file=dict(llm_result.get("rationale_by_file") or {}),
@@ -96,11 +114,46 @@ class FixPatchingRuntime:
             outcome="patch_ready",
             diagnosis=diagnosis_text,
             operations=operations,
-            planned_targets=planned_targets,
+            tool_requests=tool_requests,
             expected_verification=str(llm_result.get("expected_verification") or ""),
             rationale_by_file=dict(llm_result.get("rationale_by_file") or {}),
             raw_response=llm_result,
         )
+
+    @staticmethod
+    def _coerce_tool_requests(raw_tool_requests: list[Any]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        if not isinstance(raw_tool_requests, list):
+            return normalized
+        for item in raw_tool_requests:
+            if not isinstance(item, dict):
+                continue
+            tool = str(item.get("tool") or "").strip().lower()
+            if tool not in {"list_files", "read_files", "run_checks", "search_files", "run_command"}:
+                continue
+            raw_targets = item.get("targets") or []
+            if not isinstance(raw_targets, list):
+                raw_targets = []
+            targets: list[str] = []
+            for target in raw_targets:
+                value = str(target or "").strip().lstrip("./")
+                if not value or value in targets:
+                    continue
+                targets.append(value)
+            mode = str(item.get("mode") or ("exact" if tool == "run_checks" else "")).strip().lower()
+            if tool == "run_checks" and mode not in {"exact", "final"}:
+                mode = "exact"
+            normalized.append(
+                {
+                    "tool": tool,
+                    "mode": mode,
+                    "targets": targets[:12],
+                    "pattern": str(item.get("pattern") or "").strip(),
+                    "command": str(item.get("command") or "").strip(),
+                    "reason": str(item.get("reason") or "").strip(),
+                }
+            )
+        return normalized
 
     def plan_patch(
         self,
