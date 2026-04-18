@@ -5,9 +5,6 @@ import re
 from app.modules.miniapp_contract.runtime_contract_sync import MiniappRuntimeContractSync
 from app.models.domain import DraftFileOperation
 
-from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import (
-    MiniappGenerationContractApiRoutesCrud,
-)
 from app.modules.miniapp_generation_runtime.generation_contract_api_routes_runtime import (
     MiniappGenerationContractApiRoutesRuntime,
 )
@@ -29,38 +26,24 @@ class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
         contract_sync_mode: str = "bootstrap_only",
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
-        route_templates = {
+        bootstrap_route_templates = {
             "miniapp/app/routes/client.py": MiniappGenerationContractPageSources._deterministic_client_page_route_source(),
             "miniapp/app/routes/specialist.py": MiniappGenerationContractPageSources._deterministic_specialist_page_route_source(),
             "miniapp/app/routes/manager.py": MiniappGenerationContractPageSources._deterministic_manager_page_route_source(),
-            "miniapp/app/routes/requests.py": MiniappGenerationContractApiRoutesCrud._deterministic_requests_route_source(),
-            "miniapp/app/routes/comments.py": MiniappGenerationContractApiRoutesCrud._deterministic_comments_route_source(),
-            "miniapp/app/routes/assignments.py": MiniappGenerationContractApiRoutesCrud._deterministic_assignments_route_source(),
             "miniapp/app/routes/profiles.py": MiniappGenerationContractApiRoutesSupport._deterministic_profiles_route_source(),
             "miniapp/app/routes/runtime.py": MiniappGenerationContractApiRoutesRuntime._deterministic_runtime_route_source(),
-            "miniapp/app/routes/users.py": MiniappGenerationContractApiRoutesSupport._deterministic_users_route_source(),
-            "miniapp/app/routes/workload.py": MiniappGenerationContractApiRoutesSupport._deterministic_workload_route_source(),
-            "miniapp/app/routes/time_slots.py": MiniappGenerationContractApiRoutesSupport._deterministic_time_slots_route_source(),
         }
-        bootstrap_only_paths = {
-            "miniapp/app/routes/client.py",
-            "miniapp/app/routes/specialist.py",
-            "miniapp/app/routes/manager.py",
-            "miniapp/app/routes/runtime.py",
-            "miniapp/app/routes/profiles.py",
-        }
-        for file_path, template in route_templates.items():
+        for file_path, template in bootstrap_route_templates.items():
             content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
             if content is None:
-                if file_path in bootstrap_only_paths:
-                    operation_map[file_path] = DraftFileOperation(
-                        file_path=file_path,
-                        operation="replace",
-                        content=template,
-                        reason="Pre-apply contract sync: bootstrap a missing runtime route module from the template contract.",
-                    )
+                operation_map[file_path] = DraftFileOperation(
+                    file_path=file_path,
+                    operation="replace",
+                    content=template,
+                    reason="Pre-apply contract sync: bootstrap a missing runtime route module from the template contract.",
+                )
                 continue
-            if self._route_module_needs_stub(content) and file_path in bootstrap_only_paths:
+            if self._route_module_needs_stub(content):
                 operation_map[file_path] = DraftFileOperation(
                     file_path=file_path,
                     operation="replace",
@@ -68,7 +51,7 @@ class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
                     reason="Pre-apply contract sync: replace an empty route stub with a minimal bootstrap contract.",
                 )
                 continue
-            if self._route_module_requires_db_backed_repair(file_path, content) and file_path in bootstrap_only_paths:
+            if self._route_module_requires_db_backed_repair(file_path, content):
                 operation_map[file_path] = DraftFileOperation(
                     file_path=file_path,
                     operation="replace",
@@ -140,33 +123,9 @@ class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
         return MiniappGenerationContractPageSources._deterministic_main_runtime_source(route_modules)
 
     @staticmethod
-    def _deterministic_requests_route_source() -> str:
-        return MiniappGenerationContractApiRoutesCrud._deterministic_requests_route_source()
-
-    @staticmethod
-    def _deterministic_comments_route_source() -> str:
-        return MiniappGenerationContractApiRoutesCrud._deterministic_comments_route_source()
-
-    @staticmethod
-    def _deterministic_assignments_route_source() -> str:
-        return MiniappGenerationContractApiRoutesCrud._deterministic_assignments_route_source()
-
-    @staticmethod
     def _deterministic_profiles_route_source() -> str:
         return MiniappGenerationContractApiRoutesSupport._deterministic_profiles_route_source()
 
     @staticmethod
-    def _deterministic_users_route_source() -> str:
-        return MiniappGenerationContractApiRoutesSupport._deterministic_users_route_source()
-
-    @staticmethod
-    def _deterministic_workload_route_source() -> str:
-        return MiniappGenerationContractApiRoutesSupport._deterministic_workload_route_source()
-
-    @staticmethod
     def _deterministic_runtime_route_source() -> str:
         return MiniappGenerationContractApiRoutesRuntime._deterministic_runtime_route_source()
-
-    @staticmethod
-    def _deterministic_time_slots_route_source() -> str:
-        return MiniappGenerationContractApiRoutesSupport._deterministic_time_slots_route_source()

@@ -65,11 +65,11 @@ from app.modules.miniapp_generation_runtime import (
     MiniappGroundedSpecBuilder,
     compile_prompt_to_scaffold,
     mentions_schedule_or_time,
+    scaffold_backend_targets_from_spec,
+    scaffold_page_slug_for_route,
+    scaffold_role_pages_for_role,
+    scaffold_role_responsibility,
     select_creative_direction,
-    thin_backend_targets_from_spec,
-    thin_page_slug_for_route,
-    thin_role_pages_for_role,
-    thin_role_responsibility,
 )
 from app.modules.miniapp_materialization.materialization import MiniappMaterializationService
 from app.modules.miniapp_validation import GenerationEditGate, GenerationPreflightValidation
@@ -293,7 +293,7 @@ class GenerationService(
         if missing_corpora:
             return self._block_with_messages(job, missing_corpora, code="generation.missing_corpora", event_type="job_failed", failure_reason="Required corpora or template clone is missing.")
         if not self.openrouter_client.enabled:
-            return self._block_with_messages(job, ["Agentic app generation now requires OpenAI configuration for every run.", "Set OPENAI_API_KEY before creating or editing a mini-app workspace."], code="generation.llm_required", event_type="job_failed", failure_reason="Generation requires OpenAI because the workspace now uses the thin direct code generation loop.")
+            return self._block_with_messages(job, ["Agentic app generation now requires OpenAI configuration for every run.", "Set OPENAI_API_KEY before creating or editing a mini-app workspace."], code="generation.llm_required", event_type="job_failed", failure_reason="Generation requires OpenAI because the workspace now uses the agentic direct code generation loop.")
         if resume_bundle is not None:
             if request.resume_from_run_id and draft_run_id != request.resume_from_run_id and self.workspace_service.draft_exists(workspace_id, request.resume_from_run_id):
                 self.workspace_service.clone_draft(workspace_id, request.resume_from_run_id, draft_run_id)
@@ -321,7 +321,7 @@ class GenerationService(
         chat_turn = ChatTurnRecord(workspace_id=workspace_id, role="user", content=request.prompt, linked_job_id=job.job_id, linked_run_id=request.linked_run_id)
         self.store.upsert("chat_turns", chat_turn.turn_id, chat_turn.model_dump(mode="json"))
         creative_direction = self._select_creative_direction(effective_prompt)
-        return self.generation_entry.generate_with_thin_loop(
+        return self.generation_entry.generate_with_agent_loop(
             workspace=workspace,
             workspace_id=workspace_id,
             job=job,
@@ -339,9 +339,6 @@ class GenerationService(
             should_stop=should_stop,
             prompt_turn_id=chat_turn.turn_id,
         )
-
-    def _generate_with_thin_loop(self, **kwargs: Any) -> JobRecord:
-        return self.generation_entry.generate_with_thin_loop(**kwargs)
 
     def _compile_prompt_to_scaffold(self, *, prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str], workspace_tree: list[dict[str, str]]) -> tuple[dict[str, Any], dict[str, Any]]:
         return compile_prompt_to_scaffold(
@@ -361,23 +358,23 @@ class GenerationService(
             build_execution_plan=self._build_execution_plan,
         )
 
-    def _thin_role_pages_for_role(self, *, role: str, prompt: str, grounded_spec: GroundedSpecModel) -> list[dict[str, Any]]:
-        return thin_role_pages_for_role(role=role, prompt=prompt, grounded_spec=grounded_spec, default_page_file=self._default_page_file, default_page_asset_path=self._default_page_asset_path, default_handoff_paths_for_page_kind=self._default_handoff_paths_for_page_kind)
+    def _scaffold_role_pages_for_role(self, *, role: str, prompt: str, grounded_spec: GroundedSpecModel) -> list[dict[str, Any]]:
+        return scaffold_role_pages_for_role(role=role, prompt=prompt, grounded_spec=grounded_spec, default_page_file=self._default_page_file, default_page_asset_path=self._default_page_asset_path, default_handoff_paths_for_page_kind=self._default_handoff_paths_for_page_kind)
 
     @staticmethod
-    def _thin_page_slug_for_route(route_path: str) -> str:
-        return thin_page_slug_for_route(route_path)
+    def _scaffold_page_slug_for_route(route_path: str) -> str:
+        return scaffold_page_slug_for_route(route_path)
 
-    def _thin_backend_targets_from_spec(self, *, prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str]) -> list[str]:
-        return thin_backend_targets_from_spec(prompt=prompt, grounded_spec=grounded_spec, role_scope=role_scope)
+    def _scaffold_backend_targets_from_spec(self, *, prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str]) -> list[str]:
+        return scaffold_backend_targets_from_spec(prompt=prompt, grounded_spec=grounded_spec, role_scope=role_scope)
 
     @staticmethod
     def _mentions_schedule_or_time(prompt: str, grounded_spec: GroundedSpecModel) -> bool:
         return mentions_schedule_or_time(prompt, grounded_spec)
 
     @staticmethod
-    def _thin_role_responsibility(role: str, grounded_spec: GroundedSpecModel) -> str:
-        return thin_role_responsibility(role, grounded_spec)
+    def _scaffold_role_responsibility(role: str, grounded_spec: GroundedSpecModel) -> str:
+        return scaffold_role_responsibility(role, grounded_spec)
 
     def _store_resume_checkpoint(self, *, workspace_id: str, draft_run_id: str, request: GenerateRequest, role_scope: list[str], role_contract: dict[str, Any], plan_result: dict[str, Any]) -> None:
         self.generation_resume.store_resume_checkpoint(workspace_id=workspace_id, draft_run_id=draft_run_id, request=request, role_scope=role_scope, role_contract=role_contract, plan_result=plan_result)

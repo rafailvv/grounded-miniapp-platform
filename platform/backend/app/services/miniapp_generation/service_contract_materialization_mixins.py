@@ -87,9 +87,9 @@ class ServiceContractMaterializationMixins:
         return MiniappGenerationPlanRuntime.canonical_endpoint_name(endpoint_name)
 
     @staticmethod
-    def _page_graph_gate_issues(page_graph: dict[str, Any], role_scope: list[str], *, scope_mode: str, require_multi_page: bool, require_business_pages: bool) -> list[str]:
+    def _page_graph_gate_issues(page_graph: dict[str, Any], role_scope: list[str], *, scope_mode: str, require_multi_page: bool) -> list[str]:
         from app.services.miniapp_generation.service import GenerationService
-        return PageGraphValidation.page_graph_gate_issues(page_graph, role_scope, scope_mode=scope_mode, require_multi_page=require_multi_page, require_business_pages=require_business_pages, normalize_role_route_path=lambda role, route_path, index: GenerationService._normalize_role_route_path(role, route_path, index=index), is_business_page=GenerationService._is_business_page, is_canonical_target_path=GenerationService._is_canonical_target_path)
+        return PageGraphValidation.page_graph_gate_issues(page_graph, role_scope, scope_mode=scope_mode, require_multi_page=require_multi_page, normalize_role_route_path=lambda role, route_path, index: GenerationService._normalize_role_route_path(role, route_path, index=index), is_business_page=GenerationService._is_business_page, is_canonical_target_path=GenerationService._is_canonical_target_path)
 
     @classmethod
     def _edit_gate_issues(
@@ -100,7 +100,6 @@ class ServiceContractMaterializationMixins:
         *,
         scope_mode: str,
         target_files: list[str],
-        require_business_pages: bool,
     ) -> list[str]:
         from app.modules.miniapp_validation import GenerationEditGate
         from app.services.miniapp_generation.service import GenerationService
@@ -111,7 +110,6 @@ class ServiceContractMaterializationMixins:
             role_scope,
             scope_mode=scope_mode,
             target_files=target_files,
-            require_business_pages=require_business_pages,
             is_canonical_target_path=GenerationService._is_canonical_target_path,
             is_business_page=GenerationService._is_business_page,
             is_role_root_page=GenerationService._is_role_root_page,

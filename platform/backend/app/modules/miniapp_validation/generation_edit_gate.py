@@ -17,13 +17,12 @@ class GenerationEditGate:
         *,
         scope_mode: str,
         target_files: list[str],
-        require_business_pages: bool,
         is_canonical_target_path: Callable[[str], bool],
         is_business_page: Callable[[str, dict[str, Any]], bool],
         is_role_root_page: Callable[[str, dict[str, Any]], bool],
     ) -> list[str]:
         issues: list[str] = []
-        del require_business_pages, is_business_page, is_role_root_page, role_scope, scope_mode
+        del is_business_page, is_role_root_page, role_scope, scope_mode
         operation_paths = {operation.file_path for operation in operations}
         operation_map = {operation.file_path: operation for operation in operations}
         generated_manifest_paths = {

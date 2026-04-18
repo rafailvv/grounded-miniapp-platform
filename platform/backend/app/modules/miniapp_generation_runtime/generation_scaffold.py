@@ -119,7 +119,7 @@ def compile_prompt_to_scaffold(
     target_files: list[str] = []
     backend_targets = list(MINIMAL_BOOTSTRAP_TARGETS)
     for role in role_scope:
-        pages = thin_role_pages_for_role(
+        pages = scaffold_role_pages_for_role(
             role=role,
             prompt=prompt,
             grounded_spec=grounded_spec,
@@ -134,7 +134,7 @@ def compile_prompt_to_scaffold(
             "pages": pages,
         }
         role_contract_roles[role] = {
-            "responsibility": thin_role_responsibility(role, grounded_spec),
+            "responsibility": scaffold_role_responsibility(role, grounded_spec),
             "pages": [str(page["page_id"]) for page in pages],
         }
         backend_targets.append(role_routes_file)
@@ -160,7 +160,7 @@ def compile_prompt_to_scaffold(
     )
     flow_mode = "multi_page" if any(len((page_graph_roles.get(role) or {}).get("pages") or []) > 1 for role in role_scope) else "single_page"
     return (
-        {"roles": role_contract_roles, "source": "thin_loop"},
+        {"roles": role_contract_roles, "source": "prompt_scaffold"},
         {
             "page_graph": {"roles": page_graph_roles, "backend_targets": backend_targets, "flow_mode": flow_mode},
             "scope_mode": "whole_file_build",
@@ -174,12 +174,11 @@ def compile_prompt_to_scaffold(
             "execution_plan": execution_plan,
             "generation_clusters": generation_clusters,
             "require_multi_page": flow_mode == "multi_page",
-            "require_business_pages": False,
         },
     )
 
 
-def thin_role_pages_for_role(
+def scaffold_role_pages_for_role(
     *,
     role: str,
     prompt: str,
@@ -198,7 +197,7 @@ def thin_role_pages_for_role(
         file_path = default_page_file(role, f"{role}_{title}", route_path=route_path)
         pages.append(
             {
-                "page_id": f"{role}_{thin_page_slug_for_route(route_path)}",
+                "page_id": f"{role}_{scaffold_page_slug_for_route(route_path)}",
                 "route_path": route_path,
                 "file_path": file_path,
                 "style_path": default_page_asset_path(file_path, asset_kind="css"),
@@ -220,7 +219,7 @@ def thin_role_pages_for_role(
     return pages
 
 
-def thin_page_slug_for_route(route_path: str) -> str:
+def scaffold_page_slug_for_route(route_path: str) -> str:
     normalized = route_path.strip() or "/"
     if normalized == "/":
         return "index"
@@ -230,7 +229,7 @@ def thin_page_slug_for_route(route_path: str) -> str:
     return re.sub(r"_+", "_", slug) or "page"
 
 
-def thin_backend_targets_from_spec(
+def scaffold_backend_targets_from_spec(
     *,
     prompt: str,
     grounded_spec: GroundedSpecModel,
@@ -251,7 +250,7 @@ def mentions_schedule_or_time(prompt: str, grounded_spec: GroundedSpecModel) -> 
     return any(token in haystack for token in ("time", "slot", "schedule", "calendar", "booking"))
 
 
-def thin_role_responsibility(role: str, grounded_spec: GroundedSpecModel) -> str:
+def scaffold_role_responsibility(role: str, grounded_spec: GroundedSpecModel) -> str:
     actor = next((item for item in grounded_spec.actors if item.role == role), None)
     if actor is not None and getattr(actor, "description", None):
         return str(actor.description)

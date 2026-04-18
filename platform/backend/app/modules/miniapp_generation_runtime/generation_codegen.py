@@ -125,7 +125,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                         file_contexts=file_contexts,
                         generation_mode=GenerationMode.FAST,
                         creative_direction=creative_direction,
-                        recovery_mode="serial_compact_retry",
+                        recovery_mode="serial_recovery_retry",
                         workspace_id=workspace_id,
                         draft_run_id=draft_run_id,
                         workspace_tree=workspace_tree,

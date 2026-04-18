@@ -238,7 +238,6 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             role_scope,
             scope_mode=plan_result["scope_mode"],
             target_files=plan_result["target_files"],
-            require_business_pages=bool(plan_result.get("require_business_pages")),
         )
         initial_loop_diagnostics: list[str] = []
         if materialization_gate is not None:
@@ -274,6 +273,38 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 {"issues": edit_gate_issues},
             )
             initial_loop_diagnostics.extend(edit_gate_issues)
+        initial_exact_execution, _initial_exact_preview = service.generation_repair._execute_generation_checks(
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
+            draft_source=draft_source,
+            changed_files=[operation.file_path for operation in operations],
+            fallback_changed_files=[operation.file_path for operation in operations],
+            page_graph=plan_result["page_graph"],
+            role_scope=role_scope,
+            scope_mode=plan_result["scope_mode"],
+            mode="exact",
+        )
+        initial_exact_issues = CheckRunner.failing_issues(initial_exact_execution.results)
+        build_issues = [issue for issue in initial_exact_issues if issue.location != "preview"]
+        preview_issue = next((issue for issue in initial_exact_issues if issue.location == "preview"), None)
+        if initial_exact_issues:
+            exact_check_summary = service._summarize_failed_checks(build_issues, preview_issue)
+            service._append_trace(
+                workspace_id,
+                "exact_checks_seeded",
+                "Initial generation exact-check results were captured before entering the workspace loop.",
+                {
+                    "summary": exact_check_summary,
+                    "failing_checks": [issue.model_dump(mode="json") for issue in initial_exact_issues],
+                },
+            )
+            service._append_event(
+                job,
+                "checks_completed",
+                "Seeded the iterative workspace loop with exact-check diagnostics from the first generated draft.",
+                {"summary": exact_check_summary},
+            )
+            initial_loop_diagnostics.append(exact_check_summary)
         loop_seed_message = edit_result["assistant_message"]
         if initial_loop_diagnostics:
             loop_seed_message = (

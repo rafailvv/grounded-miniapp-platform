@@ -65,6 +65,8 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "rules": [
                     "If context is insufficient, return outcome=tool_request with tool_requests and no operations.",
                     "You may use list_files, read_files, search_files, run_command, and run_checks before editing.",
+                    "When shared CRUD wiring, route registration, or DB persistence is uncertain, inspect first and prefer run_checks with mode=exact before returning operations.",
+                    "Before concluding a cluster that touches shared CRUD, backend runtime wiring, or generated verification files, prefer run_checks with mode=final unless recent tool_results already prove the contract is green.",
                     "Return only create/replace operations for files listed in cluster_targets.",
                     "Every returned file must contain the complete final file body.",
                     "Prefer larger coherent role/domain files over micro-modules.",
@@ -157,6 +159,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "rules": [
                     "If context is insufficient, return outcome=tool_request with tool_requests and no operations.",
                     "You may use list_files, read_files, search_files, run_command, and run_checks before editing.",
+                    "When page-level persistence, route wiring, or shared record lifecycle is uncertain, inspect first and prefer run_checks with mode=exact before returning operations.",
                     "Create a real page, not a generic stats card screen.",
                     "Respect the requested role and make the actions specific to that role.",
                     "Treat page purpose, primary actions, and handoff paths from the page graph as advisory hints, not as rigid structure.",
@@ -169,6 +172,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Do not rely on dedicated loading or error blocks to make role root pages function; the main surface must already be complete on first render.",
                     "If the page edits or lists shared records, wire it to the real DB-backed /api lifecycle for the same entity instead of local arrays or console-only handlers.",
                     "Profile pages must keep the canonical /api/profiles/{role} read/write contract or the existing profileStore contract intact.",
+                    "For pages that create, list, or update shared records, prefer honest CRUD wiring over speculative UI polish and do not conclude without evidence that the corresponding API contract exists in the same draft.",
                     "If scope_mode is minimal_patch, preserve unrelated behavior and keep the diff minimal.",
                     "Return exactly one operation for the requested page file path.",
                 ],
@@ -264,6 +268,8 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "rules": [
                     "If context is insufficient, return outcome=tool_request with tool_requests and no operations.",
                     "You may use list_files, read_files, search_files, run_command, and run_checks before editing.",
+                    "When shared CRUD, route registration, or runtime wiring is uncertain, inspect first and prefer run_checks with mode=exact before returning operations.",
+                    "Before concluding a backend/runtime composition that touches shared CRUD or generated verification surfaces, prefer run_checks with mode=final unless recent tool_results already show a green result.",
                     "Only touch files listed in target_files.",
                     "If stage_name is miniapp, generate only miniapp/server/shared contract files required by the request.",
                     "If stage_name is frontend, wire pages, routes, and shared UI/state to the already planned miniapp surface.",

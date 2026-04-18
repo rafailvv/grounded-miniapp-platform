@@ -13,13 +13,12 @@ class PageGraphValidation:
         *,
         scope_mode: str,
         require_multi_page: bool,
-        require_business_pages: bool,
         normalize_role_route_path: Callable[[str, str, int], str],
         is_business_page: Callable[[str, dict[str, Any]], bool],
         is_canonical_target_path: Callable[[str], bool],
     ) -> list[str]:
         issues: list[str] = []
-        del scope_mode, require_business_pages
+        del scope_mode
         roles = page_graph.get("roles") or {}
         planned_paths = set(page_graph.get("shared_files") or []) | set(page_graph.get("backend_targets") or [])
         for role in role_scope:
@@ -94,7 +93,6 @@ class PageGraphValidation:
             role_scope,
             scope_mode=str(page_graph.get("scope_mode") or "whole_file_build"),
             require_multi_page=str(page_graph.get("flow_mode") or "single_page") == "multi_page",
-            require_business_pages=False,
             normalize_role_route_path=normalize_role_route_path,
             is_business_page=is_business_page,
             is_canonical_target_path=is_canonical_target_path,

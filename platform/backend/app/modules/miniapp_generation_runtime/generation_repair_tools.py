@@ -47,7 +47,7 @@ class GenerationRepairToolRuntime:
         draft_source: Path,
         tool_requests: list[dict[str, Any]],
         fallback_targets: list[str],
-        execute_checks: Callable[[list[str]], tuple[Any, dict[str, Any]]],
+        execute_checks: Callable[[list[str], str], tuple[Any, dict[str, Any]]],
         command_timeout_seconds: int,
     ) -> tuple[list[str], list[dict[str, object]], dict[str, str]]:
         additional_targets: list[str] = []
@@ -122,7 +122,8 @@ class GenerationRepairToolRuntime:
                 continue
             if tool_name == "run_checks":
                 requested_changed_files = list(targets or fallback_targets or ["miniapp"])
-                execution, preview_details = execute_checks(requested_changed_files)
+                mode = str(request_item.get("mode") or "exact").strip().lower() or "exact"
+                execution, preview_details = execute_checks(requested_changed_files, mode)
                 failed_checks = [
                     {
                         "name": result.name,
@@ -136,7 +137,7 @@ class GenerationRepairToolRuntime:
                 tool_results.append(
                     {
                         "tool": "run_checks",
-                        "mode": str(request_item.get("mode") or "exact").strip().lower() or "exact",
+                        "mode": mode,
                         "targets": requested_changed_files,
                         "reason": reason,
                         "failed_checks": failed_checks,

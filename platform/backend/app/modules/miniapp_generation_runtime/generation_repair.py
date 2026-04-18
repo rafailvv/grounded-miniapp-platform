@@ -44,6 +44,7 @@ class MiniappGenerationRepair:
         page_graph: dict[str, Any],
         role_scope: list[str],
         scope_mode: str,
+        mode: str = "exact",
     ) -> tuple[CheckExecutionRecord, dict[str, Any]]:
         changed = sorted(set(changed_files or fallback_changed_files))
         preflight_issues = self.service._preflight_generation_issues(
@@ -80,7 +81,7 @@ class MiniappGenerationRepair:
             source_dir=draft_source,
             changed_files=changed,
             preview_run_id=draft_run_id,
-            scope_mode=scope_mode,
+            scope_mode="whole_file_build" if mode == "final" else scope_mode,
         )
         preview = self.service.preview_service.get(workspace_id)
         preview_details = {
@@ -452,7 +453,7 @@ class MiniappGenerationRepair:
                             draft_source=draft_source,
                             tool_requests=tool_requests,
                             fallback_targets=current_target_files,
-                            execute_checks=lambda requested_changed_files: self._execute_generation_checks(
+                            execute_checks=lambda requested_changed_files, mode: self._execute_generation_checks(
                                 workspace_id=workspace_id,
                                 draft_run_id=draft_run_id,
                                 draft_source=draft_source,
@@ -461,6 +462,7 @@ class MiniappGenerationRepair:
                                 page_graph=page_graph,
                                 role_scope=role_scope,
                                 scope_mode=scope_mode,
+                                mode=mode,
                             ),
                             command_timeout_seconds=self.COMMAND_TIMEOUT_SECONDS,
                         )

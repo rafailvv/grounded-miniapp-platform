@@ -117,12 +117,13 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                             draft_source=draft_source,
                             tool_requests=tool_requests,
                             fallback_targets=cluster_targets,
-                            execute_checks=lambda requested_changed_files: self._execute_tool_requested_checks(
+                            execute_checks=lambda requested_changed_files, mode: self._execute_tool_requested_checks(
                                 workspace_id=workspace_id,
                                 draft_run_id=draft_run_id,
                                 draft_source=draft_source,
                                 changed_files=requested_changed_files,
                                 scope_mode=scope_mode,
+                                mode=mode,
                             ),
                             command_timeout_seconds=self.COMMAND_TIMEOUT_SECONDS,
                         )
@@ -295,12 +296,13 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                             draft_source=draft_source,
                             tool_requests=tool_requests,
                             fallback_targets=target_files,
-                            execute_checks=lambda requested_changed_files: self._execute_tool_requested_checks(
+                            execute_checks=lambda requested_changed_files, mode: self._execute_tool_requested_checks(
                                 workspace_id=workspace_id,
                                 draft_run_id=draft_run_id,
                                 draft_source=draft_source,
                                 changed_files=requested_changed_files,
                                 scope_mode=scope_mode,
+                                mode=mode,
                             ),
                             command_timeout_seconds=self.COMMAND_TIMEOUT_SECONDS,
                         )
@@ -359,6 +361,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
         draft_source: Path,
         changed_files: list[str],
         scope_mode: str,
+        mode: str = "exact",
     ) -> tuple[Any, dict[str, Any]]:
         execution = self.service.check_runner.run(
             workspace_id=workspace_id,
@@ -366,7 +369,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
             source_dir=draft_source,
             changed_files=sorted(set(changed_files or ["miniapp"])),
             preview_run_id=draft_run_id,
-            scope_mode=scope_mode,
+            scope_mode="whole_file_build" if mode == "final" else scope_mode,
         )
         preview = self.service.preview_service.get(workspace_id)
         return execution, {

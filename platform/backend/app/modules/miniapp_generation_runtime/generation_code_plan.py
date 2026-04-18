@@ -56,13 +56,11 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 role_scope,
                 scope_mode=scope_mode,
                 require_multi_page=require_multi_page,
-                require_business_pages=False,
             )
             planned["write_strategy"] = scope_mode
             planned["strategy_reason"] = strategy_reason
             planned["model"] = payload["model"]
             planned["plan_gate_issues"] = plan_gate_issues
-            planned["require_business_pages"] = False
             return planned
         except Exception as exc:
             self._append_trace(
@@ -87,9 +85,8 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 "require_multi_page": require_multi_page,
                 "write_strategy": scope_mode,
                 "strategy_reason": strategy_reason,
-                "model": "code-plan-advisory-missing",
+                "model": "code-plan-unavailable",
                 "plan_gate_issues": [],
-                "require_business_pages": False,
                 "error": f"Page graph planning failed: {exc}",
             }
 
@@ -230,7 +227,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             self._append_trace(
                 workspace_id,
                 "code_plan_sections_partial_merge",
-                "Code plan section timed out; merged successful sections without deterministic planner fallback.",
+                "Code plan section timed out; merged successful sections without planner-shaped substitution.",
                 {
                     "duration_ms": int((time.perf_counter() - sections_started) * 1000),
                     "section_errors": section_errors,

@@ -13,7 +13,7 @@ class MiniappGenerationEntry:
     def __init__(self, service: "GenerationService") -> None:
         self.service = service
 
-    def generate_with_thin_loop(
+    def generate_with_agent_loop(
         self,
         *,
         workspace,
@@ -36,8 +36,8 @@ class MiniappGenerationEntry:
         self.service._append_event(job, "building_scaffold", "Building a prompt-driven generation plan on top of the minimal template bootstrap.")
         self.service._append_trace(
             workspace_id,
-            "thin_loop_started",
-            "Thin direct generation loop selected as the default path.",
+            "generation_loop_started",
+            "Agentic generation loop selected as the default path.",
             {"role_scope": role_scope, "generation_mode": generation_mode.value},
         )
         grounded_spec = self.service._build_grounded_spec(
@@ -52,8 +52,8 @@ class MiniappGenerationEntry:
         )
         self.service._append_trace(
             workspace_id,
-            "thin_spec_compiler",
-            "Thin loop compiled grounded spec before prompt-driven scaffold planning.",
+            "grounded_spec_ready",
+            "Grounded spec compiled before prompt-driven scaffold planning.",
             {"llm_spec_stage_removed": True},
         )
         grounded_spec = self.service._stabilize_grounded_spec(grounded_spec)
@@ -80,19 +80,12 @@ class MiniappGenerationEntry:
             generation_mode=generation_mode,
             creative_direction=creative_direction,
         )
-        role_contract = dict(role_contract_result.get("role_contract") or self.service._minimal_role_contract(grounded_spec, role_scope))
+        role_contract = dict(role_contract_result.get("role_contract") or {})
         role_contract_issues = self.service._role_contract_gate_issues(
             role_contract,
             role_scope,
             scope_mode="whole_file_build",
         )
-        if role_contract_result.get("fallback_reason"):
-            self.service._append_trace(
-                workspace_id,
-                "role_contract_fallback",
-                "Role contract analysis fell back to minimal guidance, but generation continues code-first.",
-                {"reason": str(role_contract_result.get("fallback_reason") or "")},
-            )
         if role_contract_issues:
             self.service._append_trace(
                 workspace_id,
@@ -244,7 +237,6 @@ class MiniappGenerationEntry:
             if "require_multi_page" in advisory_plan_result
             else inferred_plan_result.get("require_multi_page")
         )
-        merged_plan["require_business_pages"] = False
         merged_plan["generation_clusters"] = list(
             advisory_plan_result.get("generation_clusters")
             or inferred_plan_result.get("generation_clusters")

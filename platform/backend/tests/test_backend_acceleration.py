@@ -192,7 +192,7 @@ def test_workspace_name_is_derived_from_prompt() -> None:
     assert name == "Clean Service Requests Manager Specialist"
 
 
-def test_workspace_log_service_creates_platform_api_and_legacy_logs(tmp_path: Path) -> None:
+def test_workspace_log_service_creates_platform_and_api_logs(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     log_service = app.state.container.workspace_log_service
@@ -203,7 +203,6 @@ def test_workspace_log_service_creates_platform_api_and_legacy_logs(tmp_path: Pa
     log_service.append_api(workspace_id, source="test", message="api entry")
 
     assert log_service.log_path(workspace_id).exists()
-    assert log_service.legacy_log_path(workspace_id).exists()
     assert log_service.api_log_path(workspace_id).exists()
     assert any("platform entry" in line for line in log_service.read_lines(workspace_id, kind="platform"))
     assert any("api entry" in line for line in log_service.read_lines(workspace_id, kind="api"))
@@ -515,7 +514,7 @@ def test_generate_json_object_with_retry_times_out_stuck_llm_call(tmp_path: Path
         raise AssertionError("Expected TimeoutError for stuck JSON-object LLM call")
 
 
-def test_code_plan_sections_fall_back_when_one_section_times_out(tmp_path: Path, monkeypatch) -> None:
+def test_code_plan_sections_merge_successful_parts_when_one_section_times_out(tmp_path: Path, monkeypatch) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
@@ -1522,7 +1521,6 @@ def test_edit_gate_allows_loading_copy_when_page_has_real_surface() -> None:
         ["specialist"],
         scope_mode="whole_file_build",
         target_files=["miniapp/app/static/specialist/index.html"],
-        require_business_pages=True,
     )
 
     assert "miniapp/app/static/specialist/index.html is dominated by loading copy instead of real page content." not in issues
@@ -1572,7 +1570,6 @@ def test_edit_gate_allows_generated_app_level_test_files() -> None:
         ["client"],
         scope_mode="whole_file_build",
         target_files=["miniapp/app/static/client/index.html"],
-        require_business_pages=False,
     )
 
     assert not any("planned target scope" in issue for issue in issues)
@@ -2024,7 +2021,6 @@ def test_page_graph_gate_normalizes_role_prefixed_entry_routes() -> None:
         ["client"],
         scope_mode="whole_file_build",
         require_multi_page=True,
-        require_business_pages=False,
     )
 
     assert "client is missing an entry route at /." not in issues
@@ -2441,7 +2437,6 @@ def test_page_graph_gate_rejects_multiple_routes_sharing_one_file() -> None:
         ["manager"],
         scope_mode="whole_file_build",
         require_multi_page=True,
-        require_business_pages=True,
     )
 
     assert any("reuses the same file for multiple routes" in issue for issue in issues)
@@ -4588,8 +4583,14 @@ def test_generation_repair_uses_tool_requests_before_patching(tmp_path: Path) ->
                 "model": "stub",
                 "payload": {
                     "outcome": "tool_request",
-                    "diagnosis": "Inspect the workspace tree, then read the implicated profile helper.",
+                    "diagnosis": "Inspect the workspace tree, run exact checks, then read the implicated profile helper.",
                     "tool_requests": [
+                        {
+                            "tool": "run_checks",
+                            "mode": "exact",
+                            "targets": [target],
+                            "reason": "Capture exact-check failures before repairing the profile helper.",
+                        },
                         {
                             "tool": "list_files",
                             "targets": ["miniapp/app/static/client"],
@@ -4604,6 +4605,7 @@ def test_generation_repair_uses_tool_requests_before_patching(tmp_path: Path) ->
                     "operations": [],
                 },
             }
+        assert any(item.get("tool") == "run_checks" and item.get("mode") == "exact" for item in tool_results)
         assert any(item.get("tool") == "list_files" for item in tool_results)
         assert target in file_contexts
         return {
@@ -4727,8 +4729,14 @@ def test_initial_codegen_uses_tool_requests_before_page_patch(tmp_path: Path) ->
                 "model": "stub",
                 "payload": {
                     "outcome": "tool_request",
-                    "diagnosis": "Inspect the client static workspace and read the targeted page before editing.",
+                    "diagnosis": "Inspect the client static workspace, run final checks, and read the targeted page before editing.",
                     "tool_requests": [
+                        {
+                            "tool": "run_checks",
+                            "mode": "final",
+                            "targets": [target],
+                            "reason": "Check the current draft state before concluding the page patch.",
+                        },
                         {
                             "tool": "list_files",
                             "targets": ["miniapp/app/static/client"],
@@ -4743,6 +4751,7 @@ def test_initial_codegen_uses_tool_requests_before_page_patch(tmp_path: Path) ->
                     "operations": [],
                 },
             }
+        assert any(item.get("tool") == "run_checks" and item.get("mode") == "final" for item in tool_results)
         assert any(item.get("tool") == "list_files" for item in tool_results)
         assert "stale orders" in current_file
         return {
@@ -5225,7 +5234,7 @@ def test_page_generation_retries_with_compact_recovery_after_retryable_provider_
     assert "mode=GenerationMode.FAST" in prompts[1][1]
 
 
-def test_parallel_page_generation_falls_back_to_serial_compact_retry(tmp_path: Path) -> None:
+def test_parallel_page_generation_retries_via_serial_recovery_mode(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service = app.state.container.generation_service
@@ -5280,7 +5289,7 @@ def test_parallel_page_generation_falls_back_to_serial_compact_retry(tmp_path: P
     )
 
     assert "error" not in result
-    assert retried == [(page_one, "serial_compact_retry")]
+    assert retried == [(page_one, "serial_recovery_retry")]
     assert any(item.file_path == page_one for item in result["operations"])
     assert any(item.file_path == page_two for item in result["operations"])
 
@@ -5609,7 +5618,6 @@ def test_page_graph_gate_accepts_root_and_profile_only_multi_page_flows(tmp_path
         ["client", "specialist"],
         scope_mode="whole_file_build",
         require_multi_page=True,
-        require_business_pages=True,
     )
 
     assert not any("missing separate business pages" in issue for issue in issues)
@@ -5643,7 +5651,6 @@ def test_page_graph_gate_rejects_incomplete_multi_page_plan_without_business_pag
         ["client", "specialist", "manager"],
         scope_mode="minimal_patch",
         require_multi_page=True,
-        require_business_pages=True,
     )
 
     assert any("did not receive enough distinct pages" in issue for issue in issues)
@@ -5696,7 +5703,6 @@ def test_edit_gate_rejects_placeholder_surface_and_unknown_handoff(tmp_path: Pat
         ["client"],
         scope_mode="whole_file_build",
         target_files=[item.file_path for item in operations],
-        require_business_pages=False,
     )
 
     assert any("still contains placeholder copy" in issue for issue in issues)
@@ -5753,7 +5759,6 @@ def test_edit_gate_accepts_content_first_root_page_with_valid_handoffs(tmp_path:
         ["client"],
         scope_mode="whole_file_build",
         target_files=[item.file_path for item in operations],
-        require_business_pages=False,
     )
 
     assert not any("placeholder copy" in issue for issue in issues)
@@ -7257,7 +7262,7 @@ def test_compile_prompt_to_scaffold_builds_role_local_targets_and_excludes_manif
         workspace_tree=[],
     )
 
-    assert role_contract["source"] == "thin_loop"
+    assert role_contract["source"] == "prompt_scaffold"
     assert plan_result["scope_mode"] == "whole_file_build"
     assert "miniapp/app/generated/route_manifest.json" not in plan_result["target_files"]
     assert "miniapp/app/generated/runtime_manifest.json" not in plan_result["target_files"]
@@ -7267,7 +7272,7 @@ def test_compile_prompt_to_scaffold_builds_role_local_targets_and_excludes_manif
     assert any(path == "miniapp/app/static/manager/profile/index.html" for path in plan_result["target_files"])
 
 
-def test_thin_backend_targets_do_not_infer_business_routes_from_prompt_tokens(tmp_path: Path) -> None:
+def test_scaffold_backend_targets_do_not_infer_business_routes_from_prompt_tokens(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
@@ -7282,7 +7287,7 @@ def test_thin_backend_targets_do_not_infer_business_routes_from_prompt_tokens(tm
         prompt_turn_id="turn_1",
         generation_mode=GenerationMode.BALANCED,
     )
-    targets = service._thin_backend_targets_from_spec(
+    targets = service._scaffold_backend_targets_from_spec(
         prompt=spec.product_goal,
         grounded_spec=spec,
         role_scope=["client", "specialist", "manager"],

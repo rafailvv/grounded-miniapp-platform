@@ -49,7 +49,7 @@ class MiniappGenerationRoleContract:
         except Exception as exc:
             return {
                 "role_contract": self.minimal_role_contract(grounded_spec, role_scope),
-                "fallback_reason": f"Role architecture analysis failed: {exc}",
+                "model": f"role-guidance-derived:{exc.__class__.__name__}",
             }
 
     def normalize_role_contract(self, payload: dict[str, Any], role_scope: list[str]) -> dict[str, Any]:

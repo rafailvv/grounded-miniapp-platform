@@ -22,14 +22,11 @@ class WorkspaceLogService:
     def log_path(self, workspace_id: str) -> Path:
         return self._logs_dir(workspace_id) / "platform.log"
 
-    def legacy_log_path(self, workspace_id: str) -> Path:
-        return self._logs_dir(workspace_id) / "WDevPlatform.log"
-
     def api_log_path(self, workspace_id: str) -> Path:
         return self._logs_dir(workspace_id) / "api.log"
 
     def ensure_log_files(self, workspace_id: str) -> None:
-        for path in (self.log_path(workspace_id), self.legacy_log_path(workspace_id), self.api_log_path(workspace_id)):
+        for path in (self.log_path(workspace_id), self.api_log_path(workspace_id)):
             with self._lock:
                 path.touch(exist_ok=True)
 
@@ -50,11 +47,9 @@ class WorkspaceLogService:
             "payload": payload or {},
         }
         line = json.dumps(entry, ensure_ascii=True)
-        log_paths = (self.log_path(workspace_id), self.legacy_log_path(workspace_id))
         with self._lock:
-            for log_path in log_paths:
-                with log_path.open("a", encoding="utf-8") as handle:
-                    handle.write(f"{line}\n")
+            with self.log_path(workspace_id).open("a", encoding="utf-8") as handle:
+                handle.write(f"{line}\n")
 
     def append_api(
         self,

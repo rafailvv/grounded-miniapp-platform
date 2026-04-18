@@ -948,7 +948,7 @@ def _fix_patch_payload(payload: dict) -> dict:
                 "file_path": first_path,
                 "operation": "replace",
                 "content": file_contexts[first_path],
-                "reason": "No-op fallback for test stubs.",
+                "reason": "No-op branch for unsupported test stubs.",
             }
         )
         rationale[first_path] = "Fallback test stub patch."
