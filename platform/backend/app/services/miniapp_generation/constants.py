@@ -5,6 +5,9 @@ ROLE_COMPONENT_PREFIX = {
     "manager": "Manager",
 }
 DESIGN_REFERENCE_FILES = (
+    "docs/README.md",
+    "docs/components.md",
+    "docs/generation-contract.md",
     "miniapp/app/static/shared/base.css",
     "miniapp/app/static/shared/common.js",
     "miniapp/app/static/client/index.html",
