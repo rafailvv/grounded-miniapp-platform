@@ -24,7 +24,19 @@ def create_workspace(
         path=str(container.settings.workspaces_dir / "pending"),
     )
     workspace.path = str(container.settings.workspaces_dir / workspace.workspace_id)
-    return container.workspace_service.create_workspace(workspace)
+    workspace = container.workspace_service.create_workspace(workspace)
+    workspace = container.workspace_service.clone_template(workspace.workspace_id)
+    threading.Thread(
+        target=container.code_index_service.index_workspace,
+        args=(workspace, container.workspace_service.source_dir(workspace.workspace_id)),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=container.preview_service.ensure_started,
+        args=(workspace.workspace_id,),
+        daemon=True,
+    ).start()
+    return workspace
 
 
 @router.get("/workspaces", response_model=list[WorkspaceRecord])

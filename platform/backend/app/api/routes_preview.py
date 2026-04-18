@@ -50,8 +50,11 @@ def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(ge
     preview = container.preview_service.peek(workspace_id)
     container_logs: dict[str, list[str]] = {}
     if preview.runtime_mode == "docker" and preview.proxy_port is not None:
-        source_dir = container.workspace_service.source_dir(workspace_id)
-        container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
+        try:
+            source_dir = container.workspace_service.source_dir(workspace_id)
+            container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
+        except Exception as exc:
+            container_logs = {"preview_runtime": [f"Unable to collect preview container logs: {exc}"]}
     return {"logs": preview.logs, "mini_app_logs": container_logs}
 
 
@@ -63,8 +66,11 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
     api_log = container.workspace_log_service.read_lines(workspace_id, kind="api")
     container_logs: dict[str, list[str]] = {}
     if preview.runtime_mode == "docker" and preview.proxy_port is not None:
-        source_dir = container.workspace_service.source_dir(workspace_id)
-        container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
+        try:
+            source_dir = container.workspace_service.source_dir(workspace_id)
+            container_logs = container.runtime_manager.collect_container_logs(workspace_id, source_dir, preview.proxy_port)
+        except Exception as exc:
+            container_logs = {"preview_runtime": [f"Unable to collect preview container logs: {exc}"]}
     workspace_event_lines = [
         (
             f"- [{event.created_at.strftime('%Y-%m-%d %H:%M:%S')}] "

@@ -400,7 +400,11 @@ class GenerationService(
         return self.store.get("reports", f"{report_type}:{workspace_id}")
 
     def latest_job_for_workspace(self, workspace_id: str) -> JobRecord | None:
-        jobs = self.store.list_jobs(workspace_id)
+        jobs = [
+            JobRecord.model_validate(item)
+            for item in self.store.list("jobs")
+            if item.get("workspace_id") == workspace_id
+        ]
         if not jobs:
             return None
         return max(jobs, key=lambda item: item.created_at)

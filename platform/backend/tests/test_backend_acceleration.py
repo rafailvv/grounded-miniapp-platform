@@ -76,6 +76,29 @@ def test_code_index_retrieval_prefers_symbol_overlap(tmp_path: Path) -> None:
     assert retrieval["stats"]["code_hits"] > 0
 
 
+def test_create_workspace_auto_clones_template(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    response = client.post(
+        "/workspaces",
+        json={
+            "name": "Auto Clone Workspace",
+            "description": "Workspace creation should immediately clone the canonical template.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    )
+
+    assert response.status_code == 200
+    workspace = response.json()
+    assert workspace["template_cloned"] is True
+    workspace_id = workspace["workspace_id"]
+    source_dir = app.state.container.workspace_service.source_dir(workspace_id)
+    assert (source_dir / "miniapp/app/main.py").exists()
+
+
 def test_system_configuration_defaults_to_balanced(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -4209,6 +4232,8 @@ def test_run_completes_before_async_preview_rebuild_finishes(tmp_path: Path) -> 
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     _install_llm_stub(app)
     client = TestClient(app)
+    preview_service = app.state.container.preview_service
+    preview_service.ensure_started = lambda workspace_id, force_rebuild=False: preview_service._get_or_create(workspace_id)  # type: ignore[method-assign]
 
     workspace = client.post(
         "/workspaces",
@@ -4220,9 +4245,7 @@ def test_run_completes_before_async_preview_rebuild_finishes(tmp_path: Path) -> 
         },
     ).json()
     workspace_id = workspace["workspace_id"]
-    app.state.container.workspace_service.clone_template(workspace_id)
 
-    preview_service = app.state.container.preview_service
     rebuild_started = threading.Event()
     release_rebuild = threading.Event()
 
