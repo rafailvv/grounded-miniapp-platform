@@ -7,6 +7,52 @@ from app.services.check_runner import CheckRunner
 
 class MiniappGenerationCompletion:
     @staticmethod
+    def informational_issues_from_execution(execution: CheckExecutionRecord) -> list[dict]:
+        issues: list[dict] = []
+        for result in execution.results:
+            if result.status == "failed":
+                continue
+            if result.name == "changed_files_static":
+                issues.append(
+                    ValidationIssue(
+                        code="build.static_checks_passed",
+                        message=result.details or "Draft source passed static validation.",
+                        severity="low",
+                        location="miniapp/app",
+                        blocking=False,
+                    ).model_dump(mode="json")
+                )
+            elif result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
+                issues.append(
+                    ValidationIssue(
+                        code="tests.generated_app_verified",
+                        message=result.details or "Generated app tests passed.",
+                        severity="low",
+                        location="tests",
+                        blocking=False,
+                    ).model_dump(mode="json")
+                )
+            elif result.name in {"preview_boot_smoke", "preview_connectivity_smoke"} and result.status in {"passed", "skipped"}:
+                issues.append(
+                    ValidationIssue(
+                        code="preview.verification_recorded",
+                        message=result.details or "Preview verification completed.",
+                        severity="low",
+                        location="preview",
+                        blocking=False,
+                    ).model_dump(mode="json")
+                )
+        deduped: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for issue in issues:
+            key = (str(issue.get("code") or ""), str(issue.get("location") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(issue)
+        return deduped
+
+    @staticmethod
     def preview_failure_issue(preview: object) -> ValidationIssue:
         message = next(
             (
@@ -40,11 +86,13 @@ class MiniappGenerationCompletion:
     def validation_snapshot_from_execution(execution: CheckExecutionRecord) -> ValidationSnapshot:
         issues = [issue.model_dump(mode="json") for issue in CheckRunner.failing_issues(execution.results)]
         build_failed = any(item.status == "failed" for item in execution.results if item.name == "changed_files_static")
+        if not issues:
+            issues = MiniappGenerationCompletion.informational_issues_from_execution(execution)
         return ValidationSnapshot(
             grounded_spec_valid=True,
             app_ir_valid=True,
             build_valid=not build_failed,
-            blocking=bool(issues),
+            blocking=any(bool(issue.get("blocking", False)) for issue in issues),
             issues=issues,
         )
 

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.models.domain import RunCheckResult, ValidationIssue
+from app.models.artifacts import ValidationIssue
+from app.models.domain import RunCheckResult
 from app.models.grounded_spec import GroundedSpecModel
 from app.services.miniapp_generation.constants import ROLE_ORDER, WORKFLOW_HEAVY_MARKERS
 
@@ -219,7 +220,15 @@ class ServiceStrategyMixins:
     @staticmethod
     def _build_fix_handoff(*, prompt: str, failure_reason: str, failure_class: str | None, issues: list[ValidationIssue], mode: str | None = None) -> dict[str, Any]:
         check_results = [
-            RunCheckResult(name=issue.code, passed=not issue.blocking, details=issue.message, metadata={"location": issue.location, "severity": issue.severity}).model_dump(mode="json")
+            RunCheckResult(
+                name=issue.code,
+                status="failed" if issue.blocking else "passed",
+                details=issue.message,
+                logs=[
+                    f"location={issue.location or 'unknown'}",
+                    f"severity={issue.severity or 'unknown'}",
+                ],
+            ).model_dump(mode="json")
             for issue in issues
         ]
         return {

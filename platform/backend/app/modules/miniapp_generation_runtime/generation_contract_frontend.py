@@ -8,34 +8,63 @@ from app.models.domain import DraftFileOperation
 
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
 
-CANONICAL_ENDPOINT_ALIASES = {
-    "submission": "requests",
-    "submissions": "requests",
-    "booking": "requests",
-    "bookings": "requests",
-    "appointment": "requests",
-    "appointments": "requests",
-    "task": "requests",
-    "tasks": "requests",
-    "assignee": "assignments",
-    "owners": "assignments",
-    "owner": "assignments",
-    "notes": "comments",
-    "note": "comments",
-    "specialist": "users",
-    "specialists": "users",
-}
+CANONICAL_ENDPOINT_ALIASES: dict[str, str] = {}
 
 
 class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
     @classmethod
-    def _normalize_api_aliases_in_text(cls, content: str) -> str:
+    def _needs_frontend_api_contract_repair(cls, file_path: str, content: str) -> bool:
+        normalized = str(content or "")
+        if not normalized:
+            return False
+        if cls._strip_mock_profile_names(normalized) != normalized:
+            return True
+        if file_path.endswith(".js"):
+            if re.search(r"(?<![\w.])fetch\(\s*([\"'`])/api/", normalized):
+                return True
+            if "window.fetch" in normalized and ("runtime.fetchJson" in normalized or "miniappApiFetch" in normalized):
+                return True
+        return False
+
+    @classmethod
+    def _needs_basic_page_state_contract_repair(
+        cls,
+        html: str,
+        *,
+        role: str,
+        declared_routes: set[str],
+        expected_style_href: str,
+        expected_script_src: str,
+    ) -> bool:
+        updated = cls._strip_mock_profile_names(html)
+        if updated != html:
+            return True
+        if "/static/shared/base.css" not in updated:
+            return True
+        if expected_style_href and expected_style_href not in updated:
+            return True
+        if expected_script_src and expected_script_src not in updated:
+            return True
+        if "/static/preview_bridge.js" not in updated:
+            return True
+        if "page-shell" not in updated:
+            return True
+        if role:
+            normalized_links = cls._normalize_role_local_links(updated, role=role, declared_routes=declared_routes)
+            if normalized_links != updated:
+                return True
+        return False
+
+    @staticmethod
+    def _strip_mock_profile_names(content: str) -> str:
         updated = str(content or "")
-        for alias, canonical in CANONICAL_ENDPOINT_ALIASES.items():
-            if alias == canonical:
-                continue
-            updated = re.sub(rf"/api/{alias}(?=[/\"'`?#]|$)", f"/api/{canonical}", updated)
+        updated = updated.replace("Ivan Ivanov", "Complete profile")
+        updated = updated.replace("ivan ivanov", "complete profile")
         return updated
+
+    @classmethod
+    def _normalize_api_aliases_in_text(cls, content: str) -> str:
+        return cls._strip_mock_profile_names(content)
 
     @staticmethod
     def _normalize_local_route_ref(route_ref: str) -> str:
@@ -54,6 +83,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         workspace_id: str,
         draft_run_id: str,
         operations: list[DraftFileOperation],
+        contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
         for file_path in list(operation_map):
@@ -61,6 +91,8 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
                 continue
             content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
             if not content:
+                continue
+            if not self._needs_frontend_api_contract_repair(file_path, content):
                 continue
             updated = self._normalize_api_aliases_in_text(content)
             if file_path.endswith(".html"):
@@ -122,6 +154,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         *,
         page_graph: dict[str, Any],
         operations: list[DraftFileOperation],
+        contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
         page_expectations: dict[str, dict[str, str]] = {}
@@ -162,7 +195,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             script = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, script_path)
             if not html:
                 continue
-            updated = html
+            updated = self._strip_mock_profile_names(html)
             role_match = re.match(r"miniapp/app/static/(client|specialist|manager)/", file_path)
             role = role_match.group(1) if role_match else ""
             asset_meta = page_assets.get(file_path) or {
@@ -171,6 +204,14 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             }
             expected_style_href = self._static_asset_href(asset_meta["style_path"])
             expected_script_src = self._static_asset_href(asset_meta["script_path"])
+            if not self._needs_basic_page_state_contract_repair(
+                html,
+                role=role,
+                declared_routes=role_routes.get(role) or set(),
+                expected_style_href=expected_style_href,
+                expected_script_src=expected_script_src,
+            ):
+                continue
             updated = updated.replace("/static/shell.css", "/static/shared/base.css")
             if "/static/shared/base.css" not in updated:
                 updated = self._inject_head_asset_link(updated, '<link rel="stylesheet" href="/static/shared/base.css" />')

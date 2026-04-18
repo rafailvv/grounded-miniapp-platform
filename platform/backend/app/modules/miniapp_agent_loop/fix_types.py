@@ -38,10 +38,8 @@ class FixPromptContext:
     failing_checks: list[dict[str, Any]] = field(default_factory=list)
     normalized_critical_issues: list[dict[str, Any]] = field(default_factory=list)
     failing_file_paths: list[str] = field(default_factory=list)
-    deterministic_companions: list[str] = field(default_factory=list)
     expected_contract: dict[str, Any] = field(default_factory=dict)
     file_contexts: dict[str, str] = field(default_factory=dict)
     read_only_surfaces: list[str] = field(default_factory=list)
     previous_attempt_summary: str | None = None
     previous_diff_summary: str | None = None
-

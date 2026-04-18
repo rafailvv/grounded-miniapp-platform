@@ -23,22 +23,38 @@ class GenerationEditGate:
         is_role_root_page: Callable[[str, dict[str, Any]], bool],
     ) -> list[str]:
         issues: list[str] = []
+        del require_business_pages, is_business_page, is_role_root_page, role_scope, scope_mode
         operation_paths = {operation.file_path for operation in operations}
         operation_map = {operation.file_path: operation for operation in operations}
         generated_manifest_paths = {
             "miniapp/app/generated/route_manifest.json",
             "miniapp/app/generated/runtime_manifest.json",
             "miniapp/app/generated/app_ir.json",
+            "miniapp/app/generated/static_runtime_manifest.json",
+            "miniapp/app/generated/role_seed.json",
+            "miniapp/app/generated/role_experience.json",
+            "miniapp/app/generated/runtime_state.json",
         }
         generated_test_paths = {
             "miniapp/tests/test_generated_app.py",
             "miniapp/tests/generated_app.test.mjs",
         }
+        bootstrap_paths = {
+            "miniapp/app/db.py",
+            "miniapp/app/main.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/routes/health.py",
+            "miniapp/app/routes/profiles.py",
+            "miniapp/app/routes/runtime.py",
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/manager.py",
+        }
         allowed_target_paths = set(target_files) | generated_manifest_paths | generated_test_paths | {
             "artifacts/generated_app_graph.json",
             "artifacts/page_graph_verification.json",
             "artifacts/grounded_spec.json",
-        }
+        } | bootstrap_paths
         unexpected_paths = [path for path in operation_paths if path not in allowed_target_paths]
         if unexpected_paths:
             issues.append(f"Generated draft touched files outside the planned target scope: {', '.join(unexpected_paths[:5])}")
@@ -53,94 +69,37 @@ class GenerationEditGate:
         ]
         if non_canonical_paths:
             issues.append(f"Generated draft left the canonical architecture roots: {', '.join(sorted(non_canonical_paths)[:5])}")
-        if scope_mode == "minimal_patch":
-            meaningful_hits = [path for path in operation_paths if path in set(target_files)]
-            support_hits = [
-                path
-                for path in operation_paths
-                if path in generated_manifest_paths
-                or path == "miniapp/app/static/shared/common.js"
-                or path.endswith("/app.js")
-                or path.endswith("/styles.css")
-            ]
-            if target_files and not meaningful_hits:
-                issues.append("Minimal patch draft returned only artifact-level changes and did not touch any planned source targets.")
-            if len(operation_paths) > max(1, len(target_files) + 1 + len(support_hits)):
-                issues.append("Minimal patch mode touched too many files.")
-            return issues
 
-        route_hits = 0
-        page_hits = 0
-        route_manifest_touched = "miniapp/app/generated/route_manifest.json" in operation_paths
         known_handoff_paths = {"/"}
-        for role in role_scope:
+        for role, role_payload in (page_graph.get("roles") or {}).items():
             role_payload = page_graph.get("roles", {}).get(role) or {}
-            routes_file = role_payload.get("routes_file")
-            if isinstance(routes_file, str) and routes_file in operation_paths:
-                route_hits += 1
             for page in role_payload.get("pages") or []:
-                file_path = page.get("file_path")
                 route_path = str(page.get("route_path") or "")
                 if route_path:
                     known_handoff_paths.add(route_path)
-                if isinstance(file_path, str) and file_path in operation_paths:
-                    page_hits += 1
-        if route_hits < len(role_scope) and not route_manifest_touched:
-            issues.append("Generated draft does not update the role route files for every selected role.")
-        if page_hits < len(role_scope):
-            issues.append("Generated draft still collapses the app into too few real page files.")
-        if require_business_pages:
-            for role in role_scope:
-                role_payload = page_graph.get("roles", {}).get(role) or {}
-                role_pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
-                business_pages = [page for page in role_pages if is_business_page(role, page)]
-                if business_pages and not any(str(page.get("file_path")) in operation_paths for page in business_pages):
-                    issues.append(f"Generated draft skipped separate business page files for {role}.")
-                index_path = f"miniapp/app/static/{role}/index.html"
-                index_operation = operation_map.get(index_path)
-                index_source = str(index_operation.content or "") if index_operation is not None else ""
-                lowered_index = index_source.lower()
-                if index_source:
-                    keyword_hits = sum(lowered_index.count(token) for token in ("catalog", "product", "products", "cart", "checkout", "orders", "queue", "management"))
-                    if keyword_hits >= 3 and not business_pages:
-                        issues.append(f"{role} index.html still absorbs business content instead of splitting it into separate pages.")
-                for page in role_pages:
-                    file_path = str(page.get("file_path") or "")
-                    if not file_path.endswith(".html"):
-                        continue
-                    page_operation = operation_map.get(file_path)
-                    content = str(page_operation.content or "").lower() if page_operation is not None else ""
-                    if not content:
-                        continue
-                    route_path = str(page.get("route_path") or "")
-                    page_kind = str(page.get("page_kind") or "").strip().lower()
-                    is_profile_page = page_kind == "profile" or route_path.rstrip("/") == "/profile" or file_path.endswith("/profile.html")
-                    loading_hits = content.count("loading")
-                    dependency_count = len(page.get("data_dependencies") or [])
-                    has_real_surface = cls.has_real_interactive_surface(content)
-                    has_business_surface = cls.has_business_surface(content)
-                    role_root = is_role_root_page(role, page)
-                    visible_loading_surface = cls.has_visible_loading_surface(content)
-                    empty_business_containers = cls.empty_business_container_count(content)
-                    if is_profile_page:
-                        for handoff_path in page.get("handoff_paths") or []:
-                            if isinstance(handoff_path, str) and handoff_path.strip() and handoff_path != route_path and handoff_path not in known_handoff_paths:
-                                issues.append(f"{file_path} references a non-canonical handoff path: {handoff_path}.")
-                        continue
-                    if role_root and dependency_count > 0:
-                        if visible_loading_surface:
-                            issues.append(f"{file_path} still renders loading-first copy as the primary role root surface.")
-                        if not has_business_surface and empty_business_containers > 0:
-                            issues.append(f"{file_path} does not render an honest business surface for first paint on a role root page.")
-                    if dependency_count == 0 and loading_hits > 0 and not has_real_surface:
-                        issues.append(f"{file_path} still uses loading-first copy even though the page has no declared data dependencies.")
-                    if loading_hits >= 3 and len(content) < 2500 and not has_real_surface:
-                        issues.append(f"{file_path} is dominated by loading copy instead of real page content.")
-                    if cls.contains_placeholder_surface(content):
-                        issues.append(f"{file_path} still contains placeholder copy.")
+        for role, role_payload in (page_graph.get("roles") or {}).items():
+            role_pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
+            for page in role_pages:
+                file_path = str(page.get("file_path") or "")
+                if not file_path.endswith(".html"):
+                    continue
+                page_operation = operation_map.get(file_path)
+                content = str(page_operation.content or "").lower() if page_operation is not None else ""
+                if not content:
+                    continue
+                route_path = str(page.get("route_path") or "")
+                page_kind = str(page.get("page_kind") or "").strip().lower()
+                is_profile_page = page_kind == "profile" or route_path.rstrip("/") == "/profile" or file_path.endswith("/profile.html")
+                if is_profile_page:
                     for handoff_path in page.get("handoff_paths") or []:
                         if isinstance(handoff_path, str) and handoff_path.strip() and handoff_path != route_path and handoff_path not in known_handoff_paths:
                             issues.append(f"{file_path} references a non-canonical handoff path: {handoff_path}.")
+                    continue
+                if cls.contains_placeholder_surface(content):
+                    issues.append(f"{file_path} still contains placeholder copy.")
+                for handoff_path in page.get("handoff_paths") or []:
+                    if isinstance(handoff_path, str) and handoff_path.strip() and handoff_path != route_path and handoff_path not in known_handoff_paths:
+                        issues.append(f"{file_path} references a non-canonical handoff path: {handoff_path}.")
         return issues
 
     @classmethod

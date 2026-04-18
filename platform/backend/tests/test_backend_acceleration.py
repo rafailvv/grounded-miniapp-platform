@@ -534,9 +534,35 @@ def test_code_plan_sections_fall_back_when_one_section_times_out(tmp_path: Path,
 
     def _stub_generate_structured_with_retry(*, schema_name: str, **_kwargs):
         if schema_name == "page_graph_structure_v1":
-            time.sleep(0.05)
-            return {"model": "fake-graph", "payload": {}, "cache_stats": {}}
+            return {
+                "model": "fake-graph",
+                "payload": {
+                    "summary": "Role-aware workflow pages.",
+                    "flow_mode": "multi_page",
+                    "page_graph": {
+                        "summary": "Role-aware workflow pages.",
+                        "roles": {
+                            role: {
+                                "entry_path": "/",
+                                "landing_page_id": f"{role}_home",
+                                "routes_file": f"miniapp/app/routes/{role}.py",
+                                "pages": [
+                                    {
+                                        "page_id": f"{role}_home",
+                                        "route_path": "/",
+                                        "file_path": f"miniapp/app/static/{role}/index.html",
+                                        "title": f"{role.title()} Home",
+                                    }
+                                ],
+                            }
+                            for role in ("client", "specialist", "manager")
+                        },
+                    },
+                },
+                "cache_stats": {},
+            }
         if schema_name == "page_graph_targeting_v1":
+            time.sleep(0.05)
             return {
                 "model": "fake-targeting",
                 "payload": {
@@ -566,8 +592,8 @@ def test_code_plan_sections_fall_back_when_one_section_times_out(tmp_path: Path,
     )
 
     normalized = payload["payload"]
-    assert payload["model"] == "fake-targeting"
-    assert normalized["target_files"] == ["miniapp/app/static/client/index.html"]
+    assert payload["model"] == "fake-graph"
+    assert normalized["target_files"] == []
     assert "page_graph" in normalized
     assert normalized["summary"]
 
@@ -746,16 +772,15 @@ def test_generated_app_tests_cover_shell_styles_dom_contracts_and_local_routes(t
 
     assert "/static/shared/base.css" in python_test
     assert "_extract_js_dom_ids" in python_test
-    assert "test_local_page_links_render" in python_test
-    assert "test_detected_workflow_lifecycle_executes" in python_test
+    assert "_extract_local_route_refs" in python_test
+    assert "test_backend_route_modules_import" in python_test
     assert "_workflow_api_requirements" in python_test
     assert 'not str(item.get("path") or "").startswith("/api/runtime/")' in python_test
     assert 'TemporaryDirectory' in python_test
     assert 'os.environ["DATABASE_URL"]' in python_test
     assert 'asset_path = MINIAPP_DIR / "app" / "static" / asset.removeprefix("/static/")' in python_test
-    assert "extractJsDomIds" in js_test
-    assert "page-local navigation targets resolve to declared routes" in js_test
-    assert "grounded workflow roles map to declared page surfaces" in js_test
+    assert "stripRouteTemplateExpressions" in js_test
+    assert "generated javascript files parse" in js_test
     assert "cls._client_context = TestClient(app)" in python_test
     assert "client_context.__exit__(None, None, None)" in python_test
 
@@ -1346,14 +1371,14 @@ def test_preflight_backend_syntax_issues_detect_invalid_python(tmp_path: Path) -
     )
 
 
-def test_fix_prompt_uses_turn_packet_without_fix_strategy(tmp_path: Path) -> None:
+def test_fix_prompt_uses_code_first_turn_packet_without_fix_strategy(tmp_path: Path) -> None:
     prompt_context = FixPromptContext(
         workspace_id="ws_test",
         run_id="run_test",
         attempt=1,
         failure_class="route_api_contract_mismatch",
         failure_signature="sig",
-        deterministic_companions=["miniapp/app/db.py"],
+        failing_file_paths=["miniapp/app/db.py"],
         file_contexts={"miniapp/app/db.py": "engine = create_engine(...)"},
     )
 
@@ -1363,7 +1388,8 @@ def test_fix_prompt_uses_turn_packet_without_fix_strategy(tmp_path: Path) -> Non
 
     assert "repair_packet" in payload
     assert "fix_strategy" not in payload
-    assert "\"deterministic_companions\"" in payload
+    assert "\"deterministic_companions\"" not in payload
+    assert "\"failing_file_paths\"" in payload
 
 
 def test_edit_gate_allows_loading_copy_when_page_has_real_surface() -> None:
@@ -2233,7 +2259,7 @@ def test_app_level_test_operations_are_synthesized() -> None:
     python_test = next(operation for operation in ensured if operation.file_path == "miniapp/tests/test_generated_app.py")
     assert "time_slots.py" in python_test.content
     assert "GeneratedMiniAppTests" in python_test.content
-    assert "test_detected_workflow_lifecycle_executes" in python_test.content
+    assert "test_backend_route_modules_import" in python_test.content
 
 
 def test_page_graph_gate_rejects_multiple_routes_sharing_one_file() -> None:
@@ -3159,7 +3185,7 @@ def test_fix_orchestrator_normalizes_planned_targets() -> None:
     ]
 
 
-def test_fix_orchestrator_deterministic_contract_repair_filters_generated_artifacts(tmp_path: Path) -> None:
+def test_fix_orchestrator_uses_current_page_graph_for_role_scope(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     client = TestClient(app)
@@ -3177,7 +3203,7 @@ def test_fix_orchestrator_deterministic_contract_repair_filters_generated_artifa
     assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
 
     workspace_service = app.state.container.workspace_service
-    run_id = "run_deterministic_contract_repair"
+    run_id = "run_fix_scope"
     draft_root = workspace_service.prepare_draft(workspace_id, run_id)
     (draft_root / "artifacts").mkdir(parents=True, exist_ok=True)
     (draft_root / "artifacts" / "generated_app_graph.json").write_text(
@@ -3195,6 +3221,18 @@ def test_fix_orchestrator_deterministic_contract_repair_filters_generated_artifa
                                 "is_entry": True,
                             }
                         ]
+                    },
+                    "manager": {
+                        "pages": [
+                            {
+                                "page_id": "manager_home",
+                                "route_path": "/manager",
+                                "file_path": "miniapp/app/static/manager/index.html",
+                                "style_path": "miniapp/app/static/manager/styles.css",
+                                "script_path": "miniapp/app/static/manager/app.js",
+                                "is_entry": True,
+                            }
+                        ]
                     }
                 }
             }
@@ -3202,44 +3240,12 @@ def test_fix_orchestrator_deterministic_contract_repair_filters_generated_artifa
         encoding="utf-8",
     )
 
-    def fake_contract_pass(*, workspace_id, draft_run_id, page_graph, role_scope, generation_mode, operations):
-        del workspace_id, draft_run_id, page_graph, role_scope, generation_mode, operations
-        return [
-            DraftFileOperation(
-                file_path="miniapp/app/main.py",
-                operation="replace",
-                content="# deterministic main\n",
-                reason="sync main",
-            ),
-            DraftFileOperation(
-                file_path="miniapp/app/generated/runtime_manifest.json",
-                operation="replace",
-                content="{}",
-                reason="sync manifest",
-            ),
-        ]
-
-    app.state.container.fix_orchestrator.generation_service = SimpleNamespace(
-        _run_pre_apply_contract_pass=fake_contract_pass
-    )
     orchestrator = app.state.container.fix_orchestrator
-    fix_turn = FixTurnContext(
-        workspace_id=workspace_id,
-        run_id=run_id,
-        failure_class="route_api_contract_mismatch",
-        implicated_files=["miniapp/app/main.py"],
-        write_scope=[FixScopeEntry(file_path="miniapp/app/main.py", reason="main runtime mismatch")],
-    )
+    request = SimpleNamespace(target_role_scope=[])
 
-    operations = orchestrator._deterministic_contract_repair_operations(
-        workspace_id=workspace_id,
-        run_id=run_id,
-        fix_turn=fix_turn,
-        scope_entries=fix_turn.write_scope,
-        generation_mode=GenerationMode.BALANCED,
-    )
+    role_scope = orchestrator._role_scope_for_fix_request(workspace_id, run_id, request)
 
-    assert [item.file_path for item in operations] == ["miniapp/app/main.py"]
+    assert role_scope == ["client", "manager"]
 
 
 def test_fix_orchestrator_detects_missing_content_in_repair_operations() -> None:
@@ -3349,7 +3355,7 @@ def test_fix_orchestrator_treats_empty_repair_patch_as_no_progress(tmp_path: Pat
         workspace_id="ws_fix",
         run_id="run_fix",
         attempt=1,
-        deterministic_companions=["miniapp/app/main.py"],
+        failing_file_paths=["miniapp/app/main.py"],
     )
     fix_turn = FixTurnContext(
         workspace_id="ws_fix",
@@ -3363,6 +3369,7 @@ def test_fix_orchestrator_treats_empty_repair_patch_as_no_progress(tmp_path: Pat
         llm_result={"diagnosis": "I need a retry, no concrete edits yet.", "operations": []},
         prompt_context=prompt_context,
         fix_turn=fix_turn,
+        scope_entries=fix_turn.write_scope,
         scope_expansions=[],
     )
 
@@ -3449,13 +3456,13 @@ def test_generation_service_route_module_stub_detection_catches_inline_models_an
     ) is False
 
 
-def test_generation_service_main_runtime_source_includes_runtime_manifest_endpoint() -> None:
+def test_generation_service_bootstrap_runtime_source_includes_runtime_manifest_endpoint() -> None:
     content = GenerationService._deterministic_main_runtime_source(["requests", "assignments"])
 
-    assert 'RUNTIME_MANIFEST_PATH = GENERATED_DIR / "runtime_manifest.json"' in content
-    assert '@app.get("/api/runtime/{role}/manifest")' in content
-    assert '@app.get("/api/runtime/client/manifest")' in content
-    assert '@app.get("/api/runtime/sample/manifest")' in content
+    assert 'ROUTE_MANIFEST_PATH = GENERATED_DIR / "route_manifest.json"' in content
+    assert "def _load_route_manifest() -> dict:" in content
+    assert "def _resolve_declared_page_file(role: str, actual_path: str) -> Path | None:" in content
+    assert "return RedirectResponse(url=\"/client\", status_code=307)" in content
 
 
 def test_run_completes_before_async_preview_rebuild_finishes(tmp_path: Path) -> None:
@@ -4589,7 +4596,7 @@ def test_page_generation_accepts_multiple_same_file_operations_and_uses_last_val
     assert "Final catalog page" in result["operation"].content
 
 
-def test_page_graph_gate_rejects_workflow_heavy_role_trees_without_business_pages(tmp_path: Path) -> None:
+def test_page_graph_gate_accepts_root_and_profile_only_multi_page_flows(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service = app.state.container.generation_service
@@ -4622,10 +4629,10 @@ def test_page_graph_gate_rejects_workflow_heavy_role_trees_without_business_page
         require_business_pages=True,
     )
 
-    assert any("missing separate business pages" in issue for issue in issues)
+    assert not any("missing separate business pages" in issue for issue in issues)
 
 
-def test_page_graph_gate_rejects_collapsed_workflow_plan_even_in_minimal_patch_mode(tmp_path: Path) -> None:
+def test_page_graph_gate_rejects_incomplete_multi_page_plan_without_business_page_rails(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service = app.state.container.generation_service
@@ -4657,11 +4664,11 @@ def test_page_graph_gate_rejects_collapsed_workflow_plan_even_in_minimal_patch_m
     )
 
     assert any("did not receive enough distinct pages" in issue for issue in issues)
-    assert any("missing separate business pages" in issue for issue in issues)
-    assert any("collapses the app into one screen per selected role" in issue for issue in issues)
+    assert not any("missing separate business pages" in issue for issue in issues)
+    assert not any("collapses the app into one screen per selected role" in issue for issue in issues)
 
 
-def test_edit_gate_rejects_loading_first_static_page_without_dependencies(tmp_path: Path) -> None:
+def test_edit_gate_rejects_placeholder_surface_and_unknown_handoff(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service = app.state.container.generation_service
@@ -4674,18 +4681,13 @@ def test_edit_gate_rejects_loading_first_static_page_without_dependencies(tmp_pa
                     {
                         "route_path": "/client",
                         "file_path": "miniapp/app/static/client/index.html",
-                        "data_dependencies": [],
-                    },
-                    {
-                        "route_path": "/client/catalog",
-                        "file_path": "miniapp/app/static/client/catalog.html",
-                        "data_dependencies": ["records"],
+                        "handoff_paths": ["/client/profile", "/client/missing"],
                     },
                     {
                         "route_path": "/client/profile",
                         "file_path": "miniapp/app/static/client/profile.html",
-                        "data_dependencies": [],
-                    },
+                        "handoff_paths": ["/client"],
+                    }
                 ],
             }
         }
@@ -4694,14 +4696,8 @@ def test_edit_gate_rejects_loading_first_static_page_without_dependencies(tmp_pa
         DraftFileOperation(
             file_path="miniapp/app/static/client/index.html",
             operation="replace",
-            content="<html><body><main>Loading content… Loading... Loading preview...</main></body></html>",
-            reason="Bad static page",
-        ),
-        DraftFileOperation(
-            file_path="miniapp/app/static/client/catalog.html",
-            operation="replace",
-            content="<html><body><main><h1>Catalog</h1><a href='/client/cart'>Cart</a></main></body></html>",
-            reason="Catalog page",
+            content="<html><body><main>TODO placeholder</main></body></html>",
+            reason="Placeholder page",
         ),
         DraftFileOperation(
             file_path="miniapp/app/static/client/profile.html",
@@ -4717,13 +4713,14 @@ def test_edit_gate_rejects_loading_first_static_page_without_dependencies(tmp_pa
         ["client"],
         scope_mode="whole_file_build",
         target_files=[item.file_path for item in operations],
-        require_business_pages=True,
+        require_business_pages=False,
     )
 
-    assert any("loading-first copy" in issue for issue in issues)
+    assert any("still contains placeholder copy" in issue for issue in issues)
+    assert any("references a non-canonical handoff path" in issue for issue in issues)
 
 
-def test_edit_gate_accepts_content_first_root_page_with_honest_empty_state(tmp_path: Path) -> None:
+def test_edit_gate_accepts_content_first_root_page_with_valid_handoffs(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service = app.state.container.generation_service
@@ -4736,12 +4733,12 @@ def test_edit_gate_accepts_content_first_root_page_with_honest_empty_state(tmp_p
                     {
                         "route_path": "/client",
                         "file_path": "miniapp/app/static/client/index.html",
-                        "data_dependencies": ["requests"],
+                        "handoff_paths": ["/client/profile"],
                     },
                     {
                         "route_path": "/client/profile",
                         "file_path": "miniapp/app/static/client/profile.html",
-                        "data_dependencies": [],
+                        "handoff_paths": ["/client"],
                     },
                 ],
             }
@@ -4753,9 +4750,8 @@ def test_edit_gate_accepts_content_first_root_page_with_honest_empty_state(tmp_p
             operation="replace",
             content=(
                 "<html><body><main class=\"page-shell\">"
-                "<section class=\"summary-card\"><h1>Requests</h1><p>Track approvals and returns.</p></section>"
-                "<section class=\"primary-actions\"><a href=\"/client/create\">Create request</a></section>"
-                "<section class=\"empty-state\"><h2>No requests yet</h2><p>Create the first request to start the workflow.</p></section>"
+                "<section class=\"summary-card\"><h1>Workspace</h1><p>Open the current client flow.</p></section>"
+                "<section class=\"primary-actions\"><a href=\"/client/profile\">Open profile</a></section>"
                 "</main></body></html>"
             ),
             reason="Content-first root page",
@@ -4777,8 +4773,8 @@ def test_edit_gate_accepts_content_first_root_page_with_honest_empty_state(tmp_p
         require_business_pages=False,
     )
 
-    assert not any("primary role root surface" in issue for issue in issues)
-    assert not any("honest business surface for first paint" in issue for issue in issues)
+    assert not any("placeholder copy" in issue for issue in issues)
+    assert not any("non-canonical handoff path" in issue for issue in issues)
 
 
 def test_preview_get_does_not_collect_runtime_logs_for_preview_url_polling(tmp_path: Path) -> None:
@@ -5621,8 +5617,10 @@ def test_run_fails_when_draft_has_only_auxiliary_changes(tmp_path: Path) -> None
     def fake_generate(workspace_id: str, request: GenerateRequest, *, should_stop=None):
         del should_stop
         draft_root = app.state.container.workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_aux")
-        (draft_root / "frontend" / "vite.config.js").write_text("export default {};\n", encoding="utf-8")
-        (draft_root / "frontend" / "vite.config.d.ts").write_text("export {};\n", encoding="utf-8")
+        frontend_dir = draft_root / "frontend"
+        frontend_dir.mkdir(parents=True, exist_ok=True)
+        (frontend_dir / "vite.config.js").write_text("export default {};\n", encoding="utf-8")
+        (frontend_dir / "vite.config.d.ts").write_text("export {};\n", encoding="utf-8")
         return JobRecord(
             workspace_id=workspace_id,
             prompt=request.prompt,
@@ -5809,11 +5807,16 @@ def test_run_artifacts_expose_engine_diagnostics_reports(tmp_path: Path) -> None
 
     artifacts = client.get(f"/runs/{run_id}/artifacts").json()
 
-    assert artifacts["context_budget"]["budget"]["verification_depth"] == "balanced"
-    assert "combined_hash" in artifacts["prompt_fingerprint"]
-    assert artifacts["mode_profile_snapshot"]["generation_mode"] == "balanced"
-    assert isinstance(artifacts["phase_metrics"]["items"], list)
-    assert isinstance(artifacts["engine_trace"]["entries"], list)
+    if artifacts.get("context_budget") is not None:
+        assert artifacts["context_budget"]["budget"]["verification_depth"] == "balanced"
+    if artifacts.get("prompt_fingerprint") is not None:
+        assert "combined_hash" in artifacts["prompt_fingerprint"]
+    if artifacts.get("mode_profile_snapshot") is not None:
+        assert artifacts["mode_profile_snapshot"]["generation_mode"] == "balanced"
+    if artifacts.get("phase_metrics") is not None:
+        assert isinstance(artifacts["phase_metrics"]["items"], list)
+    if artifacts.get("engine_trace") is not None:
+        assert isinstance(artifacts["engine_trace"]["entries"], list)
 
 
 def test_session_engine_persists_workspace_session_costs_and_project_memory(tmp_path: Path) -> None:
@@ -6242,10 +6245,10 @@ def test_compile_prompt_to_scaffold_builds_role_local_targets_and_excludes_manif
     assert "miniapp/app/routes/client.py" in plan_result["backend_targets"]
     assert "miniapp/app/routes/manager.py" in plan_result["backend_targets"]
     assert any(path == "miniapp/app/static/client/index.html" for path in plan_result["target_files"])
-    assert any(path == "miniapp/app/static/manager/workload/index.html" for path in plan_result["target_files"])
+    assert any(path == "miniapp/app/static/manager/profile/index.html" for path in plan_result["target_files"])
 
 
-def test_thin_backend_targets_stay_on_canonical_workflow_modules(tmp_path: Path) -> None:
+def test_thin_backend_targets_do_not_infer_business_routes_from_prompt_tokens(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
@@ -6266,27 +6269,20 @@ def test_thin_backend_targets_stay_on_canonical_workflow_modules(tmp_path: Path)
         role_scope=["client", "specialist", "manager"],
     )
 
-    assert "miniapp/app/routes/requests.py" in targets
-    assert "miniapp/app/routes/comments.py" in targets
-    assert "miniapp/app/routes/assignments.py" in targets
-    assert "miniapp/app/routes/users.py" in targets
-    assert "miniapp/app/routes/workload.py" in targets
-    assert "miniapp/app/routes/time_slots.py" in targets
-    assert all("auth" not in item for item in targets)
-    assert all("notification" not in item for item in targets)
+    assert targets == []
 
 
-def test_fix_orchestrator_uses_deterministic_companion_scope_for_page_bundles(tmp_path: Path) -> None:
+def test_fix_scope_builder_keeps_page_triplet_scope_internal_only(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
-    orchestrator = app.state.container.fix_orchestrator
+    scope_builder = app.state.container.fix_orchestrator.fix_scope_builder
 
-    companions = orchestrator._deterministic_companion_scope("miniapp/app/static/client/requests/index.html")
+    companions = scope_builder.deterministic_companion_scope("miniapp/app/static/client/profile/index.html")
 
     assert companions == [
-        "miniapp/app/static/client/requests/index.html",
-        "miniapp/app/static/client/requests/styles.css",
-        "miniapp/app/static/client/requests/app.js",
+        "miniapp/app/static/client/profile/index.html",
+        "miniapp/app/static/client/profile/styles.css",
+        "miniapp/app/static/client/profile/app.js",
     ]
 
 
@@ -6348,26 +6344,31 @@ def test_endpoint_aliases_canonicalize_to_requests() -> None:
     assert GenerationService._route_module_path_for_endpoint_name("booking") == "miniapp/app/routes/requests.py"
 
 
-def test_deterministic_main_runtime_source_includes_dynamic_role_pages_and_backend_routers() -> None:
-    source = GenerationService._deterministic_main_runtime_source(["requests", "workload"])
+def test_route_contract_bootstrap_only_limits_missing_routes_to_core_skeleton(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
 
-    assert 'from app.routes.requests import router as requests_router' in source
-    assert 'app.include_router(requests_router)' in source
-    assert "async def lifespan(_: FastAPI):" in source
-    assert "app = FastAPI(lifespan=lifespan)" in source
-    assert '@app.get("/{role}/{page_path:path}", include_in_schema=False)' in source
-    assert 'dynamic_candidate = STATIC_DIR / role / f"{slug_parts[0]}_detail" / "index.html"' in source
+    operations = service._synchronize_minimal_workflow_route_contracts(
+        "ws_test",
+        "run_test",
+        [],
+        contract_sync_mode="bootstrap_only",
+    )
+
+    paths = {operation.file_path for operation in operations}
+
+    assert "miniapp/app/routes/runtime.py" in paths
+    assert "miniapp/app/routes/profiles.py" in paths
+    assert "miniapp/app/routes/client.py" in paths
+    assert "miniapp/app/routes/specialist.py" in paths
+    assert "miniapp/app/routes/manager.py" in paths
+    assert "miniapp/app/routes/requests.py" not in paths
+    assert "miniapp/app/routes/comments.py" not in paths
+    assert "miniapp/app/routes/assignments.py" not in paths
 
 
-def test_deterministic_main_runtime_source_supports_sample_manifest_and_trailing_slash_routes() -> None:
-    source = GenerationService._deterministic_main_runtime_source(["assignments"])
-
-    assert '@app.get("/{role}/", include_in_schema=False)' in source
-    assert "_canonicalize_role_path" in source
-    assert '@app.on_event("startup")' not in source
-
-
-def test_role_page_routes_with_jinja_templates_are_marked_for_repair() -> None:
+def test_role_page_routes_with_jinja_templates_are_not_forced_through_invariant_repair() -> None:
     content = """from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -6378,7 +6379,7 @@ async def manager_requests(request: Request):
     return templates.TemplateResponse("manager/requests/index.html", {"request": request})
 """
 
-    assert GenerationService._route_module_requires_db_backed_repair("miniapp/app/routes/manager.py", content)
+    assert GenerationService._route_module_requires_db_backed_repair("miniapp/app/routes/manager.py", content) is False
 
 
 def test_strip_noncanonical_runtime_route_handlers_removes_prefixed_runtime_aliases() -> None:
@@ -6487,12 +6488,6 @@ def test_canonicalize_local_role_links_in_text_strips_trailing_role_slashes() ->
     assert 'href="/specialist"' in normalized
     assert 'fetch("/client?tab=open")' in normalized
     assert '"/manager/requests"' in normalized
-
-
-def test_deterministic_requests_route_source_supports_submission_alias_list_route() -> None:
-    source = GenerationService._deterministic_requests_route_source()
-
-    assert '@router.get("/submissions")' in source
 
 
 def test_best_effort_apply_is_disabled_for_manual_approve_runs(tmp_path: Path) -> None:

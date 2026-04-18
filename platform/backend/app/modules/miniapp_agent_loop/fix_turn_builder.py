@@ -90,7 +90,6 @@ class FixTurnBuilder:
         context_mode: str,
         collect_file_contexts,
         merge_additional_context_paths,
-        deterministic_contract_seed_paths,
         current_diff_summary,
         additional_paths: list[str] | None = None,
     ) -> FixPromptContext:
@@ -105,8 +104,6 @@ class FixTurnBuilder:
             full_files=full_files,
         )
         extra_paths = list(additional_paths or [])
-        if context_mode == "full_bundle":
-            extra_paths.extend(deterministic_contract_seed_paths(workspace_id, run_id, fix_turn, scope_entries))
         if extra_paths:
             file_contexts = merge_additional_context_paths(
                 workspace_id,
@@ -139,7 +136,6 @@ class FixTurnBuilder:
                 failure_class=fix_turn.failure_class,
             ),
             failing_file_paths=list(fix_turn.implicated_files),
-            deterministic_companions=[entry.file_path for entry in scope_entries],
             expected_contract=self.prompt_builder.expected_contract_snapshot(fix_turn),
             file_contexts=file_contexts,
             read_only_surfaces=self.prompt_builder.read_only_surfaces(),

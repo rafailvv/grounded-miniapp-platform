@@ -152,7 +152,7 @@ class GroundedSpecOrchestrationRuntime(MiniappGenerationRuntimeOwner):
     ) -> dict[str, Any]:
         return self.service.grounded_spec_builder.resolve_grounded_spec_fast(
             timeout_seconds=float(self.service.GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS),
-            resolve_grounded_spec_fast_with_timeout=self._resolve_grounded_spec_fast_with_timeout,
+            resolve_grounded_spec_fast_with_timeout=self.service._resolve_grounded_spec_fast_with_timeout,
             workspace_id=workspace_id,
             prompt=prompt,
             doc_refs=doc_refs,
@@ -173,7 +173,7 @@ class GroundedSpecOrchestrationRuntime(MiniappGenerationRuntimeOwner):
         return self.service.grounded_spec_builder.resolve_grounded_spec_fast_with_timeout(
             timeout_seconds=timeout_seconds,
             submit_with_context=self.service._submit_with_context,
-            resolve_grounded_spec_fast_inner=self._resolve_grounded_spec_fast_inner,
+            resolve_grounded_spec_fast_inner=self.service._resolve_grounded_spec_fast_inner,
             **kwargs,
         )
 

@@ -27,31 +27,39 @@ class MiniappRuntimeContractSync:
         workspace_id: str,
         draft_run_id: str,
         operations: list[DraftFileOperation],
+        contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
+        if contract_sync_mode == "bootstrap_only":
+            return operations
         ensured = self.synchronize_db_session_contract(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
             operations=operations,
+            contract_sync_mode=contract_sync_mode,
         )
         ensured = self.synchronize_runtime_route_contract(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
             operations=ensured,
+            contract_sync_mode=contract_sync_mode,
         )
         ensured = self.synchronize_main_runtime_contract(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
             operations=ensured,
+            contract_sync_mode=contract_sync_mode,
         )
         ensured = self.synchronize_backend_dependency_contract(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
             operations=ensured,
+            contract_sync_mode=contract_sync_mode,
         )
         ensured = self.synchronize_frontend_navigation_contract(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
             operations=ensured,
+            contract_sync_mode=contract_sync_mode,
         )
         return ensured
 
@@ -61,7 +69,10 @@ class MiniappRuntimeContractSync:
         workspace_id: str,
         draft_run_id: str,
         operations: list[DraftFileOperation],
+        contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
+        if contract_sync_mode != "repair_invariants":
+            return operations
         operation_map = {operation.file_path: operation for operation in operations}
         db_path = "miniapp/app/db.py"
         db_content = self.read_content(workspace_id, draft_run_id, operation_map, db_path)
@@ -96,7 +107,10 @@ class MiniappRuntimeContractSync:
         workspace_id: str,
         draft_run_id: str,
         operations: list[DraftFileOperation],
+        contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
+        if contract_sync_mode != "repair_invariants":
+            return operations
         operation_map = {operation.file_path: operation for operation in operations}
         for file_path in list(operation_map):
             if not (file_path.startswith("miniapp/app/routes/") and file_path.endswith(".py")):
@@ -125,7 +139,10 @@ class MiniappRuntimeContractSync:
         workspace_id: str,
         draft_run_id: str,
         operations: list[DraftFileOperation],
+        contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
+        if contract_sync_mode != "repair_invariants":
+            return operations
         operation_map = {operation.file_path: operation for operation in operations}
         main_path = "miniapp/app/main.py"
         current_main = self.read_content(workspace_id, draft_run_id, operation_map, main_path)
@@ -144,6 +161,16 @@ class MiniappRuntimeContractSync:
             stem = Path(file_path).stem
             if stem not in {"__init__", "health", "profiles"}:
                 route_modules.add(stem)
+        normalized_main = str(current_main or "").strip()
+        required_markers = ("app = FastAPI", 'app.mount("/static"', "app.include_router(health_router)", "app.include_router(profiles_router)")
+        missing_core_markers = any(marker not in normalized_main for marker in required_markers)
+        missing_route_bindings = any(
+            f"from app.routes.{module} import router as {module}_router" not in normalized_main
+            or f"app.include_router({module}_router)" not in normalized_main
+            for module in sorted(route_modules)
+        )
+        if not missing_core_markers and not missing_route_bindings:
+            return operations
         desired = self.deterministic_main_runtime_source(sorted(route_modules))
         if desired == current_main:
             return operations
@@ -161,13 +188,28 @@ class MiniappRuntimeContractSync:
         workspace_id: str,
         draft_run_id: str,
         operations: list[DraftFileOperation],
+        contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
+        if contract_sync_mode != "repair_invariants":
+            return operations
         operation_map = {operation.file_path: operation for operation in operations}
         for file_path in list(operation_map):
             if not (file_path.startswith("miniapp/app/routes/") and file_path.endswith(".py")):
                 continue
             content = self.read_content(workspace_id, draft_run_id, operation_map, file_path)
             if not content:
+                continue
+            if "Depends(" in content and "from fastapi import" in content:
+                updated = self.ensure_fastapi_import_symbol(content, "Depends")
+                if updated != content:
+                    operation_map[file_path] = DraftFileOperation(
+                        file_path=file_path,
+                        operation="replace",
+                        content=updated,
+                        reason="Pre-apply contract sync: ensure route modules import Depends when dependency injection is used.",
+                    )
+                    content = updated
+            if "Depends(lambda: get_actor_context())" not in content:
                 continue
             updated = re.sub(
                 r"Depends\(\s*lambda:\s*get_actor_context\(\)\s*\)",
@@ -192,7 +234,10 @@ class MiniappRuntimeContractSync:
         workspace_id: str,
         draft_run_id: str,
         operations: list[DraftFileOperation],
+        contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
+        if contract_sync_mode != "repair_invariants":
+            return operations
         operation_map = {operation.file_path: operation for operation in operations}
         for file_path in list(operation_map):
             if not (
@@ -202,6 +247,8 @@ class MiniappRuntimeContractSync:
                 continue
             content = self.read_content(workspace_id, draft_run_id, operation_map, file_path)
             if not content:
+                continue
+            if not re.search(r'["\'`](?:/(?:client|specialist|manager)/[^"\'`]*[{}:]|/(?:client|specialist|manager)[^"\'`]*/)', content):
                 continue
             updated = self.canonicalize_local_role_links_in_text(content)
             if updated == content:

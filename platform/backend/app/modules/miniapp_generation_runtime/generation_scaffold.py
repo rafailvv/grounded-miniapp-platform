@@ -7,6 +7,20 @@ from typing import Any
 from app.models.grounded_spec import GroundedSpecModel
 
 
+ROLE_ROOT_RESPONSIBILITIES = {
+    "client": "Own the end-user workspace and complete the primary journey.",
+    "specialist": "Own the specialist workspace and act on shared DB-backed state.",
+    "manager": "Own the oversight workspace and coordinate shared DB-backed state.",
+}
+
+MINIMAL_BOOTSTRAP_TARGETS = (
+    "miniapp/app/main.py",
+    "miniapp/app/db.py",
+    "miniapp/app/schemas.py",
+    "miniapp/app/routes/profiles.py",
+    "miniapp/app/routes/runtime.py",
+)
+
 def select_creative_direction(prompt: str) -> dict[str, Any]:
     strategies = [
         {
@@ -96,9 +110,6 @@ def compile_prompt_to_scaffold(
     grounded_spec: GroundedSpecModel,
     role_scope: list[str],
     workspace_tree: list[dict[str, str]],
-    thin_core_backend_targets: tuple[str, ...],
-    thin_optional_route_targets: dict[str, str],
-    thin_role_page_blueprints: dict[str, tuple[dict[str, str], ...]],
     design_reference_files: tuple[str, ...],
     default_page_file,
     default_page_asset_path,
@@ -113,20 +124,12 @@ def compile_prompt_to_scaffold(
     page_graph_roles: dict[str, dict[str, Any]] = {}
     role_contract_roles: dict[str, dict[str, Any]] = {}
     target_files: list[str] = []
-    backend_targets = list(thin_core_backend_targets)
-    inferred_route_targets = thin_backend_targets_from_spec(
-        prompt=prompt,
-        grounded_spec=grounded_spec,
-        role_scope=role_scope,
-        thin_optional_route_targets=thin_optional_route_targets,
-    )
-    backend_targets.extend(inferred_route_targets)
+    backend_targets = list(MINIMAL_BOOTSTRAP_TARGETS)
     for role in role_scope:
         pages = thin_role_pages_for_role(
             role=role,
             prompt=prompt,
             grounded_spec=grounded_spec,
-            thin_role_page_blueprints=thin_role_page_blueprints,
             default_page_file=default_page_file,
             default_page_asset_path=default_page_asset_path,
             default_handoff_paths_for_page_kind=default_handoff_paths_for_page_kind,
@@ -162,22 +165,23 @@ def compile_prompt_to_scaffold(
         target_files=target_files,
         generation_clusters=generation_clusters,
     )
+    flow_mode = "multi_page" if any(len((page_graph_roles.get(role) or {}).get("pages") or []) > 1 for role in role_scope) else "single_page"
     return (
         {"roles": role_contract_roles, "source": "thin_loop"},
         {
-            "page_graph": {"roles": page_graph_roles, "backend_targets": backend_targets, "flow_mode": "multi_page"},
+            "page_graph": {"roles": page_graph_roles, "backend_targets": backend_targets, "flow_mode": flow_mode},
             "scope_mode": "whole_file_build",
             "write_strategy": "whole_file_build",
-            "strategy_reason": "Thin scaffold-driven generation pipeline.",
-            "flow_mode": "multi_page",
+            "strategy_reason": "Minimal bootstrap scaffold compiled from grounded spec when prompt-driven planning is incomplete.",
+            "flow_mode": flow_mode,
             "files_to_read": files_to_read,
             "target_files": target_files,
             "shared_files": shared_files,
             "backend_targets": backend_targets,
             "execution_plan": execution_plan,
             "generation_clusters": generation_clusters,
-            "require_multi_page": True,
-            "require_business_pages": True,
+            "require_multi_page": flow_mode == "multi_page",
+            "require_business_pages": False,
         },
     )
 
@@ -187,29 +191,18 @@ def thin_role_pages_for_role(
     role: str,
     prompt: str,
     grounded_spec: GroundedSpecModel,
-    thin_role_page_blueprints: dict[str, tuple[dict[str, str], ...]],
     default_page_file,
     default_page_asset_path,
     default_handoff_paths_for_page_kind,
 ) -> list[dict[str, Any]]:
+    route_specs = _derive_role_route_specs(role=role, prompt=prompt, grounded_spec=grounded_spec)
+    all_routes = [spec["route_path"] for spec in route_specs]
     pages: list[dict[str, Any]] = []
-    include_create = role == "client"
-    include_workload = role == "manager"
-    include_requests = True
-    include_detail = True
-    if mentions_schedule_or_time(prompt, grounded_spec):
-        include_create = True
-    for blueprint in thin_role_page_blueprints.get(role, ()):
-        route_path = str(blueprint["route_path"])
-        if route_path == "/create" and not include_create:
-            continue
-        if route_path == "/workload" and not include_workload:
-            continue
-        if route_path == "/requests" and not include_requests:
-            continue
-        if route_path == "/requests/:requestId" and not include_detail:
-            continue
-        file_path = default_page_file(role, f"{role}_{blueprint['title']}", route_path=route_path)
+    for spec in route_specs:
+        route_path = str(spec["route_path"])
+        title = str(spec["title"])
+        page_kind = str(spec["page_kind"])
+        file_path = default_page_file(role, f"{role}_{title}", route_path=route_path)
         pages.append(
             {
                 "page_id": f"{role}_{thin_page_slug_for_route(route_path)}",
@@ -217,14 +210,18 @@ def thin_role_pages_for_role(
                 "file_path": file_path,
                 "style_path": default_page_asset_path(file_path, asset_kind="css"),
                 "script_path": default_page_asset_path(file_path, asset_kind="js"),
-                "page_kind": blueprint["page_kind"],
-                "navigation_label": blueprint["navigation_label"],
-                "title": blueprint["title"],
+                "page_kind": page_kind,
+                "navigation_label": str(spec["navigation_label"]),
+                "title": title,
                 "is_entry": route_path == "/",
-                "handoff_paths": default_handoff_paths_for_page_kind(
-                    str(blueprint["page_kind"]),
+                "handoff_paths": _handoff_paths_for_route(
                     route_path=route_path,
+                    all_routes=all_routes,
+                    default_handoff_paths_for_page_kind=default_handoff_paths_for_page_kind,
+                    page_kind=page_kind,
                 ),
+                "purpose": str(spec["purpose"]),
+                "data_dependencies": list(spec.get("data_dependencies") or []),
             }
         )
     return pages
@@ -245,27 +242,9 @@ def thin_backend_targets_from_spec(
     prompt: str,
     grounded_spec: GroundedSpecModel,
     role_scope: list[str],
-    thin_optional_route_targets: dict[str, str],
 ) -> list[str]:
-    targets = [thin_optional_route_targets["requests"]]
-    evidence = " ".join(
-        [
-            prompt.lower(),
-            " ".join(item.path.lower() for item in grounded_spec.api_requirements),
-            " ".join(item.name.lower() for item in grounded_spec.api_requirements),
-            " ".join(item.name.lower() for item in grounded_spec.domain_entities),
-            " ".join(item.goal.lower() for item in grounded_spec.user_flows),
-        ]
-    )
-    if any(token in evidence for token in ("comment", "progress", "note", "completion")):
-        targets.append(thin_optional_route_targets["comments"])
-    if any(role in role_scope for role in ("specialist", "manager")):
-        targets.append(thin_optional_route_targets["assignments"])
-    if "manager" in role_scope:
-        targets.extend([thin_optional_route_targets["users"], thin_optional_route_targets["workload"]])
-    if mentions_schedule_or_time(prompt, grounded_spec):
-        targets.append(thin_optional_route_targets["time_slots"])
-    return list(dict.fromkeys(targets))
+    del prompt, grounded_spec, role_scope
+    return []
 
 
 def mentions_schedule_or_time(prompt: str, grounded_spec: GroundedSpecModel) -> bool:
@@ -280,9 +259,84 @@ def mentions_schedule_or_time(prompt: str, grounded_spec: GroundedSpecModel) -> 
 
 
 def thin_role_responsibility(role: str, grounded_spec: GroundedSpecModel) -> str:
-    role_map = {
-        "client": "Create requests, provide details, choose timing, and track status.",
-        "specialist": "Work assigned requests, update status, and leave progress comments.",
-        "manager": "Review requests, assign specialists, and monitor workload.",
-    }
-    return role_map.get(role, grounded_spec.product_goal)
+    actor = next((item for item in grounded_spec.actors if item.role == role), None)
+    if actor is not None and getattr(actor, "description", None):
+        return str(actor.description)
+    return ROLE_ROOT_RESPONSIBILITIES.get(role, grounded_spec.product_goal)
+
+
+def _derive_role_route_specs(*, role: str, prompt: str, grounded_spec: GroundedSpecModel) -> list[dict[str, Any]]:
+    del prompt, grounded_spec
+    return [
+        {
+            "route_path": "/",
+            "page_kind": "landing",
+            "navigation_label": "Home",
+            "title": "Dashboard",
+            "purpose": f"{role.capitalize()} entry surface for the prompt-defined workflow.",
+            "data_dependencies": [],
+        },
+        {
+            "route_path": "/profile",
+            "page_kind": "profile",
+            "navigation_label": "Profile",
+            "title": "Profile",
+            "purpose": f"Profile and settings for the {role} workspace.",
+            "data_dependencies": ["/api/profiles"],
+        },
+    ]
+
+
+def _role_evidence(*, role: str, prompt: str, grounded_spec: GroundedSpecModel) -> str:
+    actor_ids = {actor.actor_id for actor in grounded_spec.actors if actor.role == role}
+    flow_text = " ".join(
+        " ".join(
+            [
+                flow.name,
+                flow.goal,
+                *[step.action for step in flow.steps if step.actor_id in actor_ids],
+                *flow.acceptance_criteria,
+                *flow.error_paths,
+            ]
+        )
+        for flow in grounded_spec.user_flows
+    )
+    ui_text = " ".join(
+        f"{item.description} {item.screen_hint or ''}"
+        for item in grounded_spec.ui_requirements
+        if role in f"{item.description} {item.screen_hint or ''}".lower()
+    )
+    api_text = " ".join(
+        f"{item.name} {item.path} {item.purpose}"
+        for item in grounded_spec.api_requirements
+    )
+    entity_text = " ".join(item.name for item in grounded_spec.domain_entities)
+    return " ".join([prompt.lower(), flow_text.lower(), ui_text.lower(), api_text.lower(), entity_text.lower()])
+
+
+def _dependencies_for_route(role: str, route_path: str) -> list[str]:
+    del role
+    if route_path == "/profile":
+        return ["/api/profiles"]
+    return []
+
+
+def _handoff_paths_for_route(
+    *,
+    route_path: str,
+    all_routes: list[str],
+    default_handoff_paths_for_page_kind,
+    page_kind: str,
+) -> list[str]:
+    defaults = list(default_handoff_paths_for_page_kind(page_kind, route_path=route_path))
+    extras = [candidate for candidate in all_routes if candidate != route_path]
+    ordered = [route_path, *defaults, *extras]
+    seen: set[str] = set()
+    handoffs: list[str] = []
+    for item in ordered:
+        normalized = str(item or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        handoffs.append(normalized)
+    return handoffs

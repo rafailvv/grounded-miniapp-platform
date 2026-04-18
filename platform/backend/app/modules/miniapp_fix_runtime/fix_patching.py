@@ -5,7 +5,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
-from app.models.domain import DraftFileOperation, FixAttemptOutcome, FixScopeEntry
+from app.models.domain import DraftFileOperation, FixAttemptOutcome
 from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,7 @@ class FixPatchingRuntime:
         llm_result: dict[str, Any],
         prompt_context: FixPromptContext,
         fix_turn: FixTurnContext,
+        scope_entries,
         scope_expansions: list[dict[str, Any]],
     ) -> FixAttemptOutcome:
         if "error" in llm_result:
@@ -57,10 +58,7 @@ class FixPatchingRuntime:
         try:
             operations = self.coerce_operations(
                 raw_operations,
-                scope_entries=[
-                    FixScopeEntry(file_path=path, reason="Repair packet companion scope.")
-                    for path in prompt_context.deterministic_companions
-                ],
+                scope_entries=scope_entries,
                 fix_turn=fix_turn,
                 scope_expansions=scope_expansions,
             )

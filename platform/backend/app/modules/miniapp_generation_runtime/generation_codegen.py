@@ -58,9 +58,11 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
         trace_payloads: dict[str, dict[str, Any]] = {}
         latency_breakdown: dict[str, int] = {}
         selected_pages = self._selected_pages_for_edit(page_graph, target_set)
+        resolve_page_file_edit = getattr(self.service, "_resolve_page_file_edit", self._resolve_page_file_edit)
+        resolve_page_file_edits_async = getattr(self.service, "_resolve_page_file_edits_async", self._resolve_page_file_edits_async)
         if len(selected_pages) <= 1:
             ordered_page_results = [
-                self._resolve_page_file_edit(
+                resolve_page_file_edit(
                     prompt=prompt,
                     grounded_spec=grounded_spec,
                     role=role,
@@ -77,7 +79,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
             ]
         else:
             ordered_page_results = asyncio.run(
-                self._resolve_page_file_edits_async(
+                resolve_page_file_edits_async(
                     selected_pages=selected_pages,
                     prompt=prompt,
                     grounded_spec=grounded_spec,
@@ -97,7 +99,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     if not (page_result.get("retryable") or self._is_recoverable_page_error_message(str(page_result.get("error") or ""))):
                         continue
                     role, page = selected_pages[index]
-                    ordered_page_results[index] = self._resolve_page_file_edit(
+                    ordered_page_results[index] = resolve_page_file_edit(
                         prompt=prompt,
                         grounded_spec=grounded_spec,
                         role=role,

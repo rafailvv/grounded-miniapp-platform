@@ -41,6 +41,7 @@ class MiniappGenerationRepair:
     ) -> tuple[CheckExecutionRecord, dict[str, Any]]:
         changed = sorted(set(changed_files or fallback_changed_files))
         preflight_issues = self.service._preflight_generation_issues(
+            draft_root=draft_source,
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
             changed_files=changed,
@@ -246,6 +247,15 @@ class MiniappGenerationRepair:
             role_scope=role_scope,
             operations=operations,
         )
+        operations = self.service._run_pre_apply_contract_pass(
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
+            page_graph=page_graph,
+            role_scope=role_scope,
+            generation_mode=generation_mode,
+            operations=operations,
+            contract_sync_mode="repair_invariants",
+        )
         return WorkspaceLoopTurnPlan(
             outcome="patch_ready",
             assistant_message=str(repair_result.get("assistant_message") or ""),
@@ -342,6 +352,7 @@ class MiniappGenerationRepair:
                 role_scope=role_scope,
                 generation_mode=generation_mode,
                 operations=list(operations),
+                contract_sync_mode="repair_invariants",
             ),
             append_event=self.service._append_event,
             append_trace=self.service._append_trace,

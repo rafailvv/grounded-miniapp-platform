@@ -39,7 +39,7 @@ class MiniappGenerationEntry:
         should_stop: Callable[[], bool] | None,
         prompt_turn_id: str,
     ) -> JobRecord:
-        self.service._append_event(job, "building_scaffold", "Compiling deterministic app scaffold.")
+        self.service._append_event(job, "building_scaffold", "Building a prompt-driven generation plan on top of the minimal template bootstrap.")
         self.service._append_trace(
             workspace_id,
             "thin_loop_started",
@@ -59,7 +59,7 @@ class MiniappGenerationEntry:
         self.service._append_trace(
             workspace_id,
             "thin_spec_compiler",
-            "Thin loop used deterministic grounded spec compilation.",
+            "Thin loop compiled grounded spec before prompt-driven scaffold planning.",
             {"llm_spec_stage_removed": True},
         )
         grounded_spec = self.service._stabilize_grounded_spec(grounded_spec)
@@ -77,24 +77,95 @@ class MiniappGenerationEntry:
         self.service._append_event(job, "draft_prepared", "Prepared draft workspace from the current revision.")
 
         workspace_tree = self.service.workspace_service.file_tree(workspace_id, run_id=draft_run_id)
-        role_contract, plan_result = self.service._compile_prompt_to_scaffold(
+        role_contract_result = self.service._resolve_role_contract(
             prompt=effective_prompt,
             grounded_spec=grounded_spec,
+            doc_refs=doc_refs,
             role_scope=role_scope,
-            workspace_tree=workspace_tree,
+            intent=request.intent,
+            generation_mode=generation_mode,
+            creative_direction=creative_direction,
         )
-        self.service._append_event(job, "scaffold_ready", "Deterministic scaffold and target bundles are ready.")
+        role_contract = dict(role_contract_result.get("role_contract") or self.service._compiled_role_contract(grounded_spec, role_scope))
+        role_contract_issues = self.service._role_contract_gate_issues(
+            role_contract,
+            role_scope,
+            scope_mode="whole_file_build",
+        )
+        if role_contract_result.get("fallback_reason"):
+            self.service._append_trace(
+                workspace_id,
+                "role_contract_fallback",
+                "Role contract analysis fell back to minimal guidance, but generation continues code-first.",
+                {"reason": str(role_contract_result.get("fallback_reason") or "")},
+            )
+        if role_contract_issues:
+            self.service._append_trace(
+                workspace_id,
+                "role_contract_soft_issues",
+                "Role contract analysis produced soft guidance issues; continuing with prompt-driven planning.",
+                {"issues": role_contract_issues},
+            )
+        self.service._append_event(job, "building_scaffold", "Role guidance compiled for prompt-driven planning.")
+
+        plan_result = self.service._resolve_code_plan(
+            workspace_id=workspace_id,
+            prompt=effective_prompt,
+            grounded_spec=grounded_spec,
+            doc_refs=doc_refs,
+            role_scope=role_scope,
+            role_contract=role_contract,
+            intent=request.intent,
+            generation_mode=generation_mode,
+            creative_direction=creative_direction,
+        )
+        plan_error = str(plan_result.get("error") or "").strip()
+        if plan_error or not plan_result.get("page_graph"):
+            fallback_role_contract, fallback_plan_result = self.service._compile_prompt_to_scaffold(
+                prompt=effective_prompt,
+                grounded_spec=grounded_spec,
+                role_scope=role_scope,
+                workspace_tree=workspace_tree,
+            )
+            role_contract = fallback_role_contract
+            plan_result = fallback_plan_result
+            self.service._append_event(job, "scaffold_ready", "LLM planning was incomplete; using minimal bootstrap scaffold fallback.")
+            self.service._append_trace(
+                workspace_id,
+                "bootstrap_scaffold_fallback",
+                "Prompt-driven code plan was incomplete, so generation fell back to the minimal bootstrap scaffold.",
+                {"reason": plan_error or "missing_page_graph"},
+            )
+        else:
+            self.service._append_event(job, "scaffold_ready", "Prompt-driven code plan and target bundles are ready.")
+            self.service._append_trace(
+                workspace_id,
+                "code_plan_ready",
+                "Prompt-driven page graph and target plan compiled before code generation.",
+                {
+                    "target_files": len(plan_result["target_files"]),
+                    "backend_targets": len(plan_result["backend_targets"]),
+                    "generation_clusters": plan_result["generation_clusters"],
+                },
+            )
+            if plan_result.get("plan_gate_issues"):
+                self.service._append_trace(
+                    workspace_id,
+                    "code_plan_soft_issues",
+                    "Page graph planning produced soft gate issues but remained executable.",
+                    {"issues": list(plan_result.get("plan_gate_issues") or [])},
+                )
+        self.service._store_report(f"role_contract:{workspace_id}", {"run_id": draft_run_id, "role_contract": role_contract})
         self.service._append_trace(
             workspace_id,
-            "thin_scaffold_ready",
-            "Deterministic scaffold compiled without planner-owned manifests.",
+            "thin_plan_ready",
+            "Prompt-driven runtime plan compiled before generation.",
             {
                 "target_files": len(plan_result["target_files"]),
                 "backend_targets": len(plan_result["backend_targets"]),
                 "generation_clusters": plan_result["generation_clusters"],
             },
         )
-        self.service._store_report(f"role_contract:{workspace_id}", {"run_id": draft_run_id, "role_contract": role_contract})
         self.service._store_report(f"page_graph:{workspace_id}", {"run_id": draft_run_id, "page_graph": plan_result["page_graph"]})
         self.service._store_report(f"execution_plan:{workspace_id}", {"run_id": draft_run_id, "execution_plan": plan_result.get("execution_plan", {})})
 
@@ -179,7 +250,9 @@ class MiniappGenerationEntry:
             if content is None:
                 continue
             file_contexts[file_path] = content
-        current_cache_stats = service.ACTIVE_LLM_CACHE_STATS.get() or {}
+        from app.services.miniapp_generation.service import ACTIVE_LLM_CACHE_STATS
+
+        current_cache_stats = ACTIVE_LLM_CACHE_STATS.get() or {}
         current_cache_stats["prompt_cache_key"] = context_pack.prompt_cache_key
         current_cache_stats["stable_prefix_chars"] = len(context_pack.system_prefix)
         job.cache_stats = dict(current_cache_stats)
@@ -297,6 +370,7 @@ class MiniappGenerationEntry:
             role_scope=role_scope,
             generation_mode=generation_mode,
             operations=operations,
+            contract_sync_mode="bootstrap_only",
         )
         patch_envelope = service.workspace_service.build_patch_envelope_for_draft(workspace_id, draft_run_id, operations)
         apply_result = service.workspace_service.apply_patch_envelope_to_draft(workspace_id, draft_run_id, patch_envelope)
@@ -438,12 +512,21 @@ class MiniappGenerationEntry:
             return job
 
         job.outcome_kind = "applied"
-        job.validation_snapshot = ValidationSnapshot(
-            grounded_spec_valid=True,
-            app_ir_valid=True,
-            build_valid=True,
-            blocking=False,
-            issues=[],
+        if loop_result.latest_execution is not None:
+            job.validation_snapshot = service.generation_completion.validation_snapshot_from_execution(
+                loop_result.latest_execution
+            )
+        else:
+            job.validation_snapshot = ValidationSnapshot(
+                grounded_spec_valid=True,
+                app_ir_valid=True,
+                build_valid=True,
+                blocking=False,
+                issues=[],
+            )
+        service._store_report(
+            f"validation:{workspace_id}",
+            job.validation_snapshot.model_dump(mode="json"),
         )
 
         traceability = service._build_agent_traceability_report(workspace_id, grounded_spec, all_operations)
@@ -473,7 +556,9 @@ class MiniappGenerationEntry:
         job.fix_targets = sorted({operation.file_path for operation in all_operations})
         job.latency_breakdown["ttft_ms"] = retrieval_ms
         job.latency_breakdown["total_ms"] = int((time.perf_counter() - started_at) * 1000)
-        job.cache_stats = dict(service.ACTIVE_LLM_CACHE_STATS.get() or job.cache_stats)
+        from app.services.miniapp_generation.service import ACTIVE_LLM_CACHE_STATS
+
+        job.cache_stats = dict(ACTIVE_LLM_CACHE_STATS.get() or job.cache_stats)
         job.compile_summary = service._compile_code_summary(all_operations, role_scope)
         job.artifacts = {
             "preview_url": latest_preview.url or "",

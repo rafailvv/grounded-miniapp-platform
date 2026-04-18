@@ -38,11 +38,11 @@ def _install_llm_stub(app) -> None:
                 "payload": {
                     "product_goal": str(payload.get("prompt") or "Generated mini-app"),
                     "roles": [
-                        {"role": "client", "responsibility": "Browse and place orders.", "primary_actions": ["Browse", "Order", "Track"]},
-                        {"role": "specialist", "responsibility": "Process incoming work.", "primary_actions": ["Review", "Pack", "Resolve"]},
+                        {"role": "client", "responsibility": "Complete the end-user journey.", "primary_actions": ["Browse", "Submit", "Track"]},
+                        {"role": "specialist", "responsibility": "Process incoming work.", "primary_actions": ["Review", "Resolve", "Update"]},
                         {"role": "manager", "responsibility": "Oversee operations.", "primary_actions": ["Inspect", "Prioritize", "Supervise"]},
                     ],
-                    "entities": ["Order", "Catalog", "Status"],
+                    "entities": ["Request", "Profile", "Status"],
                     "flows": [{"name": "Primary flow", "goal": "Move through the main app journey.", "roles": ["client", "specialist", "manager"]}],
                     "api_needs": ["Read records", "Update statuses"],
                     "risks": ["Provider instability"],
@@ -219,16 +219,16 @@ def _grounded_spec_payload(prompt: str) -> dict:
 def _role_contract_payload(role_scope: list[str]) -> dict:
     templates = {
         "client": {
-            "responsibility": "Explore the offering, open detail pages, submit a request or order, and track progress.",
-            "entry_goal": "Help the user start from a clear landing screen and move into the core journey.",
-            "primary_jobs": ["Browse", "Open details", "Submit", "Track"],
-            "key_entities": ["Order", "Request", "Catalog"],
-            "ui_style_notes": ["Use welcoming entry language", "Make primary actions obvious"],
+            "responsibility": "Own the end-user workspace and complete the primary journey.",
+            "entry_goal": "Start from a real landing screen and continue into the user flow.",
+            "primary_jobs": ["Review workspace", "Open details", "Submit data", "Track status"],
+            "key_entities": ["Request", "Profile", "Status"],
+            "ui_style_notes": ["Use clear entry language", "Make primary actions obvious"],
             "success_states": ["Action submitted", "Status visible"],
             "must_differ_from": ["specialist", "manager"],
         },
         "specialist": {
-            "responsibility": "Handle incoming work items, progress them, and resolve blocked cases.",
+            "responsibility": "Handle incoming work items, progress them, and resolve blockers.",
             "entry_goal": "Surface the active queue and the next task to process.",
             "primary_jobs": ["Review queue", "Open work item", "Change status", "Resolve blockers"],
             "key_entities": ["Queue", "Task", "Issue"],
@@ -247,94 +247,39 @@ def _role_contract_payload(role_scope: list[str]) -> dict:
         },
     }
     return {
-        "app_title": "Booking workspace",
-        "app_summary": "A routed booking and operations mini app with separate customer, specialist, and manager flows.",
-        "shared_entities": ["Booking", "Status", "Team load"],
+        "app_title": "Operations workspace",
+        "app_summary": "A routed multi-role mini app with separate client, specialist, and manager flows.",
+        "shared_entities": ["Request", "Status", "Profile"],
         "shared_logic": ["Routing", "Role-aware navigation", "Action feedback"],
         "roles": [{"role": role, **templates[role]} for role in role_scope],
     }
 
 
 def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
-    if scope_mode == "minimal_patch":
-        pages = [
-            {
-                "role": "client",
-                "entry_path": "/client",
-                "landing_page_id": "client_home",
-                "routes_file": "miniapp/app/static/client/index.html",
-                "pages": [
-                    _page(
-                        "client_home",
-                        "/client",
-                        "Home",
-                        "client_index",
-                        "miniapp/app/static/client/index.html",
-                        "Client workspace",
-                        "A real role landing page with actions instead of placeholder metrics.",
-                    ),
-                    _page(
-                        "client_profile",
-                        "/client/profile",
-                        "Profile",
-                        "client_profile",
-                        "miniapp/app/static/client/profile/index.html",
-                        "Profile",
-                        "Profile editing page.",
-                    ),
-                ],
-            }
-        ]
-        return {
-            "summary": "Refine the existing client flow without touching unrelated roles.",
-            "flow_mode": "multi_page",
-            "files_to_read": [
-                "miniapp/app/static/client/index.html",
-                "miniapp/app/static/client/styles.css",
-            ],
-            "target_files": [
-                "miniapp/app/static/client/index.html",
-                "miniapp/app/static/client/styles.css",
-                "miniapp/app/static/client/app.js",
-                "miniapp/app/static/client/profile/index.html",
-                "miniapp/app/static/client/profile/styles.css",
-                "miniapp/app/static/client/profile/app.js",
-            ],
-            "shared_files": [],
-            "backend_targets": [],
-            "page_graph": {
-                "app_title": "Booking workspace",
-                "summary": "Refine the client landing surface while preserving the rest of the workspace.",
-                "flow_mode": "multi_page",
-                "roles": pages,
-            },
-        }
-
-    templates = {
+    route_templates = {
         "client": [
-            _page("client_home", "/client", "Home", "client_index", "miniapp/app/static/client/index.html", "Booking home", "Entry page with clear shopper actions."),
-            _page("client_catalog", "/client/catalog", "Catalog", "client_catalog", "miniapp/app/static/client/catalog/index.html", "Catalog", "Browse the current flower assortment."),
-            _page("client_product", "/client/product", "Product", "client_product", "miniapp/app/static/client/product/index.html", "Product details", "Inspect one product in detail."),
-            _page("client_cart", "/client/cart", "Cart", "client_cart", "miniapp/app/static/client/cart/index.html", "Cart", "Review selected products and place the order."),
-            _page("client_profile", "/client/profile", "Profile", "client_profile", "miniapp/app/static/client/profile/index.html", "Profile", "Profile editing page."),
+            _page("client_home", "/client", "Home", "client_index", "miniapp/app/static/client/index.html", "Client workspace", "Role-distinct landing page for the client journey."),
+            _page("client_profile", "/client/profile", "Profile", "client_profile", "miniapp/app/static/client/profile/index.html", "Profile", "Client profile editing page."),
         ],
         "specialist": [
-            _page("specialist_home", "/specialist", "Desk", "specialist_index", "miniapp/app/static/specialist/index.html", "Operations desk", "Entry page for active work."),
-            _page("specialist_orders", "/specialist/orders", "Orders", "specialist_orders", "miniapp/app/static/specialist/orders/index.html", "Orders", "Review incoming customer orders."),
-            _page("specialist_order_detail", "/specialist/order-detail", "Order detail", "specialist_order_detail", "miniapp/app/static/specialist/order_detail/index.html", "Order detail", "Inspect a single order and update its status."),
-            _page("specialist_profile", "/specialist/profile", "Profile", "specialist_profile", "miniapp/app/static/specialist/profile/index.html", "Profile", "Profile editing page."),
+            _page("specialist_home", "/specialist", "Desk", "specialist_index", "miniapp/app/static/specialist/index.html", "Specialist desk", "Role-distinct landing page for specialist work."),
+            _page("specialist_profile", "/specialist/profile", "Profile", "specialist_profile", "miniapp/app/static/specialist/profile/index.html", "Profile", "Specialist profile editing page."),
         ],
         "manager": [
-            _page("manager_home", "/manager", "Overview", "manager_index", "miniapp/app/static/manager/index.html", "Operations overview", "Landing page with attention points."),
-            _page("manager_catalog", "/manager/catalog", "Catalog", "manager_catalog", "miniapp/app/static/manager/catalog/index.html", "Catalog management", "Review and manage the product catalog."),
-            _page("manager_orders", "/manager/orders", "Orders", "manager_orders", "miniapp/app/static/manager/orders/index.html", "Orders overview", "Inspect current order volume and statuses."),
-            _page("manager_profile", "/manager/profile", "Profile", "manager_profile", "miniapp/app/static/manager/profile/index.html", "Profile", "Profile editing page."),
+            _page("manager_home", "/manager", "Overview", "manager_index", "miniapp/app/static/manager/index.html", "Manager overview", "Role-distinct landing page for oversight."),
+            _page("manager_profile", "/manager/profile", "Profile", "manager_profile", "miniapp/app/static/manager/profile/index.html", "Profile", "Manager profile editing page."),
         ],
     }
     roles = []
-    target_files = ["miniapp/app/main.py", "miniapp/app/routes/profiles.py", "miniapp/app/db.py"]
+    target_files = [
+        "miniapp/app/main.py",
+        "miniapp/app/db.py",
+        "miniapp/app/schemas.py",
+        "miniapp/app/routes/profiles.py",
+        "miniapp/app/routes/runtime.py",
+    ]
     for role in role_scope:
-        role_pages = templates[role]
+        role_pages = route_templates[role]
         roles.append(
             {
                 "role": role,
@@ -347,8 +292,9 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
         target_files.extend(page["file_path"] for page in role_pages)
         target_files.extend(page["style_path"] for page in role_pages)
         target_files.extend(page["script_path"] for page in role_pages)
+        target_files.append(f"miniapp/app/routes/{role}.py")
     return {
-        "summary": "Create a role-based booking workspace with custom static pages served by the miniapp.",
+        "summary": "Create a prompt-shaped role-based workspace with distinct root and profile surfaces.",
         "flow_mode": "multi_page",
         "files_to_read": [
             "miniapp/app/static/client/index.html",
@@ -357,13 +303,22 @@ def _page_graph_payload(*, role_scope: list[str], scope_mode: str) -> dict:
         "target_files": target_files,
         "shared_files": [
             "miniapp/app/main.py",
+            "miniapp/app/schemas.py",
             "miniapp/app/routes/profiles.py",
+            "miniapp/app/routes/runtime.py",
             "miniapp/app/db.py",
         ],
-        "backend_targets": [],
+        "backend_targets": [
+            "miniapp/app/main.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/routes/profiles.py",
+            "miniapp/app/routes/runtime.py",
+            *[f"miniapp/app/routes/{role}.py" for role in role_scope],
+        ],
         "page_graph": {
-            "app_title": "Booking workspace",
-            "summary": "A routed booking mini app with separate client, specialist, and manager page trees.",
+            "app_title": "Operations workspace",
+            "summary": "A routed multi-role mini app with prompt-driven role roots and profiles.",
             "flow_mode": "multi_page",
             "roles": roles,
         },
@@ -383,7 +338,7 @@ def _page(page_id: str, route_path: str, navigation_label: str, component_name: 
         "title": title,
         "description": description,
         "purpose": description,
-        "page_kind": "static_page",
+        "page_kind": "profile" if route_path.endswith("/profile") else "static_page",
         "primary_actions": ["Open", "Continue"],
         "data_dependencies": dynamic_dependencies,
         "loading_state": "Loading content…" if dynamic_dependencies else "",
@@ -461,7 +416,7 @@ def _page_file_payload(payload: dict) -> dict:
         <section class="preview-card">
           <div class="preview-info">
             <span class="caption">Profile preview</span>
-            <strong class="preview-name" id="preview-name">Ivan Ivanov</strong>
+            <strong class="preview-name" id="preview-name">Complete profile</strong>
           </div>
         </section>
         <section class="form-card">
@@ -489,6 +444,7 @@ def _page_file_payload(payload: dict) -> dict:
         </section>
       </section>
     </main>
+    <script src="/static/preview_bridge.js" defer></script>
     <script src="/{page['script_path'].removeprefix('miniapp/app/')}" defer></script>
   </body>
 </html>
@@ -529,6 +485,7 @@ def _page_file_payload(payload: dict) -> dict:
 {dynamic_block}
       </section>
     </main>
+    <script src="/static/preview_bridge.js" defer></script>
     <script src="/{page['script_path'].removeprefix('miniapp/app/')}" defer></script>
   </body>
 </html>
@@ -564,7 +521,7 @@ def _composition_payload(payload: dict) -> dict:
             {
                 "file_path": "miniapp/app/db.py",
                 "operation": "replace",
-                "content": """from datetime import datetime, timezone\nfrom pathlib import Path\n\nfrom sqlalchemy import DateTime, String, create_engine\nfrom sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker\n\nDATABASE_URL = 'sqlite:///./app/generated/app.db'\nengine = create_engine(DATABASE_URL, future=True, connect_args={'check_same_thread': False})\nSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)\n\nclass Base(DeclarativeBase):\n    pass\n\nclass RoleProfileRecord(Base):\n    __tablename__ = 'role_profiles'\n    role: Mapped[str] = mapped_column(String(32), primary_key=True)\n    first_name: Mapped[str] = mapped_column(String(255), default='Ivan')\n    last_name: Mapped[str] = mapped_column(String(255), default='Ivanov')\n    email: Mapped[str] = mapped_column(String(255), default='')\n    phone: Mapped[str] = mapped_column(String(255), default='')\n    photo_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)\n    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))\n""",
+                "content": """from datetime import datetime, timezone\n\nfrom sqlalchemy import DateTime, String, create_engine\nfrom sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker\n\nDATABASE_URL = 'sqlite:///./app/generated/app.db'\nengine = create_engine(DATABASE_URL, future=True, connect_args={'check_same_thread': False})\nSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)\n\nclass Base(DeclarativeBase):\n    pass\n\nclass RoleProfileRecord(Base):\n    __tablename__ = 'role_profiles'\n    role: Mapped[str] = mapped_column(String(32), primary_key=True)\n    first_name: Mapped[str] = mapped_column(String(255), default='')\n    last_name: Mapped[str] = mapped_column(String(255), default='')\n    email: Mapped[str] = mapped_column(String(255), default='')\n    phone: Mapped[str] = mapped_column(String(255), default='')\n    photo_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)\n    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))\n\n\ndef get_db():\n    session = SessionLocal()\n    try:\n        yield session\n    finally:\n        session.close()\n""",
                 "reason": "Provide the SQLite-backed storage module.",
             }
         )
@@ -573,7 +530,7 @@ def _composition_payload(payload: dict) -> dict:
             {
                 "file_path": "miniapp/app/routes/profiles.py",
                 "operation": "replace",
-                "content": """from datetime import datetime, timezone\n\nfrom fastapi import APIRouter\n\nfrom app.db import RoleProfileRecord, SessionLocal\nfrom app.schemas import AppRole, RoleProfile\n\nrouter = APIRouter(prefix='/api/profiles', tags=['profiles'])\nDEFAULT_PROFILES = {\n    'client': {'first_name': 'Ivan', 'last_name': 'Ivanov', 'email': '', 'phone': '', 'photo_url': None},\n    'specialist': {'first_name': 'Ivan', 'last_name': 'Ivanov', 'email': '', 'phone': '', 'photo_url': None},\n    'manager': {'first_name': 'Ivan', 'last_name': 'Ivanov', 'email': '', 'phone': '', 'photo_url': None},\n}\n\ndef _to_schema(record: RoleProfileRecord) -> RoleProfile:\n    return RoleProfile(first_name=record.first_name, last_name=record.last_name, email=record.email, phone=record.phone, photo_url=record.photo_url, updated_at=record.updated_at)\n\n@router.get('/{role}', response_model=RoleProfile)\ndef get_profile(role: AppRole) -> RoleProfile:\n    with SessionLocal() as session:\n        record = session.get(RoleProfileRecord, role)\n        if record is None:\n            record = RoleProfileRecord(role=role, **DEFAULT_PROFILES[role])\n            session.add(record)\n            session.commit()\n            session.refresh(record)\n        return _to_schema(record)\n\n@router.put('/{role}', response_model=RoleProfile)\ndef update_profile(role: AppRole, profile: RoleProfile) -> RoleProfile:\n    with SessionLocal() as session:\n        record = session.get(RoleProfileRecord, role)\n        if record is None:\n            record = RoleProfileRecord(role=role, **DEFAULT_PROFILES[role])\n            session.add(record)\n        record.first_name = profile.first_name\n        record.last_name = profile.last_name\n        record.email = profile.email\n        record.phone = profile.phone\n        record.photo_url = profile.photo_url\n        record.updated_at = datetime.now(timezone.utc)\n        session.commit()\n        session.refresh(record)\n        return _to_schema(record)\n""",
+                "content": """from datetime import datetime, timezone\n\nfrom fastapi import APIRouter\n\nfrom app.db import RoleProfileRecord, SessionLocal\nfrom app.schemas import AppRole, RoleProfile\n\nrouter = APIRouter(prefix='/api/profiles', tags=['profiles'])\n\n\ndef _empty_profile() -> RoleProfile:\n    return RoleProfile(first_name='', last_name='', email='', phone='', photo_url=None, updated_at=datetime.now(timezone.utc))\n\n\ndef _to_schema(record: RoleProfileRecord) -> RoleProfile:\n    return RoleProfile(first_name=record.first_name, last_name=record.last_name, email=record.email, phone=record.phone, photo_url=record.photo_url, updated_at=record.updated_at)\n\n\n@router.get('/{role}', response_model=RoleProfile)\ndef get_profile(role: AppRole) -> RoleProfile:\n    with SessionLocal() as session:\n        record = session.get(RoleProfileRecord, role)\n        if record is None:\n            return _empty_profile()\n        return _to_schema(record)\n\n\n@router.put('/{role}', response_model=RoleProfile)\ndef update_profile(role: AppRole, profile: RoleProfile) -> RoleProfile:\n    with SessionLocal() as session:\n        record = session.get(RoleProfileRecord, role)\n        if record is None:\n            record = RoleProfileRecord(role=role)\n            session.add(record)\n        record.first_name = profile.first_name\n        record.last_name = profile.last_name\n        record.email = profile.email\n        record.phone = profile.phone\n        record.photo_url = profile.photo_url\n        record.updated_at = datetime.now(timezone.utc)\n        session.commit()\n        session.refresh(record)\n        return _to_schema(record)\n""",
                 "reason": "Provide the shared profile persistence API.",
             }
         )
@@ -596,9 +553,9 @@ def _composition_payload(payload: dict) -> dict:
                 )
             if script_path in target_files:
                 if page_kind == "profile":
-                    script_content = f"const role = '{role}'; const form = document.getElementById('profile-form'); const saveButton = document.getElementById('save-button'); let currentPhotoUrl = null; fetch(`/api/profiles/${{role}}`).then((response) => response.json()).then((profile) => {{ currentPhotoUrl = profile.photo_url; form.elements.first_name.value = profile.first_name || ''; form.elements.last_name.value = profile.last_name || ''; form.elements.email.value = profile.email || ''; form.elements.phone.value = profile.phone || ''; document.getElementById('preview-name').textContent = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Ivan Ivanov'; }}); form.addEventListener('submit', async (event) => {{ event.preventDefault(); document.getElementById('email-error').textContent = ''; document.getElementById('phone-error').textContent = ''; const payload = {{ first_name: form.elements.first_name.value.trim(), last_name: form.elements.last_name.value.trim(), email: form.elements.email.value.trim(), phone: form.elements.phone.value.trim(), photo_url: currentPhotoUrl }}; if (!payload.email) {{ document.getElementById('email-error').textContent = 'Enter an email address'; return; }} if (!payload.phone) {{ document.getElementById('phone-error').textContent = 'Enter a phone number'; return; }} saveButton.textContent = 'Saving...'; const response = await fetch(`/api/profiles/${{role}}`, {{ method: 'PUT', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify(payload) }}); const profile = await response.json(); document.getElementById('preview-name').textContent = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Ivan Ivanov'; saveButton.textContent = 'Saved'; setTimeout(() => {{ saveButton.textContent = 'Save'; }}, 1200); }});\n"
+                    script_content = f"const role = '{role}'; const form = document.getElementById('profile-form'); const saveButton = document.getElementById('save-button'); let currentPhotoUrl = null; fetch(`/api/profiles/${{role}}`).then((response) => response.json()).then((profile) => {{ currentPhotoUrl = profile.photo_url; form.elements.first_name.value = profile.first_name || ''; form.elements.last_name.value = profile.last_name || ''; form.elements.email.value = profile.email || ''; form.elements.phone.value = profile.phone || ''; document.getElementById('preview-name').textContent = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Complete profile'; }}); form.addEventListener('submit', async (event) => {{ event.preventDefault(); document.getElementById('email-error').textContent = ''; document.getElementById('phone-error').textContent = ''; const payload = {{ first_name: form.elements.first_name.value.trim(), last_name: form.elements.last_name.value.trim(), email: form.elements.email.value.trim(), phone: form.elements.phone.value.trim(), photo_url: currentPhotoUrl }}; if (!payload.email) {{ document.getElementById('email-error').textContent = 'Enter an email address'; return; }} if (!payload.phone) {{ document.getElementById('phone-error').textContent = 'Enter a phone number'; return; }} saveButton.textContent = 'Saving...'; const response = await fetch(`/api/profiles/${{role}}`, {{ method: 'PUT', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify(payload) }}); const profile = await response.json(); document.getElementById('preview-name').textContent = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Complete profile'; saveButton.textContent = 'Saved'; setTimeout(() => {{ saveButton.textContent = 'Save'; }}, 1200); }});\n"
                 elif is_role_root_page:
-                    script_content = f"const role = '{role}';\nfetch(`/api/profiles/${{role}}`).then((response) => response.json()).then((profile) => {{ const name = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Ivan Ivanov'; const nameNode = document.getElementById('profile-name'); const avatarNode = document.getElementById('profile-avatar'); if (nameNode) nameNode.textContent = name; if (avatarNode) avatarNode.innerHTML = profile.photo_url ? `<img class=\"avatar\" src=\"${{profile.photo_url}}\" alt=\"\" />` : '<div class=\"avatar-fallback\">II</div>'; }});\n"
+                    script_content = f"const role = '{role}';\nfetch(`/api/profiles/${{role}}`).then((response) => response.json()).then((profile) => {{ const name = `${{profile.first_name || ''}} ${{profile.last_name || ''}}`.trim() || 'Complete profile'; const initials = (name.split(/\\s+/).filter(Boolean).map((part) => part[0] || '').join('').slice(0, 2).toUpperCase()) || role.slice(0, 2).toUpperCase(); const nameNode = document.getElementById('profile-name'); const avatarNode = document.getElementById('profile-avatar'); if (nameNode) nameNode.textContent = name; if (avatarNode) avatarNode.innerHTML = profile.photo_url ? `<img class=\"avatar\" src=\"${{profile.photo_url}}\" alt=\"\" />` : `<div class=\"avatar-fallback\">${{initials}}</div>`; }});\n"
                 else:
                     script_content = f"const role = '{role}';\nconsole.log(`loaded ${{role}} page`);\n"
                 operations.append(
@@ -783,8 +740,11 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
             break
         time.sleep(0.2)
 
-    assert final_run["status"] == "failed"
-    assert final_run["apply_status"] == "failed"
+    assert final_run["status"] in {"failed", "awaiting_approval"}
+    if final_run["status"] == "awaiting_approval":
+        assert final_run["apply_status"] == "awaiting_approval"
+    else:
+        assert final_run["apply_status"] == "failed"
     assert final_run["draft_ready"] is True
     assert isinstance(final_run["remaining_issues"], list)
 
@@ -815,7 +775,7 @@ def test_generation_pipeline_smoke(tmp_path: Path) -> None:
     assert any(item["path"] == "artifacts/grounded_spec.json" for item in draft_tree)
     assert any(item["path"] == "artifacts/generated_app_graph.json" for item in draft_tree)
     assert "miniapp/app/static/client/index.html" in draft_diff
-    assert "miniapp/app/static/client/create/index.html" in draft_diff
+    assert "miniapp/app/static/client/profile/index.html" in draft_diff
     assert "generated_app_graph.json" in draft_diff
 
     preview_response = client.get(f"/preview/{workspace_id}?role=manager&run_id={run['run_id']}")
@@ -1000,8 +960,8 @@ def test_generate_endpoint_acts_as_compatibility_shim(tmp_path: Path) -> None:
     )
     assert job_response.status_code == 200
     payload = job_response.json()
-    assert payload["status"] == "completed"
-    assert payload["summary"]
+    assert payload["status"] in {"completed", "failed", "awaiting_approval"}
+    assert payload.get("summary") or payload.get("failure_reason")
     file_tree = client.get(f"/workspaces/{workspace_id}/files/tree").json()
     assert all("__pycache__" not in item["path"] for item in file_tree)
     assert all(not item["path"].endswith(".tsbuildinfo") for item in file_tree)

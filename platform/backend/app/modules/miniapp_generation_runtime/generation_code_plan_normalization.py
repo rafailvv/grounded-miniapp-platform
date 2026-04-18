@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.services.miniapp_generation.constants import TEMPLATE_OWNED_SHARED_FILES
+from app.services.miniapp_generation.constants import SHARED_GENERATED_FILES, TEMPLATE_OWNED_SHARED_FILES
 
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
 

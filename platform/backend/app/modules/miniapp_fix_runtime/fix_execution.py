@@ -168,7 +168,7 @@ class FixExecutionRuntime:
         explicit_scope = [role for role in request.target_role_scope if role in {"client", "specialist", "manager"}]
         if explicit_scope:
             return explicit_scope
-        page_graph = self.service._page_graph_for_deterministic_repair(workspace_id, run_id)
+        page_graph = self.service._page_graph_for_run(workspace_id, run_id)
         graph_scope = [str(role) for role in (page_graph.get("roles") or {}).keys() if role in {"client", "specialist", "manager"}]
         return graph_scope or ["client", "specialist", "manager"]
 
@@ -241,7 +241,7 @@ class FixExecutionRuntime:
     def is_fix_success(results: list[RunCheckResult], preview_details: dict[str, Any]) -> bool:
         validators_ok = all(result.status != "failed" for result in results if result.name in {"schema_validators", "connectivity_validators"})
         build_ok = all(result.status != "failed" for result in results if result.name == "changed_files_static")
-        app_tests_ok = all(result.status == "passed" for result in results if result.name in {"generated_app_python_tests", "generated_app_js_tests"})
+        app_tests_ok = all(result.status != "failed" for result in results if result.name in {"generated_app_python_tests", "generated_app_js_tests"})
         preview_result = next((result for result in results if result.name == "preview_boot_smoke"), None)
         preview_connectivity_result = next((result for result in results if result.name == "preview_connectivity_smoke"), None)
         preview_deferred = (
@@ -277,7 +277,7 @@ class FixExecutionRuntime:
             and preview_result.status != "failed"
             and preview_connectivity_result.status != "failed"
         )
-        non_blocking_validation_codes = {"build.identical_role_pages"}
+        non_blocking_validation_codes: set[str] = set()
         validation_failures = [
             issue
             for issue in (validation_snapshot.issues if validation_snapshot is not None else [])

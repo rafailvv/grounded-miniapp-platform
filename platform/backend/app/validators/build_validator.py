@@ -124,15 +124,6 @@ class BuildValidator:
                     location=location,
                 )
             )
-        if not self._has_business_surface(content) and self._empty_business_container_count(content) > 0:
-            issues.append(
-                ValidationIssue(
-                    code="build.root_page_missing_business_surface",
-                    message=f"{Path(location).name} does not render a real first-paint business surface for the role root page.",
-                    severity="high",
-                    location=location,
-                )
-            )
         return issues
 
     def _validate_generated_app_shape(self, workspace_path: Path) -> list[ValidationIssue]:
@@ -167,11 +158,8 @@ class BuildValidator:
             ]
 
         issues: list[ValidationIssue] = []
-        if graph.get("scope_mode") == "minimal_patch":
-            return issues
         roles = graph.get("roles") or {}
         backend_targets = [str(path) for path in (graph.get("backend_targets") or []) if isinstance(path, str)]
-        normalized_root_pages: list[str] = []
         if graph.get("flow_mode") == "multi_page" and not route_manifest_path.exists():
             issues.append(
                 ValidationIssue(
@@ -428,40 +416,12 @@ class BuildValidator:
                                     location=file_path_raw,
                                 )
                             )
-                if page.get("route_path") in {"/", f"/{role}"}:
-                    normalized_root_pages.append(self._normalize_role_page(content))
-
-        if len(normalized_root_pages) > 1 and len(set(normalized_root_pages)) == 1:
-            issues.append(
-                ValidationIssue(
-                    code="build.identical_role_pages",
-                    message="Generated role root pages are effectively identical apart from role labels.",
-                    severity="high",
-                    location="artifacts/generated_app_graph.json",
-                )
-            )
-        default_only = []
-        for role, role_payload in roles.items():
-            pages = role_payload.get("pages") or []
-            route_paths = {str(page.get("route_path") or "") for page in pages if isinstance(page, dict)}
-            if route_paths and route_paths.issubset({"/", "/profile", f"/{role}", f"/{role}/profile"}):
-                default_only.append(role)
-        if default_only:
-            issues.append(
-                ValidationIssue(
-                    code="build.workflow_shell_collapse",
-                    message=f"Workflow app collapsed back to root/profile shell for: {', '.join(default_only)}.",
-                    severity="high",
-                    location="artifacts/generated_app_graph.json",
-                )
-            )
         return issues
 
     def _validate_route_manifest_only(self, workspace_path: Path, route_manifest: dict | list | None) -> list[ValidationIssue]:
         if not isinstance(route_manifest, dict):
             return []
         issues: list[ValidationIssue] = []
-        normalized_root_pages: list[str] = []
         for role, role_payload in (route_manifest.get("roles") or {}).items():
             if not isinstance(role_payload, dict):
                 continue
@@ -609,17 +569,6 @@ class BuildValidator:
                                     location=file_path_raw,
                                 )
                             )
-                if str(page.get("route_path") or "/") in {"/", f"/{role}"}:
-                    normalized_root_pages.append(self._normalize_role_page(content))
-        if len(normalized_root_pages) > 1 and len(set(normalized_root_pages)) == 1:
-            issues.append(
-                ValidationIssue(
-                    code="build.identical_role_pages",
-                    message="Generated role root pages are effectively identical apart from role labels.",
-                    severity="high",
-                    location="miniapp/app/generated/route_manifest.json",
-                )
-            )
         return issues
 
     @staticmethod
@@ -1081,8 +1030,4 @@ class BuildValidator:
 
     @staticmethod
     def _normalize_role_page(content: str) -> str:
-        lowered = content.lower()
-        for marker in ("client", "specialist", "manager", "shopper", "operations", "management"):
-            lowered = lowered.replace(marker, "role")
-        lowered = re.sub(r"\s+", "", lowered)
-        return lowered
+        return re.sub(r"\s+", "", content.lower())

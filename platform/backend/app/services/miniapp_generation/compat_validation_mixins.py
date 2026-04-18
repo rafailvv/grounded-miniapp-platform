@@ -14,6 +14,7 @@ class CompatValidationMixins:
             "_has_visible_loading_surface": GenerationEditGate,
             "_has_business_surface": GenerationEditGate,
             "_empty_business_container_count": GenerationEditGate,
+            "_edit_gate_issues": GenerationEditGate,
             "_preflight_backend_syntax_issues": GenerationPreflightValidation,
             "_preflight_frontend_syntax_issues": GenerationPreflightValidation,
             "_preflight_profile_schema_issues": GenerationPreflightValidation,

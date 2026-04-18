@@ -128,7 +128,7 @@ class GenerationPreflightValidation:
         page_graph: dict[str, Any],
         role_scope: list[str],
         *,
-        normalize_local_route_ref: Any,
+        normalize_local_route_ref: Any | None = None,
     ) -> list[ValidationIssue]:
         manifest_path = draft_root / "miniapp/app/generated/route_manifest.json"
         if not manifest_path.exists():
@@ -137,6 +137,7 @@ class GenerationPreflightValidation:
             route_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
             return []
+        normalize_local_route_ref = normalize_local_route_ref or cls._normalize_local_route_ref
         declared_routes: set[str] = set()
         for role in role_scope:
             for page in (((route_manifest.get("roles") or {}).get(role) or {}).get("pages") or []):

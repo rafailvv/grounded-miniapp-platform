@@ -2,16 +2,31 @@ from __future__ import annotations
 
 import re
 
+from app.modules.miniapp_generation_runtime.generation_contract_api_routes_support import MiniappGenerationContractApiRoutesSupport
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
 from app.models.domain import DraftFileOperation
 
 
 class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
+    @staticmethod
+    def _needs_profile_contract_repair(profiles_content: str) -> bool:
+        return any(marker in str(profiles_content or "") for marker in ("DEFAULT_PROFILES", "_get_or_create(", "_get_or_create_profile_record("))
+
+    @staticmethod
+    def _needs_route_schema_contract_repair(imported_names: set[str], schemas_content: str) -> bool:
+        updated_schemas = str(schemas_content or "")
+        return (
+            ("RequestDetail" in imported_names and "class RequestDetail" not in updated_schemas)
+            or ("RoleProfile" in imported_names and "class RoleProfile" not in updated_schemas)
+            or ("RoleProfile" in imported_names and "AppRole =" not in updated_schemas)
+        )
+
     def _synchronize_profile_schema_contract(
         self,
         workspace_id: str,
         draft_run_id: str,
         operations: list[DraftFileOperation],
+        contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
         profiles_path = "miniapp/app/routes/profiles.py"
@@ -20,6 +35,14 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
         schemas_content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, schemas_path)
         if not profiles_content or not schemas_content:
             return operations
+        if self._needs_profile_contract_repair(profiles_content):
+            operation_map[profiles_path] = DraftFileOperation(
+                file_path=profiles_path,
+                operation="replace",
+                content=MiniappGenerationContractApiRoutesSupport._deterministic_profiles_route_source(),
+                reason="Pre-apply contract sync: strip placeholder profile persistence and restore DB-backed empty-profile behavior.",
+            )
+            profiles_content = operation_map[profiles_path].content
         if "from app.schemas import" not in profiles_content or "RoleProfile" not in profiles_content:
             return operations
         updated_schemas = schemas_content
@@ -108,6 +131,7 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
         workspace_id: str,
         draft_run_id: str,
         operations: list[DraftFileOperation],
+        contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
         schemas_path = "miniapp/app/schemas.py"
@@ -125,6 +149,8 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
                 imported_names.update({part.strip() for part in match.group(1).replace("\n", " ").split(",") if part.strip()})
             for match in re.finditer(r"from\s+app\.schemas\s+import\s+([A-Za-z0-9_, ]+)", content):
                 imported_names.update({part.strip() for part in match.group(1).split(",") if part.strip()})
+        if not self._needs_route_schema_contract_repair(imported_names, schemas_content):
+            return operations
         updated_schemas = schemas_content
         if "RequestDetail" in imported_names and "class RequestDetail" not in updated_schemas:
             if "Field" not in updated_schemas and "from pydantic import" in updated_schemas:

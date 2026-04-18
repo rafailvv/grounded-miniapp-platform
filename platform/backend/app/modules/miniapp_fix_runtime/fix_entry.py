@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -34,6 +35,15 @@ class FixEntryRuntime:
         del role_scope
         scope_entries = []
         scope_expansions: list[dict[str, object]] = []
+
+        def _call_plan_patch(*, prompt_context):
+            planner = self.service._plan_patch
+            parameters = inspect.signature(planner).parameters
+            if "prompt_context" in parameters or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+                return planner(job=job, prompt_context=prompt_context)
+            if "repair_packet" in parameters:
+                return planner(job=job, repair_packet=prompt_context)
+            return planner(job=job, prompt_context=prompt_context)
 
         def _execute_checks(changed_files: list[str]):
             return self.service._execute_exact_checks(
@@ -106,26 +116,6 @@ class FixEntryRuntime:
                     "repeated_no_progress": repeated_no_progress,
                 },
             )
-            deterministic_operations = self.service._deterministic_contract_repair_operations(
-                workspace_id=workspace_id,
-                run_id=run_id,
-                fix_turn=fix_turn,
-                scope_entries=scope_entries,
-                generation_mode=effective_mode,
-            )
-            if deterministic_operations:
-                return WorkspaceLoopTurnPlan(
-                    outcome="patch_ready",
-                    assistant_message="Applied deterministic contract repair before model editing.",
-                    diagnosis="Applied deterministic contract repair before model editing.",
-                    operations=deterministic_operations,
-                    files_read=[entry.file_path for entry in scope_entries],
-                    failure_class=fix_turn.failure_class,
-                    failure_signature=fix_turn.failure_signature,
-                    root_cause_summary=fix_turn.root_cause_summary,
-                    fix_targets=list(fix_turn.implicated_files),
-                    metadata={"source": "deterministic_contract_repair"},
-                )
             prompt_context = self.service._build_repair_packet(
                 workspace_id=workspace_id,
                 run_id=run_id,
@@ -142,11 +132,12 @@ class FixEntryRuntime:
                 "Prepared repair packet for the current failure bundle.",
                 {"attempt": attempt, "scope": [entry.file_path for entry in scope_entries], "context_mode": prompt_context.context_mode},
             )
-            llm_result = self.service._plan_patch(job=job, prompt_context=prompt_context)
+            llm_result = _call_plan_patch(prompt_context=prompt_context)
             repair_outcome = self.service._repair_outcome_from_response(
                 llm_result=llm_result,
                 prompt_context=prompt_context,
                 fix_turn=fix_turn,
+                scope_entries=scope_entries,
                 scope_expansions=scope_expansions,
             )
             mapped_outcome = repair_outcome.outcome
@@ -186,10 +177,11 @@ class FixEntryRuntime:
             apply_contract_sync=lambda operations: self.service.generation_service._run_pre_apply_contract_pass(
                 workspace_id=workspace_id,
                 draft_run_id=run_id,
-                page_graph=self.service._page_graph_for_deterministic_repair(workspace_id, run_id),
+                page_graph=self.service._page_graph_for_run(workspace_id, run_id),
                 role_scope=self.service._role_scope_for_fix_request(workspace_id, run_id, request),
                 generation_mode=effective_mode,
                 operations=list(operations),
+                contract_sync_mode="repair_invariants",
             )
             if self.service.generation_service is not None
             else list(operations),

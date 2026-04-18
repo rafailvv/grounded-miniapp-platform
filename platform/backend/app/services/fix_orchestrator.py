@@ -217,11 +217,12 @@ class FixOrchestrator:
 
     def _build_fix_case(self, **kwargs: Any) -> FixTurnContext:
         workspace_id = kwargs["workspace_id"]
+        memory_context = kwargs.pop(
+            "memory_context",
+            (self.store.get("reports", f"project_memory_context:{workspace_id}") or {}).get("summary"),
+        )
         return self.fix_turn_builder.build_turn_context(
-            memory_context=kwargs.get(
-                "memory_context",
-                (self.store.get("reports", f"project_memory_context:{workspace_id}") or {}).get("summary"),
-            ),
+            memory_context=memory_context,
             augment_failure_evidence=self._augment_failure_evidence_from_test_results,
             implicated_files=self._implicated_files,
             specialized_failure_class=self._specialized_failure_class,
@@ -242,7 +243,6 @@ class FixOrchestrator:
         return self.fix_turn_builder.build_prompt_context(
             collect_file_contexts=self._collect_file_contexts,
             merge_additional_context_paths=self._merge_additional_context_paths,
-            deterministic_contract_seed_paths=self._deterministic_contract_seed_paths,
             current_diff_summary=self._current_diff_summary,
             **kwargs,
         )
@@ -295,10 +295,6 @@ class FixOrchestrator:
     def _build_write_scope(self, workspace_id: str, run_id: str, implicated_files: list[str], failure_class: str, existing_scope: list[FixScopeEntry]):
         return self.fix_scope.build_write_scope(workspace_id, run_id, implicated_files, failure_class, existing_scope)
 
-    @staticmethod
-    def _deterministic_companion_scope(file_path: str) -> list[str]:
-        return FixScopeRuntime.deterministic_companion_scope(file_path)
-
     def _structural_scope_bundle(self, workspace_id: str, run_id: str, implicated_files: list[str], failure_class: str) -> list[str]:
         return self.fix_scope.structural_scope_bundle(workspace_id, run_id, implicated_files, failure_class)
 
@@ -312,14 +308,8 @@ class FixOrchestrator:
     def _collect_file_contexts(self, workspace_id: str, run_id: str, scope_entries, *, fix_turn: FixTurnContext | None = None, budget_override: int | None = None, full_files: bool = False):
         return self.fix_context.collect_file_contexts(workspace_id, run_id, scope_entries, fix_turn=fix_turn, budget_override=budget_override, full_files=full_files)
 
-    def _deterministic_contract_repair_operations(self, **kwargs: Any):
-        return self.fix_scope.deterministic_contract_repair_operations(**kwargs)
-
-    def _page_graph_for_deterministic_repair(self, workspace_id: str, run_id: str) -> dict[str, Any]:
-        return self.fix_scope.page_graph_for_deterministic_repair(workspace_id, run_id)
-
-    def _deterministic_contract_seed_paths(self, workspace_id: str, run_id: str, fix_turn: FixTurnContext, scope_entries):
-        return self.fix_scope.deterministic_contract_seed_paths(workspace_id, run_id, fix_turn, scope_entries)
+    def _page_graph_for_run(self, workspace_id: str, run_id: str) -> dict[str, Any]:
+        return self.fix_scope.page_graph_for_run(workspace_id, run_id)
 
     @staticmethod
     def _looks_like_context_refusal(diagnosis: str) -> bool:

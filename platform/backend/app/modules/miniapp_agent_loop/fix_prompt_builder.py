@@ -41,20 +41,6 @@ class FixPromptBuilder:
             required_exports.append("get_db")
         return {
             "strict_green": True,
-            "content_first_role_roots": {
-                "client": ["profile_card", "summary_metrics", "primary_actions", "requests_empty_state"],
-                "specialist": ["profile_card", "summary_metrics", "queue_empty_state", "availability_panel"],
-                "manager": ["profile_card", "oversight_metrics", "approval_panel", "conflict_panel"],
-            },
-            "runtime_manifest_aliases": {"sample": "client"},
-            "canonical_api_aliases": {
-                "submission": "requests",
-                "submissions": "requests",
-                "booking": "requests",
-                "bookings": "requests",
-                "specialist": "users",
-                "specialists": "users",
-            },
             "required_api_routes": required_api_routes,
             "required_role_routes": required_role_routes,
             "required_exports": required_exports,
@@ -159,7 +145,6 @@ class FixPromptBuilder:
                     "failing_checks": repair_packet.failing_checks,
                     "normalized_critical_issues": repair_packet.normalized_critical_issues,
                     "failing_file_paths": repair_packet.failing_file_paths,
-                    "deterministic_companions": repair_packet.deterministic_companions,
                     "expected_contract": repair_packet.expected_contract,
                     "file_contexts": repair_packet.file_contexts,
                     "read_only_surfaces": repair_packet.read_only_surfaces,
@@ -170,8 +155,8 @@ class FixPromptBuilder:
                 "rules": [
                     "Fix only the current root-cause cluster before moving on.",
                     "Return the smallest safe patch.",
-                    "Prefer editing the failing file and its deterministic bundle companions over broad refactors.",
-                    "Treat repair_packet.expected_contract and deterministic_companions as the source of truth for repair scope.",
+                    "Prefer editing the implicated failing files first and expand only when adjacent structural files are genuinely required.",
+                    "Treat failing_checks, failing_file_paths, file_contexts, and hard runtime invariants as the source of truth for repair scope.",
                     "Only change generated app code. Generated tests, generated manifests, and platform runtime assets are read-only.",
                     "Do not modify miniapp/tests/*; default to repairing app code instead of test code.",
                     "Do not modify generated manifests such as route_manifest.json or generated_app_graph.json; repair the application bundle so the deterministic manifest builder stays correct.",
@@ -197,9 +182,8 @@ class FixPromptBuilder:
                     repair_packet.failure_class or "unknown",
                     repair_packet.failure_signature or "unknown",
                     repair_packet.context_mode,
-                    ",".join(sorted(repair_packet.deterministic_companions)),
+                    ",".join(sorted(repair_packet.failing_file_paths)),
                 ]
             ).encode("utf-8")
         ).hexdigest()
         return f"fix:{digest}"
-

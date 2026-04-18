@@ -23,6 +23,10 @@ const RUNTIME_MANIFEST_PATH = path.join(APP_DIR, 'generated', 'runtime_manifest.
 const GROUNDED_SPEC_PATH = path.join(MINIAPP_DIR, '..', 'artifacts', 'grounded_spec.json');
 const ROLES = __ROLES_LITERAL__;
 
+function stripRouteTemplateExpressions(content) {
+  return String(content || '').replace(/\$\{[^}]+\}/g, 'sample');
+}
+
 function loadJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }

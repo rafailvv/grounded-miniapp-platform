@@ -26,6 +26,7 @@ class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
         workspace_id: str,
         draft_run_id: str,
         operations: list[DraftFileOperation],
+        contract_sync_mode: str = "bootstrap_only",
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
         route_templates = {
@@ -41,25 +42,49 @@ class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
             "miniapp/app/routes/workload.py": MiniappGenerationContractApiRoutesSupport._deterministic_workload_route_source(),
             "miniapp/app/routes/time_slots.py": MiniappGenerationContractApiRoutesSupport._deterministic_time_slots_route_source(),
         }
+        bootstrap_only_paths = {
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/manager.py",
+            "miniapp/app/routes/runtime.py",
+            "miniapp/app/routes/profiles.py",
+        }
         for file_path, template in route_templates.items():
             content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
             if content is None:
-                if file_path in {"miniapp/app/routes/comments.py", "miniapp/app/routes/runtime.py"}:
+                if file_path in bootstrap_only_paths:
                     operation_map[file_path] = DraftFileOperation(
                         file_path=file_path,
                         operation="replace",
                         content=template,
-                        reason="Pre-apply contract sync: materialize the canonical DB-backed workflow route module.",
+                        reason="Pre-apply contract sync: bootstrap a missing runtime route module from the template contract.",
                     )
                 continue
-            if not (self._route_module_needs_stub(content) or self._route_module_requires_db_backed_repair(file_path, content)):
+            if self._route_module_needs_stub(content) and file_path in bootstrap_only_paths:
+                operation_map[file_path] = DraftFileOperation(
+                    file_path=file_path,
+                    operation="replace",
+                    content=template,
+                    reason="Pre-apply contract sync: replace an empty route stub with a minimal bootstrap contract.",
+                )
                 continue
-            operation_map[file_path] = DraftFileOperation(
-                file_path=file_path,
-                operation="replace",
-                content=template,
-                reason="Pre-apply contract sync: replace invalid workflow route module with the canonical DB-backed contract.",
-            )
+            if self._route_module_requires_db_backed_repair(file_path, content) and file_path in bootstrap_only_paths:
+                operation_map[file_path] = DraftFileOperation(
+                    file_path=file_path,
+                    operation="replace",
+                    content=template,
+                    reason="Pre-apply contract sync: restore a hard-invariant DB-backed route module when placeholder persistence leaked into the draft.",
+                )
+                continue
+            if contract_sync_mode == "repair_invariants" and file_path.endswith("/runtime.py"):
+                normalized = self._normalize_runtime_route_module_source(content)
+                if normalized != content:
+                    operation_map[file_path] = DraftFileOperation(
+                        file_path=file_path,
+                        operation="replace",
+                        content=normalized,
+                        reason="Pre-apply contract sync: normalize runtime route ownership without regenerating the whole app route layer.",
+                    )
         return list(operation_map.values())
 
     @staticmethod
@@ -84,20 +109,10 @@ class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
     def _route_module_requires_db_backed_repair(file_path: str, content: str) -> bool:
         normalized_path = str(file_path or "").strip().replace("\\", "/")
         normalized = str(content or "")
-        if normalized_path.endswith("/requests.py"):
-            return "placeholder =" in normalized or "return create_request(" in normalized
-        if normalized_path.endswith("/assignments.py"):
-            return "INSERT OR IGNORE INTO requests" in normalized
-        if normalized_path.endswith("/profiles.py"):
-            return "DEFAULT_PROFILES" in normalized
-        if normalized_path.endswith(("/client.py", "/specialist.py", "/manager.py")):
-            return any(marker in normalized for marker in ("Jinja2Templates", "TemplateResponse")) or "FileResponse" not in normalized
         if normalized_path.endswith("/runtime.py"):
             return any(marker in normalized for marker in ("DEMO_REQUESTS", "/actions/{action_id}", "runtime_action("))
-        if normalized_path.endswith("/workload.py"):
-            return "/api/runtime/" in normalized
-        if normalized_path.endswith("/users.py"):
-            return any(marker in normalized for marker in ("Alex Specialist", "Nina Specialist", "Maria Manager"))
+        if normalized_path.endswith("/profiles.py"):
+            return any(marker in normalized for marker in ("DEFAULT_PROFILES", "_get_or_create(", "_get_or_create_profile_record("))
         return False
 
     @staticmethod

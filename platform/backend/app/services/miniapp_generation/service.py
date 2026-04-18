@@ -75,43 +75,6 @@ from app.modules.miniapp_validation import GenerationEditGate, GenerationPreflig
 from app.modules.miniapp_agent_loop.engine import WorkspaceLoopEngine
 from app.validators.suite import ValidationSuite
 
-
-THIN_ROLE_PAGE_BLUEPRINTS = {
-    "client": (
-        {"route_path": "/", "page_kind": "landing", "navigation_label": "Home", "title": "Dashboard"},
-        {"route_path": "/create", "page_kind": "form", "navigation_label": "New Request", "title": "New Request"},
-        {"route_path": "/requests", "page_kind": "list", "navigation_label": "Requests", "title": "My Requests"},
-        {"route_path": "/requests/:requestId", "page_kind": "detail", "navigation_label": "Details", "title": "Request Details"},
-        {"route_path": "/profile", "page_kind": "profile", "navigation_label": "Profile", "title": "Profile"},
-    ),
-    "specialist": (
-        {"route_path": "/", "page_kind": "landing", "navigation_label": "Home", "title": "Dashboard"},
-        {"route_path": "/requests", "page_kind": "list", "navigation_label": "Assigned", "title": "Assigned Requests"},
-        {"route_path": "/requests/:requestId", "page_kind": "detail", "navigation_label": "Details", "title": "Request Details"},
-        {"route_path": "/profile", "page_kind": "profile", "navigation_label": "Profile", "title": "Profile"},
-    ),
-    "manager": (
-        {"route_path": "/", "page_kind": "landing", "navigation_label": "Home", "title": "Dashboard"},
-        {"route_path": "/requests", "page_kind": "list", "navigation_label": "Requests", "title": "All Requests"},
-        {"route_path": "/requests/:requestId", "page_kind": "detail", "navigation_label": "Details", "title": "Request Details"},
-        {"route_path": "/workload", "page_kind": "workspace", "navigation_label": "Workload", "title": "Team Workload"},
-        {"route_path": "/profile", "page_kind": "profile", "navigation_label": "Profile", "title": "Profile"},
-    ),
-}
-THIN_CORE_BACKEND_TARGETS = (
-    "miniapp/app/main.py",
-    "miniapp/app/db.py",
-    "miniapp/app/schemas.py",
-    "miniapp/app/routes/profiles.py",
-)
-THIN_OPTIONAL_ROUTE_TARGETS = {
-    "requests": "miniapp/app/routes/requests.py",
-    "comments": "miniapp/app/routes/comments.py",
-    "assignments": "miniapp/app/routes/assignments.py",
-    "users": "miniapp/app/routes/users.py",
-    "workload": "miniapp/app/routes/workload.py",
-    "time_slots": "miniapp/app/routes/time_slots.py",
-}
 ACTIVE_LLM_CACHE_CONTEXT: ContextVar[dict[str, str] | None] = ContextVar("active_llm_cache_context", default=None)
 ACTIVE_LLM_CACHE_STATS: ContextVar[dict[str, Any] | None] = ContextVar("active_llm_cache_stats", default=None)
 QUALITY_FIDELITY = {
@@ -146,6 +109,38 @@ class GenerationService(
     WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS = 240
     STRUCTURED_LLM_TIMEOUT_SECONDS = 180
     JSON_OBJECT_LLM_TIMEOUT_SECONDS = 120
+
+    @classmethod
+    def _compat_owner_factories(cls) -> dict[str, Any]:
+        return {
+            "grounded_spec_orchestration": GroundedSpecOrchestrationRuntime,
+            "generation_completion": MiniappGenerationCompletion,
+            "generation_repair": MiniappGenerationRepair,
+            "generation_entry": MiniappGenerationEntry,
+            "generation_resume": MiniappGenerationResume,
+            "generation_plan_runtime": MiniappGenerationPlanRuntime,
+            "generation_role_contract": MiniappGenerationRoleContract,
+            "generation_code_plan": MiniappGenerationCodePlan,
+            "generation_code_plan_defaults": MiniappGenerationCodePlanDefaults,
+            "generation_code_plan_prompts": MiniappGenerationCodePlanPrompts,
+            "generation_code_plan_normalization": MiniappGenerationCodePlanNormalization,
+            "generation_codegen": MiniappGenerationCodegen,
+            "generation_codegen_clusters": MiniappGenerationCodegenClusters,
+            "generation_codegen_prompts": MiniappGenerationCodegenPrompts,
+            "generation_codegen_selection": MiniappGenerationCodegenSelection,
+            "generation_targeting": MiniappGenerationTargeting,
+            "generation_page_graph_runtime": MiniappGenerationPageGraphRuntime,
+            "generation_progress_reporting": GenerationProgressReportingRuntime,
+            "generation_reporting": MiniappGenerationReporting,
+            "generation_reporting_compaction": MiniappGenerationReportingCompaction,
+            "generation_reporting_repair": MiniappGenerationReportingRepair,
+            "generation_edit_gate": lambda _service: GenerationEditGate(),
+            "generation_preflight_validation": lambda _service: GenerationPreflightValidation(),
+            "generation_contract_pass": MiniappGenerationContractPass,
+            "generation_contract_schema": MiniappGenerationContractSchema,
+            "generation_contract_routes": MiniappGenerationContractRoutes,
+            "generation_contract_frontend": MiniappGenerationContractFrontend,
+        }
 
     def __init__(
         self,
@@ -351,9 +346,6 @@ class GenerationService(
             grounded_spec=grounded_spec,
             role_scope=role_scope,
             workspace_tree=workspace_tree,
-            thin_core_backend_targets=THIN_CORE_BACKEND_TARGETS,
-            thin_optional_route_targets=THIN_OPTIONAL_ROUTE_TARGETS,
-            thin_role_page_blueprints=THIN_ROLE_PAGE_BLUEPRINTS,
             design_reference_files=DESIGN_REFERENCE_FILES,
             default_page_file=self._default_page_file,
             default_page_asset_path=self._default_page_asset_path,
@@ -367,14 +359,14 @@ class GenerationService(
         )
 
     def _thin_role_pages_for_role(self, *, role: str, prompt: str, grounded_spec: GroundedSpecModel) -> list[dict[str, Any]]:
-        return thin_role_pages_for_role(role=role, prompt=prompt, grounded_spec=grounded_spec, thin_role_page_blueprints=THIN_ROLE_PAGE_BLUEPRINTS, default_page_file=self._default_page_file, default_page_asset_path=self._default_page_asset_path, default_handoff_paths_for_page_kind=self._default_handoff_paths_for_page_kind)
+        return thin_role_pages_for_role(role=role, prompt=prompt, grounded_spec=grounded_spec, default_page_file=self._default_page_file, default_page_asset_path=self._default_page_asset_path, default_handoff_paths_for_page_kind=self._default_handoff_paths_for_page_kind)
 
     @staticmethod
     def _thin_page_slug_for_route(route_path: str) -> str:
         return thin_page_slug_for_route(route_path)
 
     def _thin_backend_targets_from_spec(self, *, prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str]) -> list[str]:
-        return thin_backend_targets_from_spec(prompt=prompt, grounded_spec=grounded_spec, role_scope=role_scope, thin_optional_route_targets=THIN_OPTIONAL_ROUTE_TARGETS)
+        return thin_backend_targets_from_spec(prompt=prompt, grounded_spec=grounded_spec, role_scope=role_scope)
 
     @staticmethod
     def _mentions_schedule_or_time(prompt: str, grounded_spec: GroundedSpecModel) -> bool:

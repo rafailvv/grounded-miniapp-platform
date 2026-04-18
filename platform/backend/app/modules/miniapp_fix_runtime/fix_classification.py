@@ -50,7 +50,7 @@ class FixClassificationRuntime:
     ) -> str | None:
         lowered = combined_text.lower()
         issue_codes = {issue.code for issue in CheckRunner.failing_issues(results)}
-        if {"build.loading_first_root_surface", "build.root_page_missing_business_surface"} & issue_codes:
+        if "build.loading_first_root_surface" in issue_codes:
             return "loading_first_root_surface"
         if (
             ("no module named 'flask'" in lowered or 'no module named "flask"' in lowered or "from flask import" in lowered)

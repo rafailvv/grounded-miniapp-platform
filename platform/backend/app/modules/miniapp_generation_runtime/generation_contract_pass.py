@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Literal
 
 from app.models.common import GenerationMode
 from app.models.domain import DraftFileOperation
@@ -10,6 +11,14 @@ from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerati
 
 
 class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
+    ContractSyncMode = Literal["bootstrap_only", "repair_invariants"]
+    _FORBIDDEN_GENERATED_ARTIFACTS = (
+        "miniapp/app/generated/static_runtime_manifest.json",
+        "miniapp/app/generated/role_seed.json",
+        "miniapp/app/generated/role_experience.json",
+        "miniapp/app/generated/runtime_state.json",
+    )
+
     def _ensure_runtime_artifact_operations(
         self,
         *,
@@ -51,32 +60,69 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
         role_scope: list[str],
         generation_mode: GenerationMode,
         operations: list[DraftFileOperation],
+        contract_sync_mode: ContractSyncMode = "bootstrap_only",
     ) -> list[DraftFileOperation]:
-        ensured = self._ensure_runtime_artifact_operations(
-            grounded_spec=self._resolve_grounded_spec_for_contract_pass(
+        grounded_spec: GroundedSpecModel | None = None
+        try:
+            grounded_spec = self._resolve_grounded_spec_for_contract_pass(
                 workspace_id=workspace_id,
                 draft_run_id=draft_run_id,
                 operations=operations,
-            ),
-            page_graph=page_graph,
-            role_scope=role_scope,
-            generation_mode=generation_mode,
-            operations=operations,
+            )
+        except ValueError:
+            if contract_sync_mode != "repair_invariants":
+                raise
+        ensured = (
+            self._ensure_runtime_artifact_operations(
+                grounded_spec=grounded_spec,
+                page_graph=page_graph,
+                role_scope=role_scope,
+                generation_mode=generation_mode,
+                operations=operations,
+            )
+            if grounded_spec is not None
+            else list(operations)
         )
-        ensured = self._synchronize_profile_schema_contract(workspace_id, draft_run_id, ensured)
-        ensured = self._synchronize_route_schema_contract(workspace_id, draft_run_id, ensured)
+        ensured = self._remove_seeded_generated_artifacts(operations=ensured)
+        ensured = self._synchronize_minimal_workflow_route_contracts(
+            workspace_id,
+            draft_run_id,
+            ensured,
+            contract_sync_mode=contract_sync_mode,
+        )
+        if contract_sync_mode == "repair_invariants":
+            ensured = self._synchronize_profile_schema_contract(
+                workspace_id,
+                draft_run_id,
+                ensured,
+                contract_sync_mode=contract_sync_mode,
+            )
+            ensured = self._synchronize_route_schema_contract(
+                workspace_id,
+                draft_run_id,
+                ensured,
+                contract_sync_mode=contract_sync_mode,
+            )
         ensured = self.runtime_contract_sync.synchronize(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
             operations=ensured,
+            contract_sync_mode=contract_sync_mode,
         )
-        ensured = self._synchronize_minimal_workflow_route_contracts(workspace_id, draft_run_id, ensured)
-        ensured = self._synchronize_frontend_api_contract(workspace_id, draft_run_id, ensured)
+        if contract_sync_mode != "repair_invariants":
+            return ensured
+        ensured = self._synchronize_frontend_api_contract(
+            workspace_id,
+            draft_run_id,
+            ensured,
+            contract_sync_mode=contract_sync_mode,
+        )
         return self._synchronize_basic_page_state_contract(
             workspace_id,
             draft_run_id,
             page_graph=page_graph,
             operations=ensured,
+            contract_sync_mode=contract_sync_mode,
         )
 
     @staticmethod
@@ -116,3 +162,18 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
                 except Exception:
                     pass
             raise ValueError("grounded_spec.json is required for the contract pass and was not found in the draft or reports.")
+
+    def _remove_seeded_generated_artifacts(
+        self,
+        *,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        for file_path in self._FORBIDDEN_GENERATED_ARTIFACTS:
+            operation_map[file_path] = DraftFileOperation(
+                file_path=file_path,
+                operation="delete",
+                content=None,
+                reason="Pre-apply contract sync: remove legacy generated seed artifacts so runtime state is derived from real code and DB data only.",
+            )
+        return list(operation_map.values())

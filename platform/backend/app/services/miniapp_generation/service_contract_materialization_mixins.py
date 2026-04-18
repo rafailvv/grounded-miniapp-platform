@@ -91,8 +91,31 @@ class ServiceContractMaterializationMixins:
         from app.services.miniapp_generation.service import GenerationService
         return PageGraphValidation.page_graph_gate_issues(page_graph, role_scope, scope_mode=scope_mode, require_multi_page=require_multi_page, require_business_pages=require_business_pages, normalize_role_route_path=lambda role, route_path, index: GenerationService._normalize_role_route_path(role, route_path, index=index), is_business_page=GenerationService._is_business_page, is_canonical_target_path=GenerationService._is_canonical_target_path)
 
-    def _edit_gate_issues(self, page_graph: dict[str, Any], operations: list[DraftFileOperation], role_scope: list[str], *, scope_mode: str, target_files: list[str], require_business_pages: bool) -> list[str]:
-        return self.generation_edit_gate.edit_gate_issues(page_graph, operations, role_scope, scope_mode=scope_mode, target_files=target_files, require_business_pages=require_business_pages, is_canonical_target_path=self._is_canonical_target_path, is_business_page=self._is_business_page, is_role_root_page=self._is_role_root_page)
+    @classmethod
+    def _edit_gate_issues(
+        cls,
+        page_graph: dict[str, Any],
+        operations: list[DraftFileOperation],
+        role_scope: list[str],
+        *,
+        scope_mode: str,
+        target_files: list[str],
+        require_business_pages: bool,
+    ) -> list[str]:
+        from app.modules.miniapp_validation import GenerationEditGate
+        from app.services.miniapp_generation.service import GenerationService
+
+        return GenerationEditGate.edit_gate_issues(
+            page_graph,
+            operations,
+            role_scope,
+            scope_mode=scope_mode,
+            target_files=target_files,
+            require_business_pages=require_business_pages,
+            is_canonical_target_path=GenerationService._is_canonical_target_path,
+            is_business_page=GenerationService._is_business_page,
+            is_role_root_page=GenerationService._is_role_root_page,
+        )
 
     def _preflight_generation_issues(self, *, draft_root: Path, changed_files: list[str], page_graph: dict[str, Any], role_scope: list[str], **_: Any) -> list[ValidationIssue]:
         return self.generation_preflight_validation.preflight_generation_issues(draft_root=draft_root, changed_files=changed_files, page_graph=page_graph, role_scope=role_scope, normalize_local_route_ref=self._normalize_local_route_ref)

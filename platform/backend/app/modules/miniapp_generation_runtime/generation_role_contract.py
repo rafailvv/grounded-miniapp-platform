@@ -27,13 +27,7 @@ class MiniappGenerationRoleContract:
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
-        if generation_mode == GenerationMode.FAST or self.should_use_compiled_role_contract(
-            prompt=prompt,
-            role_scope=role_scope,
-            intent=intent,
-            generation_mode=generation_mode,
-        ):
-            return {"role_contract": self.compiled_role_contract(grounded_spec, role_scope)}
+        del generation_mode
         try:
             payload = self.service._generate_structured_with_retry(
                 role="code_plan",
@@ -53,7 +47,10 @@ class MiniappGenerationRoleContract:
             role_contract = self.normalize_role_contract(normalized, role_scope)
             return {"role_contract": role_contract, "model": payload["model"]}
         except Exception as exc:
-            return {"error": f"Role architecture analysis failed: {exc}"}
+            return {
+                "role_contract": self.minimal_role_contract(grounded_spec, role_scope),
+                "fallback_reason": f"Role architecture analysis failed: {exc}",
+            }
 
     def should_use_compiled_role_contract(
         self,
@@ -63,14 +60,7 @@ class MiniappGenerationRoleContract:
         intent: str,
         generation_mode: GenerationMode,
     ) -> bool:
-        if generation_mode != GenerationMode.BALANCED:
-            return False
-        if self.service._scope_mode(intent, prompt, role_scope) == "minimal_patch":
-            return True
-        lowered = prompt.lower()
-        if len(role_scope) == len(ROLE_ORDER) and intent in {"create", "refine"}:
-            simple_markers = ("simple", "basic", "minimal", "fast", "quick draft", "template-safe")
-            return any(marker in lowered for marker in simple_markers)
+        del prompt, role_scope, intent, generation_mode
         return False
 
     def normalize_role_contract(self, payload: dict[str, Any], role_scope: list[str]) -> dict[str, Any]:
@@ -104,7 +94,7 @@ class MiniappGenerationRoleContract:
             "roles": roles,
         }
 
-    def compiled_role_contract(self, grounded_spec: GroundedSpecModel, role_scope: list[str]) -> dict[str, Any]:
+    def minimal_role_contract(self, grounded_spec: GroundedSpecModel, role_scope: list[str]) -> dict[str, Any]:
         entities = [entity.name for entity in grounded_spec.domain_entities if entity.name]
         flows = grounded_spec.user_flows
         roles: dict[str, dict[str, Any]] = {}
@@ -142,6 +132,9 @@ class MiniappGenerationRoleContract:
             "shared_logic": [flow.name for flow in flows[:4] if flow.name],
             "roles": roles,
         }
+
+    def compiled_role_contract(self, grounded_spec: GroundedSpecModel, role_scope: list[str]) -> dict[str, Any]:
+        return self.minimal_role_contract(grounded_spec, role_scope)
 
     @staticmethod
     def role_contract_schema() -> dict[str, Any]:
@@ -186,13 +179,11 @@ class MiniappGenerationRoleContract:
 
     @staticmethod
     def role_contract_system_prompt() -> str:
-        prompt = (
+        return (
             "You are the role analyst for a real mini-app coding workspace. "
             "Before planning files, separate what client, specialist, and manager each truly own. "
             "Do not collapse roles into relabeled versions of the same surface."
         )
-        GenerationService._assert_english_control_text(prompt)
-        return prompt
 
     def role_contract_user_prompt(
         self,

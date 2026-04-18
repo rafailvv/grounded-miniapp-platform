@@ -99,6 +99,16 @@ class MiniappGenerationReportingRepair(MiniappGenerationRuntimeOwner):
         for issue in build_issues:
             if issue.location in active_target_set:
                 causal.add(issue.location)
+            if issue.code in {"build.placeholder_role_surface", "build.placeholder_page"}:
+                for candidate in active_targets:
+                    normalized = candidate.replace("\\", "/")
+                    if normalized.startswith("miniapp/app/static/") and any(
+                        normalized.endswith(suffix)
+                        for suffix in ("/index.html", "/app.js", "/styles.css")
+                    ):
+                        role_segment = normalized.split("/")[3] if len(normalized.split("/")) > 3 else ""
+                        if role_segment in {"client", "specialist", "manager"}:
+                            causal.add(candidate)
             for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", issue.message):
                 endpoint_name = match.group(1)
                 causal.add(self._route_module_path_for_endpoint_name(endpoint_name))
@@ -126,6 +136,8 @@ class MiniappGenerationReportingRepair(MiniappGenerationRuntimeOwner):
                 "build.missing_role_routes",
                 "build.insufficient_routes",
                 "build.insufficient_pages",
+                "build.placeholder_role_surface",
+                "build.placeholder_page",
                 "build.missing_role_profile_page",
                 "build.page_missing_script_link",
                 "build.page_script_dom_contract",

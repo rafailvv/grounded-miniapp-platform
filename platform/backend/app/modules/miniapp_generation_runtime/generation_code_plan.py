@@ -26,7 +26,6 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
     ) -> dict[str, Any]:
         scope_mode = self._scope_mode(intent, prompt, role_scope)
         require_multi_page = self._requires_multi_page(prompt, grounded_spec, role_scope, intent)
-        require_business_pages = self._requires_business_pages(prompt, grounded_spec, role_scope, intent)
         strategy_reason = self._strategy_reason(intent, prompt, role_scope, require_multi_page=require_multi_page)
         workspace_tree = self.workspace_service.file_tree(workspace_id)
         corrective_prompt = self._planning_retry_prompt(prompt)
@@ -63,13 +62,13 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                     role_scope,
                     scope_mode=scope_mode,
                     require_multi_page=require_multi_page,
-                    require_business_pages=require_business_pages,
+                    require_business_pages=False,
                 )
                 planned["write_strategy"] = scope_mode
                 planned["strategy_reason"] = strategy_reason
                 planned["model"] = payload["model"]
                 planned["plan_gate_issues"] = plan_gate_issues
-                planned["require_business_pages"] = require_business_pages
+                planned["require_business_pages"] = False
                 if not plan_gate_issues or attempt + 1 >= attempts:
                     return planned
                 last_gate_issues = plan_gate_issues
@@ -196,30 +195,30 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                     future.cancel()
 
         if section_errors:
-            if not section_payloads:
+            graph_payload = section_payloads.get("graph")
+            if graph_payload is None:
                 raise RuntimeError(
                     "Code plan generation returned incomplete sections without a valid agent response: "
                     f"{section_errors}"
                 )
-            fallback_payload = self._deterministic_code_plan_payload(
-                prompt=prompt,
-                grounded_spec=grounded_spec,
-                role_scope=role_scope,
-                scope_mode=scope_mode,
-                require_multi_page=require_multi_page,
+            merged_payload = self._normalize_model_payload(graph_payload["payload"])
+            targeting_payload = section_payloads.get("targeting")
+            if targeting_payload is not None:
+                merged_payload.update(self._normalize_model_payload(targeting_payload["payload"]))
+            else:
+                merged_payload.setdefault("files_to_read", [])
+                merged_payload.setdefault("target_files", [])
+                merged_payload.setdefault("shared_files", [])
+                merged_payload.setdefault("backend_targets", [])
+            winning_model = str(
+                (targeting_payload or {}).get("model")
+                or graph_payload.get("model")
+                or "code-plan-partial"
             )
-            merged_payload = self._normalize_model_payload(fallback_payload["payload"])
-            winning_model = "deterministic-planner"
-            for section_name in ("graph", "targeting"):
-                section_payload = section_payloads.get(section_name)
-                if not section_payload:
-                    continue
-                merged_payload.update(self._normalize_model_payload(section_payload["payload"]))
-                winning_model = str(section_payload.get("model") or winning_model)
             self._append_trace(
                 workspace_id,
-                "code_plan_sections_partial_fallback",
-                "Code plan section timed out; merged successful sections with deterministic fallback.",
+                "code_plan_sections_partial_merge",
+                "Code plan section timed out; merged successful sections without deterministic planner fallback.",
                 {
                     "duration_ms": int((time.perf_counter() - sections_started) * 1000),
                     "section_errors": section_errors,
@@ -229,7 +228,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             return {
                 "model": winning_model,
                 "payload": merged_payload,
-                "response_mode": "code_plan_sections_partial_fallback",
+                "response_mode": "code_plan_sections_partial_merge",
             }
 
         self._append_trace(

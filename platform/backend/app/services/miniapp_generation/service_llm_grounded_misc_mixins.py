@@ -7,8 +7,9 @@ from contextvars import copy_context
 from pathlib import Path
 from typing import Any, Callable
 
+from app.models.artifacts import RunOutcomeKind
 from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
-from app.models.domain import JobRecord, RunOutcomeKind, ValidationSnapshot
+from app.models.domain import JobRecord, ValidationSnapshot
 from app.models.grounded_spec import APIRequirement, Actor, Assumption, Contradiction, EntityAttribute, GroundedSpecModel, UserFlow
 from app.modules.miniapp_generation_runtime import MiniappGroundedSpecBuilder, build_route_manifest, select_creative_direction
 from app.services.miniapp_generation.constants import ROLE_ORDER

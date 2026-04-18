@@ -675,7 +675,7 @@ def test_build_validator_accepts_distinct_multi_page_role_graph(tmp_path: Path) 
     assert "build.identical_role_pages" not in issue_codes
 
 
-def test_build_validator_flags_placeholder_and_identical_role_pages(tmp_path: Path) -> None:
+def test_build_validator_flags_placeholder_role_pages_without_identical_page_rail(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
     _create_workspace_scaffold(workspace_root)
     graph = _multi_page_graph()
@@ -696,8 +696,8 @@ def test_build_validator_flags_placeholder_and_identical_role_pages(tmp_path: Pa
 
     issues = BuildValidator().validate(workspace_root)
     issue_codes = {issue.code for issue in issues}
-    assert "build.placeholder_role_surface" in issue_codes
-    assert "build.identical_role_pages" in issue_codes
+    assert "build.placeholder_page" in issue_codes
+    assert "build.identical_role_pages" not in issue_codes
 
 
 def test_build_validator_flags_loading_first_role_root_surface(tmp_path: Path) -> None:
@@ -724,7 +724,6 @@ def test_build_validator_flags_loading_first_role_root_surface(tmp_path: Path) -
     issue_codes = {issue.code for issue in issues}
 
     assert "build.loading_first_root_surface" in issue_codes
-    assert "build.root_page_missing_business_surface" in issue_codes
 
 
 def test_build_validator_accepts_content_first_root_surface_without_pseudo_data(tmp_path: Path) -> None:
@@ -751,7 +750,6 @@ def test_build_validator_accepts_content_first_root_surface_without_pseudo_data(
     issue_codes = {issue.code for issue in issues}
 
     assert "build.loading_first_root_surface" not in issue_codes
-    assert "build.root_page_missing_business_surface" not in issue_codes
 
 
 def test_build_validator_flags_route_self_import(tmp_path: Path) -> None:
