@@ -95,7 +95,11 @@ class MiniappGenerationPageGraphRuntime(MiniappGenerationRuntimeOwner):
             backend_groups: dict[str, list[str]] = {}
             support_targets: list[str] = []
             for path in list(dict.fromkeys(backend_targets)):
-                if path.strip().replace("\\", "/") == "miniapp/app/routes/__init__.py":
+                normalized = path.strip().replace("\\", "/")
+                if normalized in {
+                    "miniapp/app/routes/__init__.py",
+                    "miniapp/app/routes/role_pages.py",
+                }:
                     continue
                 cluster_name = cls._backend_cluster_name_for_path(path)
                 if cluster_name == "backend_support":

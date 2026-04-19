@@ -54,7 +54,14 @@ def _extract_local_route_refs(content: str) -> set[str]:
         refs.add(match.group(1))
     for match in re.finditer(r"[\"\\'](/(?:client|specialist|manager)[^\"\\'#?]*)[\"\\']", content):
         refs.add(match.group(1))
-    return refs
+    filtered: set[str] = set()
+    for ref in refs:
+        normalized = ref.strip()
+        leaf = normalized.rsplit("/", 1)[-1].lower()
+        if leaf.endswith((".js", ".css", ".json", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp")):
+            continue
+        filtered.add(normalized)
+    return filtered
 
 
 def _extract_js_dom_ids(source: str) -> set[str]:

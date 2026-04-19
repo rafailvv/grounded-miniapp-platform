@@ -196,7 +196,11 @@ def _normalize_status(value: Any) -> str | None:
     compatibility = {
         "pending": "submitted" if "submitted" in allowed else ("pending" if "pending" in allowed else None),
         "claimed": "in_review" if "in_review" in allowed else ("claimed" if "claimed" in allowed else None),
-        "in_progress": "in_review" if "in_review" in allowed else ("in_progress" if "in_progress" in allowed else None),
+        "in_progress": (
+            "claimed"
+            if "claimed" in allowed
+            else ("issued" if "issued" in allowed else ("in_review" if "in_review" in allowed else ("in_progress" if "in_progress" in allowed else None)))
+        ),
         "submitted": "pending" if "submitted" not in allowed and "pending" in allowed else None,
         "in_review": "claimed" if "in_review" not in allowed and "claimed" in allowed else ("in_progress" if "in_progress" in allowed else None),
         "cancelled": "closed" if "cancelled" not in allowed and "closed" in allowed else None,
@@ -222,9 +226,10 @@ def _normalize_create_payload(payload: dict[str, Any]) -> BookingRequestCreate:
 
 
 def _normalize_update_payload(payload: dict[str, Any]) -> BookingRequestUpdate:
+    owner_field = "specialist_owner" if "specialist_owner" in getattr(BookingRequestUpdate, "model_fields", {}) else "owner"
     normalized = _filter_for_schema(BookingRequestUpdate, {
         "status": _normalize_status(payload.get("status") or payload.get("state")),
-        "specialist_owner": payload.get("specialist_owner") or payload.get("owner_role") or payload.get("owner"),
+        owner_field: payload.get("specialist_owner") or payload.get("owner_role") or payload.get("owner"),
         "returned_at": payload.get("returned_at"),
         "item_label": payload.get("item_label") or payload.get("assigned_item") or payload.get("equipment_details"),
         "issued_at": payload.get("issued_at"),
@@ -234,6 +239,8 @@ def _normalize_update_payload(payload: dict[str, Any]) -> BookingRequestUpdate:
 
 def _to_schema(record: BookingRequestRecord, conflict: bool = False) -> BookingRequestRead:
     record_id = getattr(record, "bookingrequest_id", getattr(record, "id", None))
+    read_fields = getattr(BookingRequestRead, "model_fields", {})
+    owner_field = "specialist_owner" if "specialist_owner" in read_fields else "owner"
     payload = _filter_for_schema(BookingRequestRead, {
         "id": record_id,
         "bookingrequest_id": record_id,
@@ -245,7 +252,7 @@ def _to_schema(record: BookingRequestRecord, conflict: bool = False) -> BookingR
         "reason": record.reason,
         "status": record.status,
         "requested_by": getattr(record, "requested_by", None),
-        "specialist_owner": getattr(record, "specialist_owner", getattr(record, "owner_role", None)),
+        owner_field: getattr(record, "specialist_owner", getattr(record, "owner", getattr(record, "owner_role", None))),
         "owner_role": getattr(record, "owner_role", None),
         "owner_assigned_at": getattr(record, "owner_assigned_at", None),
         "issued_at": getattr(record, "issued_at", None),
@@ -259,7 +266,7 @@ def _to_schema(record: BookingRequestRecord, conflict: bool = False) -> BookingR
         "conflict_note": getattr(record, "status_notes", None),
         "conflict": conflict,
     })
-    payload.setdefault("specialist_owner", getattr(record, "specialist_owner", getattr(record, "owner_role", None)))
+    payload.setdefault(owner_field, getattr(record, "specialist_owner", getattr(record, "owner", getattr(record, "owner_role", None))))
     payload.setdefault("issued_at", getattr(record, "issued_at", None))
     payload.setdefault("returned_at", getattr(record, "returned_at", None))
     return BookingRequestRead.model_validate(payload)
@@ -346,7 +353,7 @@ def update_booking_request(item_id: str, payload: dict[str, Any]) -> BookingRequ
             record.owner_role = normalized.owner_role
             if hasattr(record, "owner_assigned_at"):
                 record.owner_assigned_at = datetime.now(timezone.utc)
-        if normalized.item_label is not None:
+        if hasattr(normalized, "item_label") and normalized.item_label is not None:
             record.item_label = normalized.item_label
         if hasattr(normalized, "issued_at") and normalized.issued_at is not None and hasattr(record, "issued_at"):
             record.issued_at = normalized.issued_at
