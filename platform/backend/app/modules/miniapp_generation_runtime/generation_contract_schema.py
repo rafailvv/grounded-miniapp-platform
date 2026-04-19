@@ -12,6 +12,13 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
     @staticmethod
     def _needs_canonical_bookingrequests_route_repair(content: str) -> bool:
         normalized = str(content or "")
+        lowered = normalized.lower()
+        if not normalized.strip():
+            return True
+        if "/api/submissions/{table}" in lowered:
+            return True
+        if "@router.post(\"\")" not in normalized or "@router.get(\"\")" not in normalized or "@router.put(\"/{item_id}\")" not in normalized:
+            return True
         return any(
             marker in normalized
             for marker in (

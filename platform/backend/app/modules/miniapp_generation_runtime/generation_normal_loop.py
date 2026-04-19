@@ -92,6 +92,15 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
         return missing
 
     @staticmethod
+    def _has_invalid_datetime_timezone_call(py_source: str) -> bool:
+        return bool(
+            re.search(
+                r"DateTime\s*\(\s*timezone\s*\(\s*(?:True|False)\s*\)\s*\)",
+                py_source,
+            )
+        )
+
+    @staticmethod
     def _mapped_class_field_names(py_source: str, class_name: str) -> set[str]:
         return MiniappGenerationNormalLoop._class_field_names(py_source, class_name)
 
@@ -202,6 +211,10 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 except OSError:
                     draft_db_source = ""
                     source_db_source = ""
+                if self._has_invalid_datetime_timezone_call(draft_db_source) and not self._has_invalid_datetime_timezone_call(source_db_source):
+                    draft_db_path.write_text(source_db_source, encoding="utf-8")
+                    changed_files.add("miniapp/app/db.py")
+                    draft_db_source = source_db_source
                 required_db_fields = self._record_constructor_kwargs(draft_route_source, "BookingRequestRecord")
                 required_db_fields.update(self._record_class_attr_reads(draft_route_source, "BookingRequestRecord"))
                 for field_name in ("requested_at", "status_updated_at", "updated_at", "owner_assigned_at", "returned_at"):

@@ -533,6 +533,30 @@ class RunService:
                         payload={"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status},
                     )
                     return
+                if self._complete_failed_run_from_green_draft(
+                    run=run,
+                    job=job,
+                    meaningful_paths=meaningful_paths,
+                ):
+                    self._save_run(run)
+                    self._store_run_artifacts(run, change_plan, job, self.preview_service.get(run.workspace_id))
+                    self.store.delete("reports", f"run_stop_request:{run.run_id}")
+                    logger.info(
+                        "run_finished run_id=%s workspace_id=%s status=%s progress=%s",
+                        run.run_id,
+                        run.workspace_id,
+                        run.status,
+                        run.progress_percent,
+                    )
+                    self.workspace_log_service.append(
+                        run.workspace_id,
+                        source="run",
+                        message="Run finished.",
+                        payload={"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status},
+                    )
+                    if run.status == "completed" and run.apply_status == "applied":
+                        self._queue_preview_refresh(run, reason="run completion", draft_run_id=None)
+                    return
                 if job.status == "blocked":
                     run.status = "blocked"
                     run.apply_status = "blocked"
@@ -1219,6 +1243,92 @@ class RunService:
             source="run",
             message=message,
             payload={"run_id": run.run_id, "mode": "noop_completion"},
+        )
+        return True
+
+    def _complete_failed_run_from_green_draft(
+        self,
+        *,
+        run: RunRecord,
+        job: Any,
+        meaningful_paths: list[str],
+    ) -> bool:
+        if not meaningful_paths:
+            return False
+        if not self.workspace_service.draft_exists(run.workspace_id, run.run_id):
+            return False
+        if run.apply_strategy != "staged_auto_apply":
+            return False
+
+        draft_source = self.workspace_service.draft_source_dir(run.workspace_id, run.run_id)
+        execution = self.check_runner.run(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            source_dir=draft_source,
+            changed_files=meaningful_paths,
+            preview_run_id=run.run_id,
+            scope_mode="whole_file_build",
+        )
+        validation_snapshot = MiniappGenerationCompletion.validation_snapshot_from_execution(execution)
+        results = execution.results
+        draft_green = all(
+            result.status != "failed"
+            for result in results
+            if result.name not in {"preview_boot_smoke", "preview_connectivity_smoke"}
+        )
+        if not draft_green:
+            return False
+
+        self.store.upsert(
+            "reports",
+            f"check_results:{run.workspace_id}",
+            {
+                "items": [result.model_dump(mode="json") for result in execution.results],
+                "execution": execution.model_dump(mode="json"),
+            },
+        )
+        self.store.upsert(
+            "reports",
+            f"validation:{run.workspace_id}",
+            validation_snapshot.model_dump(mode="json"),
+        )
+
+        message = "Retained draft passed validators/build/tests and was applied automatically."
+        run.checks_summary = self._build_checks_summary(validation_snapshot, self.preview_service.get(run.workspace_id).status)
+        run.remaining_issues = []
+        run.summary = message
+        run.failure_reason = None
+        run.failure_class = None
+        run.failure_signature = None
+        run.root_cause_summary = None
+        run.current_fix_phase = None
+        run.current_failing_command = None
+        run.current_exit_code = None
+        run.fix_targets = []
+        run.handoff_from_failed_generate = None
+        run.updated_at = datetime.now(timezone.utc)
+
+        job.status = "completed"
+        job.outcome_kind = "applied"
+        job.summary = message
+        job.failure_reason = None
+        job.failure_class = None
+        job.failure_signature = None
+        job.root_cause_summary = None
+        job.validation_snapshot = validation_snapshot
+        self.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
+        self._append_job_event(
+            run.linked_job_id,
+            "job_completed",
+            message,
+            {"reason": "green_draft_auto_apply", "run_id": run.run_id},
+        )
+        self._apply_completed_draft(run, message="Applying retained green draft to the source workspace.")
+        self.workspace_log_service.append(
+            run.workspace_id,
+            source="run",
+            message=message,
+            payload={"run_id": run.run_id, "mode": "green_draft_auto_apply"},
         )
         return True
 

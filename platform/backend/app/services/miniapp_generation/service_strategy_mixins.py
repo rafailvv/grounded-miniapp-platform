@@ -106,6 +106,7 @@ class ServiceStrategyMixins:
             "Use dashboard, workbench, workspace, and profile only as structural references when the prompt does not imply a better structure. "
             "Differentiate the roles through page purpose, actions, and handoffs instead of mirrored wording. "
             "Role root pages must feel complete on first render without fake records: render real sections, actions, and honest empty states immediately. "
+            "Do not pre-render invented request cards, approval rows, conflict records, or availability items just to make the page feel populated. "
             "Do not make loading or error UI the primary visible surface on first render."
         )
         return f"{prompt.rstrip()}\n\n{corrective}"
@@ -126,11 +127,11 @@ class ServiceStrategyMixins:
     @staticmethod
     def _first_paint_required_sections(role: str) -> list[str]:
         section_map = {
-            "client": ["profile_card", "summary_metrics", "primary_actions", "requests_preview"],
-            "specialist": ["profile_card", "summary_metrics", "queue_preview", "availability_preview", "conflict_preview"],
-            "manager": ["profile_card", "oversight_metrics", "availability_preview", "conflict_preview", "approval_preview"],
+            "client": ["profile_card", "primary_actions", "live_section_shell", "empty_state_guidance"],
+            "specialist": ["profile_card", "operational_actions", "live_section_shell", "empty_state_guidance"],
+            "manager": ["profile_card", "oversight_summary", "live_section_shell", "empty_state_guidance"],
         }
-        return list(section_map.get(role, ["summary_metrics", "primary_actions"]))
+        return list(section_map.get(role, ["primary_actions", "live_section_shell", "empty_state_guidance"]))
 
     def _first_paint_contract_for_page(self, *, role: str, page: dict[str, Any], grounded_spec: GroundedSpecModel) -> dict[str, Any]:
         dependency_count = len(page.get("data_dependencies") or [])

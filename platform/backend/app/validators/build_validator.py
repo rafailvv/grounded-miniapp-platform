@@ -936,6 +936,24 @@ class BuildValidator:
                                 location=script_path_raw,
                             )
                         )
+                    if self._looks_like_live_collection_surface(html_content) and self._contains_seeded_business_markup(html_content):
+                        issues.append(
+                            ValidationIssue(
+                                code="build.seeded_live_markup",
+                                message=f"{Path(file_path_raw).name} pre-renders filled workflow records in HTML instead of starting from real API data or an honest empty state.",
+                                severity="high",
+                                location=file_path_raw,
+                            )
+                        )
+                    if self._looks_like_live_collection_surface(html_content) and self._contains_seeded_live_collection(script_content):
+                        issues.append(
+                            ValidationIssue(
+                                code="build.seeded_live_collection",
+                                message=f"{Path(script_path_raw).name} still contains seeded business records for a live workflow surface. Keep dropdown/filter options only and load real records from the API.",
+                                severity="high",
+                                location=script_path_raw,
+                            )
+                        )
         return issues
 
     @staticmethod
@@ -1011,6 +1029,77 @@ class BuildValidator:
             flags=re.IGNORECASE,
         )
         return bool(collection_pattern.search(content))
+
+    @staticmethod
+    def _contains_seeded_live_collection(script_content: str) -> bool:
+        content = str(script_content or "")
+        collection_pattern = re.compile(
+            r"\b(?:const|let|var)\s+(?:requests|records|orders|tasks|items|queue|workload|comments|entries)\s*=\s*\[(?P<body>.*?)\]",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        field_markers = (
+            "status",
+            "start_date",
+            "end_date",
+            "requested_at",
+            "returned_at",
+            "reason",
+            "requester",
+            "owner",
+            "assignee",
+            "approved_by",
+            "conflict",
+            "availability",
+            "item_type",
+            "item_label",
+        )
+        value_markers = (
+            "pending",
+            "approved",
+            "issued",
+            "returned",
+            "claimed",
+            "rejected",
+            "cancelled",
+            "confirmed",
+        )
+        for match in collection_pattern.finditer(content):
+            body = match.group("body") or ""
+            if not body.strip().startswith("{"):
+                continue
+            if any(marker in body for marker in field_markers) and any(marker in body.lower() for marker in value_markers):
+                return True
+        return False
+
+    @staticmethod
+    def _contains_seeded_business_markup(html_content: str) -> bool:
+        content = str(html_content or "")
+        business_item_pattern = re.compile(
+            r"<(?:article|li|div)[^>]+class=['\"][^'\"]*(?:request|queue|approval|availability|conflict|booking|record)[^'\"]*['\"][^>]*>(?P<body>.*?)</(?:article|li|div)>",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        status_markers = (
+            "pending",
+            "approved",
+            "issued",
+            "returned",
+            "claimed",
+            "rejected",
+            "cancelled",
+            "confirmed",
+            "needs review",
+        )
+        for match in business_item_pattern.finditer(content):
+            body = re.sub(r"<[^>]+>", " ", match.group("body") or "")
+            body = re.sub(r"\s+", " ", body).strip().lower()
+            if not body:
+                continue
+            has_status = any(marker in body for marker in status_markers)
+            has_date_like = bool(re.search(r"\b\d{4}-\d{2}-\d{2}\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}\b", body))
+            has_entity_like = len(body.split()) >= 4
+            if has_entity_like and (has_status or has_date_like):
+                return True
+        return False
 
     @staticmethod
     def _read_json(path: Path) -> dict | list | None:

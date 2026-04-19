@@ -13,8 +13,7 @@ class FixPromptBuilder:
     def read_only_surfaces() -> list[str]:
         return [
             "miniapp/tests/",
-            "miniapp/app/generated/route_manifest.json",
-            "miniapp/app/generated/runtime_manifest.json",
+            "miniapp/app/generated/",
             "artifacts/generated_app_graph.json",
         ]
 
@@ -125,7 +124,8 @@ class FixPromptBuilder:
             "Do not redesign the app. Fix the current root-cause cluster only. "
             "Preserve the existing backend architecture, routers, and static mounting unless the evidence explicitly implicates them. "
             "Never replace a functioning FastAPI backend or route module with placeholder HTML handlers, stub pages, or a simplified demo app. "
-            "Do not rewrite generated tests or generated manifests to make the app pass; repair the application code and runtime contract instead."
+            "Do not rewrite generated tests or generated manifests to make the app pass; repair the application code and runtime contract instead. "
+            "When generated app tests report a create/update API failure, treat the primary repair cluster as app/routes/<resource>.py plus app/schemas.py and app/db.py before touching broader runtime files."
         )
 
     @staticmethod
@@ -165,6 +165,8 @@ class FixPromptBuilder:
                     "Strict-green is the ideal target, but the immediate goal is to remove blocking runtime, compile, routing, and preview failures first.",
                     "Preserve existing endpoints, router wiring, and static file serving unless the evidence shows they are broken.",
                     "Do not replace main.py, route modules, or backend services with placeholder HTML stubs or hard-coded pages.",
+                    "If generated_app_python_tests reports a create/update API failure, prioritize the resource route module plus app/schemas.py and app/db.py before touching main.py or unrelated runtime files.",
+                    "If a FastAPI route raises HTTPException from ValidationError, keep the detail JSON-safe instead of passing through raw Python exceptions.",
                     "Every create or replace operation must include the full resulting file content.",
                     "Use the tool-owned repair loop: ask for tool actions first when evidence is insufficient, then return a patch only after you have enough context.",
                     "Always return outcome=patch_ready, outcome=tool_request, outcome=no_progress, or outcome=fatal_invalid_response.",

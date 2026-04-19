@@ -15,6 +15,18 @@ class FixClassificationRuntime:
         self.service = service
 
     @staticmethod
+    def _resource_fix_targets(resource: str) -> list[str]:
+        normalized = re.sub(r"[^a-z0-9_]+", "", str(resource or "").lower()).strip()
+        if not normalized:
+            return []
+        return [
+            f"miniapp/app/routes/{normalized}.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/main.py",
+        ]
+
+    @staticmethod
     def prefer_failure_class(existing: str | None, candidate: str | None) -> str | None:
         if not candidate:
             return existing
@@ -164,30 +176,29 @@ class FixClassificationRuntime:
             route_segments = [segment for segment in route_path.strip("/").split("/") if segment]
             if len(route_segments) >= 2 and route_segments[0] == "api":
                 resource = route_segments[1]
-                candidates.extend(
-                    [
-                        f"miniapp/app/routes/{resource}.py",
-                        "miniapp/app/db.py",
-                        "miniapp/app/schemas.py",
-                        "miniapp/tests/test_generated_app.py",
-                        "miniapp/app/main.py",
-                    ]
-                )
+                candidates.extend(self._resource_fix_targets(resource))
         update_api_match = re.search(r"update api failed:\s+(/api/[a-z0-9_/-]+)", lowered)
         if update_api_match:
             route_path = update_api_match.group(1).strip()
             route_segments = [segment for segment in route_path.strip("/").split("/") if segment]
             if len(route_segments) >= 2 and route_segments[0] == "api":
                 resource = route_segments[1]
-                candidates.extend(
-                    [
-                        f"miniapp/app/routes/{resource}.py",
-                        "miniapp/app/db.py",
-                        "miniapp/app/schemas.py",
-                        "miniapp/tests/test_generated_app.py",
-                        "miniapp/app/main.py",
-                    ]
-                )
+                candidates.extend(self._resource_fix_targets(resource))
+        json_serialization_api_match = re.search(r"(/api/[a-z0-9_/-]+)", lowered)
+        if any(
+            marker in lowered
+            for marker in (
+                "object of type valueerror is not json serializable",
+                "validationerror",
+                "must be before end_date",
+                "must be after start_date",
+                "must be before start_date",
+            )
+        ) and json_serialization_api_match:
+            route_path = json_serialization_api_match.group(1).strip()
+            route_segments = [segment for segment in route_path.strip("/").split("/") if segment]
+            if len(route_segments) >= 2 and route_segments[0] == "api":
+                candidates.extend(self._resource_fix_targets(route_segments[1]))
         if "sessionlocal" in lowered:
             candidates.extend(["miniapp/app/main.py", "miniapp/app/db.py"])
         if "roleprofilerecord" in lowered:

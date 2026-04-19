@@ -226,9 +226,7 @@ class FixPatchingRuntime:
     @staticmethod
     def is_read_only_generated_surface(file_path: str) -> bool:
         normalized = str(file_path or "").strip().replace("\\", "/")
-        return normalized in {
-            "miniapp/app/generated/route_manifest.json",
-            "miniapp/app/generated/runtime_manifest.json",
+        return normalized.startswith("miniapp/app/generated/") or normalized in {
             "artifacts/generated_app_graph.json",
         }
 

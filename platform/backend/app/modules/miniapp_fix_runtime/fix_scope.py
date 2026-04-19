@@ -11,9 +11,10 @@ if TYPE_CHECKING:
 
 
 class FixScopeRuntime:
+    _READ_ONLY_CONTEXT_SURFACE_PREFIXES = (
+        "miniapp/app/generated/",
+    )
     _READ_ONLY_CONTEXT_SURFACES = {
-        "miniapp/app/generated/route_manifest.json",
-        "miniapp/app/generated/runtime_manifest.json",
         "artifacts/generated_app_graph.json",
     }
 
@@ -36,7 +37,7 @@ class FixScopeRuntime:
             existing_scope=existing_scope,
             allow_missing_scope_path=self.allow_missing_scope_path,
         )
-        entries = [entry for entry in entries if entry.file_path not in self._READ_ONLY_CONTEXT_SURFACES]
+        entries = [entry for entry in entries if not self._is_read_only_context_surface(entry.file_path)]
         if not self.service._allow_test_file_writes_for_failure(failure_class):
             entries = [entry for entry in entries if not entry.file_path.startswith("miniapp/tests/")]
         return entries
@@ -135,3 +136,8 @@ class FixScopeRuntime:
         current = {entry.file_path for entry in existing_scope}
         upcoming = {entry.file_path for entry in next_scope}
         return bool(upcoming - current)
+
+    @classmethod
+    def _is_read_only_context_surface(cls, file_path: str) -> bool:
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        return normalized in cls._READ_ONLY_CONTEXT_SURFACES or normalized.startswith(cls._READ_ONLY_CONTEXT_SURFACE_PREFIXES)

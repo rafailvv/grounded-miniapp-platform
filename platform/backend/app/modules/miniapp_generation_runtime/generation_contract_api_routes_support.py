@@ -152,6 +152,7 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
     def _deterministic_bookingrequests_route_source() -> str:
         return """from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, get_args
 
@@ -214,6 +215,13 @@ def _filter_for_schema(model_cls: type, payload: dict[str, Any]) -> dict[str, An
     return {key: value for key, value in payload.items() if value is not None and key in allowed}
 
 
+def _json_safe_validation_errors(exc: ValidationError) -> list[dict[str, Any]]:
+    try:
+        return json.loads(exc.json())
+    except Exception:
+        return [{"msg": str(exc), "type": "value_error"}]
+
+
 def _normalize_create_payload(payload: dict[str, Any]) -> BookingRequestCreate:
     normalized = _filter_for_schema(BookingRequestCreate, {
         "item_type": payload.get("item_type") or payload.get("equipment_type") or payload.get("equipment") or payload.get("item"),
@@ -237,8 +245,48 @@ def _normalize_update_payload(payload: dict[str, Any]) -> BookingRequestUpdate:
     return BookingRequestUpdate.model_validate(normalized)
 
 
+def _record_identifier(record: BookingRequestRecord) -> Any:
+    for field_name in ("bookingrequest_id", "request_id", "id"):
+        value = getattr(record, field_name, None)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _record_order_column():
+    for field_name in ("requested_at", "created_at", "updated_at", "bookingrequest_id", "id"):
+        column = getattr(BookingRequestRecord, field_name, None)
+        if column is not None:
+            return column
+    raise AttributeError("BookingRequestRecord has no sortable column.")
+
+
+def _list_records(session) -> list[BookingRequestRecord]:
+    return session.query(BookingRequestRecord).order_by(_record_order_column().desc()).all()
+
+
+def _record_payload_from_create(normalized: BookingRequestCreate, now: datetime) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for field_name in ("item_type", "item_label", "start_date", "end_date", "reason"):
+        if hasattr(BookingRequestRecord, field_name):
+            payload[field_name] = getattr(normalized, field_name)
+    if hasattr(BookingRequestRecord, "status"):
+        payload["status"] = _default_status()
+    if hasattr(BookingRequestRecord, "requested_by"):
+        payload["requested_by"] = "client"
+    if hasattr(BookingRequestRecord, "requested_at"):
+        payload["requested_at"] = now
+    if hasattr(BookingRequestRecord, "status_updated_at"):
+        payload["status_updated_at"] = now
+    if hasattr(BookingRequestRecord, "created_at"):
+        payload["created_at"] = now
+    if hasattr(BookingRequestRecord, "updated_at"):
+        payload["updated_at"] = now
+    return payload
+
+
 def _to_schema(record: BookingRequestRecord, conflict: bool = False) -> BookingRequestRead:
-    record_id = getattr(record, "bookingrequest_id", getattr(record, "id", None))
+    record_id = _record_identifier(record)
     read_fields = getattr(BookingRequestRead, "model_fields", {})
     owner_field = "specialist_owner" if "specialist_owner" in read_fields else "owner"
     payload = _filter_for_schema(BookingRequestRead, {
@@ -278,8 +326,9 @@ def _overlaps(record: BookingRequestRecord, other: BookingRequestRecord) -> bool
 
 def _conflict_count(record: BookingRequestRecord, records: list[BookingRequestRecord]) -> int:
     count = 0
+    record_id = _record_identifier(record)
     for other in records:
-        if other.id == record.id:
+        if _record_identifier(other) == record_id:
             continue
         if other.item_type != record.item_type:
             continue
@@ -302,33 +351,21 @@ def create_booking_request(payload: dict[str, Any]) -> BookingRequestRead:
     try:
         normalized = _normalize_create_payload(payload)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        raise HTTPException(status_code=422, detail=_json_safe_validation_errors(exc)) from exc
     now = datetime.now(timezone.utc)
-    record = BookingRequestRecord(
-        item_type=normalized.item_type,
-        item_label=normalized.item_label,
-        start_date=normalized.start_date,
-        end_date=normalized.end_date,
-        reason=normalized.reason,
-        status=_default_status(),
-        requested_at=now,
-        status_updated_at=now,
-        updated_at=now,
-    )
-    if hasattr(record, "requested_by"):
-        record.requested_by = "client"
+    record = BookingRequestRecord(**_record_payload_from_create(normalized, now))
     with SessionLocal() as session:
         session.add(record)
         session.commit()
         session.refresh(record)
-        records = session.query(BookingRequestRecord).order_by(BookingRequestRecord.requested_at.desc()).all()
+        records = _list_records(session)
         return _to_schema(record, _conflict_count(record, records) > 0)
 
 
 @router.get("", response_model=BookingRequestListResponse)
 def list_booking_requests() -> BookingRequestListResponse:
     with SessionLocal() as session:
-        records = session.query(BookingRequestRecord).order_by(BookingRequestRecord.requested_at.desc()).all()
+        records = _list_records(session)
         items = [_to_schema(record, _conflict_count(record, records) > 0) for record in records]
     return BookingRequestListResponse(items=items)
 
@@ -338,7 +375,7 @@ def update_booking_request(item_id: str, payload: dict[str, Any]) -> BookingRequ
     try:
         normalized = _normalize_update_payload(payload)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        raise HTTPException(status_code=422, detail=_json_safe_validation_errors(exc)) from exc
     with SessionLocal() as session:
         record = session.get(BookingRequestRecord, _coerce_request_id(item_id))
         if record is None:
@@ -359,9 +396,10 @@ def update_booking_request(item_id: str, payload: dict[str, Any]) -> BookingRequ
             record.issued_at = normalized.issued_at
         if hasattr(normalized, "returned_at") and normalized.returned_at is not None and hasattr(record, "returned_at"):
             record.returned_at = normalized.returned_at
-        record.updated_at = datetime.now(timezone.utc)
+        if hasattr(record, "updated_at"):
+            record.updated_at = datetime.now(timezone.utc)
         session.commit()
         session.refresh(record)
-        records = session.query(BookingRequestRecord).order_by(BookingRequestRecord.requested_at.desc()).all()
+        records = _list_records(session)
         return _to_schema(record, _conflict_count(record, records) > 0)
 """

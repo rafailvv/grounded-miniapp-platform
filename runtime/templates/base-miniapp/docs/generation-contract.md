@@ -31,6 +31,8 @@ Use this template as an extension target, not as something to replace.
 - `specialist` reads and updates the same records.
 - `manager` observes the same shared state or an aggregate of it.
 - Do not ship form UI, lists, or role dashboards without real read/write API paths in the same draft.
+- Do not pre-render invented business records just to make a page look populated. Live request cards, approval rows, conflict items, and availability records must come from real API reads, or the page must show an honest empty state instead.
+- Static dropdown options, filter chips, and guidance copy are allowed. Example request cards, seeded bookings, and pre-filled live rows are not allowed.
 - Derive the dominant workflow entity, route names, and page names from the prompt and grounded spec. Do not hard-code domain nouns from previous apps.
 - Prefer one canonical backend route module per dominant workflow entity instead of splitting the same lifecycle across multiple near-duplicate route files.
 - If the prompt implies time-bound reservations, bookings, requests, loans, or appointments, keep the API and UI vocabulary internally consistent instead of mixing several synonyms in parallel.

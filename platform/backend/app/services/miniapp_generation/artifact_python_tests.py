@@ -248,7 +248,27 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
         elif lowered in {"specialist_id", "assignee_id", "owner_id", "user_id"}:
             payload[name] = "sample-user"
         elif "time" in lowered or "date" in lowered:
-            payload[name] = "2026-04-17T10:00:00Z"
+            if any(
+                token in lowered
+                for token in (
+                    "end",
+                    "until",
+                    "return",
+                    "returned",
+                    "due",
+                    "finish",
+                    "expires",
+                    "updated",
+                    "completed",
+                    "to_",
+                    "_to",
+                    "available_to",
+                    "ends_at",
+                )
+            ):
+                payload[name] = "2026-04-18T18:00:00Z"
+            else:
+                payload[name] = "2026-04-17T10:00:00Z"
         else:
             payload[name] = "sample"
     if not payload:
