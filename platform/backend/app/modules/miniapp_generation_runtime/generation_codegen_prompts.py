@@ -12,6 +12,91 @@ from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerati
 
 class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
     @staticmethod
+    def _prioritized_supporting_contexts(
+        *,
+        cluster_name: str,
+        cluster_targets: list[str],
+        file_contexts: dict[str, str],
+    ) -> dict[str, str]:
+        supporting_paths = [
+            path
+            for path, content in file_contexts.items()
+            if path not in cluster_targets and str(content or "").strip()
+        ]
+        if cluster_name == "backend_support":
+            preferred_paths = [
+                "miniapp/app/generated/route_manifest.json",
+                "miniapp/app/routes/runtime.py",
+                "miniapp/app/routes/client.py",
+                "miniapp/app/routes/specialist.py",
+                "miniapp/app/routes/manager.py",
+            ]
+        elif cluster_name.startswith("backend_route_"):
+            preferred_paths = [
+                "miniapp/app/main.py",
+                "miniapp/app/db.py",
+                "miniapp/app/schemas.py",
+                "miniapp/app/routes/profiles.py",
+                "miniapp/app/generated/runtime_manifest.json",
+                "miniapp/app/generated/route_manifest.json",
+                "miniapp/app/routes/runtime.py",
+                "miniapp/app/routes/client.py",
+                "miniapp/app/routes/specialist.py",
+                "miniapp/app/routes/manager.py",
+            ]
+        elif "_ui_root" in cluster_name:
+            role_match = cluster_name.split("_")
+            role = role_match[1] if len(role_match) > 2 else ""
+            preferred_paths = [
+                "miniapp/app/static/shared/base.css",
+                "miniapp/app/static/shared/common.js",
+                "miniapp/app/static/preview_bridge.js",
+                "miniapp/app/routes/profiles.py",
+                "miniapp/app/db.py",
+                "miniapp/app/schemas.py",
+                "miniapp/app/routes/bookingrequests.py",
+                "miniapp/app/generated/runtime_manifest.json",
+                "miniapp/app/generated/route_manifest.json",
+            ]
+            if role in {"client", "specialist", "manager"}:
+                preferred_paths.extend(
+                    [
+                        f"miniapp/app/static/{role}/profile/index.html",
+                        f"miniapp/app/static/{role}/profile/styles.css",
+                        f"miniapp/app/static/{role}/profile/app.js",
+                    ]
+                )
+        elif "_ui_bookingrequests" in cluster_name:
+            role_match = cluster_name.split("_")
+            role = role_match[1] if len(role_match) > 2 else ""
+            preferred_paths = [
+                "miniapp/app/static/shared/base.css",
+                "miniapp/app/static/shared/common.js",
+                "miniapp/app/static/preview_bridge.js",
+                "miniapp/app/routes/bookingrequests.py",
+                "miniapp/app/db.py",
+                "miniapp/app/schemas.py",
+                "miniapp/app/generated/runtime_manifest.json",
+                "miniapp/app/generated/route_manifest.json",
+            ]
+            if role in {"client", "specialist", "manager"}:
+                preferred_paths.extend(
+                    [
+                        f"miniapp/app/static/{role}/index.html",
+                        f"miniapp/app/static/{role}/styles.css",
+                        f"miniapp/app/static/{role}/app.js",
+                        f"miniapp/app/static/{role}/profile/index.html",
+                        f"miniapp/app/static/{role}/profile/styles.css",
+                        f"miniapp/app/static/{role}/profile/app.js",
+                    ]
+                )
+        else:
+            preferred_paths = []
+        ordered_paths = [path for path in preferred_paths if path in supporting_paths]
+        ordered_paths.extend(path for path in supporting_paths if path not in ordered_paths)
+        return {path: file_contexts.get(path, "") for path in ordered_paths}
+
+    @staticmethod
     def _whole_file_cluster_system_prompt(cluster_name: str) -> str:
         prompt = (
             "Generate a whole-file code bundle for a real Telegram/MAX mini-app workspace. "
@@ -19,6 +104,13 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
             "Return complete file contents for the allowed target files. "
             "Do not emit partial patches, placeholder wrappers, or files outside the provided cluster scope."
         )
+        if cluster_name == "backend_support":
+            prompt = (
+                f"{prompt.rstrip()}\n\n"
+                "For backend_support specifically, treat role route files and route manifests as reference-only supporting context. "
+                "They are not a prerequisite for emitting backend_support operations. "
+                "If supporting route files are missing, continue anyway and generate the allowed backend_support targets from the product prompt, db contract, schemas contract, and template profile/runtime conventions."
+            ).strip()
         from app.services.miniapp_generation.service import GenerationService
 
         GenerationService._assert_english_control_text(prompt)
@@ -47,6 +139,96 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
             max_file_chars=2600 if compact else 5200,
             max_total_chars=10000 if compact else 18000,
         )
+        supporting_contexts = self._bounded_file_contexts(
+            self._prioritized_supporting_contexts(
+                cluster_name=cluster_name,
+                cluster_targets=cluster_targets,
+                file_contexts=file_contexts,
+            ),
+            max_file_chars=2400 if compact else 4200,
+            max_total_chars=7000 if compact else 16000,
+        )
+        cluster_specific_rules: list[str] = []
+        if cluster_name == "backend_support":
+            cluster_specific_rules = [
+                "For backend_support, do not block on route module or route_manifest reads before writing operations.",
+                "If supporting route files are shown as FILE_MISSING or only as references, proceed anyway and generate the allowed backend_support targets.",
+                "Use supporting route/module context only to stay compatible with naming and runtime conventions; do not treat it as a prerequisite for emitting operations.",
+                "For backend_support, app.db owns SQLAlchemy models, app.schemas owns request/response schemas, and app.routes.profiles owns profile persistence.",
+                "Keep main.py limited to FastAPI app bootstrap, middleware, create-all startup, and router inclusion. Do not implement booking request CRUD or page-serving route handlers in main.py.",
+                "Do not define BookingRequestRecord, role-specific route handlers, or inline Pydantic request/response models in main.py.",
+            ]
+        elif cluster_name.startswith("backend_route_"):
+            cluster_specific_rules = [
+                "For backend_route clusters, treat db.py, schemas.py, main.py, and runtime manifests as the primary supporting context.",
+                "Do not return no_progress just because other role route files are thin, missing, or only present as compatibility references.",
+                "If db.py and schemas.py are present in supporting_file_contexts, use them directly and emit the route module for the current cluster target.",
+            ]
+            if cluster_name in {"backend_route_client", "backend_route_specialist", "backend_route_manager"}:
+                cluster_specific_rules.extend(
+                    [
+                        "Role route modules client.py, specialist.py, and manager.py are page-serving routers only.",
+                        "Keep these modules limited to APIRouter + FileResponse handlers that serve existing role HTML pages.",
+                        "Do not implement booking request CRUD, do not declare BookingRequestRecord, and do not define route-local Pydantic schemas in role route modules.",
+                        "Do not import BookingRequestRecord or request/response schemas from peer role route modules. Shared persistence belongs only to app.db and app.schemas.",
+                    ]
+                )
+            if cluster_name == "backend_route_bookingrequests":
+                cluster_specific_rules.extend(
+                    [
+                        "For backend_route_bookingrequests, the booking request SQLAlchemy model already belongs in app.db and request/response schemas already belong in app.schemas.",
+                        "Import BookingRequestRecord from app.db and booking request schema types from app.schemas instead of defining inline ORM or Pydantic models in the route module.",
+                        "Do not declare Base subclasses, mapped_column fields, or route-local request/response models in bookingrequests.py.",
+                        "Use only the canonical booking request statuses from app.schemas: submitted, in_review, issued, returned, cancelled.",
+                        "Do not emit pending, pending_review, approved, or canceled in booking request API responses or defaults.",
+                    ]
+                )
+            if cluster_name == "backend_route_runtime":
+                cluster_specific_rules.extend(
+                    [
+                        "For backend_route_runtime, keep the module limited to runtime/init-data validation, lightweight runtime helpers, and compatibility endpoints only.",
+                        "Do not implement booking request CRUD, do not define BookingRequestRecord, and do not duplicate persistence or request/response schemas already owned by app.db and app.schemas.",
+                        "If the workflow needs /api/bookingrequests, that ownership belongs to bookingrequests.py, not runtime.py.",
+                    ]
+                )
+            if cluster_name == "backend_route_runtime_manifest":
+                cluster_specific_rules.extend(
+                    [
+                        "For backend_route_runtime_manifest, keep the module limited to role-aware manifest JSON for runtime navigation.",
+                        "Do not duplicate booking request CRUD, profile persistence, or init-data verification logic that belongs in other runtime modules.",
+                    ]
+                )
+        elif "_ui_bookingrequests" in cluster_name:
+            cluster_specific_rules = [
+                "For role bookingrequests UI clusters, use the current role root page, shared shell assets, and backend API routes as the primary references.",
+                "The canonical runtime bridge is /static/preview_bridge.js. It provides window.setupPreviewBridge(role) and window.miniappApiFetch(input, init, role).",
+                "If supporting_file_contexts already include preview_bridge.js or existing role pages that call /api/... directly, use those conventions as-is and do not search for static/shared/runtime.js or static/shared/api.js.",
+                "Do not block on peer-role bookingrequests pages, shared runtime helper files, or any supporting file shown as FILE_MISSING.",
+                "If peer-role bookingrequests pages are unavailable, continue anyway and generate a complete role-specific bookingrequests surface from the prompt, same-role root page, and live backend API contract.",
+                "If same-role root files are present in supporting_file_contexts, use them directly as the style and navigation anchor instead of returning no_progress.",
+                "Do not return no_progress only because same-role root files were previously generated in this run; consume the available supporting_file_contexts and emit the bookingrequests page operations now.",
+            ]
+        elif "_ui_profile" in cluster_name:
+            cluster_specific_rules = [
+                "For role profile UI clusters, use the same-role root page, routes/profiles.py, db.py, and the shared shell assets as the primary references.",
+                "The canonical runtime bridge is /static/preview_bridge.js. It provides window.setupPreviewBridge(role) and window.miniappApiFetch(input, init, role).",
+                "If supporting_file_contexts already include preview_bridge.js or existing role pages that call /api/... directly, use those conventions as-is and do not search for static/shared/runtime.js or static/shared/api.js.",
+                "Do not block on static/shared/common.js, peer-role profile pages, or any supporting file shown as FILE_MISSING.",
+                "If a shared helper file is unavailable, continue anyway and generate the complete role-specific profile surface from the template profile contract, preview bridge conventions, and the canonical /api/profiles/{role} read/write lifecycle.",
+                "Do not return no_progress only because a shared helper or optional support file is absent from the current context bundle.",
+                "For profile writes, prefer direct window.miniappApiFetch('/api/profiles/{role}', { method: 'PUT' | 'PATCH', ... }, role) calls or an alias that still visibly targets /api/... with a write method.",
+            ]
+        elif "_ui_root" in cluster_name:
+            cluster_specific_rules = [
+                "For role root UI clusters, treat the same-role profile files, shared shell assets, db.py, schemas.py, and the canonical bookingrequests route as the primary supporting context.",
+                "The canonical runtime bridge is /static/preview_bridge.js. It provides window.setupPreviewBridge(role) and window.miniappApiFetch(input, init, role).",
+                "If preview_bridge.js is already present in supporting_file_contexts, treat that as sufficient runtime/API convention context for the current cluster.",
+                "If supporting examples call /api/... directly with same-origin fetch, that is also acceptable for the current cluster. Do not search for static/shared/runtime.js or static/shared/api.js.",
+                "Do not block on sibling feature pages, peer-role pages, static/shared/runtime.js, static/shared/api.js, or any supporting file shown as FILE_MISSING.",
+                "Do not request peer-role feature pages or sibling pages that belong to other generation clusters in the same batch.",
+                "If a same-role feature page is not already present in supporting_file_contexts, continue anyway and generate the role root/dashboard directly from the product prompt, backend API contract, and shared shell conventions.",
+                "The role root cluster must be self-sufficient: return operations for its own root targets without waiting for sibling cluster outputs.",
+            ]
         return json_dumps(
             {
                 "task": "Generate a whole-file cluster for the planned app change",
@@ -60,6 +242,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "role_contract": self._compact_role_contract_for_codegen(role_contract, role_scope),
                 "page_graph": self._compact_page_graph_for_codegen(page_graph, role_scope),
                 "file_contexts": bounded_contexts,
+                "supporting_file_contexts": supporting_contexts,
                 "tool_results": list(tool_results or []),
                 "creative_direction": creative_direction,
                 "rules": [
@@ -80,11 +263,13 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Do not render manual Refresh buttons, pseudo-data rows, or loading-only placeholder shells as the primary surface.",
                     "Do not introduce flat role entry files like miniapp/app/static/client/index.html unless that exact path is listed in cluster_targets.",
                     "Use the template runtime conventions for API access instead of raw authless fetch patterns.",
+                    "Use supporting_file_contexts as read-only references for routing, manifest, or shared runtime wiring before asking to read the same files again.",
                     "Do not invent auth/login/me endpoints, auth bootstrap modules, or /api/auth references in generated app code.",
                     "Preserve the template profile flow: root role pages may link to /<role>/profile, and profile persistence stays compatible with routes/profiles.py plus RoleProfileRecord in db.py.",
                     "For every workflow app, implement one real shared persisted entity lifecycle: client creates it, specialist reads and updates the same record, and manager observes the same DB-backed state.",
                     "Do not ship form UI, list UI, or role dashboards unless the corresponding /api read and write paths already exist in the same draft.",
-                ],
+                ]
+                + cluster_specific_rules,
             }
         )
 
@@ -117,6 +302,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
         tool_results: list[dict[str, Any]] | None = None,
     ) -> str:
         compact = generation_mode == GenerationMode.FAST
+        page_kind = str(page.get("page_kind") or "").strip().lower()
         sibling_pages = [
             item
             for item in (page_graph.get("roles", {}).get(role, {}) or {}).get("pages", [])
@@ -127,6 +313,14 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
             max_file_chars=2400 if compact else 4000,
             max_total_chars=7200 if compact else 12000,
         )
+        profile_specific_rules: list[str] = []
+        if page_kind == "profile":
+            profile_specific_rules = [
+                "For profile pages, treat routes/profiles.py, RoleProfileRecord in db.py, and the template shell contract as the primary references.",
+                "Do not block on static/shared/common.js, optional helper modules, or peer-role profile pages when they are absent or shown as FILE_MISSING.",
+                "If a shared helper is unavailable, continue using the canonical /api/profiles/{role} contract, window.miniappApiFetch(...), and the existing page-shell conventions.",
+                "Do not return outcome=no_progress only because an optional shared helper file is unavailable.",
+            ]
         return json_dumps(
             {
                 "task": "Generate one page file",
@@ -175,7 +369,8 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "For pages that create, list, or update shared records, prefer honest CRUD wiring over speculative UI polish and do not conclude without evidence that the corresponding API contract exists in the same draft.",
                     "If scope_mode is minimal_patch, preserve unrelated behavior and keep the diff minimal.",
                     "Return exactly one operation for the requested page file path.",
-                ],
+                ]
+                + profile_specific_rules,
             }
         )
 
@@ -277,6 +472,8 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "For any workflow or stateful backend, use miniapp/app/db.py plus miniapp/app/schemas.py as the canonical persistence contract.",
                     "Persist mutable business entities through SQLAlchemy models and sessions from db.py; do not keep route-level dict/list stores for app data.",
                     "Define request/response models in schemas.py and import them from route modules instead of declaring inline Pydantic BaseModel classes inside routes.",
+                    "If dedicated backend_route_* targets exist, keep main.py focused on app bootstrap and router wiring; do not duplicate domain CRUD handlers inside main.py.",
+                    "Route modules must import shared ORM/session objects from app.db and request/response models from app.schemas; do not redeclare BookingRequestRecord or inline BookingRequest BaseModel classes inside miniapp/app/routes/*.py.",
                     "When planned pages have dynamic dependencies, generate only the minimum state wiring needed for real refresh paths instead of defaulting to loading-first shells.",
                     "For role root pages, the first visible surface must already be a usable business page with real sections and honest empty states.",
                     "When generated sources reference /api endpoints, include the matching miniapp route modules and router wiring from the first draft whenever those files are in target_files.",
@@ -296,6 +493,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Do not collapse multiple pages into shared role-level app.js/styles.css files.",
                     "Do not leave page behavior or styling inline when page-level JS/CSS targets exist.",
                     "For frontend calls to /api/... use window.miniappApiFetch(...) from /static/preview_bridge.js instead of raw fetch(...).",
+                    "Every generated page must keep <main class=\"page-shell\"> with style=\"padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));\" so the shared shell safe-area contract is explicit in the page HTML.",
                     "For backend dependencies use Depends(get_actor_context), never Depends(lambda: get_actor_context()).",
                     "When linking to detail routes from JS, keep route templates aligned with route_manifest paths and use dynamic placeholders consistently.",
                     "Do not render manual Refresh buttons or links; rely on normal loading states and existing actions.",

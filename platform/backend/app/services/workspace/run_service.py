@@ -566,6 +566,8 @@ class RunService:
                 message="Run finished.",
                 payload={"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status},
             )
+            if run.status == "completed" and run.apply_status == "applied":
+                self._queue_resume_generation_from_checkpoint_if_needed(run, request)
             if queue_preview_reason is not None:
                 self._queue_preview_refresh(run, reason=queue_preview_reason, draft_run_id=None)
         except Exception as exc:

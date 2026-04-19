@@ -25,16 +25,12 @@ def _to_schema(record: RoleProfileRecord) -> RoleProfile:
     )
 
 
-def _get(role: AppRole) -> RoleProfileRecord | None:
-    with SessionLocal() as session:
-        return session.get(RoleProfileRecord, role)
-
-
 def load_role_profile(role: AppRole) -> RoleProfile:
-    record = _get(role)
-    if record is None:
-        return _empty_profile()
-    return _to_schema(record)
+    with SessionLocal() as session:
+        record = session.get(RoleProfileRecord, role)
+        if record is None:
+            return _empty_profile()
+        return _to_schema(record)
 
 
 def save_role_profile(role: AppRole, profile: RoleProfile) -> RoleProfile:

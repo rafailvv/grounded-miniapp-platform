@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any, Callable
 
 from app.models.artifacts import ValidationIssue
@@ -32,6 +33,101 @@ class MiniappGenerationRepair:
     def __init__(self, service: "GenerationService") -> None:
         self.service = service
         self.tool_runtime = GenerationRepairToolRuntime(service)
+
+    @staticmethod
+    def _tool_request_signature(tool_requests: list[dict[str, Any]]) -> str:
+        if not tool_requests:
+            return ""
+        normalized_items = []
+        for item in tool_requests:
+            normalized_items.append(
+                {
+                    "tool": str(item.get("tool") or "").strip().lower(),
+                    "mode": str(item.get("mode") or "").strip().lower(),
+                    "targets": [
+                        str(target or "").strip().lstrip("./")
+                        for target in list(item.get("targets") or [])
+                        if str(target or "").strip()
+                    ],
+                    "pattern": str(item.get("pattern") or "").strip(),
+                    "command": str(item.get("command") or "").strip(),
+                }
+            )
+        return json.dumps(normalized_items, sort_keys=True, ensure_ascii=True)
+
+    @staticmethod
+    def _duplicate_tool_request_feedback(tool_requests: list[dict[str, Any]]) -> dict[str, object]:
+        requested_targets = [
+            str(target or "").strip().lstrip("./")
+            for item in tool_requests
+            for target in list(item.get("targets") or [])
+            if str(target or "").strip()
+        ]
+        return {
+            "tool": "tool_request_feedback",
+            "targets": list(dict.fromkeys(requested_targets)),
+            "error": (
+                "The same tool request was already executed in this repair attempt. "
+                "These files were already read and are available in file_contexts or prior tool_results. "
+                "Use the existing context to return operations or outcome=no_progress instead of requesting the same files again."
+            ),
+        }
+
+    @staticmethod
+    def _already_available_context_note(tool_requests: list[dict[str, Any]]) -> str:
+        requested_targets = [
+            str(target or "").strip().lstrip("./")
+            for item in tool_requests
+            for target in list(item.get("targets") or [])
+            if str(target or "").strip()
+        ]
+        distinct_targets = list(dict.fromkeys(requested_targets))
+        if not distinct_targets:
+            return (
+                "Context reuse recovery mode:\n"
+                "- The files you asked to read are already present in file_contexts.\n"
+                "- Do not request read_files again for already provided files.\n"
+                "- Use the current context to return create/replace operations for the allowed targets now.\n"
+                "- If the current context still is not enough, return outcome=no_progress with a short diagnosis instead of repeating the same tool request.\n"
+            )
+        rendered_targets = "\n".join(f"- {target}" for target in distinct_targets[:12])
+        return (
+            "Context reuse recovery mode:\n"
+            "- The files you asked to read are already present in file_contexts.\n"
+            "- These already-available files are:\n"
+            f"{rendered_targets}\n"
+            "- Do not request read_files again for these files.\n"
+            "- Use the current context to return create/replace operations for the allowed targets now.\n"
+            "- If the current context still is not enough, return outcome=no_progress with a short diagnosis instead of repeating the same tool request.\n"
+        )
+
+    @staticmethod
+    def _read_request_already_satisfied(
+        tool_requests: list[dict[str, Any]],
+        file_contexts: dict[str, str],
+    ) -> bool:
+        if not tool_requests:
+            return False
+        saw_read = False
+        for item in tool_requests:
+            tool_name = str(item.get("tool") or "").strip().lower()
+            if tool_name != "read_files":
+                return False
+            saw_read = True
+            targets = [
+                str(target or "").strip().lstrip("./")
+                for target in list(item.get("targets") or [])
+                if str(target or "").strip()
+            ]
+            if not targets:
+                return False
+            if any(
+                not str(file_contexts.get(target) or "").strip()
+                or GenerationRepairToolRuntime.is_missing_file_context(file_contexts.get(target))
+                for target in targets
+            ):
+                return False
+        return saw_read
 
     def _execute_generation_checks(
         self,
@@ -415,6 +511,8 @@ class MiniappGenerationRepair:
             allowed_targets = set(current_target_files)
             current_file_contexts = dict(file_contexts)
             tool_results_for_attempt: list[dict[str, object]] = []
+            seen_tool_request_signatures: set[str] = set()
+            context_reuse_recovery_note: str | None = None
             try:
                 for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
                     payload = self.service._generate_structured_with_retry(
@@ -439,6 +537,11 @@ class MiniappGenerationRepair:
                             previous_turn_summary=previous_turn_summary,
                             previous_diff_summary=previous_diff_summary,
                             tool_results=tool_results_for_attempt,
+                        )
+                        + (
+                            f"\n\n{context_reuse_recovery_note}"
+                            if context_reuse_recovery_note
+                            else ""
                         ),
                     )
                     normalized = self.service._normalize_model_payload(payload["payload"])
@@ -446,6 +549,18 @@ class MiniappGenerationRepair:
                     outcome_hint = str(normalized.get("outcome") or "").strip().lower()
                     raw_operations = normalized.get("operations")
                     if outcome_hint == "tool_request" or tool_requests:
+                        if self._read_request_already_satisfied(tool_requests, current_file_contexts):
+                            context_reuse_recovery_note = self._already_available_context_note(tool_requests)
+                            tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
+                            if tool_round < self.MAX_TOOL_ROUNDS:
+                                continue
+                            raise ValueError("Repair step exhausted the tool-request budget without returning operations.")
+                        request_signature = self._tool_request_signature(tool_requests)
+                        if request_signature and request_signature in seen_tool_request_signatures:
+                            tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
+                            if tool_round < self.MAX_TOOL_ROUNDS:
+                                continue
+                            raise ValueError("Repair step exhausted the tool-request budget without returning operations.")
                         requested_targets, executed_tool_results, extra_contexts = self.tool_runtime.execute_tool_requests(
                             workspace_id=workspace_id,
                             draft_run_id=draft_run_id,
@@ -472,6 +587,8 @@ class MiniappGenerationRepair:
                         current_file_contexts.update(extra_contexts)
                         allowed_targets = set(current_target_files)
                         tool_results_for_attempt.extend(executed_tool_results)
+                        if request_signature:
+                            seen_tool_request_signatures.add(request_signature)
                         if tool_round < self.MAX_TOOL_ROUNDS and (requested_targets or executed_tool_results):
                             continue
                         raise ValueError("Repair step exhausted the tool-request budget without returning operations.")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from app.modules.miniapp_generation_runtime.generation_contract_api_routes_support import MiniappGenerationContractApiRoutesSupport
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
@@ -8,6 +9,24 @@ from app.models.domain import DraftFileOperation
 
 
 class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
+    @staticmethod
+    def _needs_canonical_bookingrequests_route_repair(content: str) -> bool:
+        normalized = str(content or "")
+        return any(
+            marker in normalized
+            for marker in (
+                "class BookingRequestRecord(Base):",
+                "class BookingRequestCreate(",
+                "class BookingRequestUpdate(",
+                "class BookingRequestItem(",
+                "class BookingRequestList(",
+                "class BookingRequestCreateResponse(",
+                "BookingRequestList,",
+                "owner_specialist_id",
+                "bookingrequest_id=record.bookingrequest_id",
+            )
+        )
+
     @staticmethod
     def _needs_profile_contract_repair(profiles_content: str) -> bool:
         return any(marker in str(profiles_content or "") for marker in ("DEFAULT_PROFILES", "_get_or_create(", "_get_or_create_profile_record("))
@@ -135,7 +154,9 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
         schemas_path = "miniapp/app/schemas.py"
+        db_path = "miniapp/app/db.py"
         schemas_content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, schemas_path)
+        db_content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, db_path)
         if not schemas_content:
             return operations
         imported_names: set[str] = set()
@@ -145,12 +166,35 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
             content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
             if not content:
                 continue
+            if (
+                Path(file_path).stem == "bookingrequests"
+                and db_content
+                and "class BookingRequestRecord" in db_content
+                and "class BookingRequestCreate" in schemas_content
+                and "class BookingRequestUpdate" in schemas_content
+                and (
+                    "class BookingRequestListResponse" in schemas_content
+                    or "class BookingRequestList" in schemas_content
+                )
+                and (
+                    "class BookingRequestRead" in schemas_content
+                    or "class BookingRequest" in schemas_content
+                )
+                and self._needs_canonical_bookingrequests_route_repair(content)
+            ):
+                operation_map[file_path] = DraftFileOperation(
+                    file_path=file_path,
+                    operation="replace",
+                    content=MiniappGenerationContractApiRoutesSupport._deterministic_bookingrequests_route_source(),
+                    reason="Pre-apply contract sync: keep bookingrequests.py aligned with db.py and schemas.py instead of declaring inline ORM and Pydantic models.",
+                )
+                continue
             for match in re.finditer(r"from\s+app\.schemas\s+import\s+\((.*?)\)", content, flags=re.DOTALL):
                 imported_names.update({part.strip() for part in match.group(1).replace("\n", " ").split(",") if part.strip()})
             for match in re.finditer(r"from\s+app\.schemas\s+import\s+([A-Za-z0-9_, ]+)", content):
                 imported_names.update({part.strip() for part in match.group(1).split(",") if part.strip()})
         if not self._needs_route_schema_contract_repair(imported_names, schemas_content):
-            return operations
+            return list(operation_map.values())
         updated_schemas = schemas_content
         if "RequestDetail" in imported_names and "class RequestDetail" not in updated_schemas:
             if "Field" not in updated_schemas and "from pydantic import" in updated_schemas:

@@ -97,33 +97,37 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
                 ensured,
                 contract_sync_mode=contract_sync_mode,
             )
-            ensured = self._synchronize_route_schema_contract(
-                workspace_id,
-                draft_run_id,
-                ensured,
-                contract_sync_mode=contract_sync_mode,
-            )
         ensured = self.runtime_contract_sync.synchronize(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
             operations=ensured,
             contract_sync_mode=contract_sync_mode,
         )
-        if contract_sync_mode != "repair_invariants":
-            return ensured
+        ensured = self._synchronize_main_runtime_contract(
+            workspace_id,
+            draft_run_id,
+            ensured,
+        )
+        ensured = self._synchronize_route_schema_contract(
+            workspace_id,
+            draft_run_id,
+            ensured,
+            contract_sync_mode="repair_invariants",
+        )
         ensured = self._synchronize_frontend_api_contract(
             workspace_id,
             draft_run_id,
             ensured,
-            contract_sync_mode=contract_sync_mode,
+            contract_sync_mode="repair_invariants",
         )
-        return self._synchronize_basic_page_state_contract(
+        ensured = self._synchronize_basic_page_state_contract(
             workspace_id,
             draft_run_id,
             page_graph=page_graph,
             operations=ensured,
-            contract_sync_mode=contract_sync_mode,
+            contract_sync_mode="repair_invariants",
         )
+        return ensured
 
     @staticmethod
     def _grounded_spec_from_operations(operations: list[DraftFileOperation]) -> GroundedSpecModel:

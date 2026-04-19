@@ -81,7 +81,7 @@ def _serialize_request(row: Any) -> dict[str, Any]:
         "end_date": end_date,
         "date_range": f"{start_date} → {end_date}" if start_date and end_date else start_date or end_date or "Dates to be confirmed",
         "reason": mapping.get("reason") or mapping.get("description") or mapping.get("comment") or "",
-        "status": mapping.get("status") or "pending_review",
+        "status": mapping.get("status") or "submitted",
         "assigned_specialist": mapping.get("assigned_specialist") or "",
         "specialist_notes": mapping.get("specialist_notes") or "",
     }
@@ -95,7 +95,7 @@ def _fetch_requests() -> list[dict[str, Any]]:
 
 
 def _availability(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    active_statuses = {"pending_review", "approved", "issued"}
+    active_statuses = {"submitted", "in_review", "issued"}
     usage: dict[str, int] = {}
     for item in items:
         equipment = str(item.get("equipment_type") or item.get("equipment") or "Other")
@@ -122,8 +122,8 @@ def _availability(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _summary(items: list[dict[str, Any]]) -> dict[str, int]:
-    pending = sum(1 for item in items if item.get("status") == "pending_review")
-    approved = sum(1 for item in items if item.get("status") == "approved")
+    pending = sum(1 for item in items if item.get("status") == "submitted")
+    approved = sum(1 for item in items if item.get("status") == "in_review")
     issued = sum(1 for item in items if item.get("status") == "issued")
     returns_due = sum(1 for item in items if item.get("status") == "issued")
     return {
@@ -169,7 +169,7 @@ async def runtime_manifest(role: str) -> dict[str, Any]:
             "generated_at": datetime.utcnow().isoformat() + "Z",
         }
     if role == "specialist":
-        queue = [item for item in requests if item.get("status") in {"pending_review", "approved", "issued"}]
+        queue = [item for item in requests if item.get("status") in {"submitted", "in_review", "issued"}]
         return {
             "role": role,
             "summary": summary,
@@ -185,7 +185,7 @@ async def runtime_manifest(role: str) -> dict[str, Any]:
             "conflicts": len(_manager_conflicts(requests)),
         },
         "conflicts": _manager_conflicts(requests),
-        "approvals": [item for item in requests if item.get("status") == "pending_review"],
+        "approvals": [item for item in requests if item.get("status") == "submitted"],
         "availability": availability,
         "generated_at": datetime.utcnow().isoformat() + "Z",
     }

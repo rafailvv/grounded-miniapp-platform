@@ -63,7 +63,7 @@ def _serialize_request(row: Any) -> dict[str, Any]:
         "phone": mapping["phone"] or "",
         "preferred_time": mapping["preferred_time"] or "",
         "comment": mapping["comment"] or "",
-        "status": mapping["status"] or "pending_review",
+        "status": mapping["status"] or "submitted",
         "assigned_specialist": mapping["assigned_specialist"],
         "specialist": mapping["assigned_specialist"] or "",
         "equipment_type": mapping.get("equipment_type") or "",
@@ -105,7 +105,7 @@ def _fetch_comments(conn: Any, request_id: str) -> list[dict[str, Any]]:
 def _timeline_for_request(request: dict[str, Any], comments: list[dict[str, Any]]) -> list[dict[str, str]]:
     timeline = [
         {"title": "Submitted", "note": request.get("created_at") or "Created"},
-        {"title": "Current status", "note": request.get("status") or "pending_review"},
+        {"title": "Current status", "note": request.get("status") or "submitted"},
     ]
     for item in comments[-3:]:
         note = (item.get("comment") or "").strip()
@@ -138,7 +138,7 @@ def create_request(payload: dict[str, Any] = Body(default_factory=dict)) -> dict
         "phone": str(payload.get("phone") or ""),
         "preferred_time": str(payload.get("preferred_time") or payload.get("date") or payload.get("slot") or payload.get("start_date") or ""),
         "comment": str(payload.get("comment") or payload.get("notes") or ""),
-        "status": str(payload.get("status") or "pending_review"),
+        "status": str(payload.get("status") or "submitted"),
         "assigned_specialist": payload.get("assigned_specialist"),
         "equipment_type": str(payload.get("equipment_type") or payload.get("item_type") or payload.get("title") or ""),
         "start_date": str(payload.get("start_date") or ""),
@@ -190,7 +190,7 @@ def update_request(request_id: str, payload: dict[str, Any] = Body(default_facto
             "phone": str(payload.get("phone") or current.get("phone") or ""),
             "preferred_time": str(payload.get("preferred_time") or current.get("preferred_time") or ""),
             "comment": str(payload.get("comment") or current.get("comment") or ""),
-            "status": str(payload.get("status") or current.get("status") or "pending_review"),
+            "status": str(payload.get("status") or current.get("status") or "submitted"),
             "assigned_specialist": payload.get("assigned_specialist") if payload.get("assigned_specialist") is not None else current.get("assigned_specialist"),
             "equipment_type": str(payload.get("equipment_type") or current.get("equipment_type") or ""),
             "start_date": str(payload.get("start_date") or current.get("start_date") or ""),
@@ -212,7 +212,7 @@ def update_request(request_id: str, payload: dict[str, Any] = Body(default_facto
 @router.patch("/requests/{request_id}/status")
 def update_request_status(request_id: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     _ensure_tables()
-    status = str(payload.get("status") or "approved")
+    status = str(payload.get("status") or "in_review")
     now = datetime.now(timezone.utc).isoformat()
     with engine.begin() as conn:
         row = _fetch_request(conn, request_id)

@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from app.modules.miniapp_materialization.materialization import MiniappMaterializationService
 from app.services.miniapp_generation.constants import (
     DESIGN_REFERENCE_FILES,
     LEGACY_ARCHITECTURE_MARKERS,
@@ -16,6 +17,7 @@ from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerati
 from app.modules.miniapp_generation_runtime.generation_paths import MiniappGenerationPaths
 
 FORBIDDEN_ROUTE_MODULE_STEMS = {
+    "__init__",
     "auth",
     "auth_telegram",
     "attachment",
@@ -215,7 +217,9 @@ class MiniappGenerationTargeting(MiniappGenerationRuntimeOwner):
         for path in backend_targets:
             if not isinstance(path, str):
                 continue
-            normalized = path.strip().replace("\\", "/")
+            normalized = MiniappMaterializationService.normalize_runtime_python_path(
+                path.strip().replace("\\", "/")
+            )
             if normalized == "miniapp/app/generated/route_manifest.json":
                 continue
             if normalized.startswith("miniapp/app/routes/") and normalized.endswith(".py"):
@@ -239,7 +243,9 @@ class MiniappGenerationTargeting(MiniappGenerationRuntimeOwner):
         for path in target_files:
             if not isinstance(path, str):
                 continue
-            normalized = path.strip().replace("\\", "/")
+            normalized = MiniappMaterializationService.normalize_runtime_python_path(
+                path.strip().replace("\\", "/")
+            )
             if normalized == "miniapp/app/generated/route_manifest.json":
                 continue
             if normalized.startswith("miniapp/app/routes/"):

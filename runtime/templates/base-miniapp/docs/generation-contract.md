@@ -22,6 +22,7 @@ Use this template as an extension target, not as something to replace.
 - Generated pages must stay compatible with preview back navigation.
 - Do not remove or bypass `setupPreviewBridge()` behavior.
 - For frontend API calls, prefer `window.miniappApiFetch(...)` from the preview bridge over raw `fetch(...)`.
+- A local alias like `const apiFetch = window.miniappApiFetch || fetch;` is valid, but write surfaces must still visibly target `/api/...` with a write method.
 
 ## Workflow rules
 
@@ -30,9 +31,19 @@ Use this template as an extension target, not as something to replace.
 - `specialist` reads and updates the same records.
 - `manager` observes the same shared state or an aggregate of it.
 - Do not ship form UI, lists, or role dashboards without real read/write API paths in the same draft.
+- Derive the dominant workflow entity, route names, and page names from the prompt and grounded spec. Do not hard-code domain nouns from previous apps.
+- Prefer one canonical backend route module per dominant workflow entity instead of splitting the same lifecycle across multiple near-duplicate route files.
+- If the prompt implies time-bound reservations, bookings, requests, loans, or appointments, keep the API and UI vocabulary internally consistent instead of mixing several synonyms in parallel.
 
 ## Backend rules
 
 - Keep routers under `miniapp/app/routes` on FastAPI with top-level `router = APIRouter(...)`.
 - Extend `db.py` and `schemas.py` when new persistent entities are introduced.
 - Keep route wiring, runtime manifests, and generated tests derived from realized code.
+- Keep schema enum/status values consistent across `db.py`, `schemas.py`, route handlers, and frontend UI labels. Do not invent alternate status literals in only one layer.
+
+## Related docs
+
+- See `docs/ownership-contract.md` for file and module ownership.
+- See `docs/generic-persisted-workflow.md` for the canonical CRUD and role-lifecycle pattern.
+- See `docs/anti-patterns.md` for generation mistakes that should be avoided.

@@ -10,8 +10,12 @@ from app.services.miniapp_generation.constants import DESIGN_REFERENCE_FILES
 CANONICAL_ENDPOINT_ALIASES = {
     "submission": "requests",
     "submissions": "requests",
-    "booking": "requests",
-    "bookings": "requests",
+    "booking": "bookingrequests",
+    "bookings": "bookingrequests",
+    "booking_request": "bookingrequests",
+    "booking_requests": "bookingrequests",
+    "request": "requests",
+    "requests": "requests",
     "appointment": "requests",
     "appointments": "requests",
     "task": "requests",
@@ -26,6 +30,7 @@ CANONICAL_ENDPOINT_ALIASES = {
 }
 
 FORBIDDEN_ROUTE_MODULE_STEMS = {
+    "__init__",
     "auth",
     "auth_telegram",
     "attachment",

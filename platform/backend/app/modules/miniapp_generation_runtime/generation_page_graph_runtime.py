@@ -95,6 +95,8 @@ class MiniappGenerationPageGraphRuntime(MiniappGenerationRuntimeOwner):
             backend_groups: dict[str, list[str]] = {}
             support_targets: list[str] = []
             for path in list(dict.fromkeys(backend_targets)):
+                if path.strip().replace("\\", "/") == "miniapp/app/routes/__init__.py":
+                    continue
                 cluster_name = cls._backend_cluster_name_for_path(path)
                 if cluster_name == "backend_support":
                     support_targets.append(path)
@@ -107,7 +109,7 @@ class MiniappGenerationPageGraphRuntime(MiniappGenerationRuntimeOwner):
         role_priority = {"manager": 0, "specialist": 1, "client": 2}
         for (role, cluster_suffix), paths in sorted(
             role_page_groups.items(),
-            key=lambda item: (role_priority.get(item[0][0], 99), 0 if item[0][1] == "root" else 1, item[0][1]),
+            key=lambda item: (role_priority.get(item[0][0], 99), 1 if item[0][1] == "root" else 0, item[0][1]),
         ):
             clusters.append({"cluster_name": f"role_{role}_ui_{cluster_suffix}", "target_files": list(dict.fromkeys(paths))})
         return clusters

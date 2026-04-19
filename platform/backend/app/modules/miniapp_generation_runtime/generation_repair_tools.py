@@ -17,6 +17,18 @@ class GenerationRepairToolRuntime:
     def __init__(self, service: "GenerationService") -> None:
         self.service = service
 
+    @staticmethod
+    def is_missing_file_context(content: str | None) -> bool:
+        return str(content or "").startswith("FILE_MISSING:")
+
+    @staticmethod
+    def _missing_file_context(path: str) -> str:
+        return (
+            f"FILE_MISSING: {path}\n"
+            "This approved target does not exist in the current draft workspace yet.\n"
+            "Treat it as a create-from-scratch target and return a complete file body instead of requesting it again."
+        )
+
     def approve_requested_targets(
         self,
         *,
@@ -67,17 +79,22 @@ class GenerationRepairToolRuntime:
                     draft_run_id=draft_run_id,
                     targets=targets,
                 )
+                missing_targets: list[str] = []
                 for path in approved:
                     if path not in additional_targets:
                         additional_targets.append(path)
                     content = self.service.workspace_service.try_read_text_file(workspace_id, path, run_id=draft_run_id)
                     if content is not None:
                         extra_contexts[path] = content
+                        continue
+                    missing_targets.append(path)
+                    extra_contexts[path] = self._missing_file_context(path)
                 tool_results.append(
                     {
                         "tool": "read_files",
                         "targets": list(targets),
                         "approved_targets": list(approved),
+                        "missing_targets": missing_targets,
                         "reason": reason,
                     }
                 )

@@ -15,7 +15,7 @@ The current baseline is a tri-role app:
 - `GET /api/profiles/{role}` loads the persisted role profile.
 - `PUT /api/profiles/{role}` saves the role profile.
 - `GET /health` reports backend readiness.
-- `GET /client`, `GET /specialist`, and `GET /manager` serve the role home pages.
+- `miniapp/app/routes/client.py`, `miniapp/app/routes/specialist.py`, and `miniapp/app/routes/manager.py` serve the role page surfaces.
 - `GET /client/profile`, `GET /specialist/profile`, and `GET /manager/profile` serve the role profile pages.
 
 ## UI contract
@@ -36,3 +36,10 @@ The current baseline is a tri-role app:
 - Extend this template by editing real source files instead of layering parallel runtime systems.
 - Preserve manual edits as separate git revisions.
 - Keep all three roles available in preview simultaneously.
+
+## Generation references
+
+- `docs/generation-contract.md`: product, shell, workflow, and backend invariants.
+- `docs/ownership-contract.md`: file ownership and module responsibilities.
+- `docs/generic-persisted-workflow.md`: canonical CRUD and cross-role lifecycle pattern.
+- `docs/anti-patterns.md`: generation mistakes that should be avoided.

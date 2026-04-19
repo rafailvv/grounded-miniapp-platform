@@ -156,6 +156,14 @@ class GroundedSpecHygieneRuntime:
                 EntityAttribute(name="delivery_address", type="text", required=False, description="Delivery address", pii=True),
                 EntityAttribute(name="comment", type="text", required=False, description="Order comment", pii=False),
             ]
+        if "booking" in lowered and any(marker in lowered for marker in ("equipment", "laptop", "projector", "issuance", "returned", "availability")):
+            return [
+                EntityAttribute(name="item_type", type="string", required=True, description="Requested equipment type", pii=False),
+                EntityAttribute(name="item_label", type="string", required=False, description="Specific equipment label or model", pii=False),
+                EntityAttribute(name="start_date", type="datetime", required=True, description="Requested issue start date", pii=False),
+                EntityAttribute(name="end_date", type="datetime", required=True, description="Requested return or end date", pii=False),
+                EntityAttribute(name="reason", type="text", required=True, description="Business reason for the equipment request", pii=False),
+            ]
         mappings = [
             ("name", "string", "Requester name", True, True),
             ("phone", "phone", "Contact phone number", True, True),

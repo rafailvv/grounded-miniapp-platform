@@ -12,6 +12,33 @@ from app.modules.miniapp_generation_runtime import MiniappGenerationReporting, M
 
 
 class ServiceRepairReportingMixins:
+    @staticmethod
+    def _prioritize_repair_file_contexts(
+        file_contexts: dict[str, str],
+        tool_results: list[dict[str, Any]] | None,
+    ) -> dict[str, str]:
+        if not file_contexts:
+            return {}
+        prioritized_paths: list[str] = []
+        for item in reversed(list(tool_results or [])):
+            if str(item.get("tool") or "").strip().lower() != "read_files":
+                continue
+            for target in list(item.get("approved_targets") or item.get("targets") or []):
+                normalized = str(target or "").strip().lstrip("./")
+                if not normalized or normalized in prioritized_paths:
+                    continue
+                if normalized in file_contexts:
+                    prioritized_paths.append(normalized)
+        if not prioritized_paths:
+            return dict(file_contexts)
+        ordered: dict[str, str] = {}
+        for path in prioritized_paths:
+            ordered[path] = file_contexts[path]
+        for path, content in file_contexts.items():
+            if path not in ordered:
+                ordered[path] = content
+        return ordered
+
     def _collect_existing_file_contexts(self, workspace_id: str, run_id: str, target_files: list[str]) -> dict[str, str]:
         file_contexts: dict[str, str] = {}
         for file_path in target_files:
@@ -110,7 +137,11 @@ class ServiceRepairReportingMixins:
         build_issues = kwargs["build_issues"]
         structural_failure = self._is_structural_contract_failure(build_issues)
         compact_target_files = list(kwargs["target_files"]) if kwargs.get("expanded_context") else (kwargs["target_files"][:28] if structural_failure else kwargs["target_files"][:12])
-        compact_file_contexts = self._compact_file_contexts_for_repair(kwargs["file_contexts"], max_file_chars=5600 if kwargs.get("expanded_context") else (4200 if structural_failure else 2200), max_total_chars=32000 if kwargs.get("expanded_context") else (22000 if structural_failure else 9000))
+        prioritized_file_contexts = self._prioritize_repair_file_contexts(
+            kwargs["file_contexts"],
+            kwargs.get("tool_results") or [],
+        )
+        compact_file_contexts = self._compact_file_contexts_for_repair(prioritized_file_contexts, max_file_chars=5600 if kwargs.get("expanded_context") else (4200 if structural_failure else 2200), max_total_chars=32000 if kwargs.get("expanded_context") else (22000 if structural_failure else 9000))
         grounded_spec = kwargs["grounded_spec"]
         return json_dumps({
             "task": "Repair build or preview failures in the generated draft",

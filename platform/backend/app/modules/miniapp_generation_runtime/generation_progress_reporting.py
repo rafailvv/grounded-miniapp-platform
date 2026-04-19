@@ -116,7 +116,7 @@ class GenerationProgressReportingRuntime(MiniappGenerationRuntimeOwner):
         if cluster_name.startswith("backend_route_"):
             return "backend_route"
         if cluster_name.startswith("role_") and "_ui_" in cluster_name:
-            return "role_ui"
+            return "serial"
         return "serial"
 
     @classmethod

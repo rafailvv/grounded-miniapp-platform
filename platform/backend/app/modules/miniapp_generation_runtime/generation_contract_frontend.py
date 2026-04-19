@@ -50,6 +50,8 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             return True
         if MiniappGenerationShellContract.PAGE_SHELL_CLASS not in updated:
             return True
+        if MiniappGenerationShellContract.PAGE_SHELL_INLINE_STYLE not in updated:
+            return True
         if role:
             normalized_links = cls._normalize_role_local_links(updated, role=role, declared_routes=declared_routes)
             if normalized_links != updated:

@@ -951,6 +951,7 @@ class BuildValidator:
         return bool(
             "miniappApiFetch(" in content
             or "window.miniappApiFetch(" in content
+            or re.search(r"\bapiFetch\(\s*[\"'`]/api/", content)
             or re.search(r"fetch\(\s*[\"'`]/api/", content)
         )
 
@@ -960,6 +961,7 @@ class BuildValidator:
         has_api_call = bool(
             "miniappApiFetch(" in content
             or "window.miniappApiFetch(" in content
+            or re.search(r"\bapiFetch\(\s*[\"'`]/api/", content)
             or re.search(r"fetch\(\s*[\"'`]/api/", content)
         )
         has_write_method = bool(re.search(r"method\s*:\s*[\"'](?:POST|PUT|PATCH|DELETE)[\"']", content, flags=re.IGNORECASE))

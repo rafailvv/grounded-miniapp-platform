@@ -223,7 +223,7 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
         if lowered in {"id", "request_id", "submission_id", "task_id", "item_id", "record_id"} and created_id:
             payload[name] = created_id
         elif lowered in {"status", "state"}:
-            payload[name] = "open"
+            payload[name] = "submitted"
         elif lowered in {"comment", "note", "message"}:
             payload[name] = "Generated comment"
         elif lowered in {"specialist_id", "assignee_id", "owner_id", "user_id"}:
@@ -232,8 +232,18 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
             payload[name] = "2026-04-17T10:00:00Z"
         else:
             payload[name] = "sample"
+    if not payload:
+        path_tokens = str(path).lower()
+        if any(token in path_tokens for token in ("booking", "reservation", "equipment", "request", "requests", "loan")):
+            payload = {
+                "item_type": "Laptop",
+                "item_label": "ThinkPad T14",
+                "start_date": "2026-04-17T10:00:00Z",
+                "end_date": "2026-04-18T18:00:00Z",
+                "reason": "Resource needed for an internal team session.",
+            }
     if not payload and method in {"POST", "PUT", "PATCH"}:
-        payload = {"name": "sample", "status": "open"}
+        payload = {"name": "sample", "status": "submitted"}
     return payload
 
 
@@ -379,7 +389,14 @@ class GeneratedMiniAppTests(unittest.TestCase):
 
         create_path = _sample_route_path(str(create_requirement.get("path") or ""))
         create_payload = _payload_for_api(create_requirement, create_path, str(create_requirement.get("method") or "POST")) or {}
-        create_payload.update({"title": "Generated request", "status": "new", "comment": "Created from generated app test"})
+        create_allowed_fields = {
+            str(field.get("name") or "").strip()
+            for field in create_requirement.get("fields") or []
+            if isinstance(field, dict) and str(field.get("name") or "").strip()
+        }
+        for key, value in {"title": "Generated request", "status": "new", "comment": "Created from generated app test"}.items():
+            if key in create_allowed_fields and key not in create_payload:
+                create_payload[key] = value
         create_response = _request_and_assert(self.client, str(create_requirement.get("method") or "POST"), create_path, create_payload)
         self.assertLess(create_response.status_code, 400, f"Create API failed: {create_path} -> {create_response.status_code}")
         created_payload = _response_json(create_response)
@@ -394,7 +411,14 @@ class GeneratedMiniAppTests(unittest.TestCase):
 
         update_path = _resolve_path_params(str(update_requirement.get("path") or ""), {"id": created_id, "request_id": created_id, "record_id": created_id, "item_id": created_id})
         update_payload = _payload_for_api(update_requirement, update_path, str(update_requirement.get("method") or "PATCH"), created_id=created_id) or {}
-        update_payload.update({"status": "in_progress", "comment": "Updated by specialist"})
+        update_allowed_fields = {
+            str(field.get("name") or "").strip()
+            for field in update_requirement.get("fields") or []
+            if isinstance(field, dict) and str(field.get("name") or "").strip()
+        }
+        for key, value in {"status": "in_progress", "comment": "Updated by specialist"}.items():
+            if (not update_allowed_fields and key == "status") or key in update_allowed_fields:
+                update_payload[key] = value
         update_response = _request_and_assert(self.client, str(update_requirement.get("method") or "PATCH"), update_path, update_payload)
         self.assertLess(update_response.status_code, 400, f"Update API failed: {update_path} -> {update_response.status_code}")
         updated_payload = _response_json(update_response)

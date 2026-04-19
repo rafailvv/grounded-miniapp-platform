@@ -8,6 +8,15 @@ from app.models.artifacts import MaterializationReport, ValidationIssue
 from app.models.common import GenerationMode
 from app.models.domain import DraftFileOperation, RunCheckResult
 
+CANONICAL_ROUTE_MODULE_FILENAMES = {
+    "booking.py": "bookingrequests.py",
+    "bookings.py": "bookingrequests.py",
+    "booking_request.py": "bookingrequests.py",
+    "booking_requests.py": "bookingrequests.py",
+    "request.py": "bookingrequests.py",
+    "requests.py": "bookingrequests.py",
+}
+
 
 class MiniappMaterializationService:
     def __init__(
@@ -25,8 +34,10 @@ class MiniappMaterializationService:
     def normalize_runtime_python_path(path: str) -> str:
         if path.startswith("miniapp/app/routes/") and path.endswith(".py"):
             head, tail = path.rsplit("/", 1)
+            tail = CANONICAL_ROUTE_MODULE_FILENAMES.get(tail, tail)
             if "-" in tail:
-                return f"{head}/{tail.replace('-', '_')}"
+                tail = tail.replace("-", "_")
+            return f"{head}/{tail}"
         return path
 
     @classmethod
