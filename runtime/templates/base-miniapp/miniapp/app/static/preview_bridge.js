@@ -3,7 +3,6 @@ let bridgeInitialized = false;
 
 function setupPreviewBridge(role) {
   currentRole = inferRole(role);
-  const rootPath = `/${role}`;
 
   if (bridgeInitialized) {
     notifyParent(window.location.pathname);
@@ -19,12 +18,23 @@ function setupPreviewBridge(role) {
     if (!payload || typeof payload !== "object" || payload.type !== "runtime-preview-command") {
       return;
     }
+    if (typeof payload.role === "string" && payload.role && payload.role !== currentRole) {
+      return;
+    }
+    if (typeof payload.frameId === "string" && payload.frameId && payload.frameId !== getFrameId()) {
+      return;
+    }
+    const rootPath = getRootPath();
     if (payload.command === "refresh") {
       window.location.reload();
       return;
     }
     if (payload.command === "close") {
       window.location.href = rootPath;
+      return;
+    }
+    if (payload.command === "navigate") {
+      window.location.href = buildPreviewPath(payload.path);
       return;
     }
     if (payload.command === "back") {
@@ -50,11 +60,65 @@ function inferRole(role) {
   return match ? match[1] : "client";
 }
 
+function getRootPath() {
+  currentRole = inferRole();
+  return `/${currentRole}`;
+}
+
+function getFrameStorageKey(role = inferRole()) {
+  return `miniapp-preview-frame-id:${role}`;
+}
+
+function rememberFrameId(frameId, role = inferRole()) {
+  if (!frameId) {
+    return null;
+  }
+  try {
+    window.sessionStorage.setItem(getFrameStorageKey(role), frameId);
+  } catch {
+    // Ignore storage failures; bridge commands still work when URL carries the frame id.
+  }
+  return frameId;
+}
+
+function getFrameId() {
+  const role = inferRole();
+  try {
+    const frameId = new URLSearchParams(window.location.search).get("preview_frame_id");
+    if (frameId && frameId.trim()) {
+      return rememberFrameId(frameId.trim(), role);
+    }
+  } catch {
+    // Ignore malformed URLs and fall back to session storage.
+  }
+  try {
+    const stored = window.sessionStorage.getItem(getFrameStorageKey(role));
+    return stored && stored.trim() ? stored.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildPreviewPath(path) {
+  if (typeof path !== "string" || !path.trim()) {
+    return getRootPath();
+  }
+  const url = new URL(path, window.location.origin);
+  const frameId = getFrameId();
+  if (frameId && !url.searchParams.get("preview_frame_id")) {
+    url.searchParams.set("preview_frame_id", frameId);
+  }
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
 function notifyParent(path) {
+  currentRole = inferRole();
   window.parent.postMessage(
     {
       type: "runtime-preview-route",
       path,
+      role: currentRole,
+      frameId: getFrameId(),
     },
     "*",
   );

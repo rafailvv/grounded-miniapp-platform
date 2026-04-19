@@ -31,7 +31,7 @@ export type Run = {
   result_revision_id?: string | null;
   candidate_revision_id?: string | null;
   status: "pending" | "running" | "awaiting_approval" | "completed" | "blocked" | "failed";
-  apply_status: "pending" | "applied" | "awaiting_approval" | "blocked" | "failed" | "rolled_back";
+  apply_status: "pending" | "applied" | "awaiting_approval" | "blocked" | "failed" | "rolled_back" | "noop";
   draft_status: "none" | "ready" | "approved" | "discarded" | "failed";
   draft_ready: boolean;
   approval_required: boolean;

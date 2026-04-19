@@ -488,6 +488,7 @@ class RunService:
                 should_apply_fix_draft = request.mode == "fix" and self.workspace_service.draft_exists(run.workspace_id, run.run_id)
                 if should_apply_fix_draft:
                     self._apply_completed_draft(run, message="Applying verified fix draft to the source workspace.")
+                    self._clear_successful_completion_metadata(run=run, job=job)
                 else:
                     meaningful_paths = self._meaningful_paths_for_run(
                         workspace_id=run.workspace_id,
@@ -505,6 +506,7 @@ class RunService:
                         run.progress_percent = 99
                     else:
                         self._apply_completed_draft(run, message="Applying generated draft to the source workspace.")
+                        self._clear_successful_completion_metadata(run=run, job=job)
             else:
                 meaningful_paths = self._meaningful_paths_for_run(
                     workspace_id=run.workspace_id,
@@ -1106,6 +1108,36 @@ class RunService:
                 fallback_paths = list(dict.fromkeys([*fallback_paths, *inherited]))
         return fallback_paths
 
+    def _revision_commit_sha(self, workspace: WorkspaceRecord, revision_id: str | None) -> str | None:
+        if not revision_id:
+            return None
+        for revision in workspace.revisions:
+            if revision.revision_id == revision_id:
+                return revision.commit_sha
+        return None
+
+    def _meaningful_paths_between_revisions(
+        self,
+        *,
+        workspace_id: str,
+        source_revision_id: str | None,
+        result_revision_id: str | None,
+    ) -> list[str]:
+        workspace = self.workspace_service.get_workspace(workspace_id)
+        source_sha = self._revision_commit_sha(workspace, source_revision_id)
+        result_sha = self._revision_commit_sha(workspace, result_revision_id)
+        if not source_sha or not result_sha or source_sha == result_sha:
+            return []
+        try:
+            diff_output = self.workspace_service._git_output(
+                self.workspace_service.source_dir(workspace_id),
+                ["diff", "--name-only", f"{source_sha}..{result_sha}"],
+            )
+        except Exception:
+            return []
+        paths = [line.strip() for line in diff_output.splitlines() if line.strip()]
+        return [path for path in list(dict.fromkeys(paths)) if self._is_meaningful_source_path(path)]
+
     def _inherited_touched_files_for_fix(self, *, workspace_id: str, run: RunRecord) -> list[str]:
         if run.mode != "fix":
             return []
@@ -1324,6 +1356,7 @@ class RunService:
             {"reason": "green_draft_auto_apply", "run_id": run.run_id},
         )
         self._apply_completed_draft(run, message="Applying retained green draft to the source workspace.")
+        self._clear_successful_completion_metadata(run=run, job=job)
         self.workspace_log_service.append(
             run.workspace_id,
             source="run",
@@ -1340,6 +1373,28 @@ class RunService:
         del run, job, meaningful_paths
         return False
 
+    @staticmethod
+    def _clear_successful_completion_metadata(*, run: RunRecord, job: Any | None = None) -> None:
+        run.failure_reason = None
+        run.failure_class = None
+        run.failure_signature = None
+        run.root_cause_summary = None
+        run.current_fix_phase = None
+        run.current_failing_command = None
+        run.current_exit_code = None
+        run.fix_targets = []
+        run.handoff_from_failed_generate = None
+        if job is not None:
+            job.failure_reason = None
+            job.failure_class = None
+            job.failure_signature = None
+            job.root_cause_summary = None
+            job.current_fix_phase = None
+            job.current_failing_command = None
+            job.current_exit_code = None
+            job.fix_targets = []
+            job.handoff_from_failed_generate = None
+
     def _apply_completed_draft(self, run: RunRecord, *, message: str) -> None:
         apply_started_at = time.perf_counter()
         run.current_stage = "finalizing apply"
@@ -1355,11 +1410,19 @@ class RunService:
         run.apply_status = "applied"
         run.outcome_kind = "applied"
         run.remaining_issues = []
+        self._clear_successful_completion_metadata(run=run)
         run.draft_status = "approved"
         run.draft_ready = False
         run.current_stage = "completed"
         run.progress_percent = 100
         run.latency_breakdown["apply_ms"] = int((time.perf_counter() - apply_started_at) * 1000)
+        revision_paths = self._meaningful_paths_between_revisions(
+            workspace_id=run.workspace_id,
+            source_revision_id=run.source_revision_id,
+            result_revision_id=run.result_revision_id,
+        )
+        if revision_paths:
+            run.touched_files = revision_paths
         self._append_job_event(
             run.linked_job_id,
             "apply_completed",

@@ -53,6 +53,13 @@ type PreviewInfo = {
   last_error?: string | null;
 };
 
+type PreviewHistoryState = {
+  entries: string[];
+  index: number;
+  pendingPath: string | null;
+  pendingIndex: number | null;
+};
+
 type RunComposerMode = "generate" | "fix";
 type UserGenerationMode = "fast" | "balanced" | "quality";
 
@@ -116,15 +123,50 @@ function getRoleRootPreviewPath(role: RoleKey): string {
   return `/${role}`;
 }
 
+function normalizeRolePreviewPath(role: RoleKey, path: string | undefined): string {
+  const normalized = path?.trim();
+  if (!normalized || normalized === ROOT_PREVIEW_PATH) {
+    return getRoleRootPreviewPath(role);
+  }
+  return normalized;
+}
+
 function isRoleAtRootPreviewPath(role: RoleKey, path: string | undefined): boolean {
-  const normalized = path || ROOT_PREVIEW_PATH;
-  return normalized === ROOT_PREVIEW_PATH || normalized === getRoleRootPreviewPath(role);
+  return normalizeRolePreviewPath(role, path) === getRoleRootPreviewPath(role);
+}
+
+function buildRolePreviewFrameId(role: RoleKey, cycle: number): string {
+  return `${role}:${cycle}`;
+}
+
+function extractPreviewFrameId(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const url = new URL(value, window.location.origin);
+    const frameId = url.searchParams.get("preview_frame_id");
+    return frameId && frameId.trim() ? frameId.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function createPreviewHistoryState(role: RoleKey): PreviewHistoryState {
+  const root = getRoleRootPreviewPath(role);
+  return {
+    entries: [root],
+    index: 0,
+    pendingPath: null,
+    pendingIndex: null,
+  };
 }
 
 function buildRolePreviewSrc(baseUrl: string, role: RoleKey, roleUrl: string | undefined, cycle: number): string {
   const rawUrl = roleUrl ?? `${baseUrl}/${role}`;
   const separator = rawUrl.includes("?") ? "&" : "?";
-  return `${rawUrl}${separator}preview_cycle=${cycle}`;
+  const frameId = encodeURIComponent(buildRolePreviewFrameId(role, cycle));
+  return `${rawUrl}${separator}preview_cycle=${cycle}&preview_frame_id=${frameId}`;
 }
 
 function editorLanguageForPath(path: string): { label: string; extensions: Extension[] } {
@@ -210,6 +252,13 @@ function formatRoleScope(scope?: RoleKey[] | unknown): string {
     return "all roles";
   }
   return normalizedScope.map((role) => ROLE_LABELS[role]).join(", ");
+}
+
+function isCompletedGenerateRun(run?: Run | null): boolean {
+  if (!run) {
+    return false;
+  }
+  return run.mode !== "fix" && run.status === "completed" && (run.apply_status === "applied" || run.apply_status === "noop");
 }
 
 type RunIterationView = {
@@ -881,6 +930,11 @@ export default function App() {
     specialist: null,
     manager: null,
   });
+  const previewHistoryRef = useRef<Record<RoleKey, PreviewHistoryState>>({
+    client: createPreviewHistoryState("client"),
+    specialist: createPreviewHistoryState("specialist"),
+    manager: createPreviewHistoryState("manager"),
+  });
   const activeWorkspaceIdRef = useRef("");
 
   useEffect(() => {
@@ -896,9 +950,26 @@ export default function App() {
       if (!role) {
         return;
       }
+      const currentFrameId = extractPreviewFrameId(previewFrameRefs.current[role]?.src);
+      if (typeof payload.frameId === "string" && currentFrameId && payload.frameId !== currentFrameId) {
+        return;
+      }
+      const nextPath = normalizeRolePreviewPath(role, typeof payload.path === "string" ? payload.path : ROOT_PREVIEW_PATH);
+      const history = previewHistoryRef.current[role];
+      if (history.pendingPath && nextPath === history.pendingPath && history.pendingIndex !== null) {
+        history.index = history.pendingIndex;
+        history.pendingPath = null;
+        history.pendingIndex = null;
+      } else if (history.entries[history.index] !== nextPath) {
+        history.entries = history.entries.slice(0, history.index + 1);
+        history.entries.push(nextPath);
+        history.index = history.entries.length - 1;
+        history.pendingPath = null;
+        history.pendingIndex = null;
+      }
       setRolePreviewPath((current) => ({
         ...current,
-        [role]: typeof payload.path === "string" && payload.path ? payload.path : ROOT_PREVIEW_PATH,
+        [role]: nextPath,
       }));
     }
 
@@ -1218,6 +1289,7 @@ export default function App() {
     selectedRun?.summary ??
     selectedRun?.failure_reason ??
     "";
+  const completedGenerateRun = isCompletedGenerateRun(selectedRun);
   const failureAnalysis = runArtifacts?.failure_analysis ?? (selectedRun
     ? {
         mode: selectedRun.mode,
@@ -1232,6 +1304,13 @@ export default function App() {
         current_exit_code: selectedRun.current_exit_code,
       }
     : null);
+  const displayIterations = completedGenerateRun ? [] : normalizeRunIterations(runArtifacts?.iterations);
+  const filesSectionTitle =
+    completedGenerateRun && selectedRun?.intent === "create"
+      ? "Created files"
+      : completedGenerateRun
+        ? "Result files"
+        : "Files";
   const fixAttemptItems = asRecordArray(runArtifacts?.fix_attempts?.items ?? selectedRun?.fix_attempts);
   const scopeExpansionItems = asRecordArray(runArtifacts?.scope_expansions?.items ?? selectedRun?.scope_expansions);
   const fixCase = runArtifacts?.fix_case ?? workspaceLogs?.reports?.fix_case ?? null;
@@ -1433,6 +1512,7 @@ export default function App() {
           setRolePreviewUrls(previewPayload.role_urls ?? {});
           setPreviewStatus(previewPayload.status ?? "");
           setPreviewCycle((current) => current + 1);
+          resetPreviewHistory();
           setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
           setPreviewFailed({
             client: false,
@@ -1502,6 +1582,7 @@ export default function App() {
           setPreviewUrl(preview.url);
           setRolePreviewUrls(preview.role_urls ?? {});
           setPreviewCycle((current) => current + 1);
+          resetPreviewHistory();
           setPreviewLoading({ ...PREVIEW_BOOT_ROLES });
           setPreviewFailed({
             client: false,
@@ -1835,6 +1916,7 @@ export default function App() {
       specialist: ROOT_PREVIEW_PATH,
       manager: ROOT_PREVIEW_PATH,
     });
+    resetPreviewHistory();
     setPreviewBooting(false);
   }
 
@@ -1855,6 +1937,7 @@ export default function App() {
       specialist: ROOT_PREVIEW_PATH,
       manager: ROOT_PREVIEW_PATH,
     });
+    resetPreviewHistory();
     setPreviewBooting(true);
   }
 
@@ -1924,12 +2007,25 @@ export default function App() {
     }
   }
 
-  function sendPreviewCommand(role: RoleKey, command: "back" | "close" | "refresh") {
+  function resetPreviewHistory(role?: RoleKey) {
+    if (role) {
+      previewHistoryRef.current[role] = createPreviewHistoryState(role);
+      return;
+    }
+    ROLE_ORDER.forEach((candidate) => {
+      previewHistoryRef.current[candidate] = createPreviewHistoryState(candidate);
+    });
+  }
+
+  function sendPreviewCommand(role: RoleKey, command: "back" | "close" | "refresh" | "navigate", path?: string) {
+    const frameId = extractPreviewFrameId(previewFrameRefs.current[role]?.src);
     previewFrameRefs.current[role]?.contentWindow?.postMessage(
       {
         type: "runtime-preview-command",
         command,
         role,
+        frameId,
+        path,
       },
       "*",
     );
@@ -1940,7 +2036,15 @@ export default function App() {
       sendPreviewCommand(role, "close");
       return;
     }
-    sendPreviewCommand(role, "back");
+    const history = previewHistoryRef.current[role];
+    if (history.index <= 0) {
+      sendPreviewCommand(role, "close");
+      return;
+    }
+    const targetPath = history.entries[history.index - 1] ?? getRoleRootPreviewPath(role);
+    history.pendingPath = targetPath;
+    history.pendingIndex = Math.max(0, history.index - 1);
+    sendPreviewCommand(role, "navigate", targetPath);
   }
 
   function handleMockupRefresh(role: RoleKey) {
@@ -1962,6 +2066,7 @@ export default function App() {
           setPreviewUrl(preview.url ?? "");
           setRolePreviewUrls(preview.role_urls ?? {});
           setPreviewCycle((current) => current + 1);
+          resetPreviewHistory();
           setPreviewFailed({
             client: false,
             specialist: false,
@@ -2028,8 +2133,10 @@ export default function App() {
       return;
     }
     clearPreviewTimeout(role);
+    resetPreviewHistory(role);
     setPreviewFailed((current) => ({ ...current, [role]: false }));
     setPreviewLoading((current) => ({ ...current, [role]: true }));
+    setRolePreviewPath((current) => ({ ...current, [role]: getRoleRootPreviewPath(role) }));
     setRolePreviewCycle((current) => ({ ...current, [role]: (current[role] ?? 0) + 1 }));
     armPreviewTimeout(role);
   }
@@ -2190,7 +2297,7 @@ export default function App() {
               </section>
             ) : null}
 
-            {selectedRun.failure_reason ? (
+            {selectedRun.failure_reason && !completedGenerateRun ? (
               <section className="run-detail-section">
                 <h4>Failure reason</h4>
                 <p>{selectedRun.failure_reason}</p>
@@ -2202,7 +2309,7 @@ export default function App() {
               </section>
             ) : null}
 
-            {failureAnalysis?.failure_class || failureAnalysis?.root_cause_summary || failureAnalysis?.fix_targets?.length ? (
+            {!completedGenerateRun && (failureAnalysis?.failure_class || failureAnalysis?.root_cause_summary || failureAnalysis?.fix_targets?.length) ? (
               <section className="run-detail-section">
                 <h4>Error analysis</h4>
                 <div className="run-details-grid">
@@ -2319,7 +2426,7 @@ export default function App() {
             </section>
 
             <section className="run-detail-section">
-              <h4>Files</h4>
+              <h4>{filesSectionTitle}</h4>
               {selectedRun.touched_files.length ? (
                 <div className="run-detail-list">
                   {selectedRun.touched_files.map((filePath) => (
@@ -2333,11 +2440,12 @@ export default function App() {
               )}
             </section>
 
-            <section className="run-detail-section">
-              <h4>Iterations</h4>
-              {normalizeRunIterations(runArtifacts?.iterations).length ? (
+            {!completedGenerateRun ? (
+              <section className="run-detail-section">
+                <h4>Iterations</h4>
+                {displayIterations.length ? (
                 <div className="run-detail-list">
-                  {normalizeRunIterations(runArtifacts?.iterations).map((iteration) => (
+                  {displayIterations.map((iteration) => (
                     <div key={iteration.iteration_id} className="run-detail-item">
                       <div className="run-detail-item-top">
                         <strong>{formatTimestamp(iteration.created_at)}</strong>
@@ -2355,7 +2463,8 @@ export default function App() {
               ) : (
                 <p className="muted">No iteration details recorded yet.</p>
               )}
-            </section>
+              </section>
+            ) : null}
           </div>
         ) : (
           <div className="run-details-body">
