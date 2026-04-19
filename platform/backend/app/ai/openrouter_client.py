@@ -76,6 +76,9 @@ class OpenRouterClient:
         user_prompt: str,
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
+        model_override: str | None = None,
+        fallback_model_override: str | None = None,
+        responses_tuning_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("OpenAI is not configured.")
@@ -103,8 +106,8 @@ class OpenRouterClient:
                 "cache_stats": payload["cache_stats"],
             }
         model_config = MODEL_REGISTRY[role]
-        primary_model = model_config["primary"]
-        fallback_model = model_config["fallback"]
+        primary_model = str(model_override or model_config["primary"])
+        fallback_model = str(fallback_model_override or model_config["fallback"])
         models = [primary_model] if fallback_model == primary_model else [primary_model, fallback_model]
         last_error: Exception | None = None
         for model in models:
@@ -118,6 +121,7 @@ class OpenRouterClient:
                     user_prompt=user_prompt,
                     prompt_cache_key=prompt_cache_key,
                     stable_prefix=stable_prefix,
+                    responses_tuning_override=responses_tuning_override,
                 )
                 return {
                     "model": model,
@@ -137,6 +141,7 @@ class OpenRouterClient:
                         user_prompt=user_prompt,
                         prompt_cache_key=prompt_cache_key,
                         stable_prefix=stable_prefix,
+                        responses_tuning_override=responses_tuning_override,
                     )
                     return {
                         "model": model,
@@ -196,6 +201,9 @@ class OpenRouterClient:
         user_prompt: str,
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
+        model_override: str | None = None,
+        fallback_model_override: str | None = None,
+        responses_tuning_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.generate_structured(
             role="repair",
@@ -205,6 +213,9 @@ class OpenRouterClient:
             user_prompt=user_prompt,
             prompt_cache_key=prompt_cache_key,
             stable_prefix=stable_prefix,
+            model_override=model_override,
+            fallback_model_override=fallback_model_override,
+            responses_tuning_override=responses_tuning_override,
         )
 
     def generate_workspace_edits(
@@ -300,6 +311,7 @@ class OpenRouterClient:
         user_prompt: str,
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
+        responses_tuning_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if model.startswith("gpt-5"):
             return self._responses_structured(
@@ -311,6 +323,7 @@ class OpenRouterClient:
                 user_prompt=user_prompt,
                 prompt_cache_key=prompt_cache_key,
                 stable_prefix=stable_prefix,
+                tuning_override=responses_tuning_override,
             )
         return self._chat_structured(
             role=role,
@@ -334,6 +347,7 @@ class OpenRouterClient:
         user_prompt: str,
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
+        responses_tuning_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         schema_hint = self._schema_hint(schema_name, schema)
         augmented_system_prompt = (
@@ -351,6 +365,7 @@ class OpenRouterClient:
                 user_prompt=augmented_user_prompt,
                 prompt_cache_key=prompt_cache_key,
                 stable_prefix=stable_prefix,
+                tuning_override=responses_tuning_override,
             )
         return self._chat_json_object(
             role=role,
@@ -652,6 +667,7 @@ class OpenRouterClient:
         user_prompt: str,
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
+        tuning_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         tuning = self._responses_tuning(role=role, schema_name=schema_name)
         payload = {
@@ -672,6 +688,8 @@ class OpenRouterClient:
             },
         }
         payload.update(tuning)
+        if tuning_override:
+            payload.update(tuning_override)
         cache_control = self._cache_control(model)
         if cache_control is not None:
             payload["cache_control"] = cache_control
@@ -745,6 +763,7 @@ class OpenRouterClient:
         user_prompt: str,
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
+        tuning_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         tuning = self._responses_tuning(role=role, schema_name=schema_name)
         payload = {
@@ -762,6 +781,8 @@ class OpenRouterClient:
             },
         }
         payload.update(tuning)
+        if tuning_override:
+            payload.update(tuning_override)
         cache_control = self._cache_control(model)
         if cache_control is not None:
             payload["cache_control"] = cache_control
@@ -933,7 +954,9 @@ class OpenRouterClient:
     @staticmethod
     def _responses_tuning(*, role: str, schema_name: str) -> dict[str, Any]:
         if role == "repair":
-            return {"reasoning": {"effort": "low"}}
+            if schema_name == "fix_patch_v1":
+                return {"reasoning": {"effort": "medium"}}
+            return {"reasoning": {"effort": "high"}}
         if role == "code_edit":
             return {"reasoning": {"effort": "low"}}
         if role == "code_plan":

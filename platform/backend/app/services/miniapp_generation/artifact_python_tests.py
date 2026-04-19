@@ -443,8 +443,13 @@ class GeneratedMiniAppTests(unittest.TestCase):
         for key, value in {"title": "Generated request", "status": "new", "comment": "Created from generated app test"}.items():
             if key in create_allowed_fields and key not in create_payload:
                 create_payload[key] = value
-        create_response = _request_and_assert(self.client, str(create_requirement.get("method") or "POST"), create_path, create_payload)
-        self.assertLess(create_response.status_code, 400, f"Create API failed: {create_path} -> {create_response.status_code}")
+        create_method = str(create_requirement.get("method") or "POST").upper()
+        create_response = _request_and_assert(self.client, create_method, create_path, create_payload)
+        self.assertLess(
+            create_response.status_code,
+            400,
+            f"Create API failed: {create_method} {create_path} -> {create_response.status_code}; payload={json.dumps(create_payload, sort_keys=True, default=str)}; body={create_response.text}",
+        )
         created_payload = _response_json(create_response)
         created_id = _extract_record_id(created_payload)
         self.assertTrue(created_id, f"Create API {create_path} must return a persisted record id. Payload: {created_payload}")
@@ -465,11 +470,12 @@ class GeneratedMiniAppTests(unittest.TestCase):
         for key, value in {"status": "in_progress"}.items():
             if (not update_allowed_fields and key == "status") or key in update_allowed_fields:
                 update_payload[key] = value
-        update_response = _request_and_assert(self.client, str(update_requirement.get("method") or "PATCH"), update_path, update_payload)
+        update_method = str(update_requirement.get("method") or "PATCH").upper()
+        update_response = _request_and_assert(self.client, update_method, update_path, update_payload)
         self.assertLess(
             update_response.status_code,
             400,
-            f"Update API failed: {update_path} -> {update_response.status_code}; body={update_response.text}",
+            f"Update API failed: {update_method} {update_path} -> {update_response.status_code}; payload={json.dumps(update_payload, sort_keys=True, default=str)}; body={update_response.text}",
         )
         updated_payload = _response_json(update_response)
         self.assertTrue(

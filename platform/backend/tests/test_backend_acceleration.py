@@ -25,6 +25,7 @@ from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnCo
 from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
 from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES, GenerationService
+from app.services.check_runner import CheckRunner
 from app.services.run_service import RunService
 from app.modules.miniapp_validation.build_validator import BuildValidator
 
@@ -6216,6 +6217,81 @@ def test_fix_orchestrator_reuses_existing_generation_draft(tmp_path: Path) -> No
     assert any(entry.get("stage") == "draft_reused" for entry in trace.get("entries", []))
 
 
+def test_fix_orchestrator_resets_to_safe_source_when_failed_draft_regresses_contract(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Safe Base Workspace",
+            "description": "Fix should restart from source when the failed draft regresses canonical API shape.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    workspace_service = app.state.container.workspace_service
+    workspace_service.clone_template(workspace_id)
+
+    source_main = workspace_service.source_dir(workspace_id) / "miniapp/app/main.py"
+    source_marker = "\n# source-safe-marker\n"
+    source_main.write_text(source_main.read_text(encoding="utf-8") + source_marker, encoding="utf-8")
+
+    failed_run_id = "run_failed_generation"
+    failed_draft = workspace_service.prepare_draft(workspace_id, failed_run_id)
+    (failed_draft / "miniapp/app/routes/bookingrequests.py").write_text(
+        'from fastapi import APIRouter\n\nrouter = APIRouter()\n\n@router.post("/api/submissions/{table}")\ndef submit(table: str):\n    return {"table": table}\n',
+        encoding="utf-8",
+    )
+
+    def fake_execute_exact_checks(*, job, workspace_id, run_id, draft_source, changed_files):
+        del job, changed_files
+        assert source_marker.strip() in (draft_source / "miniapp/app/main.py").read_text(encoding="utf-8")
+        return (
+            CheckExecutionRecord(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                results=[
+                    RunCheckResult(name="schema_validators", status="passed", details="Validators passed."),
+                    RunCheckResult(name="connectivity_validators", status="passed", details="Connectivity validators passed."),
+                    RunCheckResult(name="changed_files_static", status="passed", details="Static checks passed."),
+                    RunCheckResult(name="preview_boot_smoke", status="passed", details="Preview is healthy."),
+                    RunCheckResult(name="preview_connectivity_smoke", status="passed", details="Preview routes are healthy."),
+                ],
+                duration_ms=1,
+            ),
+            {"status": "running", "stage": "running", "progress_percent": 100, "logs": [], "last_error": None, "mini_app_logs": []},
+        )
+
+    app.state.container.fix_orchestrator._execute_exact_checks = fake_execute_exact_checks  # type: ignore[method-assign]
+    app.state.container.fix_orchestrator._execute_final_checks = fake_execute_exact_checks  # type: ignore[method-assign]
+
+    job = app.state.container.fix_orchestrator.generate(
+        workspace_id,
+        GenerateRequest(
+            prompt="Repair the broken booking request API after the failed generation run.",
+            mode="fix",
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+            generation_mode="balanced",
+            model_profile="openai_code_fast",
+            resume_from_run_id=failed_run_id,
+            error_context={
+                "raw_error": "Create API failed: POST /api/bookingrequests -> 405",
+                "source": "runtime",
+                "failing_target": "/api/bookingrequests",
+            },
+        ),
+    )
+
+    assert job.status == "completed"
+    assert job.repair_base == "current_source_safe_reset"
+    trace = app.state.container.store.get("reports", f"trace:{workspace_id}") or {}
+    assert any("current source snapshot" in str(entry.get("message") or "").lower() for entry in trace.get("entries", []))
+
+
 def test_fix_context_includes_generated_app_graph_for_connectivity_state_failures(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -6691,14 +6767,14 @@ def test_mode_profiles_differentiate_fast_balanced_and_quality() -> None:
     assert quality.verification_depth == "deep"
 
 
-    def test_task_profiles_use_codex_for_code_paths() -> None:
-        for profile in TASK_PROFILES.values():
-            routing = profile["routing"]
-            assert routing["spec_analysis"] == "gpt-5-mini"
-            assert routing["code_plan"] == "gpt-5-mini"
-            assert routing["ir_codegen"] == "gpt-5.1-codex-mini"
-            assert routing["code_edit"] == "gpt-5.1-codex-mini"
-            assert routing["repair"] == "gpt-5.1-codex-mini"
+def test_task_profiles_use_quality_first_repair_routing() -> None:
+    for profile in TASK_PROFILES.values():
+        routing = profile["routing"]
+        assert routing["spec_analysis"] == "gpt-5-mini"
+        assert routing["code_plan"] == "gpt-5-mini"
+        assert routing["ir_codegen"] == "gpt-5.1-codex-mini"
+        assert routing["code_edit"] == "gpt-5.1-codex-mini"
+        assert routing["repair"] == "gpt-5.1-codex-max"
 
 
 def test_context_pack_builder_applies_mode_budget_and_prompt_fingerprint(tmp_path: Path) -> None:
@@ -7398,6 +7474,57 @@ def test_fix_orchestrator_marks_generated_manifests_read_only(tmp_path: Path) ->
     assert orchestrator._is_read_only_generated_surface("miniapp/app/generated/route_manifest.json")
     assert orchestrator._is_read_only_generated_surface("artifacts/generated_app_graph.json")
     assert not orchestrator._is_read_only_generated_surface("miniapp/app/routes/requests.py")
+
+
+def test_fix_orchestrator_rejects_regressed_bookingrequests_route_shape(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    orchestrator = app.state.container.fix_orchestrator
+
+    fix_turn = FixTurnContext(
+        workspace_id="ws_test",
+        run_id="run_test",
+        failure_class="route_api_contract_mismatch",
+        implicated_files=["miniapp/app/routes/bookingrequests.py", "miniapp/app/db.py", "miniapp/app/schemas.py"],
+        write_scope=[FixScopeEntry(file_path="miniapp/app/routes/bookingrequests.py", reason="api failure")],
+    )
+    outcome = orchestrator._repair_outcome_from_response(
+        llm_result={
+            "outcome": "patch_ready",
+            "diagnosis": "Rewrite the route quickly.",
+            "operations": [
+                {
+                    "file_path": "miniapp/app/routes/bookingrequests.py",
+                    "operation": "replace",
+                    "content": 'from fastapi import APIRouter\n\nrouter = APIRouter()\n\n@router.post("/api/submissions/{table}")\ndef submit(table: str):\n    return {"table": table}\n',
+                    "reason": "Use a generic submission endpoint.",
+                }
+            ],
+        },
+        prompt_context=FixPromptContext(workspace_id="ws_test", run_id="run_test", attempt=1),
+        fix_turn=fix_turn,
+        scope_entries=fix_turn.write_scope,
+        scope_expansions=[],
+    )
+
+    assert outcome.outcome == "no_progress"
+    assert "canonical bookingrequests api shape" in str(outcome.validation_error or "").lower()
+
+
+def test_check_runner_extracts_structured_generated_app_api_failure_diagnostics() -> None:
+    logs = [
+        "FAIL: test_role_journey_round_trip_persists_shared_record (tests.test_generated_app.GeneratedAppTests)",
+        "AssertionError: 405 not less than 400 : Create API failed: POST /api/bookingrequests -> 405; payload={\"title\": \"Generated request\"}; body={\"detail\":\"Method Not Allowed\"}",
+    ]
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(logs)
+
+    assert diagnostics["failing_test_name"] == "test_role_journey_round_trip_persists_shared_record"
+    api_failure = diagnostics["api_failure"]
+    assert api_failure["method"] == "POST"
+    assert api_failure["path"] == "/api/bookingrequests"
+    assert api_failure["status_code"] == 405
+    assert api_failure["resource_slug"] == "bookingrequests"
 
 
 def test_endpoint_aliases_canonicalize_to_requests() -> None:

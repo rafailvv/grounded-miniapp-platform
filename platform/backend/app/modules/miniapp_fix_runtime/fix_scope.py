@@ -40,6 +40,7 @@ class FixScopeRuntime:
         entries = [entry for entry in entries if not self._is_read_only_context_surface(entry.file_path)]
         if not self.service._allow_test_file_writes_for_failure(failure_class):
             entries = [entry for entry in entries if not entry.file_path.startswith("miniapp/tests/")]
+        entries.sort(key=lambda entry: self._scope_priority(entry.file_path, failure_class))
         return entries
 
     def structural_scope_bundle(
@@ -141,3 +142,23 @@ class FixScopeRuntime:
     def _is_read_only_context_surface(cls, file_path: str) -> bool:
         normalized = str(file_path or "").strip().replace("\\", "/")
         return normalized in cls._READ_ONLY_CONTEXT_SURFACES or normalized.startswith(cls._READ_ONLY_CONTEXT_SURFACE_PREFIXES)
+
+    @staticmethod
+    def _scope_priority(file_path: str, failure_class: str) -> tuple[int, str]:
+        normalized = str(file_path or "").strip()
+        if normalized.startswith("miniapp/app/routes/"):
+            return (0, normalized)
+        if normalized == "miniapp/app/schemas.py":
+            return (1, normalized)
+        if normalized == "miniapp/app/db.py":
+            return (2, normalized)
+        if normalized == "miniapp/app/main.py" and failure_class in {
+            "backend_framework_mismatch",
+            "runtime_manifest_route_missing",
+            "router_not_registered",
+            "db_dependency_export_missing",
+        }:
+            return (3, normalized)
+        if normalized == "miniapp/app/main.py":
+            return (9, normalized)
+        return (5, normalized)

@@ -234,14 +234,21 @@ def _normalize_create_payload(payload: dict[str, Any]) -> BookingRequestCreate:
 
 
 def _normalize_update_payload(payload: dict[str, Any]) -> BookingRequestUpdate:
-    owner_field = "specialist_owner" if "specialist_owner" in getattr(BookingRequestUpdate, "model_fields", {}) else "owner"
-    normalized = _filter_for_schema(BookingRequestUpdate, {
+    update_fields = getattr(BookingRequestUpdate, "model_fields", {})
+    owner_value = payload.get("specialist_owner") or payload.get("owner_role") or payload.get("owner")
+    normalized_payload: dict[str, Any] = {
         "status": _normalize_status(payload.get("status") or payload.get("state")),
-        owner_field: payload.get("specialist_owner") or payload.get("owner_role") or payload.get("owner"),
         "returned_at": payload.get("returned_at"),
         "item_label": payload.get("item_label") or payload.get("assigned_item") or payload.get("equipment_details"),
         "issued_at": payload.get("issued_at"),
-    })
+    }
+    if "specialist_owner" in update_fields:
+        normalized_payload["specialist_owner"] = owner_value
+    elif "owner_role" in update_fields:
+        normalized_payload["owner_role"] = owner_value
+    elif "owner" in update_fields:
+        normalized_payload["owner"] = owner_value
+    normalized = _filter_for_schema(BookingRequestUpdate, normalized_payload)
     return BookingRequestUpdate.model_validate(normalized)
 
 
@@ -288,8 +295,8 @@ def _record_payload_from_create(normalized: BookingRequestCreate, now: datetime)
 def _to_schema(record: BookingRequestRecord, conflict: bool = False) -> BookingRequestRead:
     record_id = _record_identifier(record)
     read_fields = getattr(BookingRequestRead, "model_fields", {})
-    owner_field = "specialist_owner" if "specialist_owner" in read_fields else "owner"
-    payload = _filter_for_schema(BookingRequestRead, {
+    owner_value = getattr(record, "specialist_owner", getattr(record, "owner", getattr(record, "owner_role", None)))
+    payload_data: dict[str, Any] = {
         "id": record_id,
         "bookingrequest_id": record_id,
         "request_id": str(record_id) if record_id is not None else None,
@@ -300,7 +307,6 @@ def _to_schema(record: BookingRequestRecord, conflict: bool = False) -> BookingR
         "reason": record.reason,
         "status": record.status,
         "requested_by": getattr(record, "requested_by", None),
-        owner_field: getattr(record, "specialist_owner", getattr(record, "owner", getattr(record, "owner_role", None))),
         "owner_role": getattr(record, "owner_role", None),
         "owner_assigned_at": getattr(record, "owner_assigned_at", None),
         "issued_at": getattr(record, "issued_at", None),
@@ -313,10 +319,14 @@ def _to_schema(record: BookingRequestRecord, conflict: bool = False) -> BookingR
         "updated_at": record.updated_at,
         "conflict_note": getattr(record, "status_notes", None),
         "conflict": conflict,
-    })
-    payload.setdefault(owner_field, getattr(record, "specialist_owner", getattr(record, "owner", getattr(record, "owner_role", None))))
-    payload.setdefault("issued_at", getattr(record, "issued_at", None))
-    payload.setdefault("returned_at", getattr(record, "returned_at", None))
+    }
+    if "specialist_owner" in read_fields:
+        payload_data["specialist_owner"] = owner_value
+    elif "owner" in read_fields:
+        payload_data["owner"] = owner_value
+    elif "owner_role" in read_fields and payload_data.get("owner_role") is None:
+        payload_data["owner_role"] = owner_value
+    payload = _filter_for_schema(BookingRequestRead, payload_data)
     return BookingRequestRead.model_validate(payload)
 
 

@@ -23,7 +23,6 @@ class FixClassificationRuntime:
             f"miniapp/app/routes/{normalized}.py",
             "miniapp/app/db.py",
             "miniapp/app/schemas.py",
-            "miniapp/app/main.py",
         ]
 
     @staticmethod
@@ -135,6 +134,15 @@ class FixClassificationRuntime:
     def root_cause_summary(results: list[RunCheckResult], preview_details: dict[str, str], raw_error: str) -> str:
         for result in results:
             if result.status == "failed":
+                diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+                api_failure = diagnostics.get("api_failure") if isinstance(diagnostics, dict) else None
+                if isinstance(api_failure, dict):
+                    method = str(api_failure.get("method") or "").strip().upper()
+                    path = str(api_failure.get("path") or "").strip()
+                    status = api_failure.get("status_code")
+                    if path and status:
+                        route_label = " ".join(part for part in [method, path] if part).strip()
+                        return f"Generated app API failure: {route_label} -> {status}".strip()
                 line = next((item.strip() for item in result.logs if item.strip()), result.details or "")
                 if line:
                     return line
@@ -151,6 +159,22 @@ class FixClassificationRuntime:
             if result.status != "failed":
                 continue
             haystack = "\n".join([result.details or "", *result.logs]).lower()
+            diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+            api_failure = diagnostics.get("api_failure") if isinstance(diagnostics, dict) else None
+            if isinstance(api_failure, dict):
+                markers.append(
+                    " ".join(
+                        part
+                        for part in [
+                            "generated_app_api_failure",
+                            str(api_failure.get("method") or "").strip().upper(),
+                            str(api_failure.get("path") or "").strip(),
+                            str(api_failure.get("status_code") or "").strip(),
+                            str(api_failure.get("resource_slug") or "").strip(),
+                        ]
+                        if part
+                    ).strip()
+                )
             if result.name == "generated_app_python_tests":
                 if "sessionlocal" in haystack:
                     markers.append("runtime.startup.missing_sessionlocal")
@@ -184,6 +208,15 @@ class FixClassificationRuntime:
             if len(route_segments) >= 2 and route_segments[0] == "api":
                 resource = route_segments[1]
                 candidates.extend(self._resource_fix_targets(resource))
+        api_contract_match = re.search(
+            r"(?:create|update)\s+api\s+failed:\s+(?:(?:post|put|patch|get|delete)\s+)?(/api/[a-z0-9_/-]+)\s*->\s*(405|4\d\d|5\d\d)",
+            lowered,
+        )
+        if api_contract_match:
+            route_path = api_contract_match.group(1).strip()
+            route_segments = [segment for segment in route_path.strip("/").split("/") if segment]
+            if len(route_segments) >= 2 and route_segments[0] == "api":
+                candidates.extend(self._resource_fix_targets(route_segments[1]))
         json_serialization_api_match = re.search(r"(/api/[a-z0-9_/-]+)", lowered)
         if any(
             marker in lowered

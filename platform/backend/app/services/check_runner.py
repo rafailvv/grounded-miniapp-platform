@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,16 @@ from app.validators.suite import ValidationSuite
 
 
 class CheckRunner:
+    _API_FAILURE_RE = re.compile(
+        r"(?P<label>Create|Update|List|Post-update list)\s+API\s+failed:\s*"
+        r"(?:(?P<method>POST|PUT|PATCH|GET|DELETE)\s+)?"
+        r"(?P<path>/api/[A-Za-z0-9_/{}/-]+)\s*->\s*(?P<status>\d+)"
+        r"(?:;\s*payload=(?P<payload>.*?))?"
+        r"(?:;\s*body=(?P<body>.*))?$",
+        re.IGNORECASE,
+    )
+    _UNITTEST_FAIL_RE = re.compile(r"FAIL:\s+(?P<name>[A-Za-z0-9_]+)\s+\(")
+
     def __init__(self, validation_suite: ValidationSuite, preview_service: PreviewService) -> None:
         self.validation_suite = validation_suite
         self.preview_service = preview_service
@@ -149,7 +160,16 @@ class CheckRunner:
             if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
                 location = "tests"
                 code = "tests.python_generated_app" if result.name == "generated_app_python_tests" else "tests.js_generated_app"
-                message = next((line for line in reversed(result.logs) if line.strip()), message)
+                diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+                api_failure = diagnostics.get("api_failure") if isinstance(diagnostics, dict) else None
+                if isinstance(api_failure, dict):
+                    method = str(api_failure.get("method") or "").strip().upper()
+                    path = str(api_failure.get("path") or "").strip()
+                    status = api_failure.get("status_code")
+                    route_label = " ".join(part for part in [method, path] if part).strip()
+                    message = f"Generated app API failure: {route_label} -> {status}".strip()
+                else:
+                    message = next((line for line in reversed(result.logs) if line.strip()), message)
             if result.name in {"preview_boot_smoke", "preview_connectivity_smoke"}:
                 location = "preview"
                 code = "connectivity.preview_route_unreachable" if result.name == "preview_connectivity_smoke" else "preview.rebuild_failed"
@@ -407,13 +427,15 @@ class CheckRunner:
                 logs=self._command_logs("Generated Python app tests timed out.", exc.stdout or "", exc.stderr or ""),
             )
         if result.returncode != 0:
+            logs = self._command_logs("Generated Python app tests failed for the draft miniapp.", result.stdout, result.stderr)
             return RunCheckResult(
                 name="generated_app_python_tests",
                 status="failed",
                 details="Generated Python app tests failed for the draft miniapp.",
                 command=" ".join(command),
                 exit_code=result.returncode,
-                logs=self._command_logs("Generated Python app tests failed for the draft miniapp.", result.stdout, result.stderr),
+                logs=logs,
+                diagnostics=self._extract_generated_app_test_diagnostics(logs),
             )
         return RunCheckResult(
             name="generated_app_python_tests",
@@ -698,6 +720,41 @@ class CheckRunner:
             return [summary]
         tail = lines[-tail_lines:]
         return [summary, *tail]
+
+    @classmethod
+    def _extract_generated_app_test_diagnostics(cls, logs: list[str]) -> dict[str, object]:
+        diagnostics: dict[str, object] = {}
+        failing_test = next(
+            (
+                match.group("name")
+                for line in logs
+                if (match := cls._UNITTEST_FAIL_RE.search(str(line or "")))
+            ),
+            None,
+        )
+        if failing_test:
+            diagnostics["failing_test_name"] = failing_test
+        stack_excerpt = [str(line or "") for line in logs[-12:] if str(line or "").strip()]
+        if stack_excerpt:
+            diagnostics["stack_excerpt"] = stack_excerpt
+        for line in reversed(logs):
+            match = cls._API_FAILURE_RE.search(str(line or ""))
+            if not match:
+                continue
+            path = str(match.group("path") or "").strip()
+            segments = [segment for segment in path.strip("/").split("/") if segment]
+            resource_slug = segments[1] if len(segments) >= 2 and segments[0] == "api" else ""
+            diagnostics["api_failure"] = {
+                "label": str(match.group("label") or "").strip().lower().replace(" ", "_"),
+                "method": str(match.group("method") or "").strip().upper() or None,
+                "path": path,
+                "status_code": int(match.group("status") or 0),
+                "request_payload": str(match.group("payload") or "").strip() or None,
+                "response_body": str(match.group("body") or "").strip() or None,
+                "resource_slug": resource_slug or None,
+            }
+            break
+        return diagnostics
 
     @staticmethod
     def _filter_build_issues(issues: list[ValidationIssue], scope_mode: str) -> list[ValidationIssue]:

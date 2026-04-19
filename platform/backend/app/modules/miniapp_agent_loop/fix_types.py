@@ -22,6 +22,7 @@ class FixTurnContext:
     write_scope: list[FixScopeEntry] = field(default_factory=list)
     attempt_history: list[FixAttemptRecord | dict[str, Any]] = field(default_factory=list)
     executed_checks: list[RunCheckResult] = field(default_factory=list)
+    api_failure_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     memory_context: str | None = None
 
 
@@ -36,6 +37,7 @@ class FixPromptContext:
     exact_error_excerpt: str | None = None
     context_mode: Literal["minimal", "expanded", "full_bundle"] = "minimal"
     failing_checks: list[dict[str, Any]] = field(default_factory=list)
+    api_failure_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     normalized_critical_issues: list[dict[str, Any]] = field(default_factory=list)
     failing_file_paths: list[str] = field(default_factory=list)
     expected_contract: dict[str, Any] = field(default_factory=dict)
@@ -44,3 +46,4 @@ class FixPromptContext:
     read_only_surfaces: list[str] = field(default_factory=list)
     previous_attempt_summary: str | None = None
     previous_diff_summary: str | None = None
+    repair_base: str | None = None

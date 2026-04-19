@@ -176,6 +176,7 @@ class JobRecord(StrictModel):
     failure_class: str | None = None
     failure_signature: str | None = None
     root_cause_summary: str | None = None
+    repair_base: str | None = None
     current_fix_phase: str | None = None
     current_failing_command: str | None = None
     current_exit_code: int | None = None
@@ -352,6 +353,7 @@ class RunCheckResult(StrictModel):
     command: str | None = None
     exit_code: int | None = None
     logs: list[str] = Field(default_factory=list)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
 
 
 class CheckExecutionRecord(StrictModel):

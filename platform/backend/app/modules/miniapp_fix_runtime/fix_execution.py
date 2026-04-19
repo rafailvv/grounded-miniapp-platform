@@ -25,6 +25,41 @@ class FixExecutionRuntime:
     def __init__(self, service: "FixOrchestrator") -> None:
         self.service = service
 
+    def _refresh_derived_app_tests(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        draft_source: Path,
+    ) -> None:
+        generation_service = getattr(self.service, "generation_service", None)
+        if generation_service is None:
+            return
+        try:
+            page_graph = self.service._page_graph_for_run(workspace_id, run_id)
+        except Exception:
+            page_graph = {}
+        role_scope = [
+            str(role)
+            for role in ((page_graph.get("roles") or {}).keys() if isinstance(page_graph, dict) else [])
+            if str(role) in {"client", "specialist", "manager"}
+        ] or ["client", "specialist", "manager"]
+        artifact_builder = generation_service.artifact_builder
+        test_files = {
+            "miniapp/tests/test_generated_app.py": artifact_builder.python_app_level_test_content(
+                page_graph=page_graph,
+                role_scope=role_scope,
+            ),
+            "miniapp/tests/generated_app.test.mjs": artifact_builder.js_app_level_test_content(
+                page_graph=page_graph,
+                role_scope=role_scope,
+            ),
+        }
+        for relative_path, content in test_files.items():
+            target_path = draft_source / relative_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(content, encoding="utf-8")
+
     def execute_exact_checks(
         self,
         *,
@@ -36,6 +71,11 @@ class FixExecutionRuntime:
     ) -> tuple[CheckExecutionRecord, dict[str, Any]]:
         self.service._append_event(job, "frontend_build_started", "Running exact frontend/build verification.")
         self.service._append_event(job, "backend_compile_started", "Running exact miniapp compile verification.")
+        self._refresh_derived_app_tests(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            draft_source=draft_source,
+        )
         execution = self.service.check_runner.run(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -121,6 +161,11 @@ class FixExecutionRuntime:
         changed_files: list[str],
     ) -> tuple[CheckExecutionRecord, dict[str, Any]]:
         self.service._append_event(job, "final_checks_started", "Running final full verification before completing fix.")
+        self._refresh_derived_app_tests(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            draft_source=draft_source,
+        )
         execution = self.service.check_runner.run(
             workspace_id=workspace_id,
             run_id=run_id,

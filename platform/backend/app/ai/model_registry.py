@@ -1,5 +1,6 @@
 PLANNING_MODEL = "gpt-5-mini"
 CODE_MODEL = "gpt-5.1-codex-mini"
+REPAIR_MODEL = "gpt-5.1-codex-max"
 SUMMARY_MODEL = "gpt-5-mini"
 
 TASK_PROFILES = {
@@ -12,7 +13,7 @@ TASK_PROFILES = {
             "ir_codegen": CODE_MODEL,
             "code_plan": PLANNING_MODEL,
             "code_edit": CODE_MODEL,
-            "repair": CODE_MODEL,
+            "repair": REPAIR_MODEL,
             "summarize": SUMMARY_MODEL,
             "cheap_task": SUMMARY_MODEL,
         },
@@ -27,7 +28,7 @@ TASK_PROFILES = {
             "ir_codegen": CODE_MODEL,
             "code_plan": PLANNING_MODEL,
             "code_edit": CODE_MODEL,
-            "repair": CODE_MODEL,
+            "repair": REPAIR_MODEL,
             "summarize": SUMMARY_MODEL,
             "cheap_task": SUMMARY_MODEL,
         },

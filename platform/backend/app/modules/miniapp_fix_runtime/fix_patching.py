@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -137,14 +138,19 @@ class FixPatchingRuntime:
         job.current_fix_phase = "patching"
         self.service._save_job(job)
         prompt_cache_key = self.service._prompt_cache_key(prompt_context)
+        repair_context_mode = str(prompt_context.context_mode or "minimal").strip().lower()
+        tuning_override = {"reasoning": {"effort": "medium"}}
+        if repair_context_mode in {"expanded", "full_bundle"} or prompt_context.previous_attempt_summary:
+            tuning_override = {"reasoning": {"effort": "high"}}
         try:
-            payload = self.service.openrouter_client.generate_workspace_edits(
+            payload = self.service.openrouter_client.generate_repair(
                 schema_name="fix_patch_v1",
                 schema=self.service._repair_schema(),
                 system_prompt=self.service._repair_system_prompt(),
                 user_prompt=self.service._repair_user_prompt(prompt_context, repair_feedback=repair_feedback),
                 prompt_cache_key=prompt_cache_key,
                 stable_prefix=self.service._repair_system_prompt(),
+                responses_tuning_override=tuning_override,
             )
             job.llm_model = str(payload["model"])
             job.cache_stats = self.merge_cache_stats(job.cache_stats, payload.get("cache_stats") or {})
@@ -190,6 +196,9 @@ class FixPatchingRuntime:
                 raise ValueError(f"Repair attempted to edit generated tests instead of the app surface: {operation.file_path}")
             if self.is_read_only_generated_surface(operation.file_path):
                 raise ValueError(f"Repair attempted to edit a generated manifest surface instead of the app bundle: {operation.file_path}")
+            route_regression_error = self._resource_route_regression_error(operation)
+            if route_regression_error:
+                raise ValueError(route_regression_error)
             if operation.file_path not in scope_paths:
                 if patch_expansion_count >= self.service.MAX_SCOPE_EXPANSIONS or not self.can_expand_for_file(operation.file_path, fix_turn.implicated_files):
                     raise ValueError(f"Repair touched files outside the allowed evidence-based scope: {operation.file_path}")
@@ -256,6 +265,24 @@ class FixPatchingRuntime:
             if item.get("content") is None:
                 missing.append(file_path)
         return list(dict.fromkeys(missing))
+
+    @staticmethod
+    def _resource_route_regression_error(operation: DraftFileOperation) -> str | None:
+        if operation.operation not in {"create", "replace"} or operation.content is None:
+            return None
+        normalized_path = str(operation.file_path or "").strip().replace("\\", "/")
+        if not normalized_path.startswith("miniapp/app/routes/"):
+            return None
+        if Path(normalized_path).stem != "bookingrequests":
+            return None
+        content = str(operation.content or "")
+        lowered = content.lower()
+        if "/api/submissions/{table}" in lowered:
+            return "Repair regressed the canonical bookingrequests API shape into a generic submissions shim."
+        required_markers = ('@router.post("")', '@router.get("")', '@router.put("/{item_id}")')
+        if any(marker not in content for marker in required_markers):
+            return "Repair removed canonical bookingrequests CRUD endpoints instead of fixing the resource route."
+        return None
 
     @staticmethod
     def should_retry_patch_validation(message: str) -> bool:

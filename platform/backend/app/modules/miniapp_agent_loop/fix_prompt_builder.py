@@ -23,6 +23,13 @@ class FixPromptBuilder:
             [
                 str(fix_turn.root_cause_summary or ""),
                 str(fix_turn.exact_error_excerpt or ""),
+                *[
+                    " ".join(
+                        str(item.get(key) or "")
+                        for key in ("method", "path", "status_code", "resource_slug")
+                    ).strip()
+                    for item in fix_turn.api_failure_diagnostics
+                ],
                 *[item.details or "" for item in fix_turn.executed_checks],
                 *[line for item in fix_turn.executed_checks for line in item.logs],
             ]
@@ -111,6 +118,7 @@ class FixPromptBuilder:
                     "details": result.details,
                     "command": result.command,
                     "failure_class": failure_class,
+                    "diagnostics": dict(result.diagnostics or {}),
                 }
             )
         return issues[:16]
@@ -143,6 +151,7 @@ class FixPromptBuilder:
                     "exact_error_excerpt": repair_packet.exact_error_excerpt,
                     "context_mode": repair_packet.context_mode,
                     "failing_checks": repair_packet.failing_checks,
+                    "api_failure_diagnostics": repair_packet.api_failure_diagnostics,
                     "normalized_critical_issues": repair_packet.normalized_critical_issues,
                     "failing_file_paths": repair_packet.failing_file_paths,
                     "expected_contract": repair_packet.expected_contract,
@@ -151,6 +160,7 @@ class FixPromptBuilder:
                     "read_only_surfaces": repair_packet.read_only_surfaces,
                     "previous_attempt_summary": repair_packet.previous_attempt_summary,
                     "previous_diff_summary": repair_packet.previous_diff_summary,
+                    "repair_base": repair_packet.repair_base,
                 },
                 "repair_feedback": repair_feedback,
                 "rules": [

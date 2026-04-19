@@ -57,6 +57,13 @@ class FixTurnBuilder:
         signature = failure_signature(failure_class, root_cause)
         scope = write_scope(workspace_id, run_id, implicated, failure_class, existing_scope)
         excerpt = error_excerpt(check_execution.results, preview_details, raw_error)
+        api_failure_diagnostics = [
+            dict(result.diagnostics.get("api_failure") or {})
+            for result in check_execution.results
+            if result.status == "failed"
+            and isinstance(result.diagnostics, dict)
+            and isinstance(result.diagnostics.get("api_failure"), dict)
+        ]
         container_statuses = [
             ContainerStatusRecord.model_validate(item)
             for item in preview_details.get("containers", [])
@@ -77,6 +84,7 @@ class FixTurnBuilder:
             write_scope=scope,
             attempt_history=[item.model_dump(mode="json") for item in prior_attempts[-4:]],
             executed_checks=check_execution.results,
+            api_failure_diagnostics=api_failure_diagnostics,
             memory_context=memory_context,
         )
 
@@ -93,8 +101,13 @@ class FixTurnBuilder:
         current_diff_summary,
         additional_paths: list[str] | None = None,
         tool_results: list[dict[str, Any]] | None = None,
+        repair_base: str | None = None,
     ) -> FixPromptContext:
-        full_files = context_mode in {"expanded", "full_bundle"} or self.prompt_builder.needs_full_context_first(fix_turn)
+        full_files = (
+            context_mode in {"expanded", "full_bundle"}
+            or self.prompt_builder.needs_full_context_first(fix_turn)
+            or bool(fix_turn.api_failure_diagnostics)
+        )
         budget = 32000 if full_files else 12000
         file_contexts = collect_file_contexts(
             workspace_id,
@@ -128,10 +141,12 @@ class FixTurnBuilder:
                     "status": item.status,
                     "details": item.details,
                     "logs": item.logs[-12:],
+                    "diagnostics": dict(item.diagnostics or {}),
                 }
                 for item in fix_turn.executed_checks
                 if item.status == "failed"
             ],
+            api_failure_diagnostics=list(fix_turn.api_failure_diagnostics),
             normalized_critical_issues=self.prompt_builder.normalized_critical_issues(
                 fix_turn.executed_checks,
                 failure_class=fix_turn.failure_class,
@@ -143,4 +158,5 @@ class FixTurnBuilder:
             read_only_surfaces=self.prompt_builder.read_only_surfaces(),
             previous_attempt_summary=self.prompt_builder.previous_attempt_summary(fix_turn),
             previous_diff_summary=current_diff_summary(workspace_id, run_id),
+            repair_base=repair_base,
         )

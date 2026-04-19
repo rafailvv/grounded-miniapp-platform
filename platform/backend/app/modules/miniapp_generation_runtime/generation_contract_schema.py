@@ -10,6 +10,19 @@ from app.models.domain import DraftFileOperation
 
 class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
     @staticmethod
+    def _normalize_booking_schema_contract(schemas_content: str) -> str:
+        updated = str(schemas_content or "")
+        if "class BookingRequestRead" not in updated:
+            return updated
+        updated = re.sub(
+            r"(^\s*owner_role:\s*AppRole\s*\|\s*None)\s*$",
+            r"\1 = None",
+            updated,
+            flags=re.MULTILINE,
+        )
+        return updated
+
+    @staticmethod
     def _needs_canonical_bookingrequests_route_repair(content: str) -> bool:
         normalized = str(content or "")
         lowered = normalized.lower()
@@ -170,6 +183,15 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
         db_content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, db_path)
         if not schemas_content:
             return operations
+        normalized_schemas = self._normalize_booking_schema_contract(schemas_content)
+        if normalized_schemas != schemas_content:
+            operation_map[schemas_path] = DraftFileOperation(
+                file_path=schemas_path,
+                operation="replace",
+                content=normalized_schemas,
+                reason="Pre-apply contract sync: normalize optional booking schema fields so route responses serialize without response-model drift.",
+            )
+            schemas_content = normalized_schemas
         imported_names: set[str] = set()
         for file_path in list(operation_map):
             if not (file_path.startswith("miniapp/app/routes/") and file_path.endswith(".py")):

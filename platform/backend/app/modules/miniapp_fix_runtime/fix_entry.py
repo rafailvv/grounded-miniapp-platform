@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 
 class FixEntryRuntime:
-    MAX_TOOL_ROUNDS = 5
+    MAX_TOOL_ROUNDS = 7
     COMMAND_TIMEOUT_SECONDS = 20
 
     def __init__(self, service: "FixOrchestrator") -> None:
@@ -360,6 +360,7 @@ class FixEntryRuntime:
             tool_results_for_attempt: list[dict[str, object]] = []
             last_prompt_context = None
             seen_tool_request_signatures: set[str] = set()
+            api_diag_test_reread_count = 0
             for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
                 prompt_context = self.service._build_repair_packet(
                     workspace_id=workspace_id,
@@ -369,6 +370,7 @@ class FixEntryRuntime:
                     context_mode=context_mode,
                     additional_paths=extra_paths_for_attempt,
                     tool_results=tool_results_for_attempt,
+                    repair_base=job.repair_base,
                 )
                 last_prompt_context = prompt_context
                 if last_turn_summary or latest_diff_summary:
@@ -395,13 +397,50 @@ class FixEntryRuntime:
                 )
                 if repair_outcome.outcome == "tool_request":
                     normalized_tool_requests = list(repair_outcome.tool_requests)
+                    read_test_only = bool(normalized_tool_requests) and all(
+                        str(item.get("tool") or "").strip().lower() == "read_files"
+                        and all(
+                            str(target or "").strip().lstrip("./") == "miniapp/tests/test_generated_app.py"
+                            for target in list(item.get("targets") or [])
+                            if str(target or "").strip()
+                        )
+                        for item in normalized_tool_requests
+                    )
                     tool_request_signature = self._tool_request_signature(normalized_tool_requests)
                     duplicate_request = bool(tool_request_signature) and tool_request_signature in seen_tool_request_signatures
                     already_satisfied_read = self._read_request_already_satisfied(
                         normalized_tool_requests,
                         prompt_context.file_contexts,
                     )
-                    if duplicate_request or already_satisfied_read:
+                    if read_test_only and prompt_context.api_failure_diagnostics:
+                        api_diag_test_reread_count += 1
+                        requested_paths = []
+                        executed_tool_results = [
+                            {
+                                "tool": "tool_request_feedback",
+                                "targets": ["miniapp/tests/test_generated_app.py"],
+                                "error": (
+                                    "The failing request is already structured in api_failure_diagnostics. "
+                                    "Patch the implicated route/schema/db cluster or return outcome=no_progress."
+                                ),
+                            }
+                        ]
+                        if api_diag_test_reread_count >= 2:
+                            return WorkspaceLoopTurnPlan(
+                                outcome="no_op",
+                                assistant_message="The fix loop is rereading miniapp/tests/test_generated_app.py instead of patching the implicated route/schema/db cluster.",
+                                diagnosis=(
+                                    "Structured API failure diagnostics are already available. "
+                                    "Patch the implicated route/schema/db files or escalate the repair base."
+                                ),
+                                files_read=list(prompt_context.file_contexts.keys()),
+                                failure_class=fix_turn.failure_class,
+                                failure_signature=fix_turn.failure_signature,
+                                root_cause_summary=fix_turn.root_cause_summary,
+                                fix_targets=list(fix_turn.implicated_files),
+                                metadata={"tool_requests": list(repair_outcome.tool_requests), "stall_reason": "repeated_test_reread"},
+                            )
+                    elif duplicate_request or already_satisfied_read:
                         requested_paths = []
                         executed_tool_results = [
                             self._duplicate_tool_request_feedback(normalized_tool_requests),

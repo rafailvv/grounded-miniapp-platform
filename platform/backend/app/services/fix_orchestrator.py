@@ -45,8 +45,8 @@ if TYPE_CHECKING:
 class FixOrchestrator:
     MAX_ATTEMPTS = 12
     MAX_SCOPE_EXPANSIONS = 4
-    MAX_CONTEXT_CHARS = 12000
-    MAX_CONTEXT_CHARS_EXPANDED = 32000
+    MAX_CONTEXT_CHARS = 20000
+    MAX_CONTEXT_CHARS_EXPANDED = 48000
 
     def __init__(
         self,
@@ -147,9 +147,16 @@ class FixOrchestrator:
         )
         source_run_id = str(request.resume_from_run_id or "").strip()
         cloned_source_draft = False
+        repair_base = "current_source"
+        safe_source_repair = False
         if source_run_id and source_run_id != run_id and self.workspace_service.draft_exists(workspace_id, source_run_id):
-            self.workspace_service.clone_draft(workspace_id, source_run_id, run_id)
-            cloned_source_draft = True
+            if self._should_resume_failed_draft(workspace_id, source_run_id, request):
+                self.workspace_service.clone_draft(workspace_id, source_run_id, run_id)
+                cloned_source_draft = True
+                repair_base = f"draft:{source_run_id}"
+            else:
+                safe_source_repair = True
+                repair_base = "current_source_safe_reset"
         reuse_existing_draft = cloned_source_draft or bool(request.linked_run_id and self.workspace_service.draft_exists(workspace_id, run_id))
         self._clear_reports(workspace_id, preserve_generation_state=reuse_existing_draft)
         if not reuse_existing_draft:
@@ -175,12 +182,21 @@ class FixOrchestrator:
                 "reused_existing_draft": reuse_existing_draft,
                 "source_run_id": source_run_id or None,
                 "cloned_source_draft": cloned_source_draft,
+                "repair_base": repair_base,
             },
         )
         if cloned_source_draft:
             self._append_trace(workspace_id, "draft_reused", "Fix cloned the previous failed generation draft and continued from it.", {"run_id": run_id, "source_run_id": source_run_id})
+        elif safe_source_repair:
+            self._append_trace(
+                workspace_id,
+                "draft_reused",
+                "Fix detected a regressed failed draft and restarted repair from the current source snapshot.",
+                {"run_id": run_id, "source_run_id": source_run_id, "repair_base": repair_base},
+            )
         elif reuse_existing_draft:
             self._append_trace(workspace_id, "draft_reused", "Fix reused the existing generation draft instead of resetting it to the current source revision.", {"run_id": run_id})
+        job.repair_base = repair_base
         if self.workspace_loop_engine is None:
             raise RuntimeError("Workspace loop engine is required for fix mode.")
         return self._generate_with_workspace_loop(
@@ -246,6 +262,30 @@ class FixOrchestrator:
             current_diff_summary=self._current_diff_summary,
             **kwargs,
         )
+
+    def _should_resume_failed_draft(self, workspace_id: str, source_run_id: str, request: GenerateRequest) -> bool:
+        if not self.workspace_service.draft_exists(workspace_id, source_run_id):
+            return False
+        return not self._draft_has_contract_regression(workspace_id, source_run_id, request)
+
+    def _draft_has_contract_regression(self, workspace_id: str, run_id: str, request: GenerateRequest) -> bool:
+        raw_error = str(request.error_context.raw_error if request.error_context else request.prompt or "")
+        if "/api/" not in raw_error and "generated_app_python_tests" not in raw_error.lower():
+            return False
+        route_dir = self.workspace_service.draft_source_dir(workspace_id, run_id) / "miniapp/app/routes"
+        if not route_dir.exists():
+            return False
+        for route_file in sorted(route_dir.glob("*.py")):
+            try:
+                content = route_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if "/api/submissions/{table}" in content.lower():
+                return True
+            if route_file.stem == "bookingrequests" and self.generation_service is not None:
+                if self.generation_service.generation_contract_schema._needs_canonical_bookingrequests_route_repair(content):
+                    return True
+        return False
 
     def _read_only_surfaces(self) -> list[str]:
         return self.fix_prompts.read_only_surfaces()

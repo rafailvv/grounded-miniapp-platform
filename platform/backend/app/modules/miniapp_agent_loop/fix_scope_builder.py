@@ -42,7 +42,16 @@ class FixScopeBuilder:
         bundle: list[str] = []
         needs_route_registration_context = any(path.startswith("miniapp/app/routes/") and path.endswith(".py") for path in implicated_files)
         if needs_route_registration_context or ("route" in failure_class or "contract" in failure_class):
-            for candidate in ("miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"):
+            structural_candidates = ["miniapp/app/db.py", "miniapp/app/schemas.py"]
+            if failure_class in {
+                "backend_framework_mismatch",
+                "runtime_manifest_route_missing",
+                "router_not_registered",
+                "db_dependency_export_missing",
+                "loading_first_root_surface",
+            }:
+                structural_candidates.insert(0, "miniapp/app/main.py")
+            for candidate in structural_candidates:
                 if candidate in implicated_files:
                     continue
                 if self._file_exists(workspace_id, run_id, candidate) or allow_missing_scope_path(candidate):
