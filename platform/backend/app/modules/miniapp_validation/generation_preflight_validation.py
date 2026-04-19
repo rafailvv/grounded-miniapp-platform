@@ -204,4 +204,7 @@ class GenerationPreflightValidation:
         normalized = re.sub(r":[^/]+", "sample", normalized)
         if normalized != "/" and normalized.endswith("/"):
             normalized = normalized.rstrip("/")
+        for role in ("client", "specialist", "manager"):
+            if normalized == f"/{role}/root":
+                return f"/{role}"
         return normalized

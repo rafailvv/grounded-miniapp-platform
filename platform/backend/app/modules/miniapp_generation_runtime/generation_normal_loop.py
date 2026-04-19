@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -14,6 +17,288 @@ from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerati
 
 
 class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
+    @staticmethod
+    def _file_has_python_syntax_error(path: Path) -> bool:
+        if not path.exists():
+            return False
+        try:
+            compile(path.read_text(encoding="utf-8"), str(path), "exec")
+        except SyntaxError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    @staticmethod
+    def _imported_schema_names(route_source: str) -> set[str]:
+        match = re.search(r"from\s+app\.schemas\s+import\s+([^\n]+)", route_source)
+        if not match:
+            return set()
+        raw_names = match.group(1)
+        return {
+            token.strip()
+            for token in raw_names.split(",")
+            if token.strip() and token.strip() != "*"
+        }
+
+    @staticmethod
+    def _defined_schema_names(schema_source: str) -> set[str]:
+        return set(re.findall(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|:)", schema_source, flags=re.MULTILINE))
+
+    @staticmethod
+    def _class_field_names(schema_source: str, class_name: str) -> set[str]:
+        try:
+            module = ast.parse(schema_source)
+        except SyntaxError:
+            return set()
+        for node in module.body:
+            if isinstance(node, ast.ClassDef) and node.name == class_name:
+                return {
+                    item.target.id
+                    for item in node.body
+                    if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+                }
+        return set()
+
+    @staticmethod
+    def _normalized_attr_reads(route_source: str) -> set[str]:
+        return set(re.findall(r"\bnormalized\.([A-Za-z_][A-Za-z0-9_]*)\b", route_source))
+
+    @staticmethod
+    def _html_dom_ids(html_source: str) -> set[str]:
+        return set(re.findall(r'id=["\']([A-Za-z0-9_-]+)["\']', html_source))
+
+    @staticmethod
+    def _js_required_dom_ids(js_source: str) -> set[str]:
+        dom_ids = set(
+            re.findall(
+                r'querySelector(?:All)?\(\s*["\']#([A-Za-z0-9_-]+)',
+                js_source,
+            )
+        )
+        dom_ids.update(
+            re.findall(
+                r'getElementById\(\s*["\']([A-Za-z0-9_-]+)',
+                js_source,
+            )
+        )
+        return dom_ids
+
+    @staticmethod
+    def _missing_required_imports(py_source: str) -> set[str]:
+        missing: set[str] = set()
+        if re.search(r"\bre\.", py_source) and not re.search(r"^\s*(?:import|from)\s+re\b", py_source, flags=re.MULTILINE):
+            missing.add("re")
+        return missing
+
+    @staticmethod
+    def _mapped_class_field_names(py_source: str, class_name: str) -> set[str]:
+        return MiniappGenerationNormalLoop._class_field_names(py_source, class_name)
+
+    @staticmethod
+    def _record_constructor_kwargs(route_source: str, class_name: str) -> set[str]:
+        kwargs: set[str] = set()
+        for match in re.finditer(
+            rf"{re.escape(class_name)}\((?P<body>[\s\S]*?)\n\s*\)",
+            route_source,
+        ):
+            kwargs.update(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=", match.group("body") or ""))
+        return kwargs
+
+    @staticmethod
+    def _record_class_attr_reads(route_source: str, class_name: str) -> set[str]:
+        return set(
+            re.findall(
+                rf"\b{re.escape(class_name)}\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                route_source,
+            )
+        )
+
+    @staticmethod
+    def _contains_manual_refresh_action(*, html_source: str, js_source: str) -> bool:
+        if re.search(r">\s*Refresh\s*<", html_source):
+            return True
+        if re.search(r'createButton\(\s*["\']Refresh["\']', js_source):
+            return True
+        if re.search(r'getElementById\(\s*["\']refresh-action["\']', js_source):
+            return True
+        return False
+
+    def stabilize_draft_contract_from_source(
+        self,
+        *,
+        workspace_id: str,
+        draft_source: Path,
+    ) -> list[str]:
+        service = self.service
+        source_root = service.workspace_service.source_dir(workspace_id)
+        changed_files: set[str] = set()
+        runtime_rel_paths = (
+            "miniapp/app/main.py",
+            "miniapp/app/routes/runtime.py",
+        )
+        for rel_path in runtime_rel_paths:
+            draft_path = draft_source / rel_path
+            source_path = source_root / rel_path
+            if not source_path.exists():
+                continue
+            try:
+                draft_runtime_source = draft_path.read_text(encoding="utf-8") if draft_path.exists() else ""
+                source_runtime_source = source_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            should_restore_runtime = False
+            if self._file_has_python_syntax_error(draft_path) and not self._file_has_python_syntax_error(source_path):
+                should_restore_runtime = True
+            elif self._missing_required_imports(draft_runtime_source) and not self._missing_required_imports(source_runtime_source):
+                should_restore_runtime = True
+            if should_restore_runtime:
+                draft_path.parent.mkdir(parents=True, exist_ok=True)
+                draft_path.write_text(source_runtime_source, encoding="utf-8")
+                changed_files.add(rel_path)
+
+        draft_route_path = draft_source / "miniapp/app/routes/bookingrequests.py"
+        draft_schemas_path = draft_source / "miniapp/app/schemas.py"
+        source_schemas_path = source_root / "miniapp/app/schemas.py"
+        if not (draft_route_path.exists() and draft_schemas_path.exists() and source_schemas_path.exists()):
+            return sorted(changed_files)
+        try:
+            route_source = draft_route_path.read_text(encoding="utf-8")
+            draft_schema_source = draft_schemas_path.read_text(encoding="utf-8")
+            source_schema_source = source_schemas_path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        imported_names = self._imported_schema_names(route_source)
+        if not imported_names:
+            return sorted(changed_files)
+        missing_in_draft = imported_names - self._defined_schema_names(draft_schema_source)
+        source_route_path = source_root / "miniapp/app/routes/bookingrequests.py"
+        if missing_in_draft and missing_in_draft.issubset(self._defined_schema_names(source_schema_source)):
+            draft_schemas_path.write_text(source_schema_source, encoding="utf-8")
+            changed_files.add("miniapp/app/schemas.py")
+        if source_route_path.exists() and draft_route_path.exists():
+            try:
+                draft_route_source = draft_route_path.read_text(encoding="utf-8")
+                source_route_source = source_route_path.read_text(encoding="utf-8")
+            except OSError:
+                draft_route_source = ""
+                source_route_source = ""
+            source_update_fields = self._class_field_names(source_schema_source, "BookingRequestUpdate")
+            draft_normalized_reads = self._normalized_attr_reads(draft_route_source)
+            if source_update_fields and any(
+                field.startswith(("status", "owner", "returned", "item"))
+                and field not in source_update_fields
+                for field in draft_normalized_reads
+            ):
+                draft_route_path.write_text(source_route_source, encoding="utf-8")
+                changed_files.add("miniapp/app/routes/bookingrequests.py")
+                draft_route_source = source_route_source
+            draft_db_path = draft_source / "miniapp/app/db.py"
+            source_db_path = source_root / "miniapp/app/db.py"
+            if draft_db_path.exists() and source_db_path.exists():
+                try:
+                    draft_db_source = draft_db_path.read_text(encoding="utf-8")
+                    source_db_source = source_db_path.read_text(encoding="utf-8")
+                except OSError:
+                    draft_db_source = ""
+                    source_db_source = ""
+                required_db_fields = self._record_constructor_kwargs(draft_route_source, "BookingRequestRecord")
+                required_db_fields.update(self._record_class_attr_reads(draft_route_source, "BookingRequestRecord"))
+                for field_name in ("requested_at", "status_updated_at", "updated_at", "owner_assigned_at", "returned_at"):
+                    if re.search(rf"\b{re.escape(field_name)}\b", draft_route_source):
+                        required_db_fields.add(field_name)
+                source_db_fields = self._mapped_class_field_names(source_db_source, "BookingRequestRecord")
+                draft_db_fields = self._mapped_class_field_names(draft_db_source, "BookingRequestRecord")
+                missing_db_fields = required_db_fields - draft_db_fields
+                if missing_db_fields and missing_db_fields.issubset(source_db_fields):
+                    draft_db_path.write_text(source_db_source, encoding="utf-8")
+                    changed_files.add("miniapp/app/db.py")
+
+        route_manifest_path = draft_source / "miniapp/app/generated/route_manifest.json"
+        runtime_manifest_path = draft_source / "miniapp/app/generated/runtime_manifest.json"
+        if route_manifest_path.exists() and runtime_manifest_path.exists():
+            try:
+                draft_route_manifest = json.loads(route_manifest_path.read_text(encoding="utf-8"))
+                draft_runtime_manifest = json.loads(runtime_manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                draft_route_manifest = None
+                draft_runtime_manifest = None
+            if (
+                isinstance(draft_route_manifest, dict)
+                and isinstance(draft_runtime_manifest, dict)
+                and not isinstance(draft_route_manifest.get("roles"), dict)
+                and isinstance(draft_runtime_manifest.get("roles"), dict)
+            ):
+                repaired_route_manifest = service._build_route_manifest(draft_runtime_manifest)
+                route_manifest_path.write_text(json_dumps(repaired_route_manifest), encoding="utf-8")
+                changed_files.add("miniapp/app/generated/route_manifest.json")
+
+        static_root = draft_source / "miniapp/app/static"
+        source_static_root = source_root / "miniapp/app/static"
+        for draft_html in static_root.rglob("index.html"):
+            relative = draft_html.relative_to(static_root)
+            draft_js = draft_html.parent / "app.js"
+            source_html = source_static_root / relative
+            source_js = source_html.parent / "app.js"
+            source_css = source_html.parent / "styles.css"
+            if not (draft_js.exists() and source_html.exists() and source_js.exists()):
+                continue
+            try:
+                draft_html_source = draft_html.read_text(encoding="utf-8")
+                draft_js_source = draft_js.read_text(encoding="utf-8")
+                source_html_source = source_html.read_text(encoding="utf-8")
+                source_js_source = source_js.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if self._contains_manual_refresh_action(
+                html_source=draft_html_source,
+                js_source=draft_js_source,
+            ) and not self._contains_manual_refresh_action(
+                html_source=source_html_source,
+                js_source=source_js_source,
+            ):
+                draft_html.write_text(source_html_source, encoding="utf-8")
+                draft_js.write_text(source_js_source, encoding="utf-8")
+                changed_files.add(f"miniapp/app/static/{relative.as_posix()}")
+                changed_files.add(f"miniapp/app/static/{relative.parent.as_posix()}/app.js")
+                draft_css = draft_html.parent / "styles.css"
+                if draft_css.exists() and source_css.exists():
+                    try:
+                        draft_css.write_text(source_css.read_text(encoding="utf-8"), encoding="utf-8")
+                        changed_files.add(f"miniapp/app/static/{relative.parent.as_posix()}/styles.css")
+                    except OSError:
+                        pass
+                continue
+            missing_ids = self._js_required_dom_ids(draft_js_source) - self._html_dom_ids(draft_html_source)
+            if not missing_ids:
+                continue
+            source_missing_ids = self._js_required_dom_ids(source_js_source) - self._html_dom_ids(source_html_source)
+            if source_missing_ids:
+                continue
+            draft_html.write_text(source_html_source, encoding="utf-8")
+            draft_js.write_text(source_js_source, encoding="utf-8")
+            changed_files.add(f"miniapp/app/static/{relative.as_posix()}")
+            changed_files.add(f"miniapp/app/static/{relative.parent.as_posix()}/app.js")
+            draft_css = draft_html.parent / "styles.css"
+            if draft_css.exists() and source_css.exists():
+                try:
+                    draft_css.write_text(source_css.read_text(encoding="utf-8"), encoding="utf-8")
+                    changed_files.add(f"miniapp/app/static/{relative.parent.as_posix()}/styles.css")
+                except OSError:
+                    pass
+        return sorted(changed_files)
+
+    def _stabilize_backend_contract_from_source(
+        self,
+        *,
+        workspace_id: str,
+        draft_source: Path,
+    ) -> None:
+        self.stabilize_draft_contract_from_source(
+            workspace_id=workspace_id,
+            draft_source=draft_source,
+        )
+
     def run(
         self,
         *,
@@ -205,6 +490,10 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 event_type="job_failed",
                 failure_reason=apply_result.conflict_reason or "Draft patch could not be applied safely.",
             )
+        self._stabilize_backend_contract_from_source(
+            workspace_id=workspace_id,
+            draft_source=draft_source,
+        )
         job.apply_result = apply_result.model_dump(mode="json")
         realized_paths = service._realized_draft_file_paths(workspace_id, draft_run_id)
         stage_reports = service._build_stage_reports(
@@ -254,9 +543,12 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             )
             service._append_event(
                 job,
-                "materialization_needs_iteration",
+                "iteration_ready",
                 "Initial generation produced a partial workflow surface. Continuing through exact-check iteration instead of blocking early.",
-                {"messages": failure_messages},
+                {
+                    "messages": failure_messages,
+                    "iteration_reason": "materialization_needs_iteration",
+                },
             )
             initial_loop_diagnostics.extend(failure_messages)
         if edit_gate_issues:
@@ -268,9 +560,12 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             )
             service._append_event(
                 job,
-                "editing_needs_iteration",
+                "iteration_ready",
                 "Initial generation left placeholder or structural issues. Continuing through exact-check iteration.",
-                {"issues": edit_gate_issues},
+                {
+                    "issues": edit_gate_issues,
+                    "iteration_reason": "editing_needs_iteration",
+                },
             )
             initial_loop_diagnostics.extend(edit_gate_issues)
         initial_exact_execution, _initial_exact_preview = service.generation_repair._execute_generation_checks(

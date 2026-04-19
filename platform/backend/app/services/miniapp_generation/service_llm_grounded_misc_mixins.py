@@ -253,6 +253,20 @@ class ServiceLlmGroundedMiscMixins:
     def _clean_generated_text(content: str) -> str:
         return "".join(ch for ch in content if ch in "\n\r\t" or (32 <= ord(ch) and ord(ch) != 0x7F and not 0x80 <= ord(ch) < 0xA0) or ord(ch) in {0x85, 0xA0})
 
+    @staticmethod
+    def _strip_llm_sentinel_lines(content: str) -> str:
+        lines = content.splitlines()
+        cleaned_lines: list[str] = []
+        sentinel_pattern = re.compile(r"^\*{3}\s*end of file\s*\*{3}$", re.IGNORECASE)
+        for line in lines:
+            if sentinel_pattern.match(line.strip()):
+                continue
+            cleaned_lines.append(line)
+        cleaned = "\n".join(cleaned_lines)
+        if content.endswith("\n") and not cleaned.endswith("\n"):
+            cleaned += "\n"
+        return cleaned
+
     @classmethod
     def _sanitize_draft_operations(cls, operations: list[Any]) -> list[Any]:
         sanitized: list[Any] = []
@@ -260,7 +274,7 @@ class ServiceLlmGroundedMiscMixins:
             if operation.content is None:
                 sanitized.append(operation)
                 continue
-            cleaned = cls._clean_generated_text(operation.content)
+            cleaned = cls._strip_llm_sentinel_lines(cls._clean_generated_text(operation.content))
             sanitized.append(operation if cleaned == operation.content else operation.model_copy(update={"content": cleaned}))
         return sanitized
 

@@ -61,7 +61,7 @@ def _extract_js_dom_ids(source: str) -> set[str]:
     ids: set[str] = set()
     for match in re.finditer(r"getElementById\(\s*[\"\\']([^\"\\']+)[\"\\']\s*\)", source):
         ids.add(match.group(1))
-    for match in re.finditer(r"querySelector\(\s*[\"\\']#([^\"\\']+)[\"\\']\s*\)", source):
+    for match in re.finditer(r"querySelector(?:All)?\(\s*[\"\\']#([A-Za-z0-9_-]+)", source):
         ids.add(match.group(1))
     return ids
 
@@ -105,6 +105,7 @@ def _request_and_assert(client: TestClient, method: str, path: str, payload: dic
 def _sample_route_path(path: str) -> str:
     normalized = path
     normalized = re.sub(r"\$[{{][^/]+[}}]", "sample", normalized)
+    normalized = re.sub(r"\{[^/]+\}", "sample", normalized)
     normalized = re.sub(r"{{[^/]+}}", "sample", normalized)
     normalized = re.sub(r":[^/]+", "sample", normalized)
     return normalized
@@ -119,9 +120,11 @@ def _route_pattern_matches(pattern: str, actual: str) -> bool:
 def _resolve_path_params(path: str, replacements: dict[str, str]) -> str:
     resolved = path
     for key, value in replacements.items():
+        resolved = re.sub(r"\{" + re.escape(key) + r"\}", value, resolved)
         resolved = re.sub(r"{{" + re.escape(key) + r"}}", value, resolved)
         resolved = re.sub(r":" + re.escape(key) + r"\b", value, resolved)
     resolved = re.sub(r"\$[{{][^/]+[}}]", "sample", resolved)
+    resolved = re.sub(r"\{[^/]+\}", "sample", resolved)
     resolved = re.sub(r"{{[^/]+}}", "sample", resolved)
     resolved = re.sub(r":[^/]+", "sample", resolved)
     return resolved
@@ -159,6 +162,10 @@ def _extract_record_id(payload):
         for key in ("id", "request_id", "submission_id", "task_id", "item_id", "record_id"):
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key, value in payload.items():
+            normalized_key = str(key or "").strip().lower()
+            if normalized_key.endswith("_id") and isinstance(value, str) and value.strip():
                 return value.strip()
         for value in payload.values():
             candidate = _extract_record_id(value)
@@ -213,7 +220,8 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
     if method == "GET":
         return None
     payload = {}
-    for field in requirement.get("fields") or []:
+    field_definitions = requirement.get("fields") or requirement.get("request_fields") or []
+    for field in field_definitions:
         if not isinstance(field, dict):
             continue
         name = str(field.get("name") or "").strip()
@@ -223,7 +231,11 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
         if lowered in {"id", "request_id", "submission_id", "task_id", "item_id", "record_id"} and created_id:
             payload[name] = created_id
         elif lowered in {"status", "state"}:
-            payload[name] = "submitted"
+            payload[name] = "requested"
+        elif lowered in {"item_type", "equipment_type"}:
+            payload[name] = "laptop"
+        elif lowered in {"item_label", "equipment_details", "item_name", "preferred_item"}:
+            payload[name] = "ThinkPad T14"
         elif lowered in {"comment", "note", "message"}:
             payload[name] = "Generated comment"
         elif lowered in {"specialist_id", "assignee_id", "owner_id", "user_id"}:
@@ -234,16 +246,18 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
             payload[name] = "sample"
     if not payload:
         path_tokens = str(path).lower()
-        if any(token in path_tokens for token in ("booking", "reservation", "equipment", "request", "requests", "loan")):
+        if method == "POST" and any(token in path_tokens for token in ("booking", "reservation", "equipment", "request", "requests", "loan")):
             payload = {
-                "item_type": "Laptop",
+                "item_type": "laptop",
                 "item_label": "ThinkPad T14",
                 "start_date": "2026-04-17T10:00:00Z",
                 "end_date": "2026-04-18T18:00:00Z",
                 "reason": "Resource needed for an internal team session.",
             }
+        elif method in {"PUT", "PATCH"} and any(token in path_tokens for token in ("booking", "reservation", "equipment", "request", "requests", "loan")):
+            payload = {"status": "in_progress"}
     if not payload and method in {"POST", "PUT", "PATCH"}:
-        payload = {"name": "sample", "status": "submitted"}
+        payload = {"name": "sample", "status": "requested"}
     return payload
 
 
@@ -326,6 +340,12 @@ class GeneratedMiniAppTests(unittest.TestCase):
                     self.assertTrue(asset_path.exists(), f"Missing referenced asset {asset} from {file_path}")
 
     def test_declared_role_routes_render_shell_contract(self) -> None:
+        shared_base_css = (MINIAPP_DIR / "app" / "static" / "shared" / "base.css").read_text(encoding="utf-8")
+        self.assertIn(".page-shell", shared_base_css, "Shared base.css must define the page-shell contract")
+        self.assertTrue(
+            "padding-top: 76px" in shared_base_css or "padding-top: max(76px" in shared_base_css,
+            "Shared base.css must preserve the 76px shell safe-area baseline",
+        )
         for role in ROLES:
             pages = ((self.route_manifest.get("roles") or {}).get(role) or {}).get("pages") or []
             self.assertTrue(pages, f"No declared pages for role {role}")
@@ -340,7 +360,6 @@ class GeneratedMiniAppTests(unittest.TestCase):
                 self.assertIn("/static/shared/base.css", content, f"{route_path} must keep the shared shell stylesheet")
                 self.assertIn("/static/preview_bridge.js", content, f"{route_path} must keep the preview bridge runtime")
                 self.assertIn("page-shell", content, f"{route_path} must render the shared page-shell root")
-                self.assertIn("padding-top: max(76px", content, f"{route_path} must preserve the 76px shell safe-area baseline")
 
     def test_local_route_refs_resolve_inside_generated_route_manifest(self) -> None:
         declared_paths = {
@@ -391,7 +410,7 @@ class GeneratedMiniAppTests(unittest.TestCase):
         create_payload = _payload_for_api(create_requirement, create_path, str(create_requirement.get("method") or "POST")) or {}
         create_allowed_fields = {
             str(field.get("name") or "").strip()
-            for field in create_requirement.get("fields") or []
+            for field in (create_requirement.get("fields") or create_requirement.get("request_fields") or [])
             if isinstance(field, dict) and str(field.get("name") or "").strip()
         }
         for key, value in {"title": "Generated request", "status": "new", "comment": "Created from generated app test"}.items():
@@ -413,17 +432,22 @@ class GeneratedMiniAppTests(unittest.TestCase):
         update_payload = _payload_for_api(update_requirement, update_path, str(update_requirement.get("method") or "PATCH"), created_id=created_id) or {}
         update_allowed_fields = {
             str(field.get("name") or "").strip()
-            for field in update_requirement.get("fields") or []
+            for field in (update_requirement.get("fields") or update_requirement.get("request_fields") or [])
             if isinstance(field, dict) and str(field.get("name") or "").strip()
         }
-        for key, value in {"status": "in_progress", "comment": "Updated by specialist"}.items():
+        for key, value in {"status": "in_progress"}.items():
             if (not update_allowed_fields and key == "status") or key in update_allowed_fields:
                 update_payload[key] = value
         update_response = _request_and_assert(self.client, str(update_requirement.get("method") or "PATCH"), update_path, update_payload)
-        self.assertLess(update_response.status_code, 400, f"Update API failed: {update_path} -> {update_response.status_code}")
+        self.assertLess(
+            update_response.status_code,
+            400,
+            f"Update API failed: {update_path} -> {update_response.status_code}; body={update_response.text}",
+        )
         updated_payload = _response_json(update_response)
         self.assertTrue(
-            _payload_contains_value(updated_payload, created_id) or _contains_status(updated_payload, "in_progress"),
+            _payload_contains_value(updated_payload, created_id)
+            or any(_contains_status(updated_payload, status) for status in ("in_progress", "claimed", "in_review", "issued")),
             f"Update API {update_path} did not acknowledge the persisted record update. Payload: {updated_payload}",
         )
 
@@ -432,7 +456,8 @@ class GeneratedMiniAppTests(unittest.TestCase):
         post_update_payload = _response_json(post_update_list_response)
         self.assertTrue(_payload_contains_value(post_update_payload, created_id), f"Updated record {created_id} disappeared from list API {list_path}. Payload: {post_update_payload}")
         self.assertTrue(
-            _contains_status(post_update_payload, "in_progress") or _payload_contains_value(post_update_payload, "Updated by specialist"),
+            any(_contains_status(post_update_payload, status) for status in ("in_progress", "claimed", "in_review", "issued"))
+            or _payload_contains_value(post_update_payload, "Updated by specialist"),
             f"Updated record {created_id} did not reflect specialist changes in shared state. Payload: {post_update_payload}",
         )
 

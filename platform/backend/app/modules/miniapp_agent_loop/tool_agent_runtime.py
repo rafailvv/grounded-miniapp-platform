@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -123,6 +124,23 @@ def truncate_tool_text(value: str, *, max_chars: int = MAX_TOOL_OUTPUT_CHARS) ->
     return f"{head}\n...[truncated {omitted} chars]...\n{tail}"
 
 
+def summarize_read_file_payloads(
+    *,
+    file_contents: dict[str, str],
+    max_files: int = 8,
+    max_chars_per_file: int = 2200,
+) -> list[dict[str, str]]:
+    payloads: list[dict[str, str]] = []
+    for path, content in list(file_contents.items())[:max_files]:
+        payloads.append(
+            {
+                "file_path": path,
+                "content_excerpt": truncate_tool_text(content, max_chars=max_chars_per_file),
+            }
+        )
+    return payloads
+
+
 def list_workspace_files(*, workspace_tree: list[dict[str, str]], targets: list[str], max_paths: int = 200) -> dict[str, object]:
     selected_paths = [
         item["path"]
@@ -213,9 +231,25 @@ def run_workspace_command(
             "error": policy_error,
             "cwd": str(draft_source),
         }
+    shell_candidates = ["/bin/zsh", shutil.which("zsh"), "/bin/sh", shutil.which("sh")]
+    shell_path = next(
+        (
+            candidate
+            for candidate in shell_candidates
+            if candidate and Path(candidate).exists()
+        ),
+        None,
+    )
+    if not shell_path:
+        return {
+            "tool": "run_command",
+            "command": command,
+            "error": "No compatible shell was found for diagnostic command execution.",
+            "cwd": str(draft_source),
+        }
     try:
         completed = subprocess.run(
-            ["/bin/zsh", "-lc", command],
+            [shell_path, "-lc", command],
             cwd=draft_source,
             capture_output=True,
             text=True,
@@ -224,6 +258,7 @@ def run_workspace_command(
         return {
             "tool": "run_command",
             "command": command,
+            "shell": shell_path,
             "exit_code": completed.returncode,
             "stdout": truncate_tool_text(completed.stdout, max_chars=max_output_chars),
             "stderr": truncate_tool_text(completed.stderr, max_chars=max_output_chars),
@@ -233,6 +268,7 @@ def run_workspace_command(
         return {
             "tool": "run_command",
             "command": command,
+            "shell": shell_path,
             "error": f"Command timed out after {timeout_seconds}s.",
             "stdout": truncate_tool_text(exc.stdout or "", max_chars=max_output_chars),
             "stderr": truncate_tool_text(exc.stderr or "", max_chars=max_output_chars),

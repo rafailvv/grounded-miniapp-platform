@@ -593,43 +593,61 @@ class BuildValidator:
     def _validate_route_module_import_safety(self, workspace_path: Path) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         routes_dir = workspace_path / "miniapp" / "app" / "routes"
-        if not routes_dir.exists():
-            return issues
-        for route_file in routes_dir.glob("*.py"):
-            module_name = route_file.stem
+        if routes_dir.exists():
+            for route_file in routes_dir.glob("*.py"):
+                module_name = route_file.stem
+                try:
+                    content = route_file.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                self_import_markers = (
+                    f"from app.routes.{module_name} import ",
+                    f"import app.routes.{module_name}",
+                )
+                if any(marker in content for marker in self_import_markers):
+                    issues.append(
+                        ValidationIssue(
+                            code="build.route_self_import",
+                            message=f"Route module {route_file.name} imports itself and will fail at runtime.",
+                            severity="high",
+                            location=str(route_file.relative_to(workspace_path)),
+                        )
+                    )
+                if "from miniapp.app import " in content or "import miniapp.app." in content:
+                    issues.append(
+                        ValidationIssue(
+                            code="build.invalid_route_import_root",
+                            message=f"Route module {route_file.name} imports from miniapp.app; generated runtime modules must import from app.* inside the workspace.",
+                            severity="high",
+                            location=str(route_file.relative_to(workspace_path)),
+                        )
+                    )
+                if re.search(r"Depends\(\s*lambda:\s*get_actor_context\(\)\s*\)", content):
+                    issues.append(
+                        ValidationIssue(
+                            code="build.invalid_actor_dependency",
+                            message=f"Route module {route_file.name} wraps get_actor_context in lambda, which breaks FastAPI header injection.",
+                            severity="high",
+                            location=str(route_file.relative_to(workspace_path)),
+                        )
+                    )
+        main_py = workspace_path / "miniapp" / "app" / "main.py"
+        if main_py.exists():
             try:
-                content = route_file.read_text(encoding="utf-8")
+                main_content = main_py.read_text(encoding="utf-8")
             except OSError:
-                continue
-            self_import_markers = (
-                f"from app.routes.{module_name} import ",
-                f"import app.routes.{module_name}",
-            )
-            if any(marker in content for marker in self_import_markers):
+                main_content = ""
+            if (
+                "from app.routes.role_pages import router" in main_content
+                or "from app.routes.role_pages import router as" in main_content
+                or "include_router(role_pages_router)" in main_content
+            ):
                 issues.append(
                     ValidationIssue(
-                        code="build.route_self_import",
-                        message=f"Route module {route_file.name} imports itself and will fail at runtime.",
+                        code="build.invalid_role_pages_router_import",
+                        message="main.py must not import or include a router from app.routes.role_pages; role_pages.py is helper-only.",
                         severity="high",
-                        location=str(route_file.relative_to(workspace_path)),
-                    )
-                )
-            if "from miniapp.app import " in content or "import miniapp.app." in content:
-                issues.append(
-                    ValidationIssue(
-                        code="build.invalid_route_import_root",
-                        message=f"Route module {route_file.name} imports from miniapp.app; generated runtime modules must import from app.* inside the workspace.",
-                        severity="high",
-                        location=str(route_file.relative_to(workspace_path)),
-                    )
-                )
-            if re.search(r"Depends\(\s*lambda:\s*get_actor_context\(\)\s*\)", content):
-                issues.append(
-                    ValidationIssue(
-                        code="build.invalid_actor_dependency",
-                        message=f"Route module {route_file.name} wraps get_actor_context in lambda, which breaks FastAPI header injection.",
-                        severity="high",
-                        location=str(route_file.relative_to(workspace_path)),
+                        location="miniapp/app/main.py",
                     )
                 )
         return issues
@@ -754,6 +772,10 @@ class BuildValidator:
         issues: list[ValidationIssue] = []
         routes_dir = workspace_path / "miniapp" / "app" / "routes"
         runtime_owners: list[str] = []
+        canonical_runtime_companions = {
+            "miniapp/app/routes/runtime.py",
+            "miniapp/app/routes/role_pages.py",
+        }
         if routes_dir.exists():
             for route_file in routes_dir.glob("*.py"):
                 try:
@@ -762,7 +784,8 @@ class BuildValidator:
                     continue
                 if 'APIRouter(prefix="/api/runtime"' in content or "/api/runtime/" in content:
                     runtime_owners.append(str(route_file.relative_to(workspace_path)))
-        if len(runtime_owners) > 1:
+        runtime_owner_set = set(runtime_owners)
+        if len(runtime_owners) > 1 and runtime_owner_set != canonical_runtime_companions:
             issues.append(
                 ValidationIssue(
                     code="build.duplicate_runtime_route_provider",
@@ -1017,7 +1040,7 @@ class BuildValidator:
         refs: set[str] = set()
         patterns = (
             r'getElementById\(["\']([^"\']+)["\']\)',
-            r'querySelector\(["\']#([^"\']+)["\']\)',
+            r'querySelector(?:All)?\(["\']#([^"\'\s\.\[:>,+~]+)',
         )
         for pattern in patterns:
             for match in re.finditer(pattern, content):

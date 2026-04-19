@@ -13,10 +13,13 @@ class StrictModel(BaseModel):
 AppRole = Literal["client", "specialist", "manager"]
 
 
-class RoleProfile(StrictModel):
-    first_name: str
+class RoleProfileInput(StrictModel):
+    first_name: str = ""
     last_name: str = ""
     email: str = ""
     phone: str = ""
     photo_url: str | None = None
+
+
+class RoleProfile(RoleProfileInput):
     updated_at: datetime | None = None

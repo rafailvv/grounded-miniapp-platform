@@ -129,6 +129,7 @@ class ServiceContainer:
             self.generation_service,
             self.fix_orchestrator,
             self.preview_service,
+            self.check_runner,
             self.openrouter_client,
             self.workspace_log_service,
             self.session_engine,

@@ -169,11 +169,20 @@ class FixPatchingRuntime:
         scope_expansions: list[dict[str, Any]],
     ) -> list[DraftFileOperation]:
         scope_paths = {entry.file_path for entry in scope_entries}
+        patch_expansion_count = sum(
+            1
+            for expansion in scope_expansions
+            if str(expansion.get("reason") or "") == "Repair model requested an adjacent evidence-based file."
+        )
         operations: list[DraftFileOperation] = []
         for index, item in enumerate(raw_operations):
             operation = DraftFileOperation.model_validate(item)
             if operation.operation in {"create", "replace"} and operation.content is None:
                 raise ValueError(f"Repair returned {operation.operation} for {operation.file_path} without content.")
+            if operation.content is not None:
+                sanitized_content = self._sanitize_operation_content(operation.content)
+                if sanitized_content != operation.content:
+                    operation = operation.model_copy(update={"content": sanitized_content})
             framework_validation_error = self.backend_framework_validation_error(operation)
             if framework_validation_error:
                 raise ValueError(framework_validation_error)
@@ -182,7 +191,7 @@ class FixPatchingRuntime:
             if self.is_read_only_generated_surface(operation.file_path):
                 raise ValueError(f"Repair attempted to edit a generated manifest surface instead of the app bundle: {operation.file_path}")
             if operation.file_path not in scope_paths:
-                if len(scope_expansions) >= self.service.MAX_SCOPE_EXPANSIONS or not self.can_expand_for_file(operation.file_path, fix_turn.implicated_files):
+                if patch_expansion_count >= self.service.MAX_SCOPE_EXPANSIONS or not self.can_expand_for_file(operation.file_path, fix_turn.implicated_files):
                     raise ValueError(f"Repair touched files outside the allowed evidence-based scope: {operation.file_path}")
                 scope_expansions.append(
                     {
@@ -191,6 +200,7 @@ class FixPatchingRuntime:
                         "reason": "Repair model requested an adjacent evidence-based file.",
                     }
                 )
+                patch_expansion_count += 1
                 scope_paths.add(operation.file_path)
             operations.append(
                 DraftFileOperation(
@@ -202,6 +212,16 @@ class FixPatchingRuntime:
                 )
             )
         return operations
+
+    @staticmethod
+    def _sanitize_operation_content(content: str) -> str:
+        lines = content.splitlines()
+        sentinel_pattern = re.compile(r"^\*{3}\s*end of file\s*\*{3}$", re.IGNORECASE)
+        cleaned_lines = [line for line in lines if not sentinel_pattern.match(line.strip())]
+        cleaned = "\n".join(cleaned_lines)
+        if content.endswith("\n") and not cleaned.endswith("\n"):
+            cleaned += "\n"
+        return cleaned
 
     @staticmethod
     def is_read_only_generated_surface(file_path: str) -> bool:
@@ -263,6 +283,10 @@ class FixPatchingRuntime:
         lowered = content.lower()
         if "from flask import" in lowered or "blueprint(" in lowered:
             return f"{file_path} must stay on FastAPI APIRouter, not Flask/Blueprint."
+        if file_path == "miniapp/app/routes/role_pages.py":
+            if "def resolve_role_page" not in content:
+                return f"{file_path} must keep the shared role page resolution helpers."
+            return None
         if "apirouter" not in lowered:
             return f"{file_path} must stay on FastAPI APIRouter."
         if re.search(r"(?m)^\s*router\s*=\s*APIRouter\(", content) is None:

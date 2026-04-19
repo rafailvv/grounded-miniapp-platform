@@ -46,7 +46,6 @@ class WorkspaceLoopTurnRunner:
         initial_changed_files: list[str],
         callbacks: WorkspaceLoopCallbacks,
     ) -> WorkspaceLoopResult:
-        del draft_source
         del generation_mode
         latest_execution = None
         latest_preview_details: dict[str, object] = {}
@@ -379,6 +378,15 @@ class WorkspaceLoopTurnRunner:
             latest_operations = list(synced_operations)
             all_operations.extend(latest_operations)
             changed_files = list(apply_result.changed_files or [operation.file_path for operation in latest_operations])
+            if callbacks.post_apply_stabilize is not None:
+                stabilized_files = callbacks.post_apply_stabilize(
+                    workspace_id,
+                    run_id,
+                    draft_source,
+                    list(changed_files),
+                )
+                if stabilized_files:
+                    changed_files = sorted(set(changed_files) | {str(path) for path in stabilized_files if str(path).strip()})
             latest_assistant_message = plan.assistant_message or plan.diagnosis or latest_assistant_message
             turn_history[-1]["result"] = "patched"
             turn_history[-1]["files_changed"] = list(changed_files)
@@ -414,4 +422,3 @@ class WorkspaceLoopTurnRunner:
             last_assistant_message=latest_assistant_message,
             turn_history=turn_history,
         )
-

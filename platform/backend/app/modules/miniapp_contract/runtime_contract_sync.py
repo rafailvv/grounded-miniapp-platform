@@ -12,6 +12,8 @@ ReadContentFn = Callable[[str, str, dict[str, DraftFileOperation], str], str | N
 
 
 class MiniappRuntimeContractSync:
+    _HELPER_ONLY_ROUTE_MODULES = {"role_pages"}
+
     def __init__(
         self,
         *,
@@ -153,13 +155,13 @@ class MiniappRuntimeContractSync:
         if route_root.exists():
             for file_path in route_root.glob("*.py"):
                 stem = file_path.stem
-                if stem not in {"__init__", "health", "profiles"}:
+                if stem not in {"__init__", "health", "profiles", *self._HELPER_ONLY_ROUTE_MODULES}:
                     route_modules.add(stem)
         for file_path in operation_map:
             if not file_path.startswith("miniapp/app/routes/") or not file_path.endswith(".py"):
                 continue
             stem = Path(file_path).stem
-            if stem not in {"__init__", "health", "profiles"}:
+            if stem not in {"__init__", "health", "profiles", *self._HELPER_ONLY_ROUTE_MODULES}:
                 route_modules.add(stem)
         normalized_main = str(current_main or "").strip()
         required_markers = ("app = FastAPI", 'app.mount("/static"', "app.include_router(health_router)", "app.include_router(profiles_router)")
@@ -351,6 +353,7 @@ class MiniappRuntimeContractSync:
 
     @staticmethod
     def deterministic_main_runtime_source(route_modules: list[str]) -> str:
+        route_modules = [module for module in route_modules if module not in {"role_pages"}]
         route_import_lines = "\n".join(
             f"from app.routes.{module} import router as {module}_router"
             for module in route_modules
@@ -471,6 +474,9 @@ def _canonicalize_role_path(path: str) -> str:
     normalized = str(path or "").strip() or "/"
     if normalized != "/" and normalized.endswith("/"):
         normalized = normalized.rstrip("/")
+    for role in ROLES:
+        if normalized == f"/{{role}}/root":
+            return f"/{{role}}"
     return normalized or "/"
 
 

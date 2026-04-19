@@ -12,6 +12,38 @@ ROLE_ORDER = ("client", "specialist", "manager")
 
 
 class ArtifactManifestsMixin:
+    @staticmethod
+    def _is_redundant_role_root_alias_page(
+        role: str,
+        page: dict[str, Any],
+        *,
+        normalized_route: str,
+        has_canonical_entry_page: bool,
+    ) -> bool:
+        if not has_canonical_entry_page:
+            return False
+        if normalized_route not in {f"/{role}", f"/{role}/root"}:
+            return False
+        file_path = str(page.get("file_path") or "").strip().replace("\\", "/")
+        if file_path == f"miniapp/app/static/{role}/root/index.html":
+            return True
+        route_path = str(page.get("route_path") or "").strip()
+        return bool(route_path == f"/{role}/root" and file_path.startswith(f"miniapp/app/static/{role}/root/"))
+
+    def _normalize_manifest_handoff_path(self, role: str, path: str) -> str:
+        normalized_role_path = self._normalize_role_route_path(role, str(path or "").strip() or "/")
+        return self._absolute_role_route_path(role, normalized_role_path)
+
+    @staticmethod
+    def _has_canonical_role_entry_page(role: str, pages: list[dict[str, Any]]) -> bool:
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            route_path = str(page.get("route_path") or "").strip() or f"/{role}"
+            if route_path in {"/", f"/{role}"}:
+                return True
+        return False
+
     def ensure_runtime_artifact_operations(
         self,
         *,
@@ -45,12 +77,21 @@ class ArtifactManifestsMixin:
         for role in role_scope:
             payload = role_payloads.get(role) or {}
             pages: list[dict[str, Any]] = []
-            for index, page in enumerate(payload.get("pages") or []):
+            role_pages = [page for page in (payload.get("pages") or []) if isinstance(page, dict)]
+            has_canonical_entry_page = self._has_canonical_role_entry_page(role, role_pages)
+            for index, page in enumerate(role_pages):
                 if not isinstance(page, dict):
                     continue
                 route_path = str(page.get("route_path") or f"/{role}").strip() or f"/{role}"
                 normalized_role_route = self._normalize_role_route_path(role, route_path)
                 normalized_route = self._absolute_role_route_path(role, normalized_role_route)
+                if self._is_redundant_role_root_alias_page(
+                    role,
+                    page,
+                    normalized_route=normalized_route,
+                    has_canonical_entry_page=has_canonical_entry_page,
+                ):
+                    continue
                 page_kind = str(page.get("page_kind") or "").strip().lower()
                 file_path = str(page.get("file_path") or f"miniapp/app/static/{role}/index.html")
                 default_style_path = self._default_page_asset_path(file_path, "css")
@@ -71,7 +112,16 @@ class ArtifactManifestsMixin:
                         "page_kind": page_kind or ("profile" if normalized_route.endswith("/profile") else "page"),
                         "navigation_label": str(page.get("navigation_label") or page.get("title") or "Open"),
                         "title": str(page.get("title") or page.get("navigation_label") or role.title()),
-                        "handoff_paths": [str(path) for path in (page.get("handoff_paths") or []) if isinstance(path, str)],
+                        "handoff_paths": list(
+                            dict.fromkeys(
+                                [
+                                    self._normalize_manifest_handoff_path(role, str(path))
+                                    for path in (page.get("handoff_paths") or [])
+                                    if isinstance(path, str)
+                                    and self._normalize_manifest_handoff_path(role, str(path)) != normalized_route
+                                ]
+                            )
+                        ),
                         "is_entry": bool(page.get("is_entry") or normalized_route == f"/{role}"),
                     }
                 )

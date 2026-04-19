@@ -99,7 +99,8 @@ class MiniappGenerationCodePlanPrompts(MiniappGenerationRuntimeOwner):
         prompt = (
             "Plan a real file-level multi-page mini-app. "
             "Use the role contract first, then infer the page graph, route tree, shared app files, and miniapp touch points. "
-            "Do not output placeholders, metrics-only dashboards, or one-screen role wrappers."
+            "Do not output placeholders, metrics-only dashboards, or one-screen role wrappers. "
+            "Canonical role entry pages are /client, /specialist, and /manager only; do not invent /root or /<role>/root pages."
         )
         from app.services.miniapp_generation.service import GenerationService
 
@@ -167,6 +168,7 @@ class MiniappGenerationCodePlanPrompts(MiniappGenerationRuntimeOwner):
                     "Request/response payload models must live in schemas.py and be imported by route modules instead of being defined inline.",
                     "For targeted edits, keep target_files minimal and touch only the files required by the request.",
                     "Do not output role copies with changed titles only.",
+                    "Canonical role entry pages are /client, /specialist, and /manager only; do not invent /root or /<role>/root pages or static files under miniapp/app/static/<role>/root/.",
                     "Return only repo-relative file paths that fit the current workspace tree and path hints.",
                     "Do not return HTTP endpoints, route strings, or prose labels inside target_files or backend_targets.",
                     "Do not invent alternate miniapp roots such as miniapp/src when the current workspace uses another miniapp layout.",
@@ -223,6 +225,7 @@ class MiniappGenerationCodePlanPrompts(MiniappGenerationRuntimeOwner):
                     "Plan persisted business entities through SQLAlchemy models in db.py, never through route-level dict/list stores.",
                     "Plan request and response models in schemas.py so route modules import them instead of defining inline Pydantic classes.",
                     "Keep role page purposes, primary actions, and handoff paths distinct.",
+                    "Canonical role entry pages are /client, /specialist, and /manager only; do not invent /root or /<role>/root pages or static files under miniapp/app/static/<role>/root/.",
                     "Do not output role copies with changed titles only.",
                     "Return only repo-relative file paths that fit the current workspace tree and path hints.",
                     "Do not return HTTP endpoints, route strings, or prose labels inside target_files or backend_targets.",

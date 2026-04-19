@@ -75,6 +75,10 @@ class MiniappGenerationPlanRuntime:
     ) -> dict[str, Any]:
         service = self.service
         service._normalize_runtime_python_paths_in_plan(plan_result)
+        if isinstance(plan_result.get("page_graph"), dict):
+            plan_result["page_graph"] = service.generation_targeting.sanitize_page_graph_role_entries(
+                dict(plan_result["page_graph"])
+            )
         plan_result["target_files"] = list(dict.fromkeys(plan_result.get("target_files") or []))
         plan_result["backend_targets"] = service._sanitize_backend_targets(
             list(dict.fromkeys(plan_result.get("backend_targets") or []))

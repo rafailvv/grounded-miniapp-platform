@@ -123,7 +123,7 @@ class GroundedSpecModelingRuntime:
                 ),
             ],
             ui_requirements=[
-                UIRequirement(req_id="ui_role_roots", category="screen", description="Provide a real root page for each role with live state and primary actions.", priority="must", evidence=evidence, screen_hint="role_root"),
+                UIRequirement(req_id="ui_role_roots", category="screen", description="Provide a real canonical entry page at /<role> for each role with live state and primary actions; do not create nested /root alias pages.", priority="must", evidence=evidence, screen_hint="role_root"),
                 UIRequirement(req_id="ui_role_profiles", category="screen", description="Provide a real profile/settings page for each role.", priority="must", evidence=evidence, screen_hint="role_profile"),
                 UIRequirement(req_id="ui_shared_flow", category="screen", description=f"Expose the shared {shared_entity_name.lower()} flow through routed pages, not placeholders.", priority="must", evidence=evidence, screen_hint="shared_flow"),
                 UIRequirement(req_id="ui_theme", category="theme", description=f"Respect {target_label} theme and viewport constraints.", priority="should", evidence=evidence),

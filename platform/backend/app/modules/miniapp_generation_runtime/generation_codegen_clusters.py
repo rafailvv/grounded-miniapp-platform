@@ -21,12 +21,47 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
     MAX_TOOL_ROUNDS = 5
     COMMAND_TIMEOUT_SECONDS = 20
     _HELPER_DISCOVERY_TARGETS = {
-        "miniapp/app/static/shared/common.js",
         "miniapp/app/static/shared/runtime.js",
         "miniapp/app/static/shared/api.js",
         "miniapp/app/static/preview_bridge.js",
     }
     _HELPER_DISCOVERY_PATTERNS = {"api", "runtime", "miniappapifetch", "preview_bridge"}
+
+    @staticmethod
+    def _is_retryable_empty_cluster_diagnosis(diagnosis: str) -> bool:
+        normalized = str(diagnosis or "").strip().lower()
+        if not normalized:
+            return False
+        return any(
+            marker in normalized
+            for marker in (
+                "tool use was blocked",
+                "unable to comply",
+                "cannot comply",
+                "could not comply",
+                "request was blocked",
+            )
+        )
+
+    @staticmethod
+    def _is_existing_content_noop_diagnosis(diagnosis: str, outcome_hint: str) -> bool:
+        normalized = str(diagnosis or "").strip().lower()
+        normalized_outcome = str(outcome_hint or "").strip().lower()
+        if not normalized:
+            return False
+        if normalized_outcome not in {"fatal_invalid_response", "no_progress", "patch_ready"}:
+            return False
+        return any(
+            marker in normalized
+            for marker in (
+                "existing file contents",
+                "no new modifications made",
+                "already matches the requested workspace state",
+                "already matches the requested state",
+                "no modifications made",
+                "current files already satisfy",
+            )
+        )
 
     @staticmethod
     def _tool_request_signature(tool_requests: list[dict[str, Any]]) -> str:
@@ -38,7 +73,13 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                 {
                     "tool": str(item.get("tool") or "").strip().lower(),
                     "mode": str(item.get("mode") or "").strip().lower(),
-                    "targets": [str(target or "").strip().lstrip("./") for target in list(item.get("targets") or []) if str(target or "").strip()],
+                    "targets": sorted(
+                        {
+                            str(target or "").strip().lstrip("./")
+                            for target in list(item.get("targets") or [])
+                            if str(target or "").strip()
+                        }
+                    ),
                     "pattern": str(item.get("pattern") or "").strip(),
                     "command": str(item.get("command") or "").strip(),
                 }
@@ -135,6 +176,54 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                 "Use the current file_contexts and supporting_file_contexts to emit operations now."
             ),
         }
+
+    @staticmethod
+    def _nonessential_backend_support_feedback(tool_requests: list[dict[str, Any]]) -> dict[str, object]:
+        requested_targets = [
+            str(target or "").strip().lstrip("./")
+            for item in tool_requests
+            for target in list(item.get("targets") or [])
+            if str(target or "").strip()
+        ]
+        return {
+            "tool": "tool_request_feedback",
+            "targets": list(dict.fromkeys(requested_targets)),
+            "error": (
+                "Do not use list_files or pre-patch run_checks for backend_support. "
+                "This cluster already has enough template/runtime context to emit db.py, schemas.py, profiles.py, "
+                "and runtime manifest operations directly. Generated manifests are derived artifacts, not prerequisites."
+            ),
+        }
+
+    @staticmethod
+    def _is_nonessential_backend_support_request(
+        *,
+        cluster_name: str,
+        tool_requests: list[dict[str, Any]],
+    ) -> bool:
+        if cluster_name != "backend_support" or not tool_requests:
+            return False
+        for item in tool_requests:
+            tool_name = str(item.get("tool") or "").strip().lower()
+            targets = [
+                str(target or "").strip().lstrip("./")
+                for target in list(item.get("targets") or [])
+                if str(target or "").strip()
+            ]
+            if tool_name == "list_files":
+                continue
+            if tool_name == "run_checks":
+                if not targets:
+                    return True
+                if all(
+                    target.startswith("miniapp/app/generated/")
+                    or target.startswith("miniapp/app/routes/")
+                    or target in {"miniapp/app/db.py", "miniapp/app/schemas.py"}
+                    for target in targets
+                ):
+                    continue
+            return False
+        return True
 
     @staticmethod
     def _read_request_already_satisfied(
@@ -255,6 +344,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
         completeness_recovery_used = False
         scope_recovery_used = False
         framework_recovery_used = False
+        compact_recovery_used = False
         context_reuse_recovery_note = ""
         last_error: Exception | None = None
         tool_runtime = GenerationRepairToolRuntime(self.service)
@@ -287,7 +377,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                         scope_mode=scope_mode,
                         intent=intent,
                         file_contexts=current_file_contexts,
-                        generation_mode=generation_mode,
+                        generation_mode=GenerationMode.FAST if compact_recovery_used else generation_mode,
                         creative_direction=creative_direction,
                         tool_results=list(tool_results_for_attempt),
                     )
@@ -321,6 +411,16 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                         )
                         system_prompt = f"{system_prompt.rstrip()}\n\n{framework_note}".strip()
                         user_prompt = f"{user_prompt.rstrip()}\n\n{framework_note}".strip()
+                    if compact_recovery_used:
+                        compact_note = (
+                            "Compact recovery mode:\n"
+                            "- The previous attempt returned no operations because the response drifted into an empty blocked/no_progress state.\n"
+                            "- Keep the answer concise and emit create/replace operations for the allowed cluster_targets directly.\n"
+                            "- Do not request tools unless a concrete missing file path is truly required for correctness.\n"
+                            "- Prefer the simplest self-contained role page or route implementation that satisfies the current cluster scope."
+                        )
+                        system_prompt = f"{system_prompt.rstrip()}\n\n{compact_note}".strip()
+                        user_prompt = f"{user_prompt.rstrip()}\n\n{compact_note}".strip()
                     if context_reuse_recovery_note:
                         system_prompt = f"{system_prompt.rstrip()}\n\n{context_reuse_recovery_note}".strip()
                         user_prompt = f"{user_prompt.rstrip()}\n\n{context_reuse_recovery_note}".strip()
@@ -335,7 +435,27 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                     tool_requests = normalize_tool_requests(normalized.get("tool_requests") or [])
                     raw_operations = normalized.get("operations")
                     outcome_hint = str(normalized.get("outcome") or "").strip().lower()
+                    diagnosis = str(normalized.get("diagnosis") or normalized.get("assistant_message") or "").strip()
                     if outcome_hint == "tool_request" or tool_requests:
+                        if self._is_nonessential_backend_support_request(
+                            cluster_name=cluster_name,
+                            tool_requests=tool_requests,
+                        ):
+                            context_reuse_recovery_note = (
+                                "Backend support recovery mode:\n"
+                                "- Do not use list_files or pre-patch run_checks for backend_support.\n"
+                                "- db.py, schemas.py, profiles.py, and generated manifests are owned by this cluster.\n"
+                                "- Route files and generated manifests are reference-only supporting context.\n"
+                                "- Emit operations for the allowed backend_support targets now.\n"
+                            )
+                            tool_results_for_attempt.append(
+                                self._nonessential_backend_support_feedback(tool_requests)
+                            )
+                            if tool_round < self.MAX_TOOL_ROUNDS:
+                                continue
+                            raise ValueError(
+                                f"Whole-file cluster {cluster_name} kept requesting nonessential backend-support tool actions instead of emitting operations."
+                            )
                         if self._is_runtime_helper_discovery_request(cluster_name=cluster_name, tool_requests=tool_requests):
                             context_reuse_recovery_note = (
                                 "Runtime helper recovery mode:\n"
@@ -396,11 +516,35 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                         if tool_round < self.MAX_TOOL_ROUNDS and (requested_targets or executed_tool_results):
                             continue
                         raise ValueError(f"Whole-file cluster {cluster_name} exhausted the tool-request budget without returning operations.")
+                    if (
+                        outcome_hint == "no_progress"
+                        and not tool_requests
+                        and not raw_operations
+                        and self._is_retryable_empty_cluster_diagnosis(diagnosis)
+                    ):
+                        if not compact_recovery_used:
+                            compact_recovery_used = True
+                            tool_results_for_attempt.append(
+                                {
+                                    "tool": "cluster_recovery_feedback",
+                                    "targets": list(cluster_targets),
+                                    "error": (
+                                        "The previous response returned no operations with a blocked/no_progress diagnosis. "
+                                        "Retry in compact recovery mode and emit operations for the current cluster targets directly."
+                                    ),
+                                }
+                            )
+                            continue
+                        raise ValueError(
+                            f"Whole-file cluster {cluster_name} returned repeated blocked/no_progress responses without file operations."
+                        )
                     if not isinstance(raw_operations, list):
                         raise ValueError("Whole-file cluster did not return operations.")
                     operations = self._sanitize_draft_operations([DraftFileOperation.model_validate(item) for item in raw_operations])
                     if not operations:
-                        if intent != "create" and all(str(current_file_contexts.get(path) or "").strip() for path in cluster_targets):
+                        if all(str(current_file_contexts.get(path) or "").strip() for path in cluster_targets) and (
+                            intent != "create" or self._is_existing_content_noop_diagnosis(diagnosis, outcome_hint)
+                        ):
                             return {
                                 "assistant_message": str(normalized.get("diagnosis") or normalized.get("assistant_message") or "").strip() or f"{cluster_name} already matches the requested workspace state.",
                                 "operations": [],

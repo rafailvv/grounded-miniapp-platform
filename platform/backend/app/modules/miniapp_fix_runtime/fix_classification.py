@@ -158,18 +158,53 @@ class FixClassificationRuntime:
     def test_failure_implicated_paths(self, text: str) -> list[str]:
         lowered = text.lower()
         candidates: list[str] = []
+        create_api_match = re.search(r"create api failed:\s+(/api/[a-z0-9_/-]+)", lowered)
+        if create_api_match:
+            route_path = create_api_match.group(1).strip()
+            route_segments = [segment for segment in route_path.strip("/").split("/") if segment]
+            if len(route_segments) >= 2 and route_segments[0] == "api":
+                resource = route_segments[1]
+                candidates.extend(
+                    [
+                        f"miniapp/app/routes/{resource}.py",
+                        "miniapp/app/db.py",
+                        "miniapp/app/schemas.py",
+                        "miniapp/tests/test_generated_app.py",
+                        "miniapp/app/main.py",
+                    ]
+                )
+        update_api_match = re.search(r"update api failed:\s+(/api/[a-z0-9_/-]+)", lowered)
+        if update_api_match:
+            route_path = update_api_match.group(1).strip()
+            route_segments = [segment for segment in route_path.strip("/").split("/") if segment]
+            if len(route_segments) >= 2 and route_segments[0] == "api":
+                resource = route_segments[1]
+                candidates.extend(
+                    [
+                        f"miniapp/app/routes/{resource}.py",
+                        "miniapp/app/db.py",
+                        "miniapp/app/schemas.py",
+                        "miniapp/tests/test_generated_app.py",
+                        "miniapp/app/main.py",
+                    ]
+                )
         if "sessionlocal" in lowered:
-            candidates.extend(["miniapp/app/main.py", "miniapp/app/db.py", "miniapp/tests/test_generated_app.py"])
+            candidates.extend(["miniapp/app/main.py", "miniapp/app/db.py"])
         if "roleprofilerecord" in lowered:
             candidates.extend(
                 [
                     "miniapp/app/db.py",
                     "miniapp/app/routes/profiles.py",
                     "miniapp/app/schemas.py",
-                    "miniapp/tests/test_generated_app.py",
                 ]
             )
-        if any(marker in lowered for marker in ("docker compose", "container", "preview rebuild", "connection refused", "npm run build", "preview runtime")):
+        if "str' object has no attribute 'hex'" in lowered or ".hex" in lowered:
+            candidates.extend(["miniapp/app/db.py", "miniapp/app/schemas.py"])
+            for table_name in re.findall(r"insert into ([a-zA-Z0-9_]+)", lowered):
+                normalized = re.sub(r"[^a-z0-9]+", "", table_name.lower()).strip()
+                if normalized:
+                    candidates.append(f"miniapp/app/routes/{normalized}.py")
+        if any(marker in lowered for marker in ("docker compose", "preview rebuild", "connection refused", "npm run build", "preview runtime")):
             candidates.extend(["docker/docker-compose.yml", "miniapp/requirements.txt", "miniapp/app/main.py"])
         route_refs = re.findall(r"Route\s+([/A-Za-z0-9_{}:-]+)\s+referenced", text)
         route_refs.extend(match for _, match in re.findall(r"(['\"])(/[^'\"]+)\1", text))
@@ -184,6 +219,15 @@ class FixClassificationRuntime:
             role = route.strip("/").split("/", 1)[0]
             if role in {"client", "specialist", "manager"}:
                 candidates.append(f"miniapp/app/routes/{role}.py")
+                if route.endswith("/root"):
+                    candidates.extend(
+                        [
+                            "miniapp/app/routes/runtime.py",
+                            "miniapp/app/generated/route_manifest.json",
+                            "miniapp/app/generated/runtime_manifest.json",
+                            "miniapp/app/main.py",
+                        ]
+                    )
         return candidates
 
     @staticmethod

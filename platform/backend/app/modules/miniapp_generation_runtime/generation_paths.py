@@ -139,7 +139,7 @@ class MiniappGenerationPaths(MiniappGenerationRuntimeOwner):
         if normalized.startswith(underscore_prefix):
             suffix = normalized[len(underscore_prefix):]
             return f"/{suffix}" if suffix else "/"
-        if normalized in {"/home", "/dashboard"}:
+        if normalized in {"/home", "/dashboard", "/root"}:
             return "/"
         if role == "client" and normalized in {"/new", "/request_new", "/request_create"}:
             return "/create"

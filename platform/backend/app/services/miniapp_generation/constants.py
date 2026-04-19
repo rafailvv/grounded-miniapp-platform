@@ -19,8 +19,9 @@ DESIGN_REFERENCE_FILES = (
     "miniapp/app/routes/manager.py",
     "miniapp/app/routes/profiles.py",
     "miniapp/app/routes/role_pages.py",
+    "miniapp/app/generated/__init__.py",
     "miniapp/app/static/shared/base.css",
-    "miniapp/app/static/shared/common.js",
+    "miniapp/app/static/preview_bridge.js",
     "miniapp/app/static/client/index.html",
     "miniapp/app/static/specialist/index.html",
     "miniapp/app/static/manager/index.html",
@@ -34,6 +35,7 @@ SHARED_GENERATED_FILES = (
     "miniapp/app/routes/manager.py",
     "miniapp/app/routes/profiles.py",
     "miniapp/app/db.py",
+    "miniapp/app/generated/__init__.py",
     "miniapp/app/generated/route_manifest.json",
     "miniapp/app/generated/runtime_manifest.json",
 )

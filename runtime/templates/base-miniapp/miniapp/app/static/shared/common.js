@@ -1,1 +1,0 @@
-window.miniappCommon = window.miniappCommon || {};

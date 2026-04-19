@@ -45,6 +45,80 @@ FORBIDDEN_ROUTE_MODULE_STEMS = {
 
 
 class MiniappGenerationTargeting(MiniappGenerationRuntimeOwner):
+    @classmethod
+    def sanitize_page_graph_role_entries(cls, page_graph: dict[str, Any]) -> dict[str, Any]:
+        roles = page_graph.get("roles") or {}
+        if not isinstance(roles, dict):
+            return page_graph
+        for role, role_payload in roles.items():
+            if not isinstance(role_payload, dict):
+                continue
+            pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
+            has_canonical_entry = any(
+                cls._is_canonical_role_entry_page(role, page)
+                for page in pages
+            )
+            if not has_canonical_entry:
+                continue
+            sanitized_pages = []
+            for page in pages:
+                if cls._is_redundant_role_root_alias_page(role, page):
+                    continue
+                handoff_paths = page.get("handoff_paths") or []
+                if isinstance(handoff_paths, list):
+                    page["handoff_paths"] = [
+                        path
+                        for path in handoff_paths
+                        if not cls._is_redundant_role_root_alias_path(role, path)
+                    ]
+                sanitized_pages.append(page)
+            role_payload["pages"] = sanitized_pages
+        return page_graph
+
+    @staticmethod
+    def _is_canonical_role_entry_page(role: str, page: dict[str, Any]) -> bool:
+        route_path = str(page.get("route_path") or "").strip().replace("\\", "/")
+        file_path = str(page.get("file_path") or "").strip().replace("\\", "/")
+        return (
+            route_path in {"/", f"/{role}"}
+            and file_path == f"miniapp/app/static/{role}/index.html"
+        )
+
+    @staticmethod
+    def _is_redundant_role_root_alias_page(role: str, page: dict[str, Any]) -> bool:
+        route_path = str(page.get("route_path") or "").strip().replace("\\", "/")
+        file_path = str(page.get("file_path") or "").strip().replace("\\", "/")
+        return (
+            route_path in {"/root", f"/{role}", f"/{role}/root"}
+            and file_path == f"miniapp/app/static/{role}/root/index.html"
+        )
+
+    @staticmethod
+    def _is_redundant_role_root_alias_path(role: str, path: Any) -> bool:
+        normalized = str(path or "").strip().replace("\\", "/")
+        return normalized in {"/root", f"/{role}/root"}
+
+    @staticmethod
+    def _prune_redundant_role_root_alias_targets(target_files: list[str]) -> list[str]:
+        target_set = {str(path or "").strip().replace("\\", "/") for path in target_files if isinstance(path, str)}
+        pruned: list[str] = []
+        for path in target_files:
+            if not isinstance(path, str):
+                continue
+            normalized = str(path or "").strip().replace("\\", "/")
+            alias_match = re.fullmatch(
+                r"miniapp/app/static/(?P<role>client|specialist|manager)/root/(?P<name>index\.html|styles\.css|app\.js)",
+                normalized,
+            )
+            if alias_match:
+                role = alias_match.group("role")
+                name = alias_match.group("name")
+                canonical_root_target = f"miniapp/app/static/{role}/{name}"
+                if canonical_root_target in target_set:
+                    continue
+            pruned.append(normalized)
+        return list(dict.fromkeys(pruned))
+
     @staticmethod
     def _is_canonical_role_local_static_path(path: str) -> bool:
         normalized = str(path or "").strip().replace("\\", "/")
@@ -126,6 +200,7 @@ class MiniappGenerationTargeting(MiniappGenerationRuntimeOwner):
             ):
                 canonical.append(normalized_path)
         expanded = self._expand_page_triplet_targets(canonical)
+        expanded = self._prune_redundant_role_root_alias_targets(expanded)
         if scope_mode == "minimal_patch":
             return list(dict.fromkeys(expanded))
         return list(dict.fromkeys(expanded))
@@ -138,7 +213,6 @@ class MiniappGenerationTargeting(MiniappGenerationRuntimeOwner):
         if normalized.startswith("miniapp/app/static/shared/"):
             allowed_shared = {
                 "miniapp/app/static/shared/base.css",
-                "miniapp/app/static/shared/common.js",
             }
             return normalized if normalized in allowed_shared else None
         role_root_match = re.fullmatch(
@@ -200,7 +274,6 @@ class MiniappGenerationTargeting(MiniappGenerationRuntimeOwner):
             if path.startswith("miniapp/app/static/shared/"):
                 if path in {
                     "miniapp/app/static/shared/base.css",
-                    "miniapp/app/static/shared/common.js",
                 }:
                     pruned.append(path)
                 continue

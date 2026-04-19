@@ -12,6 +12,7 @@ from app.modules.miniapp_agent_loop.tool_agent_runtime import (
     list_workspace_files,
     run_workspace_command,
     search_workspace_files,
+    summarize_read_file_payloads,
 )
 from app.services.check_runner import CheckRunner
 
@@ -25,6 +26,69 @@ class FixEntryRuntime:
 
     def __init__(self, service: "FixOrchestrator") -> None:
         self.service = service
+
+    @staticmethod
+    def _tool_request_signature(tool_requests: list[dict[str, object]]) -> str:
+        normalized_items: list[dict[str, object]] = []
+        for item in tool_requests:
+            normalized_items.append(
+                {
+                    "tool": str(item.get("tool") or "").strip().lower(),
+                    "mode": str(item.get("mode") or "").strip().lower(),
+                    "targets": sorted(
+                        {
+                            str(target or "").strip().lstrip("./")
+                            for target in list(item.get("targets") or [])
+                            if str(target or "").strip()
+                        }
+                    ),
+                    "pattern": str(item.get("pattern") or "").strip(),
+                    "command": str(item.get("command") or "").strip(),
+                }
+            )
+        return str(normalized_items)
+
+    @staticmethod
+    def _duplicate_tool_request_feedback(tool_requests: list[dict[str, object]]) -> dict[str, object]:
+        requested_targets = [
+            str(target or "").strip().lstrip("./")
+            for item in tool_requests
+            for target in list(item.get("targets") or [])
+            if str(target or "").strip()
+        ]
+        return {
+            "tool": "tool_request_feedback",
+            "targets": list(dict.fromkeys(requested_targets)),
+            "error": (
+                "The same tool request was already executed in this repair attempt. "
+                "Use the current file_contexts and prior tool_results to return operations "
+                "or outcome=no_progress instead of requesting the same files again."
+            ),
+        }
+
+    @staticmethod
+    def _read_request_already_satisfied(
+        tool_requests: list[dict[str, object]],
+        file_contexts: dict[str, str],
+    ) -> bool:
+        saw_read = False
+        for item in tool_requests:
+            tool_name = str(item.get("tool") or "").strip().lower()
+            if tool_name != "read_files":
+                return False
+            saw_read = True
+            targets = [
+                str(target or "").strip().lstrip("./")
+                for target in list(item.get("targets") or [])
+                if str(target or "").strip()
+            ]
+            if not targets:
+                return False
+            for target in targets:
+                content = str(file_contexts.get(target) or "")
+                if not content.strip() or content.startswith("FILE_MISSING:"):
+                    return False
+        return saw_read
 
     def generate_with_workspace_loop(
         self,
@@ -157,14 +221,23 @@ class FixEntryRuntime:
                         fix_turn=fix_turn,
                         reason=reason or "Repair agent requested additional file reads.",
                     )
+                    loaded_contents: dict[str, str] = {}
                     for path in approved:
                         if path not in additional_paths:
                             additional_paths.append(path)
+                        content = self.service.workspace_service.try_read_text_file(
+                            workspace_id,
+                            path,
+                            run_id=run_id,
+                        )
+                        if content is not None:
+                            loaded_contents[path] = content
                     tool_results.append(
                         {
                             "tool": "read_files",
                             "targets": list(targets),
                             "approved_targets": list(approved),
+                            "files": summarize_read_file_payloads(file_contents=loaded_contents),
                             "reason": reason,
                         }
                     )
@@ -286,6 +359,7 @@ class FixEntryRuntime:
             extra_paths_for_attempt: list[str] = []
             tool_results_for_attempt: list[dict[str, object]] = []
             last_prompt_context = None
+            seen_tool_request_signatures: set[str] = set()
             for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
                 prompt_context = self.service._build_repair_packet(
                     workspace_id=workspace_id,
@@ -320,10 +394,25 @@ class FixEntryRuntime:
                     scope_expansions=scope_expansions,
                 )
                 if repair_outcome.outcome == "tool_request":
-                    requested_paths, executed_tool_results = _execute_tool_requests(
-                        fix_turn=fix_turn,
-                        tool_requests=list(repair_outcome.tool_requests),
+                    normalized_tool_requests = list(repair_outcome.tool_requests)
+                    tool_request_signature = self._tool_request_signature(normalized_tool_requests)
+                    duplicate_request = bool(tool_request_signature) and tool_request_signature in seen_tool_request_signatures
+                    already_satisfied_read = self._read_request_already_satisfied(
+                        normalized_tool_requests,
+                        prompt_context.file_contexts,
                     )
+                    if duplicate_request or already_satisfied_read:
+                        requested_paths = []
+                        executed_tool_results = [
+                            self._duplicate_tool_request_feedback(normalized_tool_requests),
+                        ]
+                    else:
+                        if tool_request_signature:
+                            seen_tool_request_signatures.add(tool_request_signature)
+                        requested_paths, executed_tool_results = _execute_tool_requests(
+                            fix_turn=fix_turn,
+                            tool_requests=normalized_tool_requests,
+                        )
                     for path in requested_paths:
                         if path not in extra_paths_for_attempt:
                             extra_paths_for_attempt.append(path)
@@ -406,6 +495,14 @@ class FixEntryRuntime:
             )
             if self.service.generation_service is not None
             else list(operations),
+            post_apply_stabilize=lambda current_workspace_id, _run_id, current_draft_source, _changed_files: (
+                self.service.generation_service.generation_normal_loop.stabilize_draft_contract_from_source(
+                    workspace_id=current_workspace_id,
+                    draft_source=current_draft_source,
+                )
+                if self.service.generation_service is not None
+                else []
+            ),
             append_event=self.service._append_event,
             append_trace=self.service._append_trace,
             store_report=self.service._store_report,

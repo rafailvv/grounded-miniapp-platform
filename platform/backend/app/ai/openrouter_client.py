@@ -31,6 +31,10 @@ class OpenRouterClient:
         self.workspace_log_service = workspace_log_service
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        self.connect_timeout_sec = float(os.getenv("OPENAI_CONNECT_TIMEOUT_SEC", "10"))
+        self.read_timeout_sec = float(os.getenv("OPENAI_READ_TIMEOUT_SEC", "120"))
+        self.write_timeout_sec = float(os.getenv("OPENAI_WRITE_TIMEOUT_SEC", "60"))
+        self.pool_timeout_sec = float(os.getenv("OPENAI_POOL_TIMEOUT_SEC", "60"))
 
     @property
     def enabled(self) -> bool:
@@ -783,7 +787,14 @@ class OpenRouterClient:
         for attempt in range(3):
             try:
                 started = time.perf_counter()
-                with httpx.Client(timeout=httpx.Timeout(connect=10, read=300, write=60, pool=60)) as client:
+                with httpx.Client(
+                    timeout=httpx.Timeout(
+                        connect=self.connect_timeout_sec,
+                        read=self.read_timeout_sec,
+                        write=self.write_timeout_sec,
+                        pool=self.pool_timeout_sec,
+                    )
+                ) as client:
                     response = client.post(f"{self.base_url}/{endpoint}", headers=self._headers(), json=payload)
                     duration_ms = int((time.perf_counter() - started) * 1000)
                     self._log_response(endpoint=endpoint, model=model, response=response)

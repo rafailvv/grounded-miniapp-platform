@@ -76,6 +76,7 @@ class WorkspaceLoopCallbacks:
     has_tooling_failure: Callable[[list[Any]], bool]
     plan_turn: Callable[..., WorkspaceLoopTurnPlan]
     apply_contract_sync: Callable[[list[DraftFileOperation]], list[DraftFileOperation]]
+    post_apply_stabilize: Callable[[str, str, Any, list[str]], list[str]] | None
     append_event: Callable[[JobRecord, str, str, dict[str, Any] | None], None]
     append_trace: Callable[[str, str, str, dict[str, Any] | None], None]
     store_report: Callable[[str, dict[str, Any]], None]

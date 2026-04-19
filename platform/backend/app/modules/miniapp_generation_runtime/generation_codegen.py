@@ -17,6 +17,79 @@ logger = logging.getLogger(__name__)
 
 
 class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
+    def _whole_file_batch_timeout_seconds(self, batch: list[dict[str, Any]]) -> int:
+        if any(
+            str(cluster.get("cluster_name") or "").startswith("role_")
+            or str(cluster.get("cluster_name") or "") == "backend_support"
+            for cluster in batch
+        ):
+            return int(getattr(self, "WHOLE_FILE_UI_CLUSTER_TIMEOUT_SECONDS", self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS))
+        return int(self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS)
+
+    def _whole_file_timeout_fallback_result(
+        self,
+        *,
+        cluster_name: str,
+        cluster_targets: list[str],
+    ) -> dict[str, Any] | None:
+        operations: list[DraftFileOperation] = []
+        for target in cluster_targets:
+            deterministic_source = self.generation_contract_routes._deterministic_route_source_for_path(target)
+            if deterministic_source is None:
+                return None
+            operations.append(
+                DraftFileOperation(
+                    file_path=target,
+                    operation="replace",
+                    content=deterministic_source,
+                    reason=(
+                        "Whole-file generation timeout fallback: restore this canonical route module "
+                        "from the deterministic contract source instead of blocking the entire run."
+                    ),
+                )
+            )
+        return {
+            "cluster_name": cluster_name,
+            "target_files": list(cluster_targets),
+            "assistant_message": (
+                f"{cluster_name} timed out during whole-file generation, so the canonical deterministic "
+                "route contract was applied instead."
+            ),
+            "operations": operations,
+            "duration_ms": int(self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS * 1000),
+            "fallback_used": True,
+        }
+
+    def _whole_file_error_fallback_result(
+        self,
+        *,
+        cluster_name: str,
+        cluster_targets: list[str],
+        error_message: str,
+    ) -> dict[str, Any] | None:
+        lowered = str(error_message or "").lower()
+        if not any(
+            marker in lowered
+            for marker in (
+                "returned no file operations",
+                "exhausted the tool-request budget",
+                "requested files that were already present in the current context",
+                "repeated identical tool requests",
+            )
+        ):
+            return None
+        fallback = self._whole_file_timeout_fallback_result(
+            cluster_name=cluster_name,
+            cluster_targets=cluster_targets,
+        )
+        if fallback is None:
+            return None
+        fallback["assistant_message"] = (
+            f"{cluster_name} failed during whole-file generation, so the canonical deterministic "
+            "route contract was applied instead."
+        )
+        return fallback
+
     def _resolve_code_edits(
         self,
         *,
@@ -222,6 +295,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                         generated_backend_sources[operation.file_path] = operation.content
             if str(result.get("assistant_message") or "").strip():
                 page_messages.append(str(result["assistant_message"]).strip())
+        page_graph = self.generation_targeting.sanitize_page_graph_role_entries(page_graph)
         operations = self._dedupe_operations(
             [
                 DraftFileOperation(file_path="artifacts/generated_app_graph.json", operation="replace", content=json_dumps(page_graph), reason="Persist the LLM-generated page graph for validation, preview, and run artifacts."),
@@ -259,6 +333,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
         )
         draft_source = self.workspace_service.draft_source_dir(kwargs["workspace_id"], kwargs["draft_run_id"])
         for batch in self._group_generation_clusters_for_execution(clusters):
+            batch_timeout_seconds = self._whole_file_batch_timeout_seconds(batch)
             self._sync_generation_batch_started(
                 linked_run_id=kwargs["draft_run_id"],
                 completed_target_files=completed_target_files,
@@ -266,7 +341,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                 batch=batch,
             )
             executor = ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix=f"whole-file-batch-{self._whole_file_parallel_group(str(batch[0]['cluster_name']))}")
-            future_map: dict[Any, tuple[str, int]] = {}
+            future_map: dict[Any, tuple[str, int, list[str]]] = {}
             for cluster in batch:
                 cluster_name = str(cluster["cluster_name"])
                 cluster_targets = list(cluster["target_files"])
@@ -292,28 +367,101 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     workspace_tree=workspace_tree,
                     draft_source=draft_source,
                 )
-                future_map[future] = (cluster_name, cluster_target_count)
-            done, not_done = wait(future_map.keys(), timeout=self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS, return_when=ALL_COMPLETED)
+                future_map[future] = (cluster_name, cluster_target_count, cluster_targets)
+            done, not_done = wait(future_map.keys(), timeout=batch_timeout_seconds, return_when=ALL_COMPLETED)
+            pending_fallback_results: list[dict[str, Any]] = []
             if not_done:
                 executor.shutdown(wait=False, cancel_futures=True)
-                pending_names = ", ".join(future_map[future][0] for future in not_done)
-                return {"error": f"Whole-file generation timed out while waiting for cluster result: {pending_names}"}
+                unresolved_pending: list[str] = []
+                for future in not_done:
+                    cluster_name, _, cluster_targets = future_map[future]
+                    fallback_result = self._whole_file_timeout_fallback_result(
+                        cluster_name=cluster_name,
+                        cluster_targets=cluster_targets,
+                    )
+                    if fallback_result is None:
+                        unresolved_pending.append(cluster_name)
+                        continue
+                    pending_fallback_results.append(fallback_result)
+                    self.workspace_log_service.append(
+                        kwargs["workspace_id"],
+                        source="generation.cluster_timeout_fallback",
+                        message="Applied deterministic timeout fallback for a canonical route cluster.",
+                        payload={"draft_run_id": kwargs["draft_run_id"], "cluster_name": cluster_name, "file_paths": cluster_targets},
+                    )
+                if unresolved_pending:
+                    pending_names = ", ".join(unresolved_pending)
+                    return {"error": f"Whole-file generation timed out while waiting for cluster result: {pending_names}"}
             try:
                 for future in done:
-                    cluster_name, cluster_target_count = future_map[future]
+                    cluster_name, cluster_target_count, cluster_targets = future_map[future]
                     cluster_result = future.result()
                     if "error" in cluster_result:
-                        return {"error": str(cluster_result["error"])}
+                        fallback_result = self._whole_file_error_fallback_result(
+                            cluster_name=cluster_name,
+                            cluster_targets=cluster_targets,
+                            error_message=str(cluster_result["error"]),
+                        )
+                        if fallback_result is None:
+                            return {"error": str(cluster_result["error"])}
+                        cluster_result = fallback_result
+                        self.workspace_log_service.append(
+                            kwargs["workspace_id"],
+                            source="generation.cluster_error_fallback",
+                            message="Applied deterministic fallback for a canonical route cluster after a whole-file generation error.",
+                            payload={
+                                "draft_run_id": kwargs["draft_run_id"],
+                                "cluster_name": cluster_name,
+                                "file_paths": cluster_targets,
+                                "error": str(cluster_result.get("assistant_message") or ""),
+                            },
+                        )
                     cluster_operations = [DraftFileOperation.model_validate(item) for item in cluster_result.get("operations", [])]
                     if cluster_operations:
-                        self.workspace_service.apply_draft_operations(kwargs["workspace_id"], kwargs["draft_run_id"], self._dedupe_operations(cluster_operations))
+                        deduped_cluster_operations = self._dedupe_operations(cluster_operations)
+                        self.workspace_service.apply_draft_operations(
+                            kwargs["workspace_id"],
+                            kwargs["draft_run_id"],
+                            deduped_cluster_operations,
+                        )
+                        for operation in deduped_cluster_operations:
+                            if operation.content is not None:
+                                kwargs["file_contexts"][operation.file_path] = operation.content
                         self.workspace_log_service.append(
                             kwargs["workspace_id"],
                             source="generation.cluster_persisted",
                             message="Persisted completed code cluster into the draft workspace.",
-                            payload={"draft_run_id": kwargs["draft_run_id"], "cluster_name": cluster_name, "file_paths": [operation.file_path for operation in cluster_operations]},
+                            payload={"draft_run_id": kwargs["draft_run_id"], "cluster_name": cluster_name, "file_paths": [operation.file_path for operation in deduped_cluster_operations]},
                         )
                     logger.info("whole_file_cluster_completed workspace_id=%s draft_run_id=%s cluster=%s duration_ms=%s", kwargs["workspace_id"], kwargs["draft_run_id"], cluster_name, cluster_result.get("duration_ms"))
+                    results.append(cluster_result)
+                    completed_target_files += cluster_target_count
+                    self._sync_generation_cluster_progress(
+                        linked_run_id=kwargs["draft_run_id"],
+                        completed_target_files=completed_target_files,
+                        total_target_files=total_target_files,
+                        cluster_name=cluster_name,
+                    )
+                for cluster_result in pending_fallback_results:
+                    cluster_name = str(cluster_result["cluster_name"])
+                    cluster_target_count = len(list(cluster_result.get("target_files") or []))
+                    cluster_operations = [DraftFileOperation.model_validate(item) for item in cluster_result.get("operations", [])]
+                    if cluster_operations:
+                        deduped_cluster_operations = self._dedupe_operations(cluster_operations)
+                        self.workspace_service.apply_draft_operations(
+                            kwargs["workspace_id"],
+                            kwargs["draft_run_id"],
+                            deduped_cluster_operations,
+                        )
+                        for operation in deduped_cluster_operations:
+                            if operation.content is not None:
+                                kwargs["file_contexts"][operation.file_path] = operation.content
+                        self.workspace_log_service.append(
+                            kwargs["workspace_id"],
+                            source="generation.cluster_persisted",
+                            message="Persisted completed code cluster into the draft workspace.",
+                            payload={"draft_run_id": kwargs["draft_run_id"], "cluster_name": cluster_name, "file_paths": [operation.file_path for operation in deduped_cluster_operations], "fallback_used": True},
+                        )
                     results.append(cluster_result)
                     completed_target_files += cluster_target_count
                     self._sync_generation_cluster_progress(
@@ -327,9 +475,10 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                 return {"error": f"Whole-file cluster failed: {exc}"}
             else:
                 executor.shutdown(wait=False, cancel_futures=False)
+        page_graph = self.generation_targeting.sanitize_page_graph_role_entries(kwargs["page_graph"])
         operations: list[DraftFileOperation] = [
-            DraftFileOperation(file_path="artifacts/generated_app_graph.json", operation="replace", content=json_dumps(kwargs["page_graph"]), reason="Persist the planned page graph for validation, preview, and run artifacts."),
-            DraftFileOperation(file_path="artifacts/page_graph_verification.json", operation="replace", content=json_dumps(self._build_page_graph_verification_report(kwargs["page_graph"], kwargs["role_scope"])), reason="Persist structural verification for the planned page graph and route tree."),
+            DraftFileOperation(file_path="artifacts/generated_app_graph.json", operation="replace", content=json_dumps(page_graph), reason="Persist the planned page graph for validation, preview, and run artifacts."),
+            DraftFileOperation(file_path="artifacts/page_graph_verification.json", operation="replace", content=json_dumps(self._build_page_graph_verification_report(page_graph, kwargs["role_scope"])), reason="Persist structural verification for the planned page graph and route tree."),
         ]
         messages: list[str] = []
         latency_breakdown: dict[str, int] = {}

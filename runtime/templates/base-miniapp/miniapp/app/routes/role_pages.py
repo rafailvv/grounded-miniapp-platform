@@ -21,6 +21,15 @@ def load_route_manifest() -> dict:
         return {}
 
 
+def canonicalize_role_path(role: str, actual_path: str) -> str:
+    normalized = str(actual_path or "").strip() or f"/{role}"
+    if normalized != "/" and normalized.endswith("/"):
+        normalized = normalized.rstrip("/")
+    if normalized == f"/{role}/root":
+        return f"/{role}"
+    return normalized or f"/{role}"
+
+
 def normalize_declared_page_path(file_path: str) -> Path:
     normalized_file_path = str(file_path or "").replace("\\", "/")
     if normalized_file_path.startswith("miniapp/app/"):
@@ -37,6 +46,7 @@ def route_matches(pattern: str, actual: str) -> bool:
 
 
 def resolve_declared_page_file(role: str, actual_path: str) -> Path | None:
+    actual_path = canonicalize_role_path(role, actual_path)
     route_manifest = load_route_manifest()
     pages = (((route_manifest.get("roles") or {}).get(role) or {}).get("pages") or [])
     for page in pages:
@@ -55,6 +65,7 @@ def resolve_declared_page_file(role: str, actual_path: str) -> Path | None:
 
 
 def resolve_default_role_page(role: str, actual_path: str) -> Path | None:
+    actual_path = canonicalize_role_path(role, actual_path)
     if actual_path == f"/{role}":
         page_file = STATIC_DIR / role / "index.html"
         return page_file if page_file.exists() else None
@@ -71,6 +82,7 @@ def resolve_default_role_page(role: str, actual_path: str) -> Path | None:
 def resolve_role_page(role: str, actual_path: str) -> Path:
     if role not in ROLES:
         raise KeyError(role)
+    actual_path = canonicalize_role_path(role, actual_path)
     declared_page = resolve_declared_page_file(role, actual_path)
     if declared_page is not None:
         return declared_page

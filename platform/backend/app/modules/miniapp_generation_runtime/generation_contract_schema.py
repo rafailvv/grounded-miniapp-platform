@@ -22,7 +22,11 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
                 "class BookingRequestList(",
                 "class BookingRequestCreateResponse(",
                 "BookingRequestList,",
+                "id=str(uuid4())",
                 "owner_specialist_id",
+                "owner_role",
+                "issued_at",
+                "returned_at",
                 "bookingrequest_id=record.bookingrequest_id",
             )
         )

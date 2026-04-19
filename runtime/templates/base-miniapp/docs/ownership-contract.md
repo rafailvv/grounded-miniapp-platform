@@ -8,9 +8,11 @@ Use this template as a contract-guided codebase. Keep file ownership stable.
 - `miniapp/app/db.py` owns SQLAlchemy models, engine/session setup, and persisted entity storage.
 - `miniapp/app/schemas.py` owns request and response models, enums, and shared API literals.
 - `miniapp/app/routes/profiles.py` owns role profile reads and writes.
+- `miniapp/app/routes/profiles.py` is the simplest DB-backed route example: load one record, upsert one record, and return a response schema with server-owned fields.
 - `miniapp/app/routes/<feature>.py` owns CRUD and API logic for one dominant workflow entity.
 - `miniapp/app/routes/client.py`, `miniapp/app/routes/specialist.py`, and `miniapp/app/routes/manager.py` own page-serving routes only.
 - `miniapp/app/routes/role_pages.py` owns shared role-page resolution helpers only.
+- `miniapp/app/routes/role_pages.py` is helper-only and does not export a FastAPI `router`; never import `router` from it in `main.py`.
 - `miniapp/app/generated/*` owns derived manifests and generated runtime metadata only.
 
 ## Frontend ownership
@@ -25,6 +27,7 @@ Use this template as a contract-guided codebase. Keep file ownership stable.
 
 - Do not define ORM models inside route modules.
 - Do not define inline Pydantic request/response models inside route modules when the type belongs in `schemas.py`.
+- Use separate input and response schemas when the server owns timestamps, ids, or derived fields.
 - Do not move business logic into `main.py`.
 - Do not split one dominant workflow entity across several near-duplicate route modules.
 - Keep status literals and enum-like values owned by `schemas.py` and reused everywhere else.

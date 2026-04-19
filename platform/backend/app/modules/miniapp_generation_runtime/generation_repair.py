@@ -44,11 +44,13 @@ class MiniappGenerationRepair:
                 {
                     "tool": str(item.get("tool") or "").strip().lower(),
                     "mode": str(item.get("mode") or "").strip().lower(),
-                    "targets": [
-                        str(target or "").strip().lstrip("./")
-                        for target in list(item.get("targets") or [])
-                        if str(target or "").strip()
-                    ],
+                    "targets": sorted(
+                        {
+                            str(target or "").strip().lstrip("./")
+                            for target in list(item.get("targets") or [])
+                            if str(target or "").strip()
+                        }
+                    ),
                     "pattern": str(item.get("pattern") or "").strip(),
                     "command": str(item.get("command") or "").strip(),
                 }
@@ -128,6 +130,31 @@ class MiniappGenerationRepair:
             ):
                 return False
         return saw_read
+
+    @staticmethod
+    def _is_retryable_patch_validation_error(message: str) -> bool:
+        lowered = str(message or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "must stay on fastapi apirouter",
+                "must define router = apirouter",
+                "must keep the shared role page resolution helpers",
+                "full resulting file content",
+                "partial snippet",
+                "import block",
+            )
+        )
+
+    @staticmethod
+    def _invalid_patch_feedback(message: str) -> str:
+        return (
+            "Previous patch response was invalid.\n"
+            f"- Validation error: {message}\n"
+            "- For every create or replace operation, content must be the full resulting file body, not a snippet, diff fragment, or import-only block.\n"
+            "- For Python route files under miniapp/app/routes, keep the full FastAPI module with `from fastapi import APIRouter` and a top-level `router = APIRouter(...)` unless the target is helper-only role_pages.py.\n"
+            "- Reuse the existing file_contexts and return corrected operations now.\n"
+        )
 
     def _execute_generation_checks(
         self,
@@ -458,6 +485,10 @@ class MiniappGenerationRepair:
                 operations=list(operations),
                 contract_sync_mode="repair_invariants",
             ),
+            post_apply_stabilize=lambda current_workspace_id, _run_id, current_draft_source, _changed_files: self.service.generation_normal_loop.stabilize_draft_contract_from_source(
+                workspace_id=current_workspace_id,
+                draft_source=current_draft_source,
+            ),
             append_event=self.service._append_event,
             append_trace=self.service._append_trace,
             store_report=self.service._store_report,
@@ -513,6 +544,7 @@ class MiniappGenerationRepair:
             tool_results_for_attempt: list[dict[str, object]] = []
             seen_tool_request_signatures: set[str] = set()
             context_reuse_recovery_note: str | None = None
+            invalid_patch_feedback_note: str | None = None
             try:
                 for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
                     payload = self.service._generate_structured_with_retry(
@@ -520,28 +552,35 @@ class MiniappGenerationRepair:
                         schema_name="generation_repair_patch_v1",
                         schema=self.service._repair_schema(),
                         system_prompt=self.service._repair_system_prompt(),
-                        user_prompt=self.service._repair_user_prompt(
-                            prompt=prompt,
-                            grounded_spec=grounded_spec,
-                            role_scope=role_scope,
-                            role_contract=role_contract,
-                            page_graph=page_graph,
-                            scope_mode=scope_mode,
-                            target_files=current_target_files,
-                            file_contexts=current_file_contexts,
-                            build_issues=build_issues,
-                            preview_issue=preview_issue,
-                            preview_logs=preview_logs,
-                            attempt=attempt,
-                            expanded_context=expanded_context,
-                            previous_turn_summary=previous_turn_summary,
-                            previous_diff_summary=previous_diff_summary,
-                            tool_results=tool_results_for_attempt,
-                        )
-                        + (
-                            f"\n\n{context_reuse_recovery_note}"
-                            if context_reuse_recovery_note
-                            else ""
+                        user_prompt=(
+                            self.service._repair_user_prompt(
+                                prompt=prompt,
+                                grounded_spec=grounded_spec,
+                                role_scope=role_scope,
+                                role_contract=role_contract,
+                                page_graph=page_graph,
+                                scope_mode=scope_mode,
+                                target_files=current_target_files,
+                                file_contexts=current_file_contexts,
+                                build_issues=build_issues,
+                                preview_issue=preview_issue,
+                                preview_logs=preview_logs,
+                                attempt=attempt,
+                                expanded_context=expanded_context,
+                                previous_turn_summary=previous_turn_summary,
+                                previous_diff_summary=previous_diff_summary,
+                                tool_results=tool_results_for_attempt,
+                            )
+                            + (
+                                f"\n\n{context_reuse_recovery_note}"
+                                if context_reuse_recovery_note
+                                else ""
+                            )
+                            + (
+                                f"\n\n{invalid_patch_feedback_note}"
+                                if invalid_patch_feedback_note
+                                else ""
+                            )
                         ),
                     )
                     normalized = self.service._normalize_model_payload(payload["payload"])
@@ -629,11 +668,17 @@ class MiniappGenerationRepair:
                                 f"Repair touched files outside the planned scope: {', '.join(residual_invalid[:5])}"
                             )
                         current_target_files = expanded_targets
-                    self.service._validate_targeted_operations(
-                        stage_name="repair",
-                        target_files=current_target_files,
-                        operations=operations,
-                    )
+                    try:
+                        self.service._validate_targeted_operations(
+                            stage_name="repair",
+                            target_files=current_target_files,
+                            operations=operations,
+                        )
+                    except Exception as exc:
+                        if tool_round < self.MAX_TOOL_ROUNDS and self._is_retryable_patch_validation_error(str(exc)):
+                            invalid_patch_feedback_note = self._invalid_patch_feedback(str(exc))
+                            continue
+                        raise
                     return {
                         "assistant_message": str(normalized.get("diagnosis") or normalized.get("assistant_message") or "").strip(),
                         "operations": operations,

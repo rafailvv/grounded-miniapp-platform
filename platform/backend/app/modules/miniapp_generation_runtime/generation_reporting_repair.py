@@ -152,8 +152,8 @@ class MiniappGenerationReportingRepair(MiniappGenerationRuntimeOwner):
                     "miniapp/app/db.py",
                     "miniapp/app/schemas.py",
                     "miniapp/app/routes/profiles.py",
-                    "miniapp/app/static/shared/common.js",
                     "miniapp/app/static/shared/base.css",
+                    "miniapp/app/static/preview_bridge.js",
                     "miniapp/app/generated/route_manifest.json",
                     "miniapp/app/generated/runtime_manifest.json",
                 ):

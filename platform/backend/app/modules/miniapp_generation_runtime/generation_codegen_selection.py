@@ -22,7 +22,6 @@ class MiniappGenerationCodegenSelection(MiniappGenerationRuntimeOwner):
     MAX_TOOL_ROUNDS = 5
     COMMAND_TIMEOUT_SECONDS = 20
     _HELPER_DISCOVERY_TARGETS = {
-        "miniapp/app/static/shared/common.js",
         "miniapp/app/static/shared/runtime.js",
         "miniapp/app/static/shared/api.js",
         "miniapp/app/static/preview_bridge.js",
@@ -39,7 +38,13 @@ class MiniappGenerationCodegenSelection(MiniappGenerationRuntimeOwner):
                 {
                     "tool": str(item.get("tool") or "").strip().lower(),
                     "mode": str(item.get("mode") or "").strip().lower(),
-                    "targets": [str(target or "").strip().lstrip("./") for target in list(item.get("targets") or []) if str(target or "").strip()],
+                    "targets": sorted(
+                        {
+                            str(target or "").strip().lstrip("./")
+                            for target in list(item.get("targets") or [])
+                            if str(target or "").strip()
+                        }
+                    ),
                     "pattern": str(item.get("pattern") or "").strip(),
                     "command": str(item.get("command") or "").strip(),
                 }

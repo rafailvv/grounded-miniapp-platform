@@ -21,7 +21,9 @@ from app.models.domain import (
     RunRecord,
     WorkspaceRecord,
 )
+from app.modules.miniapp_generation_runtime.generation_completion import MiniappGenerationCompletion
 from app.repositories.state_store import StateStore
+from app.services.check_runner import CheckRunner
 from app.services.fix_orchestrator import FixOrchestrator
 from app.services.miniapp_generation.service import GenerationService
 from app.services.workspace.log_service import WorkspaceLogService
@@ -83,6 +85,7 @@ class RunService:
         generation_service: GenerationService,
         fix_orchestrator: FixOrchestrator,
         preview_service: PreviewService,
+        check_runner: CheckRunner,
         openrouter_client: OpenRouterClient,
         workspace_log_service: WorkspaceLogService,
         session_engine: Any | None = None,
@@ -92,6 +95,7 @@ class RunService:
         self.generation_service = generation_service
         self.fix_orchestrator = fix_orchestrator
         self.preview_service = preview_service
+        self.check_runner = check_runner
         self.openrouter_client = openrouter_client
         self.workspace_log_service = workspace_log_service
         self.session_engine = session_engine
@@ -507,6 +511,28 @@ class RunService:
                     run=run,
                     change_plan=change_plan,
                 )
+                if self._complete_blocked_noop_run_from_green_source(
+                    run=run,
+                    job=job,
+                    meaningful_paths=meaningful_paths,
+                ):
+                    self._save_run(run)
+                    self._store_run_artifacts(run, change_plan, job, self.preview_service.get(run.workspace_id))
+                    self.store.delete("reports", f"run_stop_request:{run.run_id}")
+                    logger.info(
+                        "run_finished run_id=%s workspace_id=%s status=%s progress=%s",
+                        run.run_id,
+                        run.workspace_id,
+                        run.status,
+                        run.progress_percent,
+                    )
+                    self.workspace_log_service.append(
+                        run.workspace_id,
+                        source="run",
+                        message="Run finished.",
+                        payload={"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status},
+                    )
+                    return
                 if job.status == "blocked":
                     run.status = "blocked"
                     run.apply_status = "blocked"
@@ -1101,6 +1127,100 @@ class RunService:
         job.summary = message
         job.failure_reason = message
         self.generation_service._append_event(job, "job_failed", message, {"reason": "no_meaningful_diff"})
+
+    def _complete_blocked_noop_run_from_green_source(
+        self,
+        *,
+        run: RunRecord,
+        job: Any,
+        meaningful_paths: list[str],
+    ) -> bool:
+        if meaningful_paths:
+            return False
+        if str(getattr(job, "failure_class", "") or "") != "generation.edit.llm_failure":
+            return False
+
+        source_dir = self.workspace_service.source_dir(run.workspace_id)
+        execution = self.check_runner.run(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            source_dir=source_dir,
+            changed_files=[],
+            preview_run_id=None,
+            scope_mode="whole_file_build",
+        )
+        validation_snapshot = MiniappGenerationCompletion.validation_snapshot_from_execution(execution)
+        completion_state = MiniappGenerationCompletion.workspace_loop_completion_state(
+            execution.results,
+            self._preview_snapshot(run.workspace_id, self.preview_service.get(run.workspace_id)),
+            validation_snapshot,
+        )
+        if not bool(completion_state.get("strict_green")):
+            return False
+
+        self.store.upsert(
+            "reports",
+            f"check_results:{run.workspace_id}",
+            {
+                "items": [result.model_dump(mode="json") for result in execution.results],
+                "execution": execution.model_dump(mode="json"),
+            },
+        )
+        self.store.upsert(
+            "reports",
+            f"validation:{run.workspace_id}",
+            validation_snapshot.model_dump(mode="json"),
+        )
+
+        if self.workspace_service.draft_exists(run.workspace_id, run.run_id):
+            self.workspace_service.discard_draft(run.workspace_id, run.run_id)
+
+        message = "Current workspace source already passed the quality gates. No meaningful draft changes were needed."
+        run.result_revision_id = run.source_revision_id
+        run.candidate_revision_id = run.source_revision_id
+        run.status = "completed"
+        run.apply_status = "noop"
+        run.outcome_kind = "warnings"
+        run.summary = message
+        run.failure_reason = None
+        run.failure_class = None
+        run.failure_signature = None
+        run.root_cause_summary = None
+        run.remaining_issues = list(completion_state.get("remaining_issues") or [])
+        run.draft_status = "discarded"
+        run.draft_ready = False
+        run.current_stage = "completed"
+        run.progress_percent = 100
+        run.checks_summary = self._build_checks_summary(validation_snapshot, self.preview_service.get(run.workspace_id).status)
+        run.current_fix_phase = None
+        run.current_failing_command = None
+        run.current_exit_code = None
+        run.fix_targets = []
+        run.handoff_from_failed_generate = None
+        run.touched_files = []
+        run.updated_at = datetime.now(timezone.utc)
+
+        job.status = "completed"
+        job.outcome_kind = "warnings"
+        job.summary = message
+        job.failure_reason = None
+        job.failure_class = None
+        job.failure_signature = None
+        job.root_cause_summary = None
+        job.validation_snapshot = validation_snapshot
+        self._append_job_event(
+            run.linked_job_id,
+            "job_completed",
+            message,
+            {"reason": "green_source_noop", "run_id": run.run_id},
+        )
+        self.workspace_log_service.append(
+            run.workspace_id,
+            source="run",
+            message=message,
+            payload={"run_id": run.run_id, "mode": "noop_completion"},
+        )
+        return True
 
     def _should_apply_best_effort_after_failed_repairs(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
         del run, job, meaningful_paths

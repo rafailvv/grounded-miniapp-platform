@@ -7,6 +7,7 @@ from app.modules.miniapp_agent_loop.tool_agent_runtime import (
     list_workspace_files,
     run_workspace_command,
     search_workspace_files,
+    summarize_read_file_payloads,
 )
 
 if TYPE_CHECKING:
@@ -80,12 +81,14 @@ class GenerationRepairToolRuntime:
                     targets=targets,
                 )
                 missing_targets: list[str] = []
+                loaded_contents: dict[str, str] = {}
                 for path in approved:
                     if path not in additional_targets:
                         additional_targets.append(path)
                     content = self.service.workspace_service.try_read_text_file(workspace_id, path, run_id=draft_run_id)
                     if content is not None:
                         extra_contexts[path] = content
+                        loaded_contents[path] = content
                         continue
                     missing_targets.append(path)
                     extra_contexts[path] = self._missing_file_context(path)
@@ -95,6 +98,7 @@ class GenerationRepairToolRuntime:
                         "targets": list(targets),
                         "approved_targets": list(approved),
                         "missing_targets": missing_targets,
+                        "files": summarize_read_file_payloads(file_contents=loaded_contents),
                         "reason": reason,
                     }
                 )

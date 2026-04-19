@@ -241,7 +241,7 @@ def test_generation_clusters_grouped_for_safe_parallel_execution() -> None:
         {"cluster_name": "role_manager_ui_profile", "target_files": ["miniapp/app/static/manager/profile/index.html"]},
         {"cluster_name": "role_manager_ui_requests", "target_files": ["miniapp/app/static/manager/requests/index.html"]},
         {"cluster_name": "role_specialist_ui_root", "target_files": ["miniapp/app/static/specialist/index.html"]},
-        {"cluster_name": "shared_static", "target_files": ["miniapp/app/static/shared/common.js"]},
+        {"cluster_name": "shared_static", "target_files": ["miniapp/app/static/shared/base.css"]},
     ]
 
     grouped = GenerationService._group_generation_clusters_for_execution(clusters)
@@ -6696,9 +6696,9 @@ def test_mode_profiles_differentiate_fast_balanced_and_quality() -> None:
             routing = profile["routing"]
             assert routing["spec_analysis"] == "gpt-5-mini"
             assert routing["code_plan"] == "gpt-5-mini"
-            assert routing["ir_codegen"] == "gpt-5.2-codex"
-            assert routing["code_edit"] == "gpt-5.2-codex"
-            assert routing["repair"] == "gpt-5.2-codex"
+            assert routing["ir_codegen"] == "gpt-5.1-codex-mini"
+            assert routing["code_edit"] == "gpt-5.1-codex-mini"
+            assert routing["repair"] == "gpt-5.1-codex-mini"
 
 
 def test_context_pack_builder_applies_mode_budget_and_prompt_fingerprint(tmp_path: Path) -> None:

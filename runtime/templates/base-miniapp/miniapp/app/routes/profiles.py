@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter
 
 from app.db import RoleProfileRecord, SessionLocal
-from app.schemas import AppRole, RoleProfile
+from app.schemas import AppRole, RoleProfile, RoleProfileInput
 
 router = APIRouter(prefix="/api/profiles", tags=["profiles"])
 
@@ -25,6 +25,15 @@ def _to_schema(record: RoleProfileRecord) -> RoleProfile:
     )
 
 
+def _apply_profile(record: RoleProfileRecord, profile: RoleProfileInput) -> None:
+    record.first_name = profile.first_name
+    record.last_name = profile.last_name
+    record.email = profile.email
+    record.phone = profile.phone
+    record.photo_url = profile.photo_url
+    record.updated_at = datetime.now(timezone.utc)
+
+
 def load_role_profile(role: AppRole) -> RoleProfile:
     with SessionLocal() as session:
         record = session.get(RoleProfileRecord, role)
@@ -33,18 +42,13 @@ def load_role_profile(role: AppRole) -> RoleProfile:
         return _to_schema(record)
 
 
-def save_role_profile(role: AppRole, profile: RoleProfile) -> RoleProfile:
+def save_role_profile(role: AppRole, profile: RoleProfileInput) -> RoleProfile:
     with SessionLocal() as session:
         record = session.get(RoleProfileRecord, role)
         if record is None:
             record = RoleProfileRecord(role=role)
             session.add(record)
-        record.first_name = profile.first_name
-        record.last_name = profile.last_name
-        record.email = profile.email
-        record.phone = profile.phone
-        record.photo_url = profile.photo_url
-        record.updated_at = datetime.now(timezone.utc)
+        _apply_profile(record, profile)
         session.commit()
         session.refresh(record)
         return _to_schema(record)
@@ -56,5 +60,5 @@ def get_profile(role: AppRole) -> RoleProfile:
 
 
 @router.put("/{role}", response_model=RoleProfile)
-def update_profile(role: AppRole, profile: RoleProfile) -> RoleProfile:
+def update_profile(role: AppRole, profile: RoleProfileInput) -> RoleProfile:
     return save_role_profile(role, profile)

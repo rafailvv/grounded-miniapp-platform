@@ -153,8 +153,7 @@ def list_time_slots() -> dict[str, list[dict[str, str]]]:
         return """from __future__ import annotations
 
 from datetime import datetime, timezone
-from uuid import uuid4
-from typing import Any
+from typing import Any, get_args
 
 from fastapi import APIRouter, HTTPException
 from pydantic import ValidationError
@@ -165,51 +164,105 @@ from app.schemas import BookingRequestCreate, BookingRequestListResponse, Bookin
 router = APIRouter(prefix="/api/bookingrequests", tags=["bookingrequests"])
 
 
+def _allowed_statuses() -> list[str]:
+    status_field = getattr(BookingRequestRead, "model_fields", {}).get("status")
+    annotation = getattr(status_field, "annotation", None)
+    values = [str(value) for value in get_args(annotation) if isinstance(value, str)]
+    return values or ["submitted", "in_review", "issued", "returned", "cancelled", "conflict"]
+
+
+def _default_status() -> str:
+    allowed = _allowed_statuses()
+    for candidate in ("submitted", "pending", "in_review", "claimed", "in_progress", "issued"):
+        if candidate in allowed:
+            return candidate
+    return allowed[0]
+
+
+def _normalize_status(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    aliases = {
+        "canceled": "cancelled",
+        "approved": "in_review",
+        "pending_review": "in_review",
+        "review": "in_review",
+    }
+    normalized = aliases.get(normalized, normalized)
+    allowed = set(_allowed_statuses())
+    if normalized in allowed:
+        return normalized
+    compatibility = {
+        "pending": "submitted" if "submitted" in allowed else ("pending" if "pending" in allowed else None),
+        "claimed": "in_review" if "in_review" in allowed else ("claimed" if "claimed" in allowed else None),
+        "in_progress": "in_review" if "in_review" in allowed else ("in_progress" if "in_progress" in allowed else None),
+        "submitted": "pending" if "submitted" not in allowed and "pending" in allowed else None,
+        "in_review": "claimed" if "in_review" not in allowed and "claimed" in allowed else ("in_progress" if "in_progress" in allowed else None),
+        "cancelled": "closed" if "cancelled" not in allowed and "closed" in allowed else None,
+    }
+    remapped = compatibility.get(normalized)
+    return remapped if remapped in allowed else None
+
+
+def _filter_for_schema(model_cls: type, payload: dict[str, Any]) -> dict[str, Any]:
+    allowed = set(getattr(model_cls, "model_fields", {}).keys())
+    return {key: value for key, value in payload.items() if value is not None and key in allowed}
+
+
 def _normalize_create_payload(payload: dict[str, Any]) -> BookingRequestCreate:
-    normalized = {
+    normalized = _filter_for_schema(BookingRequestCreate, {
         "item_type": payload.get("item_type") or payload.get("equipment_type") or payload.get("equipment") or payload.get("item"),
         "item_label": payload.get("item_label") or payload.get("equipment_details") or payload.get("item_name") or payload.get("preferred_item"),
         "start_date": payload.get("start_date") or payload.get("preferred_date") or payload.get("date"),
         "end_date": payload.get("end_date") or payload.get("preferred_date") or payload.get("date"),
         "reason": payload.get("reason") or payload.get("comment") or payload.get("description") or payload.get("details") or "",
-    }
+    })
     return BookingRequestCreate.model_validate(normalized)
 
 
 def _normalize_update_payload(payload: dict[str, Any]) -> BookingRequestUpdate:
-    normalized_status = payload.get("status") or payload.get("state")
-    if normalized_status == "canceled":
-        normalized_status = "cancelled"
-    normalized = {
-        "status": normalized_status,
-        "owner_role": payload.get("owner_role") or payload.get("owner") or payload.get("owner_specialist_id") or payload.get("owner_specialist") or payload.get("specialist_id"),
+    normalized = _filter_for_schema(BookingRequestUpdate, {
+        "status": _normalize_status(payload.get("status") or payload.get("state")),
+        "specialist_owner": payload.get("specialist_owner") or payload.get("owner_role") or payload.get("owner"),
+        "returned_at": payload.get("returned_at"),
         "item_label": payload.get("item_label") or payload.get("assigned_item") or payload.get("equipment_details"),
         "issued_at": payload.get("issued_at"),
-        "returned_at": payload.get("returned_at"),
-        "start_date": payload.get("start_date"),
-        "end_date": payload.get("end_date"),
-        "reason": payload.get("reason") or payload.get("comment") or payload.get("description") or payload.get("details"),
-    }
-    filtered = {key: value for key, value in normalized.items() if value is not None}
-    return BookingRequestUpdate.model_validate(filtered)
+    })
+    return BookingRequestUpdate.model_validate(normalized)
 
 
 def _to_schema(record: BookingRequestRecord, conflict: bool = False) -> BookingRequestRead:
-    return BookingRequestRead(
-        bookingrequest_id=record.id,
-        item_type=record.item_type,
-        item_label=record.item_label,
-        start_date=record.start_date,
-        end_date=record.end_date,
-        reason=record.reason,
-        status=record.status,
-        owner_role=record.owner_role,
-        issued_at=record.issued_at,
-        returned_at=record.returned_at,
-        created_at=record.created_at,
-        updated_at=record.updated_at,
-        conflict=conflict,
-    )
+    record_id = getattr(record, "bookingrequest_id", getattr(record, "id", None))
+    payload = _filter_for_schema(BookingRequestRead, {
+        "id": record_id,
+        "bookingrequest_id": record_id,
+        "request_id": str(record_id) if record_id is not None else None,
+        "item_type": record.item_type,
+        "item_label": record.item_label,
+        "start_date": record.start_date,
+        "end_date": record.end_date,
+        "reason": record.reason,
+        "status": record.status,
+        "requested_by": getattr(record, "requested_by", None),
+        "specialist_owner": getattr(record, "specialist_owner", getattr(record, "owner_role", None)),
+        "owner_role": getattr(record, "owner_role", None),
+        "owner_assigned_at": getattr(record, "owner_assigned_at", None),
+        "issued_at": getattr(record, "issued_at", None),
+        "status_notes": getattr(record, "status_notes", None),
+        "conflict_warning": getattr(record, "conflict_warning", False),
+        "returned_at": getattr(record, "returned_at", None),
+        "requested_at": getattr(record, "requested_at", None),
+        "status_updated_at": getattr(record, "status_updated_at", None),
+        "created_at": getattr(record, "created_at", getattr(record, "requested_at", None)),
+        "updated_at": record.updated_at,
+        "conflict_note": getattr(record, "status_notes", None),
+        "conflict": conflict,
+    })
+    payload.setdefault("specialist_owner", getattr(record, "specialist_owner", getattr(record, "owner_role", None)))
+    payload.setdefault("issued_at", getattr(record, "issued_at", None))
+    payload.setdefault("returned_at", getattr(record, "returned_at", None))
+    return BookingRequestRead.model_validate(payload)
 
 
 def _overlaps(record: BookingRequestRecord, other: BookingRequestRecord) -> bool:
@@ -223,11 +276,18 @@ def _conflict_count(record: BookingRequestRecord, records: list[BookingRequestRe
             continue
         if other.item_type != record.item_type:
             continue
-        if other.status in {"cancelled", "closed", "returned"}:
+        if str(other.status).lower() in {"cancelled", "closed", "returned"}:
             continue
         if _overlaps(record, other):
             count += 1
     return count
+
+
+def _coerce_request_id(item_id: str) -> Any:
+    try:
+        return int(str(item_id))
+    except Exception:
+        return item_id
 
 
 @router.post("", response_model=BookingRequestRead)
@@ -238,28 +298,30 @@ def create_booking_request(payload: dict[str, Any]) -> BookingRequestRead:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
     now = datetime.now(timezone.utc)
     record = BookingRequestRecord(
-        id=str(uuid4()),
         item_type=normalized.item_type,
         item_label=normalized.item_label,
         start_date=normalized.start_date,
         end_date=normalized.end_date,
         reason=normalized.reason,
-        status="submitted",
-        created_at=now,
+        status=_default_status(),
+        requested_at=now,
+        status_updated_at=now,
         updated_at=now,
     )
+    if hasattr(record, "requested_by"):
+        record.requested_by = "client"
     with SessionLocal() as session:
         session.add(record)
         session.commit()
         session.refresh(record)
-        records = session.query(BookingRequestRecord).order_by(BookingRequestRecord.created_at.desc()).all()
+        records = session.query(BookingRequestRecord).order_by(BookingRequestRecord.requested_at.desc()).all()
         return _to_schema(record, _conflict_count(record, records) > 0)
 
 
 @router.get("", response_model=BookingRequestListResponse)
 def list_booking_requests() -> BookingRequestListResponse:
     with SessionLocal() as session:
-        records = session.query(BookingRequestRecord).order_by(BookingRequestRecord.created_at.desc()).all()
+        records = session.query(BookingRequestRecord).order_by(BookingRequestRecord.requested_at.desc()).all()
         items = [_to_schema(record, _conflict_count(record, records) > 0) for record in records]
     return BookingRequestListResponse(items=items)
 
@@ -271,28 +333,28 @@ def update_booking_request(item_id: str, payload: dict[str, Any]) -> BookingRequ
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
     with SessionLocal() as session:
-        record = session.get(BookingRequestRecord, item_id)
+        record = session.get(BookingRequestRecord, _coerce_request_id(item_id))
         if record is None:
             raise HTTPException(status_code=404, detail="Booking request not found.")
         if normalized.status is not None:
             record.status = normalized.status
-        if normalized.owner_role is not None:
+            if hasattr(record, "status_updated_at"):
+                record.status_updated_at = datetime.now(timezone.utc)
+        if hasattr(normalized, "specialist_owner") and normalized.specialist_owner is not None and hasattr(record, "specialist_owner"):
+            record.specialist_owner = normalized.specialist_owner
+        if hasattr(normalized, "owner_role") and normalized.owner_role is not None and hasattr(record, "owner_role"):
             record.owner_role = normalized.owner_role
+            if hasattr(record, "owner_assigned_at"):
+                record.owner_assigned_at = datetime.now(timezone.utc)
         if normalized.item_label is not None:
             record.item_label = normalized.item_label
-        if normalized.issued_at is not None:
+        if hasattr(normalized, "issued_at") and normalized.issued_at is not None and hasattr(record, "issued_at"):
             record.issued_at = normalized.issued_at
-        if normalized.returned_at is not None:
+        if hasattr(normalized, "returned_at") and normalized.returned_at is not None and hasattr(record, "returned_at"):
             record.returned_at = normalized.returned_at
-        if normalized.start_date is not None:
-            record.start_date = normalized.start_date
-        if normalized.end_date is not None:
-            record.end_date = normalized.end_date
-        if normalized.reason is not None:
-            record.reason = normalized.reason
         record.updated_at = datetime.now(timezone.utc)
         session.commit()
         session.refresh(record)
-        records = session.query(BookingRequestRecord).order_by(BookingRequestRecord.created_at.desc()).all()
+        records = session.query(BookingRequestRecord).order_by(BookingRequestRecord.requested_at.desc()).all()
         return _to_schema(record, _conflict_count(record, records) > 0)
 """

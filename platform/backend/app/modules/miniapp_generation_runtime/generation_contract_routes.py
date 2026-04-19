@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from app.modules.miniapp_contract.runtime_contract_sync import MiniappRuntimeContractSync
 from app.models.domain import DraftFileOperation
 
 from app.modules.miniapp_generation_runtime.generation_contract_api_routes_runtime import (
     MiniappGenerationContractApiRoutesRuntime,
+)
+from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import (
+    MiniappGenerationContractApiRoutesCrud,
 )
 from app.modules.miniapp_generation_runtime.generation_contract_api_routes_support import (
     MiniappGenerationContractApiRoutesSupport,
@@ -18,6 +22,52 @@ from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerati
 
 
 class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
+    @staticmethod
+    def _template_app_root() -> Path:
+        return Path(__file__).resolve().parents[5] / "runtime" / "templates" / "base-miniapp" / "miniapp" / "app"
+
+    @classmethod
+    def _template_source_for_path(cls, file_path: str) -> str | None:
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        template_root = cls._template_app_root()
+        mapping = {
+            "miniapp/app/main.py": template_root / "main.py",
+            "miniapp/app/db.py": template_root / "db.py",
+            "miniapp/app/schemas.py": template_root / "schemas.py",
+            "miniapp/app/generated/__init__.py": template_root / "generated" / "__init__.py",
+            "miniapp/app/generated/route_manifest.json": template_root / "generated" / "route_manifest.json",
+            "miniapp/app/generated/runtime_manifest.json": template_root / "generated" / "runtime_manifest.json",
+            "miniapp/app/generated/static_runtime_manifest.json": template_root / "generated" / "static_runtime_manifest.json",
+            "miniapp/app/generated/role_seed.json": template_root / "generated" / "role_seed.json",
+            "miniapp/app/generated/role_experience.json": template_root / "generated" / "role_experience.json",
+        }
+        source_path = mapping.get(normalized)
+        if source_path is None or not source_path.exists():
+            return None
+        return source_path.read_text(encoding="utf-8")
+
+    @staticmethod
+    def _deterministic_route_source_for_path(file_path: str) -> str | None:
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        mapping = {
+            "miniapp/app/routes/client.py": MiniappGenerationContractPageSources._deterministic_client_page_route_source,
+            "miniapp/app/routes/specialist.py": MiniappGenerationContractPageSources._deterministic_specialist_page_route_source,
+            "miniapp/app/routes/manager.py": MiniappGenerationContractPageSources._deterministic_manager_page_route_source,
+            "miniapp/app/routes/profiles.py": MiniappGenerationContractApiRoutesSupport._deterministic_profiles_route_source,
+            "miniapp/app/routes/runtime.py": MiniappGenerationContractApiRoutesRuntime._deterministic_runtime_route_source,
+            "miniapp/app/routes/users.py": MiniappGenerationContractApiRoutesSupport._deterministic_users_route_source,
+            "miniapp/app/routes/workload.py": MiniappGenerationContractApiRoutesSupport._deterministic_workload_route_source,
+            "miniapp/app/routes/time_slots.py": MiniappGenerationContractApiRoutesSupport._deterministic_time_slots_route_source,
+            "miniapp/app/routes/bookingrequests.py": MiniappGenerationContractApiRoutesSupport._deterministic_bookingrequests_route_source,
+            "miniapp/app/routes/requests.py": MiniappGenerationContractApiRoutesCrud._deterministic_requests_route_source,
+            "miniapp/app/routes/comments.py": MiniappGenerationContractApiRoutesCrud._deterministic_comments_route_source,
+            "miniapp/app/routes/assignments.py": MiniappGenerationContractApiRoutesCrud._deterministic_assignments_route_source,
+        }
+        source_builder = mapping.get(normalized)
+        if source_builder is not None:
+            return source_builder()
+        return MiniappGenerationContractRoutes._template_source_for_path(normalized)
+
     def _synchronize_minimal_workflow_route_contracts(
         self,
         workspace_id: str,

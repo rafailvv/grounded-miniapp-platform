@@ -52,6 +52,54 @@ class ServiceRepairReportingMixins:
         return file_contexts
 
     @staticmethod
+    def _repair_full_context_paths(
+        *,
+        target_files: list[str],
+        build_issues: list[ValidationIssue],
+        file_contexts: dict[str, str],
+    ) -> list[str]:
+        preferred: list[str] = []
+        for path in [*target_files, *[str(issue.location or "").strip() for issue in build_issues]]:
+            normalized = str(path or "").strip().lstrip("./")
+            if not normalized or normalized in preferred or normalized not in file_contexts:
+                continue
+            preferred.append(normalized)
+        return preferred[:8]
+
+    def _compact_repair_contexts(
+        self,
+        *,
+        file_contexts: dict[str, str],
+        full_paths: list[str],
+        max_file_chars: int,
+        max_total_chars: int,
+        max_full_file_chars: int,
+    ) -> dict[str, str]:
+        compact: dict[str, str] = {}
+        total = 0
+        for path in full_paths:
+            content = str(file_contexts.get(path) or "")
+            if not content:
+                continue
+            bounded = self._limit_text(content, max_full_file_chars)
+            next_total = total + len(bounded)
+            if compact and next_total > max_total_chars:
+                break
+            compact[path] = bounded
+            total = next_total
+        remaining_contexts = {path: content for path, content in file_contexts.items() if path not in compact}
+        remaining_budget = max(0, max_total_chars - total)
+        if remaining_contexts and remaining_budget > 0:
+            compact.update(
+                self._compact_file_contexts_for_repair(
+                    remaining_contexts,
+                    max_file_chars=max_file_chars,
+                    max_total_chars=remaining_budget,
+                )
+            )
+        return compact
+
+    @staticmethod
     def _preview_failure_issue(preview: Any) -> ValidationIssue:
         message = next((str(line).strip() for line in reversed(preview.logs or []) if str(line).strip()), "Preview runtime failed to rebuild.")
         return ValidationIssue(code="preview.rebuild_failed", message=message, severity="high", location="preview", blocking=True)
@@ -113,6 +161,10 @@ class ServiceRepairReportingMixins:
         lowered = content.lower()
         if "from flask import" in lowered or "blueprint(" in lowered:
             raise RuntimeError(f"{file_path} must stay on FastAPI APIRouter, not Flask/Blueprint.")
+        if file_path == "miniapp/app/routes/role_pages.py":
+            if "def resolve_role_page" not in content:
+                raise RuntimeError(f"{file_path} must keep the shared role page resolution helpers.")
+            return
         if "apirouter" not in lowered:
             raise RuntimeError(f"{file_path} must stay on FastAPI APIRouter.")
         if re.search(r"(?m)^\s*router\s*=\s*APIRouter\(", content) is None:
@@ -141,7 +193,18 @@ class ServiceRepairReportingMixins:
             kwargs["file_contexts"],
             kwargs.get("tool_results") or [],
         )
-        compact_file_contexts = self._compact_file_contexts_for_repair(prioritized_file_contexts, max_file_chars=5600 if kwargs.get("expanded_context") else (4200 if structural_failure else 2200), max_total_chars=32000 if kwargs.get("expanded_context") else (22000 if structural_failure else 9000))
+        full_context_paths = self._repair_full_context_paths(
+            target_files=compact_target_files,
+            build_issues=build_issues,
+            file_contexts=prioritized_file_contexts,
+        )
+        compact_file_contexts = self._compact_repair_contexts(
+            file_contexts=prioritized_file_contexts,
+            full_paths=full_context_paths,
+            max_file_chars=5600 if kwargs.get("expanded_context") else (4200 if structural_failure else 2200),
+            max_total_chars=42000 if kwargs.get("expanded_context") else (32000 if structural_failure else 24000),
+            max_full_file_chars=14000 if kwargs.get("expanded_context") else 12000,
+        )
         grounded_spec = kwargs["grounded_spec"]
         return json_dumps({
             "task": "Repair build or preview failures in the generated draft",
@@ -172,6 +235,7 @@ class ServiceRepairReportingMixins:
                 "Treat build_issues, preview_issue, target_files, file_contexts, and hard invariants as the source of truth.",
                 "Preserve the three-role DB-backed runtime and linked flows for client, specialist, and manager.",
                 "Preserve the shared shell contract, including the current 76px top safe-area baseline and preview bridge references.",
+                "Every create or replace operation must include the full resulting file content. Never return import-only snippets, diff fragments, or partial blocks.",
                 "Generated tests and generated manifests are read-only; repair application code instead.",
                 "Do not redesign the app or synthesize a new business flow. Fix the current failing cluster only.",
                 "If you return outcome=tool_request, return tool_requests and no operations.",

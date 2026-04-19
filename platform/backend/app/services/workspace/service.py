@@ -499,6 +499,8 @@ class WorkspaceService:
         subprocess.run(["git", "init"], cwd=source_dir, check=True, capture_output=True, text=True)
 
     def _git_commit(self, source_dir: Path, message: str) -> str:
+        if not (source_dir / ".git").exists():
+            self._git_init(source_dir)
         subprocess.run(["git", "add", "."], cwd=source_dir, check=True, capture_output=True, text=True)
         status = self._git_output(source_dir, ["status", "--short"])
         if not status.strip():
