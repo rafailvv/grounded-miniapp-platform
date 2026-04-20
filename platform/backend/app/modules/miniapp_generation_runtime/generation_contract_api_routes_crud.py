@@ -255,11 +255,11 @@ def _now() -> datetime:
 def _normalize_payload(payload: dict[str, Any], *, partial: bool) -> dict[str, Any]:
     schema_model = _update_schema_model() if partial else _create_schema_model()
     data = dict(payload or {{}})
+    if "status" in data:
+        normalized_status = _normalize_status(data.get("status"))
+        if normalized_status is not None:
+            data["status"] = normalized_status
     if schema_model is None:
-        if "status" in data:
-            normalized_status = _normalize_status(data.get("status"))
-            if normalized_status is not None:
-                data["status"] = normalized_status
         return data
     try:
         validated = schema_model.model_validate(data)

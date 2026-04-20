@@ -9,36 +9,138 @@ from app.services.miniapp_generation.constants import ROLE_ORDER, WORKFLOW_HEAVY
 
 
 class ServiceStrategyMixins:
+    _VISUAL_ROLE_PATCH_MARKERS = (
+        "style",
+        "styles",
+        "styling",
+        "polish",
+        "polished",
+        "visual",
+        "look",
+        "looks",
+        "spacing",
+        "hierarchy",
+        "readable",
+        "readability",
+        "clear labels",
+        "consistent with the rest of the app",
+        "plain",
+        "unfinished",
+        "layout",
+        "css",
+        "padding",
+        "margin",
+        "avatar",
+        "photo",
+        "logo",
+        "image",
+        "background",
+        "full-screen",
+        "full screen",
+        "stretched",
+        "properly sized",
+        "aligned",
+        "proportions",
+    )
+    _UI_FLOW_ROLE_PATCH_MARKERS = (
+        "separate page",
+        "separate details page",
+        "details page",
+        "detail page",
+        "dedicated page",
+        "dedicated details page",
+        "open a separate page",
+        "opens a separate page",
+        "open on a separate page",
+        "clicks on a request",
+        "click on a request",
+        "clicks on",
+        "click on",
+        "from the list",
+        "instead of keeping everything only in the list",
+        "show full information",
+        "full information about",
+        "open the details",
+        "open details",
+        "details screen",
+        "detail screen",
+    )
+    _CONTRACT_ROLE_PATCH_MARKERS = (
+        "real saved action",
+        "real persisted",
+        "persist to the real backend",
+        "persisted to the backend",
+        "shared db state",
+        "shared state",
+        "status must change",
+        "status must update",
+        "across the app",
+        "across the whole app",
+        "across specialist",
+        "across manager",
+        "across client",
+        "backend",
+        "database",
+        "schema",
+        "persist",
+        "persistence",
+        "api",
+        "endpoint",
+        "route",
+        "record when",
+        "reject the request",
+        "approve the request",
+        "must be able to reject",
+        "must be able to approve",
+        "save action",
+        "create ",
+        "update ",
+        "delete ",
+        "status is correctly reflected",
+    )
+
     @staticmethod
     def _looks_like_role_flow_expansion_request(lowered: str) -> bool:
-        flow_markers = (
-            "separate page",
-            "separate details page",
-            "details page",
-            "detail page",
-            "dedicated page",
-            "dedicated details page",
-            "open a separate page",
-            "opens a separate page",
-            "open on a separate page",
-            "clicks on a request",
-            "click on a request",
-            "when a client clicks",
-            "when a specialist clicks",
-            "when a manager clicks",
-            "open full information",
-            "full information about that request",
-            "instead of keeping everything only in the list",
-        )
-        return any(marker in lowered for marker in flow_markers)
+        return any(marker in lowered for marker in ServiceStrategyMixins._UI_FLOW_ROLE_PATCH_MARKERS)
+
+    @staticmethod
+    def _looks_like_visual_role_patch_request(lowered: str) -> bool:
+        if not lowered.strip():
+            return False
+        visual_hits = sum(1 for marker in ServiceStrategyMixins._VISUAL_ROLE_PATCH_MARKERS if marker in lowered)
+        if visual_hits == 0:
+            return False
+        return not any(marker in lowered for marker in ServiceStrategyMixins._CONTRACT_ROLE_PATCH_MARKERS)
+
+    @staticmethod
+    def _looks_like_contract_role_patch_request(lowered: str) -> bool:
+        return any(marker in lowered for marker in ServiceStrategyMixins._CONTRACT_ROLE_PATCH_MARKERS)
+
+    @staticmethod
+    def _role_only_patch_kind(*, prompt: str, role_scope: list[str], intent: str) -> str | None:
+        if len(role_scope) != 1:
+            return None
+        if intent not in {"edit", "refine", "role_only_change"}:
+            return None
+        lowered = str(prompt or "").lower()
+        if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
+            return None
+        if ServiceStrategyMixins._looks_like_contract_role_patch_request(lowered):
+            return "contract_patch"
+        if ServiceStrategyMixins._looks_like_role_flow_expansion_request(lowered):
+            return "ui_flow_patch"
+        if ServiceStrategyMixins._looks_like_visual_role_patch_request(lowered):
+            return "visual_patch"
+        return None
 
     @staticmethod
     def _scope_mode(intent: str, prompt: str, role_scope: list[str]) -> str:
         lowered = prompt.lower()
+        role_patch_kind = ServiceStrategyMixins._role_only_patch_kind(prompt=prompt, role_scope=role_scope, intent=intent)
         if ServiceStrategyMixins._looks_like_fix_request(lowered):
             return "minimal_patch"
-        if len(role_scope) == 1 and ServiceStrategyMixins._looks_like_role_flow_expansion_request(lowered):
-            return "whole_file_build"
+        if role_patch_kind in {"visual_patch", "ui_flow_patch", "contract_patch"}:
+            return "minimal_patch"
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
             return "whole_file_build"
         if intent in {"edit", "refine", "role_only_change"}:
@@ -57,10 +159,15 @@ class ServiceStrategyMixins:
     @staticmethod
     def _strategy_reason(intent: str, prompt: str, role_scope: list[str], *, require_multi_page: bool) -> str:
         lowered = prompt.lower()
+        role_patch_kind = ServiceStrategyMixins._role_only_patch_kind(prompt=prompt, role_scope=role_scope, intent=intent)
         if intent == "create":
             return "Intent=create requires a whole-file build for the primary app surface."
-        if len(role_scope) == 1 and ServiceStrategyMixins._looks_like_role_flow_expansion_request(lowered):
-            return "The request expands one role into a new multi-page flow, so generation uses a whole-file build for that role."
+        if role_patch_kind == "visual_patch":
+            return "The request is a single-role visual patch, so generation stays in minimal patch mode."
+        if role_patch_kind == "ui_flow_patch":
+            return "The request expands an existing single-role UI flow, so generation stays in minimal patch mode with focused root/list/detail companions."
+        if role_patch_kind == "contract_patch":
+            return "The request changes a single-role contract-backed behavior, so generation stays in minimal patch mode with focused backend files."
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
             return "The request describes a new workflow-heavy app surface, so generation uses whole-file bundles."
         if len(role_scope) > 1:
@@ -73,11 +180,16 @@ class ServiceStrategyMixins:
 
     @staticmethod
     def _requires_multi_page(prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str], intent: str) -> bool:
+        role_patch_kind = ServiceStrategyMixins._role_only_patch_kind(prompt=prompt, role_scope=role_scope, intent=intent)
         if intent == "create":
             return True
         lowered = prompt.lower()
         if ServiceStrategyMixins._looks_like_fix_request(lowered):
             return False
+        if role_patch_kind == "visual_patch":
+            return False
+        if role_patch_kind == "ui_flow_patch":
+            return True
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
             return True
         if intent in {"edit", "refine", "role_only_change"}:

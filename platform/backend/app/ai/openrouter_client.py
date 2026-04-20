@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import hashlib
 import json
 import logging
 import os
@@ -1069,7 +1070,14 @@ class OpenRouterClient:
     @staticmethod
     def _sanitize_schema_name(schema_name: str) -> str:
         sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", schema_name).strip("_")
-        return sanitized or "schema"
+        sanitized = sanitized or "schema"
+        max_length = 64
+        if len(sanitized) <= max_length:
+            return sanitized
+        digest = hashlib.sha1(sanitized.encode("utf-8")).hexdigest()[:10]
+        prefix_budget = max_length - len(digest) - 1
+        prefix = sanitized[:prefix_budget].rstrip("_-") or "schema"
+        return f"{prefix}_{digest}"
 
     @staticmethod
     def _parse_json_payload(raw_text: str, endpoint: str) -> dict[str, Any]:

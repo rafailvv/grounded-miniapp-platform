@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import json
 import time
@@ -26,6 +27,24 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
         "miniapp/app/static/preview_bridge.js",
     }
     _HELPER_DISCOVERY_PATTERNS = {"api", "runtime", "miniappapifetch", "preview_bridge"}
+
+    @staticmethod
+    def _whole_file_bundle_schema_name(cluster_name: str) -> str:
+        prefix = "whole_file_bundle_v1"
+        normalized_cluster = str(cluster_name or "").strip().lower()
+        normalized_cluster = normalized_cluster.replace("/", "_").replace(".", "_").replace(" ", "_")
+        normalized_cluster = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in normalized_cluster).strip("_")
+        if not normalized_cluster:
+            return prefix
+        candidate = f"{prefix}_{normalized_cluster}"
+        if len(candidate) <= 64:
+            return candidate
+        digest = hashlib.sha1(normalized_cluster.encode("utf-8")).hexdigest()[:10]
+        prefix_budget = 64 - len(prefix) - len(digest) - 2
+        truncated_cluster = normalized_cluster[: max(prefix_budget, 0)].rstrip("_-")
+        if truncated_cluster:
+            return f"{prefix}_{truncated_cluster}_{digest}"
+        return f"{prefix}_{digest}"
 
     @staticmethod
     def _is_retryable_empty_cluster_diagnosis(diagnosis: str) -> bool:
@@ -450,7 +469,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                         user_prompt = f"{user_prompt.rstrip()}\n\n{context_reuse_recovery_note}".strip()
                     payload = self._generate_structured_with_retry(
                         role="code_edit",
-                        schema_name=f"whole_file_bundle_v1_{cluster_name}",
+                        schema_name=self._whole_file_bundle_schema_name(cluster_name),
                         schema=self._code_edit_schema(),
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,

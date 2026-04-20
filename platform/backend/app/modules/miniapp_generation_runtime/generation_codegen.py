@@ -44,7 +44,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
         *,
         cluster_name: str,
         cluster_targets: list[str],
-        timeout_seconds: int,
+        timeout_seconds: int = 0,
     ) -> dict[str, Any] | None:
         operations: list[DraftFileOperation] = []
         for target in cluster_targets:

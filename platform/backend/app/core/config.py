@@ -23,6 +23,27 @@ class Settings:
     openrouter_site_url: str = "http://localhost:5173"
 
 
+def _load_repo_env(dotenv_path: Path) -> None:
+    if not dotenv_path.exists():
+        return
+    try:
+        raw_lines = dotenv_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return
+    for raw_line in raw_lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        parsed = value.strip()
+        if parsed and parsed[0] == parsed[-1] and parsed[0] in {'"', "'"}:
+            parsed = parsed[1:-1]
+        os.environ[key] = parsed
+
+
 def get_settings(
     *,
     repo_root: Path | None = None,
@@ -30,6 +51,7 @@ def get_settings(
     preview_base_url: str = "http://localhost:8000",
 ) -> Settings:
     root = repo_root or Path(__file__).resolve().parents[4]
+    _load_repo_env(root / ".env")
     preview_base_url = os.getenv("PREVIEW_BASE_URL", preview_base_url)
     resolved_data_dir = data_dir or Path(os.getenv("PLATFORM_DATA_DIR", str(root / "data")))
     resolved_host_data_dir = Path(os.getenv("PLATFORM_HOST_DATA_DIR", str(resolved_data_dir)))

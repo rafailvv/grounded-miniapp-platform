@@ -122,11 +122,9 @@ class RunService:
         return run
 
     def create_run(self, workspace_id: str, request: CreateRunRequest) -> RunRecord:
-        self._recover_orphaned_active_runs()
         return self._start_run(workspace_id, request, wait=False)
 
     def create_run_sync(self, workspace_id: str, request: CreateRunRequest) -> RunRecord:
-        self._recover_orphaned_active_runs()
         return self._start_run(workspace_id, request, wait=True)
 
     def _start_run(self, workspace_id: str, request: CreateRunRequest, *, wait: bool) -> RunRecord:
@@ -207,7 +205,6 @@ class RunService:
         return title[:48].rstrip(" -_,")
 
     def list_runs(self, workspace_id: str) -> list[RunRecord]:
-        self._recover_orphaned_active_runs()
         runs = [
             RunRecord.model_validate(item)
             for item in self.store.list("runs")

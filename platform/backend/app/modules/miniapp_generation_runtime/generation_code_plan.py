@@ -120,6 +120,11 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
         scope_mode = self._scope_mode(intent, prompt, role_scope)
+        role_patch_kind = self.service._role_only_patch_kind(
+            prompt=prompt,
+            role_scope=role_scope,
+            intent=intent,
+        )
         require_multi_page = self._requires_multi_page(prompt, grounded_spec, role_scope, intent)
         strategy_reason = self._strategy_reason(intent, prompt, role_scope, require_multi_page=require_multi_page)
         workspace_tree = self.workspace_service.file_tree(workspace_id)
@@ -147,7 +152,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 workspace_tree=workspace_tree,
             )
             planned["workspace_id"] = workspace_id
-            if len(role_scope) == 1 and self.service._looks_like_role_flow_expansion_request(prompt.lower()):
+            if len(role_scope) == 1 and role_patch_kind == "ui_flow_patch":
                 planned = self._stabilize_single_role_flow_expansion_plan(
                     planned,
                     prompt=prompt,
@@ -160,6 +165,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                     prompt=prompt,
                     focused_role=focused_role,
                     role_scope=role_scope,
+                    role_patch_kind=role_patch_kind,
                 )
             plan_gate_issues = self._page_graph_gate_issues(
                 planned["page_graph"],
@@ -171,6 +177,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             planned["strategy_reason"] = strategy_reason
             planned["model"] = payload["model"]
             planned["plan_gate_issues"] = plan_gate_issues
+            planned["role_patch_kind"] = role_patch_kind
             return planned
         except Exception as exc:
             self._append_trace(
@@ -198,6 +205,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 "model": "code-plan-unavailable",
                 "plan_gate_issues": [],
                 "workspace_id": workspace_id,
+                "role_patch_kind": role_patch_kind,
                 "error": f"Page graph planning failed: {exc}",
             }
 
@@ -245,6 +253,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         prompt: str,
         focused_role: str,
         role_scope: list[str],
+        role_patch_kind: str | None = None,
     ) -> dict[str, Any]:
         page_graph = dict(planned.get("page_graph") or {})
         roles = dict(page_graph.get("roles") or {})
@@ -260,7 +269,10 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 if isinstance(path, str) and path.startswith("miniapp/app/static/"):
                     focused_page_targets.add(path)
 
-        visual_only_patch = self._looks_like_visual_page_patch(prompt=prompt)
+        visual_only_patch = role_patch_kind == "visual_patch" or (
+            role_patch_kind is None and self._looks_like_visual_page_patch(prompt=prompt)
+        )
+        ui_flow_patch = role_patch_kind == "ui_flow_patch"
         if visual_only_patch:
             source_role_pages = self._source_role_pages_for_focus(workspace_id=planned.get("workspace_id"), role=focused_role)
             for page in source_role_pages:
@@ -338,6 +350,54 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             for path in (planned.get("backend_targets") or [])
             if path not in non_focused_route_files
         ]
+        if ui_flow_patch:
+            feature_stems = {
+                stem
+                for stem in (
+                    self._page_feature_stem(focused_role=focused_role, page=page)
+                    for page in focused_pages
+                )
+                if stem
+            }
+            allowed_route_stems = {focused_role, "runtime", *feature_stems}
+            allowed_route_targets = {
+                path
+                for path in [*pruned_target_files, *pruned_backend_targets]
+                if isinstance(path, str)
+                and path.startswith("miniapp/app/routes/")
+                and path.removeprefix("miniapp/app/routes/").removesuffix(".py") in allowed_route_stems
+            }
+
+            def _is_kept_ui_flow_path(path: str) -> bool:
+                if path.startswith("miniapp/app/static/"):
+                    return path in selected_page_targets or path.startswith("miniapp/app/static/shared/")
+                if path in allowed_route_targets:
+                    return True
+                if path.startswith("miniapp/app/routes/"):
+                    return False
+                if path.startswith("miniapp/app/generated/"):
+                    return False
+                return path.startswith("miniapp/app/static/shared/")
+
+            pruned_target_files = [
+                path
+                for path in pruned_target_files
+                if isinstance(path, str) and _is_kept_ui_flow_path(path)
+            ]
+            pruned_target_files = list(
+                dict.fromkeys(
+                    [
+                        *pruned_target_files,
+                        *sorted(selected_page_targets),
+                        *sorted(allowed_route_targets),
+                    ]
+                )
+            )
+            pruned_backend_targets = [
+                path
+                for path in pruned_backend_targets
+                if isinstance(path, str) and path in allowed_route_targets
+            ]
         if visual_only_patch:
             pruned_target_files = [
                 path
@@ -358,14 +418,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         if visual_only_patch and focused_pages:
             filtered_roles[focused_role] = {
                 **focused_payload,
-                "pages": [
-                    page
-                    for page in focused_pages
-                    if any(
-                        isinstance(page.get(key), str) and page.get(key) in selected_page_targets
-                        for key in ("file_path", "style_path", "script_path")
-                    )
-                ],
+                "pages": list(focused_pages),
             }
             page_graph["roles"] = filtered_roles
 
@@ -395,6 +448,23 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                     or path.startswith("miniapp/app/static/shared/")
                 )
             ]
+        elif ui_flow_patch:
+            role_support_targets = {
+                str(path)
+                for page in focused_pages
+                for path in (page.get("file_path"), page.get("style_path"), page.get("script_path"))
+                if isinstance(path, str) and path.startswith(f"miniapp/app/static/{focused_role}/")
+            }
+            allowed_read_targets = set(pruned_target_files) | role_support_targets
+            pruned_files_to_read = [
+                path
+                for path in pruned_files_to_read
+                if isinstance(path, str)
+                and (
+                    path in allowed_read_targets
+                    or path.startswith("miniapp/app/static/shared/")
+                )
+            ]
         generation_clusters = self._build_generation_clusters(pruned_target_files)
         execution_plan = self._build_execution_plan(
             role_scope=role_scope,
@@ -414,6 +484,8 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             "active_role_scope": execution_plan["active_role_scope"],
             "execution_plan": execution_plan,
             "visual_only_patch": visual_only_patch,
+            "ui_flow_patch": ui_flow_patch,
+            "role_patch_kind": role_patch_kind,
             "suppress_role_route_targets": visual_only_patch,
         }
 
@@ -449,6 +521,12 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             ):
                 continue
             pages.append(page)
+        role_payload = {
+            **role_payload,
+            "pages": pages,
+        }
+        roles[focused_role] = role_payload
+        page_graph["roles"] = roles
         if not pages:
             return planned
 
@@ -501,6 +579,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
 
         return {
             **planned,
+            "page_graph": page_graph,
             "target_files": list(dict.fromkeys([*filtered_target_files, *sorted(selected_targets), *sorted(profile_targets)])),
             "files_to_read": list(dict.fromkeys([*filtered_files_to_read, *sorted(selected_targets), *sorted(profile_targets)])),
         }

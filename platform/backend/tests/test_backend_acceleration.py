@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from app.modules.miniapp_agent_loop.fix_prompt_builder import FixPromptBuilder
 from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
 from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import MiniappGenerationContractApiRoutesCrud
 from app.modules.miniapp_generation_runtime.generation_codegen_clusters import MiniappGenerationCodegenClusters
+from app.core.config import get_settings
 from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
 from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES, GenerationService
@@ -113,6 +115,22 @@ def test_system_configuration_defaults_to_balanced(tmp_path: Path) -> None:
     assert response.json()["defaults"]["generation_mode"] == "balanced"
 
 
+def test_get_settings_loads_repo_root_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    (repo_root / ".env").write_text(
+        "OPENAI_API_KEY=test-openai-key\nPREVIEW_BASE_URL=http://127.0.0.1:9000\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("PREVIEW_BASE_URL", raising=False)
+
+    settings = get_settings(repo_root=repo_root, data_dir=tmp_path / "data")
+
+    assert os.getenv("OPENAI_API_KEY") == "test-openai-key"
+    assert settings.preview_base_url == "http://127.0.0.1:9000"
+
+
 def test_role_ui_cluster_gets_one_recovery_round_for_satisfied_read_request() -> None:
     tool_requests = [{"tool": "read_files", "targets": ["miniapp/app/static/client/app.js"]}]
 
@@ -142,6 +160,31 @@ def test_role_ui_cluster_gets_one_recovery_round_for_satisfied_read_request() ->
     )
 
 
+def test_whole_file_error_fallback_does_not_require_timeout_argument(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    codegen = app.state.container.generation_service.generation_codegen
+
+    fallback = codegen._whole_file_error_fallback_result(
+        cluster_name="backend_route_bookings",
+        cluster_targets=["miniapp/app/routes/bookings.py"],
+        error_message="returned no file operations",
+    )
+
+    assert fallback is not None
+    assert fallback["cluster_name"] == "backend_route_bookings"
+    assert fallback["duration_ms"] == 0
+
+
+def test_whole_file_bundle_schema_name_stays_within_openai_limit() -> None:
+    schema_name = MiniappGenerationCodegenClusters._whole_file_bundle_schema_name(
+        "role_specialist_ui_bookings_booking_id_process"
+    )
+
+    assert len(schema_name) <= 64
+    assert schema_name.startswith("whole_file_bundle_v1_")
+
+
 def test_openrouter_client_truncates_large_log_text() -> None:
     text = "a" * 6000
 
@@ -165,6 +208,16 @@ def test_openrouter_client_compacts_large_nested_payloads() -> None:
     text_value = compact["input"][0]["content"][0]["text"]
     assert isinstance(text_value, str)
     assert "[truncated " in text_value
+
+
+def test_openrouter_client_sanitize_schema_name_truncates_to_openai_limit() -> None:
+    raw_name = "whole_file_bundle_v1_role_specialist_ui_bookings_booking_id_process"
+
+    sanitized = OpenRouterClient._sanitize_schema_name(raw_name)
+
+    assert len(sanitized) <= 64
+    assert sanitized.startswith("whole_file_bundle_v1_")
+    assert sanitized != raw_name
 
 
 def test_openrouter_client_retries_dns_resolution_failures() -> None:
@@ -326,6 +379,352 @@ def test_entity_contract_uses_prompt_derived_slug_for_booking_prompt(tmp_path: P
     assert contract["route_file"] == "miniapp/app/routes/bookings.py"
 
 
+def test_role_only_patch_kind_distinguishes_visual_ui_flow_and_contract(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    assert (
+        service._role_only_patch_kind(
+            prompt="Please fix the client avatar so it is not stretched full-screen and stays inside the avatar container on the main page.",
+            role_scope=["client"],
+            intent="role_only_change",
+        )
+        == "visual_patch"
+    )
+    assert (
+        service._role_only_patch_kind(
+            prompt="When the client clicks an item from the list, open a separate details page and show the full information while keeping the current logic.",
+            role_scope=["client"],
+            intent="role_only_change",
+        )
+        == "ui_flow_patch"
+    )
+    assert (
+        service._role_only_patch_kind(
+            prompt="On the specialist details page add a reject action that persists to the real backend and updates status across the app.",
+            role_scope=["specialist"],
+            intent="role_only_change",
+        )
+        == "contract_patch"
+    )
+
+
+def test_ui_flow_patch_prunes_broad_backend_support_from_focused_role_plan(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    planned = {
+        "workspace_id": "ws_ui_flow",
+        "page_graph": {
+            "roles": {
+                "client": {
+                    "routes_file": "miniapp/app/routes/client.py",
+                    "pages": [
+                        {
+                            "page_id": "client_root",
+                            "route_path": "/client",
+                            "page_kind": "role_root",
+                            "file_path": "miniapp/app/static/client/index.html",
+                            "style_path": "miniapp/app/static/client/styles.css",
+                            "script_path": "miniapp/app/static/client/app.js",
+                        },
+                        {
+                            "page_id": "client_bookings",
+                            "route_path": "/client/bookings",
+                            "page_kind": "list",
+                            "file_path": "miniapp/app/static/client/bookings/index.html",
+                            "style_path": "miniapp/app/static/client/bookings/styles.css",
+                            "script_path": "miniapp/app/static/client/bookings/app.js",
+                        },
+                        {
+                            "page_id": "client_booking_detail",
+                            "route_path": "/client/bookings/{booking_id}",
+                            "page_kind": "detail",
+                            "file_path": "miniapp/app/static/client/bookings_detail/index.html",
+                            "style_path": "miniapp/app/static/client/bookings_detail/styles.css",
+                            "script_path": "miniapp/app/static/client/bookings_detail/app.js",
+                        },
+                    ],
+                },
+                "manager": {
+                    "routes_file": "miniapp/app/routes/manager.py",
+                    "pages": [],
+                },
+            }
+        },
+        "target_files": [
+            "miniapp/app/main.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/generated/runtime_manifest.json",
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/bookings.py",
+            "miniapp/app/routes/runtime.py",
+            "miniapp/app/routes/profiles.py",
+            "miniapp/app/routes/manager.py",
+            "miniapp/app/static/shared/base.css",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/styles.css",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/client/bookings/index.html",
+            "miniapp/app/static/client/bookings/styles.css",
+            "miniapp/app/static/client/bookings/app.js",
+            "miniapp/app/static/client/bookings_detail/index.html",
+            "miniapp/app/static/client/bookings_detail/styles.css",
+            "miniapp/app/static/client/bookings_detail/app.js",
+        ],
+        "backend_targets": [
+            "miniapp/app/main.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/bookings.py",
+            "miniapp/app/routes/runtime.py",
+            "miniapp/app/routes/profiles.py",
+            "miniapp/app/routes/manager.py",
+        ],
+        "shared_files": ["miniapp/app/static/shared/base.css"],
+        "files_to_read": [
+            "miniapp/app/main.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/generated/runtime_manifest.json",
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/bookings.py",
+            "miniapp/app/routes/runtime.py",
+            "miniapp/app/routes/profiles.py",
+            "miniapp/app/routes/manager.py",
+            "miniapp/app/static/shared/base.css",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/styles.css",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/client/bookings/index.html",
+            "miniapp/app/static/client/bookings/styles.css",
+            "miniapp/app/static/client/bookings/app.js",
+            "miniapp/app/static/client/bookings_detail/index.html",
+            "miniapp/app/static/client/bookings_detail/styles.css",
+            "miniapp/app/static/client/bookings_detail/app.js",
+        ],
+    }
+
+    pruned = service.generation_code_plan._prune_minimal_patch_plan_to_focused_role(
+        planned,
+        prompt="When the client clicks an item from the list, open a separate details page with the full information and keep the current logic.",
+        focused_role="client",
+        role_scope=["client"],
+        role_patch_kind="ui_flow_patch",
+    )
+
+    target_paths = set(pruned["target_files"])
+    backend_paths = set(pruned["backend_targets"])
+    read_paths = set(pruned["files_to_read"])
+
+    assert "miniapp/app/routes/client.py" in target_paths
+    assert "miniapp/app/routes/bookings.py" in target_paths
+    assert "miniapp/app/routes/runtime.py" in target_paths
+    assert "miniapp/app/static/client/bookings/index.html" in target_paths
+    assert "miniapp/app/static/client/bookings_detail/index.html" in target_paths
+    assert "miniapp/app/static/shared/base.css" in target_paths
+    assert "miniapp/app/main.py" not in target_paths
+    assert "miniapp/app/db.py" not in target_paths
+    assert "miniapp/app/schemas.py" not in target_paths
+    assert "miniapp/app/generated/runtime_manifest.json" not in target_paths
+    assert "miniapp/app/routes/profiles.py" not in target_paths
+    assert "miniapp/app/routes/manager.py" not in target_paths
+    assert backend_paths == {
+        "miniapp/app/routes/client.py",
+        "miniapp/app/routes/bookings.py",
+        "miniapp/app/routes/runtime.py",
+    }
+    assert "miniapp/app/main.py" not in read_paths
+    assert "miniapp/app/db.py" not in read_paths
+    assert "miniapp/app/generated/runtime_manifest.json" not in read_paths
+
+
+def test_visual_patch_keeps_role_pages_in_page_graph_while_narrowing_targets(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    planned = {
+        "workspace_id": "ws_visual_patch",
+        "page_graph": {
+            "roles": {
+                "client": {
+                    "routes_file": "miniapp/app/routes/client.py",
+                    "pages": [
+                        {
+                            "page_id": "client_root",
+                            "route_path": "/client",
+                            "page_kind": "role_root",
+                            "file_path": "miniapp/app/static/client/index.html",
+                            "style_path": "miniapp/app/static/client/styles.css",
+                            "script_path": "miniapp/app/static/client/app.js",
+                        },
+                        {
+                            "page_id": "client_profile",
+                            "route_path": "/client/profile",
+                            "page_kind": "profile",
+                            "file_path": "miniapp/app/static/client/profile/index.html",
+                            "style_path": "miniapp/app/static/client/profile/styles.css",
+                            "script_path": "miniapp/app/static/client/profile/app.js",
+                        },
+                    ],
+                }
+            }
+        },
+        "target_files": [
+            "miniapp/app/static/shared/base.css",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/styles.css",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/client/profile/index.html",
+            "miniapp/app/static/client/profile/styles.css",
+            "miniapp/app/static/client/profile/app.js",
+            "miniapp/app/routes/client.py",
+        ],
+        "backend_targets": ["miniapp/app/routes/client.py"],
+        "shared_files": ["miniapp/app/static/shared/base.css"],
+        "files_to_read": [
+            "miniapp/app/static/shared/base.css",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/styles.css",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/client/profile/index.html",
+            "miniapp/app/static/client/profile/styles.css",
+            "miniapp/app/static/client/profile/app.js",
+        ],
+    }
+
+    pruned = service.generation_code_plan._prune_minimal_patch_plan_to_focused_role(
+        planned,
+        prompt="Please fix the client avatar on the main client page so it stays inside the small avatar container and does not stretch full screen.",
+        focused_role="client",
+        role_scope=["client"],
+        role_patch_kind="visual_patch",
+    )
+
+    target_paths = set(pruned["target_files"])
+    page_paths = {
+        page["file_path"]
+        for page in pruned["page_graph"]["roles"]["client"]["pages"]
+    }
+
+    assert "miniapp/app/static/client/index.html" in target_paths
+    assert "miniapp/app/static/client/profile/index.html" not in target_paths
+    assert page_paths == {
+        "miniapp/app/static/client/index.html",
+        "miniapp/app/static/client/profile/index.html",
+    }
+
+
+def test_prepare_runtime_plan_ui_flow_patch_keeps_route_targets_without_contract_foundation(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="UI Flow Runtime Plan Workspace",
+            description="UI flow patch should not reintroduce broad backend foundation targets.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_ui_flow_runtime_plan").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    draft_source = workspace_service.source_dir(workspace.workspace_id)
+
+    grounded_spec = service._build_grounded_spec(
+        workspace_id=workspace.workspace_id,
+        prompt="Let the client open a separate details page from the list.",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        doc_refs=[],
+        template_revision_id="template-test",
+        prompt_turn_id="turn_ui_flow_runtime_plan",
+        generation_mode=GenerationMode.BALANCED,
+    )
+
+    plan_result = {
+        "target_files": [
+            "miniapp/app/static/shared/base.css",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/styles.css",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/client/bookings/index.html",
+            "miniapp/app/static/client/bookings/styles.css",
+            "miniapp/app/static/client/bookings/app.js",
+            "miniapp/app/static/client/bookings_detail/index.html",
+            "miniapp/app/static/client/bookings_detail/styles.css",
+            "miniapp/app/static/client/bookings_detail/app.js",
+            "miniapp/app/generated/runtime_manifest.json",
+        ],
+        "backend_targets": [],
+        "shared_files": ["miniapp/app/static/shared/base.css"],
+        "files_to_read": [
+            "miniapp/app/static/shared/base.css",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/bookings/index.html",
+            "miniapp/app/static/client/bookings_detail/index.html",
+        ],
+        "page_graph": {
+            "roles": {
+                "client": {
+                    "routes_file": "miniapp/app/routes/client.py",
+                    "pages": [
+                        {
+                            "page_id": "client_bookings",
+                            "route_path": "/client/bookings",
+                            "page_kind": "list",
+                            "file_path": "miniapp/app/static/client/bookings/index.html",
+                            "style_path": "miniapp/app/static/client/bookings/styles.css",
+                            "script_path": "miniapp/app/static/client/bookings/app.js",
+                            "data_dependencies": ["GET /api/bookings"],
+                        },
+                        {
+                            "page_id": "client_booking_detail",
+                            "route_path": "/client/bookings/{booking_id}",
+                            "page_kind": "detail",
+                            "file_path": "miniapp/app/static/client/bookings_detail/index.html",
+                            "style_path": "miniapp/app/static/client/bookings_detail/styles.css",
+                            "script_path": "miniapp/app/static/client/bookings_detail/app.js",
+                            "data_dependencies": ["GET /api/bookings/{booking_id}"],
+                        },
+                    ],
+                }
+            }
+        },
+        "role_patch_kind": "ui_flow_patch",
+        "ui_flow_patch": True,
+        "visual_only_patch": False,
+    }
+
+    prepared = service.generation_plan_runtime.prepare_runtime_plan(
+        workspace_id=workspace.workspace_id,
+        draft_source=draft_source,
+        grounded_spec=grounded_spec,
+        entity_contract={"route_file": "miniapp/app/routes/bookings.py", "api_path": "/api/bookings"},
+        role_scope=["client"],
+        plan_result=plan_result,
+    )
+
+    paths = set(prepared["target_files"])
+    backend_paths = set(prepared["backend_targets"])
+
+    assert "miniapp/app/routes/client.py" in paths
+    assert "miniapp/app/routes/bookings.py" in paths
+    assert "miniapp/app/main.py" not in paths
+    assert "miniapp/app/db.py" not in paths
+    assert "miniapp/app/schemas.py" not in paths
+    assert "miniapp/app/generated/runtime_manifest.json" not in paths
+    assert backend_paths == {
+        "miniapp/app/routes/client.py",
+        "miniapp/app/routes/bookings.py",
+    }
+
+
 def test_contract_critic_flags_generic_submission_shim_and_seeded_live_data(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -465,6 +864,43 @@ def test_run_service_recovers_orphaned_active_runs_after_restart(tmp_path: Path)
     assert recovered_stopping.apply_status == "blocked"
     assert recovered_stopping.current_stage == "stopped"
     assert "stop" in (recovered_stopping.failure_reason or "").lower()
+
+
+def test_run_service_hot_paths_do_not_rescan_orphaned_runs_after_startup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Hot Path Workspace",
+            description="Run creation and listing should not trigger orphan recovery scans repeatedly.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_hot_path").resolve()),
+        )
+    )
+
+    calls: list[str] = []
+
+    def _unexpected_recovery() -> None:
+        calls.append("recover")
+        raise AssertionError("orphan recovery should not run inside create_run/list_runs hot paths")
+
+    monkeypatch.setattr(run_service, "_recover_orphaned_active_runs", _unexpected_recovery)
+    monkeypatch.setattr(run_service, "_execute_run", lambda *_args, **_kwargs: None)
+
+    run = run_service.create_run(
+        workspace.workspace_id,
+        CreateRunRequest(
+            prompt="Create a narrow dashboard update without touching the rest of the app.",
+            intent="edit",
+        ),
+    )
+    runs = run_service.list_runs(workspace.workspace_id)
+
+    assert run.workspace_id == workspace.workspace_id
+    assert len(runs) == 1
+    assert calls == []
 
 
 def test_preview_runtime_compose_uses_built_image_without_runtime_pip_install(tmp_path: Path) -> None:
@@ -2919,6 +3355,125 @@ def test_single_role_flow_expansion_plan_keeps_root_and_list_detail_companions_b
     assert "miniapp/app/static/client/profile/index.html" not in stabilized["files_to_read"]
 
 
+def test_role_only_visual_patch_preserves_existing_source_entity_contract_from_source_tests(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Visual Patch Contract Workspace",
+            description="Source entity contract should be preserved for narrow role patches.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_visual_patch_contract").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    source_tests = workspace_service.source_dir(workspace.workspace_id) / "miniapp" / "tests" / "test_generated_app.py"
+    source_tests.parent.mkdir(parents=True, exist_ok=True)
+    source_tests.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "import json",
+                'ENTITY_CONTRACT = json.loads(\'{\"api_path\":\"/api/bookings\",\"route_file\":\"miniapp/app/routes/bookings.py\",\"entity_slug\":\"booking\",\"entity_slug_plural\":\"bookings\",\"schema_prefix\":\"Booking\",\"key_fields\":[{\"name\":\"request_type\",\"type\":\"string\",\"required\":true},{\"name\":\"start_date\",\"type\":\"datetime\",\"required\":true},{\"name\":\"end_date\",\"type\":\"datetime\",\"required\":true},{\"name\":\"reason\",\"type\":\"text\",\"required\":true}],\"status_literals\":[\"pending\",\"claimed\",\"issued\",\"returned\",\"conflict\"],\"page_contract\":{\"list_page_expected\":true,\"detail_page_expected\":true,\"update_action_expected\":true}}\')',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    extracted = {
+        "api_path": "/api/records",
+        "route_file": "miniapp/app/routes/records.py",
+        "entity_slug": "record",
+        "entity_slug_plural": "records",
+        "schema_prefix": "Record",
+        "key_fields": [
+            {"name": "title", "type": "string", "required": True},
+            {"name": "details", "type": "text", "required": False},
+        ],
+        "status_literals": ["open"],
+        "page_contract": {
+            "list_page_expected": True,
+            "detail_page_expected": True,
+            "update_action_expected": True,
+        },
+        "extraction_mode": "balanced",
+    }
+
+    preserved = service.generation_entry._preserve_source_entity_contract_for_role_patch(
+        workspace_id=workspace.workspace_id,
+        extracted_entity_contract=extracted,
+        role_patch_kind="visual_patch",
+    )
+
+    assert preserved["api_path"] == "/api/bookings"
+    assert preserved["route_file"] == "miniapp/app/routes/bookings.py"
+    assert preserved["entity_slug_plural"] == "bookings"
+    assert preserved["key_fields"][0]["name"] == "request_type"
+    assert preserved["status_literals"] == ["pending", "claimed", "issued", "returned", "conflict"]
+    assert preserved["source"]["preserved_from_source_contract"] is True
+    assert preserved["source"]["patch_kind"] == "visual_patch"
+
+
+def test_role_only_ui_flow_patch_preserves_source_entity_contract_but_merges_page_expectations(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="UI Flow Contract Workspace",
+            description="UI flow patch should keep entity shape while merging page expectations.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_ui_flow_contract").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    app.state.container.store.upsert(
+        "reports",
+        f"entity_contract:{workspace.workspace_id}",
+        {
+            "run_id": "run_source_contract",
+            "entity_contract": {
+                "api_path": "/api/cases",
+                "route_file": "miniapp/app/routes/cases.py",
+                "entity_slug": "case",
+                "entity_slug_plural": "cases",
+                "schema_prefix": "Case",
+                "key_fields": [{"name": "summary", "type": "string", "required": True}],
+                "status_literals": ["open", "closed"],
+                "page_contract": {
+                    "list_page_expected": True,
+                    "detail_page_expected": False,
+                    "update_action_expected": True,
+                },
+            },
+        },
+    )
+
+    preserved = service.generation_entry._preserve_source_entity_contract_for_role_patch(
+        workspace_id=workspace.workspace_id,
+        extracted_entity_contract={
+            "api_path": "/api/records",
+            "route_file": "miniapp/app/routes/records.py",
+            "page_contract": {
+                "list_page_expected": True,
+                "detail_page_expected": True,
+                "update_action_expected": True,
+            },
+            "extraction_mode": "balanced",
+        },
+        role_patch_kind="ui_flow_patch",
+    )
+
+    assert preserved["api_path"] == "/api/cases"
+    assert preserved["route_file"] == "miniapp/app/routes/cases.py"
+    assert preserved["page_contract"]["detail_page_expected"] is True
+    assert preserved["status_literals"] == ["open", "closed"]
+    assert preserved["source"]["patch_kind"] == "ui_flow_patch"
+
+
 def test_single_role_flow_expansion_plan_restores_missing_list_companion_from_source_graph(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -3828,6 +4383,25 @@ def test_deterministic_resource_route_source_builds_dynamic_model_when_db_surfac
     assert 'mapped_column(String(255), default="")' in source
     assert "def _passthrough_read_fields() -> set[str]:" in source
     assert "if field in payload and field not in serialized:" in source
+    assert 'if "status" in data:' in source
+    assert "validated = schema_model.model_validate(data)" in source
+
+
+def test_generated_python_app_tests_choose_allowed_progress_status_literal(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    artifact_builder = app.state.container.generation_service.artifact_builder
+
+    content = artifact_builder.python_app_level_test_content(
+        page_graph={"backend_targets": [], "shared_files": [], "roles": {}},
+        role_scope=["client", "specialist", "manager"],
+        entity_contract=None,
+    )
+
+    assert "def _pick_progress_status_value(resource_slug: str) -> str:" in content
+    assert '"status": _pick_progress_status_value(_resource_slug(update_path))' in content
+    assert "from enum import Enum" in content
+    assert "issubclass(annotation, Enum)" in content
 
 
 def test_build_validator_recognizes_role_prefixed_profile_routes_with_real_api_write() -> None:

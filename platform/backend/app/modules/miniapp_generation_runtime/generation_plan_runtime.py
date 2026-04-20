@@ -61,12 +61,26 @@ class MiniappGenerationPlanRuntime:
                 dict(plan_result["page_graph"])
             )
         visual_only_patch = bool(plan_result.get("visual_only_patch"))
+        role_patch_kind = str(plan_result.get("role_patch_kind") or "").strip().lower()
+        ui_flow_patch = role_patch_kind == "ui_flow_patch" or bool(plan_result.get("ui_flow_patch"))
         plan_result["target_files"] = list(dict.fromkeys(plan_result.get("target_files") or []))
         plan_result["backend_targets"] = service._sanitize_backend_targets(
             list(dict.fromkeys(plan_result.get("backend_targets") or []))
         )
         inferred_backend_targets: list[str] = []
-        if not visual_only_patch:
+        if ui_flow_patch:
+            inferred_backend_targets = list(
+                dict.fromkeys(
+                    self.detect_missing_backend_route_targets_from_ui_flow(
+                        page_graph=plan_result.get("page_graph") or {},
+                        role_scope=role_scope,
+                        current_target_files=plan_result["target_files"],
+                        backend_targets=plan_result["backend_targets"],
+                        entity_contract=entity_contract,
+                    )
+                )
+            )
+        elif not visual_only_patch:
             inferred_backend_targets = list(
                 dict.fromkeys(
                     [
@@ -101,6 +115,12 @@ class MiniappGenerationPlanRuntime:
                     ]
                 )
             )
+        if ui_flow_patch:
+            plan_result["target_files"] = [
+                path
+                for path in plan_result["target_files"]
+                if not (isinstance(path, str) and path.startswith("miniapp/app/generated/"))
+            ]
         plan_result["files_to_read"] = list(dict.fromkeys(plan_result.get("files_to_read") or []))
         plan_result["shared_files"] = list(dict.fromkeys(plan_result.get("shared_files") or []))
         plan_result["target_files"] = service._sanitize_planner_target_files(
@@ -144,6 +164,48 @@ class MiniappGenerationPlanRuntime:
                 generation_clusters=plan_result["generation_clusters"],
             )
         return plan_result
+
+    @classmethod
+    def detect_missing_backend_route_targets_from_ui_flow(
+        cls,
+        *,
+        page_graph: dict[str, Any],
+        role_scope: list[str],
+        current_target_files: list[str],
+        backend_targets: list[str],
+        entity_contract: dict[str, Any] | None = None,
+    ) -> list[str]:
+        existing_targets = set(current_target_files) | set(backend_targets)
+        inferred: list[str] = []
+        for role in role_scope:
+            role_payload = (page_graph.get("roles") or {}).get(role)
+            routes_file = str((role_payload or {}).get("routes_file") or "").strip()
+            if routes_file.startswith("miniapp/app/routes/") and routes_file not in existing_targets:
+                inferred.append(cls.normalize_runtime_python_path(routes_file))
+        endpoint_names: set[str] = set()
+        for role_payload in (page_graph.get("roles") or {}).values():
+            if not isinstance(role_payload, dict):
+                continue
+            for page in role_payload.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                for dependency in page.get("data_dependencies") or []:
+                    if isinstance(dependency, str):
+                        endpoint_names.update(cls.endpoint_names_from_dependency_text(dependency))
+        for endpoint_name in sorted(endpoint_names):
+            normalized_endpoint_name = cls.normalize_endpoint_name_for_entity_contract(
+                endpoint_name,
+                entity_contract=entity_contract,
+            )
+            if cls.is_forbidden_endpoint_name(normalized_endpoint_name):
+                continue
+            inferred_path = cls.route_module_path_for_endpoint_name(normalized_endpoint_name)
+            if inferred_path not in existing_targets:
+                inferred.append(inferred_path)
+        entity_route_file = cls.entity_route_file(entity_contract)
+        if entity_route_file and entity_route_file not in existing_targets and endpoint_names:
+            inferred.append(entity_route_file)
+        return list(dict.fromkeys(inferred))
 
     @staticmethod
     def _expand_page_triplets_for_targeted_pages(

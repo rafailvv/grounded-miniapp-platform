@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import unittest
+from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import get_args, get_origin
@@ -186,6 +187,11 @@ def _schema_prefix_candidates(resource_slug: str) -> list[str]:
 
 
 def _string_literal_choices(annotation) -> list[str]:
+    try:
+        if isinstance(annotation, type) and issubclass(annotation, Enum):
+            return [str(member.value) for member in annotation if isinstance(member.value, str)]
+    except Exception:
+        pass
     origin = get_origin(annotation)
     if origin is None:
         return []
@@ -242,6 +248,26 @@ def _pick_status_value(resource_slug: str) -> str:
         if candidate in choices:
             return candidate
     return choices[0] if choices else "requested"
+
+
+def _pick_progress_status_value(resource_slug: str) -> str:
+    preferred = (
+        "in_progress",
+        "claimed",
+        "in_review",
+        "issued",
+        "active",
+        "open",
+        "processing",
+        "approved",
+        "returned",
+        "closed",
+    )
+    choices = _field_literal_choices(resource_slug, "status", suffixes=("Update", "Read", "Create"))
+    for candidate in preferred:
+        if candidate in choices:
+            return candidate
+    return _pick_status_value(resource_slug)
 
 
 def _extract_record_id(payload):
@@ -610,7 +636,7 @@ class GeneratedMiniAppTests(unittest.TestCase):
             for field in (update_requirement.get("fields") or update_requirement.get("request_fields") or [])
             if isinstance(field, dict) and str(field.get("name") or "").strip()
         }
-        for key, value in {"status": "in_progress"}.items():
+        for key, value in {"status": _pick_progress_status_value(_resource_slug(update_path))}.items():
             if (not update_allowed_fields and key == "status") or key in update_allowed_fields:
                 update_payload[key] = value
         update_method = str(update_requirement.get("method") or "PATCH").upper()

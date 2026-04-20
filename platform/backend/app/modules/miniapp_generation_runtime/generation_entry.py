@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ast
 from copy import deepcopy
+import json
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING, Any, Callable
 
 from app.models.domain import GenerateRequest, JobRecord
@@ -65,6 +68,29 @@ class MiniappGenerationEntry:
             grounded_spec=grounded_spec,
             generation_mode=generation_mode,
         )
+        role_patch_kind = self.service._role_only_patch_kind(
+            prompt=effective_prompt,
+            role_scope=role_scope,
+            intent=request.intent,
+        )
+        preserved_entity_contract = self._preserve_source_entity_contract_for_role_patch(
+            workspace_id=workspace_id,
+            extracted_entity_contract=entity_contract,
+            role_patch_kind=role_patch_kind,
+        )
+        if preserved_entity_contract is not entity_contract:
+            entity_contract = preserved_entity_contract
+            self.service._append_trace(
+                workspace_id,
+                "entity_contract_preserved",
+                "Preserved the existing source entity contract for a narrow single-role patch.",
+                {
+                    "role_patch_kind": role_patch_kind,
+                    "entity_slug": entity_contract.get("entity_slug"),
+                    "api_path": entity_contract.get("api_path"),
+                    "route_file": entity_contract.get("route_file"),
+                },
+            )
         self.service._store_report(
             f"entity_contract:{workspace_id}",
             {"run_id": draft_run_id, "entity_contract": entity_contract},
@@ -200,6 +226,70 @@ class MiniappGenerationEntry:
             should_stop=should_stop,
         )
 
+    def _preserve_source_entity_contract_for_role_patch(
+        self,
+        *,
+        workspace_id: str,
+        extracted_entity_contract: dict[str, Any],
+        role_patch_kind: str | None,
+    ) -> dict[str, Any]:
+        if role_patch_kind not in {"visual_patch", "ui_flow_patch"}:
+            return extracted_entity_contract
+        source_entity_contract = self._load_existing_entity_contract(workspace_id)
+        if not source_entity_contract:
+            return extracted_entity_contract
+        preserved = deepcopy(source_entity_contract)
+        if extracted_entity_contract.get("extraction_mode"):
+            preserved["extraction_mode"] = extracted_entity_contract.get("extraction_mode")
+        if role_patch_kind == "ui_flow_patch":
+            preserved_page_contract = dict(source_entity_contract.get("page_contract") or {})
+            for key, value in dict(extracted_entity_contract.get("page_contract") or {}).items():
+                if value is not None:
+                    preserved_page_contract[key] = value
+            if preserved_page_contract:
+                preserved["page_contract"] = preserved_page_contract
+        preserved_source = dict(source_entity_contract.get("source") or {})
+        preserved_source["preserved_from_source_contract"] = True
+        preserved_source["patch_kind"] = role_patch_kind
+        preserved["source"] = preserved_source
+        return preserved
+
+    def _load_existing_entity_contract(self, workspace_id: str) -> dict[str, Any] | None:
+        report_payload = self.service.store.get("reports", f"entity_contract:{workspace_id}") or {}
+        report_contract = report_payload.get("entity_contract") if isinstance(report_payload, dict) else None
+        if self._looks_like_entity_contract(report_contract):
+            return dict(report_contract)
+        source_tests_path = self.service.workspace_service.source_dir(workspace_id) / "miniapp" / "tests" / "test_generated_app.py"
+        if not source_tests_path.exists():
+            return None
+        try:
+            content = source_tests_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        match = re.search(
+            r"ENTITY_CONTRACT\s*=\s*json\.loads\((?P<literal>(?:'[^']*'|\"[^\"]*\"))\)",
+            content,
+            re.DOTALL,
+        )
+        if not match:
+            return None
+        try:
+            literal = ast.literal_eval(match.group("literal"))
+            parsed = json.loads(literal)
+        except Exception:
+            return None
+        if self._looks_like_entity_contract(parsed):
+            return dict(parsed)
+        return None
+
+    @staticmethod
+    def _looks_like_entity_contract(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        api_path = str(payload.get("api_path") or "").strip()
+        route_file = str(payload.get("route_file") or "").strip()
+        return api_path.startswith("/api/") and route_file.endswith(".py")
+
     def _merge_advisory_generation_inputs(
         self,
         *,
@@ -252,7 +342,13 @@ class MiniappGenerationEntry:
             if path.startswith("miniapp/app/static/")
         ]
         visual_only_patch = bool(advisory_plan_result.get("visual_only_patch"))
+        ui_flow_patch = bool(advisory_plan_result.get("ui_flow_patch") or inferred_plan_result.get("ui_flow_patch"))
         suppress_role_route_targets = bool(advisory_plan_result.get("suppress_role_route_targets"))
+        role_patch_kind = (
+            str(advisory_plan_result.get("role_patch_kind") or "").strip()
+            or str(inferred_plan_result.get("role_patch_kind") or "").strip()
+            or None
+        )
         minimal_patch_uses_advisory_scope = bool(
             scope_mode == "minimal_patch" and (advisory_page_targets or advisory_backend_targets)
         )
@@ -356,6 +452,8 @@ class MiniappGenerationEntry:
             else inferred_plan_result.get("require_multi_page")
         )
         merged_plan["visual_only_patch"] = visual_only_patch
+        merged_plan["ui_flow_patch"] = ui_flow_patch
+        merged_plan["role_patch_kind"] = role_patch_kind
         merged_plan["suppress_role_route_targets"] = suppress_role_route_targets
         merged_plan["generation_clusters"] = list(self.service._build_generation_clusters(merged_plan["target_files"]) or [])
         role_scope = [
