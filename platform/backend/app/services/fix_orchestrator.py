@@ -272,6 +272,9 @@ class FixOrchestrator:
         raw_error = str(request.error_context.raw_error if request.error_context else request.prompt or "")
         if "/api/" not in raw_error and "generated_app_python_tests" not in raw_error.lower():
             return False
+        resource_match = re.search(r"/api/([a-z0-9_-]+)", raw_error.lower())
+        failed_resource = str(resource_match.group(1) or "").strip() if resource_match else ""
+        failed_resource_candidates = {failed_resource, failed_resource.replace("-", "_")} if failed_resource else set()
         route_dir = self.workspace_service.draft_source_dir(workspace_id, run_id) / "miniapp/app/routes"
         if not route_dir.exists():
             return False
@@ -282,8 +285,12 @@ class FixOrchestrator:
                 continue
             if "/api/submissions/{table}" in content.lower():
                 return True
-            if route_file.stem == "bookingrequests" and self.generation_service is not None:
-                if self.generation_service.generation_contract_schema._needs_canonical_bookingrequests_route_repair(content):
+            if (
+                failed_resource_candidates
+                and route_file.stem in failed_resource_candidates
+                and self.generation_service is not None
+            ):
+                if self.generation_service.generation_contract_schema._needs_canonical_resource_route_repair(content, route_file.stem):
                     return True
         return False
 

@@ -3,16 +3,33 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import MiniappGenerationContractApiRoutesCrud
+from app.modules.miniapp_generation_runtime.generation_plan_runtime import FORBIDDEN_ROUTE_MODULE_STEMS
 from app.modules.miniapp_generation_runtime.generation_contract_api_routes_support import MiniappGenerationContractApiRoutesSupport
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
 from app.models.domain import DraftFileOperation
 
 
 class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
+    _FEATURE_ROUTE_EXCLUDED_STEMS = FORBIDDEN_ROUTE_MODULE_STEMS | {
+        "client",
+        "specialist",
+        "manager",
+        "profiles",
+        "runtime",
+        "users",
+        "workload",
+        "time_slots",
+        "comments",
+        "assignments",
+        "role_pages",
+        "health",
+    }
+
     @staticmethod
-    def _normalize_booking_schema_contract(schemas_content: str) -> str:
+    def _normalize_request_schema_contract(schemas_content: str) -> str:
         updated = str(schemas_content or "")
-        if "class BookingRequestRead" not in updated:
+        if "class RequestRead" not in updated:
             return updated
         updated = re.sub(
             r"(^\s*owner_role:\s*AppRole\s*\|\s*None)\s*$",
@@ -23,31 +40,45 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
         return updated
 
     @staticmethod
-    def _needs_canonical_bookingrequests_route_repair(content: str) -> bool:
+    def _route_path_candidates(resource_stem: str) -> set[str]:
+        normalized = str(resource_stem or "").strip().strip("/").lower()
+        if not normalized:
+            return set()
+        dashed = normalized.replace("_", "-")
+        return {normalized, dashed}
+
+    @classmethod
+    def _needs_canonical_resource_route_repair(cls, content: str, resource_stem: str) -> bool:
         normalized = str(content or "")
         lowered = normalized.lower()
         if not normalized.strip():
             return True
         if "/api/submissions/{table}" in lowered:
             return True
-        if "@router.post(\"\")" not in normalized or "@router.get(\"\")" not in normalized or "@router.put(\"/{item_id}\")" not in normalized:
+        path_candidates = cls._route_path_candidates(resource_stem)
+        if not path_candidates:
+            return True
+        has_list = any(f'@router.get("/{candidate}")' in normalized for candidate in path_candidates)
+        has_create = any(f'@router.post("/{candidate}")' in normalized for candidate in path_candidates)
+        has_detail = any(
+            re.search(rf'@router\.get\("/{re.escape(candidate)}/\{{[A-Za-z_][A-Za-z0-9_]*\}}"\)', normalized)
+            for candidate in path_candidates
+        )
+        has_update = any(
+            re.search(rf'@router\.(?:patch|put)\("/{re.escape(candidate)}/\{{[A-Za-z_][A-Za-z0-9_]*\}}"\)', normalized)
+            for candidate in path_candidates
+        )
+        if not (has_list and has_create and has_detail and has_update):
             return True
         return any(
-            marker in normalized
-            for marker in (
-                "class BookingRequestRecord(Base):",
-                "class BookingRequestCreate(",
-                "class BookingRequestUpdate(",
-                "class BookingRequestItem(",
-                "class BookingRequestList(",
-                "class BookingRequestCreateResponse(",
-                "BookingRequestList,",
-                "id=str(uuid4())",
-                "owner_specialist_id",
-                "owner_role",
-                "issued_at",
-                "returned_at",
-                "bookingrequest_id=record.bookingrequest_id",
+            re.search(pattern, normalized, flags=re.MULTILINE)
+            for pattern in (
+                r"^class\s+[A-Za-z0-9_]*Record\s*\(Base\):",
+                r"^class\s+[A-Za-z0-9_]*Create\s*\(",
+                r"^class\s+[A-Za-z0-9_]*Update\s*\(",
+                r"from\s+pydantic\s+import\s+BaseModel",
+                r"\bid=str\(uuid4\(\)\)",
+                r"\bowner_specialist_id\b",
             )
         )
 
@@ -183,13 +214,13 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
         db_content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, db_path)
         if not schemas_content:
             return operations
-        normalized_schemas = self._normalize_booking_schema_contract(schemas_content)
+        normalized_schemas = self._normalize_request_schema_contract(schemas_content)
         if normalized_schemas != schemas_content:
             operation_map[schemas_path] = DraftFileOperation(
                 file_path=schemas_path,
                 operation="replace",
                 content=normalized_schemas,
-                reason="Pre-apply contract sync: normalize optional booking schema fields so route responses serialize without response-model drift.",
+                reason="Pre-apply contract sync: normalize optional request schema fields so route responses serialize without response-model drift.",
             )
             schemas_content = normalized_schemas
         imported_names: set[str] = set()
@@ -200,26 +231,15 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
             if not content:
                 continue
             if (
-                Path(file_path).stem == "bookingrequests"
-                and db_content
-                and "class BookingRequestRecord" in db_content
-                and "class BookingRequestCreate" in schemas_content
-                and "class BookingRequestUpdate" in schemas_content
-                and (
-                    "class BookingRequestListResponse" in schemas_content
-                    or "class BookingRequestList" in schemas_content
-                )
-                and (
-                    "class BookingRequestRead" in schemas_content
-                    or "class BookingRequest" in schemas_content
-                )
-                and self._needs_canonical_bookingrequests_route_repair(content)
+                Path(file_path).stem not in self._FEATURE_ROUTE_EXCLUDED_STEMS
+                and self._needs_canonical_resource_route_repair(content, Path(file_path).stem)
             ):
+                resource_stem = Path(file_path).stem
                 operation_map[file_path] = DraftFileOperation(
                     file_path=file_path,
                     operation="replace",
-                    content=MiniappGenerationContractApiRoutesSupport._deterministic_bookingrequests_route_source(),
-                    reason="Pre-apply contract sync: keep bookingrequests.py aligned with db.py and schemas.py instead of declaring inline ORM and Pydantic models.",
+                    content=MiniappGenerationContractApiRoutesCrud._deterministic_resource_route_source(resource_stem),
+                    reason=f"Pre-apply contract sync: keep {resource_stem}.py aligned with the generic workflow resource contract instead of drifting into route-local models.",
                 )
                 continue
             for match in re.finditer(r"from\s+app\.schemas\s+import\s+\((.*?)\)", content, flags=re.DOTALL):

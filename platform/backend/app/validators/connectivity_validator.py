@@ -27,18 +27,7 @@ PLACEHOLDER_DYNAMIC_MARKERS = (
     "coming soon",
     "placeholder",
 )
-CANONICAL_ROUTE_ALIASES = {
-    "submission": "requests",
-    "submissions": "requests",
-    "booking": "requests",
-    "bookings": "requests",
-    "task": "requests",
-    "tasks": "requests",
-    "note": "comments",
-    "notes": "comments",
-    "specialist": "users",
-    "specialists": "users",
-}
+CANONICAL_ROUTE_ALIASES: dict[str, str] = {}
 
 
 class ConnectivityValidator:

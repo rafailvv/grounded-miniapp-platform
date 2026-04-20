@@ -7,28 +7,6 @@ from app.models.grounded_spec import GroundedSpecModel
 from app.modules.miniapp_materialization.materialization import MiniappMaterializationService
 from app.services.miniapp_generation.constants import DESIGN_REFERENCE_FILES
 
-CANONICAL_ENDPOINT_ALIASES = {
-    "submission": "requests",
-    "submissions": "requests",
-    "booking": "bookingrequests",
-    "bookings": "bookingrequests",
-    "booking_request": "bookingrequests",
-    "booking_requests": "bookingrequests",
-    "request": "requests",
-    "requests": "requests",
-    "appointment": "requests",
-    "appointments": "requests",
-    "task": "requests",
-    "tasks": "requests",
-    "assignee": "assignments",
-    "owners": "assignments",
-    "owner": "assignments",
-    "notes": "comments",
-    "note": "comments",
-    "specialist": "users",
-    "specialists": "users",
-}
-
 FORBIDDEN_ROUTE_MODULE_STEMS = {
     "__init__",
     "auth",
@@ -265,4 +243,4 @@ class MiniappGenerationPlanRuntime:
     @classmethod
     def canonical_endpoint_name(cls, endpoint_name: str) -> str:
         normalized = cls._snake_case_filename((endpoint_name or "").strip()).lower()
-        return CANONICAL_ENDPOINT_ALIASES.get(normalized, normalized)
+        return normalized

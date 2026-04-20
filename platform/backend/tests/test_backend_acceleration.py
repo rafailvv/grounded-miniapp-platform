@@ -1976,9 +1976,9 @@ def test_merge_advisory_generation_inputs_prefers_advisory_pages_for_editing_tar
         inferred_plan_result={
             "target_files": [
                 "miniapp/app/static/client/index.html",
-                "miniapp/app/static/client/bookingrequests/index.html",
-                "miniapp/app/static/client/bookingrequests/styles.css",
-                "miniapp/app/static/client/bookingrequests/app.js",
+                "miniapp/app/static/client/requests/index.html",
+                "miniapp/app/static/client/requests/styles.css",
+                "miniapp/app/static/client/requests/app.js",
             ],
             "backend_targets": ["miniapp/app/routes/client.py"],
             "shared_files": ["miniapp/app/static/shared/base.css"],
@@ -1996,11 +1996,11 @@ def test_merge_advisory_generation_inputs_prefers_advisory_pages_for_editing_tar
                                 "page_kind": "landing",
                             },
                             {
-                                "page_id": "client_bookingrequests",
-                                "route_path": "/bookingrequests",
-                                "file_path": "miniapp/app/static/client/bookingrequests/index.html",
-                                "style_path": "miniapp/app/static/client/bookingrequests/styles.css",
-                                "script_path": "miniapp/app/static/client/bookingrequests/app.js",
+                                "page_id": "client_requests",
+                                "route_path": "/requests",
+                                "file_path": "miniapp/app/static/client/requests/index.html",
+                                "style_path": "miniapp/app/static/client/requests/styles.css",
+                                "script_path": "miniapp/app/static/client/requests/app.js",
                                 "page_kind": "feature",
                             },
                         ]
@@ -2024,11 +2024,11 @@ def test_merge_advisory_generation_inputs_prefers_advisory_pages_for_editing_tar
                                 "page_kind": "profile",
                             },
                             {
-                                "page_id": "specialist_bookingrequests",
-                                "route_path": "/bookingrequests",
-                                "file_path": "miniapp/app/static/specialist/bookingrequests/index.html",
-                                "style_path": "miniapp/app/static/specialist/bookingrequests/styles.css",
-                                "script_path": "miniapp/app/static/specialist/bookingrequests/app.js",
+                                "page_id": "specialist_requests",
+                                "route_path": "/requests",
+                                "file_path": "miniapp/app/static/specialist/requests/index.html",
+                                "style_path": "miniapp/app/static/specialist/requests/styles.css",
+                                "script_path": "miniapp/app/static/specialist/requests/app.js",
                                 "page_kind": "feature",
                             },
                         ],
@@ -2060,7 +2060,7 @@ def test_merge_advisory_generation_inputs_prefers_advisory_pages_for_editing_tar
     assert "miniapp/app/static/specialist/request_detail/styles.css" in plan_result["target_files"]
     assert "miniapp/app/static/specialist/request_detail/app.js" in plan_result["target_files"]
     assert "miniapp/app/static/client/index.html" not in plan_result["target_files"]
-    assert "miniapp/app/static/client/bookingrequests/index.html" not in plan_result["target_files"]
+    assert "miniapp/app/static/client/requests/index.html" not in plan_result["target_files"]
     assert "miniapp/app/routes/requests.py" in plan_result["backend_targets"]
     assert "miniapp/app/routes/client.py" not in plan_result["backend_targets"]
     assert "miniapp/app/routes/specialist.py" in plan_result["backend_targets"]
@@ -2068,7 +2068,7 @@ def test_merge_advisory_generation_inputs_prefers_advisory_pages_for_editing_tar
     specialist_paths = [page["file_path"] for page in plan_result["page_graph"]["roles"]["specialist"]["pages"]]
     assert "miniapp/app/static/specialist/request_detail/index.html" in specialist_paths
     assert "miniapp/app/static/specialist/profile/index.html" in specialist_paths
-    assert "miniapp/app/static/specialist/bookingrequests/index.html" not in specialist_paths
+    assert "miniapp/app/static/specialist/requests/index.html" not in specialist_paths
     cluster_names = {cluster["cluster_name"] for cluster in plan_result["generation_clusters"]}
     assert "role_specialist_ui_request_detail" in cluster_names
 
@@ -2079,7 +2079,7 @@ def test_minimal_patch_focus_role_prunes_non_focused_static_targets(tmp_path: Pa
     service: GenerationService = app.state.container.generation_service
 
     prompt = (
-        "Please finish the existing office equipment booking app by adding a proper incoming request details "
+        "Please finish the existing workflow requests app by adding a proper incoming request details "
         "page for the specialist workflow: when a specialist opens a request from the incoming requests list, "
         "it should open on a separate page and the specialist must be able to reject the request, while the "
         "rejected status is reflected for the manager and the client."
@@ -2100,14 +2100,14 @@ def test_minimal_patch_focus_role_prunes_non_focused_static_targets(tmp_path: Pa
             "miniapp/app/static/manager/requests/app.js",
             "miniapp/app/routes/specialist.py",
             "miniapp/app/routes/manager.py",
-            "miniapp/app/routes/bookingrequests.py",
+            "miniapp/app/routes/requests.py",
             "miniapp/app/db.py",
             "miniapp/app/schemas.py",
         ],
         "backend_targets": [
             "miniapp/app/routes/specialist.py",
             "miniapp/app/routes/manager.py",
-            "miniapp/app/routes/bookingrequests.py",
+            "miniapp/app/routes/requests.py",
             "miniapp/app/db.py",
             "miniapp/app/schemas.py",
         ],
@@ -2153,7 +2153,7 @@ def test_minimal_patch_focus_role_prunes_non_focused_static_targets(tmp_path: Pa
     assert "miniapp/app/static/specialist/requests_id/index.html" in pruned["target_files"]
     assert "miniapp/app/static/manager/requests/index.html" not in pruned["target_files"]
     assert "miniapp/app/routes/manager.py" not in pruned["backend_targets"]
-    assert "miniapp/app/routes/bookingrequests.py" in pruned["backend_targets"]
+    assert "miniapp/app/routes/requests.py" in pruned["backend_targets"]
     cluster_names = {cluster["cluster_name"] for cluster in pruned["generation_clusters"]}
     assert "role_specialist_ui_requests_id" in cluster_names
     assert "role_manager_ui_requests" not in cluster_names
@@ -6427,7 +6427,7 @@ def test_fix_orchestrator_resets_to_safe_source_when_failed_draft_regresses_cont
 
     failed_run_id = "run_failed_generation"
     failed_draft = workspace_service.prepare_draft(workspace_id, failed_run_id)
-    (failed_draft / "miniapp/app/routes/bookingrequests.py").write_text(
+    (failed_draft / "miniapp/app/routes/requests.py").write_text(
         'from fastapi import APIRouter\n\nrouter = APIRouter()\n\n@router.post("/api/submissions/{table}")\ndef submit(table: str):\n    return {"table": table}\n',
         encoding="utf-8",
     )
@@ -6457,7 +6457,7 @@ def test_fix_orchestrator_resets_to_safe_source_when_failed_draft_regresses_cont
     job = app.state.container.fix_orchestrator.generate(
         workspace_id,
         GenerateRequest(
-            prompt="Repair the broken booking request API after the failed generation run.",
+            prompt="Repair the broken requests API after the failed generation run.",
             mode="fix",
             target_platform="telegram_mini_app",
             preview_profile="telegram_mock",
@@ -6465,9 +6465,9 @@ def test_fix_orchestrator_resets_to_safe_source_when_failed_draft_regresses_cont
             model_profile="openai_code_fast",
             resume_from_run_id=failed_run_id,
             error_context={
-                "raw_error": "Create API failed: POST /api/bookingrequests -> 405",
+                "raw_error": "Create API failed: POST /api/requests -> 405",
                 "source": "runtime",
-                "failing_target": "/api/bookingrequests",
+                "failing_target": "/api/requests",
             },
         ),
     )
@@ -7662,7 +7662,7 @@ def test_fix_orchestrator_marks_generated_manifests_read_only(tmp_path: Path) ->
     assert not orchestrator._is_read_only_generated_surface("miniapp/app/routes/requests.py")
 
 
-def test_fix_orchestrator_rejects_regressed_bookingrequests_route_shape(tmp_path: Path) -> None:
+def test_fix_orchestrator_rejects_regressed_requests_route_shape(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     orchestrator = app.state.container.fix_orchestrator
@@ -7671,8 +7671,8 @@ def test_fix_orchestrator_rejects_regressed_bookingrequests_route_shape(tmp_path
         workspace_id="ws_test",
         run_id="run_test",
         failure_class="route_api_contract_mismatch",
-        implicated_files=["miniapp/app/routes/bookingrequests.py", "miniapp/app/db.py", "miniapp/app/schemas.py"],
-        write_scope=[FixScopeEntry(file_path="miniapp/app/routes/bookingrequests.py", reason="api failure")],
+        implicated_files=["miniapp/app/routes/requests.py", "miniapp/app/db.py", "miniapp/app/schemas.py"],
+        write_scope=[FixScopeEntry(file_path="miniapp/app/routes/requests.py", reason="api failure")],
     )
     outcome = orchestrator._repair_outcome_from_response(
         llm_result={
@@ -7680,7 +7680,7 @@ def test_fix_orchestrator_rejects_regressed_bookingrequests_route_shape(tmp_path
             "diagnosis": "Rewrite the route quickly.",
             "operations": [
                 {
-                    "file_path": "miniapp/app/routes/bookingrequests.py",
+                    "file_path": "miniapp/app/routes/requests.py",
                     "operation": "replace",
                     "content": 'from fastapi import APIRouter\n\nrouter = APIRouter()\n\n@router.post("/api/submissions/{table}")\ndef submit(table: str):\n    return {"table": table}\n',
                     "reason": "Use a generic submission endpoint.",
@@ -7694,13 +7694,13 @@ def test_fix_orchestrator_rejects_regressed_bookingrequests_route_shape(tmp_path
     )
 
     assert outcome.outcome == "no_progress"
-    assert "canonical bookingrequests api shape" in str(outcome.validation_error or "").lower()
+    assert "canonical requests api shape" in str(outcome.validation_error or "").lower()
 
 
 def test_check_runner_extracts_structured_generated_app_api_failure_diagnostics() -> None:
     logs = [
         "FAIL: test_role_journey_round_trip_persists_shared_record (tests.test_generated_app.GeneratedAppTests)",
-        "AssertionError: 405 not less than 400 : Create API failed: POST /api/bookingrequests -> 405; payload={\"title\": \"Generated request\"}; body={\"detail\":\"Method Not Allowed\"}",
+        "AssertionError: 405 not less than 400 : Create API failed: POST /api/requests -> 405; payload={\"title\": \"Generated request\"}; body={\"detail\":\"Method Not Allowed\"}",
     ]
 
     diagnostics = CheckRunner._extract_generated_app_test_diagnostics(logs)
@@ -7708,9 +7708,9 @@ def test_check_runner_extracts_structured_generated_app_api_failure_diagnostics(
     assert diagnostics["failing_test_name"] == "test_role_journey_round_trip_persists_shared_record"
     api_failure = diagnostics["api_failure"]
     assert api_failure["method"] == "POST"
-    assert api_failure["path"] == "/api/bookingrequests"
+    assert api_failure["path"] == "/api/requests"
     assert api_failure["status_code"] == 405
-    assert api_failure["resource_slug"] == "bookingrequests"
+    assert api_failure["resource_slug"] == "requests"
 
 
 def test_endpoint_aliases_canonicalize_to_requests() -> None:

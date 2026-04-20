@@ -18,6 +18,7 @@ from app.modules.miniapp_generation_runtime.generation_contract_api_routes_suppo
 from app.modules.miniapp_generation_runtime.generation_contract_page_sources import (
     MiniappGenerationContractPageSources,
 )
+from app.modules.miniapp_generation_runtime.generation_plan_runtime import FORBIDDEN_ROUTE_MODULE_STEMS
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
 
 
@@ -58,14 +59,30 @@ class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
             "miniapp/app/routes/users.py": MiniappGenerationContractApiRoutesSupport._deterministic_users_route_source,
             "miniapp/app/routes/workload.py": MiniappGenerationContractApiRoutesSupport._deterministic_workload_route_source,
             "miniapp/app/routes/time_slots.py": MiniappGenerationContractApiRoutesSupport._deterministic_time_slots_route_source,
-            "miniapp/app/routes/bookingrequests.py": MiniappGenerationContractApiRoutesSupport._deterministic_bookingrequests_route_source,
-            "miniapp/app/routes/requests.py": MiniappGenerationContractApiRoutesCrud._deterministic_requests_route_source,
             "miniapp/app/routes/comments.py": MiniappGenerationContractApiRoutesCrud._deterministic_comments_route_source,
             "miniapp/app/routes/assignments.py": MiniappGenerationContractApiRoutesCrud._deterministic_assignments_route_source,
         }
         source_builder = mapping.get(normalized)
         if source_builder is not None:
             return source_builder()
+        if normalized.startswith("miniapp/app/routes/") and normalized.endswith(".py"):
+            stem = Path(normalized).stem.lower()
+            if stem not in FORBIDDEN_ROUTE_MODULE_STEMS and stem not in {
+                "__init__",
+                "client",
+                "specialist",
+                "manager",
+                "profiles",
+                "runtime",
+                "users",
+                "workload",
+                "time_slots",
+                "comments",
+                "assignments",
+                "role_pages",
+                "health",
+            }:
+                return MiniappGenerationContractApiRoutesCrud._deterministic_resource_route_source(stem)
         return MiniappGenerationContractRoutes._template_source_for_path(normalized)
 
     def _synchronize_minimal_workflow_route_contracts(

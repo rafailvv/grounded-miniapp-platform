@@ -17,6 +17,24 @@ if TYPE_CHECKING:
 
 
 class FixPatchingRuntime:
+    _FEATURE_ROUTE_EXCLUDED_STEMS = {
+        "__init__",
+        "auth",
+        "auth_telegram",
+        "client",
+        "specialist",
+        "manager",
+        "profiles",
+        "runtime",
+        "users",
+        "workload",
+        "time_slots",
+        "comments",
+        "assignments",
+        "role_pages",
+        "health",
+    }
+
     def __init__(self, service: "FixOrchestrator") -> None:
         self.service = service
 
@@ -273,15 +291,26 @@ class FixPatchingRuntime:
         normalized_path = str(operation.file_path or "").strip().replace("\\", "/")
         if not normalized_path.startswith("miniapp/app/routes/"):
             return None
-        if Path(normalized_path).stem != "bookingrequests":
+        resource_stem = Path(normalized_path).stem
+        if resource_stem in FixPatchingRuntime._FEATURE_ROUTE_EXCLUDED_STEMS:
             return None
         content = str(operation.content or "")
         lowered = content.lower()
         if "/api/submissions/{table}" in lowered:
-            return "Repair regressed the canonical bookingrequests API shape into a generic submissions shim."
-        required_markers = ('@router.post("")', '@router.get("")', '@router.put("/{item_id}")')
-        if any(marker not in content for marker in required_markers):
-            return "Repair removed canonical bookingrequests CRUD endpoints instead of fixing the resource route."
+            return "Repair regressed the resource API shape into a generic submissions shim."
+        candidates = {resource_stem, resource_stem.replace("_", "-")}
+        has_list = any(f'@router.get("/{candidate}")' in content for candidate in candidates)
+        has_create = any(f'@router.post("/{candidate}")' in content for candidate in candidates)
+        has_detail = any(
+            re.search(rf'@router\.get\("/{re.escape(candidate)}/\{{[A-Za-z_][A-Za-z0-9_]*\}}"\)', content)
+            for candidate in candidates
+        )
+        has_update = any(
+            re.search(rf'@router\.(?:patch|put)\("/{re.escape(candidate)}/\{{[A-Za-z_][A-Za-z0-9_]*\}}"\)', content)
+            for candidate in candidates
+        )
+        if not (has_list and has_create and has_detail and has_update):
+            return f"Repair removed the required CRUD endpoints for the {resource_stem} resource route."
         return None
 
     @staticmethod

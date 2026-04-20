@@ -16,13 +16,6 @@ from app.db import engine
 
 router = APIRouter(prefix="/api/runtime", tags=["runtime"])
 ALLOWED_ROLES = {"client", "specialist", "manager"}
-EQUIPMENT_CATALOG = (
-    ("Laptop", 8),
-    ("Projector", 4),
-    ("Monitor", 6),
-    ("Tablet", 5),
-    ("Other", 10),
-)
 
 
 def _normalize_runtime_role(role: str) -> str:
@@ -52,7 +45,8 @@ def _ensure_tables() -> None:
             "comment TEXT, "
             "status TEXT, "
             "assigned_specialist TEXT, "
-            "equipment_type TEXT, "
+            "item_type TEXT, "
+            "item_label TEXT, "
             "start_date TEXT, "
             "end_date TEXT, "
             "reason TEXT, "
@@ -73,8 +67,8 @@ def _serialize_request(row: Any) -> dict[str, Any]:
         "request_id": mapping["id"],
         "id": mapping["id"],
         "title": mapping["title"] or "Request",
-        "equipment": mapping.get("equipment_type") or mapping["title"] or "Equipment request",
-        "equipment_type": mapping.get("equipment_type") or "",
+        "item_type": mapping.get("item_type") or "",
+        "item_label": mapping.get("item_label") or "",
         "employee_name": mapping.get("client_name") or "",
         "client_name": mapping.get("client_name") or "",
         "start_date": start_date,
@@ -95,30 +89,34 @@ def _fetch_requests() -> list[dict[str, Any]]:
 
 
 def _availability(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    active_statuses = {"submitted", "in_review", "issued"}
-    usage: dict[str, int] = {}
+    buckets: dict[str, dict[str, Any]] = {}
+    active_statuses = {"submitted", "in_review", "issued", "in_progress", "claimed"}
     for item in items:
-        equipment = str(item.get("equipment_type") or item.get("equipment") or "Other")
-        if str(item.get("status") or "") in active_statuses:
-            usage[equipment] = usage.get(equipment, 0) + 1
-    result: list[dict[str, Any]] = []
-    for equipment, total in EQUIPMENT_CATALOG:
-        in_use = usage.get(equipment, 0)
-        available = max(total - in_use, 0)
-        result.append(
+        label = str(item.get("item_label") or item.get("item_type") or item.get("title") or "Unlabeled item").strip()
+        entry = buckets.setdefault(
+            label,
+            {"name": label, "item": label, "item_type": str(item.get("item_type") or ""), "active": 0, "total": 0},
+        )
+        entry["total"] += 1
+        if str(item.get("status") or "").lower() in active_statuses:
+            entry["active"] += 1
+    results: list[dict[str, Any]] = []
+    for label in sorted(buckets):
+        entry = buckets[label]
+        results.append(
             {
-                "name": equipment,
-                "item": equipment,
-                "equipment_type": equipment,
-                "in_use": in_use,
-                "total": total,
-                "available": available,
-                "status": "Available" if available > 0 else "Fully booked",
-                "detail": f"{available} of {total} available",
-                "note": f"{available} of {total} available",
+                "name": entry["name"],
+                "item": entry["item"],
+                "item_type": entry["item_type"],
+                "active": entry["active"],
+                "total": entry["total"],
+                "available": max(entry["total"] - entry["active"], 0),
+                "status": "Active" if entry["active"] else "Idle",
+                "detail": f"{entry['active']} active of {entry['total']} tracked",
+                "note": f"{entry['active']} active of {entry['total']} tracked",
             }
         )
-    return result
+    return results
 
 
 def _summary(items: list[dict[str, Any]]) -> dict[str, int]:
@@ -138,17 +136,17 @@ def _summary(items: list[dict[str, Any]]) -> dict[str, int]:
 
 def _manager_conflicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     conflicts: list[dict[str, Any]] = []
-    by_equipment: dict[str, list[dict[str, Any]]] = {}
+    by_item: dict[str, list[dict[str, Any]]] = {}
     for item in items:
-        equipment = str(item.get("equipment_type") or item.get("equipment") or "Other")
-        by_equipment.setdefault(equipment, []).append(item)
-    for equipment, equipment_items in by_equipment.items():
-        if len(equipment_items) < 2:
+        label = str(item.get("item_label") or item.get("item_type") or item.get("title") or "Shared item")
+        by_item.setdefault(label, []).append(item)
+    for label, grouped_items in by_item.items():
+        if len(grouped_items) < 2:
             continue
         conflicts.append(
             {
-                "title": f"{equipment} overlap risk",
-                "detail": f"{len(equipment_items)} requests currently reference the same equipment type.",
+                "title": f"{label} overlap risk",
+                "detail": f"{len(grouped_items)} requests currently reference the same shared item.",
             }
         )
     return conflicts

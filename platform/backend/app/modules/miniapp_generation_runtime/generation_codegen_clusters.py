@@ -134,7 +134,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
 
     @classmethod
     def _is_runtime_helper_discovery_request(cls, *, cluster_name: str, tool_requests: list[dict[str, Any]]) -> bool:
-        if not tool_requests or not any(tag in cluster_name for tag in ("_ui_root", "_ui_profile", "_ui_bookingrequests")):
+        if not tool_requests or not (cluster_name.startswith("role_") and "_ui_" in cluster_name):
             return False
         for item in tool_requests:
             tool_name = str(item.get("tool") or "").strip().lower()

@@ -827,9 +827,50 @@ class BuildValidator:
             "fallbackData",
             "demoData",
         )
+        feature_route_excluded = {
+            "__init__.py",
+            "client.py",
+            "specialist.py",
+            "manager.py",
+            "profiles.py",
+            "runtime.py",
+            "users.py",
+            "workload.py",
+            "time_slots.py",
+            "comments.py",
+            "assignments.py",
+            "role_pages.py",
+            "health.py",
+        }
+        routes_root = workspace_path / "miniapp/app/routes"
+        if routes_root.exists():
+            for route_path in sorted(routes_root.glob("*.py")):
+                if route_path.name in feature_route_excluded:
+                    continue
+                rel_path = str(route_path.relative_to(workspace_path))
+                try:
+                    content = route_path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if "placeholder =" in content:
+                    issues.append(
+                        ValidationIssue(
+                            code="build.placeholder_resource_read",
+                            message=f"{route_path.name} still contains placeholder-creating persistence logic.",
+                            severity="high",
+                            location=rel_path,
+                        )
+                    )
+                if re.search(r"\breturn\s+create_[a-z_]+\(", content):
+                    issues.append(
+                        ValidationIssue(
+                            code="build.placeholder_resource_update",
+                            message=f"{route_path.name} still contains placeholder-creating persistence logic.",
+                            severity="high",
+                            location=rel_path,
+                        )
+                    )
         placeholder_patterns = (
-            ("miniapp/app/routes/requests.py", "placeholder =", "build.placeholder_request_read"),
-            ("miniapp/app/routes/requests.py", "return create_request(", "build.placeholder_request_update"),
             ("miniapp/app/routes/assignments.py", "INSERT OR IGNORE INTO requests", "build.placeholder_assignment_write"),
             ("miniapp/app/routes/profiles.py", "DEFAULT_PROFILES", "build.placeholder_profile_seed"),
         )

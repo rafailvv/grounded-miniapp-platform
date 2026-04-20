@@ -4,7 +4,14 @@ from __future__ import annotations
 class MiniappGenerationContractApiRoutesCrud:
     @staticmethod
     def _deterministic_requests_route_source() -> str:
-        return """from __future__ import annotations
+        return MiniappGenerationContractApiRoutesCrud._deterministic_resource_route_source("requests")
+
+    @staticmethod
+    def _deterministic_resource_route_source(resource_slug: str) -> str:
+        normalized_slug = str(resource_slug or "").strip().strip("/").replace("\\", "/")
+        normalized_slug = normalized_slug.replace("-", "_")
+        normalized_slug = normalized_slug or "records"
+        source = """from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
@@ -31,7 +38,8 @@ def _ensure_tables() -> None:
             "comment TEXT, "
             "status TEXT, "
             "assigned_specialist TEXT, "
-            "equipment_type TEXT, "
+            "item_type TEXT, "
+            "item_label TEXT, "
             "start_date TEXT, "
             "end_date TEXT, "
             "reason TEXT, "
@@ -66,15 +74,15 @@ def _serialize_request(row: Any) -> dict[str, Any]:
         "status": mapping["status"] or "submitted",
         "assigned_specialist": mapping["assigned_specialist"],
         "specialist": mapping["assigned_specialist"] or "",
-        "equipment_type": mapping.get("equipment_type") or "",
-        "equipment": mapping.get("equipment_type") or mapping["title"] or "Equipment request",
-        "item_type": mapping.get("equipment_type") or mapping["title"] or "Equipment request",
+        "item_type": mapping.get("item_type") or "",
+        "item_label": mapping.get("item_label") or "",
+        "resource_type": mapping.get("item_type") or "",
         "start_date": start_date,
         "end_date": end_date,
         "date_range": f"{start_date} → {end_date}" if start_date and end_date else start_date or end_date or "Dates to be confirmed",
         "reason": mapping.get("reason") or mapping["description"] or mapping["comment"] or "",
         "specialist_notes": mapping.get("specialist_notes") or "",
-        "availability": "Availability is based on active bookings in the shared queue.",
+        "availability": "Availability is derived from active records in the shared queue.",
         "conflict": "No conflicts reported yet.",
         "created_at": mapping["created_at"],
         "updated_at": mapping["updated_at"],
@@ -116,7 +124,6 @@ def _timeline_for_request(request: dict[str, Any], comments: list[dict[str, Any]
 
 
 @router.get("/requests")
-@router.get("/submissions")
 def list_requests() -> dict[str, list[dict[str, Any]]]:
     _ensure_tables()
     with engine.begin() as conn:
@@ -125,14 +132,13 @@ def list_requests() -> dict[str, list[dict[str, Any]]]:
 
 
 @router.post("/requests")
-@router.post("/submissions")
 def create_request(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     _ensure_tables()
     request_id = str(payload.get("request_id") or payload.get("id") or uuid4().hex[:12])
     now = datetime.now(timezone.utc).isoformat()
     record = {
         "id": request_id,
-        "title": str(payload.get("title") or payload.get("equipment_type") or payload.get("item_type") or payload.get("task") or payload.get("subject") or "Request"),
+        "title": str(payload.get("title") or payload.get("request_type") or payload.get("item_type") or payload.get("task") or payload.get("subject") or "Request"),
         "description": str(payload.get("description") or payload.get("details") or payload.get("reason") or ""),
         "client_name": str(payload.get("requested_by") or payload.get("name") or payload.get("client_name") or ""),
         "phone": str(payload.get("phone") or ""),
@@ -140,7 +146,8 @@ def create_request(payload: dict[str, Any] = Body(default_factory=dict)) -> dict
         "comment": str(payload.get("comment") or payload.get("notes") or ""),
         "status": str(payload.get("status") or "submitted"),
         "assigned_specialist": payload.get("assigned_specialist"),
-        "equipment_type": str(payload.get("equipment_type") or payload.get("item_type") or payload.get("title") or ""),
+        "item_type": str(payload.get("item_type") or payload.get("request_type") or payload.get("title") or ""),
+        "item_label": str(payload.get("item_label") or payload.get("request_label") or payload.get("item_name") or ""),
         "start_date": str(payload.get("start_date") or ""),
         "end_date": str(payload.get("end_date") or ""),
         "reason": str(payload.get("reason") or payload.get("purpose") or payload.get("description") or ""),
@@ -151,15 +158,14 @@ def create_request(payload: dict[str, Any] = Body(default_factory=dict)) -> dict
     with engine.begin() as conn:
         conn.execute(text(
             "INSERT OR REPLACE INTO requests "
-            "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, equipment_type, start_date, end_date, reason, specialist_notes, created_at, updated_at) "
-            "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :equipment_type, :start_date, :end_date, :reason, :specialist_notes, :created_at, :updated_at)"
+            "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, item_type, item_label, start_date, end_date, reason, specialist_notes, created_at, updated_at) "
+            "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :item_type, :item_label, :start_date, :end_date, :reason, :specialist_notes, :created_at, :updated_at)"
         ), record)
         row = _fetch_request(conn, request_id)
     return _serialize_request(row)
 
 
 @router.get("/requests/{request_id}")
-@router.get("/submissions/{request_id}")
 def get_request(request_id: str) -> dict[str, Any]:
     _ensure_tables()
     with engine.begin() as conn:
@@ -192,7 +198,8 @@ def update_request(request_id: str, payload: dict[str, Any] = Body(default_facto
             "comment": str(payload.get("comment") or current.get("comment") or ""),
             "status": str(payload.get("status") or current.get("status") or "submitted"),
             "assigned_specialist": payload.get("assigned_specialist") if payload.get("assigned_specialist") is not None else current.get("assigned_specialist"),
-            "equipment_type": str(payload.get("equipment_type") or current.get("equipment_type") or ""),
+            "item_type": str(payload.get("item_type") or current.get("item_type") or ""),
+            "item_label": str(payload.get("item_label") or current.get("item_label") or ""),
             "start_date": str(payload.get("start_date") or current.get("start_date") or ""),
             "end_date": str(payload.get("end_date") or current.get("end_date") or ""),
             "reason": str(payload.get("reason") or current.get("reason") or ""),
@@ -202,8 +209,8 @@ def update_request(request_id: str, payload: dict[str, Any] = Body(default_facto
         }
         conn.execute(text(
             "INSERT OR REPLACE INTO requests "
-            "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, equipment_type, start_date, end_date, reason, specialist_notes, created_at, updated_at) "
-            "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :equipment_type, :start_date, :end_date, :reason, :specialist_notes, :created_at, :updated_at)"
+            "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, item_type, item_label, start_date, end_date, reason, specialist_notes, created_at, updated_at) "
+            "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :item_type, :item_label, :start_date, :end_date, :reason, :specialist_notes, :created_at, :updated_at)"
         ), record)
         updated = _fetch_request(conn, request_id)
     return _serialize_request(updated)
@@ -222,6 +229,23 @@ def update_request_status(request_id: str, payload: dict[str, Any] = Body(defaul
         row = _fetch_request(conn, request_id)
     return _serialize_request(row)
 """
+        if normalized_slug == "requests":
+            return source
+        replacement_slug = normalized_slug.replace("_", "-")
+        source = source.replace('tags=["requests"]', f'tags=["{replacement_slug}"]')
+        source = source.replace('@router.get("/requests/{request_id}")', f'@router.get("/{replacement_slug}/{{record_id}}")')
+        source = source.replace('def get_request(request_id: str)', 'def get_request(record_id: str)')
+        source = source.replace('@router.patch("/requests/{request_id}/status")', f'@router.patch("/{replacement_slug}/{{record_id}}/status")')
+        source = source.replace('def update_request_status(request_id: str, payload: dict[str, Any] = Body(default_factory=dict))', 'def update_request_status(record_id: str, payload: dict[str, Any] = Body(default_factory=dict))')
+        source = source.replace('@router.patch("/requests/{request_id}")', f'@router.patch("/{replacement_slug}/{{record_id}}")')
+        source = source.replace('def update_request(request_id: str, payload: dict[str, Any] = Body(default_factory=dict))', 'def update_request(record_id: str, payload: dict[str, Any] = Body(default_factory=dict))')
+        source = source.replace('@router.post("/requests")', f'@router.post("/{replacement_slug}")')
+        source = source.replace('@router.get("/requests")', f'@router.get("/{replacement_slug}")')
+        source = source.replace('request_id = str(payload.get("request_id") or payload.get("id") or uuid4().hex[:12])', 'request_id = str(payload.get("record_id") or payload.get("request_id") or payload.get("id") or uuid4().hex[:12])')
+        source = source.replace('row = _fetch_request(conn, request_id)', 'row = _fetch_request(conn, record_id)', 1)
+        source = source.replace('payload["comments"] = comments\n    payload["timeline"] = _timeline_for_request(payload, comments)\n    return payload', 'payload["comments"] = comments\n    payload["timeline"] = _timeline_for_request(payload, comments)\n    return payload')
+        source = source.replace('assignment_request_id = str(request_id or payload.get("request_id") or payload.get("id") or "")', 'assignment_request_id = str(request_id or payload.get("record_id") or payload.get("request_id") or payload.get("id") or "")')
+        return source
 
     @staticmethod
     def _deterministic_comments_route_source() -> str:
@@ -252,7 +276,8 @@ def _ensure_tables() -> None:
             "comment TEXT, "
             "status TEXT, "
             "assigned_specialist TEXT, "
-            "equipment_type TEXT, "
+            "item_type TEXT, "
+            "item_label TEXT, "
             "start_date TEXT, "
             "end_date TEXT, "
             "reason TEXT, "
@@ -340,7 +365,8 @@ def _ensure_tables() -> None:
             "comment TEXT, "
             "status TEXT, "
             "assigned_specialist TEXT, "
-            "equipment_type TEXT, "
+            "item_type TEXT, "
+            "item_label TEXT, "
             "start_date TEXT, "
             "end_date TEXT, "
             "reason TEXT, "

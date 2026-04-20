@@ -17,6 +17,27 @@ from app.models.grounded_spec import (
 
 
 class GroundedSpecStabilizationRuntime:
+    @staticmethod
+    def _default_api_resource_slug(spec: GroundedSpecModel) -> str:
+        candidates: list[str] = []
+        if spec.domain_entities:
+            candidates.append(str(spec.domain_entities[0].name or ""))
+        candidates.extend(
+            match.group(1)
+            for match in re.finditer(
+                r"\b(bookings?|requests?|submissions?|orders?|tasks?|appointments?|tickets?|records?|cases?|items?)\b",
+                str(spec.product_goal or "").lower(),
+            )
+        )
+        for candidate in candidates:
+            normalized = re.sub(r"[^a-z0-9]+", "_", candidate.lower()).strip("_")
+            if not normalized or normalized in {"data", "page", "flow", "miniapp", "app"}:
+                continue
+            if not normalized.endswith("s"):
+                normalized = f"{normalized}s"
+            return normalized
+        return "records"
+
     def stabilize_grounded_spec(self, spec: GroundedSpecModel) -> GroundedSpecModel:
         product_goal = str(spec.product_goal or "").strip()
         if self.is_forbidden_spec_governance_text(product_goal):
@@ -93,15 +114,17 @@ class GroundedSpecStabilizationRuntime:
             if not self.is_forbidden_generated_api_requirement(item)
         ]
         if not api_requirements and any(term in spec.product_goal.lower() for term in ("booking", "consultation", "form", "request")):
+            resource_slug = self._default_api_resource_slug(spec)
+            resource_path = f"/api/{resource_slug.replace('_', '-')}"
             evidence = [EvidenceLink(doc_ref_id="prompt-source", evidence_type="derived", note="Synthesized from prompt intent and canonical runtime defaults.")]
             api_requirements.extend(
                 [
                     APIRequirement(
                         api_req_id="api_submit_primary_form",
-                        name="Submit primary request",
+                        name="Submit primary workflow record",
                         method="POST",
-                        path="/api/submissions",
-                        purpose="Persist the primary end-user form submission in the generated mini-app miniapp.",
+                        path=resource_path,
+                        purpose="Persist the primary end-user workflow record in the generated mini-app.",
                         request_fields=[
                             APIField(name="name", type="string", required=True, description="End-user display name"),
                             APIField(name="phone", type="phone", required=True, description="End-user phone number"),
@@ -109,7 +132,7 @@ class GroundedSpecStabilizationRuntime:
                             APIField(name="comment", type="text", required=False, description="Additional request comment"),
                         ],
                         response_fields=[
-                            APIField(name="submission_id", type="uuid", required=True, description="Created request identifier"),
+                            APIField(name="record_id", type="uuid", required=True, description="Created workflow record identifier"),
                             APIField(name="status", type="string", required=True, description="Current workflow status"),
                         ],
                         auth_required=False,
@@ -118,13 +141,13 @@ class GroundedSpecStabilizationRuntime:
                     ),
                     APIRequirement(
                         api_req_id="api_list_primary_requests",
-                        name="List submitted requests",
+                        name="List workflow records",
                         method="GET",
-                        path="/api/submissions",
-                        purpose="Load current user submissions and role queues in the generated runtime.",
+                        path=resource_path,
+                        purpose="Load current user records and role queues in the generated runtime.",
                         request_fields=[],
                         response_fields=[
-                            APIField(name="items", type="array", required=True, description="Runtime submission records"),
+                            APIField(name="items", type="array", required=True, description="Runtime workflow records"),
                         ],
                         auth_required=False,
                         existing_in_template=False,
@@ -134,10 +157,10 @@ class GroundedSpecStabilizationRuntime:
             )
             assumptions.append(
                 Assumption(
-                    assumption_id="assume_generated_submission_api",
-                    text="The canonical generated miniapp exposes a default submission API for primary form flows.",
+                    assumption_id="assume_generated_workflow_api",
+                    text=f"The generated miniapp exposes a default primary workflow API under {resource_path}.",
                     status="active",
-                    rationale="Simple booking and request prompts should compile into a usable end-to-end demo without blocking on undocumented project-specific endpoints.",
+                    rationale="Simple workflow prompts should compile into a usable end-to-end demo without blocking on undocumented project-specific endpoint names.",
                     impact="medium",
                 )
             )

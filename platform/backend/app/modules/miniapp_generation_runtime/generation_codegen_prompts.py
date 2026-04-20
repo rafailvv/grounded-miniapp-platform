@@ -11,6 +11,45 @@ from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerati
 
 
 class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
+    _FEATURE_ROUTE_EXCLUDED_STEMS = {
+        "__init__",
+        "client",
+        "specialist",
+        "manager",
+        "profiles",
+        "runtime",
+        "users",
+        "workload",
+        "time_slots",
+        "comments",
+        "assignments",
+        "role_pages",
+        "health",
+        "misc",
+    }
+
+    @staticmethod
+    def _cluster_role(cluster_name: str) -> str:
+        if not cluster_name.startswith("role_") or "_ui_" not in cluster_name:
+            return ""
+        parts = cluster_name.split("_")
+        return parts[1] if len(parts) > 2 else ""
+
+    @staticmethod
+    def _cluster_suffix(cluster_name: str) -> str:
+        if cluster_name.startswith("backend_route_"):
+            return cluster_name.removeprefix("backend_route_")
+        if cluster_name.startswith("role_") and "_ui_" in cluster_name:
+            return cluster_name.split("_ui_", 1)[1]
+        return ""
+
+    @classmethod
+    def _feature_route_path_for_cluster(cls, cluster_name: str) -> str | None:
+        stem = cls._cluster_suffix(cluster_name)
+        if not stem or stem in {"root", "profile"} or stem in cls._FEATURE_ROUTE_EXCLUDED_STEMS:
+            return None
+        return f"miniapp/app/routes/{stem}.py"
+
     @staticmethod
     def _prioritized_supporting_contexts(
         *,
@@ -18,6 +57,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
         cluster_targets: list[str],
         file_contexts: dict[str, str],
     ) -> dict[str, str]:
+        feature_route_path = MiniappGenerationCodegenPrompts._feature_route_path_for_cluster(cluster_name)
         supporting_paths = [
             path
             for path, content in file_contexts.items()
@@ -45,15 +85,13 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "miniapp/app/routes/manager.py",
             ]
         elif "_ui_root" in cluster_name:
-            role_match = cluster_name.split("_")
-            role = role_match[1] if len(role_match) > 2 else ""
+            role = MiniappGenerationCodegenPrompts._cluster_role(cluster_name)
             preferred_paths = [
                 "miniapp/app/static/shared/base.css",
                 "miniapp/app/static/preview_bridge.js",
                 "miniapp/app/routes/profiles.py",
                 "miniapp/app/db.py",
                 "miniapp/app/schemas.py",
-                "miniapp/app/routes/bookingrequests.py",
                 "miniapp/app/generated/runtime_manifest.json",
                 "miniapp/app/generated/route_manifest.json",
             ]
@@ -65,13 +103,12 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                         f"miniapp/app/static/{role}/profile/app.js",
                     ]
                 )
-        elif "_ui_bookingrequests" in cluster_name:
-            role_match = cluster_name.split("_")
-            role = role_match[1] if len(role_match) > 2 else ""
+        elif feature_route_path and cluster_name.startswith("role_") and "_ui_" in cluster_name:
+            role = MiniappGenerationCodegenPrompts._cluster_role(cluster_name)
             preferred_paths = [
                 "miniapp/app/static/shared/base.css",
                 "miniapp/app/static/preview_bridge.js",
-                "miniapp/app/routes/bookingrequests.py",
+                feature_route_path,
                 "miniapp/app/db.py",
                 "miniapp/app/schemas.py",
                 "miniapp/app/generated/runtime_manifest.json",
@@ -136,6 +173,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
         tool_results: list[dict[str, Any]] | None = None,
     ) -> str:
         compact = generation_mode == GenerationMode.FAST
+        feature_route_path = self._feature_route_path_for_cluster(cluster_name)
         bounded_contexts = self._bounded_file_contexts(
             {path: file_contexts.get(path, "") for path in cluster_targets},
             max_file_chars=2600 if compact else 5200,
@@ -161,12 +199,12 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "For backend_support, app.db owns SQLAlchemy models, app.schemas owns request/response schemas, and app.routes.profiles owns profile persistence.",
                 "If app/main.py already contains working route-manifest, role-page, and static resolution helpers in target_file_contexts, preserve those helpers and symbol names instead of rewriting them from scratch.",
                 "When app/main.py already uses ROUTE_MANIFEST_PATH, _load_route_manifest, _canonicalize_role_path, _route_matches, or _resolve_role_page, keep those exact names and working signatures.",
-                "Keep main.py limited to FastAPI app bootstrap, middleware, create-all startup, and router inclusion. Do not implement booking request CRUD or page-serving route handlers in main.py.",
-                "Do not define BookingRequestRecord, role-specific route handlers, or inline Pydantic request/response models in main.py.",
+                "Keep main.py limited to FastAPI app bootstrap, middleware, create-all startup, and router inclusion. Do not implement workflow request CRUD or page-serving route handlers in main.py.",
+                "Do not define route-local ORM record classes, role-specific route handlers, or inline Pydantic request/response models in main.py.",
                 "app.routes.role_pages is a helper-only module for shared page resolution and does not export a FastAPI router.",
                 "Do not import router from app.routes.role_pages and do not call app.include_router(...) for role_pages in main.py.",
-                "Only include routers in main.py from modules that explicitly expose APIRouter instances, such as health, profiles, bookingrequests, client, specialist, manager, and runtime when present.",
-                "If app/schemas.py already exports BookingRequestRead or BookingRequestListResponse in target_file_contexts, preserve those schema names and keep them importable after the rewrite.",
+                "Only include routers in main.py from modules that explicitly expose APIRouter instances, such as health, profiles, feature route modules, client, specialist, manager, and runtime when present.",
+                "If app/schemas.py already exports shared request read/list response models in target_file_contexts, preserve those schema names and keep them importable after the rewrite.",
             ]
         elif cluster_name.startswith("backend_route_"):
             cluster_specific_rules = [
@@ -180,37 +218,34 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     [
                         "Role route modules client.py, specialist.py, and manager.py are page-serving routers only.",
                         "Keep these modules limited to APIRouter + FileResponse handlers that serve existing role HTML pages.",
-                        "Do not implement booking request CRUD, do not declare BookingRequestRecord, and do not define route-local Pydantic schemas in role route modules.",
-                        "Do not import BookingRequestRecord or request/response schemas from peer role route modules. Shared persistence belongs only to app.db and app.schemas.",
+                        "Do not implement workflow request CRUD, do not declare route-local ORM models, and do not define route-local Pydantic schemas in role route modules.",
+                        "Do not import shared request persistence or request/response schemas from peer role route modules. Shared persistence belongs only to app.db and app.schemas.",
                         "The canonical role entry route is /<role>, not /<role>/root.",
                         "Do not emit @router.get('/root') alias handlers and do not call resolve_role_page(role, '/<role>/root').",
-                        "For role entry pages, resolve only /<role>, /<role>/profile, and explicit feature paths such as /<role>/bookingrequests.",
+                        "For role entry pages, resolve only /<role>, /<role>/profile, and explicit feature paths under that role.",
                     ]
                 )
-            if cluster_name == "backend_route_bookingrequests":
+            if feature_route_path and cluster_name not in {"backend_route_runtime", "backend_route_runtime_manifest"} and not cluster_name.startswith("backend_route_client") and not cluster_name.startswith("backend_route_specialist") and not cluster_name.startswith("backend_route_manager"):
                 cluster_specific_rules.extend(
                     [
-                        "For backend_route_bookingrequests, the booking request SQLAlchemy model already belongs in app.db and request/response schemas already belong in app.schemas.",
-                        "Import BookingRequestRecord from app.db and booking request schema types from app.schemas instead of defining inline ORM or Pydantic models in the route module.",
-                        "Do not declare Base subclasses, mapped_column fields, or route-local request/response models in bookingrequests.py.",
-                        "Use only the canonical booking request statuses from app.schemas: submitted, in_review, issued, returned, cancelled.",
-                        "Do not emit pending, pending_review, approved, or canceled in booking request API responses or defaults.",
-                        "Do not derive allowed booking request statuses from typing.get_args() on an Enum-typed field annotation. Reuse the actual BookingRequestStatus enum members from app.schemas or map strictly to those exact declared values only.",
-                        "Import only booking request schema names that already exist in app.schemas. If target_file_contexts show BookingRequestRead and BookingRequestListResponse, preserve and use those names. If app.schemas only exposes BookingRequest and BookingRequestList, use those exact names instead of inventing new imports.",
-                        "Do not reference fields in BookingRequestUpdate that are absent from app.schemas. If item_label is not part of BookingRequestUpdate in target_file_contexts, do not read or write it in the update payload normalization.",
-                        "When BookingRequestRecord already owns the primary key in app.db, do not pass id=str(uuid4()) or any other stringified UUID into the ORM constructor; let the ORM default generate the id or pass a real UUID object only if db.py explicitly requires one.",
-                        "Do not coerce booking request path parameters to UUID before Session.get(...) unless app.db explicitly defines the BookingRequestRecord primary key as a UUID-typed column. If the record id is stored as text/string, keep the path id as the original string.",
-                        "Only read or write booking request fields that already exist in app.db and app.schemas. Do not invent owner_role, issued_at, returned_at, bookingrequest_id, or similar fields unless those exact attributes are present in the supporting db.py and schemas.py context.",
-                        "If BookingRequestRead in app.schemas requires request_id, requested_at, status_updated_at, owner_assigned_at, status_notes, or conflict_warning, populate those exact fields in _to_schema from BookingRequestRecord instead of omitting them.",
-                        "If app.db already exposes requested_at and status_updated_at, order booking request lists by requested_at and update status_updated_at when status changes.",
+                        f"For {feature_route_path}, the shared workflow entity already belongs in app.db and request/response schemas already belong in app.schemas.",
+                        "Import persistence and schema types from app.db and app.schemas instead of defining inline ORM or Pydantic models in the feature route module.",
+                        f"Do not declare Base subclasses, mapped_column fields, or route-local request/response models in {feature_route_path.rsplit('/', 1)[-1]}.",
+                        "Use only the canonical workflow request statuses declared in app.schemas.",
+                        "Do not emit alternate status spellings or inferred fallback enums in workflow API responses or defaults.",
+                        "Import only request schema names that already exist in app.schemas. Preserve the exact exported names shown in target_file_contexts instead of inventing new imports.",
+                        "Do not reference update fields that are absent from app.schemas. Only read or write fields that exist in the supporting db.py and schemas.py context.",
+                        "When the request ORM model already owns the primary key in app.db, do not pass ad-hoc UUID strings into the ORM constructor unless db.py explicitly requires that type.",
+                        "Do not coerce request path parameters to UUID before Session.get(...) unless app.db explicitly defines the primary key as a UUID-typed column. If the record id is stored as text/string, keep the path id as the original string.",
+                        "If app.db already exposes requested_at and status_updated_at, order request lists by requested_at and update status_updated_at when status changes.",
                     ]
                 )
             if cluster_name == "backend_route_runtime":
                 cluster_specific_rules.extend(
                     [
                         "For backend_route_runtime, keep the module limited to runtime/init-data validation, lightweight runtime helpers, and compatibility endpoints only.",
-                        "Do not implement booking request CRUD, do not define BookingRequestRecord, and do not duplicate persistence or request/response schemas already owned by app.db and app.schemas.",
-                        "If the workflow needs /api/bookingrequests, that ownership belongs to bookingrequests.py, not runtime.py.",
+                        "Do not implement workflow request CRUD and do not duplicate persistence or request/response schemas already owned by app.db and app.schemas.",
+                        "If the workflow needs a persisted feature CRUD endpoint, that ownership belongs to its dedicated feature route module under miniapp/app/routes/, not runtime.py.",
                         "Do not declare role root alias screens, routes, or static_entry/file_path values under miniapp/app/static/<role>/root/index.html.",
                         "Within runtime manifests and screen helpers, canonical entry pages are /client, /specialist, and /manager only; never /client/root, /specialist/root, or /manager/root.",
                     ]
@@ -219,20 +254,20 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 cluster_specific_rules.extend(
                     [
                         "For backend_route_runtime_manifest, keep the module limited to role-aware manifest JSON for runtime navigation.",
-                        "Do not duplicate booking request CRUD, profile persistence, or init-data verification logic that belongs in other runtime modules.",
+                        "Do not duplicate workflow request CRUD, profile persistence, or init-data verification logic that belongs in other runtime modules.",
                         "Do not emit handoff_paths containing /root or static file paths under miniapp/app/static/<role>/root/.",
                     ]
                 )
-        elif "_ui_bookingrequests" in cluster_name:
+        elif feature_route_path and cluster_name.startswith("role_") and "_ui_" in cluster_name:
             cluster_specific_rules = [
-                "For role bookingrequests UI clusters, use the current role root page, shared shell assets, and backend API routes as the primary references.",
+                "For role request UI clusters, use the current role root page, shared shell assets, and backend API routes as the primary references.",
                 "The canonical runtime bridge is /static/preview_bridge.js. It provides window.setupPreviewBridge(role) and window.miniappApiFetch(input, init, role).",
                 "If supporting_file_contexts already include preview_bridge.js or existing role pages that call /api/... directly, use those conventions as-is and do not search for static/shared/runtime.js or static/shared/api.js.",
-                "Do not block on peer-role bookingrequests pages, shared runtime helper files, or any supporting file shown as FILE_MISSING.",
-                "If peer-role bookingrequests pages are unavailable, continue anyway and generate a complete role-specific bookingrequests surface from the prompt, same-role root page, and live backend API contract.",
+                "Do not block on peer-role request pages, shared runtime helper files, or any supporting file shown as FILE_MISSING.",
+                "If peer-role request pages are unavailable, continue anyway and generate a complete role-specific request surface from the prompt, same-role root page, and live backend API contract.",
                 "If same-role root files are present in supporting_file_contexts, use them directly as the style and navigation anchor instead of returning no_progress.",
-                "Do not return no_progress only because same-role root files were previously generated in this run; consume the available supporting_file_contexts and emit the bookingrequests page operations now.",
-                "Do not render placeholder roadmap copy such as 'coming soon', 'snapshot coming soon', 'to be added', 'todo', or 'TBD' in any bookingrequests page section.",
+                "Do not return no_progress only because same-role root files were previously generated in this run; consume the available supporting_file_contexts and emit the request page operations now.",
+                "Do not render placeholder roadmap copy such as 'coming soon', 'snapshot coming soon', 'to be added', 'todo', or 'TBD' in any request page section.",
                 "If a section has no live rows yet, render an honest empty state with concrete next actions instead of placeholder product copy.",
             ]
         elif "_ui_profile" in cluster_name:
@@ -247,7 +282,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
             ]
         elif "_ui_root" in cluster_name:
             cluster_specific_rules = [
-                "For role root UI clusters, treat the same-role profile files, shared shell assets, db.py, schemas.py, and the canonical bookingrequests route as the primary supporting context.",
+                "For role root UI clusters, treat the same-role profile files, shared shell assets, db.py, schemas.py, and any feature route modules already present in supporting context as the primary supporting context.",
                 "The canonical runtime bridge is /static/preview_bridge.js. It provides window.setupPreviewBridge(role) and window.miniappApiFetch(input, init, role).",
                 "If preview_bridge.js is already present in supporting_file_contexts, treat that as sufficient runtime/API convention context for the current cluster.",
                 "If supporting examples call /api/... directly with same-origin fetch, that is also acceptable for the current cluster. Do not search for static/shared/runtime.js or static/shared/api.js.",
@@ -390,7 +425,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Static or mostly static pages should render immediately without spinner-first UX.",
                     "Role root pages with data dependencies must render a complete business surface on first paint without pseudo-data: use real sections, actions, and honest empty states immediately.",
                     "Do not pre-render invented business records in HTML or JS. Live request cards, approval rows, queue entries, conflict items, and similar workflow records must appear only after reading real API data.",
-                    "Dropdown options, filter chips, and static guidance copy are allowed, but example request cards, seeded bookings, and pre-filled live rows are not allowed.",
+                    "Dropdown options, filter chips, and static guidance copy are allowed, but example request cards, seeded workflow rows, and pre-filled live rows are not allowed.",
                     "Keep role root pages complete on first paint and preserve any explicit nested feature routes that are already present in the writable surface.",
                     "Do not rely on dedicated loading or error blocks to make role root pages function; the main surface must already be complete on first render.",
                     "If the page edits or lists shared records, wire it to the real DB-backed /api lifecycle for the same entity instead of local arrays or console-only handlers.",
@@ -503,7 +538,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Define request/response models in schemas.py and import them from route modules instead of declaring inline Pydantic BaseModel classes inside routes.",
                     "If dedicated backend_route_* targets exist, keep main.py focused on app bootstrap and router wiring; do not duplicate domain CRUD handlers inside main.py.",
                     "app.routes.role_pages is a helper-only module and must not be imported as router or included via app.include_router(...) in main.py.",
-                    "Route modules must import shared ORM/session objects from app.db and request/response models from app.schemas; do not redeclare BookingRequestRecord or inline BookingRequest BaseModel classes inside miniapp/app/routes/*.py.",
+                    "Route modules must import shared ORM/session objects from app.db and request/response models from app.schemas; do not redeclare route-local ORM records or inline request BaseModel classes inside miniapp/app/routes/*.py.",
                     "When planned pages have dynamic dependencies, generate only the minimum state wiring needed for real refresh paths instead of defaulting to loading-first shells.",
                     "For role root pages, the first visible surface must already be a usable business page with real sections and honest empty states.",
                     "When generated sources reference /api endpoints, include the matching miniapp route modules and router wiring from the first draft whenever those files are in target_files.",

@@ -239,10 +239,10 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
             payload[name] = created_id
         elif lowered in {"status", "state"}:
             payload[name] = "requested"
-        elif lowered in {"item_type", "equipment_type"}:
-            payload[name] = "laptop"
-        elif lowered in {"item_label", "equipment_details", "item_name", "preferred_item"}:
-            payload[name] = "ThinkPad T14"
+        elif lowered in {"item_type", "request_type", "resource_type"}:
+            payload[name] = "resource"
+        elif lowered in {"item_label", "equipment_details", "item_name", "preferred_item", "request_label", "resource_label"}:
+            payload[name] = "Primary resource"
         elif lowered in {"comment", "note", "message"}:
             payload[name] = "Generated comment"
         elif lowered in {"specialist_id", "assignee_id", "owner_id", "user_id"}:
@@ -273,15 +273,15 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
             payload[name] = "sample"
     if not payload:
         path_tokens = str(path).lower()
-        if method == "POST" and any(token in path_tokens for token in ("booking", "reservation", "equipment", "request", "requests", "loan")):
+        if method == "POST" and any(token in path_tokens for token in ("booking", "reservation", "request", "requests", "loan", "appointment", "task")):
             payload = {
-                "item_type": "laptop",
-                "item_label": "ThinkPad T14",
+                "item_type": "resource",
+                "item_label": "Primary resource",
                 "start_date": "2026-04-17T10:00:00Z",
                 "end_date": "2026-04-18T18:00:00Z",
-                "reason": "Resource needed for an internal team session.",
+                "reason": "Resource needed for an internal workflow.",
             }
-        elif method in {"PUT", "PATCH"} and any(token in path_tokens for token in ("booking", "reservation", "equipment", "request", "requests", "loan")):
+        elif method in {"PUT", "PATCH"} and any(token in path_tokens for token in ("booking", "reservation", "request", "requests", "loan", "appointment", "task")):
             payload = {"status": "in_progress"}
     if not payload and method in {"POST", "PUT", "PATCH"}:
         payload = {"name": "sample", "status": "requested"}

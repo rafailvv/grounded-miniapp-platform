@@ -166,66 +166,63 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 draft_path.write_text(source_runtime_source, encoding="utf-8")
                 changed_files.add(rel_path)
 
-        draft_route_path = draft_source / "miniapp/app/routes/bookingrequests.py"
         draft_schemas_path = draft_source / "miniapp/app/schemas.py"
         source_schemas_path = source_root / "miniapp/app/schemas.py"
-        if not (draft_route_path.exists() and draft_schemas_path.exists() and source_schemas_path.exists()):
+        if not (draft_schemas_path.exists() and source_schemas_path.exists()):
             return sorted(changed_files)
         try:
-            route_source = draft_route_path.read_text(encoding="utf-8")
             draft_schema_source = draft_schemas_path.read_text(encoding="utf-8")
             source_schema_source = source_schemas_path.read_text(encoding="utf-8")
         except OSError:
             return
-        imported_names = self._imported_schema_names(route_source)
-        if not imported_names:
-            return sorted(changed_files)
-        missing_in_draft = imported_names - self._defined_schema_names(draft_schema_source)
-        source_route_path = source_root / "miniapp/app/routes/bookingrequests.py"
-        if missing_in_draft and missing_in_draft.issubset(self._defined_schema_names(source_schema_source)):
-            draft_schemas_path.write_text(source_schema_source, encoding="utf-8")
-            changed_files.add("miniapp/app/schemas.py")
-        if source_route_path.exists() and draft_route_path.exists():
-            try:
-                draft_route_source = draft_route_path.read_text(encoding="utf-8")
-                source_route_source = source_route_path.read_text(encoding="utf-8")
-            except OSError:
-                draft_route_source = ""
-                source_route_source = ""
-            source_update_fields = self._class_field_names(source_schema_source, "BookingRequestUpdate")
-            draft_normalized_reads = self._normalized_attr_reads(draft_route_source)
-            if source_update_fields and any(
-                field.startswith(("status", "owner", "returned", "item"))
-                and field not in source_update_fields
-                for field in draft_normalized_reads
-            ):
-                draft_route_path.write_text(source_route_source, encoding="utf-8")
-                changed_files.add("miniapp/app/routes/bookingrequests.py")
-                draft_route_source = source_route_source
-            draft_db_path = draft_source / "miniapp/app/db.py"
-            source_db_path = source_root / "miniapp/app/db.py"
-            if draft_db_path.exists() and source_db_path.exists():
+        draft_route_root = draft_source / "miniapp/app/routes"
+        source_route_root = source_root / "miniapp/app/routes"
+        feature_route_excluded = {
+            "__init__",
+            "client",
+            "specialist",
+            "manager",
+            "profiles",
+            "runtime",
+            "users",
+            "workload",
+            "time_slots",
+            "comments",
+            "assignments",
+            "role_pages",
+            "health",
+        }
+        if draft_route_root.exists() and source_route_root.exists():
+            for source_route_path in sorted(source_route_root.glob("*.py")):
+                if source_route_path.stem in feature_route_excluded:
+                    continue
+                draft_route_path = draft_route_root / source_route_path.name
+                if not draft_route_path.exists():
+                    continue
                 try:
-                    draft_db_source = draft_db_path.read_text(encoding="utf-8")
-                    source_db_source = source_db_path.read_text(encoding="utf-8")
+                    route_source = draft_route_path.read_text(encoding="utf-8")
                 except OSError:
-                    draft_db_source = ""
-                    source_db_source = ""
-                if self._has_invalid_datetime_timezone_call(draft_db_source) and not self._has_invalid_datetime_timezone_call(source_db_source):
-                    draft_db_path.write_text(source_db_source, encoding="utf-8")
-                    changed_files.add("miniapp/app/db.py")
-                    draft_db_source = source_db_source
-                required_db_fields = self._record_constructor_kwargs(draft_route_source, "BookingRequestRecord")
-                required_db_fields.update(self._record_class_attr_reads(draft_route_source, "BookingRequestRecord"))
-                for field_name in ("requested_at", "status_updated_at", "updated_at", "owner_assigned_at", "returned_at"):
-                    if re.search(rf"\b{re.escape(field_name)}\b", draft_route_source):
-                        required_db_fields.add(field_name)
-                source_db_fields = self._mapped_class_field_names(source_db_source, "BookingRequestRecord")
-                draft_db_fields = self._mapped_class_field_names(draft_db_source, "BookingRequestRecord")
-                missing_db_fields = required_db_fields - draft_db_fields
-                if missing_db_fields and missing_db_fields.issubset(source_db_fields):
-                    draft_db_path.write_text(source_db_source, encoding="utf-8")
-                    changed_files.add("miniapp/app/db.py")
+                    continue
+                imported_names = self._imported_schema_names(route_source)
+                if not imported_names:
+                    continue
+                missing_in_draft = imported_names - self._defined_schema_names(draft_schema_source)
+                if missing_in_draft and missing_in_draft.issubset(self._defined_schema_names(source_schema_source)):
+                    draft_schemas_path.write_text(source_schema_source, encoding="utf-8")
+                    changed_files.add("miniapp/app/schemas.py")
+                    break
+        draft_db_path = draft_source / "miniapp/app/db.py"
+        source_db_path = source_root / "miniapp/app/db.py"
+        if draft_db_path.exists() and source_db_path.exists():
+            try:
+                draft_db_source = draft_db_path.read_text(encoding="utf-8")
+                source_db_source = source_db_path.read_text(encoding="utf-8")
+            except OSError:
+                draft_db_source = ""
+                source_db_source = ""
+            if self._has_invalid_datetime_timezone_call(draft_db_source) and not self._has_invalid_datetime_timezone_call(source_db_source):
+                draft_db_path.write_text(source_db_source, encoding="utf-8")
+                changed_files.add("miniapp/app/db.py")
 
         route_manifest_path = draft_source / "miniapp/app/generated/route_manifest.json"
         runtime_manifest_path = draft_source / "miniapp/app/generated/runtime_manifest.json"

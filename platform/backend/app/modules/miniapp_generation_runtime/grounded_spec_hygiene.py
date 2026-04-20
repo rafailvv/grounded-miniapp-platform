@@ -139,8 +139,8 @@ class GroundedSpecHygieneRuntime:
             return "Order"
         if "consultation" in lowered:
             return "ConsultationRequest"
-        if "booking" in lowered:
-            return "BookingRequest"
+        if any(marker in lowered for marker in ("booking", "reservation", "appointment", "request")):
+            return "WorkflowRequest"
         return "WorkflowRequest"
 
     @staticmethod
@@ -156,13 +156,15 @@ class GroundedSpecHygieneRuntime:
                 EntityAttribute(name="delivery_address", type="text", required=False, description="Delivery address", pii=True),
                 EntityAttribute(name="comment", type="text", required=False, description="Order comment", pii=False),
             ]
-        if "booking" in lowered and any(marker in lowered for marker in ("equipment", "laptop", "projector", "issuance", "returned", "availability")):
+        if any(marker in lowered for marker in ("booking", "reservation", "appointment", "request")) and any(
+            marker in lowered for marker in ("date", "time", "slot", "range", "period", "schedule", "return", "availability")
+        ):
             return [
-                EntityAttribute(name="item_type", type="string", required=True, description="Requested equipment type", pii=False),
-                EntityAttribute(name="item_label", type="string", required=False, description="Specific equipment label or model", pii=False),
-                EntityAttribute(name="start_date", type="datetime", required=True, description="Requested issue start date", pii=False),
-                EntityAttribute(name="end_date", type="datetime", required=True, description="Requested return or end date", pii=False),
-                EntityAttribute(name="reason", type="text", required=True, description="Business reason for the equipment request", pii=False),
+                EntityAttribute(name="request_type", type="string", required=True, description="Requested workflow item type", pii=False),
+                EntityAttribute(name="request_label", type="string", required=False, description="Optional label or reference for the requested item", pii=False),
+                EntityAttribute(name="start_date", type="datetime", required=True, description="Requested start date", pii=False),
+                EntityAttribute(name="end_date", type="datetime", required=True, description="Requested end date", pii=False),
+                EntityAttribute(name="reason", type="text", required=True, description="Business reason for the request", pii=False),
             ]
         mappings = [
             ("name", "string", "Requester name", True, True),

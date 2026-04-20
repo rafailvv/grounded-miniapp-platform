@@ -8,14 +8,7 @@ from app.models.artifacts import MaterializationReport, ValidationIssue
 from app.models.common import GenerationMode
 from app.models.domain import DraftFileOperation, RunCheckResult
 
-CANONICAL_ROUTE_MODULE_FILENAMES = {
-    "booking.py": "bookingrequests.py",
-    "bookings.py": "bookingrequests.py",
-    "booking_request.py": "bookingrequests.py",
-    "booking_requests.py": "bookingrequests.py",
-    "request.py": "bookingrequests.py",
-    "requests.py": "bookingrequests.py",
-}
+CANONICAL_ROUTE_MODULE_FILENAMES: dict[str, str] = {}
 
 
 class MiniappMaterializationService:
