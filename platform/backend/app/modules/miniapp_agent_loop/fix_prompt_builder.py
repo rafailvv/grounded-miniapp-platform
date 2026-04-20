@@ -5,6 +5,7 @@ import json
 import re
 from typing import Any
 
+from app.models.common import GenerationMode
 from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
 
 
@@ -64,6 +65,10 @@ class FixPromptBuilder:
             "db_dependency_export_missing",
             "loading_first_root_surface",
         }
+        if fix_turn.generation_mode == GenerationMode.QUALITY:
+            if repeated_signature_without_progress >= 1 or route_runtime_failure:
+                return "full_bundle"
+            return "expanded"
         if repeated_signature_without_progress >= 2:
             return "full_bundle"
         if repeated_signature_without_progress >= 1 or route_runtime_failure:
@@ -161,6 +166,7 @@ class FixPromptBuilder:
                     "previous_attempt_summary": repair_packet.previous_attempt_summary,
                     "previous_diff_summary": repair_packet.previous_diff_summary,
                     "repair_base": repair_packet.repair_base,
+                    "generation_mode": repair_packet.generation_mode.value,
                 },
                 "repair_feedback": repair_feedback,
                 "rules": [

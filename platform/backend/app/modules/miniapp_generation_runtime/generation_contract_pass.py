@@ -42,12 +42,14 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
         *,
         page_graph: dict[str, object],
         role_scope: list[str],
+        entity_contract: dict[str, object] | None,
         operations: list[DraftFileOperation],
     ) -> list[DraftFileOperation]:
         builder = getattr(self, "artifact_builder", None) or self._artifact_builder()
         return builder.ensure_app_level_test_operations(
             page_graph=page_graph,
             role_scope=role_scope,
+            entity_contract=entity_contract,
             operations=operations,
         )
 
@@ -60,6 +62,7 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
         role_scope: list[str],
         generation_mode: GenerationMode,
         operations: list[DraftFileOperation],
+        entity_contract: dict[str, object] | None = None,
         contract_sync_mode: ContractSyncMode = "bootstrap_only",
     ) -> list[DraftFileOperation]:
         grounded_spec: GroundedSpecModel | None = None
@@ -83,6 +86,7 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
             if grounded_spec is not None
             else list(operations)
         )
+        ensured = self._normalize_sqlalchemy_db_defaults(operations=ensured)
         ensured = self._remove_seeded_generated_artifacts(operations=ensured)
         ensured = self._synchronize_minimal_workflow_route_contracts(
             workspace_id,
@@ -118,6 +122,7 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
             workspace_id,
             draft_run_id,
             ensured,
+            entity_contract=entity_contract,
             contract_sync_mode="repair_invariants",
         )
         ensured = self._synchronize_basic_page_state_contract(
@@ -127,7 +132,45 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
             operations=ensured,
             contract_sync_mode="repair_invariants",
         )
+        if grounded_spec is not None:
+            ensured = self._ensure_runtime_artifact_operations(
+                grounded_spec=grounded_spec,
+                page_graph=page_graph,
+                role_scope=role_scope,
+                generation_mode=generation_mode,
+                operations=ensured,
+            )
+        ensured = self._ensure_app_level_test_operations(
+            page_graph=page_graph,
+            role_scope=role_scope,
+            entity_contract=entity_contract,
+            operations=ensured,
+        )
         return ensured
+
+    @staticmethod
+    def _normalize_sqlalchemy_db_defaults(
+        *,
+        operations: list[DraftFileOperation],
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        db_path = "miniapp/app/db.py"
+        db_operation = operation_map.get(db_path)
+        if db_operation is None or db_operation.content is None:
+            return operations
+        content = str(db_operation.content or "")
+        if "mapped_column" not in content or "default_factory=" not in content:
+            return operations
+        normalized = content.replace("default_factory=", "default=")
+        if normalized == content:
+            return operations
+        operation_map[db_path] = DraftFileOperation(
+            file_path=db_path,
+            operation=db_operation.operation,
+            content=normalized,
+            reason="Pre-apply contract sync: normalize SQLAlchemy declarative defaults so db.py does not emit dataclass-only mapped_column(default_factory=...) arguments.",
+        )
+        return list(operation_map.values())
 
     @staticmethod
     def _grounded_spec_from_operations(operations: list[DraftFileOperation]) -> GroundedSpecModel:

@@ -15,7 +15,7 @@ from app.modules.miniapp_validation import PageGraphValidation
 
 class ServiceContractMaterializationMixins:
     @staticmethod
-    def _detect_missing_backend_contract_targets(*, generated_page_sources: dict[str, str], current_target_files: list[str], backend_targets: list[str]) -> list[str]:
+    def _detect_missing_backend_contract_targets(*, generated_page_sources: dict[str, str], current_target_files: list[str], backend_targets: list[str], entity_contract: dict[str, Any] | None = None) -> list[str]:
         endpoint_names: set[str] = set()
         for source in generated_page_sources.values():
             if not isinstance(source, str):
@@ -31,13 +31,20 @@ class ServiceContractMaterializationMixins:
             if contract_path not in existing_targets:
                 inferred.append(contract_path)
         for endpoint_name in sorted(endpoint_names):
-            if ServiceContractMaterializationMixins._is_forbidden_endpoint_name(endpoint_name):
+            normalized_endpoint_name = MiniappGenerationPlanRuntime.normalize_endpoint_name_for_entity_contract(
+                endpoint_name,
+                entity_contract=entity_contract,
+            )
+            if ServiceContractMaterializationMixins._is_forbidden_endpoint_name(normalized_endpoint_name):
                 continue
-            inferred_path = ServiceContractMaterializationMixins._route_module_path_for_endpoint_name(endpoint_name)
+            inferred_path = ServiceContractMaterializationMixins._route_module_path_for_endpoint_name(normalized_endpoint_name)
             if inferred_path not in existing_targets:
                 inferred.append(inferred_path)
             if router_path not in existing_targets:
                 inferred.append(router_path)
+        entity_route_file = MiniappGenerationPlanRuntime.entity_route_file(entity_contract)
+        if entity_route_file and entity_route_file not in existing_targets and endpoint_names:
+            inferred.append(entity_route_file)
         return list(dict.fromkeys(inferred))
 
     @staticmethod
@@ -56,12 +63,12 @@ class ServiceContractMaterializationMixins:
         return MiniappGenerationTargeting._resolve_static_asset_target(raw_ref, source_path=source_path)
 
     @staticmethod
-    def _detect_missing_backend_contract_targets_from_page_graph(*, page_graph: dict[str, Any], current_target_files: list[str], backend_targets: list[str]) -> list[str]:
-        return MiniappGenerationPlanRuntime.detect_missing_backend_contract_targets_from_page_graph(page_graph=page_graph, current_target_files=current_target_files, backend_targets=backend_targets)
+    def _detect_missing_backend_contract_targets_from_page_graph(*, page_graph: dict[str, Any], current_target_files: list[str], backend_targets: list[str], entity_contract: dict[str, Any] | None = None) -> list[str]:
+        return MiniappGenerationPlanRuntime.detect_missing_backend_contract_targets_from_page_graph(page_graph=page_graph, current_target_files=current_target_files, backend_targets=backend_targets, entity_contract=entity_contract)
 
     @staticmethod
-    def _detect_missing_backend_contract_targets_from_spec(*, grounded_spec: GroundedSpecModel, page_graph: dict[str, Any], current_target_files: list[str], backend_targets: list[str]) -> list[str]:
-        return MiniappGenerationPlanRuntime.detect_missing_backend_contract_targets_from_spec(grounded_spec=grounded_spec, page_graph=page_graph, current_target_files=current_target_files, backend_targets=backend_targets)
+    def _detect_missing_backend_contract_targets_from_spec(*, grounded_spec: GroundedSpecModel, page_graph: dict[str, Any], current_target_files: list[str], backend_targets: list[str], entity_contract: dict[str, Any] | None = None) -> list[str]:
+        return MiniappGenerationPlanRuntime.detect_missing_backend_contract_targets_from_spec(grounded_spec=grounded_spec, page_graph=page_graph, current_target_files=current_target_files, backend_targets=backend_targets, entity_contract=entity_contract)
 
     @staticmethod
     def _endpoint_names_from_dependency_text(dependency: str) -> set[str]:
@@ -119,8 +126,8 @@ class ServiceContractMaterializationMixins:
         return self.generation_preflight_validation.preflight_generation_issues(draft_root=draft_root, changed_files=changed_files, page_graph=page_graph, role_scope=role_scope, normalize_local_route_ref=self._normalize_local_route_ref)
 
     @classmethod
-    def _python_app_level_test_content(cls, *, page_graph: dict[str, Any], role_scope: list[str]) -> str:
-        return cls._artifact_builder().python_app_level_test_content(page_graph=page_graph, role_scope=role_scope)
+    def _python_app_level_test_content(cls, *, page_graph: dict[str, Any], role_scope: list[str], entity_contract: dict[str, Any] | None = None) -> str:
+        return cls._artifact_builder().python_app_level_test_content(page_graph=page_graph, role_scope=role_scope, entity_contract=entity_contract)
 
     @classmethod
     def _js_app_level_test_content(cls, *, page_graph: dict[str, Any], role_scope: list[str]) -> str:

@@ -126,14 +126,14 @@ class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
                     reason="Pre-apply contract sync: restore a hard-invariant DB-backed route module when placeholder persistence leaked into the draft.",
                 )
                 continue
-            if contract_sync_mode == "repair_invariants" and file_path.endswith("/runtime.py"):
+            if file_path.endswith("/runtime.py"):
                 normalized = self._normalize_runtime_route_module_source(content)
                 if normalized != content:
                     operation_map[file_path] = DraftFileOperation(
                         file_path=file_path,
                         operation="replace",
                         content=normalized,
-                        reason="Pre-apply contract sync: normalize runtime route ownership without regenerating the whole app route layer.",
+                        reason="Pre-apply contract sync: normalize runtime route module invariants without regenerating the whole app route layer.",
                     )
         return list(operation_map.values())
 

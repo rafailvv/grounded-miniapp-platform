@@ -60,6 +60,26 @@ class MiniappGenerationEntry:
         )
         grounded_spec = self.service._stabilize_grounded_spec(grounded_spec)
         self.service._store_report(f"spec:{workspace_id}", grounded_spec.model_dump(mode="json"))
+        entity_contract = self.service.generation_entity_contract.extract_entity_contract(
+            prompt=effective_prompt,
+            grounded_spec=grounded_spec,
+            generation_mode=generation_mode,
+        )
+        self.service._store_report(
+            f"entity_contract:{workspace_id}",
+            {"run_id": draft_run_id, "entity_contract": entity_contract},
+        )
+        self.service._append_trace(
+            workspace_id,
+            "entity_contract_ready",
+            "Extracted a prompt-derived entity contract before planning and code generation.",
+            {
+                "entity_slug": entity_contract.get("entity_slug"),
+                "api_path": entity_contract.get("api_path"),
+                "route_file": entity_contract.get("route_file"),
+                "generation_mode": generation_mode.value,
+            },
+        )
         self.service._append_event(job, "spec_ready", "Grounded specification compiled for thin generation.")
 
         execution_class = self.service._classify_execution_class(
@@ -111,6 +131,7 @@ class MiniappGenerationEntry:
         inferred_role_contract, inferred_plan_result = self.service._compile_prompt_to_scaffold(
             prompt=effective_prompt,
             grounded_spec=grounded_spec,
+            entity_contract=entity_contract,
             role_scope=role_scope,
             workspace_tree=workspace_tree,
         )
@@ -167,6 +188,7 @@ class MiniappGenerationEntry:
             draft_source=draft_source,
             effective_prompt=effective_prompt,
             grounded_spec=grounded_spec,
+            entity_contract=entity_contract,
             role_scope=role_scope,
             role_contract=role_contract,
             plan_result=plan_result,
@@ -418,6 +440,7 @@ class MiniappGenerationEntry:
         draft_source: Path,
         effective_prompt: str,
         grounded_spec,
+        entity_contract: dict[str, Any],
         role_scope: list[str],
         role_contract: dict[str, Any],
         plan_result: dict[str, Any],
@@ -437,6 +460,7 @@ class MiniappGenerationEntry:
             draft_source=draft_source,
             effective_prompt=effective_prompt,
             grounded_spec=grounded_spec,
+            entity_contract=entity_contract,
             role_scope=role_scope,
             role_contract=role_contract,
             plan_result=plan_result,

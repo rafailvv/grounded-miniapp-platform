@@ -33,10 +33,11 @@ class MiniappArtifactBuilder(
         *,
         page_graph: dict[str, Any],
         role_scope: list[str],
+        entity_contract: dict[str, Any] | None,
         operations: list[DraftFileOperation],
     ) -> list[DraftFileOperation]:
         required_tests = {
-            "miniapp/tests/test_generated_app.py": self.python_app_level_test_content(page_graph=page_graph, role_scope=role_scope),
+            "miniapp/tests/test_generated_app.py": self.python_app_level_test_content(page_graph=page_graph, role_scope=role_scope, entity_contract=entity_contract),
             "miniapp/tests/generated_app.test.mjs": self.js_app_level_test_content(page_graph=page_graph, role_scope=role_scope),
         }
         ensured_operations = [operation for operation in operations if operation.file_path not in required_tests]

@@ -14,6 +14,28 @@ ReadContentFn = Callable[[str, str, dict[str, DraftFileOperation], str], str | N
 class MiniappRuntimeContractSync:
     _HELPER_ONLY_ROUTE_MODULES = {"role_pages"}
 
+    @staticmethod
+    def normalize_future_annotations_import(content: str) -> str:
+        updated = str(content or "")
+        future_line = "from __future__ import annotations"
+        lines = updated.splitlines()
+        future_positions = [index for index, line in enumerate(lines) if line.strip() == future_line]
+        if not future_positions:
+            return updated
+        filtered = [line for index, line in enumerate(lines) if index not in future_positions]
+        insert_at = 0
+        if filtered and filtered[0].startswith("#!"):
+            insert_at = 1
+        while insert_at < len(filtered) and re.match(r"^#.*coding[:=]", filtered[insert_at]):
+            insert_at += 1
+        while insert_at < len(filtered) and filtered[insert_at].strip() == "":
+            insert_at += 1
+        normalized_lines = filtered[:insert_at] + [future_line, ""] + filtered[insert_at:]
+        normalized = "\n".join(normalized_lines)
+        if updated.endswith("\n"):
+            normalized += "\n"
+        return normalized
+
     def __init__(
         self,
         *,
@@ -111,20 +133,21 @@ class MiniappRuntimeContractSync:
         operations: list[DraftFileOperation],
         contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
-        if contract_sync_mode != "repair_invariants":
+        if contract_sync_mode not in {"bootstrap_only", "repair_invariants"}:
             return operations
         operation_map = {operation.file_path: operation for operation in operations}
         for file_path in list(operation_map):
             if not (file_path.startswith("miniapp/app/routes/") and file_path.endswith(".py")):
                 continue
             content = self.read_content(workspace_id, draft_run_id, operation_map, file_path)
-            if not content or "/api/runtime/" not in content:
+            if not content:
                 continue
-            updated = (
-                self.normalize_runtime_route_module_source(content)
-                if file_path == "miniapp/app/routes/runtime.py"
-                else self.strip_noncanonical_runtime_route_handlers(content)
-            )
+            if file_path == "miniapp/app/routes/runtime.py":
+                updated = self.normalize_runtime_route_module_source(content)
+            else:
+                if contract_sync_mode != "repair_invariants" or "/api/runtime/" not in content:
+                    continue
+                updated = self.strip_noncanonical_runtime_route_handlers(content)
             if updated == content:
                 continue
             operation_map[file_path] = DraftFileOperation(
@@ -316,7 +339,7 @@ class MiniappRuntimeContractSync:
 
     @classmethod
     def normalize_runtime_route_module_source(cls, content: str) -> str:
-        updated = str(content or "")
+        updated = cls.normalize_future_annotations_import(content)
         if "/api/runtime/" not in updated:
             return updated
         helper_block = (

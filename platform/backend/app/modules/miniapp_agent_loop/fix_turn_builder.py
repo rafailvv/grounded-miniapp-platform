@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.models.common import GenerationMode
 from app.models.domain import ContainerStatusRecord
 from app.modules.miniapp_agent_loop.fix_prompt_builder import FixPromptBuilder
 from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
@@ -23,6 +24,7 @@ class FixTurnBuilder:
         prior_attempts,
         existing_scope,
         memory_context: str | None,
+        generation_mode,
         augment_failure_evidence,
         implicated_files,
         specialized_failure_class,
@@ -86,6 +88,7 @@ class FixTurnBuilder:
             executed_checks=check_execution.results,
             api_failure_diagnostics=api_failure_diagnostics,
             memory_context=memory_context,
+            generation_mode=generation_mode,
         )
 
     def build_prompt_context(
@@ -108,7 +111,13 @@ class FixTurnBuilder:
             or self.prompt_builder.needs_full_context_first(fix_turn)
             or bool(fix_turn.api_failure_diagnostics)
         )
-        budget = 32000 if full_files else 12000
+        if fix_turn.generation_mode == GenerationMode.FAST:
+            base_budget = 16000
+        elif fix_turn.generation_mode == GenerationMode.QUALITY:
+            base_budget = 36000
+        else:
+            base_budget = 24000
+        budget = base_budget if full_files else max(12000, base_budget // 2)
         file_contexts = collect_file_contexts(
             workspace_id,
             run_id,
@@ -159,4 +168,5 @@ class FixTurnBuilder:
             previous_attempt_summary=self.prompt_builder.previous_attempt_summary(fix_turn),
             previous_diff_summary=current_diff_summary(workspace_id, run_id),
             repair_base=repair_base,
+            generation_mode=fix_turn.generation_mode,
         )

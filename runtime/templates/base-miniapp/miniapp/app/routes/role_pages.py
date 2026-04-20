@@ -33,9 +33,17 @@ def canonicalize_role_path(role: str, actual_path: str) -> str:
 def normalize_declared_page_path(file_path: str) -> Path:
     normalized_file_path = str(file_path or "").replace("\\", "/")
     if normalized_file_path.startswith("miniapp/app/"):
-        return BASE_DIR.parent / normalized_file_path.removeprefix("miniapp/app/")
+        relative_path = normalized_file_path.removeprefix("miniapp/app/")
+        primary = BASE_DIR / relative_path
+        if primary.exists():
+            return primary
+        return BASE_DIR.parent / relative_path
     if normalized_file_path.startswith("app/"):
-        return BASE_DIR.parent / normalized_file_path.removeprefix("app/")
+        relative_path = normalized_file_path.removeprefix("app/")
+        primary = BASE_DIR / relative_path
+        if primary.exists():
+            return primary
+        return BASE_DIR.parent / relative_path
     return BASE_DIR / normalized_file_path
 
 

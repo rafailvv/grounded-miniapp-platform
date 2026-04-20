@@ -96,6 +96,7 @@ class ConnectivityValidator:
 
                 lowered_surface = surface_content.lower()
                 has_dynamic_runtime_wiring = bool(api_refs) or any(marker in lowered_surface for marker in UI_WIRING_MARKERS)
+                profile_only_hydration = self._is_profile_only_hydration_surface(lowered_surface, api_refs)
                 if not has_dynamic_runtime_wiring:
                     issues.append(
                         ValidationIssue(
@@ -107,7 +108,12 @@ class ConnectivityValidator:
                     )
 
                 loading_state = str(page.get("loading_state") or "").strip()
-                if loading_state and has_dynamic_runtime_wiring and not self._contains_state(lowered_surface, loading_state, state_kind="loading"):
+                if (
+                    loading_state
+                    and has_dynamic_runtime_wiring
+                    and not profile_only_hydration
+                    and not self._contains_state(lowered_surface, loading_state, state_kind="loading")
+                ):
                     issues.append(
                         ValidationIssue(
                             code="connectivity.missing_ui_loading_state",
@@ -118,7 +124,12 @@ class ConnectivityValidator:
                     )
 
                 error_state = str(page.get("error_state") or "").strip()
-                if error_state and has_dynamic_runtime_wiring and not self._contains_state(lowered_surface, error_state, state_kind="error"):
+                if (
+                    error_state
+                    and has_dynamic_runtime_wiring
+                    and not profile_only_hydration
+                    and not self._contains_state(lowered_surface, error_state, state_kind="error")
+                ):
                     issues.append(
                         ValidationIssue(
                             code="connectivity.missing_ui_error_state",
@@ -308,7 +319,29 @@ class ConnectivityValidator:
             rf'queryselector\(\s*["\'][^"\']*{state_kind}[^"\']*["\']\s*\)',
             rf'queryselectorall\(\s*["\'][^"\']*{state_kind}[^"\']*["\']\s*\)',
         )
-        return any(re.search(pattern, normalized_content) for pattern in semantic_patterns)
+        if any(re.search(pattern, normalized_content) for pattern in semantic_patterns):
+            return True
+        if state_kind == "loading":
+            generic_loading_patterns = (
+                r"\bloading\b",
+                r"\bchecking\b",
+                r"\brefreshing\b",
+                r"role\s*=\s*['\"]status['\"]",
+                r"aria-live\s*=\s*['\"](?:polite|assertive)['\"]",
+                r"(?:id|class)\s*=\s*['\"][^'\"]*(?:status|message|notice|feedback)[^'\"]*['\"]",
+            )
+            return any(re.search(pattern, normalized_content) for pattern in generic_loading_patterns)
+        if state_kind == "error":
+            generic_error_patterns = (
+                r"\berror\b",
+                r"\bfailed\b",
+                r"\bunable\b",
+                r"something went wrong",
+                r"role\s*=\s*['\"]alert['\"]",
+                r"(?:id|class)\s*=\s*['\"][^'\"]*(?:error|notice|message|feedback)[^'\"]*['\"]",
+            )
+            return any(re.search(pattern, normalized_content) for pattern in generic_error_patterns)
+        return False
 
     @staticmethod
     def _looks_like_placeholder_dynamic_page(content: str, api_refs: set[str]) -> bool:
@@ -317,6 +350,18 @@ class ConnectivityValidator:
         if any(marker in content for marker in UI_WIRING_MARKERS):
             return False
         return any(marker in content for marker in PLACEHOLDER_DYNAMIC_MARKERS)
+
+    @staticmethod
+    def _is_profile_only_hydration_surface(content: str, api_refs: set[str]) -> bool:
+        if not api_refs or not api_refs.issubset({"profiles"}):
+            return False
+        if any(marker in content for marker in ("request-list", "queue-list", "records-list", "<table", "<tbody")):
+            return False
+        if any(marker in content for marker in ("addeventlistener(\"submit\"", "addeventlistener('submit'", ".onsubmit", "formdata(")):
+            return False
+        if re.search(r"method\s*:\s*[\"'](?:post|put|patch|delete)[\"']", content, flags=re.IGNORECASE):
+            return False
+        return True
 
     @staticmethod
     def _dedupe_issues(issues: list[ValidationIssue]) -> list[ValidationIssue]:

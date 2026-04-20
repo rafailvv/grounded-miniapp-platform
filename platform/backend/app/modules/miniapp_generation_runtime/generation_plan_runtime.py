@@ -39,6 +39,8 @@ if TYPE_CHECKING:
 
 
 class MiniappGenerationPlanRuntime:
+    _GENERIC_ENTITY_STEMS = {"workflowrequests", "records", "submissions"}
+
     def __init__(self, service: "GenerationService") -> None:
         self.service = service
 
@@ -48,6 +50,7 @@ class MiniappGenerationPlanRuntime:
         workspace_id: str,
         draft_source,
         grounded_spec: GroundedSpecModel,
+        entity_contract: dict[str, Any] | None,
         role_scope: list[str],
         plan_result: dict[str, Any],
     ) -> dict[str, Any]:
@@ -68,12 +71,14 @@ class MiniappGenerationPlanRuntime:
                         page_graph=plan_result.get("page_graph") or {},
                         current_target_files=plan_result["target_files"],
                         backend_targets=plan_result["backend_targets"],
+                        entity_contract=entity_contract,
                     ),
                     *self.detect_missing_backend_contract_targets_from_spec(
                         grounded_spec=grounded_spec,
                         page_graph=plan_result.get("page_graph") or {},
                         current_target_files=plan_result["target_files"],
                         backend_targets=plan_result["backend_targets"],
+                        entity_contract=entity_contract,
                     ),
                 ]
             )
@@ -135,6 +140,7 @@ class MiniappGenerationPlanRuntime:
         page_graph: dict[str, Any],
         current_target_files: list[str],
         backend_targets: list[str],
+        entity_contract: dict[str, Any] | None = None,
     ) -> list[str]:
         endpoint_names: set[str] = set()
         for role_payload in (page_graph.get("roles") or {}).values():
@@ -156,13 +162,20 @@ class MiniappGenerationPlanRuntime:
             if contract_path not in existing_targets:
                 inferred.append(contract_path)
         for endpoint_name in sorted(endpoint_names):
-            if cls.is_forbidden_endpoint_name(endpoint_name):
+            normalized_endpoint_name = cls.normalize_endpoint_name_for_entity_contract(
+                endpoint_name,
+                entity_contract=entity_contract,
+            )
+            if cls.is_forbidden_endpoint_name(normalized_endpoint_name):
                 continue
-            inferred_path = cls.route_module_path_for_endpoint_name(endpoint_name)
+            inferred_path = cls.route_module_path_for_endpoint_name(normalized_endpoint_name)
             if inferred_path not in existing_targets:
                 inferred.append(inferred_path)
             if router_path not in existing_targets:
                 inferred.append(router_path)
+        entity_route_file = cls.entity_route_file(entity_contract)
+        if entity_route_file and entity_route_file not in existing_targets and endpoint_names:
+            inferred.append(entity_route_file)
         return list(dict.fromkeys(inferred))
 
     @classmethod
@@ -173,6 +186,7 @@ class MiniappGenerationPlanRuntime:
         page_graph: dict[str, Any],
         current_target_files: list[str],
         backend_targets: list[str],
+        entity_contract: dict[str, Any] | None = None,
     ) -> list[str]:
         existing_targets = set(current_target_files) | set(backend_targets)
         inferred: list[str] = []
@@ -196,11 +210,18 @@ class MiniappGenerationPlanRuntime:
         if has_profile_pages and "miniapp/app/routes/profiles.py" not in existing_targets:
             inferred.append("miniapp/app/routes/profiles.py")
         for endpoint_name in sorted(endpoint_names):
-            if cls.is_forbidden_endpoint_name(endpoint_name):
+            normalized_endpoint_name = cls.normalize_endpoint_name_for_entity_contract(
+                endpoint_name,
+                entity_contract=entity_contract,
+            )
+            if cls.is_forbidden_endpoint_name(normalized_endpoint_name):
                 continue
-            inferred_path = cls.route_module_path_for_endpoint_name(endpoint_name)
+            inferred_path = cls.route_module_path_for_endpoint_name(normalized_endpoint_name)
             if inferred_path not in existing_targets:
                 inferred.append(inferred_path)
+        entity_route_file = cls.entity_route_file(entity_contract)
+        if entity_route_file and entity_route_file not in existing_targets and grounded_spec.api_requirements:
+            inferred.append(entity_route_file)
         return list(dict.fromkeys(inferred))
 
     @staticmethod
@@ -234,6 +255,34 @@ class MiniappGenerationPlanRuntime:
     def route_module_path_for_endpoint_name(cls, endpoint_name: str) -> str:
         filename = cls.canonical_endpoint_name(endpoint_name)
         return cls.normalize_runtime_python_path(f"miniapp/app/routes/{filename}.py")
+
+    @classmethod
+    def entity_route_file(cls, entity_contract: dict[str, Any] | None) -> str | None:
+        route_file = str((entity_contract or {}).get("route_file") or "").strip().replace("\\", "/")
+        if not route_file.startswith("miniapp/app/routes/") or not route_file.endswith(".py"):
+            return None
+        return cls.normalize_runtime_python_path(route_file)
+
+    @classmethod
+    def normalize_endpoint_name_for_entity_contract(
+        cls,
+        endpoint_name: str,
+        *,
+        entity_contract: dict[str, Any] | None,
+    ) -> str:
+        normalized = cls.canonical_endpoint_name(endpoint_name)
+        if not entity_contract:
+            return normalized
+        route_file = cls.entity_route_file(entity_contract)
+        if not route_file:
+            return normalized
+        entity_stem = route_file.rsplit("/", 1)[-1].removesuffix(".py").lower()
+        contract_api_stem = str((entity_contract or {}).get("api_path") or "").removeprefix("/api/").split("/", 1)[0].strip().lower()
+        if normalized in cls._GENERIC_ENTITY_STEMS:
+            return entity_stem
+        if contract_api_stem and normalized == contract_api_stem:
+            return entity_stem
+        return normalized
 
     @classmethod
     def is_forbidden_endpoint_name(cls, endpoint_name: str) -> bool:

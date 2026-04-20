@@ -1,4 +1,5 @@
 from app.modules.miniapp_generation_runtime.generation_completion import MiniappGenerationCompletion
+from app.modules.miniapp_generation_runtime.generation_contract_critic import MiniappGenerationContractCritic
 from app.modules.miniapp_generation_runtime.generation_contract_frontend import MiniappGenerationContractFrontend
 from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import MiniappGenerationContractApiRoutesCrud
 from app.modules.miniapp_generation_runtime.generation_contract_api_routes_runtime import MiniappGenerationContractApiRoutesRuntime
@@ -14,6 +15,7 @@ from app.modules.miniapp_generation_runtime.generation_codegen import MiniappGen
 from app.modules.miniapp_generation_runtime.generation_codegen_clusters import MiniappGenerationCodegenClusters
 from app.modules.miniapp_generation_runtime.generation_codegen_prompts import MiniappGenerationCodegenPrompts
 from app.modules.miniapp_generation_runtime.generation_codegen_selection import MiniappGenerationCodegenSelection
+from app.modules.miniapp_generation_runtime.generation_entity_contract import MiniappGenerationEntityContract
 from app.modules.miniapp_generation_runtime.generation_entry import MiniappGenerationEntry
 from app.modules.miniapp_generation_runtime.generation_normal_loop import MiniappGenerationNormalLoop
 from app.modules.miniapp_generation_runtime.generation_page_graph_runtime import MiniappGenerationPageGraphRuntime
@@ -45,6 +47,7 @@ from app.modules.miniapp_generation_runtime.generation_scaffold import (
 
 __all__ = [
     "MiniappGenerationCompletion",
+    "MiniappGenerationContractCritic",
     "MiniappGenerationContractFrontend",
     "MiniappGenerationContractApiRoutesCrud",
     "MiniappGenerationContractApiRoutesRuntime",
@@ -60,6 +63,7 @@ __all__ = [
     "MiniappGenerationCodegenClusters",
     "MiniappGenerationCodegenPrompts",
     "MiniappGenerationCodegenSelection",
+    "MiniappGenerationEntityContract",
     "MiniappGenerationEntry",
     "MiniappGenerationNormalLoop",
     "MiniappGenerationPageGraphRuntime",

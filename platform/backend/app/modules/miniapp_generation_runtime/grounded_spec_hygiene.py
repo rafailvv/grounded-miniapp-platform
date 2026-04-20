@@ -1,11 +1,40 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.models.grounded_spec import APIRequirement, Contradiction, EntityAttribute
 
 
 class GroundedSpecHygieneRuntime:
+    @staticmethod
+    def _pascal_case(value: str) -> str:
+        parts = re.split(r"[^a-zA-Z0-9]+", str(value or "").strip())
+        return "".join(part.capitalize() for part in parts if part) or "WorkflowRequest"
+
+    @classmethod
+    def _prompt_entity_name(cls, prompt: str) -> str | None:
+        lowered = str(prompt or "").lower()
+        markers = (
+            "booking",
+            "reservation",
+            "appointment",
+            "order",
+            "task",
+            "ticket",
+            "case",
+            "loan",
+            "quote",
+            "invoice",
+            "visit",
+            "approval",
+            "request",
+        )
+        for marker in markers:
+            if re.search(rf"\b{re.escape(marker)}s?\b", lowered):
+                return cls._pascal_case(marker)
+        return None
+
     @staticmethod
     def is_forbidden_generated_api_requirement(requirement: APIRequirement) -> bool:
         path = str(requirement.path or "").strip().lower()
@@ -139,8 +168,9 @@ class GroundedSpecHygieneRuntime:
             return "Order"
         if "consultation" in lowered:
             return "ConsultationRequest"
-        if any(marker in lowered for marker in ("booking", "reservation", "appointment", "request")):
-            return "WorkflowRequest"
+        prompt_entity_name = GroundedSpecHygieneRuntime._prompt_entity_name(prompt)
+        if prompt_entity_name:
+            return prompt_entity_name
         return "WorkflowRequest"
 
     @staticmethod

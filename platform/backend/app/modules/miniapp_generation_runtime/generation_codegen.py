@@ -97,6 +97,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
         draft_run_id: str,
         prompt: str,
         grounded_spec: GroundedSpecModel,
+        entity_contract: dict[str, Any],
         role_scope: list[str],
         file_contexts: dict[str, str],
         target_files: list[str],
@@ -144,6 +145,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                 resolve_page_file_edit(
                     prompt=prompt,
                     grounded_spec=grounded_spec,
+                    entity_contract=entity_contract,
                     role=role,
                     page=page,
                     page_graph=page_graph,
@@ -166,6 +168,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     selected_pages=selected_pages,
                     prompt=prompt,
                     grounded_spec=grounded_spec,
+                    entity_contract=entity_contract,
                     page_graph=page_graph,
                     role_contract=role_contract,
                     scope_mode=scope_mode,
@@ -189,6 +192,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     ordered_page_results[index] = resolve_page_file_edit(
                         prompt=prompt,
                         grounded_spec=grounded_spec,
+                        entity_contract=entity_contract,
                         role=role,
                         page=page,
                         page_graph=page_graph,
@@ -222,6 +226,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
             generated_page_sources=generated_page_sources,
             current_target_files=effective_target_files,
             backend_targets=backend_targets,
+            entity_contract=entity_contract,
         )
         static_contract_gap_targets = self._detect_missing_static_asset_targets(
             generated_page_sources=generated_page_sources,
@@ -252,6 +257,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                         cluster_name=cluster_name,
                         prompt=prompt,
                         grounded_spec=grounded_spec,
+                        entity_contract=entity_contract,
                         role_scope=role_scope,
                         role_contract=role_contract,
                         page_graph=page_graph,
@@ -354,6 +360,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     cluster_targets=cluster_targets,
                     prompt=kwargs["prompt"],
                     grounded_spec=kwargs["grounded_spec"],
+                    entity_contract=kwargs.get("entity_contract") or {},
                     role_scope=kwargs["role_scope"],
                     role_contract=kwargs["role_contract"],
                     page_graph=kwargs["page_graph"],
@@ -517,6 +524,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     self._resolve_page_file_edit,
                     prompt=kwargs["prompt"],
                     grounded_spec=kwargs["grounded_spec"],
+                    entity_contract=kwargs.get("entity_contract") or {},
                     role=role,
                     page=page,
                     page_graph=kwargs["page_graph"],

@@ -48,7 +48,6 @@ class FixScopeBuilder:
                 "runtime_manifest_route_missing",
                 "router_not_registered",
                 "db_dependency_export_missing",
-                "loading_first_root_surface",
             }:
                 structural_candidates.insert(0, "miniapp/app/main.py")
             for candidate in structural_candidates:

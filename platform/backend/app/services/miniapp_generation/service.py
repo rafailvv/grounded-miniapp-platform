@@ -39,6 +39,7 @@ from app.modules.miniapp_generation_runtime import (
     GenerationProgressReportingRuntime,
     GroundedSpecOrchestrationRuntime,
     MiniappGenerationCompletion,
+    MiniappGenerationContractCritic,
     MiniappGenerationContractFrontend,
     MiniappGenerationContractPass,
     MiniappGenerationContractRoutes,
@@ -50,6 +51,7 @@ from app.modules.miniapp_generation_runtime import (
     MiniappGenerationCodegenClusters,
     MiniappGenerationCodegenPrompts,
     MiniappGenerationCodegenSelection,
+    MiniappGenerationEntityContract,
     MiniappGenerationEntry,
     MiniappGenerationNormalLoop,
     MiniappGenerationPageGraphRuntime,
@@ -119,6 +121,8 @@ class GenerationService(
             "generation_completion": MiniappGenerationCompletion,
             "generation_repair": MiniappGenerationRepair,
             "generation_entry": MiniappGenerationEntry,
+            "generation_entity_contract": MiniappGenerationEntityContract,
+            "generation_contract_critic": MiniappGenerationContractCritic,
             "generation_normal_loop": MiniappGenerationNormalLoop,
             "generation_resume": MiniappGenerationResume,
             "generation_plan_runtime": MiniappGenerationPlanRuntime,
@@ -197,6 +201,8 @@ class GenerationService(
         self.generation_completion = MiniappGenerationCompletion()
         self.generation_repair = MiniappGenerationRepair(self)
         self.generation_entry = MiniappGenerationEntry(self)
+        self.generation_entity_contract = MiniappGenerationEntityContract(self)
+        self.generation_contract_critic = MiniappGenerationContractCritic(self)
         self.generation_normal_loop = MiniappGenerationNormalLoop(self)
         self.generation_resume = MiniappGenerationResume(self)
         self.generation_plan_runtime = MiniappGenerationPlanRuntime(self)
@@ -341,10 +347,11 @@ class GenerationService(
             prompt_turn_id=chat_turn.turn_id,
         )
 
-    def _compile_prompt_to_scaffold(self, *, prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str], workspace_tree: list[dict[str, str]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _compile_prompt_to_scaffold(self, *, prompt: str, grounded_spec: GroundedSpecModel, entity_contract: dict[str, Any] | None, role_scope: list[str], workspace_tree: list[dict[str, str]]) -> tuple[dict[str, Any], dict[str, Any]]:
         return compile_prompt_to_scaffold(
             prompt=prompt,
             grounded_spec=grounded_spec,
+            entity_contract=entity_contract,
             role_scope=role_scope,
             workspace_tree=workspace_tree,
             design_reference_files=DESIGN_REFERENCE_FILES,

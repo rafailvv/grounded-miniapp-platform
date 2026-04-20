@@ -45,10 +45,13 @@ class FixExecutionRuntime:
             if str(role) in {"client", "specialist", "manager"}
         ] or ["client", "specialist", "manager"]
         artifact_builder = generation_service.artifact_builder
+        entity_contract_report = generation_service.current_report(workspace_id, "entity_contract") or {}
+        entity_contract = dict(entity_contract_report.get("entity_contract") or {})
         test_files = {
             "miniapp/tests/test_generated_app.py": artifact_builder.python_app_level_test_content(
                 page_graph=page_graph,
                 role_scope=role_scope,
+                entity_contract=entity_contract,
             ),
             "miniapp/tests/generated_app.test.mjs": artifact_builder.js_app_level_test_content(
                 page_graph=page_graph,

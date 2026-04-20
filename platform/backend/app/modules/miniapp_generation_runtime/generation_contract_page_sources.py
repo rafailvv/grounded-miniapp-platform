@@ -8,127 +8,67 @@ class MiniappGenerationContractPageSources:
     def _deterministic_client_page_route_source() -> str:
         return """from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import APIRouter
 from fastapi.responses import FileResponse
+
+from app.routes.role_pages import resolve_role_page
 
 
 router = APIRouter(prefix="/client", tags=["client"])
 
-STATIC_ROOT = Path(__file__).resolve().parents[1] / "static" / "client"
+@router.get("", include_in_schema=False)
+def client_root() -> FileResponse:
+    return FileResponse(resolve_role_page("client", "/client"))
 
 
-def _static_file(relative_path: str) -> FileResponse:
-    return FileResponse(STATIC_ROOT / relative_path)
-
-
-@router.get("/")
-def client_index() -> FileResponse:
-    return _static_file("index.html")
-
-
-@router.get("/create")
-def client_create() -> FileResponse:
-    return _static_file("create/index.html")
-
-
-@router.get("/requests")
-def client_requests() -> FileResponse:
-    return _static_file("requests/index.html")
-
-
-@router.get("/requests/{request_id}")
-def client_requests_detail(request_id: str) -> FileResponse:
-    return _static_file("requests_detail/index.html")
-
-
-@router.get("/profile")
-def client_profile() -> FileResponse:
-    return _static_file("profile/index.html")
+@router.get("/{page_path:path}", include_in_schema=False)
+def client_nested_page(page_path: str) -> FileResponse:
+    return FileResponse(resolve_role_page("client", f"/client/{page_path}"))
 """
 
     @staticmethod
     def _deterministic_specialist_page_route_source() -> str:
         return """from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import APIRouter
 from fastapi.responses import FileResponse
+
+from app.routes.role_pages import resolve_role_page
 
 
 router = APIRouter(prefix="/specialist", tags=["specialist"])
 
-STATIC_ROOT = Path(__file__).resolve().parents[1] / "static" / "specialist"
+
+@router.get("", include_in_schema=False)
+def specialist_root() -> FileResponse:
+    return FileResponse(resolve_role_page("specialist", "/specialist"))
 
 
-def _static_file(relative_path: str) -> FileResponse:
-    return FileResponse(STATIC_ROOT / relative_path)
-
-
-@router.get("/")
-def specialist_index() -> FileResponse:
-    return _static_file("index.html")
-
-
-@router.get("/requests")
-def specialist_requests() -> FileResponse:
-    return _static_file("requests/index.html")
-
-
-@router.get("/requests/{request_id}")
-def specialist_request_detail(request_id: str) -> FileResponse:
-    return _static_file("requests_detail/index.html")
-
-
-@router.get("/profile")
-def specialist_profile() -> FileResponse:
-    return _static_file("profile/index.html")
+@router.get("/{page_path:path}", include_in_schema=False)
+def specialist_nested_page(page_path: str) -> FileResponse:
+    return FileResponse(resolve_role_page("specialist", f"/specialist/{page_path}"))
 """
 
     @staticmethod
     def _deterministic_manager_page_route_source() -> str:
         return """from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import APIRouter
 from fastapi.responses import FileResponse
 
+from app.routes.role_pages import resolve_role_page
 
 router = APIRouter(prefix="/manager", tags=["manager"])
 
-STATIC_ROOT = Path(__file__).resolve().parents[1] / "static" / "manager"
+
+@router.get("", include_in_schema=False)
+def manager_root() -> FileResponse:
+    return FileResponse(resolve_role_page("manager", "/manager"))
 
 
-def _static_file(relative_path: str) -> FileResponse:
-    return FileResponse(STATIC_ROOT / relative_path)
-
-
-@router.get("/")
-def manager_index() -> FileResponse:
-    return _static_file("index.html")
-
-
-@router.get("/requests")
-def manager_requests() -> FileResponse:
-    return _static_file("requests/index.html")
-
-
-@router.get("/requests/{request_id}")
-def manager_request_detail(request_id: str) -> FileResponse:
-    return _static_file("requests_detail/index.html")
-
-
-@router.get("/workload")
-def manager_workload() -> FileResponse:
-    return _static_file("workload/index.html")
-
-
-@router.get("/profile")
-def manager_profile() -> FileResponse:
-    return _static_file("profile/index.html")
+@router.get("/{page_path:path}", include_in_schema=False)
+def manager_nested_page(page_path: str) -> FileResponse:
+    return FileResponse(resolve_role_page("manager", f"/manager/{page_path}"))
 """
 
     @staticmethod

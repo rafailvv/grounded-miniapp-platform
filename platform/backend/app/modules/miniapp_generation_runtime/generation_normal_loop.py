@@ -14,9 +14,14 @@ from app.services.check_runner import CheckRunner
 from app.services.workspace.service import json_dumps
 
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
+from app.modules.miniapp_contract.runtime_contract_sync import MiniappRuntimeContractSync
 
 
 class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
+    @staticmethod
+    def _normalize_future_annotations_import(py_source: str) -> str:
+        return MiniappRuntimeContractSync.normalize_future_annotations_import(py_source)
+
     @staticmethod
     def _file_has_python_syntax_error(path: Path) -> bool:
         if not path.exists():
@@ -101,6 +106,13 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
         )
 
     @staticmethod
+    def _normalize_sqlalchemy_default_factory(py_source: str) -> str:
+        updated = str(py_source or "")
+        if "mapped_column" not in updated or "default_factory=" not in updated:
+            return updated
+        return updated.replace("default_factory=", "default=")
+
+    @staticmethod
     def _mapped_class_field_names(py_source: str, class_name: str) -> set[str]:
         return MiniappGenerationNormalLoop._class_field_names(py_source, class_name)
 
@@ -142,6 +154,18 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
         service = self.service
         source_root = service.workspace_service.source_dir(workspace_id)
         changed_files: set[str] = set()
+        app_root = draft_source / "miniapp/app"
+        if app_root.exists():
+            for draft_py_path in app_root.rglob("*.py"):
+                try:
+                    draft_py_source = draft_py_path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                normalized_future = self._normalize_future_annotations_import(draft_py_source)
+                if normalized_future == draft_py_source:
+                    continue
+                draft_py_path.write_text(normalized_future, encoding="utf-8")
+                changed_files.add(draft_py_path.relative_to(draft_source).as_posix())
         runtime_rel_paths = (
             "miniapp/app/main.py",
             "miniapp/app/routes/runtime.py",
@@ -220,6 +244,11 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             except OSError:
                 draft_db_source = ""
                 source_db_source = ""
+            normalized_draft_db_source = self._normalize_sqlalchemy_default_factory(draft_db_source)
+            if normalized_draft_db_source != draft_db_source:
+                draft_db_path.write_text(normalized_draft_db_source, encoding="utf-8")
+                draft_db_source = normalized_draft_db_source
+                changed_files.add("miniapp/app/db.py")
             if self._has_invalid_datetime_timezone_call(draft_db_source) and not self._has_invalid_datetime_timezone_call(source_db_source):
                 draft_db_path.write_text(source_db_source, encoding="utf-8")
                 changed_files.add("miniapp/app/db.py")
@@ -320,6 +349,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
         draft_source: Path,
         effective_prompt: str,
         grounded_spec,
+        entity_contract: dict[str, Any],
         role_scope: list[str],
         role_contract: dict[str, Any],
         plan_result: dict[str, Any],
@@ -335,6 +365,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             workspace_id=workspace_id,
             draft_source=draft_source,
             grounded_spec=grounded_spec,
+            entity_contract=entity_contract,
             role_scope=role_scope,
             plan_result=plan_result,
         )
@@ -396,6 +427,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             draft_run_id=draft_run_id,
             prompt=effective_prompt,
             grounded_spec=grounded_spec,
+            entity_contract=entity_contract,
             role_scope=role_scope,
             file_contexts=file_contexts,
             target_files=plan_result["target_files"],
@@ -479,8 +511,37 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
         operations = service._ensure_app_level_test_operations(
             page_graph=plan_result["page_graph"],
             role_scope=role_scope,
+            entity_contract=entity_contract,
             operations=operations,
         )
+        critic_report = {"executed": False, "issues": [], "issue_count": 0, "blocking_issue_count": 0}
+        if service.generation_contract_critic.should_run_preapply_critic(
+            generation_mode=generation_mode,
+            operations=operations,
+            entity_contract=entity_contract,
+        ):
+            critic_report = service.generation_contract_critic.build_preapply_report(
+                operations=operations,
+                entity_contract=entity_contract,
+                generation_mode=generation_mode,
+            )
+            service._store_report(
+                f"contract_critic:{workspace_id}",
+                {"workspace_id": workspace_id, "run_id": draft_run_id, **critic_report},
+            )
+            if critic_report.get("issue_count"):
+                service._append_event(
+                    job,
+                    "iteration_ready",
+                    "Pre-apply contract critic found coherence issues that should be corrected during draft validation and repair.",
+                    {"issue_count": critic_report.get("issue_count"), "issues": critic_report.get("issues")},
+                )
+                service._append_trace(
+                    workspace_id,
+                    "contract_critic_flagged",
+                    "Pre-apply contract critic detected naming or persistence-coherence risks in the generated draft.",
+                    critic_report,
+                )
         operations = service._run_pre_apply_contract_pass(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
@@ -488,6 +549,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             role_scope=role_scope,
             generation_mode=generation_mode,
             operations=operations,
+            entity_contract=entity_contract,
             contract_sync_mode="bootstrap_only",
         )
         patch_envelope = service.workspace_service.build_patch_envelope_for_draft(workspace_id, draft_run_id, operations)
@@ -539,6 +601,14 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             target_files=plan_result["target_files"],
         )
         initial_loop_diagnostics: list[str] = []
+        if critic_report.get("issue_count"):
+            initial_loop_diagnostics.extend(
+                [
+                    str(issue.get("message") or "").strip()
+                    for issue in list(critic_report.get("issues") or [])[:4]
+                    if str(issue.get("message") or "").strip()
+                ]
+            )
         if materialization_gate is not None:
             failure_code, failure_messages = materialization_gate
             service._append_trace(
@@ -629,6 +699,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             role_contract=role_contract,
             page_graph=plan_result["page_graph"],
             plan_result=plan_result,
+            entity_contract=entity_contract,
             generation_mode=generation_mode,
             creative_direction=creative_direction,
             files_read=files_read,

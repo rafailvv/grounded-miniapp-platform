@@ -29,10 +29,20 @@ if TYPE_CHECKING:
 class MiniappGenerationRepair:
     MAX_TOOL_ROUNDS = 5
     COMMAND_TIMEOUT_SECONDS = 20
+    _READ_ONLY_REPAIR_SURFACE_PREFIXES = (
+        "miniapp/tests/",
+        "miniapp/app/generated/",
+        "artifacts/",
+    )
 
     def __init__(self, service: "GenerationService") -> None:
         self.service = service
         self.tool_runtime = GenerationRepairToolRuntime(service)
+
+    @classmethod
+    def _is_read_only_repair_surface(cls, file_path: str) -> bool:
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        return normalized.startswith(cls._READ_ONLY_REPAIR_SURFACE_PREFIXES)
 
     @staticmethod
     def _tool_request_signature(tool_requests: list[dict[str, Any]]) -> str:
@@ -375,6 +385,7 @@ class MiniappGenerationRepair:
         operations = self.service._ensure_app_level_test_operations(
             page_graph=page_graph,
             role_scope=role_scope,
+            entity_contract=None,
             operations=operations,
         )
         operations = self.service._run_pre_apply_contract_pass(
@@ -413,6 +424,7 @@ class MiniappGenerationRepair:
         role_contract: dict[str, Any],
         page_graph: dict[str, Any],
         plan_result: dict[str, Any],
+        entity_contract: dict[str, Any],
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
         files_read: list[str],
@@ -483,6 +495,7 @@ class MiniappGenerationRepair:
                 role_scope=role_scope,
                 generation_mode=generation_mode,
                 operations=list(operations),
+                entity_contract=entity_contract,
                 contract_sync_mode="repair_invariants",
             ),
             post_apply_stabilize=lambda current_workspace_id, _run_id, current_draft_source, _changed_files: self.service.generation_normal_loop.stabilize_draft_contract_from_source(
@@ -636,6 +649,11 @@ class MiniappGenerationRepair:
                     operations = self.service._sanitize_draft_operations(
                         [DraftFileOperation.model_validate(item) for item in raw_operations]
                     )
+                    operations = [
+                        operation
+                        for operation in operations
+                        if not self._is_read_only_repair_surface(operation.file_path)
+                    ]
                     if not operations and self.service._should_retry_repair_with_expanded_context(
                         str(normalized.get("diagnosis") or normalized.get("assistant_message") or "")
                     ):

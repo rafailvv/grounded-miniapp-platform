@@ -811,7 +811,7 @@ class RunService:
             model_profile=str(checkpoint.get("model_profile") or run.model_profile),
             target_platform=str(checkpoint.get("target_platform") or "telegram_mini_app"),
             preview_profile=str(checkpoint.get("preview_profile") or "telegram_mock"),
-            generation_mode=str(checkpoint.get("generation_mode") or run.generation_mode.value),
+            generation_mode=str(checkpoint.get("generation_mode") or getattr(run.generation_mode, "value", run.generation_mode)),
             resume_from_run_id=source_run_id or None,
         )
         resumed_run = self.create_run(run.workspace_id, resume_request)

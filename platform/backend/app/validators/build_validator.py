@@ -120,7 +120,10 @@ class BuildValidator:
         if dependency_count <= 0:
             return []
         issues: list[ValidationIssue] = []
-        if self._has_visible_loading_surface(content):
+        # Root pages often contain small inline loading copy for non-blocking
+        # profile/name hydration. Treat it as a failure only when the page still
+        # lacks a real first-paint business surface.
+        if self._has_visible_loading_surface(content) and not self._has_business_surface(content):
             issues.append(
                 ValidationIssue(
                     code="build.loading_first_root_surface",
@@ -1000,15 +1003,47 @@ class BuildValidator:
     @staticmethod
     def _looks_like_persisted_form_surface(html_content: str) -> bool:
         lowered = str(html_content or "").lower()
-        return (
-            "<form" in lowered
-            or "type=\"submit\"" in lowered
-            or "type='submit'" in lowered
-            or ">create<" in lowered
-            or ">save<" in lowered
-            or ">update<" in lowered
-            or ">assign<" in lowered
+        if "<form" not in lowered:
+            return (
+                "type=\"submit\"" in lowered
+                or "type='submit'" in lowered
+                or ">create<" in lowered
+                or ">save<" in lowered
+                or ">update<" in lowered
+                or ">assign<" in lowered
+                or ">reject<" in lowered
+                or ">approve<" in lowered
+            )
+        if "type=\"submit\"" in lowered or "type='submit'" in lowered:
+            return True
+        if any(
+            marker in lowered
+            for marker in (
+                ">create<",
+                ">save<",
+                ">update<",
+                ">assign<",
+                ">reject<",
+                ">approve<",
+                "save changes",
+                "submit request",
+            )
+        ):
+            return True
+        has_textual_inputs = bool(
+            re.search(r"<textarea\b", lowered)
+            or re.search(r"<input\b(?![^>]*type=['\"](?:hidden|checkbox|radio|file)['\"])", lowered)
         )
+        if has_textual_inputs:
+            return True
+        has_only_filter_controls = (
+            "<select" in lowered
+            and not has_textual_inputs
+            and any(marker in lowered for marker in ("filter", "search", "sort", "status-filter", "type-filter"))
+        )
+        if has_only_filter_controls:
+            return False
+        return False
 
     @staticmethod
     def _looks_like_live_collection_surface(html_content: str) -> bool:
@@ -1032,7 +1067,9 @@ class BuildValidator:
         content = str(script_content or "")
         return bool(
             "miniappApiFetch(" in content
+            or "miniappApiFetch?.(" in content
             or "window.miniappApiFetch(" in content
+            or "window.miniappApiFetch?.(" in content
             or re.search(r"\bapiFetch\(\s*[\"'`]/api/", content)
             or re.search(r"fetch\(\s*[\"'`]/api/", content)
         )
@@ -1042,7 +1079,9 @@ class BuildValidator:
         content = str(script_content or "")
         has_api_call = bool(
             "miniappApiFetch(" in content
+            or "miniappApiFetch?.(" in content
             or "window.miniappApiFetch(" in content
+            or "window.miniappApiFetch?.(" in content
             or re.search(r"\bapiFetch\(\s*[\"'`]/api/", content)
             or re.search(r"fetch\(\s*[\"'`]/api/", content)
         )
@@ -1116,7 +1155,7 @@ class BuildValidator:
     def _contains_seeded_business_markup(html_content: str) -> bool:
         content = str(html_content or "")
         business_item_pattern = re.compile(
-            r"<(?:article|li|div)[^>]+class=['\"][^'\"]*(?:request|queue|approval|availability|conflict|booking|record)[^'\"]*['\"][^>]*>(?P<body>.*?)</(?:article|li|div)>",
+            r"<(?:article|li|div)[^>]+class=['\"][^'\"]*(?=[^'\"]*(?:request|queue|approval|availability|conflict|booking|record))(?=[^'\"]*(?:card|item|row|entry|tile))[^'\"]*['\"][^>]*>(?P<body>.*?)</(?:article|li|div)>",
             flags=re.IGNORECASE | re.DOTALL,
         )
         status_markers = (

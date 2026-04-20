@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 from app.modules.miniapp_contract.runtime_contract_sync import MiniappRuntimeContractSync
@@ -13,12 +14,111 @@ CANONICAL_ENDPOINT_ALIASES: dict[str, str] = {}
 
 
 class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
+    @staticmethod
+    def _compact_slug(value: str) -> str:
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+        text = re.sub(r"[^A-Za-z0-9]+", "", text)
+        return text.lower()
+
+    @classmethod
+    def _entity_api_aliases(cls, entity_contract: dict[str, Any] | None) -> tuple[str, set[str]]:
+        contract = dict(entity_contract or {})
+        canonical_api_path = str(contract.get("api_path") or "").strip()
+        canonical_match = re.match(r"^/api/([A-Za-z0-9_-]+)", canonical_api_path)
+        canonical_slug = str(canonical_match.group(1) if canonical_match else "").strip().lower()
+        aliases: set[str] = set()
+        for key in (
+            "entity_slug",
+            "entity_slug_plural",
+            "detail_route_slug",
+            "entity_name",
+            "schema_prefix",
+            "model_prefix",
+            "singular_label",
+            "plural_label",
+        ):
+            compact = cls._compact_slug(str(contract.get(key) or ""))
+            if not compact:
+                continue
+            aliases.add(compact)
+            if not compact.endswith("s"):
+                aliases.add(f"{compact}s")
+        route_file = str(contract.get("route_file") or "").strip().replace("\\", "/")
+        route_stem = Path(route_file).stem if route_file else ""
+        compact_route_stem = cls._compact_slug(route_stem)
+        if compact_route_stem:
+            aliases.add(compact_route_stem)
+        aliases.discard("")
+        if canonical_slug:
+            aliases.discard(canonical_slug)
+            aliases.discard(cls._compact_slug(canonical_slug))
+        return canonical_api_path, aliases
+
+    @classmethod
+    def _normalize_entity_api_paths(cls, content: str, entity_contract: dict[str, Any] | None) -> str:
+        canonical_api_path, aliases = cls._entity_api_aliases(entity_contract)
+        updated = str(content or "")
+        if not canonical_api_path or not aliases:
+            return updated
+        for alias in sorted(aliases, key=len, reverse=True):
+            updated = re.sub(
+                rf"/api/{re.escape(alias)}(?=(?:[/?\"'`]|$))",
+                canonical_api_path,
+                updated,
+                flags=re.IGNORECASE,
+            )
+        return updated
+
+    @staticmethod
+    def _route_aliases(route: str) -> set[str]:
+        normalized = str(route or "").strip()
+        if not normalized:
+            return set()
+        aliases = {normalized}
+        if normalized.endswith("_detail"):
+            aliases.add(normalized[: -len("_detail")])
+        if normalized.endswith("-detail"):
+            aliases.add(normalized[: -len("-detail")])
+        if normalized.endswith("detail"):
+            aliases.add(normalized[: -len("detail")].rstrip("_-"))
+        return {alias for alias in aliases if alias}
+
+    @staticmethod
+    def _template_app_root() -> Path:
+        return Path(__file__).resolve().parents[5] / "runtime" / "templates" / "base-miniapp" / "miniapp" / "app"
+
+    @classmethod
+    def _template_source_for_path(cls, file_path: str) -> str | None:
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        if not normalized:
+            return None
+        template_path = cls._template_app_root() / normalized.removeprefix("miniapp/app/")
+        if not template_path.exists():
+            return None
+        try:
+            return template_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    @classmethod
+    def _needs_shared_base_stylesheet_repair(cls, content: str) -> bool:
+        normalized = str(content or "")
+        if not normalized:
+            return False
+        if ".page-shell" not in normalized:
+            return True
+        if "padding-top: 76px" not in normalized and "padding-top: max(76px" not in normalized:
+            return True
+        if "--telegram-top-safe-offset" not in normalized:
+            return True
+        return False
+
     @classmethod
     def _needs_frontend_api_contract_repair(cls, file_path: str, content: str) -> bool:
         normalized = str(content or "")
         if not normalized:
             return False
-        if cls._strip_mock_profile_names(normalized) != normalized:
+        if cls._normalize_api_aliases_in_text(normalized) != normalized:
             return True
         if file_path.endswith(".js"):
             if re.search(r"(?<![\w.])fetch\(\s*([\"'`])/api/", normalized):
@@ -37,7 +137,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         expected_style_href: str,
         expected_script_src: str,
     ) -> bool:
-        updated = cls._strip_mock_profile_names(html)
+        updated = cls._normalize_api_aliases_in_text(html)
         if updated != html:
             return True
         if MiniappGenerationShellContract.BASE_STYLESHEET_HREF not in updated:
@@ -67,7 +167,84 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
 
     @classmethod
     def _normalize_api_aliases_in_text(cls, content: str) -> str:
-        return cls._strip_mock_profile_names(content)
+        updated = cls._strip_mock_profile_names(content)
+        updated = cls._strip_noncanonical_shared_base_html_refs(updated)
+        updated = cls._strip_noncanonical_shared_base_style_imports(updated)
+        updated = cls._strip_noncanonical_preview_bridge_html_refs(updated)
+        updated = cls._normalize_preview_bridge_script_imports(updated)
+        return updated
+
+    @classmethod
+    def _strip_noncanonical_shared_base_html_refs(cls, content: str) -> str:
+        pattern = re.compile(
+            r"""\s*<link\b[^>]*href=["'](?P<href>[^"']*shared/base\.css(?:[?#][^"']*)?)["'][^>]*>\s*""",
+            flags=re.IGNORECASE,
+        )
+
+        def _replace(match: re.Match[str]) -> str:
+            href = str(match.group("href") or "").strip()
+            if href == MiniappGenerationShellContract.BASE_STYLESHEET_HREF:
+                return match.group(0)
+            return ""
+
+        return re.sub(pattern, _replace, content)
+
+    @classmethod
+    def _strip_noncanonical_shared_base_style_imports(cls, content: str) -> str:
+        updated = str(content or "")
+        patterns = (
+            re.compile(
+                r"""(?m)^\s*import\s+["'](?!/static/shared/base\.css(?:[?#][^"']*)?)[^"']*shared/base\.css(?:[?#][^"']*)?["']\s*;?\s*$"""
+            ),
+            re.compile(
+                r"""(?m)^\s*@import\s+["'](?!/static/shared/base\.css(?:[?#][^"']*)?)[^"']*shared/base\.css(?:[?#][^"']*)?["']\s*;?\s*$"""
+            ),
+        )
+        for pattern in patterns:
+            updated = re.sub(pattern, "", updated)
+        return updated
+
+    @classmethod
+    def _strip_noncanonical_preview_bridge_html_refs(cls, content: str) -> str:
+        pattern = re.compile(
+            r"""\s*<script\b[^>]*src=["'](?!/static/preview_bridge\.js(?:[?#][^"']*)?)[^"']*preview_bridge\.js(?:[?#][^"']*)?["'][^>]*>\s*</script>""",
+            flags=re.IGNORECASE,
+        )
+        return re.sub(pattern, "", content)
+
+    @classmethod
+    def _normalize_preview_bridge_script_imports(cls, content: str) -> str:
+        updated = str(content or "")
+        named_import_pattern = re.compile(
+            r"""(?m)^\s*import\s*\{(?P<bindings>[^}]+)\}\s*from\s*["'][^"']*preview_bridge\.js(?:[?#][^"']*)?["']\s*;?\s*$"""
+        )
+        bare_import_pattern = re.compile(
+            r"""(?m)^\s*import\s*["'][^"']*preview_bridge\.js(?:[?#][^"']*)?["']\s*;?\s*$"""
+        )
+
+        def _replace_named_import(match: re.Match[str]) -> str:
+            bindings = cls._window_destructuring_bindings(match.group("bindings"))
+            if not bindings:
+                return ""
+            return f"const {{ {bindings} }} = window;"
+
+        updated = re.sub(named_import_pattern, _replace_named_import, updated)
+        updated = re.sub(bare_import_pattern, "", updated)
+        return updated
+
+    @staticmethod
+    def _window_destructuring_bindings(bindings: str) -> str:
+        normalized: list[str] = []
+        for raw_item in str(bindings or "").split(","):
+            item = raw_item.strip()
+            if not item:
+                continue
+            alias_match = re.fullmatch(r"([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)", item)
+            if alias_match:
+                normalized.append(f"{alias_match.group(1)}: {alias_match.group(2)}")
+                continue
+            normalized.append(item)
+        return ", ".join(normalized)
 
     @staticmethod
     def _normalize_local_route_ref(route_ref: str) -> str:
@@ -86,6 +263,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         workspace_id: str,
         draft_run_id: str,
         operations: list[DraftFileOperation],
+        entity_contract: dict[str, Any] | None = None,
         contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
@@ -95,9 +273,10 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
             if not content:
                 continue
-            if not self._needs_frontend_api_contract_repair(file_path, content):
-                continue
             updated = self._normalize_api_aliases_in_text(content)
+            updated = self._normalize_entity_api_paths(updated, entity_contract)
+            if not self._needs_frontend_api_contract_repair(file_path, content) and updated == content:
+                continue
             if file_path.endswith(".html"):
                 if updated == content:
                     continue
@@ -160,6 +339,22 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
+        base_stylesheet_path = MiniappGenerationShellContract.BASE_STYLESHEET_PATH
+        base_stylesheet_content = self._operation_or_workspace_content(
+            workspace_id,
+            draft_run_id,
+            operation_map,
+            base_stylesheet_path,
+        )
+        if self._needs_shared_base_stylesheet_repair(base_stylesheet_content or ""):
+            template_base_stylesheet = self._template_source_for_path(base_stylesheet_path)
+            if template_base_stylesheet:
+                operation_map[base_stylesheet_path] = DraftFileOperation(
+                    file_path=base_stylesheet_path,
+                    operation="replace",
+                    content=template_base_stylesheet,
+                    reason="Pre-apply contract sync: restore the shared shell stylesheet so page-shell spacing and preview safe-area invariants stay intact.",
+                )
         page_expectations: dict[str, dict[str, str]] = {}
         page_assets: dict[str, dict[str, str]] = {}
         role_routes: dict[str, set[str]] = {}
@@ -198,7 +393,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             script = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, script_path)
             if not html:
                 continue
-            updated = self._strip_mock_profile_names(html)
+            updated = self._normalize_api_aliases_in_text(html)
             role_match = re.match(r"miniapp/app/static/(client|specialist|manager)/", file_path)
             role = role_match.group(1) if role_match else ""
             asset_meta = page_assets.get(file_path) or {
@@ -306,7 +501,8 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
                 continue
             short = candidate[len(role) + 1 :]
             short = short or "/"
-            replacements[short] = candidate
+            for alias in cls._route_aliases(short):
+                replacements[alias] = candidate
         replacements["/"] = f"/{role}"
 
         def _replace(match: re.Match[str]) -> str:

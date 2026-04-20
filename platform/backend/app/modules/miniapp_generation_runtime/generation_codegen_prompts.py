@@ -56,8 +56,10 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
         cluster_name: str,
         cluster_targets: list[str],
         file_contexts: dict[str, str],
+        entity_contract: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         feature_route_path = MiniappGenerationCodegenPrompts._feature_route_path_for_cluster(cluster_name)
+        entity_route_path = str((entity_contract or {}).get("route_file") or "").strip()
         supporting_paths = [
             path
             for path, content in file_contexts.items()
@@ -127,6 +129,8 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 )
         else:
             preferred_paths = []
+        if entity_route_path and entity_route_path in supporting_paths and entity_route_path not in preferred_paths:
+            preferred_paths.insert(0, entity_route_path)
         ordered_paths = [path for path in preferred_paths if path in supporting_paths]
         ordered_paths.extend(path for path in supporting_paths if path not in ordered_paths)
         return {path: file_contexts.get(path, "") for path in ordered_paths}
@@ -162,6 +166,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
         cluster_targets: list[str],
         prompt: str,
         grounded_spec: GroundedSpecModel,
+        entity_contract: dict[str, Any] | None = None,
         role_scope: list[str],
         role_contract: dict[str, Any],
         page_graph: dict[str, Any],
@@ -184,6 +189,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 cluster_name=cluster_name,
                 cluster_targets=cluster_targets,
                 file_contexts=file_contexts,
+                entity_contract=entity_contract,
             ),
             max_file_chars=2400 if compact else 4200,
             max_total_chars=7000 if compact else 16000,
@@ -197,6 +203,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "Do not use list_files for backend_support. The cluster already has the required template/runtime shape.",
                 "Do not request run_checks before the first backend_support patch. Generated manifests are derived artifacts, not prerequisites.",
                 "For backend_support, app.db owns SQLAlchemy models, app.schemas owns request/response schemas, and app.routes.profiles owns profile persistence.",
+                "In db.py, standard SQLAlchemy declarative models must use mapped_column(default=...) instead of mapped_column(default_factory=...) unless the file explicitly configures SQLAlchemy dataclass mappings.",
                 "If app/main.py already contains working route-manifest, role-page, and static resolution helpers in target_file_contexts, preserve those helpers and symbol names instead of rewriting them from scratch.",
                 "When app/main.py already uses ROUTE_MANIFEST_PATH, _load_route_manifest, _canonicalize_role_path, _route_matches, or _resolve_role_page, keep those exact names and working signatures.",
                 "Keep main.py limited to FastAPI app bootstrap, middleware, create-all startup, and router inclusion. Do not implement workflow request CRUD or page-serving route handlers in main.py.",
@@ -212,6 +219,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "Do not return no_progress just because other role route files are thin, missing, or only present as compatibility references.",
                 "If db.py and schemas.py are present in supporting_file_contexts, use them directly and emit the route module for the current cluster target.",
                 "If schemas.py defines a Python Enum for status or state, route modules must reuse that exact enum and its declared values. Do not invent fallback literals, alternate spellings, or inferred status sets in route code.",
+                "When one dominant entity contract already exists, do not invent a second peer CRUD route module for adjacent read-model nouns like inventory, availability, approvals, or dashboard metrics unless the prompt explicitly asks for an independent persisted entity lifecycle.",
             ]
             if cluster_name in {"backend_route_client", "backend_route_specialist", "backend_route_manager"}:
                 cluster_specific_rules.extend(
@@ -301,6 +309,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "role_scope": role_scope,
                 "cluster_targets": cluster_targets,
                 "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
+                "entity_contract": dict(entity_contract or {}),
                 "role_contract": self._compact_role_contract_for_codegen(role_contract, role_scope),
                 "page_graph": self._compact_page_graph_for_codegen(page_graph, role_scope),
                 "file_contexts": bounded_contexts,
@@ -321,7 +330,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Use English-only control text and code comments.",
                     "For every HTML page in cluster_targets, make it reference its own page-local styles.css and app.js companions when those files are also in cluster_targets.",
                     "For role root pages with data_dependencies, render a complete business surface on first paint with real sections, actions, and honest empty states instead of loading-first shells.",
-                    "Do not force dedicated loading or error containers on role root pages; add state UI only when a real post-render fetch path needs it, and never as the primary visible surface.",
+                    "When a role root page performs post-render API reads, include a small dedicated loading/status node and a small dedicated error/notice node for those refresh paths, but keep them secondary to the main first-paint surface.",
                     "Do not render manual Refresh buttons, pseudo-data rows, or loading-only placeholder shells as the primary surface.",
                     "Do not introduce flat role entry files like miniapp/app/static/client/index.html unless that exact path is listed in cluster_targets.",
                     "Use the template runtime conventions for API access instead of raw authless fetch patterns.",
@@ -352,6 +361,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
         *,
         prompt: str,
         grounded_spec: GroundedSpecModel,
+        entity_contract: dict[str, Any] | None = None,
         role: str,
         page: dict[str, Any],
         page_graph: dict[str, Any],
@@ -392,6 +402,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "role": role,
                 "page": page,
                 "sibling_pages": sibling_pages[:2] if compact else sibling_pages[:4],
+                "entity_contract": dict(entity_contract or {}),
                 "role_contract": role_contract.get("roles", {}).get(role),
                 "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
                 "shared_contract": {
@@ -427,7 +438,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Do not pre-render invented business records in HTML or JS. Live request cards, approval rows, queue entries, conflict items, and similar workflow records must appear only after reading real API data.",
                     "Dropdown options, filter chips, and static guidance copy are allowed, but example request cards, seeded workflow rows, and pre-filled live rows are not allowed.",
                     "Keep role root pages complete on first paint and preserve any explicit nested feature routes that are already present in the writable surface.",
-                    "Do not rely on dedicated loading or error blocks to make role root pages function; the main surface must already be complete on first render.",
+                    "Role root pages may use compact loading/error state nodes for post-render refreshes, but the main surface must already be complete on first render.",
                     "If the page edits or lists shared records, wire it to the real DB-backed /api lifecycle for the same entity instead of local arrays or console-only handlers.",
                     "Profile pages must keep the canonical /api/profiles/{role} read/write contract or the existing profileStore contract intact.",
                     "For pages that create, list, or update shared records, prefer honest CRUD wiring over speculative UI polish and do not conclude without evidence that the corresponding API contract exists in the same draft.",
@@ -464,6 +475,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
         *,
         prompt: str,
         grounded_spec: GroundedSpecModel,
+        entity_contract: dict[str, Any] | None = None,
         role_scope: list[str],
         role_contract: dict[str, Any],
         page_graph: dict[str, Any],
@@ -498,11 +510,12 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "expected_backend_targets": list((page_graph.get("backend_targets") or [])[:12]),
                 "target_files": target_files,
                 "workspace_path_hints": {
-                    "target_roots": sorted({path.split("/", 1)[0] for path in target_files if "/" in path}),
-                    "target_examples": target_files[:12],
-                    "existing_file_context_paths": sorted(file_contexts.keys())[:12],
-                },
+                "target_roots": sorted({path.split("/", 1)[0] for path in target_files if "/" in path}),
+                "target_examples": target_files[:12],
+                "existing_file_context_paths": sorted(file_contexts.keys())[:12],
+            },
                 "grounded_spec": self._compact_grounded_spec_for_codegen(grounded_spec),
+                "entity_contract": dict(entity_contract or {}),
                 "file_contexts": trimmed_targets,
                 "generated_page_sources": self._bounded_file_contexts(
                     generated_page_sources,
@@ -535,6 +548,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Treat /static/preview_bridge.js and shared/base.css as the canonical shared shell assets when they are relevant to the target surface.",
                     "For any workflow or stateful backend, use miniapp/app/db.py plus miniapp/app/schemas.py as the canonical persistence contract.",
                     "Persist mutable business entities through SQLAlchemy models and sessions from db.py; do not keep route-level dict/list stores for app data.",
+                    "In db.py, use mapped_column(default=...) for standard declarative SQLAlchemy models; do not use mapped_column(default_factory=...) unless SQLAlchemy dataclass configuration is explicitly present.",
                     "Define request/response models in schemas.py and import them from route modules instead of declaring inline Pydantic BaseModel classes inside routes.",
                     "If dedicated backend_route_* targets exist, keep main.py focused on app bootstrap and router wiring; do not duplicate domain CRUD handlers inside main.py.",
                     "app.routes.role_pages is a helper-only module and must not be imported as router or included via app.include_router(...) in main.py.",
@@ -547,6 +561,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Keep role pages usable without waiting on client-side hydration for basic navigation and structure.",
                     "Do not fill role root pages with pseudo-records or invented live metrics just to avoid an empty screen.",
                     "Do not ship seeded workflow cards, static example records, or pre-filled live list rows in HTML or JS even when a real API read path also exists.",
+                    "If the extracted entity contract implies one dominant persisted workflow entity, keep adjacent availability, conflict, approval, and summary data under that same entity contract instead of inventing a second feature route stem by default.",
                     "Do not collapse explicit nested feature routes back into index.html when those routes are part of the writable surface.",
                     "For minimal_patch, preserve unrelated behavior and keep the diff minimal.",
                     "Do not touch page files unless they are included in target_files.",

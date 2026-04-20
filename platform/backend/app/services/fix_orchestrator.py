@@ -103,7 +103,9 @@ class FixOrchestrator:
         started_at = time.perf_counter()
         workspace = self.workspace_service.get_workspace(workspace_id)
         run_id = request.linked_run_id or new_id("run")
-        effective_mode = request.generation_mode if request.generation_mode == GenerationMode.QUALITY else GenerationMode.BALANCED
+        effective_mode = self._normalize_generation_mode(request.generation_mode)
+        if effective_mode == GenerationMode.BASIC:
+            effective_mode = GenerationMode.BALANCED
         stable_prefix = (
             "You are repairing a grounded mini-app workspace. "
             "Use a bounded failure packet, keep scope narrow, and avoid rereading unchanged files."
@@ -212,6 +214,19 @@ class FixOrchestrator:
             should_stop=should_stop,
         )
 
+    @staticmethod
+    def _normalize_generation_mode(value: GenerationMode | str | None) -> GenerationMode:
+        if isinstance(value, GenerationMode):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                try:
+                    return GenerationMode(normalized)
+                except Exception:
+                    pass
+        return GenerationMode.BALANCED
+
     def _generate_with_workspace_loop(self, **kwargs: Any) -> JobRecord:
         return self.fix_entry.generate_with_workspace_loop(**kwargs)
 
@@ -237,6 +252,7 @@ class FixOrchestrator:
             "memory_context",
             (self.store.get("reports", f"project_memory_context:{workspace_id}") or {}).get("summary"),
         )
+        kwargs.setdefault("generation_mode", GenerationMode.BALANCED)
         return self.fix_turn_builder.build_turn_context(
             memory_context=memory_context,
             augment_failure_evidence=self._augment_failure_evidence_from_test_results,
@@ -303,6 +319,22 @@ class FixOrchestrator:
     @staticmethod
     def _repair_context_mode(fix_turn: FixTurnContext, repeated_signature_without_progress: int) -> str:
         return FixPromptRuntime.repair_context_mode(fix_turn, repeated_signature_without_progress)
+
+    @staticmethod
+    def _tool_round_limit_for_mode(generation_mode: GenerationMode) -> int:
+        if generation_mode == GenerationMode.QUALITY:
+            return 10
+        if generation_mode == GenerationMode.FAST:
+            return 5
+        return 7
+
+    @staticmethod
+    def _max_attempts_for_mode(generation_mode: GenerationMode) -> int:
+        if generation_mode == GenerationMode.QUALITY:
+            return 14
+        if generation_mode == GenerationMode.FAST:
+            return 8
+        return 12
 
     @staticmethod
     def _needs_full_context_first(fix_turn: FixTurnContext) -> bool:

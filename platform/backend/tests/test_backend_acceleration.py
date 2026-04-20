@@ -21,6 +21,7 @@ from app.models.common import PreviewProfile, TargetPlatform
 from app.models.artifacts import ValidationIssue
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RunCheckResult, ValidationSnapshot, WorkspaceRecord
 from app.models.grounded_spec import APIRequirement
+from app.modules.miniapp_agent_loop.fix_prompt_builder import FixPromptBuilder
 from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
 from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
@@ -252,10 +253,107 @@ def test_generation_clusters_grouped_for_safe_parallel_execution() -> None:
         ["backend_support"],
         ["backend_route_assignments", "backend_route_comments"],
         ["backend_route_requests"],
-        ["role_manager_ui_root", "role_manager_ui_profile", "role_manager_ui_requests"],
+        ["role_manager_ui_root"],
+        ["role_manager_ui_profile"],
+        ["role_manager_ui_requests"],
         ["role_specialist_ui_root"],
         ["shared_static"],
     ]
+
+
+def test_entity_contract_uses_prompt_derived_slug_for_booking_prompt(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    prompt = (
+        "Create an internal mini-app for office equipment booking where employees request laptops "
+        "and specialists confirm issuance and return."
+    )
+    grounded_spec = service._stabilize_grounded_spec(
+        service._build_grounded_spec(
+            workspace_id="ws_entity_contract",
+            prompt=prompt,
+            target_platform=TargetPlatform.TELEGRAM,
+            preview_profile=PreviewProfile.TELEGRAM_MOCK,
+            doc_refs=[],
+            template_revision_id="template-test",
+            prompt_turn_id="turn_entity_contract",
+            generation_mode=GenerationMode.BALANCED,
+        )
+    )
+
+    contract = service.generation_entity_contract.extract_entity_contract(
+        prompt=prompt,
+        grounded_spec=grounded_spec,
+        generation_mode=GenerationMode.BALANCED,
+    )
+
+    assert contract["entity_slug"] == "booking"
+    assert contract["entity_slug_plural"] == "bookings"
+    assert contract["api_path"] == "/api/bookings"
+    assert contract["route_file"] == "miniapp/app/routes/bookings.py"
+
+
+def test_contract_critic_flags_generic_submission_shim_and_seeded_live_data(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    operations = [
+        DraftFileOperation(
+            file_path="miniapp/app/routes/bookings.py",
+            operation="replace",
+            content='@router.post("/api/submissions/{table}")\nasync def create_submission(table: str):\n    return {"ok": True}\n',
+            reason="test",
+        ),
+        DraftFileOperation(
+            file_path="miniapp/app/static/specialist/bookings/index.html",
+            operation="replace",
+            content='<main class="page-shell"><section class="request-list"></section></main>',
+            reason="test",
+        ),
+        DraftFileOperation(
+            file_path="miniapp/app/static/specialist/bookings/app.js",
+            operation="replace",
+            content='const bookings = [{ status: "pending", requester: "Alex", reason: "Need laptop" }];',
+            reason="test",
+        ),
+    ]
+
+    report = service.generation_contract_critic.build_preapply_report(
+        operations=operations,
+        entity_contract={"route_file": "miniapp/app/routes/bookings.py", "entity_slug_plural": "bookings"},
+        generation_mode=GenerationMode.QUALITY,
+    )
+
+    issue_codes = {item["code"] for item in report["issues"]}
+    assert "critic.generic_submission_shim" in issue_codes
+    assert "critic.seeded_live_collection" in issue_codes
+
+
+def test_quality_mode_escalates_fix_context_faster_than_balanced() -> None:
+    quality_turn = FixTurnContext(
+        workspace_id="ws_test",
+        run_id="run_test",
+        generation_mode=GenerationMode.QUALITY,
+    )
+    balanced_turn = FixTurnContext(
+        workspace_id="ws_test",
+        run_id="run_test",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    fast_turn = FixTurnContext(
+        workspace_id="ws_test",
+        run_id="run_test",
+        generation_mode=GenerationMode.FAST,
+    )
+
+    assert FixPromptBuilder.repair_context_mode(quality_turn, 0) == "expanded"
+    assert FixPromptBuilder.repair_context_mode(quality_turn, 1) == "full_bundle"
+    assert FixPromptBuilder.repair_context_mode(balanced_turn, 0) == "minimal"
+    assert FixPromptBuilder.repair_context_mode(balanced_turn, 1) == "expanded"
+    assert FixPromptBuilder.repair_context_mode(fast_turn, 1) == "expanded"
 
 
 def test_create_run_renames_workspace_from_prompt(tmp_path: Path) -> None:
@@ -444,6 +542,16 @@ def test_whole_file_generation_times_out_instead_of_hanging(tmp_path: Path, monk
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
+    workspace_service = app.state.container.workspace_service
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Whole File Timeout Workspace",
+            description="Whole-file timeout regression.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_test").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    workspace_service.ensure_draft(workspace.workspace_id, "run_test")
 
     monkeypatch.setattr(
         service,
@@ -467,7 +575,7 @@ def test_whole_file_generation_times_out_instead_of_hanging(tmp_path: Path, monk
     service.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS = 0.001
 
     result = service._resolve_whole_file_code_edits(
-        workspace_id="ws_test",
+        workspace_id=workspace.workspace_id,
         draft_run_id="run_test",
         prompt="Build app",
         grounded_spec=None,
@@ -482,8 +590,8 @@ def test_whole_file_generation_times_out_instead_of_hanging(tmp_path: Path, monk
         creative_direction={},
     )
 
-    assert "error" in result
-    assert "Whole-file generation timed out" in result["error"]
+    assert "error" not in result
+    assert "timed out during whole-file generation" in result["assistant_message"]
 
 
 def test_generate_structured_with_retry_times_out_stuck_llm_call(tmp_path: Path, monkeypatch) -> None:
@@ -1042,7 +1150,7 @@ def test_backend_contract_target_inference_from_spec_helper_normalizes_required_
 
     assert "miniapp/app/routes/profiles.py" in inferred
     assert "miniapp/app/routes/workload.py" in inferred
-    assert "miniapp/app/routes/users.py" in inferred
+    assert "miniapp/app/routes/specialists.py" in inferred
     assert "miniapp/app/routes/auth.py" not in inferred
 
 
@@ -2550,19 +2658,19 @@ def test_build_generation_clusters_splits_role_ui_by_page_surface() -> None:
     assert clusters == [
         {"cluster_name": "backend_support", "target_files": ["miniapp/app/main.py"]},
         {
-            "cluster_name": "role_manager_ui_root",
-            "target_files": [
-                "miniapp/app/static/manager/index.html",
-                "miniapp/app/static/manager/styles.css",
-                "miniapp/app/static/manager/app.js",
-            ],
-        },
-        {
             "cluster_name": "role_manager_ui_profile",
             "target_files": [
                 "miniapp/app/static/manager/profile/index.html",
                 "miniapp/app/static/manager/profile/styles.css",
                 "miniapp/app/static/manager/profile/app.js",
+            ],
+        },
+        {
+            "cluster_name": "role_manager_ui_root",
+            "target_files": [
+                "miniapp/app/static/manager/index.html",
+                "miniapp/app/static/manager/styles.css",
+                "miniapp/app/static/manager/app.js",
             ],
         },
         {"cluster_name": "role_client_ui_root", "target_files": ["miniapp/app/static/client/index.html"]},

@@ -131,32 +131,39 @@ class MiniappGenerationReportingRepair(MiniappGenerationRuntimeOwner):
                         expanded.append(candidate)
                         added.append(candidate)
             message = str(issue.message or "").lower()
+            is_ui_contract_issue = issue.code in {
+                "build.page_missing_script_link",
+                "build.page_script_dom_contract",
+                "connectivity.missing_ui_loading_state",
+                "connectivity.missing_ui_error_state",
+                "build.placeholder_role_surface",
+                "build.placeholder_page",
+                "loading_first_root_surface",
+            }
             if issue.code in {
                 "build.invalid_generated_app_graph",
                 "build.missing_role_routes",
                 "build.insufficient_routes",
                 "build.insufficient_pages",
-                "build.placeholder_role_surface",
-                "build.placeholder_page",
                 "build.missing_role_profile_page",
-                "build.page_missing_script_link",
-                "build.page_script_dom_contract",
-                "connectivity.missing_ui_loading_state",
-                "connectivity.missing_ui_error_state",
                 "tests.python_generated_app",
                 "tests.js_generated_app",
             } or any(marker in message for marker in ("route", "navigation", "manifest", "shared", "profile", "workspace", "workbench", "roleprofilerecord", "db.py", "schemas.py")):
-                for candidate in (
-                    "artifacts/generated_app_graph.json",
-                    "miniapp/app/main.py",
+                structural_candidates = [
                     "miniapp/app/db.py",
                     "miniapp/app/schemas.py",
                     "miniapp/app/routes/profiles.py",
                     "miniapp/app/static/shared/base.css",
                     "miniapp/app/static/preview_bridge.js",
-                    "miniapp/app/generated/route_manifest.json",
-                    "miniapp/app/generated/runtime_manifest.json",
-                ):
+                ]
+                if not is_ui_contract_issue:
+                    structural_candidates.extend(
+                        [
+                            "artifacts/generated_app_graph.json",
+                            "miniapp/app/main.py",
+                        ]
+                    )
+                for candidate in structural_candidates:
                     if candidate not in expanded:
                         expanded.append(candidate)
                         added.append(candidate)

@@ -101,6 +101,7 @@ def compile_prompt_to_scaffold(
     *,
     prompt: str,
     grounded_spec: GroundedSpecModel,
+    entity_contract: dict[str, Any] | None,
     role_scope: list[str],
     workspace_tree: list[dict[str, str]],
     design_reference_files: tuple[str, ...],
@@ -118,11 +119,15 @@ def compile_prompt_to_scaffold(
     role_contract_roles: dict[str, dict[str, Any]] = {}
     target_files: list[str] = []
     backend_targets = list(MINIMAL_BOOTSTRAP_TARGETS)
+    entity_route_file = str((entity_contract or {}).get("route_file") or "").strip().replace("\\", "/")
+    if entity_route_file.startswith("miniapp/app/routes/") and entity_route_file.endswith(".py"):
+        backend_targets.append(entity_route_file)
     for role in role_scope:
         pages = scaffold_role_pages_for_role(
             role=role,
             prompt=prompt,
             grounded_spec=grounded_spec,
+            entity_contract=entity_contract,
             default_page_file=default_page_file,
             default_page_asset_path=default_page_asset_path,
             default_handoff_paths_for_page_kind=default_handoff_paths_for_page_kind,
@@ -183,11 +188,12 @@ def scaffold_role_pages_for_role(
     role: str,
     prompt: str,
     grounded_spec: GroundedSpecModel,
+    entity_contract: dict[str, Any] | None,
     default_page_file,
     default_page_asset_path,
     default_handoff_paths_for_page_kind,
 ) -> list[dict[str, Any]]:
-    route_specs = _derive_role_route_specs(role=role, prompt=prompt, grounded_spec=grounded_spec)
+    route_specs = _derive_role_route_specs(role=role, prompt=prompt, grounded_spec=grounded_spec, entity_contract=entity_contract)
     all_routes = [spec["route_path"] for spec in route_specs]
     pages: list[dict[str, Any]] = []
     for spec in route_specs:
@@ -257,7 +263,7 @@ def scaffold_role_responsibility(role: str, grounded_spec: GroundedSpecModel) ->
     return grounded_spec.product_goal
 
 
-def _derive_role_route_specs(*, role: str, prompt: str, grounded_spec: GroundedSpecModel) -> list[dict[str, Any]]:
+def _derive_role_route_specs(*, role: str, prompt: str, grounded_spec: GroundedSpecModel, entity_contract: dict[str, Any] | None) -> list[dict[str, Any]]:
     route_specs: list[dict[str, Any]] = [
         {
             "route_path": "/",
@@ -277,7 +283,7 @@ def _derive_role_route_specs(*, role: str, prompt: str, grounded_spec: GroundedS
         },
     ]
     seen_paths = {spec["route_path"] for spec in route_specs}
-    for feature in _prompt_feature_routes(role=role, prompt=prompt, grounded_spec=grounded_spec):
+    for feature in _prompt_feature_routes(role=role, prompt=prompt, grounded_spec=grounded_spec, entity_contract=entity_contract):
         route_path = str(feature["route_path"])
         if route_path in seen_paths:
             continue
@@ -320,8 +326,11 @@ def _dependencies_for_route(role: str, route_path: str) -> list[str]:
     return []
 
 
-def _prompt_feature_routes(*, role: str, prompt: str, grounded_spec: GroundedSpecModel) -> list[dict[str, Any]]:
+def _prompt_feature_routes(*, role: str, prompt: str, grounded_spec: GroundedSpecModel, entity_contract: dict[str, Any] | None) -> list[dict[str, Any]]:
     candidates: list[tuple[str, str, str]] = []
+    preferred_slug = str((entity_contract or {}).get("detail_route_slug") or (entity_contract or {}).get("entity_slug_plural") or "").strip().lower()
+    preferred_label = str((entity_contract or {}).get("plural_label") or preferred_slug.replace("_", " ").title()).strip()
+    generic_feature_slugs = {"workflowrequests", "records", "submissions"}
     for requirement in grounded_spec.api_requirements:
         path = str(requirement.path or "").strip()
         if not path:
@@ -351,6 +360,9 @@ def _prompt_feature_routes(*, role: str, prompt: str, grounded_spec: GroundedSpe
     prompt_text = prompt.lower()
     role_evidence = _role_evidence(role=role, prompt=prompt, grounded_spec=grounded_spec)
     for slug, title, purpose in candidates:
+        if preferred_slug and slug in generic_feature_slugs:
+            slug = preferred_slug
+            title = preferred_label or title
         if slug in seen_slugs:
             continue
         if slug not in prompt_text and slug not in role_evidence:
@@ -369,6 +381,24 @@ def _prompt_feature_routes(*, role: str, prompt: str, grounded_spec: GroundedSpe
         )
         if len(feature_routes) >= 2:
             break
+    if not feature_routes and preferred_slug:
+        feature_routes.append(
+            {
+                "route_path": f"/{preferred_slug}",
+                "page_kind": "feature",
+                "navigation_label": preferred_label.split()[0] if preferred_label else preferred_slug.replace("_", " ").title(),
+                "title": preferred_label or preferred_slug.replace("_", " ").title(),
+                "purpose": f"{role.capitalize()} feature flow for the prompt-derived primary entity.",
+                "data_dependencies": [
+                    value
+                    for value in (
+                        str((entity_contract or {}).get("api_path") or "").strip(),
+                        str((entity_contract or {}).get("detail_api_path") or "").strip(),
+                    )
+                    if value
+                ],
+            }
+        )
     return feature_routes
 
 

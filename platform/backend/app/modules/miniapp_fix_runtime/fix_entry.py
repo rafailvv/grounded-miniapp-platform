@@ -311,6 +311,7 @@ class FixEntryRuntime:
                 run_id=run_id,
                 attempt=attempt,
                 request=request,
+                generation_mode=effective_mode,
                 check_execution=latest_execution,
                 preview_details=latest_preview_details,
                 prior_attempts=[],
@@ -361,7 +362,9 @@ class FixEntryRuntime:
             last_prompt_context = None
             seen_tool_request_signatures: set[str] = set()
             api_diag_test_reread_count = 0
-            for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
+            repeated_nonprogress_tool_requests = 0
+            tool_round_limit = self.service._tool_round_limit_for_mode(effective_mode)
+            for tool_round in range(tool_round_limit + 1):
                 prompt_context = self.service._build_repair_packet(
                     workspace_id=workspace_id,
                     run_id=run_id,
@@ -441,11 +444,33 @@ class FixEntryRuntime:
                                 metadata={"tool_requests": list(repair_outcome.tool_requests), "stall_reason": "repeated_test_reread"},
                             )
                     elif duplicate_request or already_satisfied_read:
+                        repeated_nonprogress_tool_requests += 1
+                        if repeated_nonprogress_tool_requests >= 2:
+                            return WorkspaceLoopTurnPlan(
+                                outcome="no_op",
+                                assistant_message=(
+                                    "The fix loop repeated already-satisfied tool requests instead of returning a patch."
+                                ),
+                                diagnosis=(
+                                    "The requested diagnostic context is already present in file_contexts/tool_results. "
+                                    "Return operations for the current route/schema/db/UI cluster or escalate the repair base."
+                                ),
+                                files_read=list(prompt_context.file_contexts.keys()),
+                                failure_class=fix_turn.failure_class,
+                                failure_signature=fix_turn.failure_signature,
+                                root_cause_summary=fix_turn.root_cause_summary,
+                                fix_targets=list(fix_turn.implicated_files),
+                                metadata={
+                                    "tool_requests": list(repair_outcome.tool_requests),
+                                    "stall_reason": "repeated_satisfied_tool_request",
+                                },
+                            )
                         requested_paths = []
                         executed_tool_results = [
                             self._duplicate_tool_request_feedback(normalized_tool_requests),
                         ]
                     else:
+                        repeated_nonprogress_tool_requests = 0
                         if tool_request_signature:
                             seen_tool_request_signatures.add(tool_request_signature)
                         requested_paths, executed_tool_results = _execute_tool_requests(
@@ -466,7 +491,7 @@ class FixEntryRuntime:
                             "tool_requests": list(repair_outcome.tool_requests),
                         },
                     )
-                    if tool_round < self.MAX_TOOL_ROUNDS and (requested_paths or executed_tool_results):
+                    if tool_round < tool_round_limit and (requested_paths or executed_tool_results):
                         continue
                     return WorkspaceLoopTurnPlan(
                         outcome="needs_context",
@@ -554,7 +579,7 @@ class FixEntryRuntime:
             draft_source=draft_source,
             role_scope=self.service._role_scope_for_fix_request(workspace_id, run_id, request),
             generation_mode=effective_mode,
-            max_attempts=self.service.MAX_ATTEMPTS,
+            max_attempts=self.service._max_attempts_for_mode(effective_mode),
             initial_operations=[],
             initial_assistant_message="Fix workspace loop initialized.",
             initial_files_read=[],

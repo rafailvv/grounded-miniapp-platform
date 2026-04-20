@@ -5,7 +5,7 @@ from typing import Any
 
 
 class ArtifactPythonTestsMixin:
-    def python_app_level_test_content(self, *, page_graph: dict[str, Any], role_scope: list[str]) -> str:
+    def python_app_level_test_content(self, *, page_graph: dict[str, Any], role_scope: list[str], entity_contract: dict[str, Any] | None = None) -> str:
         roles_literal = ", ".join(repr(role) for role in role_scope)
         backend_targets = [
             self._normalize_runtime_python_path(str(path))
@@ -13,6 +13,7 @@ class ArtifactPythonTestsMixin:
             if isinstance(path, str) and path.startswith("miniapp/app/")
         ]
         backend_targets_literal = json.dumps(sorted(dict.fromkeys(backend_targets)), ensure_ascii=True, indent=2)
+        entity_contract_literal = repr(json.dumps(entity_contract or {}, ensure_ascii=True, sort_keys=True))
         template = r'''from __future__ import annotations
 
 import importlib
@@ -23,6 +24,7 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import get_args, get_origin
 
 from fastapi.testclient import TestClient
 
@@ -32,6 +34,7 @@ if str(MINIAPP_DIR) not in sys.path:
 
 ROLES = (__ROLES_LITERAL__,)
 EXPECTED_BACKEND_TARGETS = __BACKEND_TARGETS_LITERAL__
+ENTITY_CONTRACT = json.loads(__ENTITY_CONTRACT_LITERAL__)
 
 
 def _load_json(path: Path) -> dict:
@@ -164,6 +167,83 @@ def _resource_slug(path: str) -> str:
     return api_parts[0] if api_parts else ""
 
 
+def _schema_prefix_candidates(resource_slug: str) -> list[str]:
+    candidates: list[str] = []
+    for raw in (
+        (ENTITY_CONTRACT or {}).get("schema_prefix"),
+        (ENTITY_CONTRACT or {}).get("singular_label"),
+        (ENTITY_CONTRACT or {}).get("plural_label"),
+        resource_slug[:-1] if resource_slug.endswith("s") and len(resource_slug) > 3 else resource_slug,
+        resource_slug,
+    ):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        normalized = "".join(part.capitalize() for part in re.split(r"[_-]+", text) if part)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
+def _string_literal_choices(annotation) -> list[str]:
+    origin = get_origin(annotation)
+    if origin is None:
+        return []
+    if str(origin).endswith("Literal"):
+        return [str(arg) for arg in get_args(annotation) if isinstance(arg, str)]
+    choices: list[str] = []
+    for arg in get_args(annotation):
+        for value in _string_literal_choices(arg):
+            if value not in choices:
+                choices.append(value)
+    return choices
+
+
+def _field_literal_choices(resource_slug: str, field_name: str, *, suffixes=("Create", "Update", "Read")) -> list[str]:
+    try:
+        schemas_module = importlib.import_module("app.schemas")
+    except Exception:
+        return []
+    for prefix in _schema_prefix_candidates(resource_slug):
+        for suffix in suffixes:
+            schema_model = getattr(schemas_module, f"{prefix}{suffix}", None)
+            if not isinstance(schema_model, type):
+                continue
+            fields = getattr(schema_model, "model_fields", {}) or {}
+            field = fields.get(field_name)
+            if field is None:
+                continue
+            choices = _string_literal_choices(getattr(field, "annotation", None))
+            if choices:
+                return choices
+    return []
+
+
+def _pick_status_value(resource_slug: str) -> str:
+    preferred = (
+        "requested",
+        "pending",
+        "submitted",
+        "open",
+        "new",
+        "draft",
+        "queued",
+        "in_review",
+        "active",
+        "approved",
+        "issued",
+        "in_progress",
+        "returned",
+        "closed",
+        "rejected",
+    )
+    choices = _field_literal_choices(resource_slug, "status", suffixes=("Update", "Create", "Read"))
+    for candidate in preferred:
+        if candidate in choices:
+            return candidate
+    return choices[0] if choices else "requested"
+
+
 def _extract_record_id(payload):
     if isinstance(payload, dict):
         for key in ("id", "request_id", "submission_id", "task_id", "item_id", "record_id"):
@@ -227,6 +307,7 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
     if method == "GET":
         return None
     payload = {}
+    resource_slug = _resource_slug(path)
     field_definitions = requirement.get("fields") or requirement.get("request_fields") or []
     for field in field_definitions:
         if not isinstance(field, dict):
@@ -238,9 +319,10 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
         if lowered in {"id", "request_id", "submission_id", "task_id", "item_id", "record_id"} and created_id:
             payload[name] = created_id
         elif lowered in {"status", "state"}:
-            payload[name] = "requested"
+            payload[name] = _pick_status_value(resource_slug)
         elif lowered in {"item_type", "request_type", "resource_type"}:
-            payload[name] = "resource"
+            choices = _field_literal_choices(resource_slug, name, suffixes=("Create", "Update", "Read"))
+            payload[name] = choices[0] if choices else "resource"
         elif lowered in {"item_label", "equipment_details", "item_name", "preferred_item", "request_label", "resource_label"}:
             payload[name] = "Primary resource"
         elif lowered in {"comment", "note", "message"}:
@@ -274,28 +356,73 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
     if not payload:
         path_tokens = str(path).lower()
         if method == "POST" and any(token in path_tokens for token in ("booking", "reservation", "request", "requests", "loan", "appointment", "task")):
+            type_choices = _field_literal_choices(resource_slug, "request_type", suffixes=("Create", "Update", "Read"))
+            if not type_choices:
+                type_choices = _field_literal_choices(resource_slug, "item_type", suffixes=("Create", "Update", "Read"))
+            if not type_choices:
+                type_choices = _field_literal_choices(resource_slug, "resource_type", suffixes=("Create", "Update", "Read"))
             payload = {
-                "item_type": "resource",
+                "item_type": type_choices[0] if type_choices else "resource",
                 "item_label": "Primary resource",
                 "start_date": "2026-04-17T10:00:00Z",
                 "end_date": "2026-04-18T18:00:00Z",
                 "reason": "Resource needed for an internal workflow.",
             }
         elif method in {"PUT", "PATCH"} and any(token in path_tokens for token in ("booking", "reservation", "request", "requests", "loan", "appointment", "task")):
-            payload = {"status": "in_progress"}
+            payload = {"status": _pick_status_value(resource_slug)}
     if not payload and method in {"POST", "PUT", "PATCH"}:
-        payload = {"name": "sample", "status": "requested"}
+        payload = {"name": "sample", "status": _pick_status_value(resource_slug)}
     return payload
 
 
 def _workflow_api_requirements(grounded_spec: dict) -> list[dict]:
-    return [
+    requirements = [
         item
         for item in grounded_spec.get("api_requirements", [])
         if isinstance(item, dict)
         and str(item.get("path") or "").startswith("/api/")
         and not str(item.get("path") or "").startswith("/api/runtime/")
     ]
+    entity_api_path = str((ENTITY_CONTRACT or {}).get("api_path") or "").strip()
+    entity_detail_api_path = str((ENTITY_CONTRACT or {}).get("detail_api_path") or "").strip()
+    entity_key_fields = [
+        field
+        for field in (ENTITY_CONTRACT or {}).get("key_fields") or []
+        if isinstance(field, dict) and str(field.get("name") or "").strip()
+    ]
+    if entity_api_path:
+        existing_paths = {
+            str(item.get("path") or "").strip()
+            for item in requirements
+            if isinstance(item, dict)
+        }
+        if entity_api_path not in existing_paths:
+            requirements.extend(
+                [
+                    {
+                        "name": str((ENTITY_CONTRACT or {}).get("plural_label") or "records"),
+                        "path": entity_api_path,
+                        "method": "POST",
+                        "fields": entity_key_fields,
+                    },
+                    {
+                        "name": str((ENTITY_CONTRACT or {}).get("plural_label") or "records"),
+                        "path": entity_api_path,
+                        "method": "GET",
+                        "fields": [],
+                    },
+                ]
+            )
+        if entity_detail_api_path and entity_detail_api_path not in existing_paths:
+            requirements.append(
+                {
+                    "name": str((ENTITY_CONTRACT or {}).get("singular_label") or "record"),
+                    "path": entity_detail_api_path,
+                    "method": "PATCH",
+                    "fields": [{"name": "status"}],
+                }
+            )
+    return requirements
 
 
 class GeneratedMiniAppTests(unittest.TestCase):
@@ -414,10 +541,26 @@ class GeneratedMiniAppTests(unittest.TestCase):
                     self.assertLess(response.status_code, 400, f"{file_path} links to local route {route_ref} that does not resolve")
 
     def test_role_journey_round_trip_persists_shared_record(self) -> None:
-        workflow_tokens = {"request", "requests", "record", "records", "order", "orders", "task", "tasks", "submission", "submissions", "item", "items"}
-        create_requirement = _pick_workflow_api(self.workflow_api_requirements, methods={"POST"}, tokens_any=workflow_tokens)
+        entity_tokens = {
+            token.lower()
+            for token in (
+                str((ENTITY_CONTRACT or {}).get("entity_slug") or ""),
+                str((ENTITY_CONTRACT or {}).get("entity_slug_plural") or ""),
+                str((ENTITY_CONTRACT or {}).get("singular_label") or ""),
+                str((ENTITY_CONTRACT or {}).get("plural_label") or ""),
+            )
+            if str(token or "").strip()
+        }
+        workflow_tokens = entity_tokens | {"request", "requests", "record", "records", "order", "orders", "task", "tasks", "submission", "submissions", "item", "items"}
+        preferred_resource = _resource_slug(str((ENTITY_CONTRACT or {}).get("api_path") or ""))
+        create_requirement = _pick_workflow_api(
+            self.workflow_api_requirements,
+            methods={"POST"},
+            tokens_any=workflow_tokens,
+            preferred_resource=preferred_resource,
+        )
         self.assertIsNotNone(create_requirement, "Generated app must expose a POST workflow API for creating persisted records.")
-        preferred_resource = _resource_slug(str(create_requirement.get("path") or ""))
+        preferred_resource = preferred_resource or _resource_slug(str(create_requirement.get("path") or ""))
         list_requirement = _pick_workflow_api(
             self.workflow_api_requirements,
             methods={"GET"},
@@ -505,4 +648,4 @@ class GeneratedMiniAppTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 '''
-        return template.replace("__ROLES_LITERAL__", roles_literal).replace("__BACKEND_TARGETS_LITERAL__", backend_targets_literal)
+        return template.replace("__ROLES_LITERAL__", roles_literal).replace("__BACKEND_TARGETS_LITERAL__", backend_targets_literal).replace("__ENTITY_CONTRACT_LITERAL__", entity_contract_literal)

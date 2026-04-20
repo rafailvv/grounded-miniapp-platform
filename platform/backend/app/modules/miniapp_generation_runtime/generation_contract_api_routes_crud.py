@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 
 class MiniappGenerationContractApiRoutesCrud:
     @staticmethod
@@ -11,240 +13,311 @@ class MiniappGenerationContractApiRoutesCrud:
         normalized_slug = str(resource_slug or "").strip().strip("/").replace("\\", "/")
         normalized_slug = normalized_slug.replace("-", "_")
         normalized_slug = normalized_slug or "records"
-        source = """from __future__ import annotations
+        resource_path = normalized_slug.replace("_", "-")
+        singular_slug = normalized_slug[:-1] if normalized_slug.endswith("s") and len(normalized_slug) > 3 else normalized_slug
+        if singular_slug.endswith("ie"):
+            singular_slug = singular_slug[:-2] + "y"
+        schema_prefix = "".join(part.capitalize() for part in re.split(r"[_-]+", singular_slug) if part) or "Record"
+        source = f'''from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, get_args, get_origin
 from uuid import uuid4
 
 from fastapi import APIRouter, Body, HTTPException
-from sqlalchemy import text
+from pydantic import ValidationError
+from sqlalchemy import func, inspect, select
 
-from app.db import engine
+import app.db as db_module
+import app.schemas as schemas_module
+from app.db import Base, SessionLocal, engine
 
-router = APIRouter(prefix="/api", tags=["requests"])
+RESOURCE_SLUG = "{resource_path}"
+RESOURCE_SINGULAR = "{singular_slug}"
+SCHEMA_PREFIX = "{schema_prefix}"
 
-
-def _ensure_tables() -> None:
-    with engine.begin() as conn:
-        conn.execute(text(
-            "CREATE TABLE IF NOT EXISTS requests ("
-            "id TEXT PRIMARY KEY, "
-            "title TEXT, "
-            "description TEXT, "
-            "client_name TEXT, "
-            "phone TEXT, "
-            "preferred_time TEXT, "
-            "comment TEXT, "
-            "status TEXT, "
-            "assigned_specialist TEXT, "
-            "item_type TEXT, "
-            "item_label TEXT, "
-            "start_date TEXT, "
-            "end_date TEXT, "
-            "reason TEXT, "
-            "specialist_notes TEXT, "
-            "created_at TEXT, "
-            "updated_at TEXT)"
-        ))
-        conn.execute(text(
-            "CREATE TABLE IF NOT EXISTS comments ("
-            "id TEXT PRIMARY KEY, "
-            "request_id TEXT, "
-            "comment TEXT, "
-            "author_role TEXT, "
-            "created_at TEXT)"
-        ))
+router = APIRouter(prefix="/api", tags=[RESOURCE_SLUG])
 
 
-def _serialize_request(row: Any) -> dict[str, Any]:
-    mapping = getattr(row, "_mapping", row)
-    start_date = mapping.get("start_date") or ""
-    end_date = mapping.get("end_date") or ""
-    return {
-        "request_id": mapping["id"],
-        "id": mapping["id"],
-        "submission_id": mapping["id"],
-        "title": mapping["title"] or "Request",
-        "description": mapping["description"] or "",
-        "client_name": mapping["client_name"] or "",
-        "phone": mapping["phone"] or "",
-        "preferred_time": mapping["preferred_time"] or "",
-        "comment": mapping["comment"] or "",
-        "status": mapping["status"] or "submitted",
-        "assigned_specialist": mapping["assigned_specialist"],
-        "specialist": mapping["assigned_specialist"] or "",
-        "item_type": mapping.get("item_type") or "",
-        "item_label": mapping.get("item_label") or "",
-        "resource_type": mapping.get("item_type") or "",
-        "start_date": start_date,
-        "end_date": end_date,
-        "date_range": f"{start_date} → {end_date}" if start_date and end_date else start_date or end_date or "Dates to be confirmed",
-        "reason": mapping.get("reason") or mapping["description"] or mapping["comment"] or "",
-        "specialist_notes": mapping.get("specialist_notes") or "",
-        "availability": "Availability is derived from active records in the shared queue.",
-        "conflict": "No conflicts reported yet.",
-        "created_at": mapping["created_at"],
-        "updated_at": mapping["updated_at"],
-    }
+def _candidate_table_names() -> set[str]:
+    return {{
+        RESOURCE_SLUG,
+        RESOURCE_SLUG.replace("-", "_"),
+        RESOURCE_SINGULAR,
+        RESOURCE_SINGULAR.replace("-", "_"),
+    }}
 
 
-def _fetch_request(conn: Any, request_id: str) -> Any | None:
-    return conn.execute(text("SELECT * FROM requests WHERE id = :id"), {"id": request_id}).first()
+def _candidate_schema_names() -> list[str]:
+    return [SCHEMA_PREFIX]
 
 
-def _fetch_comments(conn: Any, request_id: str) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        text("SELECT id, request_id, comment, author_role, created_at FROM comments WHERE request_id = :request_id ORDER BY created_at ASC"),
-        {"request_id": request_id},
-    ).fetchall()
-    return [
-        {
-            "comment_id": row._mapping["id"],
-            "request_id": row._mapping["request_id"],
-            "comment": row._mapping["comment"] or "",
-            "author_role": row._mapping["author_role"] or "",
-            "created_at": row._mapping["created_at"],
-        }
-        for row in rows
-    ]
-
-
-def _timeline_for_request(request: dict[str, Any], comments: list[dict[str, Any]]) -> list[dict[str, str]]:
-    timeline = [
-        {"title": "Submitted", "note": request.get("created_at") or "Created"},
-        {"title": "Current status", "note": request.get("status") or "submitted"},
-    ]
-    for item in comments[-3:]:
-        note = (item.get("comment") or "").strip()
-        if not note:
+def _resource_model() -> type[Any]:
+    for value in vars(db_module).values():
+        if not isinstance(value, type):
             continue
-        timeline.append({"title": f"{item.get('author_role') or 'team'} note", "note": note})
-    return timeline
+        if value is Base or not issubclass(value, Base):
+            continue
+        table_name = str(getattr(value, "__tablename__", "") or "").strip().lower()
+        if table_name and table_name in _candidate_table_names():
+            return value
+    for prefix in _candidate_schema_names():
+        for candidate in (f"{{prefix}}Record", f"{{prefix}}Item", f"{{prefix}}Row"):
+            value = getattr(db_module, candidate, None)
+            if isinstance(value, type):
+                return value
+    raise RuntimeError(f"Unable to locate a DB record model for {{RESOURCE_SLUG}}")
 
 
-@router.get("/requests")
-def list_requests() -> dict[str, list[dict[str, Any]]]:
-    _ensure_tables()
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT * FROM requests ORDER BY created_at DESC")).fetchall()
-    return {"items": [_serialize_request(row) for row in rows]}
+def _schema_model(suffixes: tuple[str, ...]) -> type[Any] | None:
+    for prefix in _candidate_schema_names():
+        for suffix in suffixes:
+            value = getattr(schemas_module, f"{{prefix}}{{suffix}}", None)
+            if isinstance(value, type):
+                return value
+    return None
 
 
-@router.post("/requests")
-def create_request(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
-    _ensure_tables()
-    request_id = str(payload.get("request_id") or payload.get("id") or uuid4().hex[:12])
-    now = datetime.now(timezone.utc).isoformat()
-    record = {
-        "id": request_id,
-        "title": str(payload.get("title") or payload.get("request_type") or payload.get("item_type") or payload.get("task") or payload.get("subject") or "Request"),
-        "description": str(payload.get("description") or payload.get("details") or payload.get("reason") or ""),
-        "client_name": str(payload.get("requested_by") or payload.get("name") or payload.get("client_name") or ""),
-        "phone": str(payload.get("phone") or ""),
-        "preferred_time": str(payload.get("preferred_time") or payload.get("date") or payload.get("slot") or payload.get("start_date") or ""),
-        "comment": str(payload.get("comment") or payload.get("notes") or ""),
-        "status": str(payload.get("status") or "submitted"),
-        "assigned_specialist": payload.get("assigned_specialist"),
-        "item_type": str(payload.get("item_type") or payload.get("request_type") or payload.get("title") or ""),
-        "item_label": str(payload.get("item_label") or payload.get("request_label") or payload.get("item_name") or ""),
-        "start_date": str(payload.get("start_date") or ""),
-        "end_date": str(payload.get("end_date") or ""),
-        "reason": str(payload.get("reason") or payload.get("purpose") or payload.get("description") or ""),
-        "specialist_notes": str(payload.get("specialist_notes") or ""),
-        "created_at": now,
-        "updated_at": now,
-    }
-    with engine.begin() as conn:
-        conn.execute(text(
-            "INSERT OR REPLACE INTO requests "
-            "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, item_type, item_label, start_date, end_date, reason, specialist_notes, created_at, updated_at) "
-            "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :item_type, :item_label, :start_date, :end_date, :reason, :specialist_notes, :created_at, :updated_at)"
-        ), record)
-        row = _fetch_request(conn, request_id)
-    return _serialize_request(row)
+def _create_schema_model() -> type[Any] | None:
+    return _schema_model(("Create",))
 
 
-@router.get("/requests/{request_id}")
-def get_request(request_id: str) -> dict[str, Any]:
-    _ensure_tables()
-    with engine.begin() as conn:
-        row = _fetch_request(conn, request_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail="Request not found")
-        payload = _serialize_request(row)
-        comments = _fetch_comments(conn, request_id)
-    payload["comments"] = comments
-    payload["timeline"] = _timeline_for_request(payload, comments)
-    return payload
+def _update_schema_model() -> type[Any] | None:
+    return _schema_model(("Update",))
 
 
-@router.patch("/requests/{request_id}")
-def update_request(request_id: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
-    _ensure_tables()
-    now = datetime.now(timezone.utc).isoformat()
-    with engine.begin() as conn:
-        row = _fetch_request(conn, request_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail="Request not found")
-        current = _serialize_request(row)
-        record = {
-            "id": request_id,
-            "title": str(payload.get("title") or current.get("title") or "Request"),
-            "description": str(payload.get("description") or current.get("description") or ""),
-            "client_name": str(payload.get("client_name") or current.get("client_name") or ""),
-            "phone": str(payload.get("phone") or current.get("phone") or ""),
-            "preferred_time": str(payload.get("preferred_time") or current.get("preferred_time") or ""),
-            "comment": str(payload.get("comment") or current.get("comment") or ""),
-            "status": str(payload.get("status") or current.get("status") or "submitted"),
-            "assigned_specialist": payload.get("assigned_specialist") if payload.get("assigned_specialist") is not None else current.get("assigned_specialist"),
-            "item_type": str(payload.get("item_type") or current.get("item_type") or ""),
-            "item_label": str(payload.get("item_label") or current.get("item_label") or ""),
-            "start_date": str(payload.get("start_date") or current.get("start_date") or ""),
-            "end_date": str(payload.get("end_date") or current.get("end_date") or ""),
-            "reason": str(payload.get("reason") or current.get("reason") or ""),
-            "specialist_notes": str(payload.get("specialist_notes") or current.get("specialist_notes") or ""),
-            "created_at": current.get("created_at") or now,
-            "updated_at": now,
-        }
-        conn.execute(text(
-            "INSERT OR REPLACE INTO requests "
-            "(id, title, description, client_name, phone, preferred_time, comment, status, assigned_specialist, item_type, item_label, start_date, end_date, reason, specialist_notes, created_at, updated_at) "
-            "VALUES (:id, :title, :description, :client_name, :phone, :preferred_time, :comment, :status, :assigned_specialist, :item_type, :item_label, :start_date, :end_date, :reason, :specialist_notes, :created_at, :updated_at)"
-        ), record)
-        updated = _fetch_request(conn, request_id)
-    return _serialize_request(updated)
+def _read_schema_model() -> type[Any] | None:
+    return _schema_model(("Read", "Summary", "Detail"))
 
 
-@router.patch("/requests/{request_id}/status")
-def update_request_status(request_id: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
-    _ensure_tables()
-    status = str(payload.get("status") or "in_review")
-    now = datetime.now(timezone.utc).isoformat()
-    with engine.begin() as conn:
-        row = _fetch_request(conn, request_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail="Request not found")
-        conn.execute(text("UPDATE requests SET status = :status, updated_at = :updated_at WHERE id = :id"), {"id": request_id, "status": status, "updated_at": now})
-        row = _fetch_request(conn, request_id)
-    return _serialize_request(row)
-"""
-        if normalized_slug == "requests":
-            return source
-        replacement_slug = normalized_slug.replace("_", "-")
-        source = source.replace('tags=["requests"]', f'tags=["{replacement_slug}"]')
-        source = source.replace('@router.get("/requests/{request_id}")', f'@router.get("/{replacement_slug}/{{record_id}}")')
-        source = source.replace('def get_request(request_id: str)', 'def get_request(record_id: str)')
-        source = source.replace('@router.patch("/requests/{request_id}/status")', f'@router.patch("/{replacement_slug}/{{record_id}}/status")')
-        source = source.replace('def update_request_status(request_id: str, payload: dict[str, Any] = Body(default_factory=dict))', 'def update_request_status(record_id: str, payload: dict[str, Any] = Body(default_factory=dict))')
-        source = source.replace('@router.patch("/requests/{request_id}")', f'@router.patch("/{replacement_slug}/{{record_id}}")')
-        source = source.replace('def update_request(request_id: str, payload: dict[str, Any] = Body(default_factory=dict))', 'def update_request(record_id: str, payload: dict[str, Any] = Body(default_factory=dict))')
-        source = source.replace('@router.post("/requests")', f'@router.post("/{replacement_slug}")')
-        source = source.replace('@router.get("/requests")', f'@router.get("/{replacement_slug}")')
-        source = source.replace('request_id = str(payload.get("request_id") or payload.get("id") or uuid4().hex[:12])', 'request_id = str(payload.get("record_id") or payload.get("request_id") or payload.get("id") or uuid4().hex[:12])')
-        source = source.replace('row = _fetch_request(conn, request_id)', 'row = _fetch_request(conn, record_id)', 1)
-        source = source.replace('payload["comments"] = comments\n    payload["timeline"] = _timeline_for_request(payload, comments)\n    return payload', 'payload["comments"] = comments\n    payload["timeline"] = _timeline_for_request(payload, comments)\n    return payload')
-        source = source.replace('assignment_request_id = str(request_id or payload.get("request_id") or payload.get("id") or "")', 'assignment_request_id = str(request_id or payload.get("record_id") or payload.get("request_id") or payload.get("id") or "")')
+def _list_schema_model() -> type[Any] | None:
+    return _schema_model(("ListResponse",))
+
+
+def _status_literals() -> list[str]:
+    for schema_model in (_update_schema_model(), _read_schema_model(), _create_schema_model()):
+        if schema_model is None:
+            continue
+        fields = getattr(schema_model, "model_fields", {{}}) or {{}}
+        status_field = fields.get("status")
+        if status_field is None:
+            continue
+        annotation = getattr(status_field, "annotation", None)
+        origin = get_origin(annotation)
+        if origin is None:
+            continue
+        literals = [str(item) for item in get_args(annotation) if isinstance(item, str)]
+        if literals:
+            return literals
+    return []
+
+
+def _normalize_status(value: Any) -> Any:
+    if value is None:
+        return None
+    status = str(value).strip()
+    if not status:
+        return None
+    allowed = _status_literals()
+    if not allowed or status in allowed:
+        return status
+    if status == "in_progress":
+        for candidate in ("claimed", "in_review", "issued", "open", "active", "processing"):
+            if candidate in allowed:
+                return candidate
+    return allowed[0]
+
+
+def _model_inspector():
+    return inspect(_resource_model())
+
+
+def _primary_key_name() -> str:
+    primary_keys = list(_model_inspector().primary_key)
+    if not primary_keys:
+        return "id"
+    return str(primary_keys[0].key)
+
+
+def _primary_key_python_type() -> type[Any]:
+    primary_keys = list(_model_inspector().primary_key)
+    if not primary_keys:
+        return str
+    column = primary_keys[0]
+    try:
+        return column.type.python_type
+    except Exception:
+        return str
+
+
+def _coerce_primary_key(value: str) -> Any:
+    python_type = _primary_key_python_type()
+    if python_type is str:
+        return str(value)
+    try:
+        return python_type(value)
+    except Exception:
+        return value
+
+
+def _column_keys() -> list[str]:
+    return [str(column.key) for column in _model_inspector().columns]
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _normalize_payload(payload: dict[str, Any], *, partial: bool) -> dict[str, Any]:
+    schema_model = _update_schema_model() if partial else _create_schema_model()
+    data = dict(payload or {{}})
+    if schema_model is None:
+        if "status" in data:
+            normalized_status = _normalize_status(data.get("status"))
+            if normalized_status is not None:
+                data["status"] = normalized_status
+        return data
+    try:
+        validated = schema_model.model_validate(data)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+    dumped = validated.model_dump(exclude_none=partial)
+    if "status" in dumped:
+        normalized_status = _normalize_status(dumped.get("status"))
+        if normalized_status is not None:
+            dumped["status"] = normalized_status
+    return dumped
+
+
+def _normalize_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _record_to_payload(record: Any) -> dict[str, Any]:
+    payload = {{
+        key: _normalize_value(getattr(record, key))
+        for key in _column_keys()
+    }}
+    primary_key = _primary_key_name()
+    record_id = payload.get(primary_key)
+    if record_id is not None:
+        record_id = str(record_id)
+        payload.setdefault(primary_key, record_id)
+        payload.setdefault("id", record_id)
+        payload.setdefault("record_id", record_id)
+        payload.setdefault(f"{{RESOURCE_SINGULAR}}_id", record_id)
+        payload.setdefault("request_id", record_id)
+    read_schema = _read_schema_model()
+    if read_schema is None:
+        return payload
+    try:
+        return read_schema.model_validate(payload).model_dump(mode="json")
+    except ValidationError:
+        return payload
+
+
+def _apply_model_defaults(record: Any) -> None:
+    primary_key = _primary_key_name()
+    if getattr(record, primary_key, None) in (None, "") and _primary_key_python_type() is str:
+        setattr(record, primary_key, uuid4().hex[:12])
+    now = _now()
+    for field in ("created_at", "updated_at"):
+        if field in _column_keys() and getattr(record, field, None) is None:
+            setattr(record, field, now)
+
+
+def _apply_payload(record: Any, payload: dict[str, Any], *, partial: bool) -> None:
+    mutable_columns = set(_column_keys())
+    primary_key = _primary_key_name()
+    mutable_columns.discard(primary_key)
+    for key, value in payload.items():
+        if key not in mutable_columns:
+            continue
+        if value is None and partial:
+            continue
+        setattr(record, key, value)
+    if "updated_at" in mutable_columns:
+        setattr(record, "updated_at", _now())
+
+
+def _list_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
+    list_schema = _list_schema_model()
+    base_payload = {{"items": items}}
+    if list_schema is None:
+        return base_payload
+    try:
+        return list_schema.model_validate(base_payload).model_dump(mode="json")
+    except ValidationError:
+        return base_payload
+
+
+@router.get(f"/{{RESOURCE_SLUG}}/status-counts")
+def list_status_counts() -> dict[str, Any]:
+    model = _resource_model()
+    if "status" not in _column_keys():
+        return {{"items": []}}
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(getattr(model, "status"), func.count()).group_by(getattr(model, "status"))
+        ).all()
+    return {{
+        "items": [
+            {{"status": str(status or ""), "count": int(count or 0)}}
+            for status, count in rows
+        ]
+    }}
+
+
+@router.get(f"/{{RESOURCE_SLUG}}")
+def list_records() -> dict[str, Any]:
+    model = _resource_model()
+    order_field = "updated_at" if "updated_at" in _column_keys() else "created_at" if "created_at" in _column_keys() else _primary_key_name()
+    with SessionLocal() as session:
+        rows = session.scalars(select(model).order_by(getattr(model, order_field).desc())).all()
+    return _list_payload([_record_to_payload(item) for item in rows])
+
+
+@router.post(f"/{{RESOURCE_SLUG}}")
+def create_record(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    model = _resource_model()
+    normalized = _normalize_payload(payload, partial=False)
+    record = model()
+    _apply_model_defaults(record)
+    _apply_payload(record, normalized, partial=False)
+    with SessionLocal() as session:
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return _record_to_payload(record)
+
+
+@router.get(f"/{{RESOURCE_SLUG}}/{{{{item_id}}}}")
+def get_record(item_id: str) -> dict[str, Any]:
+    model = _resource_model()
+    with SessionLocal() as session:
+        record = session.get(model, _coerce_primary_key(item_id))
+        if record is None:
+            raise HTTPException(status_code=404, detail="Record not found")
+        return _record_to_payload(record)
+
+
+@router.put(f"/{{RESOURCE_SLUG}}/{{{{item_id}}}}")
+@router.patch(f"/{{RESOURCE_SLUG}}/{{{{item_id}}}}")
+def update_record(item_id: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    model = _resource_model()
+    normalized = _normalize_payload(payload, partial=True)
+    with SessionLocal() as session:
+        record = session.get(model, _coerce_primary_key(item_id))
+        if record is None:
+            raise HTTPException(status_code=404, detail="Record not found")
+        _apply_payload(record, normalized, partial=True)
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return _record_to_payload(record)
+'''
         return source
 
     @staticmethod

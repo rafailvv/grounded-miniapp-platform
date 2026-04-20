@@ -46,7 +46,6 @@ class WorkspaceLoopTurnRunner:
         initial_changed_files: list[str],
         callbacks: WorkspaceLoopCallbacks,
     ) -> WorkspaceLoopResult:
-        del generation_mode
         latest_execution = None
         latest_preview_details: dict[str, object] = {}
         latest_apply_result = None
@@ -62,6 +61,7 @@ class WorkspaceLoopTurnRunner:
         repeated_no_progress = 0
         context_mode: LoopContextMode = "minimal"
         last_turn_summary: str | None = None
+        full_bundle_no_progress_limit = 1 if generation_mode == GenerationMode.FAST else 3 if generation_mode == GenerationMode.QUALITY else self.MAX_FULL_BUNDLE_NO_PROGRESS
 
         for attempt in range(max_attempts + 1):
             if callbacks.stop_if_requested and callbacks.stop_if_requested():
@@ -188,7 +188,7 @@ class WorkspaceLoopTurnRunner:
                     context_mode = "expanded"
                 elif context_mode == "expanded":
                     context_mode = "full_bundle"
-                elif repeated_no_progress >= self.MAX_FULL_BUNDLE_NO_PROGRESS:
+                elif repeated_no_progress >= full_bundle_no_progress_limit:
                     return self.results.failed(
                         outcome_kind="blocked_generation",
                         summary="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
@@ -314,7 +314,7 @@ class WorkspaceLoopTurnRunner:
                     context_mode = "expanded"
                 elif context_mode == "expanded":
                     context_mode = "full_bundle"
-                elif repeated_no_progress >= self.MAX_FULL_BUNDLE_NO_PROGRESS:
+                elif repeated_no_progress >= full_bundle_no_progress_limit:
                     return self.results.failed(
                         outcome_kind="blocked_generation",
                         summary="Workspace loop stopped after repeated no-progress turns with full context.",

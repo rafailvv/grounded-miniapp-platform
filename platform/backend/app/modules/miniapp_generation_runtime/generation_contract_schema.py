@@ -55,6 +55,17 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
             return True
         if "/api/submissions/{table}" in lowered:
             return True
+        if any(
+            marker in lowered
+            for marker in (
+                "create table if not exists requests",
+                "insert or replace into requests",
+                "select * from requests",
+                "from app.db import engine",
+                "from sqlalchemy import text",
+            )
+        ):
+            return True
         path_candidates = cls._route_path_candidates(resource_stem)
         if not path_candidates:
             return True
@@ -68,7 +79,11 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
             re.search(rf'@router\.(?:patch|put)\("/{re.escape(candidate)}/\{{[A-Za-z_][A-Za-z0-9_]*\}}"\)', normalized)
             for candidate in path_candidates
         )
-        if not (has_list and has_create and has_detail and has_update):
+        has_put = any(
+            re.search(rf'@router\.put\("/{re.escape(candidate)}/\{{[A-Za-z_][A-Za-z0-9_]*\}}"\)', normalized)
+            for candidate in path_candidates
+        )
+        if not (has_list and has_create and has_detail and has_update and has_put):
             return True
         return any(
             re.search(pattern, normalized, flags=re.MULTILINE)

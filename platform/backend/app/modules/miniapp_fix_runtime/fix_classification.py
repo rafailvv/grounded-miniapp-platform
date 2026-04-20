@@ -11,6 +11,12 @@ if TYPE_CHECKING:
 
 
 class FixClassificationRuntime:
+    _READ_ONLY_REPAIR_SURFACES = (
+        "miniapp/tests/",
+        "miniapp/app/generated/",
+        "artifacts/",
+    )
+
     def __init__(self, service: "FixOrchestrator") -> None:
         self.service = service
 
@@ -128,7 +134,76 @@ class FixClassificationRuntime:
                 continue
             if self.service._file_exists(workspace_id, run_id, normalized) or self.service._allow_missing_scope_path(normalized):
                 unique.append(normalized)
-        return unique[:24]
+        return self._filter_implicated_paths(base_text=text, candidates=unique)[:24]
+
+    @classmethod
+    def _looks_like_runtime_infra_failure(cls, text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "docker compose",
+                "preview rebuild",
+                "connection refused",
+                "npm run build",
+                "preview runtime",
+                "no such service",
+                "failed to build preview image",
+                "container",
+                "image build",
+                "pip install",
+                "module not found",
+                "cannot import name",
+                "sessionlocal",
+                "roleprofilerecord",
+                "sqlalchemy",
+                "sqlite",
+                "alter table",
+                "startup",
+                "include_router",
+                "main.py",
+            )
+        )
+
+    @classmethod
+    def _looks_like_ui_surface_failure(cls, text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "build.page_script_dom_contract",
+                "missing dom ids",
+                "loading_first_root_surface",
+                "missing_ui_loading_state",
+                "missing_ui_error_state",
+                "page_missing_script_link",
+                "placeholder_role_surface",
+                "placeholder_page",
+                "route referenced",
+            )
+        )
+
+    @classmethod
+    def _filter_implicated_paths(cls, *, base_text: str, candidates: list[str]) -> list[str]:
+        filtered: list[str] = []
+        saw_ui_surface = cls._looks_like_ui_surface_failure(base_text)
+        saw_runtime_infra = cls._looks_like_runtime_infra_failure(base_text)
+        for candidate in candidates:
+            normalized = str(candidate or "").strip().lstrip("./")
+            if not normalized:
+                continue
+            if normalized.startswith(cls._READ_ONLY_REPAIR_SURFACES):
+                continue
+            if not saw_runtime_infra and normalized in {"docker/docker-compose.yml", "miniapp/requirements.txt"}:
+                continue
+            if (
+                saw_ui_surface
+                and not saw_runtime_infra
+                and normalized == "miniapp/app/main.py"
+            ):
+                continue
+            filtered.append(normalized)
+        return list(dict.fromkeys(filtered))
 
     @staticmethod
     def root_cause_summary(results: list[RunCheckResult], preview_details: dict[str, str], raw_error: str) -> str:
@@ -267,8 +342,6 @@ class FixClassificationRuntime:
                     candidates.extend(
                         [
                             "miniapp/app/routes/runtime.py",
-                            "miniapp/app/generated/route_manifest.json",
-                            "miniapp/app/generated/runtime_manifest.json",
                             "miniapp/app/main.py",
                         ]
                     )

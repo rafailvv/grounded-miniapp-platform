@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from app.models.common import GenerationMode
 from app.models.domain import ContainerStatusRecord, FixAttemptRecord, FixScopeEntry, RunCheckResult
 
 
@@ -24,6 +25,7 @@ class FixTurnContext:
     executed_checks: list[RunCheckResult] = field(default_factory=list)
     api_failure_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     memory_context: str | None = None
+    generation_mode: GenerationMode = GenerationMode.BALANCED
 
 
 @dataclass
@@ -47,3 +49,4 @@ class FixPromptContext:
     previous_attempt_summary: str | None = None
     previous_diff_summary: str | None = None
     repair_base: str | None = None
+    generation_mode: GenerationMode = GenerationMode.BALANCED

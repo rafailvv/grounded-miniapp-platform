@@ -49,3 +49,6 @@ Use this template as an extension target, not as something to replace.
 - See `docs/ownership-contract.md` for file and module ownership.
 - See `docs/generic-persisted-workflow.md` for the canonical CRUD and role-lifecycle pattern.
 - See `docs/anti-patterns.md` for generation mistakes that should be avoided.
+- See `docs/entity-naming-contract.md` for choosing one internal noun family per dominant entity.
+- See `docs/detail-page-pattern.md` for dedicated record detail page behavior.
+- See `docs/status-lifecycle-pattern.md` for shared status vocabulary.
