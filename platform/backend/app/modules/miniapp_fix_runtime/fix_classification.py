@@ -251,6 +251,18 @@ class FixClassificationRuntime:
                     ).strip()
                 )
             if result.name == "generated_app_python_tests":
+                missing_role_pages = diagnostics.get("missing_role_pages") if isinstance(diagnostics, dict) else None
+                if isinstance(missing_role_pages, list):
+                    for role in missing_role_pages:
+                        normalized_role = str(role or "").strip().lower()
+                        if normalized_role in {"client", "specialist", "manager"}:
+                            markers.append(f"runtime.missing_role_pages.{normalized_role}")
+                sqlite_missing_column = diagnostics.get("sqlite_missing_column") if isinstance(diagnostics, dict) else None
+                if isinstance(sqlite_missing_column, dict):
+                    table_name = str(sqlite_missing_column.get("table") or "").strip().lower()
+                    column_name = str(sqlite_missing_column.get("column") or "").strip().lower()
+                    if table_name and column_name:
+                        markers.append(f"runtime.sqlite_missing_column.{table_name}.{column_name}")
                 if "sessionlocal" in haystack:
                     markers.append("runtime.startup.missing_sessionlocal")
                 if "roleprofilerecord" in haystack:
@@ -307,6 +319,41 @@ class FixClassificationRuntime:
             route_segments = [segment for segment in route_path.strip("/").split("/") if segment]
             if len(route_segments) >= 2 and route_segments[0] == "api":
                 candidates.extend(self._resource_fix_targets(route_segments[1]))
+        sqlite_missing_column_match = re.search(
+            r"(?:runtime\.)?sqlite_missing_column\.([a-z0-9_]+)\.([a-z0-9_]+)",
+            lowered,
+        )
+        if sqlite_missing_column_match:
+            table_name = sqlite_missing_column_match.group(1).strip()
+            normalized = re.sub(r"[^a-z0-9_]+", "", table_name).strip()
+            candidates.extend(["miniapp/app/db.py", "miniapp/app/schemas.py"])
+            if normalized:
+                candidates.append(f"miniapp/app/routes/{normalized}.py")
+        elif "has no column named" in lowered:
+            candidates.extend(["miniapp/app/db.py", "miniapp/app/schemas.py"])
+            for table_name in re.findall(r"table\s+([a-zA-Z0-9_]+)\s+has no column named", text, re.IGNORECASE):
+                normalized = re.sub(r"[^a-z0-9_]+", "", table_name.lower()).strip()
+                if normalized:
+                    candidates.append(f"miniapp/app/routes/{normalized}.py")
+        missing_role_page_roles = [
+            role
+            for role in ("client", "specialist", "manager")
+            if f"runtime.missing_role_pages.{role}" in lowered
+        ]
+        if not missing_role_page_roles:
+            missing_role_page_roles = re.findall(
+                r"no(?: declared)? pages? (?:for role )?(client|specialist|manager)",
+                lowered,
+            )
+        for role in missing_role_page_roles:
+            candidates.extend(
+                [
+                    f"miniapp/app/routes/{role}.py",
+                    "miniapp/app/routes/role_pages.py",
+                    "miniapp/app/routes/runtime.py",
+                    f"miniapp/app/static/{role}/index.html",
+                ]
+            )
         if "sessionlocal" in lowered:
             candidates.extend(["miniapp/app/main.py", "miniapp/app/db.py"])
         if "roleprofilerecord" in lowered:

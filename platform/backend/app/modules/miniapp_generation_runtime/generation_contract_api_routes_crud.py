@@ -26,7 +26,8 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import ValidationError
-from sqlalchemy import func, inspect, select
+from sqlalchemy import DateTime, MetaData, String, Table, func, inspect, select
+from sqlalchemy.orm import Mapped, mapped_column
 
 import app.db as db_module
 import app.schemas as schemas_module
@@ -35,6 +36,8 @@ from app.db import Base, SessionLocal, engine
 RESOURCE_SLUG = "{resource_path}"
 RESOURCE_SINGULAR = "{singular_slug}"
 SCHEMA_PREFIX = "{schema_prefix}"
+_DYNAMIC_RESOURCE_MODEL: type[Any] | None = None
+_REFLECTED_RESOURCE_MODEL: type[Any] | None = None
 
 router = APIRouter(prefix="/api", tags=[RESOURCE_SLUG])
 
@@ -66,7 +69,66 @@ def _resource_model() -> type[Any]:
             value = getattr(db_module, candidate, None)
             if isinstance(value, type):
                 return value
-    raise RuntimeError(f"Unable to locate a DB record model for {{RESOURCE_SLUG}}")
+    reflected = _reflected_resource_model()
+    if reflected is not None:
+        return reflected
+    global _DYNAMIC_RESOURCE_MODEL
+    if _DYNAMIC_RESOURCE_MODEL is None:
+        table_name = RESOURCE_SLUG.replace("-", "_")
+        _DYNAMIC_RESOURCE_MODEL = type(
+            f"{{SCHEMA_PREFIX}}Record",
+            (Base,),
+            {{
+                "__tablename__": table_name,
+                "__annotations__": {{
+                    "id": Mapped[str],
+                    "title": Mapped[str],
+                    "details": Mapped[str],
+                    "status": Mapped[str | None],
+                    "created_at": Mapped[datetime],
+                    "updated_at": Mapped[datetime],
+                }},
+                "id": mapped_column(String(64), primary_key=True),
+                "title": mapped_column(String(255), default=""),
+                "details": mapped_column(String(4096), default=""),
+                "status": mapped_column(String(64), nullable=True),
+                "created_at": mapped_column(DateTime(timezone=True), default=_now),
+                "updated_at": mapped_column(DateTime(timezone=True), default=_now),
+            }},
+        )
+        Base.metadata.create_all(bind=engine)
+    return _DYNAMIC_RESOURCE_MODEL
+
+
+def _reflected_resource_model() -> type[Any] | None:
+    global _REFLECTED_RESOURCE_MODEL
+    if _REFLECTED_RESOURCE_MODEL is not None:
+        return _REFLECTED_RESOURCE_MODEL
+    try:
+        inspector = inspect(engine)
+        table_name = next(
+            (
+                name
+                for name in inspector.get_table_names()
+                if str(name or "").strip().lower() in _candidate_table_names()
+            ),
+            None,
+        )
+        if not table_name:
+            return None
+        metadata = MetaData()
+        table = Table(str(table_name), metadata, autoload_with=engine)
+    except Exception:
+        return None
+    _REFLECTED_RESOURCE_MODEL = type(
+        f"{{SCHEMA_PREFIX}}ReflectedRecord",
+        (Base,),
+        {{
+            "__table__": table,
+            "__module__": __name__,
+        }},
+    )
+    return _REFLECTED_RESOURCE_MODEL
 
 
 def _schema_model(suffixes: tuple[str, ...]) -> type[Any] | None:
@@ -92,6 +154,28 @@ def _read_schema_model() -> type[Any] | None:
 
 def _list_schema_model() -> type[Any] | None:
     return _schema_model(("ListResponse",))
+
+
+def _schema_field_names(schema_model: type[Any] | None) -> set[str]:
+    if schema_model is None:
+        return set()
+    fields = getattr(schema_model, "model_fields", {{}}) or {{}}
+    return {{str(name) for name in fields.keys()}}
+
+
+def _passthrough_read_fields() -> set[str]:
+    primary_key = _primary_key_name()
+    fields = {{
+        primary_key,
+        "id",
+        "record_id",
+        f"{{RESOURCE_SINGULAR}}_id",
+        "request_id",
+    }}
+    fields.update(_schema_field_names(_update_schema_model()))
+    if "status" in _column_keys():
+        fields.add("status")
+    return {{field for field in fields if field}}
 
 
 def _status_literals() -> list[str]:
@@ -213,9 +297,15 @@ def _record_to_payload(record: Any) -> dict[str, Any]:
     if read_schema is None:
         return payload
     try:
-        return read_schema.model_validate(payload).model_dump(mode="json")
+        serialized = read_schema.model_validate(payload).model_dump(mode="json")
     except ValidationError:
         return payload
+    if not isinstance(serialized, dict):
+        return payload
+    for field in _passthrough_read_fields():
+        if field in payload and field not in serialized:
+            serialized[field] = payload[field]
+    return serialized
 
 
 def _apply_model_defaults(record: Any) -> None:

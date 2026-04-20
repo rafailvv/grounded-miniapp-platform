@@ -258,6 +258,57 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             normalized = normalized.rstrip("/")
         return normalized
 
+    @staticmethod
+    def _roleless_route(route_ref: str, *, role: str) -> str:
+        normalized = MiniappGenerationContractFrontend._normalize_local_route_ref(route_ref)
+        if normalized.startswith(f"/{role}"):
+            trimmed = normalized[len(role) + 1 :]
+            if not trimmed:
+                return "/"
+            return trimmed if trimmed.startswith("/") else f"/{trimmed}"
+        return normalized
+
+    @classmethod
+    def _route_family_key(cls, route_ref: str, *, role: str) -> str:
+        normalized = cls._roleless_route(route_ref, role=role).strip("/")
+        if not normalized:
+            return "/"
+        first = normalized.split("/", 1)[0]
+        if not first or first == "sample":
+            return "/"
+        return f"/{first}"
+
+    @staticmethod
+    def _route_looks_like_detail(route_ref: str) -> bool:
+        normalized = MiniappGenerationContractFrontend._normalize_local_route_ref(route_ref)
+        if any(marker in normalized for marker in ("{", "}", ":")):
+            return True
+        segments = [segment for segment in normalized.strip("/").split("/") if segment]
+        return len(segments) >= 2 and segments[-1] not in {"new", "create", "edit"}
+
+    @classmethod
+    def _preferred_declared_family_route(
+        cls,
+        *,
+        route_ref: str,
+        role: str,
+        family_candidates: list[str],
+    ) -> str | None:
+        if not family_candidates:
+            return None
+        normalized = cls._roleless_route(route_ref, role=role)
+        wants_create = normalized.endswith("/new") or normalized.endswith("/create")
+        wants_detail = cls._route_looks_like_detail(normalized) and not wants_create
+        list_candidates = [candidate for candidate in family_candidates if not cls._route_looks_like_detail(candidate)]
+        detail_candidates = [candidate for candidate in family_candidates if cls._route_looks_like_detail(candidate)]
+        if wants_create and list_candidates:
+            return min(list_candidates, key=len)
+        if wants_detail and detail_candidates:
+            return max(detail_candidates, key=len)
+        if list_candidates:
+            return min(list_candidates, key=len)
+        return min(family_candidates, key=len)
+
     def _synchronize_frontend_api_contract(
         self,
         workspace_id: str,
@@ -496,6 +547,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         if not role:
             return html
         replacements: dict[str, str] = {}
+        family_replacements: dict[str, list[str]] = {}
         for candidate in declared_routes:
             if not candidate.startswith(f"/{role}"):
                 continue
@@ -503,6 +555,8 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             short = short or "/"
             for alias in cls._route_aliases(short):
                 replacements[alias] = candidate
+            family_key = cls._route_family_key(short, role=role)
+            family_replacements.setdefault(family_key, []).append(candidate)
         replacements["/"] = f"/{role}"
 
         def _replace(match: re.Match[str]) -> str:
@@ -512,6 +566,13 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             replacement = replacements.get(normalized)
             if replacement is None and not normalized.startswith(f"/{role}"):
                 replacement = replacements.get(normalized.rstrip("/"))
+            if replacement is None:
+                family_key = cls._route_family_key(normalized, role=role)
+                replacement = cls._preferred_declared_family_route(
+                    route_ref=normalized,
+                    role=role,
+                    family_candidates=list(family_replacements.get(family_key) or []),
+                )
             if replacement is None:
                 return match.group(0)
             return f'href={quote}{replacement}{quote}'

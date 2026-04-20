@@ -147,6 +147,12 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 workspace_tree=workspace_tree,
             )
             planned["workspace_id"] = workspace_id
+            if len(role_scope) == 1 and self.service._looks_like_role_flow_expansion_request(prompt.lower()):
+                planned = self._stabilize_single_role_flow_expansion_plan(
+                    planned,
+                    prompt=prompt,
+                    focused_role=role_scope[0],
+                )
             focused_role = self._focused_minimal_patch_role(prompt=prompt, role_scope=role_scope)
             if scope_mode == "minimal_patch" and focused_role:
                 planned = self._prune_minimal_patch_plan_to_focused_role(
@@ -411,14 +417,102 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             "suppress_role_route_targets": visual_only_patch,
         }
 
+    def _stabilize_single_role_flow_expansion_plan(
+        self,
+        planned: dict[str, Any],
+        *,
+        prompt: str,
+        focused_role: str,
+    ) -> dict[str, Any]:
+        page_graph = dict(planned.get("page_graph") or {})
+        roles = dict(page_graph.get("roles") or {})
+        role_payload = roles.get(focused_role) if isinstance(roles.get(focused_role), dict) else {}
+        pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
+        source_pages = self._source_role_pages_for_focus(
+            workspace_id=planned.get("workspace_id"),
+            role=focused_role,
+        )
+        for page in source_pages:
+            page_signature = (
+                str(page.get("page_id") or "").strip(),
+                str(page.get("route_path") or "").strip(),
+                str(page.get("file_path") or "").strip(),
+            )
+            if any(
+                (
+                    str(existing.get("page_id") or "").strip(),
+                    str(existing.get("route_path") or "").strip(),
+                    str(existing.get("file_path") or "").strip(),
+                )
+                == page_signature
+                for existing in pages
+            ):
+                continue
+            pages.append(page)
+        if not pages:
+            return planned
+
+        selected_targets: set[str] = set()
+        for page in pages:
+            if self.service._is_role_root_page(focused_role, page):
+                selected_targets.update(self._page_static_targets(page))
+
+        detail_pages = [page for page in pages if self._is_detail_like_page(page)]
+        for page in detail_pages:
+            selected_targets.update(self._page_static_targets(page))
+        for page in self._companion_list_pages_for_detail_pages(
+            focused_role=focused_role,
+            pages=pages,
+            detail_pages=detail_pages,
+        ):
+            selected_targets.update(self._page_static_targets(page))
+
+        if not selected_targets:
+            return planned
+
+        prompt_tokens = self._prompt_focus_tokens(prompt)
+        profile_prompt_tokens = {"profile", "settings", "account", "avatar", "photo", "logo", "image", "picture"}
+        include_profile = bool(profile_prompt_tokens & prompt_tokens)
+        profile_targets: set[str] = set()
+        if include_profile:
+            for page in pages:
+                if self._is_profile_like_page(page):
+                    profile_targets.update(self._page_static_targets(page))
+
+        filtered_target_files: list[str] = []
+        for path in list(planned.get("target_files") or []):
+            if not isinstance(path, str):
+                continue
+            if path.startswith(f"miniapp/app/static/{focused_role}/"):
+                if path in selected_targets or path in profile_targets:
+                    filtered_target_files.append(path)
+                continue
+            filtered_target_files.append(path)
+
+        filtered_files_to_read: list[str] = []
+        for path in list(planned.get("files_to_read") or []):
+            if not isinstance(path, str):
+                continue
+            if path.startswith(f"miniapp/app/static/{focused_role}/"):
+                if path in selected_targets or path in profile_targets:
+                    filtered_files_to_read.append(path)
+                continue
+            filtered_files_to_read.append(path)
+
+        return {
+            **planned,
+            "target_files": list(dict.fromkeys([*filtered_target_files, *sorted(selected_targets), *sorted(profile_targets)])),
+            "files_to_read": list(dict.fromkeys([*filtered_files_to_read, *sorted(selected_targets), *sorted(profile_targets)])),
+        }
+
     def _source_role_pages_for_focus(self, *, workspace_id: str | None, role: str) -> list[dict[str, Any]]:
         if not workspace_id:
             return []
         try:
-            workspace = self.workspace_service.get_workspace(workspace_id)
+            source_dir = self.workspace_service.source_dir(workspace_id)
         except Exception:
             return []
-        artifacts_path = Path(workspace.path) / "source" / "artifacts" / "generated_app_graph.json"
+        artifacts_path = Path(source_dir) / "artifacts" / "generated_app_graph.json"
         if not artifacts_path.exists():
             return []
         try:
@@ -431,6 +525,102 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         if not isinstance(pages, list):
             return []
         return [page for page in pages if isinstance(page, dict)]
+
+    @staticmethod
+    def _page_static_targets(page: dict[str, Any]) -> set[str]:
+        return {
+            str(path)
+            for path in (page.get("file_path"), page.get("style_path"), page.get("script_path"))
+            if isinstance(path, str) and path.startswith("miniapp/app/static/")
+        }
+
+    @staticmethod
+    def _is_profile_like_page(page: dict[str, Any]) -> bool:
+        page_kind = str(page.get("page_kind") or "").strip().lower()
+        route_path = str(page.get("route_path") or "").strip().lower()
+        file_path = str(page.get("file_path") or "").strip().lower()
+        return (
+            page_kind in {"profile", "role_profile"}
+            or route_path.endswith("/profile")
+            or "/profile/" in route_path
+            or file_path.endswith("/profile/index.html")
+        )
+
+    @staticmethod
+    def _is_detail_like_page(page: dict[str, Any]) -> bool:
+        page_kind = str(page.get("page_kind") or "").strip().lower()
+        route_path = str(page.get("route_path") or "").strip().lower()
+        file_path = str(page.get("file_path") or "").strip().lower()
+        page_id = str(page.get("page_id") or "").strip().lower()
+        if page_kind == "detail":
+            return True
+        if any(marker in route_path for marker in ("{", "}", ":")):
+            return True
+        if any(marker in page_id for marker in ("detail", "_id", "record_id", "request_id", "booking_id")):
+            return True
+        return any(marker in file_path for marker in ("_detail/", "_id/", "/detail/"))
+
+    @classmethod
+    def _is_list_like_page(cls, page: dict[str, Any]) -> bool:
+        if cls._is_detail_like_page(page) or cls._is_profile_like_page(page):
+            return False
+        route_path = str(page.get("route_path") or "").strip().lower()
+        page_kind = str(page.get("page_kind") or "").strip().lower()
+        page_id = str(page.get("page_id") or "").strip().lower()
+        file_path = str(page.get("file_path") or "").strip().lower()
+        if any(marker in route_path for marker in ("/new", "/create")):
+            return False
+        if any(marker in page_id for marker in ("new", "create")) or any(marker in file_path for marker in ("/new/", "/create/")):
+            return False
+        return page_kind in {"list", "feature", "table"} or route_path.count("/") >= 1
+
+    @classmethod
+    def _page_feature_stem(cls, *, focused_role: str, page: dict[str, Any]) -> str:
+        route_path = str(page.get("route_path") or "").strip().lower()
+        if route_path.startswith(f"/{focused_role}"):
+            route_path = route_path[len(focused_role) + 1 :]
+        route_path = route_path.strip("/")
+        if route_path:
+            first = route_path.split("/", 1)[0]
+            if first and not any(marker in first for marker in ("{", "}", ":")):
+                return re.sub(r"[^a-z0-9]+", "_", first).strip("_")
+        file_path = str(page.get("file_path") or "").strip().lower()
+        match = re.search(rf"/{re.escape(focused_role)}/([^/]+)/index\.html$", file_path)
+        if match:
+            stem = re.sub(r"(_detail|_id)$", "", match.group(1))
+            return stem.strip("_")
+        page_id = str(page.get("page_id") or "").strip().lower()
+        for token in re.findall(r"[a-z0-9]+", page_id):
+            if token not in {focused_role, "detail", "details", "page", "view", "profile", "root", "home", "landing"}:
+                return token
+        return ""
+
+    @classmethod
+    def _companion_list_pages_for_detail_pages(
+        cls,
+        *,
+        focused_role: str,
+        pages: list[dict[str, Any]],
+        detail_pages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        detail_stems = {
+            stem
+            for stem in (
+                cls._page_feature_stem(focused_role=focused_role, page=page)
+                for page in detail_pages
+            )
+            if stem
+        }
+        if not detail_stems:
+            return []
+        companions: list[dict[str, Any]] = []
+        for page in pages:
+            if not cls._is_list_like_page(page):
+                continue
+            stem = cls._page_feature_stem(focused_role=focused_role, page=page)
+            if stem and stem in detail_stems:
+                companions.append(page)
+        return companions
 
     @classmethod
     def _looks_like_visual_page_patch(cls, *, prompt: str) -> bool:

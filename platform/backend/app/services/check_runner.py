@@ -28,6 +28,15 @@ class CheckRunner:
         re.IGNORECASE,
     )
     _UNITTEST_FAIL_RE = re.compile(r"FAIL:\s+(?P<name>[A-Za-z0-9_]+)\s+\(")
+    _UNITTEST_ERROR_RE = re.compile(r"ERROR:\s+(?P<name>[A-Za-z0-9_]+)\s+\(")
+    _ROLE_PAGE_ASSERT_RE = re.compile(
+        r"No(?: declared)? pages?(?: declared)?(?: for role)? (?P<role>client|specialist|manager)",
+        re.IGNORECASE,
+    )
+    _SQLITE_MISSING_COLUMN_RE = re.compile(
+        r"table\s+(?P<table>[A-Za-z0-9_]+)\s+has no column named\s+(?P<column>[A-Za-z0-9_]+)",
+        re.IGNORECASE,
+    )
 
     def __init__(self, validation_suite: ValidationSuite, preview_service: PreviewService) -> None:
         self.validation_suite = validation_suite
@@ -168,6 +177,15 @@ class CheckRunner:
                     status = api_failure.get("status_code")
                     route_label = " ".join(part for part in [method, path] if part).strip()
                     message = f"Generated app API failure: {route_label} -> {status}".strip()
+                elif isinstance(diagnostics.get("missing_role_pages"), list) and diagnostics.get("missing_role_pages"):
+                    roles = ", ".join(str(role).strip() for role in diagnostics.get("missing_role_pages") if str(role).strip())
+                    message = f"Generated app role pages missing for: {roles}".strip()
+                elif isinstance(diagnostics.get("sqlite_missing_column"), dict):
+                    sqlite_issue = diagnostics.get("sqlite_missing_column") or {}
+                    table_name = str(sqlite_issue.get("table") or "").strip()
+                    column_name = str(sqlite_issue.get("column") or "").strip()
+                    if table_name and column_name:
+                        message = f"Generated app DB schema mismatch: table {table_name} is missing column {column_name}".strip()
                 else:
                     message = next((line for line in reversed(result.logs) if line.strip()), message)
             if result.name in {"preview_boot_smoke", "preview_connectivity_smoke"}:
@@ -729,6 +747,7 @@ class CheckRunner:
                 match.group("name")
                 for line in logs
                 if (match := cls._UNITTEST_FAIL_RE.search(str(line or "")))
+                or (match := cls._UNITTEST_ERROR_RE.search(str(line or "")))
             ),
             None,
         )
@@ -737,6 +756,21 @@ class CheckRunner:
         stack_excerpt = [str(line or "") for line in logs[-12:] if str(line or "").strip()]
         if stack_excerpt:
             diagnostics["stack_excerpt"] = stack_excerpt
+        missing_role_pages = [
+            str(match.group("role") or "").strip().lower()
+            for line in logs
+            if (match := cls._ROLE_PAGE_ASSERT_RE.search(str(line or "")))
+        ]
+        if missing_role_pages:
+            diagnostics["missing_role_pages"] = list(dict.fromkeys(role for role in missing_role_pages if role))
+        for line in reversed(logs):
+            sqlite_match = cls._SQLITE_MISSING_COLUMN_RE.search(str(line or ""))
+            if sqlite_match:
+                diagnostics["sqlite_missing_column"] = {
+                    "table": str(sqlite_match.group("table") or "").strip(),
+                    "column": str(sqlite_match.group("column") or "").strip(),
+                }
+                break
         for line in reversed(logs):
             match = cls._API_FAILURE_RE.search(str(line or ""))
             if not match:

@@ -71,6 +71,23 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
         entity_contract: dict[str, object] | None = None,
         contract_sync_mode: ContractSyncMode = "bootstrap_only",
     ) -> list[DraftFileOperation]:
+        preserve_existing_roles = (
+            bool(role_scope)
+            and set(role_scope) < {"client", "specialist", "manager"}
+        )
+        existing_route_manifest: dict[str, object] | None = None
+        existing_runtime_manifest: dict[str, object] | None = None
+        if preserve_existing_roles:
+            existing_route_manifest = self._load_existing_contract_artifact(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                file_path="miniapp/app/generated/route_manifest.json",
+            )
+            existing_runtime_manifest = self._load_existing_contract_artifact(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                file_path="miniapp/app/generated/runtime_manifest.json",
+            )
         grounded_spec: GroundedSpecModel | None = None
         try:
             grounded_spec = self._resolve_grounded_spec_for_contract_pass(
@@ -88,6 +105,9 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
                 role_scope=role_scope,
                 generation_mode=generation_mode,
                 operations=operations,
+                existing_route_manifest=existing_route_manifest,
+                existing_runtime_manifest=existing_runtime_manifest,
+                preserve_existing_roles=preserve_existing_roles,
             )
             if grounded_spec is not None
             else list(operations)
@@ -145,6 +165,9 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
                 role_scope=role_scope,
                 generation_mode=generation_mode,
                 operations=ensured,
+                existing_route_manifest=existing_route_manifest,
+                existing_runtime_manifest=existing_runtime_manifest,
+                preserve_existing_roles=preserve_existing_roles,
             )
         ensured = self._ensure_app_level_test_operations(
             page_graph=page_graph,
@@ -230,3 +253,23 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
                 reason="Pre-apply contract sync: remove legacy generated seed artifacts so runtime state is derived from real code and DB data only.",
             )
         return list(operation_map.values())
+
+    def _load_existing_contract_artifact(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        file_path: str,
+    ) -> dict[str, object] | None:
+        content = self.workspace_service.try_read_text_file(
+            workspace_id,
+            file_path,
+            run_id=draft_run_id,
+        )
+        if not content:
+            return None
+        try:
+            payload = json.loads(content)
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None

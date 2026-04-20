@@ -1092,7 +1092,8 @@ class BuildValidator:
     def _uses_canonical_profile_contract(page: dict, script_content: str) -> bool:
         route_path = str(page.get("route_path") or "").rstrip("/")
         page_kind = str(page.get("page_kind") or "").lower()
-        if route_path != "/profile" and page_kind != "profile":
+        is_profile_route = route_path == "/profile" or route_path.endswith("/profile")
+        if not is_profile_route and page_kind != "profile":
             return False
         content = str(script_content or "")
         if "profileStore" in content or "@/lib/profile/" in content:

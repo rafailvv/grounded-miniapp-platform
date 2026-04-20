@@ -108,6 +108,10 @@ class MiniappGenerationPlanRuntime:
             backend_targets=plan_result["backend_targets"],
             page_graph=plan_result["page_graph"],
         )
+        plan_result["target_files"] = self._expand_page_triplets_for_targeted_pages(
+            target_files=plan_result["target_files"],
+            page_graph=plan_result["page_graph"],
+        )
         target_set = set(plan_result["target_files"])
         plan_result["backend_targets"] = [path for path in plan_result["backend_targets"] if path in target_set]
         plan_result["shared_files"] = [path for path in plan_result["shared_files"] if path in target_set]
@@ -118,6 +122,11 @@ class MiniappGenerationPlanRuntime:
                         path
                         for path in plan_result["files_to_read"]
                         if path in target_set or path in DESIGN_REFERENCE_FILES
+                    ],
+                    *[
+                        path
+                        for path in plan_result["target_files"]
+                        if isinstance(path, str) and path.startswith("miniapp/app/static/")
                     ],
                     *[path for path in DESIGN_REFERENCE_FILES if (draft_source / path).exists()],
                 ]
@@ -135,6 +144,34 @@ class MiniappGenerationPlanRuntime:
                 generation_clusters=plan_result["generation_clusters"],
             )
         return plan_result
+
+    @staticmethod
+    def _expand_page_triplets_for_targeted_pages(
+        *,
+        target_files: list[str],
+        page_graph: dict[str, Any],
+    ) -> list[str]:
+        target_set = {str(path) for path in target_files if isinstance(path, str)}
+        if not target_set:
+            return list(dict.fromkeys(target_files))
+        expanded = list(target_files)
+        for role_payload in (page_graph.get("roles") or {}).values():
+            if not isinstance(role_payload, dict):
+                continue
+            for page in role_payload.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                triplet = [
+                    str(page.get(key) or "").strip()
+                    for key in ("file_path", "style_path", "script_path")
+                    if str(page.get(key) or "").strip().startswith("miniapp/app/static/")
+                ]
+                if not triplet:
+                    continue
+                if not any(path in target_set for path in triplet):
+                    continue
+                expanded.extend(triplet)
+        return list(dict.fromkeys(expanded))
 
     @classmethod
     def detect_missing_backend_contract_targets_from_page_graph(

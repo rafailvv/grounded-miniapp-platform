@@ -99,6 +99,9 @@ class RunService:
         self.openrouter_client = openrouter_client
         self.workspace_log_service = workspace_log_service
         self.session_engine = session_engine
+        self._active_workers: dict[str, threading.Thread] = {}
+        self._startup_started_at = datetime.now(timezone.utc)
+        self._recover_orphaned_active_runs()
 
     def stop_run(self, run_id: str) -> RunRecord:
         run = self.get_run(run_id)
@@ -119,9 +122,11 @@ class RunService:
         return run
 
     def create_run(self, workspace_id: str, request: CreateRunRequest) -> RunRecord:
+        self._recover_orphaned_active_runs()
         return self._start_run(workspace_id, request, wait=False)
 
     def create_run_sync(self, workspace_id: str, request: CreateRunRequest) -> RunRecord:
+        self._recover_orphaned_active_runs()
         return self._start_run(workspace_id, request, wait=True)
 
     def _start_run(self, workspace_id: str, request: CreateRunRequest, *, wait: bool) -> RunRecord:
@@ -153,6 +158,7 @@ class RunService:
         self._save_run(run)
         self.store.delete("reports", f"run_stop_request:{run.run_id}")
         if wait:
+            self._active_workers[run.run_id] = threading.current_thread()
             self._execute_run(run.run_id, request.model_dump(mode="python"))
             return self.get_run(run.run_id)
         worker = threading.Thread(
@@ -160,6 +166,7 @@ class RunService:
             args=(run.run_id, request.model_dump(mode="python")),
             daemon=True,
         )
+        self._active_workers[run.run_id] = worker
         worker.start()
         return self.get_run(run.run_id)
 
@@ -200,6 +207,7 @@ class RunService:
         return title[:48].rstrip(" -_,")
 
     def list_runs(self, workspace_id: str) -> list[RunRecord]:
+        self._recover_orphaned_active_runs()
         runs = [
             RunRecord.model_validate(item)
             for item in self.store.list("runs")
@@ -213,6 +221,43 @@ class RunService:
         if not payload:
             raise KeyError(f"Run not found: {run_id}")
         return RunRecord.model_validate(payload)
+
+    def _recover_orphaned_active_runs(self) -> None:
+        now = datetime.now(timezone.utc)
+        for item in self.store.list("runs"):
+            run = RunRecord.model_validate(item)
+            if run.status not in {"pending", "running"} and run.current_stage != "stopping":
+                continue
+            if run.run_id in self._active_workers:
+                continue
+            if run.updated_at >= self._startup_started_at:
+                continue
+            stop_requested = self._is_stop_requested(run.run_id) or run.current_stage == "stopping"
+            if stop_requested:
+                run.status = "blocked"
+                run.apply_status = "blocked"
+                run.current_stage = "stopped"
+                run.summary = run.summary or "Run was stopped during stale-run recovery."
+                run.failure_reason = run.failure_reason or "Run was interrupted after a stop request and recovered during backend restart cleanup."
+                run.outcome_kind = run.outcome_kind or "blocked_generation"
+            else:
+                run.status = "failed"
+                run.apply_status = "failed"
+                run.current_stage = "failed"
+                run.summary = run.summary or "Run was interrupted before reaching a terminal state."
+                run.failure_reason = run.failure_reason or "Run was recovered as stale after backend restart because no active worker existed."
+                run.outcome_kind = run.outcome_kind or "blocked_generation"
+            run.progress_percent = 100
+            run.updated_at = now
+            self._save_run(run)
+            self.store.delete("reports", f"run_stop_request:{run.run_id}")
+            logger.warning(
+                "recovered_orphaned_run run_id=%s workspace_id=%s status=%s stage=%s",
+                run.run_id,
+                run.workspace_id,
+                run.status,
+                run.current_stage,
+            )
 
     def get_run_artifacts(self, run_id: str) -> dict[str, Any]:
         payload = self.store.get("reports", f"run_artifacts:{run_id}")
@@ -349,30 +394,30 @@ class RunService:
 
     def _execute_run(self, run_id: str, request_payload: dict[str, Any]) -> None:
         request = CreateRunRequest.model_validate(request_payload)
-        run = self.get_run(run_id)
-        workspace = self.workspace_service.get_workspace(run.workspace_id)
-        self.workspace_log_service.ensure_log_files(run.workspace_id)
-        effective_generation_mode = self._resolve_generation_mode(workspace, request, run.intent)
-        run.status = "running"
-        run.generation_mode = effective_generation_mode
-        run.current_stage = "starting"
-        run.progress_percent = max(run.progress_percent, 5)
-        run.updated_at = datetime.now(timezone.utc)
-        self._save_run(run)
-        self.workspace_log_service.append(
-            run.workspace_id,
-            source="run",
-            message="Run started.",
-            payload={"run_id": run.run_id, "mode": run.mode, "intent": run.intent},
-        )
-        self.workspace_log_service.append_api(
-            run.workspace_id,
-            source="run",
-            message="API log initialized for run.",
-            payload={"run_id": run.run_id, "mode": run.mode},
-        )
-        logger.info("run_started run_id=%s workspace_id=%s intent=%s", run.run_id, run.workspace_id, run.intent)
         try:
+            run = self.get_run(run_id)
+            workspace = self.workspace_service.get_workspace(run.workspace_id)
+            self.workspace_log_service.ensure_log_files(run.workspace_id)
+            effective_generation_mode = self._resolve_generation_mode(workspace, request, run.intent)
+            run.status = "running"
+            run.generation_mode = effective_generation_mode
+            run.current_stage = "starting"
+            run.progress_percent = max(run.progress_percent, 5)
+            run.updated_at = datetime.now(timezone.utc)
+            self._save_run(run)
+            self.workspace_log_service.append(
+                run.workspace_id,
+                source="run",
+                message="Run started.",
+                payload={"run_id": run.run_id, "mode": run.mode, "intent": run.intent},
+            )
+            self.workspace_log_service.append_api(
+                run.workspace_id,
+                source="run",
+                message="API log initialized for run.",
+                payload={"run_id": run.run_id, "mode": run.mode},
+            )
+            logger.info("run_started run_id=%s workspace_id=%s intent=%s", run.run_id, run.workspace_id, run.intent)
             generate_request = GenerateRequest(
                 prompt=request.prompt,
                 mode=request.mode,
@@ -646,6 +691,8 @@ class RunService:
                 },
             )
             logger.exception("run_failed run_id=%s workspace_id=%s", run.run_id, run.workspace_id)
+        finally:
+            self._active_workers.pop(run_id, None)
 
     def _should_auto_fix_failed_generate(self, request: CreateRunRequest, job: Any) -> bool:
         if request.mode == "fix":

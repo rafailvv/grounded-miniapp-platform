@@ -141,8 +141,8 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
     ) -> bool:
         if tool_round >= 1:
             return True
-        if cluster_name.startswith("role_") and "_ui_root" in cluster_name:
-            return True
+        if cluster_name.startswith("role_") and "_ui_" in cluster_name:
+            return False
         if len(tool_requests) != 1:
             return False
         request = tool_requests[0]

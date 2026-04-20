@@ -383,8 +383,6 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
         role_scope: list[str],
         scope_mode: str,
     ) -> dict[str, Any]:
-        if scope_mode != "minimal_patch":
-            return page_graph
         active_roles = {str(role).strip() for role in role_scope if str(role).strip()}
         if not active_roles or active_roles >= {"client", "specialist", "manager"}:
             return page_graph
@@ -520,9 +518,40 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             )
             known_routes.add(route_path)
         if role_pages:
+            role_pages = self._canonicalize_merged_role_pages(role=role, role_pages=role_pages)
             role_payload["pages"] = role_pages
             role_payload["entry_path"] = str(role_payload.get("entry_path") or f"/{role}")
             merged_roles[role] = role_payload
+
+    def _canonicalize_merged_role_pages(
+        self,
+        *,
+        role: str,
+        role_pages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        canonical_pages: list[dict[str, Any]] = []
+        seen_routes: set[str] = set()
+        seen_files: set[str] = set()
+        for index, page in enumerate(role_pages):
+            if not isinstance(page, dict):
+                continue
+            route_path = str(page.get("route_path") or "").strip() or f"/{role}"
+            normalized_role_route = self.service._normalize_role_route_path(role, route_path, index=index)
+            normalized_route = self.service._absolute_role_route_path(role, normalized_role_route)
+            normalized_file = str(page.get("file_path") or "").strip().replace("\\", "/")
+            if normalized_route in seen_routes:
+                continue
+            if normalized_file and normalized_file in seen_files:
+                continue
+            normalized_page = dict(page)
+            normalized_page["route_path"] = normalized_route
+            if normalized_route == f"/{role}":
+                normalized_page["is_entry"] = bool(normalized_page.get("is_entry", True))
+            canonical_pages.append(normalized_page)
+            seen_routes.add(normalized_route)
+            if normalized_file:
+                seen_files.add(normalized_file)
+        return canonical_pages
 
     def run(
         self,
@@ -702,8 +731,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
         existing_route_manifest = self._load_json_file(draft_source / "miniapp/app/generated/route_manifest.json")
         existing_runtime_manifest = self._load_json_file(draft_source / "miniapp/app/generated/runtime_manifest.json")
         preserve_existing_roles = (
-            plan_result["scope_mode"] == "minimal_patch"
-            and bool(role_scope)
+            bool(role_scope)
             and set(role_scope) < {"client", "specialist", "manager"}
         )
         refresh_runtime_artifacts = self._route_manifest_missing_active_role_routes(

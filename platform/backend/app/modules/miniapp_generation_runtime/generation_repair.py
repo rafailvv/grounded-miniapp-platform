@@ -377,6 +377,10 @@ class MiniappGenerationRepair:
                 fix_targets=list(turn_context.implicated_files),
             )
         operations = list(repair_result["operations"])
+        preserve_existing_roles = (
+            bool(role_scope)
+            and set(role_scope) < {"client", "specialist", "manager"}
+        )
         if (not visual_only_patch) or refresh_runtime_artifacts:
             operations = self.service._ensure_runtime_artifact_operations(
                 grounded_spec=grounded_spec,
@@ -384,6 +388,7 @@ class MiniappGenerationRepair:
                 role_scope=role_scope,
                 generation_mode=generation_mode,
                 operations=operations,
+                preserve_existing_roles=preserve_existing_roles,
             )
         if not visual_only_patch:
             operations = self.service._ensure_app_level_test_operations(

@@ -17,20 +17,34 @@ logger = logging.getLogger(__name__)
 
 
 class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
-    def _whole_file_batch_timeout_seconds(self, batch: list[dict[str, Any]]) -> int:
-        if any(
+    def _whole_file_batch_timeout_seconds(
+        self,
+        batch: list[dict[str, Any]],
+        *,
+        generation_mode: GenerationMode,
+    ) -> int:
+        is_ui_batch = any(
             str(cluster.get("cluster_name") or "").startswith("role_")
             or str(cluster.get("cluster_name") or "") == "backend_support"
             for cluster in batch
-        ):
-            return int(getattr(self, "WHOLE_FILE_UI_CLUSTER_TIMEOUT_SECONDS", self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS))
-        return int(self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS)
+        )
+        default_timeout = int(
+            getattr(self, "WHOLE_FILE_UI_CLUSTER_TIMEOUT_SECONDS", self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS)
+            if is_ui_batch
+            else self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS
+        )
+        if generation_mode == GenerationMode.FAST:
+            return min(default_timeout, 120 if is_ui_batch else 90)
+        if generation_mode == GenerationMode.BALANCED:
+            return min(default_timeout, 180)
+        return default_timeout
 
     def _whole_file_timeout_fallback_result(
         self,
         *,
         cluster_name: str,
         cluster_targets: list[str],
+        timeout_seconds: int,
     ) -> dict[str, Any] | None:
         operations: list[DraftFileOperation] = []
         for target in cluster_targets:
@@ -56,7 +70,34 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                 "route contract was applied instead."
             ),
             "operations": operations,
-            "duration_ms": int(self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS * 1000),
+            "duration_ms": int(timeout_seconds * 1000),
+            "fallback_used": True,
+        }
+
+    def _whole_file_static_reuse_fallback_result(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        cluster_name: str,
+        cluster_targets: list[str],
+        timeout_seconds: int,
+    ) -> dict[str, Any] | None:
+        if not cluster_targets or not all(str(target).startswith("miniapp/app/static/") for target in cluster_targets):
+            return None
+        for target in cluster_targets:
+            content = self.workspace_service.try_read_text_file(workspace_id, target, run_id=draft_run_id)
+            if content is None:
+                return None
+        return {
+            "cluster_name": cluster_name,
+            "target_files": list(cluster_targets),
+            "assistant_message": (
+                f"{cluster_name} timed out during whole-file generation, so the existing static page surface "
+                "was kept and the run continued into exact checks."
+            ),
+            "operations": [],
+            "duration_ms": int(timeout_seconds * 1000),
             "fallback_used": True,
         }
 
@@ -344,7 +385,10 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
         )
         draft_source = self.workspace_service.draft_source_dir(kwargs["workspace_id"], kwargs["draft_run_id"])
         for batch in self._group_generation_clusters_for_execution(clusters):
-            batch_timeout_seconds = self._whole_file_batch_timeout_seconds(batch)
+            batch_timeout_seconds = self._whole_file_batch_timeout_seconds(
+                batch,
+                generation_mode=kwargs["generation_mode"],
+            )
             self._sync_generation_batch_started(
                 linked_run_id=kwargs["draft_run_id"],
                 completed_target_files=completed_target_files,
@@ -390,7 +434,16 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     fallback_result = self._whole_file_timeout_fallback_result(
                         cluster_name=cluster_name,
                         cluster_targets=cluster_targets,
+                        timeout_seconds=batch_timeout_seconds,
                     )
+                    if fallback_result is None:
+                        fallback_result = self._whole_file_static_reuse_fallback_result(
+                            workspace_id=kwargs["workspace_id"],
+                            draft_run_id=kwargs["draft_run_id"],
+                            cluster_name=cluster_name,
+                            cluster_targets=cluster_targets,
+                            timeout_seconds=batch_timeout_seconds,
+                        )
                     if fallback_result is None:
                         unresolved_pending.append(cluster_name)
                         continue

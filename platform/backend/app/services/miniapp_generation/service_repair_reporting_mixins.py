@@ -119,23 +119,48 @@ class ServiceRepairReportingMixins:
     def _expand_repair_targets_for_safe_companions(cls, *, target_files: list[str], invalid_paths: list[str], build_issues: list[ValidationIssue]) -> list[str] | None:
         if not invalid_paths:
             return list(dict.fromkeys(target_files))
+        issue_static_paths: set[str] = set()
+        for issue in build_issues:
+            location = str(issue.location or "").strip().lstrip("./")
+            issue_static_paths.update(cls._safe_static_companion_paths(location))
         issue_text = " ".join(f"{issue.code} {issue.message}" for issue in build_issues).lower()
         if not any(marker in issue_text for marker in ("shared", "static asset", "script", "dom", "loading", "error state", "ui")):
-            return None
+            if not issue_static_paths:
+                return None
         additions: list[str] = []
         for path in invalid_paths:
             if not isinstance(path, str):
                 return None
             if not cls._is_canonical_target_path(path):
                 return None
-            if not path.startswith("miniapp/app/static/shared/"):
+            normalized_path = path.strip().lstrip("./")
+            if normalized_path in issue_static_paths:
+                additions.append(normalized_path)
+                continue
+            if not normalized_path.startswith("miniapp/app/static/shared/"):
                 return None
-            if not path.endswith((".js", ".css")):
+            if not normalized_path.endswith((".js", ".css")):
                 return None
-            additions.append(path)
+            additions.append(normalized_path)
         if not additions:
             return None
         return list(dict.fromkeys([*target_files, *additions]))
+
+    @staticmethod
+    def _safe_static_companion_paths(path: str) -> set[str]:
+        normalized = str(path or "").strip().lstrip("./")
+        if not normalized.startswith("miniapp/app/static/"):
+            return set()
+        if normalized.endswith("/index.html"):
+            base = normalized[: -len("index.html")]
+            return {normalized, f"{base}styles.css", f"{base}app.js"}
+        if normalized.endswith("/styles.css"):
+            base = normalized[: -len("styles.css")]
+            return {f"{base}index.html", normalized, f"{base}app.js"}
+        if normalized.endswith("/app.js"):
+            base = normalized[: -len("app.js")]
+            return {f"{base}index.html", f"{base}styles.css", normalized}
+        return {normalized}
 
     @staticmethod
     def _validate_targeted_operations(*, stage_name: str, target_files: list[str], operations: list[DraftFileOperation]) -> None:
