@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait
+from pathlib import Path
 from typing import Any
 
 from app.models.common import GenerationMode
@@ -144,6 +146,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 require_multi_page=require_multi_page,
                 workspace_tree=workspace_tree,
             )
+            planned["workspace_id"] = workspace_id
             focused_role = self._focused_minimal_patch_role(prompt=prompt, role_scope=role_scope)
             if scope_mode == "minimal_patch" and focused_role:
                 planned = self._prune_minimal_patch_plan_to_focused_role(
@@ -188,6 +191,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 "strategy_reason": strategy_reason,
                 "model": "code-plan-unavailable",
                 "plan_gate_issues": [],
+                "workspace_id": workspace_id,
                 "error": f"Page graph planning failed: {exc}",
             }
 
@@ -250,17 +254,60 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 if isinstance(path, str) and path.startswith("miniapp/app/static/"):
                     focused_page_targets.add(path)
 
+        visual_only_patch = self._looks_like_visual_page_patch(prompt=prompt)
+        if visual_only_patch:
+            source_role_pages = self._source_role_pages_for_focus(workspace_id=planned.get("workspace_id"), role=focused_role)
+            for page in source_role_pages:
+                if not isinstance(page, dict):
+                    continue
+                page_signature = (
+                    str(page.get("page_id") or "").strip(),
+                    str(page.get("route_path") or "").strip(),
+                    str(page.get("file_path") or "").strip(),
+                )
+                if not any(
+                    (
+                        str(existing.get("page_id") or "").strip(),
+                        str(existing.get("route_path") or "").strip(),
+                        str(existing.get("file_path") or "").strip(),
+                    )
+                    == page_signature
+                    for existing in focused_pages
+                ):
+                    focused_pages.append(page)
+                for key in ("file_path", "style_path", "script_path"):
+                    path = page.get(key)
+                    if isinstance(path, str) and path.startswith(f"miniapp/app/static/{focused_role}/"):
+                        focused_page_targets.add(path)
+
         if not focused_page_targets:
             return planned
 
-        visual_only_patch = self._looks_like_visual_page_patch(prompt=prompt)
         selected_page_targets = focused_page_targets
         if visual_only_patch:
-            selected_page_targets = self._select_focused_visual_page_targets(
-                prompt=prompt,
-                focused_role=focused_role,
-                pages=focused_pages,
-            )
+            prompt_tokens = self._prompt_focus_tokens(prompt)
+            rootish_prompt_tokens = {"main", "home", "landing", "dashboard", "root", "header", "top"}
+            profile_prompt_tokens = {"profile", "settings", "account"}
+            if rootish_prompt_tokens & prompt_tokens and not (profile_prompt_tokens & prompt_tokens):
+                root_page_targets = {
+                    str(path)
+                    for page in focused_pages
+                    if str(page.get("page_kind") or "").lower() in {"role_root", "landing"}
+                    or str(page.get("route_path") or "").strip().lower() in {"/", f"/{focused_role}"}
+                    for path in (page.get("file_path"), page.get("style_path"), page.get("script_path"))
+                    if isinstance(path, str) and path.startswith(f"miniapp/app/static/{focused_role}/")
+                }
+                selected_page_targets = root_page_targets or self._select_focused_visual_page_targets(
+                    prompt=prompt,
+                    focused_role=focused_role,
+                    pages=focused_pages,
+                )
+            else:
+                selected_page_targets = self._select_focused_visual_page_targets(
+                    prompt=prompt,
+                    focused_role=focused_role,
+                    pages=focused_pages,
+                )
 
         non_focused_route_files = {
             str(role_payload.get("routes_file"))
@@ -291,6 +338,14 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 for path in pruned_target_files
                 if path in selected_page_targets or path.startswith("miniapp/app/static/shared/")
             ]
+            pruned_target_files = list(
+                dict.fromkeys(
+                    [
+                        *pruned_target_files,
+                        *sorted(selected_page_targets),
+                    ]
+                )
+            )
             pruned_backend_targets = []
 
         filtered_roles = dict(roles)
@@ -356,6 +411,27 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             "suppress_role_route_targets": visual_only_patch,
         }
 
+    def _source_role_pages_for_focus(self, *, workspace_id: str | None, role: str) -> list[dict[str, Any]]:
+        if not workspace_id:
+            return []
+        try:
+            workspace = self.workspace_service.get_workspace(workspace_id)
+        except Exception:
+            return []
+        artifacts_path = Path(workspace.path) / "source" / "artifacts" / "generated_app_graph.json"
+        if not artifacts_path.exists():
+            return []
+        try:
+            payload = json.loads(artifacts_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        roles = payload.get("roles") or {}
+        role_payload = roles.get(role) if isinstance(roles, dict) else None
+        pages = role_payload.get("pages") if isinstance(role_payload, dict) else None
+        if not isinstance(pages, list):
+            return []
+        return [page for page in pages if isinstance(page, dict)]
+
     @classmethod
     def _looks_like_visual_page_patch(cls, *, prompt: str) -> bool:
         lowered = str(prompt or "").lower()
@@ -382,6 +458,23 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 if isinstance(path, str) and path.startswith(f"miniapp/app/static/{focused_role}/")
             }
         prompt_tokens = cls._prompt_focus_tokens(prompt)
+        rootish_prompt_tokens = {"main", "home", "landing", "dashboard", "root", "header", "top"}
+        profile_prompt_tokens = {"profile", "settings", "account"}
+        cardish_prompt_tokens = {"card", "header", "top", "container", "avatar", "photo", "image", "logo"}
+        if rootish_prompt_tokens & prompt_tokens and (
+            not (profile_prompt_tokens & prompt_tokens)
+            or cardish_prompt_tokens & prompt_tokens
+        ):
+            root_targets = {
+                str(path)
+                for page in pages
+                if str(page.get("page_kind") or "").lower() in {"role_root", "landing"}
+                or str(page.get("route_path") or "").strip().lower() in {"/", f"/{focused_role}"}
+                for path in (page.get("file_path"), page.get("style_path"), page.get("script_path"))
+                if isinstance(path, str) and path.startswith(f"miniapp/app/static/{focused_role}/")
+            }
+            if root_targets:
+                return root_targets
         best_score = 0
         best_targets: set[str] = set()
         for page in pages:
@@ -435,12 +528,18 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                     str(page.get("route_path") or ""),
                     str(page.get("title") or ""),
                     str(page.get("navigation_label") or ""),
+                    str(page.get("purpose") or ""),
+                    str(page.get("description") or ""),
                     str(page.get("file_path") or ""),
                 ]
             )
         )
         overlap = prompt_tokens & page_tokens
         score += len(overlap) * 2
+        route_path = str(page.get("route_path") or "").strip().lower()
+        rootish_prompt_tokens = {"main", "home", "landing", "dashboard", "root", "header", "top"}
+        profile_prompt_tokens = {"profile", "settings", "account"}
+        avatar_prompt_tokens = {"avatar", "photo", "image", "logo", "picture"}
         detail_tokens = {"detail", "details", "booking", "bookings"}
         if {"detail", "details"} & prompt_tokens and (
             page_kind in {"detail", "feature"}
@@ -450,6 +549,22 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             score += 4
         if detail_tokens & prompt_tokens and detail_tokens & page_tokens:
             score += 2
+        if avatar_prompt_tokens & prompt_tokens and avatar_prompt_tokens & page_tokens:
+            score += 3
+        cardish_prompt_tokens = {"card", "header", "top", "container"}
+        if rootish_prompt_tokens & prompt_tokens:
+            if page_kind in {"role_root", "landing"} or route_path in {"/", f"/{focused_role}"}:
+                score += 6
+                if avatar_prompt_tokens & prompt_tokens:
+                    score += 4
+                if cardish_prompt_tokens & prompt_tokens:
+                    score += 3
+            if page_kind in {"role_profile", "profile"} and not (
+                (profile_prompt_tokens & prompt_tokens) and not (cardish_prompt_tokens & prompt_tokens)
+            ):
+                score -= 3
+        if profile_prompt_tokens & prompt_tokens and page_kind in {"role_profile", "profile"}:
+            score += 5
         return score
 
     def _generate_code_plan_sections_with_timeout(

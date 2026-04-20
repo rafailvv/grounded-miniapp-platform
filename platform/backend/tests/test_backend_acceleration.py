@@ -973,6 +973,114 @@ def test_runtime_artifacts_overwrite_noncanonical_generated_manifest(tmp_path: P
     assert "routes" not in payload
 
 
+def test_runtime_artifacts_preserve_unfocused_roles_for_minimal_patch(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    generation_service = app.state.container.generation_service
+    spec = generation_service._build_grounded_spec(
+        workspace_id="ws_manifest_merge",
+        prompt="Polish only the client profile page without changing the rest of the app.",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        doc_refs=[],
+        template_revision_id="rev_test",
+        prompt_turn_id="turn_test",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    page_graph = {
+        "roles": {
+            "client": {
+                "pages": [
+                    {
+                        "page_id": "client_profile",
+                        "route_path": "/client/profile",
+                        "file_path": "miniapp/app/static/client/profile/index.html",
+                        "style_path": "miniapp/app/static/client/profile/styles.css",
+                        "script_path": "miniapp/app/static/client/profile/app.js",
+                        "title": "Profile",
+                    }
+                ]
+            }
+        }
+    }
+    existing_route_manifest = {
+        "roles": {
+            "specialist": {
+                "entry_path": "/specialist",
+                "pages": [
+                    {
+                        "page_id": "specialist_index",
+                        "route_path": "/specialist",
+                        "file_path": "miniapp/app/static/specialist/index.html",
+                        "style_path": "miniapp/app/static/specialist/styles.css",
+                        "script_path": "miniapp/app/static/specialist/app.js",
+                        "title": "Dashboard",
+                        "navigation_label": "Home",
+                        "page_kind": "landing",
+                        "handoff_paths": [],
+                        "is_entry": True,
+                    }
+                ],
+            }
+        }
+    }
+    existing_runtime_manifest = {
+        "app": {"route_count": 1, "screen_count": 1},
+        "roles": {
+            "specialist": {
+                "entry_path": "/specialist",
+                "route_tree": ["/specialist"],
+                "routes": [{"path": "/specialist"}],
+                "screens": {"specialist_index": {"path": "/specialist"}},
+                "action_model": [],
+                "navigation": [{"path": "/specialist", "label": "Home", "is_entry": True}],
+            }
+        },
+    }
+
+    ensured = generation_service._ensure_runtime_artifact_operations(
+        grounded_spec=spec,
+        page_graph=page_graph,
+        role_scope=["client"],
+        generation_mode=GenerationMode.BALANCED,
+        operations=[],
+        existing_route_manifest=existing_route_manifest,
+        existing_runtime_manifest=existing_runtime_manifest,
+        preserve_existing_roles=True,
+    )
+
+    route_manifest = next(operation for operation in ensured if operation.file_path == "miniapp/app/generated/route_manifest.json")
+    runtime_manifest = next(operation for operation in ensured if operation.file_path == "miniapp/app/generated/runtime_manifest.json")
+    route_payload = json.loads(route_manifest.content or "{}")
+    runtime_payload = json.loads(runtime_manifest.content or "{}")
+    assert "client" in (route_payload.get("roles") or {})
+    assert "specialist" in (route_payload.get("roles") or {})
+    assert "client" in (runtime_payload.get("roles") or {})
+    assert "specialist" in (runtime_payload.get("roles") or {})
+
+
+def test_partial_scope_page_graph_hydrates_existing_role_shell_pages(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+    draft_source = tmp_path / "draft" / "source"
+    (draft_source / "miniapp/app/static/client/profile").mkdir(parents=True, exist_ok=True)
+    (draft_source / "miniapp/app/static/client/index.html").write_text("<main></main>\n", encoding="utf-8")
+    (draft_source / "miniapp/app/static/client/profile/index.html").write_text("<main></main>\n", encoding="utf-8")
+
+    merged = service.generation_normal_loop._merge_partial_scope_page_graph_from_draft(
+        draft_source=draft_source,
+        page_graph={"roles": {"client": {"pages": []}}},
+        role_scope=["client"],
+        scope_mode="minimal_patch",
+    )
+
+    client_pages = ((merged.get("roles") or {}).get("client") or {}).get("pages") or []
+    routes = {str(page.get("route_path")) for page in client_pages}
+    assert "/client" in routes
+    assert "/client/profile" in routes
+
+
 def test_codegen_prompts_require_db_and_schemas_for_stateful_apps(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")

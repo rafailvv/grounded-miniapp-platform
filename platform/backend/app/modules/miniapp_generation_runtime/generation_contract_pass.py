@@ -27,6 +27,9 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
         role_scope: list[str],
         generation_mode: GenerationMode,
         operations: list[DraftFileOperation],
+        existing_route_manifest: dict[str, object] | None = None,
+        existing_runtime_manifest: dict[str, object] | None = None,
+        preserve_existing_roles: bool = False,
     ) -> list[DraftFileOperation]:
         builder = getattr(self, "artifact_builder", None) or self._artifact_builder()
         return builder.ensure_runtime_artifact_operations(
@@ -35,6 +38,9 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
             role_scope=role_scope,
             generation_mode=generation_mode,
             operations=operations,
+            existing_route_manifest=existing_route_manifest,
+            existing_runtime_manifest=existing_runtime_manifest,
+            preserve_existing_roles=preserve_existing_roles,
         )
 
     def _ensure_app_level_test_operations(

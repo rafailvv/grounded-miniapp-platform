@@ -338,6 +338,192 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             draft_source=draft_source,
         )
 
+    @staticmethod
+    def _load_json_file(path: Path) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _route_manifest_missing_active_role_routes(
+        route_manifest: dict[str, Any] | None,
+        *,
+        page_graph: dict[str, Any],
+        role_scope: list[str],
+    ) -> bool:
+        if not role_scope:
+            return False
+        manifest_roles = dict((route_manifest or {}).get("roles") or {})
+        graph_roles = dict((page_graph.get("roles") or {}))
+        for role in role_scope:
+            graph_pages = [page for page in ((graph_roles.get(role) or {}).get("pages") or []) if isinstance(page, dict)]
+            if not graph_pages:
+                continue
+            declared_paths = {
+                str(page.get("route_path") or "").strip()
+                for page in (((manifest_roles.get(role) or {}).get("pages") or []))
+                if isinstance(page, dict)
+            }
+            expected_paths = {
+                str(page.get("route_path") or "").strip()
+                for page in graph_pages
+                if str(page.get("route_path") or "").strip()
+            }
+            if expected_paths - declared_paths:
+                return True
+        return False
+
+    def _merge_partial_scope_page_graph_from_draft(
+        self,
+        *,
+        draft_source: Path,
+        page_graph: dict[str, Any],
+        role_scope: list[str],
+        scope_mode: str,
+    ) -> dict[str, Any]:
+        if scope_mode != "minimal_patch":
+            return page_graph
+        active_roles = {str(role).strip() for role in role_scope if str(role).strip()}
+        if not active_roles or active_roles >= {"client", "specialist", "manager"}:
+            return page_graph
+        existing_graph = self._load_json_file(draft_source / "artifacts/generated_app_graph.json") or {}
+        existing_roles = dict((existing_graph.get("roles") or {}))
+        if not existing_roles:
+            merged = dict(page_graph)
+            merged["roles"] = dict(page_graph.get("roles") or {})
+            for role in active_roles:
+                self._hydrate_existing_role_shell_pages_from_draft(
+                    draft_source=draft_source,
+                    merged_roles=merged["roles"],
+                    role=role,
+                )
+            return merged
+        merged = dict(page_graph)
+        merged_roles = dict(existing_roles)
+        merged_roles.update(dict((page_graph.get("roles") or {})))
+        for role in active_roles:
+            self._hydrate_existing_role_shell_pages_from_draft(
+                draft_source=draft_source,
+                merged_roles=merged_roles,
+                role=role,
+            )
+        ordered_roles: dict[str, Any] = {}
+        for role in ("client", "specialist", "manager"):
+            if role in merged_roles:
+                ordered_roles[role] = merged_roles[role]
+        for role, payload in merged_roles.items():
+            if role not in ordered_roles:
+                ordered_roles[role] = payload
+        merged["roles"] = ordered_roles
+        return merged
+
+    def _hydrate_existing_role_shell_pages_from_draft(
+        self,
+        *,
+        draft_source: Path,
+        merged_roles: dict[str, Any],
+        role: str,
+    ) -> None:
+        role_payload = dict((merged_roles.get(role) or {}))
+        role_pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
+        known_routes = {str(page.get("route_path") or "").strip() for page in role_pages}
+        shell_pages = (
+            (
+                draft_source / f"miniapp/app/static/{role}/index.html",
+                f"/{role}",
+                f"{role}_index",
+                "landing",
+                "Dashboard",
+                "Home",
+                True,
+            ),
+            (
+                draft_source / f"miniapp/app/static/{role}/profile/index.html",
+                f"/{role}/profile",
+                f"{role}_profile",
+                "profile",
+                "Profile",
+                "Profile",
+                False,
+            ),
+        )
+        for html_path, route_path, page_id, page_kind, title, navigation_label, is_entry in shell_pages:
+            if route_path in known_routes or not html_path.exists():
+                continue
+            rel_html = html_path.relative_to(draft_source).as_posix()
+            role_pages.append(
+                {
+                    "page_id": page_id,
+                    "route_path": route_path,
+                    "file_path": rel_html,
+                    "style_path": self.service._default_page_asset_path(rel_html, asset_kind="css"),
+                    "script_path": self.service._default_page_asset_path(rel_html, asset_kind="js"),
+                    "page_kind": page_kind,
+                    "title": title,
+                    "navigation_label": navigation_label,
+                    "is_entry": is_entry,
+                }
+            )
+            known_routes.add(route_path)
+        role_static_dir = draft_source / f"miniapp/app/static/{role}"
+        for html_path in sorted(role_static_dir.glob("**/index.html")):
+            rel_html = html_path.relative_to(draft_source).as_posix()
+            rel_dir = html_path.parent.relative_to(role_static_dir).as_posix()
+            if rel_dir == ".":
+                route_path = f"/{role}"
+                page_id = f"{role}_index"
+            else:
+                slug = rel_dir.strip("/")
+                route_segments: list[str] = []
+                for segment in slug.split("/"):
+                    tokens = [token for token in segment.split("_") if token]
+                    if not tokens:
+                        continue
+                    rebuilt: list[str] = []
+                    index = 0
+                    while index < len(tokens):
+                        token = tokens[index]
+                        if index + 1 < len(tokens) and tokens[index + 1] == "id":
+                            rebuilt.append(f"{{{token}_id}}")
+                            index += 2
+                            continue
+                        if token.endswith("id") and token != "id":
+                            rebuilt.append(f"{{{token}}}")
+                        else:
+                            rebuilt.append(token)
+                        index += 1
+                    route_segments.extend(rebuilt)
+                route_path = f"/{role}/{'/'.join(route_segments)}" if route_segments else f"/{role}"
+                page_id = f"{role}_{slug.replace('/', '_')}".strip("_")
+            if route_path in known_routes:
+                continue
+            page_kind = self.service._page_kind(
+                None,
+                route_path=route_path.replace(f"/{role}", "", 1) or "/",
+                file_path=rel_html,
+                page_id=page_id,
+            )
+            role_pages.append(
+                {
+                    "page_id": page_id,
+                    "route_path": route_path,
+                    "file_path": rel_html,
+                    "style_path": self.service._default_page_asset_path(rel_html, asset_kind="css"),
+                    "script_path": self.service._default_page_asset_path(rel_html, asset_kind="js"),
+                    "page_kind": page_kind,
+                    "title": str(Path(rel_dir).name.replace("_", " ").title() or "Page"),
+                    "navigation_label": str(Path(rel_dir).name.replace("_", " ").title() or "Open"),
+                    "is_entry": route_path == f"/{role}",
+                }
+            )
+            known_routes.add(route_path)
+        if role_pages:
+            role_payload["pages"] = role_pages
+            role_payload["entry_path"] = str(role_payload.get("entry_path") or f"/{role}")
+            merged_roles[role] = role_payload
+
     def run(
         self,
         *,
@@ -369,6 +555,15 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             role_scope=role_scope,
             plan_result=plan_result,
         )
+        plan_result["page_graph"] = self._merge_partial_scope_page_graph_from_draft(
+            draft_source=draft_source,
+            page_graph=plan_result["page_graph"],
+            role_scope=role_scope,
+            scope_mode=plan_result["scope_mode"],
+        )
+        if bool(plan_result.get("visual_only_patch")) and isinstance(plan_result.get("page_graph"), dict):
+            plan_result["backend_targets"] = []
+            plan_result["page_graph"]["backend_targets"] = []
         service._append_event(
             job,
             "context_pack_started",
@@ -504,14 +699,31 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 for operation in edit_result["operations"]
             ],
         ]
-        if not visual_only_patch:
+        existing_route_manifest = self._load_json_file(draft_source / "miniapp/app/generated/route_manifest.json")
+        existing_runtime_manifest = self._load_json_file(draft_source / "miniapp/app/generated/runtime_manifest.json")
+        preserve_existing_roles = (
+            plan_result["scope_mode"] == "minimal_patch"
+            and bool(role_scope)
+            and set(role_scope) < {"client", "specialist", "manager"}
+        )
+        refresh_runtime_artifacts = self._route_manifest_missing_active_role_routes(
+            existing_route_manifest,
+            page_graph=plan_result["page_graph"],
+            role_scope=role_scope,
+        )
+        plan_result["refresh_runtime_artifacts"] = refresh_runtime_artifacts
+        if (not visual_only_patch) or refresh_runtime_artifacts:
             operations = service._ensure_runtime_artifact_operations(
                 grounded_spec=grounded_spec,
                 page_graph=plan_result["page_graph"],
                 role_scope=role_scope,
                 generation_mode=generation_mode,
                 operations=operations,
+                existing_route_manifest=existing_route_manifest,
+                existing_runtime_manifest=existing_runtime_manifest,
+                preserve_existing_roles=preserve_existing_roles,
             )
+        if not visual_only_patch:
             operations = service._ensure_app_level_test_operations(
                 page_graph=plan_result["page_graph"],
                 role_scope=role_scope,

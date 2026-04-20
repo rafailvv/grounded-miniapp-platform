@@ -10,10 +10,35 @@ from app.services.miniapp_generation.constants import ROLE_ORDER, WORKFLOW_HEAVY
 
 class ServiceStrategyMixins:
     @staticmethod
+    def _looks_like_role_flow_expansion_request(lowered: str) -> bool:
+        flow_markers = (
+            "separate page",
+            "separate details page",
+            "details page",
+            "detail page",
+            "dedicated page",
+            "dedicated details page",
+            "open a separate page",
+            "opens a separate page",
+            "open on a separate page",
+            "clicks on a request",
+            "click on a request",
+            "when a client clicks",
+            "when a specialist clicks",
+            "when a manager clicks",
+            "open full information",
+            "full information about that request",
+            "instead of keeping everything only in the list",
+        )
+        return any(marker in lowered for marker in flow_markers)
+
+    @staticmethod
     def _scope_mode(intent: str, prompt: str, role_scope: list[str]) -> str:
         lowered = prompt.lower()
         if ServiceStrategyMixins._looks_like_fix_request(lowered):
             return "minimal_patch"
+        if len(role_scope) == 1 and ServiceStrategyMixins._looks_like_role_flow_expansion_request(lowered):
+            return "whole_file_build"
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
             return "whole_file_build"
         if intent in {"edit", "refine", "role_only_change"}:
@@ -34,6 +59,8 @@ class ServiceStrategyMixins:
         lowered = prompt.lower()
         if intent == "create":
             return "Intent=create requires a whole-file build for the primary app surface."
+        if len(role_scope) == 1 and ServiceStrategyMixins._looks_like_role_flow_expansion_request(lowered):
+            return "The request expands one role into a new multi-page flow, so generation uses a whole-file build for that role."
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
             return "The request describes a new workflow-heavy app surface, so generation uses whole-file bundles."
         if len(role_scope) > 1:

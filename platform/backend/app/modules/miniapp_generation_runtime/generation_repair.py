@@ -312,6 +312,7 @@ class MiniappGenerationRepair:
         latest_diff_summary: str | None,
     ) -> WorkspaceLoopTurnPlan:
         visual_only_patch = bool(plan_result.get("visual_only_patch"))
+        refresh_runtime_artifacts = bool(plan_result.get("refresh_runtime_artifacts"))
         turn_context, preview_issue = self._build_generation_repair_turn_context(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
@@ -376,7 +377,7 @@ class MiniappGenerationRepair:
                 fix_targets=list(turn_context.implicated_files),
             )
         operations = list(repair_result["operations"])
-        if not visual_only_patch:
+        if (not visual_only_patch) or refresh_runtime_artifacts:
             operations = self.service._ensure_runtime_artifact_operations(
                 grounded_spec=grounded_spec,
                 page_graph=page_graph,
@@ -384,6 +385,7 @@ class MiniappGenerationRepair:
                 generation_mode=generation_mode,
                 operations=operations,
             )
+        if not visual_only_patch:
             operations = self.service._ensure_app_level_test_operations(
                 page_graph=page_graph,
                 role_scope=role_scope,
@@ -438,6 +440,7 @@ class MiniappGenerationRepair:
         if self.service.workspace_loop_engine is None:
             raise RuntimeError("Workspace loop engine is required for generation mode.")
         visual_only_patch = bool(plan_result.get("visual_only_patch"))
+        refresh_runtime_artifacts = bool(plan_result.get("refresh_runtime_artifacts"))
         active_repair_targets = list(plan_result["target_files"])
         fallback_changed_files = [operation.file_path for operation in initial_operations]
 
@@ -493,7 +496,7 @@ class MiniappGenerationRepair:
             plan_turn=_plan_turn,
             apply_contract_sync=(
                 (lambda operations: list(operations))
-                if visual_only_patch
+                if visual_only_patch and not refresh_runtime_artifacts
                 else (
                     lambda operations: self.service._run_pre_apply_contract_pass(
                         workspace_id=workspace_id,
@@ -509,7 +512,7 @@ class MiniappGenerationRepair:
             ),
             post_apply_stabilize=(
                 (lambda _current_workspace_id, _run_id, _current_draft_source, _changed_files: [])
-                if visual_only_patch
+                if visual_only_patch and not refresh_runtime_artifacts
                 else (
                     lambda current_workspace_id, _run_id, current_draft_source, _changed_files: self.service.generation_normal_loop.stabilize_draft_contract_from_source(
                         workspace_id=current_workspace_id,

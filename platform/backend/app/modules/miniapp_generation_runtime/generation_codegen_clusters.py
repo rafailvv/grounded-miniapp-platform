@@ -132,6 +132,28 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
             "- If the current context still is not enough, return outcome=no_progress with a short diagnosis instead of repeating the same tool request.\n"
         )
 
+    @staticmethod
+    def _should_fail_fast_on_satisfied_request(
+        *,
+        cluster_name: str,
+        tool_round: int,
+        tool_requests: list[dict[str, Any]],
+    ) -> bool:
+        if tool_round >= 1:
+            return True
+        if cluster_name.startswith("role_") and "_ui_root" in cluster_name:
+            return True
+        if len(tool_requests) != 1:
+            return False
+        request = tool_requests[0]
+        tool_name = str(request.get("tool") or "").strip().lower()
+        targets = [
+            str(target or "").strip().lstrip("./")
+            for target in list(request.get("targets") or [])
+            if str(target or "").strip()
+        ]
+        return tool_name == "read_files" and len(targets) <= 1
+
     @classmethod
     def _is_runtime_helper_discovery_request(cls, *, cluster_name: str, tool_requests: list[dict[str, Any]]) -> bool:
         if not tool_requests or not (cluster_name.startswith("role_") and "_ui_" in cluster_name):
@@ -475,7 +497,11 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                         if self._read_request_already_satisfied(tool_requests, current_file_contexts):
                             context_reuse_recovery_note = self._already_available_context_note(tool_requests)
                             tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
-                            if tool_round < self.MAX_TOOL_ROUNDS:
+                            if not self._should_fail_fast_on_satisfied_request(
+                                cluster_name=cluster_name,
+                                tool_round=tool_round,
+                                tool_requests=tool_requests,
+                            ) and tool_round < self.MAX_TOOL_ROUNDS:
                                 continue
                             raise ValueError(
                                 f"Whole-file cluster {cluster_name} requested files that were already present in the current context."
@@ -708,7 +734,11 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                         if self._read_request_already_satisfied(tool_requests, current_file_contexts):
                             context_reuse_recovery_note = self._already_available_context_note(tool_requests)
                             tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
-                            if tool_round < self.MAX_TOOL_ROUNDS:
+                            if not self._should_fail_fast_on_satisfied_request(
+                                cluster_name=stage_name,
+                                tool_round=tool_round,
+                                tool_requests=tool_requests,
+                            ) and tool_round < self.MAX_TOOL_ROUNDS:
                                 continue
                             raise ValueError(
                                 f"Composition stage {stage_name} requested files that were already present in the current context."

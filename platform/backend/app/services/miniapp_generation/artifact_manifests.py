@@ -13,6 +13,37 @@ ROLE_ORDER = ("client", "specialist", "manager")
 
 class ArtifactManifestsMixin:
     @staticmethod
+    def _merged_role_mapping(
+        generated_roles: dict[str, Any],
+        existing_roles: dict[str, Any],
+        *,
+        active_roles: list[str],
+    ) -> dict[str, Any]:
+        merged: dict[str, Any] = {}
+        active = {str(role).strip() for role in active_roles if str(role).strip()}
+        for role in ROLE_ORDER:
+            if role in generated_roles:
+                merged[role] = generated_roles[role]
+            elif role in existing_roles and role not in active:
+                merged[role] = existing_roles[role]
+        for role, payload in existing_roles.items():
+            if role not in merged and role not in active:
+                merged[role] = payload
+        for role, payload in generated_roles.items():
+            if role not in merged:
+                merged[role] = payload
+        return merged
+
+    @staticmethod
+    def _recount_runtime_manifest_app(runtime_manifest: dict[str, Any]) -> dict[str, Any]:
+        roles = runtime_manifest.get("roles") or {}
+        app_payload = dict(runtime_manifest.get("app") or {})
+        app_payload["route_count"] = sum(len((role_payload or {}).get("routes") or []) for role_payload in roles.values())
+        app_payload["screen_count"] = sum(len((role_payload or {}).get("screens") or {}) for role_payload in roles.values())
+        runtime_manifest["app"] = app_payload
+        return runtime_manifest
+
+    @staticmethod
     def _is_redundant_role_root_alias_page(
         role: str,
         page: dict[str, Any],
@@ -52,9 +83,26 @@ class ArtifactManifestsMixin:
         role_scope: list[str],
         generation_mode: GenerationMode,
         operations: list[DraftFileOperation],
+        existing_route_manifest: dict[str, Any] | None = None,
+        existing_runtime_manifest: dict[str, Any] | None = None,
+        preserve_existing_roles: bool = False,
     ) -> list[DraftFileOperation]:
         route_manifest = self.route_manifest_from_page_graph(page_graph, role_scope)
         runtime_manifest = self.runtime_manifest_from_page_graph(route_manifest, grounded_spec, generation_mode)
+        if preserve_existing_roles:
+            existing_route_roles = dict((existing_route_manifest or {}).get("roles") or {})
+            existing_runtime_roles = dict((existing_runtime_manifest or {}).get("roles") or {})
+            route_manifest["roles"] = self._merged_role_mapping(
+                dict(route_manifest.get("roles") or {}),
+                existing_route_roles,
+                active_roles=role_scope,
+            )
+            runtime_manifest["roles"] = self._merged_role_mapping(
+                dict(runtime_manifest.get("roles") or {}),
+                existing_runtime_roles,
+                active_roles=role_scope,
+            )
+            runtime_manifest = self._recount_runtime_manifest_app(runtime_manifest)
         required_artifacts = {
             "miniapp/app/generated/route_manifest.json": (route_manifest, "Persist the canonical route manifest for the generated role pages."),
             "miniapp/app/generated/runtime_manifest.json": (runtime_manifest, "Persist the lightweight runtime manifest for the generated role pages."),
