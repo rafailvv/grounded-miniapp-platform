@@ -420,6 +420,8 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             f"Context pack ready with {len(context_pack.code_chunks)} code chunks, {len(context_pack.doc_chunks)} doc chunks, and {len(context_pack.targeted_files)} file bodies.",
         )
 
+        visual_only_patch = bool(plan_result.get("visual_only_patch"))
+
         service._append_event(job, "generating_code", "Generating backend and page bundles.")
         service._append_event(job, "editing_started", "Generating draft file edits.")
         edit_result = service._resolve_code_edits(
@@ -437,6 +439,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             scope_mode=plan_result["scope_mode"],
             generation_mode=generation_mode,
             creative_direction=creative_direction,
+            visual_only_patch=visual_only_patch,
         )
         stopped = service._stop_if_requested(job, workspace_id, should_stop)
         if stopped is not None:
@@ -501,19 +504,20 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 for operation in edit_result["operations"]
             ],
         ]
-        operations = service._ensure_runtime_artifact_operations(
-            grounded_spec=grounded_spec,
-            page_graph=plan_result["page_graph"],
-            role_scope=role_scope,
-            generation_mode=generation_mode,
-            operations=operations,
-        )
-        operations = service._ensure_app_level_test_operations(
-            page_graph=plan_result["page_graph"],
-            role_scope=role_scope,
-            entity_contract=entity_contract,
-            operations=operations,
-        )
+        if not visual_only_patch:
+            operations = service._ensure_runtime_artifact_operations(
+                grounded_spec=grounded_spec,
+                page_graph=plan_result["page_graph"],
+                role_scope=role_scope,
+                generation_mode=generation_mode,
+                operations=operations,
+            )
+            operations = service._ensure_app_level_test_operations(
+                page_graph=plan_result["page_graph"],
+                role_scope=role_scope,
+                entity_contract=entity_contract,
+                operations=operations,
+            )
         critic_report = {"executed": False, "issues": [], "issue_count": 0, "blocking_issue_count": 0}
         if service.generation_contract_critic.should_run_preapply_critic(
             generation_mode=generation_mode,
@@ -542,16 +546,17 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                     "Pre-apply contract critic detected naming or persistence-coherence risks in the generated draft.",
                     critic_report,
                 )
-        operations = service._run_pre_apply_contract_pass(
-            workspace_id=workspace_id,
-            draft_run_id=draft_run_id,
-            page_graph=plan_result["page_graph"],
-            role_scope=role_scope,
-            generation_mode=generation_mode,
-            operations=operations,
-            entity_contract=entity_contract,
-            contract_sync_mode="bootstrap_only",
-        )
+        if not visual_only_patch:
+            operations = service._run_pre_apply_contract_pass(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                page_graph=plan_result["page_graph"],
+                role_scope=role_scope,
+                generation_mode=generation_mode,
+                operations=operations,
+                entity_contract=entity_contract,
+                contract_sync_mode="bootstrap_only",
+            )
         patch_envelope = service.workspace_service.build_patch_envelope_for_draft(workspace_id, draft_run_id, operations)
         apply_result = service.workspace_service.apply_patch_envelope_to_draft(workspace_id, draft_run_id, patch_envelope)
         if apply_result.status != "applied":
@@ -562,10 +567,11 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 event_type="job_failed",
                 failure_reason=apply_result.conflict_reason or "Draft patch could not be applied safely.",
             )
-        self._stabilize_backend_contract_from_source(
-            workspace_id=workspace_id,
-            draft_source=draft_source,
-        )
+        if not visual_only_patch:
+            self._stabilize_backend_contract_from_source(
+                workspace_id=workspace_id,
+                draft_source=draft_source,
+            )
         job.apply_result = apply_result.model_dump(mode="json")
         realized_paths = service._realized_draft_file_paths(workspace_id, draft_run_id)
         stage_reports = service._build_stage_reports(

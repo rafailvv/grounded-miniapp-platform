@@ -251,6 +251,8 @@ class MiniappGenerationEntry:
             for path in advisory_target_files
             if path.startswith("miniapp/app/static/")
         ]
+        visual_only_patch = bool(advisory_plan_result.get("visual_only_patch"))
+        suppress_role_route_targets = bool(advisory_plan_result.get("suppress_role_route_targets"))
         minimal_patch_uses_advisory_scope = bool(
             scope_mode == "minimal_patch" and (advisory_page_targets or advisory_backend_targets)
         )
@@ -274,6 +276,7 @@ class MiniappGenerationEntry:
             for role, role_payload in current_roles.items()
             if isinstance(role_payload, dict)
             and isinstance(role_payload.get("routes_file"), str)
+            and not suppress_role_route_targets
             and (
                 not minimal_patch_uses_advisory_scope
                 or role in page_target_roles
@@ -315,6 +318,28 @@ class MiniappGenerationEntry:
                 ]
             )
         )
+        if visual_only_patch:
+            visual_read_targets = set(merged_page_targets)
+            for role in page_target_roles:
+                role_payload = current_roles.get(role)
+                if not isinstance(role_payload, dict):
+                    continue
+                for page in (role_payload.get("pages") or []):
+                    if not isinstance(page, dict):
+                        continue
+                    for key in ("file_path", "style_path", "script_path"):
+                        path = page.get(key)
+                        if isinstance(path, str) and path.startswith(f"miniapp/app/static/{role}/"):
+                            visual_read_targets.add(path)
+            merged_plan["files_to_read"] = [
+                path
+                for path in (merged_plan.get("files_to_read") or [])
+                if isinstance(path, str)
+                and (
+                    path in visual_read_targets
+                    or path.startswith("miniapp/app/static/shared/")
+                )
+            ]
         merged_plan["plan_gate_issues"] = list(advisory_plan_result.get("plan_gate_issues") or [])
         merged_plan["model"] = advisory_plan_result.get("model") or inferred_plan_result.get("model")
         merged_plan["strategy_reason"] = (
@@ -330,6 +355,8 @@ class MiniappGenerationEntry:
             if "require_multi_page" in advisory_plan_result
             else inferred_plan_result.get("require_multi_page")
         )
+        merged_plan["visual_only_patch"] = visual_only_patch
+        merged_plan["suppress_role_route_targets"] = suppress_role_route_targets
         merged_plan["generation_clusters"] = list(self.service._build_generation_clusters(merged_plan["target_files"]) or [])
         role_scope = [
             role

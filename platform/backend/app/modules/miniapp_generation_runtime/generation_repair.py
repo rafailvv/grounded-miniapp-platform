@@ -311,6 +311,7 @@ class MiniappGenerationRepair:
         last_turn_summary: str | None,
         latest_diff_summary: str | None,
     ) -> WorkspaceLoopTurnPlan:
+        visual_only_patch = bool(plan_result.get("visual_only_patch"))
         turn_context, preview_issue = self._build_generation_repair_turn_context(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
@@ -375,28 +376,29 @@ class MiniappGenerationRepair:
                 fix_targets=list(turn_context.implicated_files),
             )
         operations = list(repair_result["operations"])
-        operations = self.service._ensure_runtime_artifact_operations(
-            grounded_spec=grounded_spec,
-            page_graph=page_graph,
-            role_scope=role_scope,
-            generation_mode=generation_mode,
-            operations=operations,
-        )
-        operations = self.service._ensure_app_level_test_operations(
-            page_graph=page_graph,
-            role_scope=role_scope,
-            entity_contract=None,
-            operations=operations,
-        )
-        operations = self.service._run_pre_apply_contract_pass(
-            workspace_id=workspace_id,
-            draft_run_id=draft_run_id,
-            page_graph=page_graph,
-            role_scope=role_scope,
-            generation_mode=generation_mode,
-            operations=operations,
-            contract_sync_mode="repair_invariants",
-        )
+        if not visual_only_patch:
+            operations = self.service._ensure_runtime_artifact_operations(
+                grounded_spec=grounded_spec,
+                page_graph=page_graph,
+                role_scope=role_scope,
+                generation_mode=generation_mode,
+                operations=operations,
+            )
+            operations = self.service._ensure_app_level_test_operations(
+                page_graph=page_graph,
+                role_scope=role_scope,
+                entity_contract=None,
+                operations=operations,
+            )
+            operations = self.service._run_pre_apply_contract_pass(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                page_graph=page_graph,
+                role_scope=role_scope,
+                generation_mode=generation_mode,
+                operations=operations,
+                contract_sync_mode="repair_invariants",
+            )
         return WorkspaceLoopTurnPlan(
             outcome="patch_ready",
             assistant_message=str(repair_result.get("assistant_message") or ""),
@@ -435,6 +437,7 @@ class MiniappGenerationRepair:
         del creative_direction
         if self.service.workspace_loop_engine is None:
             raise RuntimeError("Workspace loop engine is required for generation mode.")
+        visual_only_patch = bool(plan_result.get("visual_only_patch"))
         active_repair_targets = list(plan_result["target_files"])
         fallback_changed_files = [operation.file_path for operation in initial_operations]
 
@@ -488,19 +491,31 @@ class MiniappGenerationRepair:
             completion_state=self.service.generation_completion.workspace_loop_completion_state,
             has_tooling_failure=CheckRunner.has_tooling_failure,
             plan_turn=_plan_turn,
-            apply_contract_sync=lambda operations: self.service._run_pre_apply_contract_pass(
-                workspace_id=workspace_id,
-                draft_run_id=draft_run_id,
-                page_graph=page_graph,
-                role_scope=role_scope,
-                generation_mode=generation_mode,
-                operations=list(operations),
-                entity_contract=entity_contract,
-                contract_sync_mode="repair_invariants",
+            apply_contract_sync=(
+                (lambda operations: list(operations))
+                if visual_only_patch
+                else (
+                    lambda operations: self.service._run_pre_apply_contract_pass(
+                        workspace_id=workspace_id,
+                        draft_run_id=draft_run_id,
+                        page_graph=page_graph,
+                        role_scope=role_scope,
+                        generation_mode=generation_mode,
+                        operations=list(operations),
+                        entity_contract=entity_contract,
+                        contract_sync_mode="repair_invariants",
+                    )
+                )
             ),
-            post_apply_stabilize=lambda current_workspace_id, _run_id, current_draft_source, _changed_files: self.service.generation_normal_loop.stabilize_draft_contract_from_source(
-                workspace_id=current_workspace_id,
-                draft_source=current_draft_source,
+            post_apply_stabilize=(
+                (lambda _current_workspace_id, _run_id, _current_draft_source, _changed_files: [])
+                if visual_only_patch
+                else (
+                    lambda current_workspace_id, _run_id, current_draft_source, _changed_files: self.service.generation_normal_loop.stabilize_draft_contract_from_source(
+                        workspace_id=current_workspace_id,
+                        draft_source=current_draft_source,
+                    )
+                )
             ),
             append_event=self.service._append_event,
             append_trace=self.service._append_trace,

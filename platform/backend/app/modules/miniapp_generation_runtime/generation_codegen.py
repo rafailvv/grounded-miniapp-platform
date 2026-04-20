@@ -107,6 +107,7 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
         scope_mode: str,
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
+        visual_only_patch: bool = False,
     ) -> dict[str, Any]:
         if scope_mode == "whole_file_build":
             return self._resolve_whole_file_code_edits(
@@ -221,12 +222,16 @@ class MiniappGenerationCodegen(MiniappGenerationRuntimeOwner):
                     generated_page_sources[operation.file_path] = operation.content
             page_messages.append(str(page_result.get("assistant_message") or "").strip())
         effective_target_files = list(target_files)
-        backend_targets = self._backend_composition_targets(target_files, selected_pages)
-        backend_contract_gap_targets = self._detect_missing_backend_contract_targets(
-            generated_page_sources=generated_page_sources,
-            current_target_files=effective_target_files,
-            backend_targets=backend_targets,
-            entity_contract=entity_contract,
+        backend_targets = [] if visual_only_patch else self._backend_composition_targets(target_files, selected_pages)
+        backend_contract_gap_targets = (
+            []
+            if visual_only_patch
+            else self._detect_missing_backend_contract_targets(
+                generated_page_sources=generated_page_sources,
+                current_target_files=effective_target_files,
+                backend_targets=backend_targets,
+                entity_contract=entity_contract,
+            )
         )
         static_contract_gap_targets = self._detect_missing_static_asset_targets(
             generated_page_sources=generated_page_sources,

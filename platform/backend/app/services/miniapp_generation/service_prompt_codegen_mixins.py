@@ -73,6 +73,7 @@ class ServicePromptCodegenMixins:
         *,
         prompt: str,
         grounded_spec: GroundedSpecModel,
+        entity_contract: dict[str, Any],
         role: str,
         page: dict[str, Any],
         page_graph: dict[str, Any],
@@ -91,6 +92,7 @@ class ServicePromptCodegenMixins:
         return self.generation_codegen_selection._resolve_page_file_edit(
             prompt=prompt,
             grounded_spec=grounded_spec,
+            entity_contract=entity_contract,
             role=role,
             page=page,
             page_graph=page_graph,

@@ -2254,6 +2254,7 @@ def test_minimal_patch_focus_role_prunes_non_focused_static_targets(tmp_path: Pa
 
     pruned = service.generation_code_plan._prune_minimal_patch_plan_to_focused_role(
         planned,
+        prompt=prompt,
         focused_role="specialist",
         role_scope=["client", "specialist", "manager"],
     )
@@ -2265,6 +2266,467 @@ def test_minimal_patch_focus_role_prunes_non_focused_static_targets(tmp_path: Pa
     cluster_names = {cluster["cluster_name"] for cluster in pruned["generation_clusters"]}
     assert "role_specialist_ui_requests_id" in cluster_names
     assert "role_manager_ui_requests" not in cluster_names
+
+
+def test_minimal_patch_visual_page_scope_drops_backend_and_keeps_same_role_style_context(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    prompt = (
+        "Please improve the existing Booking Details page in the specialist flow so it looks polished "
+        "and consistent with the rest of the app: add proper styling, spacing, hierarchy, readable sections, "
+        "clear labels, status emphasis, and well-designed action buttons, while keeping the current functionality intact."
+    )
+    planned = {
+        "target_files": [
+            "miniapp/app/static/shared/base.css",
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/specialist/styles.css",
+            "miniapp/app/static/specialist/app.js",
+            "miniapp/app/static/specialist/bookings_booking_id/index.html",
+            "miniapp/app/static/specialist/bookings_booking_id/styles.css",
+            "miniapp/app/static/specialist/bookings_booking_id/app.js",
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/bookings.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+        ],
+        "backend_targets": [
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/bookings.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+        ],
+        "shared_files": ["miniapp/app/static/shared/base.css"],
+        "files_to_read": [
+            "miniapp/app/static/shared/base.css",
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/specialist/styles.css",
+            "miniapp/app/static/specialist/app.js",
+            "miniapp/app/static/specialist/bookings_booking_id/index.html",
+            "miniapp/app/static/specialist/bookings_booking_id/styles.css",
+            "miniapp/app/static/specialist/bookings_booking_id/app.js",
+            "miniapp/app/routes/bookings.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+        ],
+        "page_graph": {
+            "roles": {
+                "specialist": {
+                    "routes_file": "miniapp/app/routes/specialist.py",
+                    "pages": [
+                        {
+                            "page_id": "specialist_index",
+                            "route_path": "/",
+                            "file_path": "miniapp/app/static/specialist/index.html",
+                            "style_path": "miniapp/app/static/specialist/styles.css",
+                            "script_path": "miniapp/app/static/specialist/app.js",
+                            "page_kind": "landing",
+                            "title": "Specialist Home",
+                        },
+                        {
+                            "page_id": "specialist_booking_details",
+                            "route_path": "/bookings/{booking_id}",
+                            "file_path": "miniapp/app/static/specialist/bookings_booking_id/index.html",
+                            "style_path": "miniapp/app/static/specialist/bookings_booking_id/styles.css",
+                            "script_path": "miniapp/app/static/specialist/bookings_booking_id/app.js",
+                            "page_kind": "detail",
+                            "title": "Booking Details",
+                        },
+                    ],
+                }
+            }
+        },
+    }
+
+    pruned = service.generation_code_plan._prune_minimal_patch_plan_to_focused_role(
+        planned,
+        prompt=prompt,
+        focused_role="specialist",
+        role_scope=["specialist"],
+    )
+
+    assert pruned["visual_only_patch"] is True
+    assert pruned["suppress_role_route_targets"] is True
+    assert pruned["backend_targets"] == []
+    assert "miniapp/app/static/specialist/bookings_booking_id/index.html" in pruned["target_files"]
+    assert "miniapp/app/static/specialist/bookings_booking_id/styles.css" in pruned["target_files"]
+    assert "miniapp/app/static/specialist/bookings_booking_id/app.js" in pruned["target_files"]
+    assert "miniapp/app/routes/bookings.py" not in pruned["target_files"]
+    assert "miniapp/app/db.py" not in pruned["target_files"]
+    assert "miniapp/app/schemas.py" not in pruned["target_files"]
+    assert "miniapp/app/static/specialist/index.html" in pruned["files_to_read"]
+    assert "miniapp/app/static/specialist/styles.css" in pruned["files_to_read"]
+    assert "miniapp/app/routes/bookings.py" not in pruned["files_to_read"]
+
+
+def test_merge_advisory_generation_inputs_keeps_visual_role_only_patch_frontend_only(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    _, plan_result = service.generation_entry._merge_advisory_generation_inputs(
+        role_contract={"roles": {"specialist": {"responsibility": "Handle incoming items."}}},
+        inferred_role_contract={"roles": {"specialist": {"responsibility": "Handle incoming items."}}},
+        advisory_plan_result={
+            "target_files": [
+                "miniapp/app/static/shared/base.css",
+                "miniapp/app/static/specialist/bookings_booking_id/index.html",
+                "miniapp/app/static/specialist/bookings_booking_id/styles.css",
+                "miniapp/app/static/specialist/bookings_booking_id/app.js",
+            ],
+            "backend_targets": [],
+            "shared_files": ["miniapp/app/static/shared/base.css"],
+            "files_to_read": [
+                "miniapp/app/static/shared/base.css",
+                "miniapp/app/static/specialist/index.html",
+                "miniapp/app/static/specialist/styles.css",
+                "miniapp/app/static/specialist/app.js",
+                "miniapp/app/static/specialist/bookings_booking_id/index.html",
+                "miniapp/app/static/specialist/bookings_booking_id/styles.css",
+                "miniapp/app/static/specialist/bookings_booking_id/app.js",
+            ],
+            "page_graph": {
+                "roles": {
+                    "specialist": {
+                        "routes_file": "miniapp/app/routes/specialist.py",
+                        "pages": [
+                            {
+                                "page_id": "specialist_booking_details",
+                                "route_path": "/bookings/{booking_id}",
+                                "file_path": "miniapp/app/static/specialist/bookings_booking_id/index.html",
+                                "style_path": "miniapp/app/static/specialist/bookings_booking_id/styles.css",
+                                "script_path": "miniapp/app/static/specialist/bookings_booking_id/app.js",
+                                "page_kind": "detail",
+                            },
+                            {
+                                "page_id": "specialist_index",
+                                "route_path": "/",
+                                "file_path": "miniapp/app/static/specialist/index.html",
+                                "style_path": "miniapp/app/static/specialist/styles.css",
+                                "script_path": "miniapp/app/static/specialist/app.js",
+                                "page_kind": "landing",
+                            },
+                        ],
+                    }
+                }
+            },
+            "generation_clusters": [],
+            "execution_plan": {},
+            "scope_mode": "minimal_patch",
+            "flow_mode": "multi_page",
+            "require_multi_page": True,
+            "visual_only_patch": True,
+            "suppress_role_route_targets": True,
+        },
+        inferred_plan_result={
+            "target_files": [
+                "miniapp/app/routes/bookings.py",
+                "miniapp/app/db.py",
+                "miniapp/app/schemas.py",
+                "miniapp/app/static/specialist/index.html",
+            ],
+            "backend_targets": ["miniapp/app/routes/bookings.py", "miniapp/app/db.py", "miniapp/app/schemas.py"],
+            "shared_files": ["miniapp/app/static/shared/base.css"],
+            "files_to_read": [
+                "miniapp/app/routes/bookings.py",
+                "miniapp/app/db.py",
+                "miniapp/app/schemas.py",
+                "miniapp/app/static/shared/base.css",
+            ],
+            "page_graph": {
+                "roles": {
+                    "specialist": {
+                        "routes_file": "miniapp/app/routes/specialist.py",
+                        "pages": [
+                            {
+                                "page_id": "specialist_index",
+                                "route_path": "/",
+                                "file_path": "miniapp/app/static/specialist/index.html",
+                                "style_path": "miniapp/app/static/specialist/styles.css",
+                                "script_path": "miniapp/app/static/specialist/app.js",
+                                "page_kind": "landing",
+                            }
+                        ],
+                    }
+                }
+            },
+            "generation_clusters": [],
+            "execution_plan": {},
+            "scope_mode": "minimal_patch",
+            "flow_mode": "multi_page",
+            "require_multi_page": True,
+        },
+    )
+
+    assert plan_result["visual_only_patch"] is True
+    assert plan_result["backend_targets"] == []
+    assert "miniapp/app/routes/specialist.py" not in plan_result["target_files"]
+    assert "miniapp/app/routes/bookings.py" not in plan_result["target_files"]
+    assert "miniapp/app/static/specialist/bookings_booking_id/index.html" in plan_result["target_files"]
+    assert "miniapp/app/static/shared/base.css" in plan_result["target_files"]
+    assert all(not path.startswith("miniapp/app/routes/") for path in plan_result["files_to_read"])
+
+
+def test_prepare_runtime_plan_does_not_reinflate_backend_for_visual_only_patch(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    workspace = service.workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Visual Patch Workspace",
+            description="test",
+            path=str((tmp_path / "data" / "workspaces" / "ws_visual_patch").resolve()),
+        )
+    )
+    service.workspace_service.clone_template(workspace.workspace_id)
+    draft_source = service.workspace_service.prepare_draft(workspace.workspace_id, "run_visual")
+
+    plan_result = service.generation_plan_runtime.prepare_runtime_plan(
+        workspace_id=workspace.workspace_id,
+        draft_source=draft_source,
+        grounded_spec=service._build_grounded_spec(
+            workspace_id=workspace.workspace_id,
+            prompt="Improve the booking details page styling for the specialist only.",
+            target_platform=TargetPlatform.TELEGRAM,
+            preview_profile=PreviewProfile.TELEGRAM_MOCK,
+            doc_refs=[],
+            template_revision_id="template",
+            prompt_turn_id="turn_visual",
+            generation_mode=GenerationMode.BALANCED,
+        ),
+        entity_contract={
+            "entity_slug": "booking",
+            "api_path": "/api/bookings",
+            "route_file": "miniapp/app/routes/bookings.py",
+        },
+        role_scope=["specialist"],
+        plan_result={
+            "visual_only_patch": True,
+            "target_files": [
+                "miniapp/app/static/shared/base.css",
+                "miniapp/app/static/specialist/bookings_booking_id/index.html",
+                "miniapp/app/static/specialist/bookings_booking_id/styles.css",
+                "miniapp/app/static/specialist/bookings_booking_id/app.js",
+            ],
+            "backend_targets": [],
+            "shared_files": ["miniapp/app/static/shared/base.css"],
+            "files_to_read": [
+                "miniapp/app/static/shared/base.css",
+                "miniapp/app/static/specialist/bookings_booking_id/index.html",
+                "miniapp/app/static/specialist/bookings_booking_id/styles.css",
+                "miniapp/app/static/specialist/bookings_booking_id/app.js",
+            ],
+            "page_graph": {
+                "roles": {
+                    "specialist": {
+                        "pages": [
+                            {
+                                "page_id": "specialist_booking_details",
+                                "route_path": "/bookings/{booking_id}",
+                                "file_path": "miniapp/app/static/specialist/bookings_booking_id/index.html",
+                                "style_path": "miniapp/app/static/specialist/bookings_booking_id/styles.css",
+                                "script_path": "miniapp/app/static/specialist/bookings_booking_id/app.js",
+                                "page_kind": "detail",
+                                "data_dependencies": ["/api/bookings/{booking_id}"],
+                            }
+                        ]
+                    }
+                }
+            },
+        },
+    )
+
+    assert plan_result["backend_targets"] == []
+    assert "miniapp/app/routes/bookings.py" not in plan_result["target_files"]
+    assert "miniapp/app/db.py" not in plan_result["target_files"]
+    assert "miniapp/app/schemas.py" not in plan_result["target_files"]
+
+
+def test_resolve_code_edits_skips_backend_composition_for_visual_only_patch(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    workspace = service.workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Visual Only Codegen Workspace",
+            description="test",
+            path=str((tmp_path / "data" / "workspaces" / "ws_visual_codegen").resolve()),
+        )
+    )
+    service.workspace_service.clone_template(workspace.workspace_id)
+    service.workspace_service.prepare_draft(workspace.workspace_id, "run_visual_codegen")
+
+    backend_cluster_calls: list[list[str]] = []
+
+    def fake_page_edit(**kwargs):
+        file_path = str(kwargs["page"]["file_path"])
+        return {
+            "assistant_message": "Styled specialist details page.",
+            "operation": DraftFileOperation(
+                file_path=file_path,
+                operation="replace",
+                content='<main class="page-shell"><section data-api="/api/bookings/123">Styled details</section></main>\n',
+                reason="style pass",
+            ),
+        }
+
+    def fake_timed_composition_cluster(**kwargs):
+        backend_cluster_calls.append(list(kwargs["target_files"]))
+        return {
+            "cluster_name": kwargs["cluster_name"],
+            "target_files": list(kwargs["target_files"]),
+            "assistant_message": "unexpected backend compose",
+            "operations": [],
+            "duration_ms": 1,
+        }
+
+    monkeypatch.setattr(service, "_resolve_page_file_edit", fake_page_edit)
+    monkeypatch.setattr(service, "_timed_composition_cluster", fake_timed_composition_cluster)
+
+    result = service._resolve_code_edits(
+        workspace_id=workspace.workspace_id,
+        draft_run_id="run_visual_codegen",
+        prompt="Polish only the specialist booking details page styling.",
+        grounded_spec=service._build_grounded_spec(
+            workspace_id=workspace.workspace_id,
+            prompt="Polish only the specialist booking details page styling.",
+            target_platform=TargetPlatform.TELEGRAM,
+            preview_profile=PreviewProfile.TELEGRAM_MOCK,
+            doc_refs=[],
+            template_revision_id="template",
+            prompt_turn_id="turn_visual_codegen",
+            generation_mode=GenerationMode.BALANCED,
+        ),
+        entity_contract={
+            "entity_slug": "booking",
+            "api_path": "/api/bookings",
+            "route_file": "miniapp/app/routes/bookings.py",
+        },
+        role_scope=["specialist"],
+        file_contexts={},
+        target_files=[
+            "miniapp/app/static/shared/base.css",
+            "miniapp/app/static/specialist/bookings_booking_id/index.html",
+            "miniapp/app/static/specialist/bookings_booking_id/styles.css",
+            "miniapp/app/static/specialist/bookings_booking_id/app.js",
+        ],
+        role_contract={},
+        page_graph={
+            "roles": {
+                "specialist": {
+                    "pages": [
+                        {
+                            "page_id": "specialist_booking_details",
+                            "route_path": "/bookings/{booking_id}",
+                            "file_path": "miniapp/app/static/specialist/bookings_booking_id/index.html",
+                        }
+                    ]
+                }
+            }
+        },
+        intent="role_only_change",
+        scope_mode="minimal_patch",
+        generation_mode=GenerationMode.BALANCED,
+        creative_direction={},
+        visual_only_patch=True,
+    )
+
+    assert "error" not in result
+    assert result["effective_backend_targets"] == []
+    assert result["planner_contract_gap_targets"] == []
+    assert backend_cluster_calls == []
+
+
+def test_generation_repair_turn_skips_backend_sync_for_visual_only_patch(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+    generation_repair = service.generation_repair
+
+    helper_calls = {"runtime_artifacts": 0, "app_tests": 0, "contract_pass": 0}
+
+    def fake_turn_context(**kwargs):
+        del kwargs
+        return (
+            SimpleNamespace(
+                failure_class="schema/frontend",
+                failure_signature="visual_only",
+                root_cause_summary="page styling drift",
+                failing_checks=[],
+                implicated_files=["miniapp/app/static/specialist/bookings_detail/index.html"],
+                file_contexts={"miniapp/app/static/specialist/bookings_detail/index.html": "<main></main>\n"},
+                previous_turn_summary=None,
+                previous_diff_summary=None,
+                metadata={},
+            ),
+            None,
+        )
+
+    def fake_repair_draft(**kwargs):
+        del kwargs
+        return {
+            "assistant_message": "Fixed the specialist details page.",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/app/static/specialist/bookings_detail/index.html",
+                    operation="replace",
+                    content="<main>fixed visual page</main>\n",
+                    reason="visual fix",
+                )
+            ],
+        }
+
+    def count_runtime_artifacts(**kwargs):
+        helper_calls["runtime_artifacts"] += 1
+        return kwargs["operations"]
+
+    def count_app_tests(**kwargs):
+        helper_calls["app_tests"] += 1
+        return kwargs["operations"]
+
+    def count_contract_pass(**kwargs):
+        helper_calls["contract_pass"] += 1
+        return kwargs["operations"]
+
+    monkeypatch.setattr(generation_repair, "_build_generation_repair_turn_context", fake_turn_context)
+    monkeypatch.setattr(generation_repair, "repair_draft_after_failure", fake_repair_draft)
+    monkeypatch.setattr(service, "_ensure_runtime_artifact_operations", count_runtime_artifacts)
+    monkeypatch.setattr(service, "_ensure_app_level_test_operations", count_app_tests)
+    monkeypatch.setattr(service, "_run_pre_apply_contract_pass", count_contract_pass)
+
+    plan = generation_repair._plan_generation_repair_turn(
+        workspace_id="ws_visual",
+        draft_run_id="run_visual",
+        prompt="Polish only the specialist booking details page styling.",
+        grounded_spec=None,
+        role_scope=["specialist"],
+        role_contract={},
+        page_graph={"roles": {"specialist": {"pages": []}}},
+        plan_result={
+            "scope_mode": "minimal_patch",
+            "visual_only_patch": True,
+            "target_files": ["miniapp/app/static/specialist/bookings_detail/index.html"],
+        },
+        generation_mode=GenerationMode.BALANCED,
+        latest_execution=None,
+        latest_preview_details={},
+        attempt=1,
+        context_mode="minimal",
+        repeated_no_progress=0,
+        active_repair_targets=["miniapp/app/static/specialist/bookings_detail/index.html"],
+        last_turn_summary=None,
+        latest_diff_summary=None,
+    )
+
+    assert plan.outcome == "patch_ready"
+    assert [operation.file_path for operation in plan.operations] == [
+        "miniapp/app/static/specialist/bookings_detail/index.html"
+    ]
+    assert helper_calls == {"runtime_artifacts": 0, "app_tests": 0, "contract_pass": 0}
 
 
 def test_landing_alias_paths_are_canonicalized_to_role_root() -> None:

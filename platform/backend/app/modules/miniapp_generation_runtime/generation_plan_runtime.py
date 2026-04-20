@@ -60,29 +60,32 @@ class MiniappGenerationPlanRuntime:
             plan_result["page_graph"] = service.generation_targeting.sanitize_page_graph_role_entries(
                 dict(plan_result["page_graph"])
             )
+        visual_only_patch = bool(plan_result.get("visual_only_patch"))
         plan_result["target_files"] = list(dict.fromkeys(plan_result.get("target_files") or []))
         plan_result["backend_targets"] = service._sanitize_backend_targets(
             list(dict.fromkeys(plan_result.get("backend_targets") or []))
         )
-        inferred_backend_targets = list(
-            dict.fromkeys(
-                [
-                    *self.detect_missing_backend_contract_targets_from_page_graph(
-                        page_graph=plan_result.get("page_graph") or {},
-                        current_target_files=plan_result["target_files"],
-                        backend_targets=plan_result["backend_targets"],
-                        entity_contract=entity_contract,
-                    ),
-                    *self.detect_missing_backend_contract_targets_from_spec(
-                        grounded_spec=grounded_spec,
-                        page_graph=plan_result.get("page_graph") or {},
-                        current_target_files=plan_result["target_files"],
-                        backend_targets=plan_result["backend_targets"],
-                        entity_contract=entity_contract,
-                    ),
-                ]
+        inferred_backend_targets: list[str] = []
+        if not visual_only_patch:
+            inferred_backend_targets = list(
+                dict.fromkeys(
+                    [
+                        *self.detect_missing_backend_contract_targets_from_page_graph(
+                            page_graph=plan_result.get("page_graph") or {},
+                            current_target_files=plan_result["target_files"],
+                            backend_targets=plan_result["backend_targets"],
+                            entity_contract=entity_contract,
+                        ),
+                        *self.detect_missing_backend_contract_targets_from_spec(
+                            grounded_spec=grounded_spec,
+                            page_graph=plan_result.get("page_graph") or {},
+                            current_target_files=plan_result["target_files"],
+                            backend_targets=plan_result["backend_targets"],
+                            entity_contract=entity_contract,
+                        ),
+                    ]
+                )
             )
-        )
         if inferred_backend_targets:
             plan_result["backend_targets"] = service._sanitize_backend_targets(
                 [
