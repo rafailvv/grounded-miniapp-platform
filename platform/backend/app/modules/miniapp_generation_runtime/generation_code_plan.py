@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait
 from typing import Any
@@ -51,6 +52,13 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 require_multi_page=require_multi_page,
                 workspace_tree=workspace_tree,
             )
+            focused_role = self._focused_minimal_patch_role(prompt=prompt, role_scope=role_scope)
+            if scope_mode == "minimal_patch" and focused_role:
+                planned = self._prune_minimal_patch_plan_to_focused_role(
+                    planned,
+                    focused_role=focused_role,
+                    role_scope=role_scope,
+                )
             plan_gate_issues = self._page_graph_gate_issues(
                 planned["page_graph"],
                 role_scope,
@@ -89,6 +97,115 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 "plan_gate_issues": [],
                 "error": f"Page graph planning failed: {exc}",
             }
+
+    @staticmethod
+    def _focused_minimal_patch_role(*, prompt: str, role_scope: list[str]) -> str | None:
+        lowered = str(prompt or "").lower()
+        if len(role_scope) <= 1:
+            return role_scope[0] if role_scope else None
+        if not any(marker in lowered for marker in ("page", "detail", "details", "screen", "view", "route", "workflow")):
+            return None
+        scores: dict[str, int] = {}
+        for role in role_scope:
+            normalized = str(role or "").strip().lower()
+            if not normalized:
+                continue
+            score = lowered.count(normalized)
+            for pattern in (
+                rf"\bfor the {normalized}\b",
+                rf"\b{normalized} workflow\b",
+                rf"\b{normalized} flow\b",
+                rf"\b{normalized} can\b",
+                rf"\b{normalized} should\b",
+                rf"\b{normalized} must\b",
+                rf"\b{normalized} opens?\b",
+                rf"\bopen(?:s)? .*?\b{normalized}\b",
+                rf"\b{normalized}\b.*?\b(detail|details|page|screen|view|route)\b",
+                rf"\b(detail|details|page|screen|view|route)\b.*?\b{normalized}\b",
+            ):
+                if re.search(pattern, lowered):
+                    score += 2
+            scores[normalized] = score
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if len(ranked) < 2:
+            return ranked[0][0] if ranked and ranked[0][1] >= 3 else None
+        top_role, top_score = ranked[0]
+        next_score = ranked[1][1]
+        if top_score >= 4 and top_score >= next_score + 2:
+            return top_role
+        return None
+
+    def _prune_minimal_patch_plan_to_focused_role(
+        self,
+        planned: dict[str, Any],
+        *,
+        focused_role: str,
+        role_scope: list[str],
+    ) -> dict[str, Any]:
+        page_graph = dict(planned.get("page_graph") or {})
+        roles = dict(page_graph.get("roles") or {})
+        focused_payload = roles.get(focused_role) if isinstance(roles.get(focused_role), dict) else {}
+        focused_page_targets: set[str] = set()
+        for page in (focused_payload.get("pages") or []):
+            if not isinstance(page, dict):
+                continue
+            for key in ("file_path", "style_path", "script_path"):
+                path = page.get(key)
+                if isinstance(path, str) and path.startswith("miniapp/app/static/"):
+                    focused_page_targets.add(path)
+
+        if not focused_page_targets:
+            return planned
+
+        non_focused_route_files = {
+            str(role_payload.get("routes_file"))
+            for role, role_payload in roles.items()
+            if role != focused_role
+            and isinstance(role_payload, dict)
+            and isinstance(role_payload.get("routes_file"), str)
+        }
+        pruned_target_files = [
+            path
+            for path in (planned.get("target_files") or [])
+            if not (
+                isinstance(path, str)
+                and (
+                    (path.startswith("miniapp/app/static/") and path not in focused_page_targets and not path.startswith("miniapp/app/static/shared/"))
+                    or path in non_focused_route_files
+                )
+            )
+        ]
+        pruned_backend_targets = [
+            path
+            for path in (planned.get("backend_targets") or [])
+            if path not in non_focused_route_files
+        ]
+        pruned_target_files = self._sanitize_planner_target_files(
+            target_files=pruned_target_files,
+            backend_targets=pruned_backend_targets,
+            page_graph=page_graph,
+        )
+        target_set = set(pruned_target_files)
+        pruned_backend_targets = [path for path in pruned_backend_targets if path in target_set]
+        pruned_shared_files = [path for path in (planned.get("shared_files") or []) if path in target_set]
+        generation_clusters = self._build_generation_clusters(pruned_target_files)
+        execution_plan = self._build_execution_plan(
+            role_scope=role_scope,
+            roles=roles,
+            shared_files=pruned_shared_files,
+            backend_targets=pruned_backend_targets,
+            target_files=pruned_target_files,
+            generation_clusters=generation_clusters,
+        )
+        return {
+            **planned,
+            "target_files": pruned_target_files,
+            "backend_targets": pruned_backend_targets,
+            "shared_files": pruned_shared_files,
+            "generation_clusters": generation_clusters,
+            "active_role_scope": execution_plan["active_role_scope"],
+            "execution_plan": execution_plan,
+        }
 
     def _generate_code_plan_sections_with_timeout(
         self,

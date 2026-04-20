@@ -1920,7 +1920,7 @@ def test_sanitize_planner_target_files_keeps_only_canonical_page_and_backend_tar
     assert "miniapp/app/generated/route_manifest.json" not in sanitized
 
 
-def test_merge_advisory_generation_inputs_prefers_inferred_shape_and_unions_targets(tmp_path: Path) -> None:
+def test_merge_advisory_generation_inputs_prefers_advisory_pages_for_editing_targets(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
@@ -1929,19 +1929,57 @@ def test_merge_advisory_generation_inputs_prefers_inferred_shape_and_unions_targ
         role_contract={"roles": {"client": {"responsibility": "Create records."}}},
         inferred_role_contract={"roles": {"specialist": {"responsibility": "Process records."}, "manager": {"responsibility": "Observe records."}}},
         advisory_plan_result={
-            "target_files": ["miniapp/app/static/client/dashboard/index.html", "miniapp/app/routes/requests.py"],
+            "target_files": [
+                "miniapp/app/static/specialist/request_detail/index.html",
+                "miniapp/app/static/specialist/request_detail/styles.css",
+                "miniapp/app/static/specialist/request_detail/app.js",
+                "miniapp/app/routes/requests.py",
+            ],
             "backend_targets": ["miniapp/app/routes/requests.py"],
             "shared_files": [],
             "files_to_read": ["miniapp/app/main.py"],
-            "page_graph": {"roles": {}},
+            "page_graph": {
+                "roles": {
+                    "client": {
+                        "pages": [
+                            {
+                                "page_id": "client_index",
+                                "route_path": "/",
+                                "file_path": "miniapp/app/static/client/index.html",
+                                "style_path": "miniapp/app/static/client/styles.css",
+                                "script_path": "miniapp/app/static/client/app.js",
+                                "page_kind": "landing",
+                            }
+                        ]
+                    },
+                    "specialist": {
+                        "routes_file": "miniapp/app/routes/specialist.py",
+                        "pages": [
+                            {
+                                "page_id": "specialist_request_detail",
+                                "route_path": "/request-detail",
+                                "file_path": "miniapp/app/static/specialist/request_detail/index.html",
+                                "style_path": "miniapp/app/static/specialist/request_detail/styles.css",
+                                "script_path": "miniapp/app/static/specialist/request_detail/app.js",
+                                "page_kind": "feature",
+                            }
+                        ],
+                    },
+                }
+            },
             "generation_clusters": [],
             "execution_plan": {},
-            "scope_mode": "whole_file_build",
+            "scope_mode": "minimal_patch",
             "flow_mode": "multi_page",
             "require_multi_page": True,
         },
         inferred_plan_result={
-            "target_files": ["miniapp/app/static/client/index.html"],
+            "target_files": [
+                "miniapp/app/static/client/index.html",
+                "miniapp/app/static/client/bookingrequests/index.html",
+                "miniapp/app/static/client/bookingrequests/styles.css",
+                "miniapp/app/static/client/bookingrequests/app.js",
+            ],
             "backend_targets": ["miniapp/app/routes/client.py"],
             "shared_files": ["miniapp/app/static/shared/base.css"],
             "files_to_read": ["miniapp/app/static/shared/base.css"],
@@ -1953,24 +1991,172 @@ def test_merge_advisory_generation_inputs_prefers_inferred_shape_and_unions_targ
                                 "page_id": "client_index",
                                 "route_path": "/",
                                 "file_path": "miniapp/app/static/client/index.html",
-                            }
+                                "style_path": "miniapp/app/static/client/styles.css",
+                                "script_path": "miniapp/app/static/client/app.js",
+                                "page_kind": "landing",
+                            },
+                            {
+                                "page_id": "client_bookingrequests",
+                                "route_path": "/bookingrequests",
+                                "file_path": "miniapp/app/static/client/bookingrequests/index.html",
+                                "style_path": "miniapp/app/static/client/bookingrequests/styles.css",
+                                "script_path": "miniapp/app/static/client/bookingrequests/app.js",
+                                "page_kind": "feature",
+                            },
                         ]
+                    },
+                    "specialist": {
+                        "pages": [
+                            {
+                                "page_id": "specialist_index",
+                                "route_path": "/",
+                                "file_path": "miniapp/app/static/specialist/index.html",
+                                "style_path": "miniapp/app/static/specialist/styles.css",
+                                "script_path": "miniapp/app/static/specialist/app.js",
+                                "page_kind": "landing",
+                            },
+                            {
+                                "page_id": "specialist_profile",
+                                "route_path": "/profile",
+                                "file_path": "miniapp/app/static/specialist/profile/index.html",
+                                "style_path": "miniapp/app/static/specialist/profile/styles.css",
+                                "script_path": "miniapp/app/static/specialist/profile/app.js",
+                                "page_kind": "profile",
+                            },
+                            {
+                                "page_id": "specialist_bookingrequests",
+                                "route_path": "/bookingrequests",
+                                "file_path": "miniapp/app/static/specialist/bookingrequests/index.html",
+                                "style_path": "miniapp/app/static/specialist/bookingrequests/styles.css",
+                                "script_path": "miniapp/app/static/specialist/bookingrequests/app.js",
+                                "page_kind": "feature",
+                            },
+                        ],
+                        "routes_file": "miniapp/app/routes/specialist.py",
+                    },
+                    "manager": {
+                        "pages": [
+                            {
+                                "page_id": "manager_index",
+                                "route_path": "/",
+                                "file_path": "miniapp/app/static/manager/index.html",
+                                "style_path": "miniapp/app/static/manager/styles.css",
+                                "script_path": "miniapp/app/static/manager/app.js",
+                                }
+                        ],
                     }
                 }
             },
             "generation_clusters": [{"cluster_name": "role_client_ui_root", "target_files": ["miniapp/app/static/client/index.html"]}],
             "execution_plan": {"role_steps": []},
-            "scope_mode": "whole_file_build",
+            "scope_mode": "minimal_patch",
             "flow_mode": "multi_page",
             "require_multi_page": True,
         },
     )
 
     assert set(role_contract["roles"]) == {"client", "specialist", "manager"}
-    assert "miniapp/app/static/client/index.html" in plan_result["target_files"]
-    assert "miniapp/app/static/client/dashboard/index.html" not in plan_result["target_files"]
+    assert "miniapp/app/static/specialist/request_detail/index.html" in plan_result["target_files"]
+    assert "miniapp/app/static/specialist/request_detail/styles.css" in plan_result["target_files"]
+    assert "miniapp/app/static/specialist/request_detail/app.js" in plan_result["target_files"]
+    assert "miniapp/app/static/client/index.html" not in plan_result["target_files"]
+    assert "miniapp/app/static/client/bookingrequests/index.html" not in plan_result["target_files"]
     assert "miniapp/app/routes/requests.py" in plan_result["backend_targets"]
+    assert "miniapp/app/routes/client.py" not in plan_result["backend_targets"]
+    assert "miniapp/app/routes/specialist.py" in plan_result["backend_targets"]
     assert plan_result["page_graph"]["roles"]["client"]["pages"][0]["file_path"] == "miniapp/app/static/client/index.html"
+    specialist_paths = [page["file_path"] for page in plan_result["page_graph"]["roles"]["specialist"]["pages"]]
+    assert "miniapp/app/static/specialist/request_detail/index.html" in specialist_paths
+    assert "miniapp/app/static/specialist/profile/index.html" in specialist_paths
+    assert "miniapp/app/static/specialist/bookingrequests/index.html" not in specialist_paths
+    cluster_names = {cluster["cluster_name"] for cluster in plan_result["generation_clusters"]}
+    assert "role_specialist_ui_request_detail" in cluster_names
+
+
+def test_minimal_patch_focus_role_prunes_non_focused_static_targets(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    prompt = (
+        "Please finish the existing office equipment booking app by adding a proper incoming request details "
+        "page for the specialist workflow: when a specialist opens a request from the incoming requests list, "
+        "it should open on a separate page and the specialist must be able to reject the request, while the "
+        "rejected status is reflected for the manager and the client."
+    )
+    assert service.generation_code_plan._focused_minimal_patch_role(
+        prompt=prompt,
+        role_scope=["client", "specialist", "manager"],
+    ) == "specialist"
+
+    planned = {
+        "target_files": [
+            "miniapp/app/static/shared/base.css",
+            "miniapp/app/static/specialist/requests_id/index.html",
+            "miniapp/app/static/specialist/requests_id/styles.css",
+            "miniapp/app/static/specialist/requests_id/app.js",
+            "miniapp/app/static/manager/requests/index.html",
+            "miniapp/app/static/manager/requests/styles.css",
+            "miniapp/app/static/manager/requests/app.js",
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/manager.py",
+            "miniapp/app/routes/bookingrequests.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+        ],
+        "backend_targets": [
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/manager.py",
+            "miniapp/app/routes/bookingrequests.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+        ],
+        "shared_files": ["miniapp/app/static/shared/base.css"],
+        "page_graph": {
+            "roles": {
+                "specialist": {
+                    "routes_file": "miniapp/app/routes/specialist.py",
+                    "pages": [
+                        {
+                            "page_id": "specialist_request_detail",
+                            "route_path": "/requests/{id}",
+                            "file_path": "miniapp/app/static/specialist/requests_id/index.html",
+                            "style_path": "miniapp/app/static/specialist/requests_id/styles.css",
+                            "script_path": "miniapp/app/static/specialist/requests_id/app.js",
+                            "page_kind": "detail",
+                        }
+                    ],
+                },
+                "manager": {
+                    "routes_file": "miniapp/app/routes/manager.py",
+                    "pages": [
+                        {
+                            "page_id": "manager_requests",
+                            "route_path": "/requests",
+                            "file_path": "miniapp/app/static/manager/requests/index.html",
+                            "style_path": "miniapp/app/static/manager/requests/styles.css",
+                            "script_path": "miniapp/app/static/manager/requests/app.js",
+                            "page_kind": "list",
+                        }
+                    ],
+                },
+            }
+        },
+    }
+
+    pruned = service.generation_code_plan._prune_minimal_patch_plan_to_focused_role(
+        planned,
+        focused_role="specialist",
+        role_scope=["client", "specialist", "manager"],
+    )
+
+    assert "miniapp/app/static/specialist/requests_id/index.html" in pruned["target_files"]
+    assert "miniapp/app/static/manager/requests/index.html" not in pruned["target_files"]
+    assert "miniapp/app/routes/manager.py" not in pruned["backend_targets"]
+    assert "miniapp/app/routes/bookingrequests.py" in pruned["backend_targets"]
+    cluster_names = {cluster["cluster_name"] for cluster in pruned["generation_clusters"]}
+    assert "role_specialist_ui_requests_id" in cluster_names
+    assert "role_manager_ui_requests" not in cluster_names
 
 
 def test_landing_alias_paths_are_canonicalized_to_role_root() -> None:

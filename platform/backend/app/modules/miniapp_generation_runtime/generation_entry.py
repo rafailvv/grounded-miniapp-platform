@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from app.models.domain import GenerateRequest, JobRecord
+from app.services.miniapp_generation.constants import ROLE_ORDER
 
 if TYPE_CHECKING:
     from app.services.miniapp_generation.service import GenerationService
@@ -195,23 +197,45 @@ class MiniappGenerationEntry:
         current_graph = dict((merged_plan.get("page_graph") or {}))
         current_roles = dict((current_graph.get("roles") or {}))
         advisory_graph = dict(advisory_plan_result.get("page_graph") or {})
+        scope_mode = advisory_plan_result.get("scope_mode") or inferred_plan_result.get("scope_mode") or "whole_file_build"
         for role, advisory_role_payload in (advisory_graph.get("roles") or {}).items():
             existing_role_payload = current_roles.get(role)
-            if not isinstance(existing_role_payload, dict) or not (existing_role_payload.get("pages") or []):
+            if not isinstance(existing_role_payload, dict):
+                current_roles[role] = advisory_role_payload
+                continue
+            if isinstance(advisory_role_payload, dict) and (advisory_role_payload.get("pages") or []):
+                current_roles[role] = self._merge_role_page_graph_payload(
+                    role=role,
+                    existing_role_payload=existing_role_payload,
+                    advisory_role_payload=advisory_role_payload,
+                )
+                continue
+            if not (existing_role_payload.get("pages") or []):
                 current_roles[role] = advisory_role_payload
         current_graph["roles"] = current_roles
         merged_plan["page_graph"] = current_graph
-        merged_plan["target_files"] = list(
-            dict.fromkeys(
-                [
-                    *(inferred_plan_result.get("target_files") or []),
-                    *[
-                        path
-                        for path in (advisory_plan_result.get("target_files") or [])
-                        if not str(path).startswith("miniapp/app/static/")
-                    ],
-                ]
-            )
+        advisory_target_files = [
+            str(path)
+            for path in (advisory_plan_result.get("target_files") or [])
+            if isinstance(path, str) and str(path).strip()
+        ]
+        advisory_backend_targets = [
+            str(path)
+            for path in (advisory_plan_result.get("backend_targets") or [])
+            if isinstance(path, str) and str(path).strip()
+        ]
+        advisory_page_targets = [
+            path
+            for path in advisory_target_files
+            if path.startswith("miniapp/app/static/")
+        ]
+        minimal_patch_uses_advisory_scope = bool(
+            scope_mode == "minimal_patch" and (advisory_page_targets or advisory_backend_targets)
+        )
+        merged_page_targets = (
+            list(dict.fromkeys(advisory_page_targets))
+            if minimal_patch_uses_advisory_scope and advisory_page_targets
+            else self._page_graph_target_files(current_graph)
         )
         for key in ("backend_targets", "shared_files", "files_to_read"):
             merged_plan[key] = list(
@@ -222,6 +246,53 @@ class MiniappGenerationEntry:
                     ]
                 )
             )
+        page_target_roles = set(self._roles_for_static_targets(merged_page_targets))
+        explicit_role_route_targets = [
+            str(role_payload.get("routes_file"))
+            for role, role_payload in current_roles.items()
+            if isinstance(role_payload, dict)
+            and isinstance(role_payload.get("routes_file"), str)
+            and (
+                not minimal_patch_uses_advisory_scope
+                or role in page_target_roles
+            )
+        ]
+        merged_backend_targets = list(
+            dict.fromkeys(
+                [
+                    *(
+                        advisory_backend_targets
+                        if minimal_patch_uses_advisory_scope
+                        else (merged_plan.get("backend_targets") or [])
+                    ),
+                    *explicit_role_route_targets,
+                ]
+            )
+        )
+        merged_plan["backend_targets"] = merged_backend_targets
+        inferred_non_page_targets = [
+            path
+            for path in (inferred_plan_result.get("target_files") or [])
+            if not str(path).startswith("miniapp/app/static/")
+        ]
+        advisory_non_page_targets = [
+            path
+            for path in (advisory_plan_result.get("target_files") or [])
+            if not str(path).startswith("miniapp/app/static/")
+        ]
+        if minimal_patch_uses_advisory_scope:
+            inferred_non_page_targets = []
+        merged_plan["target_files"] = list(
+            dict.fromkeys(
+                [
+                    *(merged_plan.get("shared_files") or []),
+                    *merged_backend_targets,
+                    *merged_page_targets,
+                    *inferred_non_page_targets,
+                    *advisory_non_page_targets,
+                ]
+            )
+        )
         merged_plan["plan_gate_issues"] = list(advisory_plan_result.get("plan_gate_issues") or [])
         merged_plan["model"] = advisory_plan_result.get("model") or inferred_plan_result.get("model")
         merged_plan["strategy_reason"] = (
@@ -230,24 +301,111 @@ class MiniappGenerationEntry:
             or "Prompt and template affordances shaped the writable surface before tool-owned generation."
         )
         merged_plan["write_strategy"] = advisory_plan_result.get("write_strategy") or inferred_plan_result.get("write_strategy") or "whole_file_build"
-        merged_plan["scope_mode"] = advisory_plan_result.get("scope_mode") or inferred_plan_result.get("scope_mode") or "whole_file_build"
+        merged_plan["scope_mode"] = scope_mode
         merged_plan["flow_mode"] = advisory_plan_result.get("flow_mode") or inferred_plan_result.get("flow_mode") or "multi_page"
         merged_plan["require_multi_page"] = bool(
             advisory_plan_result.get("require_multi_page")
             if "require_multi_page" in advisory_plan_result
             else inferred_plan_result.get("require_multi_page")
         )
-        merged_plan["generation_clusters"] = list(
-            advisory_plan_result.get("generation_clusters")
-            or inferred_plan_result.get("generation_clusters")
-            or []
-        )
+        merged_plan["generation_clusters"] = list(self.service._build_generation_clusters(merged_plan["target_files"]) or [])
+        role_scope = [
+            role
+            for role in ROLE_ORDER
+            if role in current_roles or role in (merged_role_contract.get("roles") or {})
+        ] or list(current_roles)
         merged_plan["execution_plan"] = dict(
-            advisory_plan_result.get("execution_plan")
-            or inferred_plan_result.get("execution_plan")
-            or {}
+            self.service._build_execution_plan(
+                role_scope=role_scope,
+                roles=current_roles,
+                shared_files=list(merged_plan.get("shared_files") or []),
+                backend_targets=merged_backend_targets,
+                target_files=list(merged_plan["target_files"]),
+                generation_clusters=merged_plan["generation_clusters"],
+            )
         )
         return merged_role_contract, merged_plan
+
+    @staticmethod
+    def _page_signature(page: dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(page.get("route_path") or "").strip(),
+            str(page.get("file_path") or "").strip(),
+            str(page.get("page_id") or "").strip(),
+        )
+
+    @staticmethod
+    def _is_foundational_role_page(page: dict[str, Any]) -> bool:
+        route_path = str(page.get("route_path") or "").strip()
+        page_kind = str(page.get("page_kind") or "").strip().lower()
+        return route_path in {"/", "/profile"} or page_kind in {"landing", "profile"}
+
+    def _merge_role_page_graph_payload(
+        self,
+        *,
+        role: str,
+        existing_role_payload: dict[str, Any],
+        advisory_role_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged_role_payload = deepcopy(existing_role_payload)
+        advisory_pages = [
+            deepcopy(page)
+            for page in (advisory_role_payload.get("pages") or [])
+            if isinstance(page, dict)
+        ]
+        if advisory_pages:
+            existing_pages = [
+                deepcopy(page)
+                for page in (existing_role_payload.get("pages") or [])
+                if isinstance(page, dict)
+            ]
+            seen_signatures = {self._page_signature(page) for page in advisory_pages}
+            advisory_routes = {str(page.get("route_path") or "").strip() for page in advisory_pages}
+            merged_pages = list(advisory_pages)
+            for page in existing_pages:
+                if not self._is_foundational_role_page(page):
+                    continue
+                if self._page_signature(page) in seen_signatures:
+                    continue
+                if str(page.get("route_path") or "").strip() in advisory_routes:
+                    continue
+                merged_pages.append(page)
+            merged_role_payload["pages"] = merged_pages
+        for key in ("entry_path", "landing_page_id", "routes_file"):
+            advisory_value = advisory_role_payload.get(key)
+            if advisory_value not in (None, "", []):
+                merged_role_payload[key] = advisory_value
+        return merged_role_payload
+
+    @staticmethod
+    def _page_graph_target_files(page_graph: dict[str, Any]) -> list[str]:
+        targets: list[str] = []
+        for role_payload in (page_graph.get("roles") or {}).values():
+            if not isinstance(role_payload, dict):
+                continue
+            routes_file = role_payload.get("routes_file")
+            if isinstance(routes_file, str) and routes_file.strip():
+                targets.append(routes_file)
+            for page in role_payload.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                for key in ("file_path", "style_path", "script_path"):
+                    path = page.get(key)
+                    if isinstance(path, str) and path.strip():
+                        targets.append(path)
+        return list(dict.fromkeys(targets))
+
+    @staticmethod
+    def _roles_for_static_targets(target_files: list[str]) -> list[str]:
+        roles: list[str] = []
+        for path in target_files:
+            normalized = str(path or "").strip().replace("\\", "/")
+            parts = normalized.split("/")
+            if len(parts) >= 5 and parts[:4] == ["miniapp", "app", "static", parts[3]]:
+                role = parts[3]
+                if role in ROLE_ORDER:
+                    roles.append(role)
+        return list(dict.fromkeys(roles))
 
     def continue_generation_from_plan(
         self,
