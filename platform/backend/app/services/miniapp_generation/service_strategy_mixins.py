@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.models.artifacts import ValidationIssue
@@ -54,6 +55,17 @@ class ServiceStrategyMixins:
         "properly sized",
         "aligned",
         "proportions",
+        "text",
+        "copy",
+        "labels",
+        "loading text",
+        "action text",
+        "reads naturally",
+        "natural text",
+        "natural copy",
+        "stray numeric",
+        "numeric suffix",
+        "clean up",
     )
     _UI_FLOW_ROLE_PATCH_MARKERS = (
         "separate page",
@@ -61,6 +73,7 @@ class ServiceStrategyMixins:
         "details page",
         "detail page",
         "dedicated page",
+        "dedicated detail page",
         "dedicated details page",
         "open a separate page",
         "opens a separate page",
@@ -89,6 +102,12 @@ class ServiceStrategyMixins:
         "must be able to reject",
         "must be able to approve",
         "save action",
+        "approve/reject",
+        "approve or reject",
+        "reject controls",
+        "approve controls",
+        "decisions must persist",
+        "existing api",
     )
     _CONTRACT_ROLE_PATCH_ACTION_MARKERS = (
         "status must change",
@@ -162,7 +181,17 @@ class ServiceStrategyMixins:
         visual_hits = sum(1 for marker in ServiceStrategyMixins._VISUAL_ROLE_PATCH_MARKERS if marker in lowered)
         if visual_hits == 0:
             return False
-        return not any(marker in lowered for marker in ServiceStrategyMixins._CONTRACT_ROLE_PATCH_MARKERS)
+        normalized = ServiceStrategyMixins._without_preservation_only_contract_language(lowered)
+        return not any(marker in normalized for marker in ServiceStrategyMixins._CONTRACT_ROLE_PATCH_MARKERS)
+
+    @staticmethod
+    def _without_preservation_only_contract_language(lowered: str) -> str:
+        return re.sub(
+            r"\b(?:keep|keeping|preserve|preserving|leave|leaving)\b[^.?!]*(?:api|routes?|backend|behavior|logic|roles?|structure)[^.?!]*\b(?:intact|unchanged|as\s+is|same)\b",
+            "",
+            lowered,
+            flags=re.IGNORECASE,
+        )
 
     @staticmethod
     def _looks_like_contract_role_patch_request(lowered: str) -> bool:
@@ -181,12 +210,12 @@ class ServiceStrategyMixins:
         lowered = str(prompt or "").lower()
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
             return None
+        if ServiceStrategyMixins._looks_like_visual_role_patch_request(lowered):
+            return "visual_patch"
         if ServiceStrategyMixins._looks_like_contract_role_patch_request(lowered):
             return "contract_patch"
         if ServiceStrategyMixins._looks_like_role_flow_expansion_request(lowered):
             return "ui_flow_patch"
-        if ServiceStrategyMixins._looks_like_visual_role_patch_request(lowered):
-            return "visual_patch"
         return None
 
     @staticmethod

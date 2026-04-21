@@ -502,7 +502,16 @@ class MiniappGenerationRepair:
             has_tooling_failure=CheckRunner.has_tooling_failure,
             plan_turn=_plan_turn,
             apply_contract_sync=(
-                (lambda operations: list(operations))
+                (
+                    lambda operations: self.service._synchronize_frontend_api_contract(
+                        workspace_id,
+                        draft_run_id,
+                        list(operations),
+                        entity_contract=entity_contract,
+                        role_scope=role_scope,
+                        contract_sync_mode="repair_invariants",
+                    )
+                )
                 if visual_only_patch and not refresh_runtime_artifacts
                 else (
                     lambda operations: self.service._run_pre_apply_contract_pass(

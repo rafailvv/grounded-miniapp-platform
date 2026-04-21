@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.models.common import GenerationMode
@@ -22,6 +23,79 @@ class ArtifactManifestsMixin:
             return f"file:{file_path}"
         page_id = str(page.get("page_id") or "").strip()
         return f"id:{page_id}"
+
+    @staticmethod
+    def _route_manifest_page_score(page: dict[str, Any]) -> int:
+        page_kind = str(page.get("page_kind") or "").strip().lower()
+        route_path = str(page.get("route_path") or "").strip().lower()
+        page_id = str(page.get("page_id") or "").strip().lower()
+        score = 0
+        if page.get("is_entry"):
+            score += 100
+        if page_kind == "profile" or route_path.endswith("/profile") or "profile" in page_id:
+            score += 90
+        elif page_kind == "detail" or "{" in route_path or ":" in route_path or "detail" in page_id:
+            score += 80
+        elif page_kind in {"list", "dashboard", "home", "landing"}:
+            score += 70
+        elif page_kind == "form":
+            score += 60
+        elif page_kind == "page":
+            score += 10
+        if page_id.endswith("_id") and page_kind != "detail":
+            score -= 20
+        if re.search(r"\{[^/{}]+\}", route_path):
+            score += 3
+        if re.search(r":[a-z][a-z0-9_]*", route_path):
+            score -= 3
+        return score
+
+    @classmethod
+    def _dedupe_route_manifest_pages_by_key(
+        cls,
+        pages: list[dict[str, Any]],
+        key_name: str,
+    ) -> list[dict[str, Any]]:
+        best_by_key: dict[str, tuple[int, int, dict[str, Any]]] = {}
+        passthrough: list[tuple[int, dict[str, Any]]] = []
+        for index, page in enumerate(pages):
+            if not isinstance(page, dict):
+                continue
+            key = str(page.get(key_name) or "").strip()
+            if not key:
+                passthrough.append((index, page))
+                continue
+            score = cls._route_manifest_page_score(page)
+            previous = best_by_key.get(key)
+            if previous is None or score > previous[1]:
+                best_by_key[key] = (index, score, page)
+        winners = [(index, page) for index, _score, page in best_by_key.values()]
+        winners.extend(passthrough)
+        return [page for _index, page in sorted(winners, key=lambda item: item[0])]
+
+    @classmethod
+    def _dedupe_route_manifest_pages(cls, pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized_pages: list[dict[str, Any]] = []
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            normalized = dict(page)
+            file_path = str(page.get("file_path") or "").strip().replace("\\", "/")
+            page_id = str(page.get("page_id") or "").strip()
+            route_path = str(page.get("route_path") or "").strip().lower().rstrip("/") or "/"
+            route_key = re.sub(r":[a-z][a-z0-9_]*", "{id}", route_path)
+            route_key = re.sub(r"\{[^/{}]+\}", "{id}", route_key)
+            normalized["_dedupe_file_path"] = file_path
+            normalized["_dedupe_route_path"] = route_key
+            normalized["_dedupe_page_id"] = page_id
+            normalized_pages.append(normalized)
+        deduped = cls._dedupe_route_manifest_pages_by_key(normalized_pages, "_dedupe_file_path")
+        deduped = cls._dedupe_route_manifest_pages_by_key(deduped, "_dedupe_route_path")
+        deduped = cls._dedupe_route_manifest_pages_by_key(deduped, "_dedupe_page_id")
+        return [
+            {key: value for key, value in page.items() if not key.startswith("_dedupe_")}
+            for page in deduped
+        ]
 
     @classmethod
     def _merge_route_manifest_pages(
@@ -49,7 +123,7 @@ class ArtifactManifestsMixin:
                 continue
             ordered.append(merged)
             seen.add(key)
-        return ordered
+        return cls._dedupe_route_manifest_pages(ordered)
 
     @classmethod
     def _merged_role_mapping(
@@ -195,7 +269,7 @@ class ArtifactManifestsMixin:
                         "is_entry": bool(page.get("is_entry") or normalized_route == f"/{role}"),
                     }
                 )
-            roles[role] = {"entry_path": str(payload.get("entry_path") or f"/{role}"), "pages": pages}
+            roles[role] = {"entry_path": str(payload.get("entry_path") or f"/{role}"), "pages": self._dedupe_route_manifest_pages(pages)}
         return {"roles": roles}
 
     def runtime_manifest_from_page_graph(

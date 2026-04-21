@@ -29,6 +29,7 @@ from app.modules.miniapp_generation_runtime.generation_plan_runtime import Minia
 from app.modules.miniapp_generation_runtime.generation_progress_reporting import GenerationProgressReportingRuntime
 from app.modules.miniapp_generation_runtime.generation_page_graph_runtime import MiniappGenerationPageGraphRuntime
 from app.modules.miniapp_generation_runtime.generation_codegen import MiniappGenerationCodegen
+from app.modules.miniapp_generation_runtime.generation_contract_frontend import MiniappGenerationContractFrontend
 from app.modules.miniapp_generation_runtime.generation_contract_schema import MiniappGenerationContractSchema
 from app.modules.miniapp_generation_runtime.generation_normal_loop import MiniappGenerationNormalLoop
 from app.modules.miniapp_generation_runtime.generation_repair import MiniappGenerationRepair
@@ -38,6 +39,7 @@ from app.modules.miniapp_validation.generation_preflight_validation import Gener
 from app.validators.build_validator import BuildValidator
 from app.validators.connectivity_validator import ConnectivityValidator
 from app.repositories.state_store import StateStore
+from app.services.miniapp_generation.artifact_manifests import ArtifactManifestsMixin
 from app.services.miniapp_generation.service_llm_grounded_misc_mixins import ServiceLlmGroundedMiscMixins
 from app.services.miniapp_generation.service_strategy_mixins import ServiceStrategyMixins
 
@@ -789,6 +791,16 @@ def test_build_validator_does_not_treat_issue_heading_as_mutation() -> None:
     assert BuildValidator._looks_like_persisted_form_surface(html) is False
 
 
+def test_build_validator_accepts_role_prefixed_profile_route() -> None:
+    page = {
+        "route_path": "/manager/profile",
+        "page_kind": "form",
+        "file_path": "miniapp/app/static/manager/profile/index.html",
+    }
+
+    assert BuildValidator._looks_like_role_profile_page(page, "manager") is True
+
+
 def test_connectivity_validator_accepts_submit_spinner_as_loading_state() -> None:
     content = """
     <form id="issue-form"></form>
@@ -844,3 +856,88 @@ def test_stabilizer_preserves_valid_refresh_ui_changes(tmp_path: Path) -> None:
     assert "miniapp/app/static/client/index.html" not in changed
     assert "refresh-action" in (draft_page / "index.html").read_text(encoding="utf-8")
     assert "refresh-action" in (draft_page / "app.js").read_text(encoding="utf-8")
+
+
+def test_route_manifest_dedupes_duplicate_file_paths_preferring_detail_page() -> None:
+    pages = [
+        {
+            "page_id": "manager_requests_id",
+            "route_path": "/manager/{requests_id}",
+            "file_path": "miniapp/app/static/manager/requests_id/index.html",
+            "page_kind": "page",
+        },
+        {
+            "page_id": "manager_request_detail",
+            "route_path": "/manager/requests/{id}",
+            "file_path": "miniapp/app/static/manager/requests_id/index.html",
+            "page_kind": "detail",
+        },
+    ]
+
+    deduped = ArtifactManifestsMixin._dedupe_route_manifest_pages(pages)
+
+    assert len(deduped) == 1
+    assert deduped[0]["page_id"] == "manager_request_detail"
+
+
+def test_route_manifest_dedupes_equivalent_dynamic_routes() -> None:
+    pages = [
+        {
+            "page_id": "manager_request_detail",
+            "route_path": "/manager/requests/:id",
+            "file_path": "miniapp/app/static/manager/requests_detail/index.html",
+            "page_kind": "detail",
+        },
+        {
+            "page_id": "manager_request_detail",
+            "route_path": "/manager/requests/{id}",
+            "file_path": "miniapp/app/static/manager/requests_id/index.html",
+            "page_kind": "detail",
+        },
+    ]
+
+    deduped = ArtifactManifestsMixin._dedupe_route_manifest_pages(pages)
+
+    assert len(deduped) == 1
+    assert deduped[0]["route_path"] == "/manager/requests/{id}"
+
+
+def test_build_validator_flags_static_ui_numeric_artifacts() -> None:
+    content = """
+    actionStatusEl.textContent = "Saving decision85";
+    datesEl.textContent = `${formatDate(item.start_date)} 192 ${formatDate(item.end_date)}`;
+    <div class="loading">Loading requests10141515</div>
+    """
+
+    issues = BuildValidator._static_ui_text_artifact_issues(content, "miniapp/app/static/manager/app.js")
+
+    assert {issue.code for issue in issues} == {"build.static_ui_text_artifact"}
+    assert len(issues) == 3
+
+
+def test_frontend_contract_sync_maps_generic_record_aliases_to_entity_api() -> None:
+    content = 'const response = await window.miniappApiFetch("/api/records?status=pending");'
+
+    updated = MiniappGenerationContractFrontend._normalize_entity_api_paths(
+        content,
+        {"api_path": "/api/requests", "entity_slug_plural": "requests", "route_file": "miniapp/app/routes/requests.py"},
+    )
+
+    assert '"/api/requests?status=pending"' in updated
+
+
+def test_frontend_contract_sync_cleans_static_ui_text_artifacts() -> None:
+    content = """
+    datesEl.textContent = `${formatDate(item.start_date)} 192 ${formatDate(item.end_date)}`;
+    actionStatusEl.textContent = "Saving decision85";
+    <div class="loading">Loading requests10141515</div>
+    """
+
+    updated = MiniappGenerationContractFrontend._clean_static_ui_text_artifacts(content)
+
+    assert " 192 " not in updated
+    assert "decision85" not in updated
+    assert "requests10141515" not in updated
+    assert " - " in updated
+    assert '"Saving decision"' in updated
+    assert ">Loading requests<" in updated

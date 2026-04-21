@@ -14,6 +14,12 @@ from app.services.miniapp_generation.shell_contract import (
 
 
 class BuildValidator:
+    @staticmethod
+    def _looks_like_role_profile_page(page: dict, role: str) -> bool:
+        route_path = str(page.get("route_path") or "").rstrip("/")
+        page_kind = str(page.get("page_kind") or "").lower()
+        return page_kind == "profile" or route_path in {"/profile", f"/{role}/profile"} or route_path.endswith("/profile")
+
     _RUNTIME_ROUTER_PREFIX_PATTERN = re.compile(
         r'APIRouter\(\s*prefix\s*=\s*["\']/api/runtime(?:/)?["\']'
     )
@@ -113,6 +119,42 @@ class BuildValidator:
             flags=re.IGNORECASE,
         )
         return len(pattern.findall(str(content or "")))
+
+    @staticmethod
+    def _static_ui_text_artifact_issues(content: str, location: str) -> list[ValidationIssue]:
+        source = str(content or "")
+        patterns = (
+            (
+                re.compile(r"\$\{\s*formatDate\([^}]+\)\s*\}\s+\d{2,}\s+\$\{\s*formatDate\(", re.IGNORECASE),
+                "Date range text appears to contain a stray numeric separator.",
+            ),
+            (
+                re.compile(
+                    r"\b(?:textContent|innerText)\s*=\s*['\"][^'\"]*[A-Za-z][A-Za-z\s.,:;!?-]*[a-z]\d{2,}[^'\"]*['\"]",
+                    re.IGNORECASE,
+                ),
+                "Visible UI text appears to contain a stray numeric suffix.",
+            ),
+            (
+                re.compile(
+                    r">\s*(?:Loading|Saving|Submitting|Syncing|Refreshing|Updating|Fetching|Sending|Processing|Preparing)\b[^<]*?[A-Za-z]\d{2,}\s*<",
+                    re.IGNORECASE,
+                ),
+                "Visible UI state text appears to contain a stray numeric suffix.",
+            ),
+        )
+        issues: list[ValidationIssue] = []
+        for pattern, message in patterns:
+            if pattern.search(source):
+                issues.append(
+                    ValidationIssue(
+                        code="build.static_ui_text_artifact",
+                        message=message,
+                        severity="high",
+                        location=location,
+                    )
+                )
+        return issues
 
     def _validate_root_page_first_paint(
         self,
@@ -250,11 +292,7 @@ class BuildValidator:
             profile_pages = [
                 page
                 for page in pages
-                if isinstance(page, dict)
-                and (
-                    str(page.get("route_path") or "").rstrip("/") == "/profile"
-                    or str(page.get("page_kind") or "").lower() == "profile"
-                )
+                if isinstance(page, dict) and self._looks_like_role_profile_page(page, role)
             ]
             if not root_pages:
                 issues.append(
@@ -344,6 +382,7 @@ class BuildValidator:
                         )
 
                 content = file_path.read_text(encoding="utf-8")
+                issues.extend(self._static_ui_text_artifact_issues(content, file_path_raw))
                 issues.extend(
                     self._validate_root_page_first_paint(
                         role=role,
@@ -420,8 +459,10 @@ class BuildValidator:
                 if script_path_raw:
                     script_abs_path = workspace_path / script_path_raw
                     if script_abs_path.exists():
+                        script_content = script_abs_path.read_text(encoding="utf-8")
+                        issues.extend(self._static_ui_text_artifact_issues(script_content, script_path_raw))
                         html_ids = self._extract_html_ids(content)
-                        script_ids = self._extract_js_dom_ids(script_abs_path.read_text(encoding="utf-8"))
+                        script_ids = self._extract_js_dom_ids(script_content)
                         missing_ids = sorted(script_ids - html_ids)
                         if missing_ids:
                             issues.append(
@@ -450,11 +491,7 @@ class BuildValidator:
             profile_pages = [
                 page
                 for page in pages
-                if isinstance(page, dict)
-                and (
-                    str(page.get("route_path") or "").rstrip("/") == "/profile"
-                    or str(page.get("page_kind") or "").lower() == "profile"
-                )
+                if isinstance(page, dict) and self._looks_like_role_profile_page(page, role)
             ]
             if not root_pages:
                 issues.append(

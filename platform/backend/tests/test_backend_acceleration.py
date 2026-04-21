@@ -24,12 +24,13 @@ from app.ai.model_registry import (
 from app.ai.openrouter_client import ACTIVE_WORKSPACE_LOG_CONTEXT, OpenRouterClient
 from app.main import create_app
 from app.models.common import PreviewProfile, TargetPlatform
-from app.models.artifacts import ValidationIssue
+from app.models.artifacts import PatchEnvelope, PatchOperationModel, ValidationIssue
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RunCheckResult, RunRecord, ValidationSnapshot, WorkspaceRecord
 from app.models.grounded_spec import APIRequirement
 from app.modules.miniapp_agent_loop.fix_prompt_builder import FixPromptBuilder
 from app.modules.miniapp_agent_loop.fix_scope_builder import FixScopeBuilder
 from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
+from app.modules.miniapp_agent_loop.turn_runner import WorkspaceLoopTurnRunner
 from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import MiniappGenerationContractApiRoutesCrud
 from app.modules.miniapp_generation_runtime.generation_codegen_clusters import MiniappGenerationCodegenClusters
 from app.core.config import get_settings
@@ -40,7 +41,52 @@ from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENER
 from app.services.check_runner import CheckRunner
 from app.services.context_pack_builder import ContextPackBuilder
 from app.services.run_service import RunService
+from app.services.miniapp_generation.service_strategy_mixins import ServiceStrategyMixins
 from app.modules.miniapp_validation.build_validator import BuildValidator
+
+
+def test_workspace_loop_patch_report_omits_full_file_contents() -> None:
+    envelope = PatchEnvelope(
+        workspace_id="ws_report",
+        summary="test patch",
+        ops=[
+            PatchOperationModel(
+                operation_id="op_1",
+                op="update",
+                file_path="miniapp/app/static/client/app.js",
+                content="const value = 'large content';",
+                diff="--- a\n+++ b\n@@\n-large\n+large content\n",
+                explanation="Update client app.",
+            )
+        ],
+    )
+
+    report = WorkspaceLoopTurnRunner.compact_patch_report_envelope(envelope)
+
+    operation = report["ops"][0]
+    assert "content" not in operation
+    assert "diff" not in operation
+    assert operation["content_chars"] == len("const value = 'large content';")
+    assert operation["diff_chars"] == len("--- a\n+++ b\n@@\n-large\n+large content\n")
+    assert operation["content_omitted"] is True
+    assert operation["diff_omitted"] is True
+
+
+def test_role_patch_classifier_treats_text_cleanup_as_visual_patch() -> None:
+    prompt = (
+        "Please clean up the manager pages so the loading and action text reads naturally with no stray "
+        "numeric suffixes, while keeping the current request list, detail page, approve/reject behavior, "
+        "API routes, and all other roles intact."
+    )
+
+    assert (
+        ServiceStrategyMixins._role_only_patch_kind(
+            prompt=prompt,
+            role_scope=["manager"],
+            intent="role_only_change",
+        )
+        == "visual_patch"
+    )
 
 
 def _install_llm_stub(app) -> None:
@@ -3543,6 +3589,20 @@ def test_role_only_visual_patch_preserves_existing_source_entity_contract_from_s
         ),
         encoding="utf-8",
     )
+    app.state.container.store.upsert(
+        "reports",
+        f"entity_contract:{workspace.workspace_id}",
+        {
+            "run_id": "failed_role_patch",
+            "entity_contract": {
+                "api_path": "/api/workflows",
+                "route_file": "miniapp/app/routes/workflows.py",
+                "entity_slug": "workflow",
+                "entity_slug_plural": "workflows",
+                "schema_prefix": "Workflow",
+            },
+        },
+    )
 
     extracted = {
         "api_path": "/api/records",
@@ -3634,6 +3694,76 @@ def test_role_only_ui_flow_patch_preserves_source_entity_contract_but_merges_pag
     assert preserved["page_contract"]["detail_page_expected"] is True
     assert preserved["status_literals"] == ["open", "closed"]
     assert preserved["source"]["patch_kind"] == "ui_flow_patch"
+
+
+def test_single_role_edit_preserves_source_entity_contract_even_when_patch_kind_is_generic(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Generic Role Patch Contract Workspace",
+            description="Generic single-role edits should not drift away from the applied entity contract.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_generic_role_patch_contract").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    source_tests = workspace_service.source_dir(workspace.workspace_id) / "miniapp" / "tests" / "test_generated_app.py"
+    source_tests.parent.mkdir(parents=True, exist_ok=True)
+    source_tests.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "import json",
+                'ENTITY_CONTRACT = json.loads(\'{"api_path":"/api/training-requests","route_file":"miniapp/app/routes/training_requests.py","entity_slug":"training_request","entity_slug_plural":"training_requests","schema_prefix":"TrainingRequest"}\')',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    service.store.upsert(
+        "reports",
+        f"entity_contract:{workspace.workspace_id}",
+        {
+            "run_id": "failed_generic_patch",
+            "entity_contract": {
+                "api_path": "/api/workflows",
+                "route_file": "miniapp/app/routes/workflows.py",
+                "entity_slug": "workflow",
+                "entity_slug_plural": "workflows",
+            },
+        },
+    )
+
+    preserved = service.generation_entry._preserve_source_entity_contract_for_role_patch(
+        workspace_id=workspace.workspace_id,
+        extracted_entity_contract={
+            "api_path": "/api/workflows",
+            "route_file": "miniapp/app/routes/workflows.py",
+            "entity_slug": "workflow",
+            "entity_slug_plural": "workflows",
+        },
+        role_patch_kind="role_patch",
+    )
+
+    assert preserved["api_path"] == "/api/training-requests"
+    assert preserved["route_file"] == "miniapp/app/routes/training_requests.py"
+    assert preserved["entity_slug_plural"] == "training_requests"
+    assert preserved["source"]["patch_kind"] == "role_patch"
+
+
+def test_role_patch_classifier_recognizes_dedicated_detail_page_with_persisted_decisions() -> None:
+    prompt = (
+        "Please improve the manager side: when the manager clicks a training request, open a dedicated detail page "
+        "with approve/reject controls. Those decisions must persist through the existing API."
+    )
+
+    assert ServiceStrategyMixins._role_only_patch_kind(
+        prompt=prompt,
+        role_scope=["manager"],
+        intent="role_only_change",
+    ) == "contract_patch"
 
 
 def test_single_role_flow_expansion_plan_restores_missing_list_companion_from_source_graph(tmp_path: Path) -> None:

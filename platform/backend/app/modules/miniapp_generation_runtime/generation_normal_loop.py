@@ -771,7 +771,16 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                             ]
                         )
                     )
-        if not visual_only_patch:
+        if visual_only_patch:
+            operations = service._synchronize_frontend_api_contract(
+                workspace_id,
+                draft_run_id,
+                operations,
+                entity_contract=entity_contract,
+                role_scope=role_scope,
+                contract_sync_mode="repair_invariants",
+            )
+        else:
             operations = service._run_pre_apply_contract_pass(
                 workspace_id=workspace_id,
                 draft_run_id=draft_run_id,

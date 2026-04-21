@@ -149,6 +149,7 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
             draft_run_id,
             ensured,
             entity_contract=entity_contract,
+            role_scope=role_scope,
             contract_sync_mode="repair_invariants",
         )
         ensured = self._synchronize_basic_page_state_contract(

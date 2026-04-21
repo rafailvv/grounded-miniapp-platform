@@ -30,6 +30,24 @@ class WorkspaceLoopTurnRunner:
         self.edit_validator = WorkspaceLoopEditValidator()
         self.results = WorkspaceLoopResultFactory()
 
+    @staticmethod
+    def compact_patch_report_envelope(envelope) -> dict[str, object]:
+        payload = envelope.model_dump(mode="json")
+        compact_ops: list[dict[str, object]] = []
+        for raw_operation in payload.get("ops") or []:
+            operation = dict(raw_operation)
+            content = operation.pop("content", None)
+            diff = operation.pop("diff", None)
+            if content is not None:
+                operation["content_chars"] = len(str(content))
+                operation["content_omitted"] = True
+            if diff is not None:
+                operation["diff_chars"] = len(str(diff))
+                operation["diff_omitted"] = True
+            compact_ops.append(operation)
+        payload["ops"] = compact_ops
+        return payload
+
     def run(
         self,
         *,
@@ -351,7 +369,7 @@ class WorkspaceLoopTurnRunner:
                 f"patch:{workspace_id}",
                 {
                     "workspace_id": workspace_id,
-                    "envelope": envelope.model_dump(mode="json"),
+                    "envelope": self.compact_patch_report_envelope(envelope),
                     "apply_result": latest_apply_result,
                 },
             )

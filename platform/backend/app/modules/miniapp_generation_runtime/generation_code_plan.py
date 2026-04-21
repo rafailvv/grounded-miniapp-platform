@@ -38,6 +38,17 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         "margin",
         "design",
         "emphasis",
+        "text",
+        "copy",
+        "labels",
+        "loading text",
+        "action text",
+        "reads naturally",
+        "natural text",
+        "natural copy",
+        "stray numeric",
+        "numeric suffix",
+        "clean up",
     )
     _FUNCTIONAL_PATCH_MARKERS = (
         "backend",
@@ -722,7 +733,13 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         visual_hits = sum(1 for marker in cls._VISUAL_PATCH_MARKERS if marker in lowered)
         if visual_hits == 0:
             return False
-        return not any(marker in lowered for marker in cls._FUNCTIONAL_PATCH_MARKERS)
+        normalized = re.sub(
+            r"\b(?:keep|keeping|preserve|preserving|leave|leaving)\b[^.?!]*(?:api|routes?|backend|behavior|logic|roles?|structure)[^.?!]*\b(?:intact|unchanged|as\s+is|same)\b",
+            "",
+            lowered,
+            flags=re.IGNORECASE,
+        )
+        return not any(marker in normalized for marker in cls._FUNCTIONAL_PATCH_MARKERS)
 
     @classmethod
     def _select_focused_visual_page_targets(

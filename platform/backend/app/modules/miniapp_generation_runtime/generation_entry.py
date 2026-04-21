@@ -73,10 +73,13 @@ class MiniappGenerationEntry:
             role_scope=role_scope,
             intent=request.intent,
         )
+        source_contract_patch_kind = role_patch_kind
+        if source_contract_patch_kind is None and request.intent in {"edit", "refine", "role_only_change"} and len(role_scope) == 1:
+            source_contract_patch_kind = "role_patch"
         preserved_entity_contract = self._preserve_source_entity_contract_for_role_patch(
             workspace_id=workspace_id,
             extracted_entity_contract=entity_contract,
-            role_patch_kind=role_patch_kind,
+            role_patch_kind=source_contract_patch_kind,
         )
         if preserved_entity_contract is not entity_contract:
             entity_contract = preserved_entity_contract
@@ -85,7 +88,7 @@ class MiniappGenerationEntry:
                 "entity_contract_preserved",
                 "Preserved the existing source entity contract for a narrow single-role patch.",
                 {
-                    "role_patch_kind": role_patch_kind,
+                    "role_patch_kind": source_contract_patch_kind,
                     "entity_slug": entity_contract.get("entity_slug"),
                     "api_path": entity_contract.get("api_path"),
                     "route_file": entity_contract.get("route_file"),
@@ -233,7 +236,7 @@ class MiniappGenerationEntry:
         extracted_entity_contract: dict[str, Any],
         role_patch_kind: str | None,
     ) -> dict[str, Any]:
-        if role_patch_kind not in {"visual_patch", "ui_flow_patch", "contract_patch"}:
+        if role_patch_kind not in {"visual_patch", "ui_flow_patch", "contract_patch", "role_patch"}:
             return extracted_entity_contract
         source_entity_contract = self._load_existing_entity_contract(workspace_id)
         if not source_entity_contract:
@@ -255,10 +258,16 @@ class MiniappGenerationEntry:
         return preserved
 
     def _load_existing_entity_contract(self, workspace_id: str) -> dict[str, Any] | None:
+        source_contract = self._load_existing_entity_contract_from_source_tests(workspace_id)
+        if source_contract:
+            return source_contract
         report_payload = self.service.store.get("reports", f"entity_contract:{workspace_id}") or {}
         report_contract = report_payload.get("entity_contract") if isinstance(report_payload, dict) else None
         if self._looks_like_entity_contract(report_contract):
             return dict(report_contract)
+        return None
+
+    def _load_existing_entity_contract_from_source_tests(self, workspace_id: str) -> dict[str, Any] | None:
         source_tests_path = self.service.workspace_service.source_dir(workspace_id) / "miniapp" / "tests" / "test_generated_app.py"
         if not source_tests_path.exists():
             return None

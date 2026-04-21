@@ -48,11 +48,35 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         compact_route_stem = cls._compact_slug(route_stem)
         if compact_route_stem:
             aliases.add(compact_route_stem)
+        aliases.update({"record", "records", "item", "items", "workflow", "workflows"})
         aliases.discard("")
         if canonical_slug:
             aliases.discard(canonical_slug)
             aliases.discard(cls._compact_slug(canonical_slug))
         return canonical_api_path, aliases
+
+    @staticmethod
+    def _clean_static_ui_text_artifacts(content: str) -> str:
+        updated = str(content or "")
+        updated = re.sub(
+            r"(\$\{\s*formatDate\([^}]+\)\s*\})\s+\d{2,}\s+(\$\{\s*formatDate\([^}]+\)\s*\})",
+            r"\1 - \2",
+            updated,
+            flags=re.IGNORECASE,
+        )
+        updated = re.sub(
+            r"(\b(?:textContent|innerText)\s*=\s*['\"])([^'\"]*[A-Za-z][A-Za-z\s.,:;!?-]*[a-z])\d{2,}([^'\"]*['\"])",
+            r"\1\2\3",
+            updated,
+            flags=re.IGNORECASE,
+        )
+        updated = re.sub(
+            r"(>\s*(?:Loading|Saving|Submitting|Syncing|Refreshing|Updating|Fetching|Sending|Processing|Preparing)\b[^<]*?[A-Za-z])\d{2,}(\s*<)",
+            r"\1\2",
+            updated,
+            flags=re.IGNORECASE,
+        )
+        return updated
 
     @classmethod
     def _normalize_entity_api_paths(cls, content: str, entity_contract: dict[str, Any] | None) -> str:
@@ -315,10 +339,22 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         draft_run_id: str,
         operations: list[DraftFileOperation],
         entity_contract: dict[str, Any] | None = None,
+        role_scope: list[str] | None = None,
         contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
-        for file_path in list(operation_map):
+        target_paths = set(operation_map)
+        scoped_roles = {str(role).strip() for role in (role_scope or []) if str(role).strip()}
+        if scoped_roles:
+            for entry in self.workspace_service.file_tree(workspace_id, run_id=draft_run_id):
+                file_path = str(entry.get("path") or "")
+                if entry.get("type") != "file":
+                    continue
+                if not (file_path.endswith(".js") or file_path.endswith(".html")):
+                    continue
+                if any(file_path.startswith(f"miniapp/app/static/{role}/") for role in scoped_roles):
+                    target_paths.add(file_path)
+        for file_path in sorted(target_paths):
             if not (file_path.startswith("miniapp/app/static/") and (file_path.endswith(".js") or file_path.endswith(".html"))):
                 continue
             content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
@@ -326,6 +362,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
                 continue
             updated = self._normalize_api_aliases_in_text(content)
             updated = self._normalize_entity_api_paths(updated, entity_contract)
+            updated = self._clean_static_ui_text_artifacts(updated)
             if not self._needs_frontend_api_contract_repair(file_path, content) and updated == content:
                 continue
             if file_path.endswith(".html"):
@@ -335,7 +372,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
                     file_path=file_path,
                     operation="replace",
                     content=updated,
-                    reason="Pre-apply contract sync: canonicalize frontend API aliases before runtime checks.",
+                    reason="Pre-apply contract sync: canonicalize frontend API aliases and clean static UI text artifacts before runtime checks.",
                 )
                 continue
             updated = re.sub(r"(?<![\w.])fetch\(\s*([\"'`])/api/", r"window.miniappApiFetch(\1/api/", updated)
