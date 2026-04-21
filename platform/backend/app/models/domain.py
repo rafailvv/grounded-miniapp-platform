@@ -274,7 +274,7 @@ class GenerateRequest(StrictModel):
     generation_mode: GenerationMode = GenerationMode.BALANCED
     intent: Literal["auto", "create", "edit", "refine", "role_only_change"] = "auto"
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
-    model_profile: str = "openai_code_fast"
+    model_profile: str = ""
     linked_run_id: str | None = None
     resume_from_run_id: str | None = None
     error_context: ErrorContext | None = None
@@ -480,7 +480,7 @@ class RunRecord(StrictModel):
     intent: Literal["create", "edit", "refine", "role_only_change"]
     apply_strategy: Literal["staged_auto_apply", "manual_approve"] = "staged_auto_apply"
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
-    model_profile: str = "openai_code_fast"
+    model_profile: str = ""
     generation_mode: GenerationMode = GenerationMode.BALANCED
     llm_provider: str | None = None
     llm_model: str | None = None
@@ -533,7 +533,7 @@ class CreateRunRequest(StrictModel):
     intent: Literal["auto", "create", "edit", "refine", "role_only_change"] = "auto"
     apply_strategy: Literal["staged_auto_apply", "manual_approve"] = "staged_auto_apply"
     target_role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
-    model_profile: str = "openai_code_fast"
+    model_profile: str = ""
     target_platform: TargetPlatform = TargetPlatform.TELEGRAM
     preview_profile: PreviewProfile = PreviewProfile.TELEGRAM_MOCK
     generation_mode: GenerationMode = GenerationMode.BALANCED

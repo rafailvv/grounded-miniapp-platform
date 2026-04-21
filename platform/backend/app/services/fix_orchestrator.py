@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 from typing import TYPE_CHECKING, Any, Callable
 
+from app.ai.model_registry import resolve_model_profile
 from app.ai.openrouter_client import OpenRouterClient
 from app.models.common import GenerationMode
 from app.models.domain import FixScopeEntry, GenerateRequest, JobRecord, new_id
@@ -106,6 +107,7 @@ class FixOrchestrator:
         effective_mode = self._normalize_generation_mode(request.generation_mode)
         if effective_mode == GenerationMode.BASIC:
             effective_mode = GenerationMode.BALANCED
+        effective_model_profile = resolve_model_profile(request.model_profile, effective_mode)
         stable_prefix = (
             "You are repairing a grounded mini-app workspace. "
             "Use a bounded failure packet, keep scope narrow, and avoid rereading unchanged files."
@@ -116,7 +118,7 @@ class FixOrchestrator:
                 workspace_id=workspace_id,
                 prompt=request.prompt,
                 generation_mode=effective_mode.value,
-                model_profile=request.model_profile,
+                model_profile=effective_model_profile,
                 run_mode="fix",
                 stable_prefix=stable_prefix,
                 cache_key=cache_key,
@@ -140,7 +142,7 @@ class FixOrchestrator:
             fidelity="balanced_app",
             llm_enabled=self.openrouter_client.enabled,
             llm_provider="openai" if self.openrouter_client.enabled else None,
-            model_profile=request.model_profile,
+            model_profile=effective_model_profile,
             linked_run_id=run_id,
             error_context=request.error_context,
             failure_class=self._classify_failure_text(request.error_context.raw_error if request.error_context else request.prompt),
@@ -171,7 +173,7 @@ class FixOrchestrator:
                 workspace_id=workspace_id,
                 phase="intent",
                 generation_mode=effective_mode.value,
-                model_profile=request.model_profile,
+                model_profile=effective_model_profile,
                 run_mode="fix",
                 details={"failure_class": job.failure_class, "resume_from_run_id": request.resume_from_run_id},
             )
@@ -201,18 +203,22 @@ class FixOrchestrator:
         job.repair_base = repair_base
         if self.workspace_loop_engine is None:
             raise RuntimeError("Workspace loop engine is required for fix mode.")
-        return self._generate_with_workspace_loop(
-            workspace_id=workspace_id,
-            run_id=run_id,
-            request=request,
-            job=job,
-            draft_source=draft_source,
-            started_at=started_at,
-            role_scope=list(request.target_role_scope),
-            effective_mode=effective_mode,
-            memory_context=(self.store.get("reports", f"project_memory_context:{workspace_id}") or {}).get("summary"),
-            should_stop=should_stop,
-        )
+        with self.openrouter_client.routing_context(
+            model_profile=effective_model_profile,
+            generation_mode=effective_mode,
+        ):
+            return self._generate_with_workspace_loop(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                request=request.model_copy(update={"model_profile": effective_model_profile}),
+                job=job,
+                draft_source=draft_source,
+                started_at=started_at,
+                role_scope=list(request.target_role_scope),
+                effective_mode=effective_mode,
+                memory_context=(self.store.get("reports", f"project_memory_context:{workspace_id}") or {}).get("summary"),
+                should_stop=should_stop,
+            )
 
     @staticmethod
     def _normalize_generation_mode(value: GenerationMode | str | None) -> GenerationMode:

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from app.ai.model_registry import default_profile_for_generation_mode
 from app.models.domain import (
     CheckExecutionRecord,
     FixAttemptRecord,
@@ -454,7 +455,7 @@ class FixExecutionRuntime:
                 workspace_id=job.workspace_id,
                 phase="repair",
                 generation_mode=str(job.generation_mode),
-                model_profile=job.model_profile or "openai_code_fast",
+                model_profile=job.model_profile or default_profile_for_generation_mode(job.generation_mode),
                 run_mode="fix",
                 details={
                     "fix_attempts": len(fix_attempts),

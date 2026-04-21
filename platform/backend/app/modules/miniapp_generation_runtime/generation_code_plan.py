@@ -49,9 +49,6 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         "route",
         "real saved",
         "save action",
-        "create ",
-        "update ",
-        "delete ",
         "reject ",
         "approve ",
         "return to list",
@@ -66,8 +63,6 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         "an",
         "and",
         "app",
-        "booking",
-        "bookings",
         "button",
         "buttons",
         "clear",
@@ -92,7 +87,6 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         "proper",
         "readable",
         "rest",
-        "specialist",
         "spacing",
         "status",
         "style",
@@ -152,14 +146,21 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 workspace_tree=workspace_tree,
             )
             planned["workspace_id"] = workspace_id
-            if len(role_scope) == 1 and role_patch_kind == "ui_flow_patch":
+            if len(role_scope) == 1 and role_patch_kind in {"ui_flow_patch", "contract_patch"}:
                 planned = self._stabilize_single_role_flow_expansion_plan(
                     planned,
                     prompt=prompt,
                     focused_role=role_scope[0],
                 )
             focused_role = self._focused_minimal_patch_role(prompt=prompt, role_scope=role_scope)
-            if scope_mode == "minimal_patch" and focused_role:
+            if focused_role and (
+                scope_mode == "minimal_patch"
+                or (
+                    len(role_scope) == 1
+                    and intent in {"edit", "refine", "role_only_change"}
+                    and role_patch_kind in {"ui_flow_patch", "contract_patch"}
+                )
+            ):
                 planned = self._prune_minimal_patch_plan_to_focused_role(
                     planned,
                     prompt=prompt,
@@ -273,6 +274,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             role_patch_kind is None and self._looks_like_visual_page_patch(prompt=prompt)
         )
         ui_flow_patch = role_patch_kind == "ui_flow_patch"
+        contract_patch = role_patch_kind == "contract_patch"
         if visual_only_patch:
             source_role_pages = self._source_role_pages_for_focus(workspace_id=planned.get("workspace_id"), role=focused_role)
             for page in source_role_pages:
@@ -350,7 +352,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             for path in (planned.get("backend_targets") or [])
             if path not in non_focused_route_files
         ]
-        if ui_flow_patch:
+        if ui_flow_patch or contract_patch:
             feature_stems = {
                 stem
                 for stem in (
@@ -367,11 +369,19 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 and path.startswith("miniapp/app/routes/")
                 and path.removeprefix("miniapp/app/routes/").removesuffix(".py") in allowed_route_stems
             }
+            allowed_backend_contract_targets = {
+                path
+                for path in [*pruned_target_files, *pruned_backend_targets]
+                if isinstance(path, str)
+                and path in {"miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"}
+            }
 
             def _is_kept_ui_flow_path(path: str) -> bool:
                 if path.startswith("miniapp/app/static/"):
                     return path in selected_page_targets or path.startswith("miniapp/app/static/shared/")
                 if path in allowed_route_targets:
+                    return True
+                if contract_patch and path in allowed_backend_contract_targets:
                     return True
                 if path.startswith("miniapp/app/routes/"):
                     return False
@@ -390,13 +400,14 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                         *pruned_target_files,
                         *sorted(selected_page_targets),
                         *sorted(allowed_route_targets),
+                        *(sorted(allowed_backend_contract_targets) if contract_patch else []),
                     ]
                 )
             )
             pruned_backend_targets = [
                 path
                 for path in pruned_backend_targets
-                if isinstance(path, str) and path in allowed_route_targets
+                if isinstance(path, str) and (path in allowed_route_targets or (contract_patch and path in allowed_backend_contract_targets))
             ]
         if visual_only_patch:
             pruned_target_files = [
@@ -635,7 +646,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             return True
         if any(marker in route_path for marker in ("{", "}", ":")):
             return True
-        if any(marker in page_id for marker in ("detail", "_id", "record_id", "request_id", "booking_id")):
+        if any(marker in page_id for marker in ("detail", "_id", "record_id", "request_id")):
             return True
         return any(marker in file_path for marker in ("_detail/", "_id/", "/detail/"))
 
@@ -809,7 +820,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         rootish_prompt_tokens = {"main", "home", "landing", "dashboard", "root", "header", "top"}
         profile_prompt_tokens = {"profile", "settings", "account"}
         avatar_prompt_tokens = {"avatar", "photo", "image", "logo", "picture"}
-        detail_tokens = {"detail", "details", "booking", "bookings"}
+        detail_tokens = {"detail", "details"}
         if {"detail", "details"} & prompt_tokens and (
             page_kind in {"detail", "feature"}
             or {"detail", "details"} & page_tokens

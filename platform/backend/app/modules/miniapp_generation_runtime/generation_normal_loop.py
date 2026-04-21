@@ -786,6 +786,20 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                     "Pre-apply contract critic detected naming or persistence-coherence risks in the generated draft.",
                     critic_report,
                 )
+                critic_implicated_files = [
+                    path
+                    for path in list(critic_report.get("implicated_files") or [])
+                    if isinstance(path, str) and path.strip()
+                ]
+                if critic_implicated_files:
+                    plan_result["critic_implicated_files"] = list(
+                        dict.fromkeys(
+                            [
+                                *list(plan_result.get("critic_implicated_files") or []),
+                                *critic_implicated_files,
+                            ]
+                        )
+                    )
         if not visual_only_patch:
             operations = service._run_pre_apply_contract_pass(
                 workspace_id=workspace_id,

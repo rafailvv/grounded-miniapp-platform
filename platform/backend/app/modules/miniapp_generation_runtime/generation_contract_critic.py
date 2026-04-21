@@ -93,6 +93,7 @@ class MiniappGenerationContractCritic(MiniappGenerationRuntimeOwner):
     ) -> dict[str, Any]:
         issues: list[dict[str, Any]] = []
         feature_route_stems: set[str] = set()
+        feature_route_files: dict[str, str] = {}
         expected_route_file = str((entity_contract or {}).get("route_file") or "").replace("\\", "/")
         expected_route_stem = Path(expected_route_file).stem if expected_route_file else ""
         for operation in operations:
@@ -105,6 +106,7 @@ class MiniappGenerationContractCritic(MiniappGenerationRuntimeOwner):
                 stem = Path(normalized_path).stem
                 if stem not in self._FEATURE_ROUTE_EXCLUDED_STEMS:
                     feature_route_stems.add(stem)
+                    feature_route_files[stem] = normalized_path
                 if "/api/submissions/{table}" in lowered:
                     issues.append(
                         {
@@ -144,6 +146,7 @@ class MiniappGenerationContractCritic(MiniappGenerationRuntimeOwner):
                         + ", ".join(sorted(feature_route_stems))
                     ),
                     "route_stems": sorted(feature_route_stems),
+                    "implicated_files": [feature_route_files[stem] for stem in sorted(feature_route_stems) if stem in feature_route_files],
                 }
             )
         if expected_route_stem and feature_route_stems and expected_route_stem not in feature_route_stems:
@@ -157,14 +160,37 @@ class MiniappGenerationContractCritic(MiniappGenerationRuntimeOwner):
                     ),
                     "expected_route_stem": expected_route_stem,
                     "route_stems": sorted(feature_route_stems),
+                    "implicated_files": list(
+                        dict.fromkeys(
+                            [
+                                expected_route_file,
+                                *[feature_route_files[stem] for stem in sorted(feature_route_stems) if stem in feature_route_files],
+                            ]
+                        )
+                    ),
                 }
             )
+        implicated_files = list(
+            dict.fromkeys(
+                [
+                    str(issue.get("file_path") or "").strip()
+                    for issue in issues
+                    if str(issue.get("file_path") or "").strip()
+                ]
+                + [
+                    str(path or "").strip()
+                    for issue in issues
+                    for path in list(issue.get("implicated_files") or [])
+                    if str(path or "").strip()
+                ]
+            )
+        )
         return {
             "executed": True,
             "mode": generation_mode.value,
             "entity_contract": dict(entity_contract or {}),
             "issues": issues,
+            "implicated_files": implicated_files,
             "issue_count": len(issues),
             "blocking_issue_count": sum(1 for item in issues if str(item.get("severity") or "") == "high"),
         }
-

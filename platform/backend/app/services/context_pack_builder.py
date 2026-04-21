@@ -29,7 +29,7 @@ class ContextPackBuilder:
         *,
         workspace: WorkspaceRecord,
         prompt: str,
-        model_profile: str,
+        model_profile: str | None,
         generation_mode: GenerationMode = GenerationMode.BALANCED,
         active_paths: list[str] | None = None,
         target_files: list[str] | None = None,
@@ -119,20 +119,21 @@ class ContextPackBuilder:
         )
 
     @staticmethod
-    def stable_prefix(workspace: WorkspaceRecord, model_profile: str) -> str:
+    def stable_prefix(workspace: WorkspaceRecord, model_profile: str | None) -> str:
         platform = getattr(workspace.target_platform, "value", workspace.target_platform)
+        profile_label = str(model_profile or "mode-default")
         return (
             "You are editing a grounded mini-app workspace. "
-            "Prefer minimal targeted changes, preserve role separation, and keep generated artifacts consistent. "
-            f"Model profile: {model_profile}. Target platform: {platform}. "
+            "Prefer bounded coherent feature changes over overly narrow micro-patches, preserve role separation, and keep generated artifacts consistent. "
+            f"Model profile: {profile_label}. Target platform: {platform}. "
             "Defer non-essential file reads. Use retrieved chunks before widening context."
         )
 
     @classmethod
-    def prompt_cache_key(cls, workspace: WorkspaceRecord, model_profile: str, stable_prefix: str | None = None) -> str:
+    def prompt_cache_key(cls, workspace: WorkspaceRecord, model_profile: str | None, stable_prefix: str | None = None) -> str:
         stable_prefix = stable_prefix if stable_prefix is not None else cls.stable_prefix(workspace, model_profile)
         platform = getattr(workspace.target_platform, "value", workspace.target_platform)
-        material = f"{workspace.workspace_id}:{platform}:{model_profile}:{stable_prefix}"
+        material = f"{workspace.workspace_id}:{platform}:{str(model_profile or 'mode-default')}:{stable_prefix}"
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     @staticmethod
@@ -144,8 +145,8 @@ class ContextPackBuilder:
         if generation_mode == GenerationMode.FAST:
             return 3, 2
         if generation_mode == GenerationMode.BALANCED:
-            return 5, 3
-        return 6, 4
+            return 6, 4
+        return 7, 5
 
     @staticmethod
     def _preferred_anchor_paths(
@@ -161,8 +162,6 @@ class ContextPackBuilder:
                     "miniapp/app/main.py",
                     "miniapp/app/db.py",
                     "miniapp/app/schemas.py",
-                    "miniapp/app/generated/route_manifest.json",
-                    "miniapp/app/generated/runtime_manifest.json",
                 ]
             )
             anchors.extend(path for path in target_files if path.startswith("miniapp/app/routes/"))

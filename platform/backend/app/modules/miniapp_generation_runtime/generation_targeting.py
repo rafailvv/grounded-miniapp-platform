@@ -8,7 +8,7 @@ from typing import Any
 from app.modules.miniapp_materialization.materialization import MiniappMaterializationService
 from app.services.miniapp_generation.constants import (
     DESIGN_REFERENCE_FILES,
-    LEGACY_ARCHITECTURE_MARKERS,
+    DISALLOWED_ARCHITECTURE_MARKERS,
     CANONICAL_FILE_ROOTS,
     TEMPLATE_OWNED_SHARED_FILES,
 )
@@ -177,13 +177,9 @@ class MiniappGenerationTargeting(MiniappGenerationRuntimeOwner):
 
     @staticmethod
     def _is_canonical_target_path(path: str) -> bool:
-        if any(path.startswith(marker) for marker in LEGACY_ARCHITECTURE_MARKERS):
+        if any(path.startswith(marker) for marker in DISALLOWED_ARCHITECTURE_MARKERS):
             return False
         return any(path == root.rstrip("/") or path.startswith(root) for root in CANONICAL_FILE_ROOTS)
-
-    @staticmethod
-    def _is_legacy_role_entry_file(path: str) -> bool:
-        return False
 
     def _canonicalize_target_files(self, target_files: list[str], *, scope_mode: str) -> list[str]:
         canonical: list[str] = []
@@ -195,14 +191,11 @@ class MiniappGenerationTargeting(MiniappGenerationRuntimeOwner):
                 continue
             if (
                 self._is_canonical_target_path(normalized_path)
-                and not self._is_legacy_role_entry_file(normalized_path)
                 and normalized_path not in TEMPLATE_OWNED_SHARED_FILES
             ):
                 canonical.append(normalized_path)
         expanded = self._expand_page_triplet_targets(canonical)
         expanded = self._prune_redundant_role_root_alias_targets(expanded)
-        if scope_mode == "minimal_patch":
-            return list(dict.fromkeys(expanded))
         return list(dict.fromkeys(expanded))
 
     @classmethod

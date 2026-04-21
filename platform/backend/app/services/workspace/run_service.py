@@ -9,6 +9,7 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any
 
+from app.ai.model_registry import resolve_model_profile
 from app.ai.openrouter_client import OpenRouterClient
 from app.models.common import GenerationMode
 from app.models.domain import (
@@ -134,6 +135,7 @@ class RunService:
             workspace = self.workspace_service.rename_workspace(workspace_id, suggested_workspace_name)
         resolved_intent = self._resolve_intent(workspace, request)
         effective_generation_mode = self._resolve_generation_mode(workspace, request, resolved_intent)
+        effective_model_profile = self._resolve_model_profile(request.model_profile, effective_generation_mode)
         run = RunRecord(
             workspace_id=workspace_id,
             prompt=request.prompt,
@@ -142,7 +144,7 @@ class RunService:
             apply_strategy=request.apply_strategy,
             approval_required=request.apply_strategy == "manual_approve",
             target_role_scope=[role for role in request.target_role_scope if role in ROLE_SCOPE],
-            model_profile=request.model_profile,
+            model_profile=effective_model_profile,
             generation_mode=effective_generation_mode,
             llm_provider="openai" if self.openrouter_client.enabled else None,
             resume_from_run_id=request.resume_from_run_id,
@@ -396,8 +398,10 @@ class RunService:
             workspace = self.workspace_service.get_workspace(run.workspace_id)
             self.workspace_log_service.ensure_log_files(run.workspace_id)
             effective_generation_mode = self._resolve_generation_mode(workspace, request, run.intent)
+            effective_model_profile = self._resolve_model_profile(request.model_profile, effective_generation_mode)
             run.status = "running"
             run.generation_mode = effective_generation_mode
+            run.model_profile = effective_model_profile
             run.current_stage = "starting"
             run.progress_percent = max(run.progress_percent, 5)
             run.updated_at = datetime.now(timezone.utc)
@@ -423,7 +427,7 @@ class RunService:
                 generation_mode=effective_generation_mode,
                 intent=run.intent,
                 target_role_scope=run.target_role_scope,
-                model_profile=request.model_profile,
+                model_profile=effective_model_profile,
                 linked_run_id=run.run_id,
                 resume_from_run_id=request.resume_from_run_id,
                 error_context=request.error_context,
@@ -1047,6 +1051,10 @@ class RunService:
         if resolved_intent in {"edit", "refine", "role_only_change"} and has_existing_build:
             return GenerationMode.BALANCED
         return request.generation_mode
+
+    @staticmethod
+    def _resolve_model_profile(model_profile: str | None, generation_mode: GenerationMode) -> str:
+        return resolve_model_profile(model_profile, generation_mode)
 
     def _build_change_plan(
         self,

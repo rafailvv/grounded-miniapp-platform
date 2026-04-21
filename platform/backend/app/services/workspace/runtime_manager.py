@@ -321,10 +321,10 @@ class PreviewRuntimeManager:
         if result is not None and result.returncode == 0:
             return ["docker", "compose"]
         try:
-            legacy_result = subprocess.run(["docker-compose", "version"], capture_output=True, text=True)
+            compose_v1_result = subprocess.run(["docker-compose", "version"], capture_output=True, text=True)
         except FileNotFoundError:
-            legacy_result = None
-        if legacy_result is not None and legacy_result.returncode == 0:
+            compose_v1_result = None
+        if compose_v1_result is not None and compose_v1_result.returncode == 0:
             return ["docker-compose"]
         return None
 

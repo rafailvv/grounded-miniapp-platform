@@ -15,7 +15,12 @@ import app.services.check_runner as check_runner_module
 from fastapi.testclient import TestClient
 import pytest
 
-from app.ai.model_registry import TASK_PROFILES
+from app.ai.model_registry import (
+    TASK_PROFILES,
+    default_profile_for_generation_mode,
+    models_for_role,
+    resolve_model_profile,
+)
 from app.ai.openrouter_client import ACTIVE_WORKSPACE_LOG_CONTEXT, OpenRouterClient
 from app.main import create_app
 from app.models.common import PreviewProfile, TargetPlatform
@@ -23,14 +28,17 @@ from app.models.artifacts import ValidationIssue
 from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RunCheckResult, RunRecord, ValidationSnapshot, WorkspaceRecord
 from app.models.grounded_spec import APIRequirement
 from app.modules.miniapp_agent_loop.fix_prompt_builder import FixPromptBuilder
+from app.modules.miniapp_agent_loop.fix_scope_builder import FixScopeBuilder
 from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
 from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import MiniappGenerationContractApiRoutesCrud
 from app.modules.miniapp_generation_runtime.generation_codegen_clusters import MiniappGenerationCodegenClusters
 from app.core.config import get_settings
 from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
+from app.services.engine.task_router import TaskRouter
 from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES, GenerationService
 from app.services.check_runner import CheckRunner
+from app.services.context_pack_builder import ContextPackBuilder
 from app.services.run_service import RunService
 from app.modules.miniapp_validation.build_validator import BuildValidator
 
@@ -113,6 +121,55 @@ def test_system_configuration_defaults_to_balanced(tmp_path: Path) -> None:
     response = client.get("/system/configuration")
     assert response.status_code == 200
     assert response.json()["defaults"]["generation_mode"] == "balanced"
+    assert response.json()["defaults"]["model_profile"] == "research_balanced"
+
+
+def test_model_registry_resolves_mode_aware_profiles_and_routing() -> None:
+    assert default_profile_for_generation_mode(GenerationMode.BALANCED) == "research_balanced"
+    assert default_profile_for_generation_mode(GenerationMode.QUALITY) == "openai_code_quality"
+    assert resolve_model_profile("openai_code_fast", GenerationMode.BALANCED) == "research_balanced"
+    assert resolve_model_profile("research_balanced", GenerationMode.QUALITY) == "openai_code_quality"
+
+    balanced_code_plan, balanced_code_plan_fallback = models_for_role(
+        "code_plan",
+        model_profile="openai_code_fast",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    quality_code_edit, quality_code_edit_fallback = models_for_role(
+        "code_edit",
+        model_profile="research_balanced",
+        generation_mode=GenerationMode.QUALITY,
+    )
+
+    assert balanced_code_plan == "gpt-5.1-codex-max"
+    assert balanced_code_plan_fallback == "gpt-5-mini"
+    assert quality_code_edit == "gpt-5.1-codex-max"
+    assert quality_code_edit_fallback == "gpt-5.1-codex-mini"
+
+
+def test_task_router_uses_mode_resolved_profile_for_balanced() -> None:
+    snapshot = TaskRouter().profile_snapshot(
+        model_profile="openai_code_fast",
+        generation_mode=GenerationMode.BALANCED,
+        run_mode="generate",
+    )
+
+    assert snapshot["resolved_profile_name"] == "research_balanced"
+    assert snapshot["routing"]["code_edit"] == "gpt-5.1-codex-max"
+
+
+def test_context_pack_preferred_anchors_exclude_generated_manifests_for_entity_workflow() -> None:
+    anchors = ContextPackBuilder._preferred_anchor_paths(
+        grounded_spec=None,
+        execution_class="entity_workflow_app",
+        target_files=["miniapp/app/routes/orders.py", "miniapp/app/static/client/orders/index.html"],
+    )
+
+    assert "miniapp/app/generated/route_manifest.json" not in anchors
+    assert "miniapp/app/generated/runtime_manifest.json" not in anchors
+    assert "miniapp/app/db.py" in anchors
+    assert "miniapp/app/schemas.py" in anchors
+    assert "miniapp/app/routes/orders.py" in anchors
 
 
 def test_get_settings_loads_repo_root_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -407,6 +464,37 @@ def test_role_only_patch_kind_distinguishes_visual_ui_flow_and_contract(tmp_path
             intent="role_only_change",
         )
         == "contract_patch"
+    )
+
+
+def test_scope_mode_uses_bounded_role_regeneration_for_non_visual_role_changes(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    assert (
+        service._scope_mode(
+            "role_only_change",
+            "Please fix the client avatar so it stays inside the avatar container and does not stretch full-screen.",
+            ["client"],
+        )
+        == "minimal_patch"
+    )
+    assert (
+        service._scope_mode(
+            "role_only_change",
+            "When the client clicks an item from the list, open a separate details page with the full information and keep the current logic.",
+            ["client"],
+        )
+        == "whole_file_build"
+    )
+    assert (
+        service._scope_mode(
+            "role_only_change",
+            "On the specialist details page add a reject action that persists to the real backend and updates status across the app.",
+            ["specialist"],
+        )
+        == "whole_file_build"
     )
 
 
@@ -760,6 +848,41 @@ def test_contract_critic_flags_generic_submission_shim_and_seeded_live_data(tmp_
     issue_codes = {item["code"] for item in report["issues"]}
     assert "critic.generic_submission_shim" in issue_codes
     assert "critic.seeded_live_collection" in issue_codes
+    assert report["implicated_files"] == [
+        "miniapp/app/routes/bookings.py",
+        "miniapp/app/static/specialist/bookings/index.html",
+    ]
+
+
+def test_fix_scope_builder_expands_static_page_triplets_and_companion_pages() -> None:
+    existing_paths = {
+        "miniapp/app/static/client/bookings/index.html",
+        "miniapp/app/static/client/bookings/styles.css",
+        "miniapp/app/static/client/bookings/app.js",
+        "miniapp/app/static/client/bookings_detail/index.html",
+        "miniapp/app/static/client/bookings_detail/styles.css",
+        "miniapp/app/static/client/bookings_detail/app.js",
+        "miniapp/app/routes/client.py",
+    }
+    builder = FixScopeBuilder(file_exists=lambda _workspace_id, _run_id, path: path in existing_paths)
+
+    bundle = builder.structural_scope_bundle(
+        workspace_id="ws_scope",
+        run_id="run_scope",
+        implicated_files=["miniapp/app/static/client/bookings_detail/index.html"],
+        failure_class="static_flow_regression",
+        allow_missing_scope_path=lambda path: path.startswith("miniapp/app/static/") or path.startswith("miniapp/app/routes/"),
+    )
+
+    assert bundle == [
+        "miniapp/app/static/client/bookings_detail/index.html",
+        "miniapp/app/static/client/bookings_detail/styles.css",
+        "miniapp/app/static/client/bookings_detail/app.js",
+        "miniapp/app/routes/client.py",
+        "miniapp/app/static/client/bookings/index.html",
+        "miniapp/app/static/client/bookings/styles.css",
+        "miniapp/app/static/client/bookings/app.js",
+    ]
 
 
 def test_quality_mode_escalates_fix_context_faster_than_balanced() -> None:
@@ -813,6 +936,45 @@ def test_create_run_renames_workspace_from_prompt(tmp_path: Path) -> None:
 
     renamed = workspace_service.get_workspace(workspace.workspace_id)
     assert renamed.name == "Booking Operations Dashboard Clinic Appointments"
+
+
+def test_create_run_resolves_model_profile_from_generation_mode(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Profile Resolution Workspace",
+            description="Run creation should align the stored model profile with generation mode defaults.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_model_profile_resolution").resolve()),
+        )
+    )
+    original_execute_run = run_service._execute_run
+    run_service._execute_run = lambda *_args, **_kwargs: None
+    try:
+        balanced_run = run_service.create_run(
+            workspace.workspace_id,
+            CreateRunRequest(
+                prompt="Improve the client flow without changing the whole app.",
+                generation_mode=GenerationMode.BALANCED,
+                model_profile="openai_code_fast",
+            ),
+        )
+        quality_run = run_service.create_run(
+            workspace.workspace_id,
+            CreateRunRequest(
+                prompt="Improve the client flow with maximum quality.",
+                generation_mode=GenerationMode.QUALITY,
+                model_profile="research_balanced",
+            ),
+        )
+    finally:
+        run_service._execute_run = original_execute_run
+
+    assert balanced_run.model_profile == "research_balanced"
+    assert quality_run.model_profile == "openai_code_quality"
 
 
 def test_run_service_recovers_orphaned_active_runs_after_restart(tmp_path: Path) -> None:

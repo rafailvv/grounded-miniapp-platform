@@ -5,7 +5,7 @@ from typing import Any
 from app.models.artifacts import ValidationIssue
 from app.models.domain import RunCheckResult
 from app.models.grounded_spec import GroundedSpecModel
-from app.services.miniapp_generation.constants import ROLE_ORDER, WORKFLOW_HEAVY_MARKERS
+from app.services.miniapp_generation.constants import ROLE_ORDER
 
 
 class ServiceStrategyMixins:
@@ -93,9 +93,6 @@ class ServiceStrategyMixins:
         "must be able to reject",
         "must be able to approve",
         "save action",
-        "create ",
-        "update ",
-        "delete ",
         "status is correctly reflected",
     )
 
@@ -139,12 +136,14 @@ class ServiceStrategyMixins:
         role_patch_kind = ServiceStrategyMixins._role_only_patch_kind(prompt=prompt, role_scope=role_scope, intent=intent)
         if ServiceStrategyMixins._looks_like_fix_request(lowered):
             return "minimal_patch"
-        if role_patch_kind in {"visual_patch", "ui_flow_patch", "contract_patch"}:
+        if role_patch_kind == "visual_patch":
             return "minimal_patch"
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
             return "whole_file_build"
-        if intent in {"edit", "refine", "role_only_change"}:
-            return "minimal_patch"
+        if role_patch_kind in {"ui_flow_patch", "contract_patch"}:
+            return "whole_file_build"
+        if len(role_scope) == 1 and intent in {"edit", "refine", "role_only_change"}:
+            return "whole_file_build"
         if any(marker in lowered for marker in ("only ", "just ", "точечно", "только ", "without touching", "do not touch anything else")):
             return "minimal_patch"
         if len(role_scope) == 1 and any(marker in lowered for marker in ("change", "update", "fix", "refine", "polish")):
@@ -165,15 +164,17 @@ class ServiceStrategyMixins:
         if role_patch_kind == "visual_patch":
             return "The request is a single-role visual patch, so generation stays in minimal patch mode."
         if role_patch_kind == "ui_flow_patch":
-            return "The request expands an existing single-role UI flow, so generation stays in minimal patch mode with focused root/list/detail companions."
+            return "The request expands an existing single-role UI flow, so generation uses bounded role regeneration instead of a micro-patch."
         if role_patch_kind == "contract_patch":
-            return "The request changes a single-role contract-backed behavior, so generation stays in minimal patch mode with focused backend files."
+            return "The request changes a single-role contract-backed behavior, so generation uses bounded role regeneration with related runtime files when needed."
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
             return "The request describes a new workflow-heavy app surface, so generation uses whole-file bundles."
         if len(role_scope) > 1:
             return "Multiple roles are in scope, so generation uses whole-file bundles instead of local patches."
         if require_multi_page:
             return "The request implies multiple pages or flows, so generation uses whole-file bundles."
+        if len(role_scope) == 1 and intent in {"edit", "refine", "role_only_change"}:
+            return "A single-role change should stay bounded to that role and feature family, but not be forced into a micro-patch."
         if any(marker in lowered for marker in ("catalog", "storefront", "checkout", "workspace", "dashboard", "full implementation", "refactor")):
             return "The request introduces a new app surface, so generation uses whole-file bundles."
         return "The request is narrow enough to stay in minimal patch mode."
@@ -200,23 +201,6 @@ class ServiceStrategyMixins:
         return any(marker in lowered for marker in multi_markers)
 
     @staticmethod
-    def _requires_business_pages(prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str], intent: str) -> bool:
-        lowered = prompt.lower()
-        if ServiceStrategyMixins._looks_like_fix_request(lowered):
-            return False
-        if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
-            return True
-        if any(marker in lowered for marker in WORKFLOW_HEAVY_MARKERS):
-            return True
-        if intent == "create" and len(role_scope) > 1:
-            return True
-        if len(grounded_spec.user_flows) > 1:
-            return True
-        if len(grounded_spec.api_requirements) > 0 or len(grounded_spec.persistence_requirements) > 0:
-            return True
-        return False
-
-    @staticmethod
     def _classify_execution_class(*, prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str], intent: str) -> str:
         lowered = prompt.lower()
         lifecycle_markers = ("create", "submit", "assign", "update", "comment", "track", "filter", "schedule", "approve", "review", "manage")
@@ -236,19 +220,6 @@ class ServiceStrategyMixins:
         if intent == "create" and entity_count > 1 and lifecycle_hits >= 2:
             return "entity_workflow_app"
         return "entity_workflow_app"
-
-    @staticmethod
-    def _planning_retry_prompt(prompt: str) -> str:
-        corrective = (
-            "Planning correction: expand into a realistic route/page graph that matches the workflow. "
-            "Do not collapse the app into role landing pages. "
-            "Use dashboard, workbench, workspace, and profile only as structural references when the prompt does not imply a better structure. "
-            "Differentiate the roles through page purpose, actions, and handoffs instead of mirrored wording. "
-            "Role root pages must feel complete on first render without fake records: render real sections, actions, and honest empty states immediately. "
-            "Do not pre-render invented request cards, approval rows, conflict records, or availability items just to make the page feel populated. "
-            "Do not make loading or error UI the primary visible surface on first render."
-        )
-        return f"{prompt.rstrip()}\n\n{corrective}"
 
     @staticmethod
     def _is_business_page(role: str, page: dict[str, Any]) -> bool:

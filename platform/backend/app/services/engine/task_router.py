@@ -1,23 +1,25 @@
 from __future__ import annotations
 
-from app.ai.model_registry import TASK_PROFILES
+from app.ai.model_registry import resolve_model_profile, routing_for_profile, TASK_PROFILES
 from app.models.common import GenerationMode
 from app.services.engine.mode_profiles import ModeProfiles
 
 
 class TaskRouter:
     def profile_snapshot(self, *, model_profile: str, generation_mode: GenerationMode | str, run_mode: str) -> dict[str, object]:
-        requested_profile = TASK_PROFILES.get(model_profile) or TASK_PROFILES["openai_code_fast"]
+        resolved_profile_name = resolve_model_profile(model_profile, generation_mode)
+        requested_profile = TASK_PROFILES.get(resolved_profile_name) or TASK_PROFILES["openai_code_fast"]
         mode_profile = ModeProfiles.resolve(generation_mode)
         return {
             "requested_profile": model_profile,
+            "resolved_profile_name": resolved_profile_name,
             "resolved_profile": requested_profile["label"],
             "generation_mode": mode_profile.mode,
             "run_mode": run_mode,
             "planner_effort": mode_profile.planner_effort,
             "editor_effort": mode_profile.editor_effort,
             "repair_effort": mode_profile.repair_effort,
-            "routing": dict(requested_profile.get("routing") or {}),
+            "routing": routing_for_profile(model_profile=resolved_profile_name, generation_mode=generation_mode),
         }
 
     def route_for_phase(

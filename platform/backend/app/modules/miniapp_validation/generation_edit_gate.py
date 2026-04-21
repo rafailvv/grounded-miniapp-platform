@@ -4,7 +4,7 @@ import re
 from typing import Any, Callable
 
 from app.models.domain import DraftFileOperation
-from app.services.miniapp_generation.constants import LEGACY_ARCHITECTURE_MARKERS
+from app.services.miniapp_generation.constants import DISALLOWED_ARCHITECTURE_MARKERS
 
 
 class GenerationEditGate:
@@ -57,7 +57,7 @@ class GenerationEditGate:
         unexpected_paths = [path for path in operation_paths if path not in allowed_target_paths]
         if unexpected_paths:
             issues.append(f"Generated draft touched files outside the planned target scope: {', '.join(unexpected_paths[:5])}")
-        legacy_paths = [path for path in operation_paths if any(path.startswith(marker) for marker in LEGACY_ARCHITECTURE_MARKERS)]
+        legacy_paths = [path for path in operation_paths if any(path.startswith(marker) for marker in DISALLOWED_ARCHITECTURE_MARKERS)]
         if legacy_paths:
             issues.append(f"Generated draft reintroduced legacy architecture paths: {', '.join(sorted(legacy_paths)[:5])}")
         non_canonical_paths = [

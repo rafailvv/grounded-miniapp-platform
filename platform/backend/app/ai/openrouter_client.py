@@ -13,12 +13,19 @@ from typing import Any
 
 import httpx
 
-from app.ai.model_registry import MODEL_REGISTRY, TASK_PROFILES
+from app.ai.model_registry import (
+    MODEL_REGISTRY,
+    TASK_PROFILES,
+    default_profile_for_generation_mode,
+    models_for_role,
+)
 from app.core.config import Settings
+from app.models.common import GenerationMode
 from app.services.workspace.log_service import WorkspaceLogService
 
 logger = logging.getLogger(__name__)
 ACTIVE_WORKSPACE_LOG_CONTEXT: ContextVar[str | None] = ContextVar("active_workspace_log_context", default=None)
+ACTIVE_LLM_ROUTING_CONTEXT: ContextVar[dict[str, str] | None] = ContextVar("active_llm_routing_context", default=None)
 
 
 class OpenRouterClient:
@@ -42,20 +49,21 @@ class OpenRouterClient:
         return bool(self.api_key)
 
     def configuration(self) -> dict[str, object]:
+        default_profile = default_profile_for_generation_mode(GenerationMode.BALANCED)
         return {
             "enabled": self.enabled,
             "base_url": self.base_url,
             "models": MODEL_REGISTRY,
             "task_profiles": TASK_PROFILES,
-            "default_coding_profile": "openai_code_fast",
+            "default_coding_profile": default_profile,
             "routing": {
                 "provider": "openai",
             },
             "supports_prompt_cache_key": True,
             "mode_profiles": {
                 "fast": "openai_code_fast",
-                "balanced": "openai_code_fast",
-                "quality": "openai_code_fast",
+                "balanced": default_profile,
+                "quality": default_profile_for_generation_mode(GenerationMode.QUALITY),
             },
         }
 
@@ -66,6 +74,18 @@ class OpenRouterClient:
             yield
         finally:
             ACTIVE_WORKSPACE_LOG_CONTEXT.reset(token)
+
+    @contextmanager
+    def routing_context(self, *, model_profile: str | None, generation_mode: GenerationMode | str | None) -> Any:
+        payload = {
+            "model_profile": str(model_profile or "").strip(),
+            "generation_mode": str(getattr(generation_mode, "value", generation_mode) or "").strip(),
+        }
+        token = ACTIVE_LLM_ROUTING_CONTEXT.set(payload)
+        try:
+            yield
+        finally:
+            ACTIVE_LLM_ROUTING_CONTEXT.reset(token)
 
     def generate_structured(
         self,
@@ -107,8 +127,16 @@ class OpenRouterClient:
                 "cache_stats": payload["cache_stats"],
             }
         model_config = MODEL_REGISTRY[role]
-        primary_model = str(model_override or model_config["primary"])
-        fallback_model = str(fallback_model_override or model_config["fallback"])
+        routing_context = ACTIVE_LLM_ROUTING_CONTEXT.get() or {}
+        requested_profile = str(routing_context.get("model_profile") or "").strip() or None
+        generation_mode = str(routing_context.get("generation_mode") or "").strip() or None
+        routed_primary_model, routed_fallback_model = models_for_role(
+            role,
+            model_profile=requested_profile,
+            generation_mode=generation_mode,
+        )
+        primary_model = str(model_override or routed_primary_model or model_config["primary"])
+        fallback_model = str(fallback_model_override or routed_fallback_model or model_config["fallback"])
         models = [primary_model] if fallback_model == primary_model else [primary_model, fallback_model]
         last_error: Exception | None = None
         for model in models:
@@ -959,9 +987,9 @@ class OpenRouterClient:
                 return {"reasoning": {"effort": "medium"}}
             return {"reasoning": {"effort": "high"}}
         if role == "code_edit":
-            return {"reasoning": {"effort": "low"}}
+            return {"reasoning": {"effort": "medium"}}
         if role == "code_plan":
-            return {"reasoning": {"effort": "low"}}
+            return {"reasoning": {"effort": "medium"}}
         if role == "spec_analysis":
             return {"reasoning": {"effort": "low"}}
         if role == "ir_codegen":

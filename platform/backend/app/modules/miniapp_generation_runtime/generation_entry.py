@@ -233,7 +233,7 @@ class MiniappGenerationEntry:
         extracted_entity_contract: dict[str, Any],
         role_patch_kind: str | None,
     ) -> dict[str, Any]:
-        if role_patch_kind not in {"visual_patch", "ui_flow_patch"}:
+        if role_patch_kind not in {"visual_patch", "ui_flow_patch", "contract_patch"}:
             return extracted_entity_contract
         source_entity_contract = self._load_existing_entity_contract(workspace_id)
         if not source_entity_contract:
@@ -241,7 +241,7 @@ class MiniappGenerationEntry:
         preserved = deepcopy(source_entity_contract)
         if extracted_entity_contract.get("extraction_mode"):
             preserved["extraction_mode"] = extracted_entity_contract.get("extraction_mode")
-        if role_patch_kind == "ui_flow_patch":
+        if role_patch_kind in {"ui_flow_patch", "contract_patch"}:
             preserved_page_contract = dict(source_entity_contract.get("page_contract") or {})
             for key, value in dict(extracted_entity_contract.get("page_contract") or {}).items():
                 if value is not None:

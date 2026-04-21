@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
+from app.ai.model_registry import default_profile_for_generation_mode
 from app.api.deps import get_container
 from app.models.domain import CreateRunRequest, GenerateRequest, JobRecord
 from app.services.container import ServiceContainer
@@ -73,7 +74,7 @@ def retry_job(job_id: str, container: ServiceContainer = Depends(get_container))
             preview_profile=job.preview_profile,
             generation_mode=job.generation_mode,
             intent="edit" if job.mode == "fix" else "auto",
-            model_profile=job.model_profile or "openai_code_fast",
+            model_profile=job.model_profile or default_profile_for_generation_mode(job.generation_mode),
             linked_run_id=job.linked_run_id,
             error_context=job.error_context,
         )

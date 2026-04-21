@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
 from app.models.domain import FixScopeEntry
 
 
@@ -58,7 +60,52 @@ class FixScopeBuilder:
         for file_path in implicated_files:
             if file_path.startswith("miniapp/app/routes/"):
                 bundle.append(file_path)
+            bundle.extend(
+                self._static_page_scope_bundle(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    file_path=file_path,
+                    allow_missing_scope_path=allow_missing_scope_path,
+                )
+            )
         return list(dict.fromkeys(bundle))
+
+    def _static_page_scope_bundle(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        file_path: str,
+        allow_missing_scope_path,
+    ) -> list[str]:
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        if not normalized.startswith("miniapp/app/static/"):
+            return []
+        path = PurePosixPath(normalized)
+        if path.name not in {"index.html", "styles.css", "app.js"}:
+            return []
+        page_dir = path.parent
+        candidates: list[str] = []
+
+        def _add_triplet(base_dir: PurePosixPath) -> None:
+            for name in ("index.html", "styles.css", "app.js"):
+                candidate = str(base_dir / name)
+                if self._file_exists(workspace_id, run_id, candidate) or allow_missing_scope_path(candidate):
+                    candidates.append(candidate)
+
+        _add_triplet(page_dir)
+        parts = page_dir.parts
+        if len(parts) >= 5:
+            role = parts[3]
+            role_route = f"miniapp/app/routes/{role}.py"
+            if self._file_exists(workspace_id, run_id, role_route) or allow_missing_scope_path(role_route):
+                candidates.append(role_route)
+        page_stem = page_dir.name
+        if page_stem.endswith("_detail"):
+            _add_triplet(page_dir.with_name(page_stem[: -len("_detail")]))
+        elif page_stem not in {"client", "specialist", "manager", "profile"}:
+            _add_triplet(page_dir.with_name(f"{page_stem}_detail"))
+        return list(dict.fromkeys(candidates))
 
     @staticmethod
     def merge_scope(

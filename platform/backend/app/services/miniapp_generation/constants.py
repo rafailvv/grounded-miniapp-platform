@@ -28,8 +28,6 @@ DESIGN_REFERENCE_FILES = (
     "miniapp/app/static/client/index.html",
     "miniapp/app/static/specialist/index.html",
     "miniapp/app/static/manager/index.html",
-    "miniapp/app/generated/route_manifest.json",
-    "miniapp/app/generated/runtime_manifest.json",
 )
 SHARED_GENERATED_FILES = (
     "miniapp/app/main.py",
@@ -62,7 +60,7 @@ CANONICAL_FILE_ROOTS = (*CANONICAL_FRONTEND_ROOTS, *CANONICAL_BACKEND_ROOTS, "ar
 TEMPLATE_OWNED_SHARED_FILES = (
     "miniapp/app/static/preview_bridge.js",
 )
-LEGACY_ARCHITECTURE_MARKERS = (
+DISALLOWED_ARCHITECTURE_MARKERS = (
     "frontend/",
     "miniapp/app/api/",
     "miniapp/app/application/",

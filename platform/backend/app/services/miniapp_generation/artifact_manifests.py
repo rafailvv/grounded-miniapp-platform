@@ -73,15 +73,6 @@ class ArtifactManifestsMixin:
         return merged
 
     @staticmethod
-    def _recount_runtime_manifest_app(runtime_manifest: dict[str, Any]) -> dict[str, Any]:
-        roles = runtime_manifest.get("roles") or {}
-        app_payload = dict(runtime_manifest.get("app") or {})
-        app_payload["route_count"] = sum(len((role_payload or {}).get("routes") or []) for role_payload in roles.values())
-        app_payload["screen_count"] = sum(len((role_payload or {}).get("screens") or {}) for role_payload in roles.values())
-        runtime_manifest["app"] = app_payload
-        return runtime_manifest
-
-    @staticmethod
     def _is_redundant_role_root_alias_page(
         role: str,
         page: dict[str, Any],

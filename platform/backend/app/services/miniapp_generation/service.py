@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.ai.openrouter_client import OpenRouterClient
+from app.ai.model_registry import resolve_model_profile
 from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
 from app.models.domain import ChatTurnRecord, GenerateRequest, JobRecord
 from app.models.grounded_spec import GroundedSpecModel
@@ -15,14 +16,7 @@ from app.services.code_index_service import CodeIndexService
 from app.services.context_pack_builder import ContextPackBuilder
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.miniapp_generation.artifact_builder import MiniappArtifactBuilder
-from app.services.miniapp_generation.compat_code_plan_mixins import CompatCodePlanMixins
-from app.services.miniapp_generation.compat_codegen_mixins import CompatCodegenMixins
-from app.services.miniapp_generation.compat_contract_mixins import CompatContractMixins
-from app.services.miniapp_generation.compat_dispatch import CompatibilityDispatchMixin, GenerationServiceMeta
-from app.services.miniapp_generation.compat_grounded_spec_mixins import CompatGroundedSpecMixins
-from app.services.miniapp_generation.compat_paths_mixins import CompatPathsMixins
-from app.services.miniapp_generation.compat_reporting_mixins import CompatReportingMixins
-from app.services.miniapp_generation.compat_validation_mixins import CompatValidationMixins
+from app.services.miniapp_generation.runtime_dispatch import RuntimeDispatchMixin, RuntimeOwnerMeta
 from app.services.miniapp_generation.constants import DESIGN_REFERENCE_FILES, ROLE_ORDER
 from app.services.miniapp_generation.service_contract_materialization_mixins import ServiceContractMaterializationMixins
 from app.services.miniapp_generation.service_llm_grounded_misc_mixins import ServiceLlmGroundedMiscMixins
@@ -38,6 +32,8 @@ from app.modules.miniapp_contract.runtime_contract_sync import MiniappRuntimeCon
 from app.modules.miniapp_generation_runtime import (
     GenerationProgressReportingRuntime,
     GroundedSpecOrchestrationRuntime,
+    GroundedSpecPayloadsRuntime,
+    GroundedSpecPromptsRuntime,
     MiniappGenerationCompletion,
     MiniappGenerationContractCritic,
     MiniappGenerationContractFrontend,
@@ -55,6 +51,7 @@ from app.modules.miniapp_generation_runtime import (
     MiniappGenerationEntry,
     MiniappGenerationNormalLoop,
     MiniappGenerationPageGraphRuntime,
+    MiniappGenerationPaths,
     MiniappGenerationPlanRuntime,
     MiniappGenerationReporting,
     MiniappGenerationReportingCompaction,
@@ -74,7 +71,7 @@ from app.modules.miniapp_generation_runtime import (
     select_creative_direction,
 )
 from app.modules.miniapp_materialization.materialization import MiniappMaterializationService
-from app.modules.miniapp_validation import GenerationEditGate, GenerationPreflightValidation
+from app.modules.miniapp_validation import GenerationEditGate, GenerationPreflightValidation, PageGraphValidation
 from app.modules.miniapp_agent_loop.engine import WorkspaceLoopEngine
 from app.validators.suite import ValidationSuite
 
@@ -95,15 +92,8 @@ class GenerationService(
     ServicePromptCodegenMixins,
     ServiceStrategyMixins,
     ServicePageDefaultsMixins,
-    CompatGroundedSpecMixins,
-    CompatValidationMixins,
-    CompatReportingMixins,
-    CompatContractMixins,
-    CompatPathsMixins,
-    CompatCodegenMixins,
-    CompatCodePlanMixins,
-    CompatibilityDispatchMixin,
-    metaclass=GenerationServiceMeta,
+    RuntimeDispatchMixin,
+    metaclass=RuntimeOwnerMeta,
 ):
     GROUNDED_SPEC_SECTION_TIMEOUT_SECONDS = 90
     GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS = 120
@@ -115,7 +105,7 @@ class GenerationService(
     JSON_OBJECT_LLM_TIMEOUT_SECONDS = 120
 
     @classmethod
-    def _compat_owner_factories(cls) -> dict[str, Any]:
+    def _runtime_owner_factories(cls) -> dict[str, Any]:
         return {
             "grounded_spec_orchestration": GroundedSpecOrchestrationRuntime,
             "generation_completion": MiniappGenerationCompletion,
@@ -147,6 +137,186 @@ class GenerationService(
             "generation_contract_routes": MiniappGenerationContractRoutes,
             "generation_contract_frontend": MiniappGenerationContractFrontend,
             "generation_shell_contract": MiniappGenerationShellContract,
+        }
+
+    @classmethod
+    def _runtime_class_owner_map(cls) -> dict[str, Any]:
+        return {
+            "_grounded_spec_outline_schema": GroundedSpecPromptsRuntime,
+            "_grounded_spec_outline_system_prompt": GroundedSpecPromptsRuntime,
+            "_grounded_spec_system_prompt": GroundedSpecPromptsRuntime,
+            "_grounded_spec_section_system_prompt": GroundedSpecPromptsRuntime,
+            "_grounded_spec_outline_user_prompt": GroundedSpecPromptsRuntime,
+            "_grounded_spec_user_prompt": GroundedSpecPromptsRuntime,
+            "_grounded_spec_partial_schema": GroundedSpecPromptsRuntime,
+            "_grounded_spec_section_user_prompt": GroundedSpecPromptsRuntime,
+            "_compact_doc_refs": GroundedSpecPromptsRuntime,
+            "_compact_creative_direction": GroundedSpecPromptsRuntime,
+            "_normalize_model_payload": GroundedSpecPayloadsRuntime,
+            "_normalize_assumption_item": GroundedSpecPayloadsRuntime,
+            "_normalize_contradiction_item": GroundedSpecPayloadsRuntime,
+            "_normalize_non_functional_requirement_item": GroundedSpecPayloadsRuntime,
+            "_contains_placeholder_surface": GenerationEditGate,
+            "_has_real_interactive_surface": GenerationEditGate,
+            "_has_visible_loading_surface": GenerationEditGate,
+            "_has_business_surface": GenerationEditGate,
+            "_empty_business_container_count": GenerationEditGate,
+            "_edit_gate_issues": GenerationEditGate,
+            "_preflight_backend_syntax_issues": GenerationPreflightValidation,
+            "_preflight_frontend_syntax_issues": GenerationPreflightValidation,
+            "_preflight_profile_schema_issues": GenerationPreflightValidation,
+            "_preflight_route_schema_issues": GenerationPreflightValidation,
+            "_preflight_check_results": GenerationPreflightValidation,
+            "_normalize_local_route_ref": GenerationPreflightValidation,
+            "_page_graph_gate_issues": PageGraphValidation,
+            "_build_page_graph_verification_report": PageGraphValidation,
+            "_preflight_route_manifest_link_issues": GenerationPreflightValidation,
+            "_workspace_loop_completion_state": MiniappGenerationCompletion,
+            "_build_stage_reports": MiniappGenerationReporting,
+            "_build_materialization_report": MiniappGenerationReporting,
+            "_build_agent_traceability_report": MiniappGenerationReporting,
+            "_build_agent_summary": MiniappGenerationReporting,
+            "_compile_code_summary": MiniappGenerationReporting,
+            "_limit_text": MiniappGenerationReportingCompaction,
+            "_bounded_file_contexts": MiniappGenerationReportingCompaction,
+            "_compact_grounded_spec_for_codegen": MiniappGenerationReportingCompaction,
+            "_compact_role_contract_for_codegen": MiniappGenerationReportingCompaction,
+            "_compact_page_graph_for_codegen": MiniappGenerationReportingCompaction,
+            "_stateful_page_contracts": MiniappGenerationReportingRepair,
+            "_failure_signature_for_issues": MiniappGenerationReportingRepair,
+            "_is_structural_contract_failure": MiniappGenerationReportingRepair,
+            "_extract_failure_file_hints": MiniappGenerationReportingRepair,
+            "_causal_surface_for_issues": MiniappGenerationReportingRepair,
+            "_expand_structural_repair_targets": MiniappGenerationReportingRepair,
+            "_repair_targets_for_attempt": MiniappGenerationReportingRepair,
+            "_compact_file_contexts_for_repair": MiniappGenerationReportingCompaction,
+            "_whole_file_parallel_group": GenerationProgressReportingRuntime,
+            "_group_generation_clusters_for_execution": GenerationProgressReportingRuntime,
+            "_run_progress_for_event": GenerationProgressReportingRuntime,
+            "_grounded_spec_from_operations": MiniappGenerationContractPass,
+            "_canonicalize_local_role_links_in_text": MiniappGenerationContractFrontend,
+            "_route_module_needs_stub": MiniappGenerationContractRoutes,
+            "_route_module_requires_db_backed_repair": MiniappGenerationContractRoutes,
+            "_deterministic_client_page_route_source": MiniappGenerationContractRoutes,
+            "_deterministic_specialist_page_route_source": MiniappGenerationContractRoutes,
+            "_deterministic_manager_page_route_source": MiniappGenerationContractRoutes,
+            "_strip_noncanonical_runtime_route_handlers": MiniappGenerationContractRoutes,
+            "_normalize_runtime_route_module_source": MiniappGenerationContractRoutes,
+            "_deterministic_main_runtime_source": MiniappGenerationContractRoutes,
+            "_normalize_api_aliases_in_text": MiniappGenerationContractFrontend,
+            "_deterministic_profiles_route_source": MiniappGenerationContractRoutes,
+            "_deterministic_runtime_route_source": MiniappGenerationContractRoutes,
+            "_ensure_fastapi_import_symbol": MiniappGenerationContractFrontend,
+            "_inject_head_asset_link": MiniappGenerationContractFrontend,
+            "_ensure_head_asset_link": MiniappGenerationContractFrontend,
+            "_ensure_body_script_ref": MiniappGenerationContractFrontend,
+            "_ensure_preview_bridge_ref": MiniappGenerationContractFrontend,
+            "_ensure_page_shell_contract": MiniappGenerationContractFrontend,
+            "_ensure_html_dom_ids_for_script": MiniappGenerationContractFrontend,
+            "_static_asset_href": MiniappGenerationContractFrontend,
+            "_normalize_role_local_links": MiniappGenerationContractFrontend,
+            "_snake_case_filename": MiniappGenerationPaths,
+            "_normalize_generated_file_path": MiniappGenerationPaths,
+            "_normalize_path_list": MiniappGenerationPaths,
+            "_normalize_string_list": MiniappGenerationPaths,
+            "_normalize_role_route_path": MiniappGenerationPaths,
+            "_absolute_role_route_path": MiniappGenerationPaths,
+            "_default_page_file": MiniappGenerationPaths,
+            "_default_page_asset_path": MiniappGenerationPaths,
+            "_build_execution_plan": MiniappGenerationPageGraphRuntime,
+            "_is_canonical_target_path": MiniappGenerationTargeting,
+            "_canonicalize_static_target_path": MiniappGenerationTargeting,
+            "_planned_page_static_targets": MiniappGenerationTargeting,
+            "_prune_non_page_static_targets": MiniappGenerationTargeting,
+            "_sanitize_backend_targets": MiniappGenerationTargeting,
+            "_sanitize_planner_target_files": MiniappGenerationTargeting,
+            "_expand_page_triplet_targets": MiniappGenerationTargeting,
+            "_build_generation_clusters": MiniappGenerationPageGraphRuntime,
+            "_backend_cluster_name_for_path": MiniappGenerationPageGraphRuntime,
+            "_static_cluster_suffix_for_path": MiniappGenerationPageGraphRuntime,
+            "_expand_cluster_targets_for_safe_companions": MiniappGenerationTargeting,
+            "_detect_missing_static_asset_targets": MiniappGenerationTargeting,
+            "_extract_static_asset_targets": MiniappGenerationTargeting,
+            "_resolve_static_asset_target": MiniappGenerationTargeting,
+            "_whole_file_cluster_system_prompt": MiniappGenerationCodegenPrompts,
+            "_page_edit_system_prompt": MiniappGenerationCodegenPrompts,
+            "_composition_system_prompt": MiniappGenerationCodegenPrompts,
+            "_code_plan_schema": MiniappGenerationCodePlanPrompts,
+            "_code_plan_system_prompt": MiniappGenerationCodePlanPrompts,
+            "_code_plan_section_system_prompt": MiniappGenerationCodePlanPrompts,
+            "_code_plan_partial_schema": MiniappGenerationCodePlanPrompts,
+            "_role_contract_schema": MiniappGenerationRoleContract,
+        }
+
+    @classmethod
+    def _runtime_instance_owner_map(cls) -> dict[str, Any]:
+        return {
+            "_resolve_grounded_spec": "grounded_spec_orchestration",
+            "_generate_grounded_spec_pair_with_timeout": "grounded_spec_orchestration",
+            "_resolve_grounded_spec_fast": "grounded_spec_orchestration",
+            "_resolve_grounded_spec_fast_with_timeout": "grounded_spec_orchestration",
+            "_resolve_grounded_spec_fast_inner": "grounded_spec_orchestration",
+            "_generate_grounded_spec_pair": "grounded_spec_orchestration",
+            "_generate_grounded_spec_section": "grounded_spec_orchestration",
+            "_preflight_generation_issues": "generation_preflight_validation",
+            "_workspace_loop_validation_snapshot_from_execution": "generation_completion",
+            "_run_generation_workspace_loop": "generation_repair",
+            "_repair_draft_after_failure": "generation_repair",
+            "_append_event": "generation_progress_reporting",
+            "_save_job": "generation_progress_reporting",
+            "_store_report": "generation_progress_reporting",
+            "_clear_trace": "generation_progress_reporting",
+            "_append_trace": "generation_progress_reporting",
+            "_sync_run_progress": "generation_progress_reporting",
+            "_sync_generation_cluster_progress": "generation_progress_reporting",
+            "_sync_generation_cluster_started": "generation_progress_reporting",
+            "_sync_generation_batch_started": "generation_progress_reporting",
+            "_ensure_runtime_artifact_operations": "generation_contract_pass",
+            "_ensure_app_level_test_operations": "generation_contract_pass",
+            "_run_pre_apply_contract_pass": "generation_contract_pass",
+            "_resolve_grounded_spec_for_contract_pass": "generation_contract_pass",
+            "_synchronize_profile_schema_contract": "generation_contract_schema",
+            "_synchronize_db_session_contract": "generation_contract_schema",
+            "_synchronize_runtime_route_contract": "generation_contract_schema",
+            "_synchronize_backend_dependency_contract": "generation_contract_schema",
+            "_synchronize_main_runtime_contract": "generation_contract_schema",
+            "_synchronize_minimal_workflow_route_contracts": "generation_contract_routes",
+            "_synchronize_route_schema_contract": "generation_contract_schema",
+            "_synchronize_frontend_api_contract": "generation_contract_frontend",
+            "_synchronize_frontend_navigation_contract": "generation_contract_frontend",
+            "_synchronize_basic_page_state_contract": "generation_contract_frontend",
+            "_operation_or_workspace_content": "generation_contract_schema",
+            "_collect_files_to_read": "generation_targeting",
+            "_canonicalize_target_files": "generation_targeting",
+            "_resolve_code_edits": "generation_codegen",
+            "_resolve_whole_file_code_edits": "generation_codegen",
+            "_resolve_page_file_edits_async": "generation_codegen",
+            "_whole_file_cluster_user_prompt": "generation_codegen_prompts",
+            "_resolve_whole_file_cluster": "generation_codegen_clusters",
+            "_timed_whole_file_cluster": "generation_codegen_clusters",
+            "_page_edit_user_prompt": "generation_codegen_prompts",
+            "_composition_user_prompt": "generation_codegen_prompts",
+            "_resolve_page_file_edit": "generation_codegen_selection",
+            "_resolve_composition_edit": "generation_codegen_clusters",
+            "_timed_composition_cluster": "generation_codegen_clusters",
+            "_selected_pages_for_edit": "generation_codegen_selection",
+            "_backend_composition_targets": "generation_codegen_selection",
+            "_frontend_composition_targets": "generation_codegen_selection",
+            "_partition_frontend_composition_targets": "generation_codegen_selection",
+            "_resolve_role_contract": "generation_role_contract",
+            "_normalize_role_contract": "generation_role_contract",
+            "_minimal_role_contract": "generation_role_contract",
+            "_role_contract_user_prompt": "generation_role_contract",
+            "_role_contract_gate_issues": "generation_role_contract",
+            "_resolve_code_plan": "generation_code_plan",
+            "_generate_code_plan_sections_with_timeout": "generation_code_plan",
+            "_generate_code_plan_sections": "generation_code_plan",
+            "_normalize_page_plan": "generation_code_plan_normalization",
+            "_finalize_role_pages": "generation_code_plan_normalization",
+            "_normalize_page_definition": "generation_code_plan_normalization",
+            "_code_plan_user_prompt": "generation_code_plan_prompts",
+            "_code_plan_section_user_prompt": "generation_code_plan_prompts",
+            "_workspace_path_hints": "generation_code_plan_prompts",
         }
 
     def __init__(
@@ -256,96 +426,105 @@ class GenerationService(
         target_platform = self._target_platform(request.target_platform)
         preview_profile = self._preview_profile(request.preview_profile)
         generation_mode = self._generation_mode(request.generation_mode)
+        effective_model_profile = resolve_model_profile(request.model_profile, generation_mode)
         workspace = self.workspace_service.get_workspace(workspace_id)
         role_scope = [role for role in request.target_role_scope if role in ROLE_ORDER] or list(ROLE_ORDER)
         llm_config = self.openrouter_client.configuration()
         cache_context = {
-            "prompt_cache_key": self.context_pack_builder.prompt_cache_key(workspace, request.model_profile),
-            "stable_prefix": self.context_pack_builder.stable_prefix(workspace, request.model_profile),
+            "prompt_cache_key": self.context_pack_builder.prompt_cache_key(workspace, effective_model_profile),
+            "stable_prefix": self.context_pack_builder.stable_prefix(workspace, effective_model_profile),
         }
         cache_stats_sink = {"prompt_cache_key": cache_context["prompt_cache_key"], "stable_prefix_chars": len(cache_context["stable_prefix"]), "cached_tokens": 0, "cache_write_tokens": 0, "llm_requests": 0}
-        ACTIVE_LLM_CACHE_CONTEXT.set(cache_context)
-        ACTIVE_LLM_CACHE_STATS.set(cache_stats_sink)
+        cache_context_token = ACTIVE_LLM_CACHE_CONTEXT.set(cache_context)
+        cache_stats_token = ACTIVE_LLM_CACHE_STATS.set(cache_stats_sink)
         resume_bundle = self._load_resume_checkpoint_bundle(workspace_id, request.resume_from_run_id)
-        job = JobRecord(
-            workspace_id=workspace_id,
-            prompt=request.prompt,
-            status="running",
-            mode=request.mode,
-            generation_mode=generation_mode,
-            target_platform=target_platform,
-            preview_profile=preview_profile,
-            current_revision_id=workspace.current_revision_id,
-            fidelity=QUALITY_FIDELITY[generation_mode],  # type: ignore[arg-type]
-            llm_enabled=bool(llm_config["enabled"]),
-            llm_provider="openai" if llm_config["enabled"] else None,
-            model_profile=request.model_profile,
-            linked_run_id=request.linked_run_id,
-            error_context=request.error_context,
-            failure_class=self._failure_class_from_error_context(request.error_context),
-            root_cause_summary=self._root_cause_summary(request.error_context),
-        )
-        draft_run_id = request.linked_run_id or job.job_id
-        if resume_bundle is None:
-            self.store.delete("reports", f"resume_checkpoint:{workspace_id}")
-        self._clear_trace(workspace_id)
-        self._append_event(job, "job_started", "Generation request accepted.")
-        self.code_index_service.index_workspace(workspace, self.workspace_service.source_dir(workspace_id))
-        stopped = self._stop_if_requested(job, workspace_id, should_stop)
-        if stopped is not None:
-            return stopped
-        missing_corpora = self.document_service.ensure_required_corpora(target_platform.value)
-        if not workspace.template_cloned:
-            missing_corpora.append("Workspace template has not been cloned.")
-        if missing_corpora:
-            return self._block_with_messages(job, missing_corpora, code="generation.missing_corpora", event_type="job_failed", failure_reason="Required corpora or template clone is missing.")
-        if not self.openrouter_client.enabled:
-            return self._block_with_messages(job, ["Agentic app generation now requires OpenAI configuration for every run.", "Set OPENAI_API_KEY before creating or editing a mini-app workspace."], code="generation.llm_required", event_type="job_failed", failure_reason="Generation requires OpenAI because the workspace now uses the agentic direct code generation loop.")
-        if resume_bundle is not None:
-            if request.resume_from_run_id and draft_run_id != request.resume_from_run_id and self.workspace_service.draft_exists(workspace_id, request.resume_from_run_id):
-                self.workspace_service.clone_draft(workspace_id, request.resume_from_run_id, draft_run_id)
-            draft_source = self.workspace_service.ensure_draft(workspace_id, draft_run_id)
-            return self.generation_entry.continue_generation_from_plan(
-                workspace=workspace,
-                workspace_id=workspace_id,
-                job=job,
-                request=request,
-                draft_run_id=draft_run_id,
-                draft_source=draft_source,
-                effective_prompt=effective_prompt,
-                grounded_spec=resume_bundle["grounded_spec"],
-                role_scope=list(resume_bundle.get("role_scope") or role_scope),
-                role_contract=resume_bundle["role_contract"],
-                plan_result=resume_bundle["plan_result"],
+        try:
+            with self.openrouter_client.routing_context(
+                model_profile=effective_model_profile,
                 generation_mode=generation_mode,
-                creative_direction=self._select_creative_direction(effective_prompt),
-                retrieval_ms=0,
-                started_at=started_at,
-                should_stop=should_stop,
-            )
-        doc_refs = self.document_service.retrieve(workspace_id=workspace_id, prompt=effective_prompt, target_platform=target_platform.value)
-        retrieval_ms = int((time.perf_counter() - started_at) * 1000)
-        chat_turn = ChatTurnRecord(workspace_id=workspace_id, role="user", content=request.prompt, linked_job_id=job.job_id, linked_run_id=request.linked_run_id)
-        self.store.upsert("chat_turns", chat_turn.turn_id, chat_turn.model_dump(mode="json"))
-        creative_direction = self._select_creative_direction(effective_prompt)
-        return self.generation_entry.generate_with_agent_loop(
-            workspace=workspace,
-            workspace_id=workspace_id,
-            job=job,
-            request=request,
-            draft_run_id=draft_run_id,
-            effective_prompt=effective_prompt,
-            target_platform=target_platform,
-            preview_profile=preview_profile,
-            generation_mode=generation_mode,
-            role_scope=role_scope,
-            doc_refs=doc_refs,
-            retrieval_ms=retrieval_ms,
-            started_at=started_at,
-            creative_direction=creative_direction,
-            should_stop=should_stop,
-            prompt_turn_id=chat_turn.turn_id,
-        )
+            ):
+                job = JobRecord(
+                    workspace_id=workspace_id,
+                    prompt=request.prompt,
+                    status="running",
+                    mode=request.mode,
+                    generation_mode=generation_mode,
+                    target_platform=target_platform,
+                    preview_profile=preview_profile,
+                    current_revision_id=workspace.current_revision_id,
+                    fidelity=QUALITY_FIDELITY[generation_mode],  # type: ignore[arg-type]
+                    llm_enabled=bool(llm_config["enabled"]),
+                    llm_provider="openai" if llm_config["enabled"] else None,
+                    model_profile=effective_model_profile,
+                    linked_run_id=request.linked_run_id,
+                    error_context=request.error_context,
+                    failure_class=self._failure_class_from_error_context(request.error_context),
+                    root_cause_summary=self._root_cause_summary(request.error_context),
+                )
+                draft_run_id = request.linked_run_id or job.job_id
+                if resume_bundle is None:
+                    self.store.delete("reports", f"resume_checkpoint:{workspace_id}")
+                self._clear_trace(workspace_id)
+                self._append_event(job, "job_started", "Generation request accepted.")
+                self.code_index_service.index_workspace(workspace, self.workspace_service.source_dir(workspace_id))
+                stopped = self._stop_if_requested(job, workspace_id, should_stop)
+                if stopped is not None:
+                    return stopped
+                missing_corpora = self.document_service.ensure_required_corpora(target_platform.value)
+                if not workspace.template_cloned:
+                    missing_corpora.append("Workspace template has not been cloned.")
+                if missing_corpora:
+                    return self._block_with_messages(job, missing_corpora, code="generation.missing_corpora", event_type="job_failed", failure_reason="Required corpora or template clone is missing.")
+                if not self.openrouter_client.enabled:
+                    return self._block_with_messages(job, ["Agentic app generation now requires OpenAI configuration for every run.", "Set OPENAI_API_KEY before creating or editing a mini-app workspace."], code="generation.llm_required", event_type="job_failed", failure_reason="Generation requires OpenAI because the workspace now uses the agentic direct code generation loop.")
+                if resume_bundle is not None:
+                    if request.resume_from_run_id and draft_run_id != request.resume_from_run_id and self.workspace_service.draft_exists(workspace_id, request.resume_from_run_id):
+                        self.workspace_service.clone_draft(workspace_id, request.resume_from_run_id, draft_run_id)
+                    draft_source = self.workspace_service.ensure_draft(workspace_id, draft_run_id)
+                    return self.generation_entry.continue_generation_from_plan(
+                        workspace=workspace,
+                        workspace_id=workspace_id,
+                        job=job,
+                        request=request,
+                        draft_run_id=draft_run_id,
+                        draft_source=draft_source,
+                        effective_prompt=effective_prompt,
+                        grounded_spec=resume_bundle["grounded_spec"],
+                        role_scope=list(resume_bundle.get("role_scope") or role_scope),
+                        role_contract=resume_bundle["role_contract"],
+                        plan_result=resume_bundle["plan_result"],
+                        generation_mode=generation_mode,
+                        creative_direction=self._select_creative_direction(effective_prompt),
+                        retrieval_ms=0,
+                        started_at=started_at,
+                        should_stop=should_stop,
+                    )
+                doc_refs = self.document_service.retrieve(workspace_id=workspace_id, prompt=effective_prompt, target_platform=target_platform.value)
+                retrieval_ms = int((time.perf_counter() - started_at) * 1000)
+                chat_turn = ChatTurnRecord(workspace_id=workspace_id, role="user", content=request.prompt, linked_job_id=job.job_id, linked_run_id=request.linked_run_id)
+                self.store.upsert("chat_turns", chat_turn.turn_id, chat_turn.model_dump(mode="json"))
+                creative_direction = self._select_creative_direction(effective_prompt)
+                return self.generation_entry.generate_with_agent_loop(
+                    workspace=workspace,
+                    workspace_id=workspace_id,
+                    job=job,
+                    request=request,
+                    draft_run_id=draft_run_id,
+                    effective_prompt=effective_prompt,
+                    target_platform=target_platform,
+                    preview_profile=preview_profile,
+                    generation_mode=generation_mode,
+                    role_scope=role_scope,
+                    doc_refs=doc_refs,
+                    retrieval_ms=retrieval_ms,
+                    started_at=started_at,
+                    creative_direction=creative_direction,
+                    should_stop=should_stop,
+                    prompt_turn_id=chat_turn.turn_id,
+                )
+        finally:
+            ACTIVE_LLM_CACHE_CONTEXT.reset(cache_context_token)
+            ACTIVE_LLM_CACHE_STATS.reset(cache_stats_token)
 
     def _compile_prompt_to_scaffold(self, *, prompt: str, grounded_spec: GroundedSpecModel, entity_contract: dict[str, Any] | None, role_scope: list[str], workspace_tree: list[dict[str, str]]) -> tuple[dict[str, Any], dict[str, Any]]:
         return compile_prompt_to_scaffold(
@@ -395,7 +574,15 @@ class GenerationService(
 
     def retry(self, job_id: str) -> JobRecord:
         job = self.get_job(job_id)
-        request = GenerateRequest(prompt=job.prompt, mode=job.mode, target_platform=self._target_platform(job.target_platform), preview_profile=self._preview_profile(job.preview_profile), generation_mode=self._generation_mode(job.generation_mode), error_context=job.error_context)
+        request = GenerateRequest(
+            prompt=job.prompt,
+            mode=job.mode,
+            target_platform=self._target_platform(job.target_platform),
+            preview_profile=self._preview_profile(job.preview_profile),
+            generation_mode=self._generation_mode(job.generation_mode),
+            model_profile=job.model_profile,
+            error_context=job.error_context,
+        )
         return self.generate(job.workspace_id, request)
 
     def get_job(self, job_id: str) -> JobRecord:

@@ -214,10 +214,6 @@ class ServicePageDefaultsMixins:
     def _is_canonical_target_path(path: str) -> bool:
         return MiniappGenerationTargeting._is_canonical_target_path(path)
 
-    @staticmethod
-    def _is_legacy_role_entry_file(path: str) -> bool:
-        return MiniappGenerationTargeting._is_legacy_role_entry_file(path)
-
     def _canonicalize_target_files(self, target_files: list[str], *, scope_mode: str) -> list[str]:
         return self.generation_targeting._canonicalize_target_files(target_files, scope_mode=scope_mode)
 
