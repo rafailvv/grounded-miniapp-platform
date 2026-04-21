@@ -135,16 +135,6 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             )
         )
 
-    @staticmethod
-    def _contains_manual_refresh_action(*, html_source: str, js_source: str) -> bool:
-        if re.search(r">\s*Refresh\s*<", html_source):
-            return True
-        if re.search(r'createButton\(\s*["\']Refresh["\']', js_source):
-            return True
-        if re.search(r'getElementById\(\s*["\']refresh-action["\']', js_source):
-            return True
-        return False
-
     def stabilize_draft_contract_from_source(
         self,
         *,
@@ -288,25 +278,6 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 source_html_source = source_html.read_text(encoding="utf-8")
                 source_js_source = source_js.read_text(encoding="utf-8")
             except OSError:
-                continue
-            if self._contains_manual_refresh_action(
-                html_source=draft_html_source,
-                js_source=draft_js_source,
-            ) and not self._contains_manual_refresh_action(
-                html_source=source_html_source,
-                js_source=source_js_source,
-            ):
-                draft_html.write_text(source_html_source, encoding="utf-8")
-                draft_js.write_text(source_js_source, encoding="utf-8")
-                changed_files.add(f"miniapp/app/static/{relative.as_posix()}")
-                changed_files.add(f"miniapp/app/static/{relative.parent.as_posix()}/app.js")
-                draft_css = draft_html.parent / "styles.css"
-                if draft_css.exists() and source_css.exists():
-                    try:
-                        draft_css.write_text(source_css.read_text(encoding="utf-8"), encoding="utf-8")
-                        changed_files.add(f"miniapp/app/static/{relative.parent.as_posix()}/styles.css")
-                    except OSError:
-                        pass
                 continue
             missing_ids = self._js_required_dom_ids(draft_js_source) - self._html_dom_ids(draft_html_source)
             if not missing_ids:

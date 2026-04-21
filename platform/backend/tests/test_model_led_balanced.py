@@ -30,6 +30,7 @@ from app.modules.miniapp_generation_runtime.generation_progress_reporting import
 from app.modules.miniapp_generation_runtime.generation_page_graph_runtime import MiniappGenerationPageGraphRuntime
 from app.modules.miniapp_generation_runtime.generation_codegen import MiniappGenerationCodegen
 from app.modules.miniapp_generation_runtime.generation_contract_schema import MiniappGenerationContractSchema
+from app.modules.miniapp_generation_runtime.generation_normal_loop import MiniappGenerationNormalLoop
 from app.modules.miniapp_generation_runtime.generation_repair import MiniappGenerationRepair
 from app.modules.miniapp_generation_runtime.generation_reporting import MiniappGenerationReporting
 from app.modules.miniapp_generation_runtime.grounded_spec_stabilization import GroundedSpecStabilizationRuntime
@@ -143,6 +144,15 @@ class _DummyWorkspaceService:
         if file_path not in self.existing:
             raise FileNotFoundError(file_path)
         return self.existing[file_path]
+
+
+class _PathWorkspaceService:
+    def __init__(self, source_root: Path) -> None:
+        self._source_root = source_root
+
+    def source_dir(self, workspace_id: str) -> Path:
+        del workspace_id
+        return self._source_root
 
 
 class _CaptureWholeFileCodegen(MiniappGenerationCodegen):
@@ -799,3 +809,38 @@ def test_generated_python_tests_use_progress_status_when_schema_choices_are_unav
     )
 
     assert 'return choices[0] if choices else "in_progress"' in source
+
+
+def test_stabilizer_preserves_valid_refresh_ui_changes(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    draft = tmp_path / "draft"
+    source_page = source / "miniapp/app/static/client"
+    draft_page = draft / "miniapp/app/static/client"
+    for path in (source_page, draft_page):
+        path.mkdir(parents=True)
+    (source / "miniapp/app").mkdir(parents=True, exist_ok=True)
+    (draft / "miniapp/app").mkdir(parents=True, exist_ok=True)
+    (source / "miniapp/app/schemas.py").write_text("class RecordRead:\n    pass\n", encoding="utf-8")
+    (draft / "miniapp/app/schemas.py").write_text("class RecordRead:\n    pass\n", encoding="utf-8")
+    (source_page / "index.html").write_text(
+        '<main><section id="records"></section></main><script src="/static/client/app.js"></script>',
+        encoding="utf-8",
+    )
+    (source_page / "app.js").write_text('document.getElementById("records");', encoding="utf-8")
+    (source_page / "styles.css").write_text(".page{}\n", encoding="utf-8")
+    (draft_page / "index.html").write_text(
+        '<main><button id="refresh-action">Refresh</button><section id="records"></section></main><script src="/static/client/app.js"></script>',
+        encoding="utf-8",
+    )
+    (draft_page / "app.js").write_text(
+        'document.getElementById("records"); document.getElementById("refresh-action");',
+        encoding="utf-8",
+    )
+    (draft_page / "styles.css").write_text(".page{}.refresh{}\n", encoding="utf-8")
+
+    runtime = MiniappGenerationNormalLoop(SimpleNamespace(workspace_service=_PathWorkspaceService(source)))
+    changed = runtime.stabilize_draft_contract_from_source(workspace_id="ws_test", draft_source=draft)
+
+    assert "miniapp/app/static/client/index.html" not in changed
+    assert "refresh-action" in (draft_page / "index.html").read_text(encoding="utf-8")
+    assert "refresh-action" in (draft_page / "app.js").read_text(encoding="utf-8")
