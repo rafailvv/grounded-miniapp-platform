@@ -576,7 +576,7 @@ def test_role_ui_clusters_can_run_in_small_parallel_batches() -> None:
     assert [entry["cluster_name"] for entry in grouped[2]] == ["backend_route_manager"]
 
 
-def test_role_static_targets_group_into_one_role_family_cluster() -> None:
+def test_role_static_targets_split_by_role_page_surface() -> None:
     clusters = MiniappGenerationPageGraphRuntime._build_generation_clusters(
         [
             "miniapp/app/static/client/index.html",
@@ -590,13 +590,18 @@ def test_role_static_targets_group_into_one_role_family_cluster() -> None:
     )
 
     assert clusters == [
-        {"cluster_name": "role_manager_ui_bundle", "target_files": ["miniapp/app/static/manager/index.html"]},
+        {"cluster_name": "role_manager_ui_root", "target_files": ["miniapp/app/static/manager/index.html"]},
         {
-            "cluster_name": "role_client_ui_bundle",
+            "cluster_name": "role_client_ui_root",
             "target_files": [
                 "miniapp/app/static/client/index.html",
                 "miniapp/app/static/client/styles.css",
                 "miniapp/app/static/client/app.js",
+            ],
+        },
+        {
+            "cluster_name": "role_client_ui_items",
+            "target_files": [
                 "miniapp/app/static/client/items/index.html",
                 "miniapp/app/static/client/items/styles.css",
                 "miniapp/app/static/client/items/app.js",
@@ -676,6 +681,54 @@ def test_provider_budget_role_ui_fallback_materializes_contract_pages() -> None:
     assert "/api/cases" in joined
     assert "customer_name" in joined
     assert "Booking" not in joined
+
+
+def test_split_role_ui_timeout_fallback_materializes_contract_pages() -> None:
+    runtime = object.__new__(MiniappGenerationCodegen)
+    runtime.workspace_service = _DummyWorkspaceService()
+
+    result = runtime._whole_file_role_ui_fallback_result(
+        workspace_id="ws_test",
+        draft_run_id="run_test",
+        cluster_name="role_client_ui_details",
+        cluster_targets=[
+            "miniapp/app/static/client/details/index.html",
+            "miniapp/app/static/client/details/styles.css",
+            "miniapp/app/static/client/details/app.js",
+        ],
+        entity_contract={
+            "api_path": "/api/cases",
+            "singular_label": "case",
+            "plural_label": "cases",
+            "status_literals": ["open", "resolved"],
+            "key_fields": [{"name": "customer_name", "type": "string", "required": True}],
+        },
+        timeout_seconds=420,
+    )
+
+    assert result is not None
+    assert result["fallback_used"] is True
+    assert {operation.file_path for operation in result["operations"]} == {
+        "miniapp/app/static/client/details/index.html",
+        "miniapp/app/static/client/details/styles.css",
+        "miniapp/app/static/client/details/app.js",
+    }
+    joined = "\n".join(str(operation.content or "") for operation in result["operations"])
+    assert "/api/cases" in joined
+    assert "customer_name" in joined
+
+
+def test_balanced_role_ui_timeout_uses_service_default_not_short_cap() -> None:
+    runtime = object.__new__(MiniappGenerationCodegen)
+    runtime.WHOLE_FILE_UI_CLUSTER_TIMEOUT_SECONDS = 420
+    runtime.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS = 240
+
+    timeout = runtime._whole_file_batch_timeout_seconds(
+        [{"cluster_name": "role_client_ui_root", "target_files": ["miniapp/app/static/client/index.html"]}],
+        generation_mode=GenerationMode.BALANCED,
+    )
+
+    assert timeout == 420
 
 
 def test_whole_file_codegen_receives_entity_contract() -> None:

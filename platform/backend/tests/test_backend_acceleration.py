@@ -4898,19 +4898,19 @@ def test_build_generation_clusters_splits_role_ui_by_page_surface() -> None:
     assert clusters == [
         {"cluster_name": "backend_support", "target_files": ["miniapp/app/main.py"]},
         {
-            "cluster_name": "role_manager_ui_profile",
-            "target_files": [
-                "miniapp/app/static/manager/profile/index.html",
-                "miniapp/app/static/manager/profile/styles.css",
-                "miniapp/app/static/manager/profile/app.js",
-            ],
-        },
-        {
             "cluster_name": "role_manager_ui_root",
             "target_files": [
                 "miniapp/app/static/manager/index.html",
                 "miniapp/app/static/manager/styles.css",
                 "miniapp/app/static/manager/app.js",
+            ],
+        },
+        {
+            "cluster_name": "role_manager_ui_profile",
+            "target_files": [
+                "miniapp/app/static/manager/profile/index.html",
+                "miniapp/app/static/manager/profile/styles.css",
+                "miniapp/app/static/manager/profile/app.js",
             ],
         },
         {"cluster_name": "role_client_ui_root", "target_files": ["miniapp/app/static/client/index.html"]},

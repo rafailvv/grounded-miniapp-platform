@@ -116,8 +116,35 @@ class MiniappGenerationPageGraphRuntime(MiniappGenerationRuntimeOwner):
             role_page_groups.items(),
             key=lambda item: role_priority.get(item[0], 99),
         ):
-            clusters.append({"cluster_name": f"role_{role}_ui_bundle", "target_files": list(dict.fromkeys(paths))})
+            for suffix, grouped_paths in cls._split_role_static_targets_by_surface(paths).items():
+                clusters.append(
+                    {
+                        "cluster_name": f"role_{role}_ui_{suffix}",
+                        "target_files": grouped_paths,
+                    }
+                )
         return clusters
+
+    @classmethod
+    def _split_role_static_targets_by_surface(cls, paths: list[str]) -> dict[str, list[str]]:
+        grouped: dict[str, list[str]] = {}
+        first_seen: dict[str, int] = {}
+        for index, path in enumerate(list(dict.fromkeys(paths))):
+            suffix = cls._static_cluster_suffix_for_path(path)
+            grouped.setdefault(suffix, []).append(path)
+            first_seen.setdefault(suffix, index)
+
+        def sort_key(item: tuple[str, list[str]]) -> tuple[int, int, str]:
+            suffix, _ = item
+            if suffix == "root":
+                priority = 0
+            elif suffix == "profile":
+                priority = 2
+            else:
+                priority = 1
+            return (priority, first_seen.get(suffix, 9999), suffix)
+
+        return {suffix: grouped_paths for suffix, grouped_paths in sorted(grouped.items(), key=sort_key)}
 
     @staticmethod
     def _backend_cluster_name_for_path(path: str) -> str:

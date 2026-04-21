@@ -658,7 +658,7 @@ function escapeHtml(value) {{
         entity_contract: dict[str, Any],
         timeout_seconds: int = 0,
     ) -> dict[str, Any] | None:
-        if not (cluster_name.startswith("role_") and cluster_name.endswith("_ui_bundle")):
+        if not (cluster_name.startswith("role_") and "_ui_" in cluster_name):
             return None
         target_parts = [self._role_ui_target_parts(target) for target in cluster_targets]
         if not target_parts or any(parts is None for parts in target_parts):
@@ -728,7 +728,7 @@ function escapeHtml(value) {{
         if generation_mode == GenerationMode.FAST:
             return min(default_timeout, 120 if is_ui_batch else 90)
         if generation_mode == GenerationMode.BALANCED:
-            return min(default_timeout, 180)
+            return default_timeout
         return default_timeout
 
     def _whole_file_timeout_fallback_result(
@@ -1188,6 +1188,15 @@ function escapeHtml(value) {{
                         timeout_seconds=batch_timeout_seconds,
                     )
                     if fallback_result is None:
+                        fallback_result = self._whole_file_role_ui_fallback_result(
+                            workspace_id=kwargs["workspace_id"],
+                            draft_run_id=kwargs["draft_run_id"],
+                            cluster_name=cluster_name,
+                            cluster_targets=cluster_targets,
+                            entity_contract=kwargs.get("entity_contract") or {},
+                            timeout_seconds=batch_timeout_seconds,
+                        )
+                    if fallback_result is None:
                         fallback_result = self._whole_file_static_reuse_fallback_result(
                             workspace_id=kwargs["workspace_id"],
                             draft_run_id=kwargs["draft_run_id"],
@@ -1202,7 +1211,7 @@ function escapeHtml(value) {{
                     self.workspace_log_service.append(
                         kwargs["workspace_id"],
                         source="generation.cluster_timeout_fallback",
-                        message="Applied deterministic timeout fallback for a canonical route cluster.",
+                        message="Applied deterministic timeout fallback for an unresolved whole-file generation cluster.",
                         payload={"draft_run_id": kwargs["draft_run_id"], "cluster_name": cluster_name, "file_paths": cluster_targets},
                     )
                 if unresolved_pending:
