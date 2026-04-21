@@ -10,7 +10,6 @@ MINIMAL_BOOTSTRAP_TARGETS = (
     "miniapp/app/main.py",
     "miniapp/app/db.py",
     "miniapp/app/schemas.py",
-    "miniapp/app/routes/profiles.py",
     "miniapp/app/routes/runtime.py",
 )
 

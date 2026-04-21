@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from app.ai.model_registry import task_model_overrides
 from app.models.common import GenerationMode
 from app.models.domain import DraftFileOperation
 from app.models.grounded_spec import GroundedSpecModel
@@ -353,12 +354,22 @@ class MiniappGenerationCodegenSelection(MiniappGenerationRuntimeOwner):
                     if context_reuse_recovery_note:
                         system_prompt = f"{system_prompt.rstrip()}\n\n{context_reuse_recovery_note}".strip()
                         user_prompt = f"{user_prompt.rstrip()}\n\n{context_reuse_recovery_note}".strip()
+                    model_override, fallback_model_override = task_model_overrides(
+                        role="code_edit",
+                        generation_mode=prompt_mode,
+                        scope_mode=scope_mode,
+                        visual_only_patch=scope_mode == "minimal_patch",
+                        target_file_count=3,
+                        backend_target_count=0,
+                    )
                     payload = self._generate_structured_with_retry(
                         role="code_edit",
                         schema_name=f"page_file_v1_{page['page_id']}",
                         schema=self._code_edit_schema(),
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
+                        model_override=model_override,
+                        fallback_model_override=fallback_model_override,
                     )
                     normalized = self._normalize_model_payload(payload["payload"])
                     tool_requests = normalize_tool_requests(normalized.get("tool_requests") or [])

@@ -227,7 +227,6 @@ def _field_literal_choices(resource_slug: str, field_name: str, *, suffixes=("Cr
 
 def _pick_status_value(resource_slug: str) -> str:
     preferred = (
-        "requested",
         "pending",
         "submitted",
         "open",
@@ -237,8 +236,9 @@ def _pick_status_value(resource_slug: str) -> str:
         "in_review",
         "active",
         "approved",
-        "issued",
         "in_progress",
+        "processing",
+        "completed",
         "returned",
         "closed",
         "rejected",
@@ -247,7 +247,7 @@ def _pick_status_value(resource_slug: str) -> str:
     for candidate in preferred:
         if candidate in choices:
             return candidate
-    return choices[0] if choices else "requested"
+    return choices[0] if choices else "pending"
 
 
 def _pick_progress_status_value(resource_slug: str) -> str:
@@ -255,11 +255,11 @@ def _pick_progress_status_value(resource_slug: str) -> str:
         "in_progress",
         "claimed",
         "in_review",
-        "issued",
         "active",
         "open",
         "processing",
         "approved",
+        "completed",
         "returned",
         "closed",
     )
@@ -267,7 +267,7 @@ def _pick_progress_status_value(resource_slug: str) -> str:
     for candidate in preferred:
         if candidate in choices:
             return candidate
-    return _pick_status_value(resource_slug)
+    return choices[0] if choices else "in_progress"
 
 
 def _extract_record_id(payload):
@@ -381,7 +381,7 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
             payload[name] = "sample"
     if not payload:
         path_tokens = str(path).lower()
-        if method == "POST" and any(token in path_tokens for token in ("booking", "reservation", "request", "requests", "loan", "appointment", "task")):
+        if method == "POST" and any(token in path_tokens for token in ("record", "records", "item", "items", "entry", "entries")):
             type_choices = _field_literal_choices(resource_slug, "request_type", suffixes=("Create", "Update", "Read"))
             if not type_choices:
                 type_choices = _field_literal_choices(resource_slug, "item_type", suffixes=("Create", "Update", "Read"))
@@ -392,12 +392,12 @@ def _payload_for_api(requirement: dict, path: str, method: str, *, created_id: s
                 "item_label": "Primary resource",
                 "start_date": "2026-04-17T10:00:00Z",
                 "end_date": "2026-04-18T18:00:00Z",
-                "reason": "Resource needed for an internal workflow.",
+                "details": "Generated record created during runtime verification.",
             }
-        elif method in {"PUT", "PATCH"} and any(token in path_tokens for token in ("booking", "reservation", "request", "requests", "loan", "appointment", "task")):
+        elif method in {"PUT", "PATCH"} and any(token in path_tokens for token in ("record", "records", "item", "items", "entry", "entries")):
             payload = {"status": _pick_status_value(resource_slug)}
     if not payload and method in {"POST", "PUT", "PATCH"}:
-        payload = {"name": "sample", "status": _pick_status_value(resource_slug)}
+        payload = {"title": "Generated record", "details": "Created by generated app test", "status": _pick_status_value(resource_slug)}
     return payload
 
 
@@ -577,7 +577,7 @@ class GeneratedMiniAppTests(unittest.TestCase):
             )
             if str(token or "").strip()
         }
-        workflow_tokens = entity_tokens | {"request", "requests", "record", "records", "order", "orders", "task", "tasks", "submission", "submissions", "item", "items"}
+        workflow_tokens = entity_tokens | {"record", "records", "item", "items", "entry", "entries"}
         preferred_resource = _resource_slug(str((ENTITY_CONTRACT or {}).get("api_path") or ""))
         create_requirement = _pick_workflow_api(
             self.workflow_api_requirements,
@@ -609,7 +609,7 @@ class GeneratedMiniAppTests(unittest.TestCase):
             for field in (create_requirement.get("fields") or create_requirement.get("request_fields") or [])
             if isinstance(field, dict) and str(field.get("name") or "").strip()
         }
-        for key, value in {"title": "Generated request", "status": "new", "comment": "Created from generated app test"}.items():
+        for key, value in {"title": "Generated record", "status": "new", "details": "Created from generated app test"}.items():
             if key in create_allowed_fields and key not in create_payload:
                 create_payload[key] = value
         create_method = str(create_requirement.get("method") or "POST").upper()
@@ -647,9 +647,10 @@ class GeneratedMiniAppTests(unittest.TestCase):
             f"Update API failed: {update_method} {update_path} -> {update_response.status_code}; payload={json.dumps(update_payload, sort_keys=True, default=str)}; body={update_response.text}",
         )
         updated_payload = _response_json(update_response)
+        progress_status = _pick_progress_status_value(_resource_slug(update_path))
         self.assertTrue(
             _payload_contains_value(updated_payload, created_id)
-            or any(_contains_status(updated_payload, status) for status in ("in_progress", "claimed", "in_review", "issued")),
+            or any(_contains_status(updated_payload, status) for status in (progress_status, "in_progress", "claimed", "in_review", "processing", "completed")),
             f"Update API {update_path} did not acknowledge the persisted record update. Payload: {updated_payload}",
         )
 
@@ -658,7 +659,7 @@ class GeneratedMiniAppTests(unittest.TestCase):
         post_update_payload = _response_json(post_update_list_response)
         self.assertTrue(_payload_contains_value(post_update_payload, created_id), f"Updated record {created_id} disappeared from list API {list_path}. Payload: {post_update_payload}")
         self.assertTrue(
-            any(_contains_status(post_update_payload, status) for status in ("in_progress", "claimed", "in_review", "issued"))
+            any(_contains_status(post_update_payload, status) for status in (progress_status, "in_progress", "claimed", "in_review", "processing", "completed"))
             or _payload_contains_value(post_update_payload, "Updated by specialist"),
             f"Updated record {created_id} did not reflect specialist changes in shared state. Payload: {post_update_payload}",
         )

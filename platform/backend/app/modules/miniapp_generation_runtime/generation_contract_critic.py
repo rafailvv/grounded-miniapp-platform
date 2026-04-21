@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -46,19 +47,44 @@ class MiniappGenerationContractCritic(MiniappGenerationRuntimeOwner):
     @staticmethod
     def _contains_seeded_live_collection(script_content: str) -> bool:
         lowered = str(script_content or "").lower()
-        collection_patterns = (
-            r"\bconst\s+(?:requests|bookings|orders|tasks|tickets|cases|items)\s*=\s*\[\s*\{",
-            r"\blet\s+(?:requests|bookings|orders|tasks|tickets|cases|items)\s*=\s*\[\s*\{",
-            r"\bvar\s+(?:requests|bookings|orders|tasks|tickets|cases|items)\s*=\s*\[\s*\{",
-        )
-        if any(re.search(pattern, lowered) for pattern in collection_patterns):
+        if re.search(r"\b(?:const|let|var)\s+[a-z_][a-z0-9_]*\s*=\s*\[\s*\{", lowered):
             return True
         return bool(
             re.search(
-                r"\[\s*\{[\s\S]{0,600}(?:reason|status|requester|start_date|end_date|assigned)[\s\S]{0,600}\}\s*\]",
+                r"\[\s*\{[\s\S]{0,600}(?:status|owner|requester|assignee|title|name|details|created|updated|start_date|end_date)[\s\S]{0,600}\}\s*\]",
                 lowered,
             )
         )
+
+    @staticmethod
+    def _load_json_operation(operations: list[DraftFileOperation], file_path: str) -> dict[str, Any] | None:
+        target = file_path.replace("\\", "/")
+        for operation in operations:
+            if str(operation.file_path or "").replace("\\", "/") != target or operation.content is None:
+                continue
+            try:
+                payload = json.loads(str(operation.content or ""))
+            except Exception:
+                return None
+            return payload if isinstance(payload, dict) else None
+        return None
+
+    @staticmethod
+    def _manifest_page_file_paths(manifest: dict[str, Any]) -> dict[str, set[str]]:
+        role_paths: dict[str, set[str]] = {}
+        roles = manifest.get("roles") or {}
+        if not isinstance(roles, dict):
+            return role_paths
+        for role, role_payload in roles.items():
+            pages = (role_payload or {}).get("pages") or []
+            if not isinstance(pages, list):
+                continue
+            role_paths[str(role)] = {
+                str(page.get("file_path") or "").replace("\\", "/")
+                for page in pages
+                if isinstance(page, dict) and str(page.get("file_path") or "").strip()
+            }
+        return role_paths
 
     @classmethod
     def should_run_preapply_critic(
@@ -96,12 +122,16 @@ class MiniappGenerationContractCritic(MiniappGenerationRuntimeOwner):
         feature_route_files: dict[str, str] = {}
         expected_route_file = str((entity_contract or {}).get("route_file") or "").replace("\\", "/")
         expected_route_stem = Path(expected_route_file).stem if expected_route_file else ""
+        role_static_pages: dict[str, set[str]] = {}
         for operation in operations:
             if operation.content is None:
                 continue
             normalized_path = str(operation.file_path or "").replace("\\", "/")
             content = str(operation.content or "")
             lowered = content.lower()
+            static_match = re.match(r"miniapp/app/static/(client|specialist|manager)/(.*)/index\.html$", normalized_path)
+            if static_match:
+                role_static_pages.setdefault(static_match.group(1), set()).add(normalized_path)
             if normalized_path.startswith("miniapp/app/routes/") and normalized_path.endswith(".py"):
                 stem = Path(normalized_path).stem
                 if stem not in self._FEATURE_ROUTE_EXCLUDED_STEMS:
@@ -134,6 +164,45 @@ class MiniappGenerationContractCritic(MiniappGenerationRuntimeOwner):
                             "severity": "high",
                             "file_path": normalized_path,
                             "message": "Page renders a seeded business collection instead of relying on real API-backed state or an honest empty state.",
+                        }
+                    )
+        route_manifest = self._load_json_operation(operations, "miniapp/app/generated/route_manifest.json")
+        runtime_manifest = self._load_json_operation(operations, "miniapp/app/generated/runtime_manifest.json")
+        if route_manifest and runtime_manifest:
+            route_role_pages = self._manifest_page_file_paths(route_manifest)
+            runtime_role_pages = self._manifest_page_file_paths(runtime_manifest)
+            inconsistent_roles = [
+                role
+                for role in sorted(set(route_role_pages) | set(runtime_role_pages))
+                if route_role_pages.get(role, set()) != runtime_role_pages.get(role, set())
+            ]
+            if inconsistent_roles:
+                issues.append(
+                    {
+                        "code": "critic.route_runtime_manifest_drift",
+                        "severity": "high",
+                        "message": "Route and runtime manifests disagree about declared role pages.",
+                        "implicated_files": [
+                            "miniapp/app/generated/route_manifest.json",
+                            "miniapp/app/generated/runtime_manifest.json",
+                        ],
+                        "roles": inconsistent_roles,
+                    }
+                )
+            for role, static_pages in role_static_pages.items():
+                missing_from_manifest = sorted(static_pages - route_role_pages.get(role, set()))
+                if missing_from_manifest:
+                    issues.append(
+                        {
+                            "code": "critic.role_page_graph_drift",
+                            "severity": "high",
+                            "message": f"Role manifest does not preserve generated {role} pages present in the current draft.",
+                            "implicated_files": [
+                                "miniapp/app/generated/route_manifest.json",
+                                *missing_from_manifest,
+                            ],
+                            "role": role,
+                            "missing_pages": missing_from_manifest,
                         }
                     )
         if len(feature_route_stems) > 1:

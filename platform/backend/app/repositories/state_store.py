@@ -34,6 +34,9 @@ class StateStore:
             "previews": {},
             "exports": {},
             "reports": {},
+            "code_chunks": {},
+            "code_indexes": {},
+            "patch_applies": {},
         }
 
     @contextlib.contextmanager
@@ -106,6 +109,17 @@ class StateStore:
         with self.lock, self._interprocess_lock():
             state = self._read()
             state.setdefault(collection, {}).pop(key, None)
+            self._write(state)
+
+    def delete_many(self, collection: str, keys: list[str] | set[str] | tuple[str, ...]) -> None:
+        normalized_keys = [key for key in keys if key]
+        if not normalized_keys:
+            return
+        with self.lock, self._interprocess_lock():
+            state = self._read()
+            bucket = state.setdefault(collection, {})
+            for key in normalized_keys:
+                bucket.pop(key, None)
             self._write(state)
 
     def replace_prefixed(self, collection: str, prefix: str, values: dict[str, dict[str, Any]]) -> None:

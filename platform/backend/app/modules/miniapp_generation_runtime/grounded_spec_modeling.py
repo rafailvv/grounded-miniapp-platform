@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.models.common import PreviewProfile, TargetPlatform
@@ -24,6 +25,34 @@ from app.models.grounded_spec import (
 
 
 class GroundedSpecModelingRuntime:
+    @staticmethod
+    def _humanize_entity_name(value: str) -> str:
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+        text = text.replace("-", " ").replace("_", " ")
+        return re.sub(r"\s+", " ", text).strip() or "Record"
+
+    @classmethod
+    def _entity_slug(cls, value: str) -> str:
+        parts = [part for part in cls._humanize_entity_name(value).lower().split() if part]
+        if len(parts) > 1:
+            slug = parts[-1]
+        else:
+            slug = parts[0] if parts else "record"
+        if slug.endswith("ies") and len(slug) > 3:
+            return f"{slug[:-3]}y"
+        if slug.endswith("s") and not slug.endswith("ss") and len(slug) > 3:
+            return slug[:-1]
+        return slug
+
+    @staticmethod
+    def _pluralize_slug(slug: str) -> str:
+        normalized = str(slug or "").strip().lower() or "record"
+        if normalized.endswith("y") and len(normalized) > 1 and normalized[-2] not in "aeiou":
+            return f"{normalized[:-1]}ies"
+        if normalized.endswith(("s", "x", "z", "ch", "sh")):
+            return f"{normalized}es"
+        return f"{normalized}s"
+
     def build_grounded_spec(
         self,
         *,
@@ -43,6 +72,9 @@ class GroundedSpecModelingRuntime:
         contradictions = self.detect_contradictions(prompt)
         target_label = "Telegram Mini App" if target_platform == TargetPlatform.TELEGRAM else "MAX Mini App"
         shared_entity_name = entity_name.strip() or "Record"
+        shared_entity_label = self._humanize_entity_name(shared_entity_name)
+        shared_entity_slug = self._entity_slug(shared_entity_name)
+        shared_entity_slug_plural = self._pluralize_slug(shared_entity_slug)
         return GroundedSpecModel(
             metadata=Metadata(
                 workspace_id=workspace_id,
@@ -60,7 +92,7 @@ class GroundedSpecModelingRuntime:
                     actor_id="actor_client",
                     name="End user",
                     role="client",
-                    description=f"Starts the primary {shared_entity_name.lower()} flow and reviews their own state.",
+                    description=f"Starts the primary {shared_entity_label.lower()} flow and reviews their own state.",
                     permissions_hint=["create", "view_own_records", "continue_flow"],
                     evidence=evidence,
                 ),
@@ -68,7 +100,7 @@ class GroundedSpecModelingRuntime:
                     actor_id="actor_specialist",
                     name="Specialist",
                     role="specialist",
-                    description=f"Works on shared {shared_entity_name.lower()} items and updates progress.",
+                    description=f"Works on shared {shared_entity_label.lower()} items and updates progress.",
                     permissions_hint=["review_assigned_records", "change_status", "respond"],
                     evidence=evidence,
                 ),
@@ -76,7 +108,7 @@ class GroundedSpecModelingRuntime:
                     actor_id="actor_manager",
                     name="Manager",
                     role="manager",
-                    description=f"Oversees cross-role {shared_entity_name.lower()} activity and monitors the shared system state.",
+                    description=f"Oversees cross-role {shared_entity_label.lower()} activity and monitors the shared system state.",
                     permissions_hint=["view_metrics", "review_all_records", "intervene"],
                     evidence=evidence,
                 ),
@@ -93,18 +125,18 @@ class GroundedSpecModelingRuntime:
             user_flows=[
                 UserFlow(
                     flow_id="flow_shared_lifecycle",
-                    name=f"{shared_entity_name} lifecycle",
-                    goal=f"One {shared_entity_name.lower()} moves across the client, specialist, and manager surfaces while staying in one DB-backed state model.",
+                    name=f"{shared_entity_label} lifecycle",
+                    goal=f"One {shared_entity_label.lower()} moves across the client, specialist, and manager surfaces while staying in one DB-backed state model.",
                     steps=[
-                        FlowStep(step_id="step_client_create", order=1, actor_id="actor_client", action=f"Create or update a {shared_entity_name.lower()}"),
-                        FlowStep(step_id="step_specialist_review", order=2, actor_id="actor_specialist", action=f"Review and progress the same {shared_entity_name.lower()}"),
-                        FlowStep(step_id="step_manager_oversee", order=3, actor_id="actor_manager", action=f"Observe the shared {shared_entity_name.lower()} state and intervene when required"),
+                        FlowStep(step_id="step_client_create", order=1, actor_id="actor_client", action=f"Create or update a {shared_entity_label.lower()}"),
+                        FlowStep(step_id="step_specialist_review", order=2, actor_id="actor_specialist", action=f"Review and progress the same {shared_entity_label.lower()}"),
+                        FlowStep(step_id="step_manager_oversee", order=3, actor_id="actor_manager", action=f"Observe the shared {shared_entity_label.lower()} state and intervene when required"),
                     ],
-                    postconditions=[f"The same {shared_entity_name.lower()} is readable across all three role surfaces."],
+                    postconditions=[f"The same {shared_entity_label.lower()} is readable across all three role surfaces."],
                     acceptance_criteria=[
-                        f"Client can create or update a {shared_entity_name.lower()} and see it persisted.",
-                        f"Specialist can read and update that same {shared_entity_name.lower()} from a dedicated role surface.",
-                        f"Manager can view the aggregated or current shared {shared_entity_name.lower()} state.",
+                        f"Client can create or update a {shared_entity_label.lower()} and see it persisted.",
+                        f"Specialist can read and update that same {shared_entity_label.lower()} from a dedicated role surface.",
+                        f"Manager can view the aggregated or current shared {shared_entity_label.lower()} state.",
                     ],
                     evidence=evidence,
                 ),
@@ -125,7 +157,7 @@ class GroundedSpecModelingRuntime:
             ui_requirements=[
                 UIRequirement(req_id="ui_role_roots", category="screen", description="Provide a real canonical entry page at /<role> for each role with live state and primary actions; do not create nested /root alias pages.", priority="must", evidence=evidence, screen_hint="role_root"),
                 UIRequirement(req_id="ui_role_profiles", category="screen", description="Provide a real profile/settings page for each role.", priority="must", evidence=evidence, screen_hint="role_profile"),
-                UIRequirement(req_id="ui_shared_flow", category="screen", description=f"Expose the shared {shared_entity_name.lower()} flow through routed pages, not placeholders.", priority="must", evidence=evidence, screen_hint="shared_flow"),
+                UIRequirement(req_id="ui_shared_flow", category="screen", description=f"Expose the shared {shared_entity_label.lower()} flow through routed pages, not placeholders.", priority="must", evidence=evidence, screen_hint="shared_flow"),
                 UIRequirement(req_id="ui_theme", category="theme", description=f"Respect {target_label} theme and viewport constraints.", priority="should", evidence=evidence),
             ],
             api_requirements=[
@@ -141,32 +173,32 @@ class GroundedSpecModelingRuntime:
                 ),
                 APIRequirement(
                     api_req_id="api_submission_create",
-                    name=f"Create {shared_entity_name}",
+                    name=f"Create {shared_entity_label}",
                     method="POST",
-                    path=f"/api/{shared_entity_name.lower()}s",
-                    purpose=f"Persist workflow records and expose them across the role-specific surfaces for {shared_entity_name.lower()} work.",
+                    path=f"/api/{shared_entity_slug_plural}",
+                    purpose=f"Persist workflow records and expose them across the role-specific surfaces for {shared_entity_label.lower()} work.",
                     request_fields=[APIField(name=field.name, type=field.type, required=field.required) for field in entity_attributes],
                     response_fields=[
-                        APIField(name=f"{shared_entity_name.lower()}_id", type="uuid", required=True),
+                        APIField(name=f"{shared_entity_slug}_id", type="uuid", required=True),
                         APIField(name="status", type="string", required=True),
                     ],
                     evidence=evidence,
                 ),
                 APIRequirement(
                     api_req_id="api_submission_list",
-                    name=f"List {shared_entity_name}",
+                    name=f"List {shared_entity_label}",
                     method="GET",
-                    path=f"/api/{shared_entity_name.lower()}s",
-                    purpose=f"Read persisted {shared_entity_name.lower()} data for client, specialist, and manager views.",
+                    path=f"/api/{shared_entity_slug_plural}",
+                    purpose=f"Read persisted {shared_entity_label.lower()} data for client, specialist, and manager views.",
                     response_fields=[APIField(name="items", type="array", required=True)],
                     evidence=evidence,
                 ),
                 APIRequirement(
                     api_req_id="api_submission_update",
-                    name=f"Update {shared_entity_name}",
+                    name=f"Update {shared_entity_label}",
                     method="PUT",
-                    path=f"/api/{shared_entity_name.lower()}s/{{item_id}}",
-                    purpose=f"Update persisted {shared_entity_name.lower()} state from specialist or manager actions.",
+                    path=f"/api/{shared_entity_slug_plural}/{{item_id}}",
+                    purpose=f"Update persisted {shared_entity_label.lower()} state from specialist or manager actions.",
                     request_fields=[APIField(name="status", type="string", required=False)],
                     response_fields=[APIField(name="status", type="string", required=True)],
                     evidence=evidence,

@@ -12,6 +12,19 @@ from app.models.domain import RunCheckResult
 
 
 class GenerationPreflightValidation:
+    @staticmethod
+    def _normalized_imported_schema_names(content: str) -> set[str]:
+        imported_names: set[str] = set()
+        for match in re.finditer(r"from\s+app\.schemas\s+import\s+\((.*?)\)", content, flags=re.DOTALL):
+            parts = [part.strip() for part in match.group(1).replace("\n", " ").split(",") if part.strip()]
+            for part in parts:
+                imported_names.add(part.split(" as ", 1)[0].strip())
+        for match in re.finditer(r"from\s+app\.schemas\s+import\s+([A-Za-z0-9_, ]+)", content):
+            parts = [part.strip() for part in match.group(1).split(",") if part.strip()]
+            for part in parts:
+                imported_names.add(part.split(" as ", 1)[0].strip())
+        return imported_names
+
     @classmethod
     def preflight_generation_issues(
         cls,
@@ -109,11 +122,7 @@ class GenerationPreflightValidation:
         issues: list[ValidationIssue] = []
         for route_file in routes_dir.glob("*.py"):
             content = route_file.read_text(encoding="utf-8")
-            imported_names: set[str] = set()
-            for match in re.finditer(r"from\s+app\.schemas\s+import\s+\((.*?)\)", content, flags=re.DOTALL):
-                imported_names.update({part.strip() for part in match.group(1).replace("\n", " ").split(",") if part.strip()})
-            for match in re.finditer(r"from\s+app\.schemas\s+import\s+([A-Za-z0-9_, ]+)", content):
-                imported_names.update({part.strip() for part in match.group(1).split(",") if part.strip()})
+            imported_names = GenerationPreflightValidation._normalized_imported_schema_names(content)
             missing = sorted(name for name in imported_names if f"class {name}" not in schemas_content and f"{name} =" not in schemas_content)
             if missing:
                 issues.append(ValidationIssue(code="preflight.route_schema_contract", message=f"{route_file.name} imports schemas that do not exist in schemas.py: {', '.join(missing)}.", severity="high", location="miniapp/app/schemas.py", blocking=True))

@@ -993,6 +993,11 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             job.failure_reason = loop_result.failure_reason or loop_result.summary
             job.failure_class = loop_result.failure_class or service._failure_class_from_error_context(request.error_context)
             job.root_cause_summary = loop_result.root_cause_summary or service._summarize_failed_checks(build_issues, preview_issue)
+            job.failure_signature = (
+                loop_result.failure_signature
+                or service._failure_signature_for_issues(build_issues, preview_issue)
+                or f"{job.failure_class}:{re.sub(r'[^a-z0-9]+', '_', str(job.root_cause_summary or job.failure_reason or 'failed').lower()).strip('_')[:80] or 'failed'}"
+            )
             job.summary = loop_result.summary
             job.fix_targets = sorted(
                 {

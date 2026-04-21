@@ -303,14 +303,6 @@ class MiniappGenerationPlanRuntime:
             for contract_path in ("miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"):
                 if contract_path not in existing_targets:
                     inferred.append(contract_path)
-        has_profile_pages = any(
-            isinstance(page, dict) and str(page.get("route_path") or "").rstrip("/") == "/profile"
-            for role_payload in (page_graph.get("roles") or {}).values()
-            if isinstance(role_payload, dict)
-            for page in (role_payload.get("pages") or [])
-        )
-        if has_profile_pages and "miniapp/app/routes/profiles.py" not in existing_targets:
-            inferred.append("miniapp/app/routes/profiles.py")
         for endpoint_name in sorted(endpoint_names):
             normalized_endpoint_name = cls.normalize_endpoint_name_for_entity_contract(
                 endpoint_name,

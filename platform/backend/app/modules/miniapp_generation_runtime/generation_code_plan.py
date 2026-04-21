@@ -7,6 +7,7 @@ from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, TimeoutError a
 from pathlib import Path
 from typing import Any
 
+from app.ai.model_registry import task_model_overrides
 from app.models.common import GenerationMode
 from app.models.grounded_spec import GroundedSpecModel
 
@@ -136,6 +137,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 workspace_tree=workspace_tree,
                 generation_mode=generation_mode,
                 creative_direction=creative_direction,
+                role_patch_kind=role_patch_kind,
             )
             normalized = self._normalize_model_payload(payload["payload"])
             planned = self._normalize_page_plan(
@@ -879,9 +881,18 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         workspace_tree: list[dict[str, str]],
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
+        role_patch_kind: str | None,
     ) -> dict[str, Any]:
         sections_started = time.perf_counter()
         executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="code-plan")
+        model_override, fallback_model_override = task_model_overrides(
+            role="code_plan",
+            generation_mode=generation_mode,
+            scope_mode=scope_mode,
+            visual_only_patch=role_patch_kind == "visual_patch",
+            target_file_count=3 if role_patch_kind == "visual_patch" else 0,
+            backend_target_count=0,
+        )
         futures = {
             "graph": self._submit_with_context(
                 executor,
@@ -909,6 +920,8 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                     generation_mode=generation_mode,
                     creative_direction=creative_direction,
                 ),
+                model_override=model_override,
+                fallback_model_override=fallback_model_override,
             ),
             "targeting": self._submit_with_context(
                 executor,
@@ -936,6 +949,8 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                     generation_mode=generation_mode,
                     creative_direction=creative_direction,
                 ),
+                model_override=model_override,
+                fallback_model_override=fallback_model_override,
             ),
         }
         section_timeout = float(self.CODE_PLAN_SECTION_TIMEOUT_SECONDS)

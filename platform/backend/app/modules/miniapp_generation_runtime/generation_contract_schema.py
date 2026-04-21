@@ -27,6 +27,19 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
     }
 
     @staticmethod
+    def _normalized_imported_schema_names(content: str) -> set[str]:
+        imported_names: set[str] = set()
+        for match in re.finditer(r"from\s+app\.schemas\s+import\s+\((.*?)\)", content, flags=re.DOTALL):
+            parts = [part.strip() for part in match.group(1).replace("\n", " ").split(",") if part.strip()]
+            for part in parts:
+                imported_names.add(part.split(" as ", 1)[0].strip())
+        for match in re.finditer(r"from\s+app\.schemas\s+import\s+([A-Za-z0-9_, ]+)", content):
+            parts = [part.strip() for part in match.group(1).split(",") if part.strip()]
+            for part in parts:
+                imported_names.add(part.split(" as ", 1)[0].strip())
+        return imported_names
+
+    @staticmethod
     def _normalize_request_schema_contract(schemas_content: str) -> str:
         updated = str(schemas_content or "")
         if "class RequestRead" not in updated:
@@ -108,6 +121,62 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
             ("RequestDetail" in imported_names and "class RequestDetail" not in updated_schemas)
             or ("RoleProfile" in imported_names and "class RoleProfile" not in updated_schemas)
             or ("RoleProfile" in imported_names and "AppRole =" not in updated_schemas)
+        )
+
+    @staticmethod
+    def _schema_prefixes_declared_by_schemas(schemas_content: str) -> list[str]:
+        suffixes = ("Create", "Update", "Read", "Summary", "Detail", "ListResponse")
+        prefixes: list[str] = []
+        for match in re.finditer(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", str(schemas_content or ""), flags=re.MULTILINE):
+            name = match.group(1)
+            for suffix in suffixes:
+                if name.endswith(suffix) and len(name) > len(suffix):
+                    prefix = name[: -len(suffix)]
+                    if prefix and prefix not in prefixes:
+                        prefixes.append(prefix)
+                    break
+        return prefixes
+
+    @classmethod
+    def _route_schema_prefix_is_missing(cls, route_content: str, schemas_content: str) -> bool:
+        route = str(route_content or "")
+        schemas = str(schemas_content or "")
+        match = re.search(r"^SCHEMA_PREFIX\s*=\s*[\"']([^\"']+)[\"']", route, flags=re.MULTILINE)
+        if not match:
+            return False
+        current_prefix = match.group(1)
+        if any(f"class {current_prefix}{suffix}" in schemas for suffix in ("Create", "Update", "Read", "Summary", "Detail", "ListResponse")):
+            return False
+        return bool(cls._schema_prefixes_declared_by_schemas(schemas))
+
+    @classmethod
+    def _patch_route_schema_prefix_candidates(cls, route_content: str, schemas_content: str) -> str:
+        prefixes = cls._schema_prefixes_declared_by_schemas(schemas_content)
+        if not prefixes:
+            return route_content
+        candidates_literal = ", ".join(repr(prefix) for prefix in prefixes[:8])
+        replacement = (
+            "def _candidate_schema_names() -> list[str]:\n"
+            f"    candidates = [SCHEMA_PREFIX, {candidates_literal}]\n"
+            "    seen: list[str] = []\n"
+            "    for candidate in candidates:\n"
+            "        normalized = str(candidate or \"\").strip()\n"
+            "        if normalized and normalized not in seen:\n"
+            "            seen.append(normalized)\n"
+            "    return seen\n"
+        )
+        patched = re.sub(
+            r"def\s+_candidate_schema_names\(\)\s*->\s*list\[str\]:\n(?:    .+\n)+?(?=\n\ndef\s+)",
+            replacement,
+            str(route_content or ""),
+            count=1,
+        )
+        if patched != route_content:
+            return patched
+        return str(route_content or "").replace(
+            "def _candidate_schema_names() -> list[str]:\n    return [SCHEMA_PREFIX]\n",
+            replacement,
+            1,
         )
 
     def _synchronize_profile_schema_contract(
@@ -245,6 +314,16 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
             content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
             if not content:
                 continue
+            if self._route_schema_prefix_is_missing(content, schemas_content):
+                patched_content = self._patch_route_schema_prefix_candidates(content, schemas_content)
+                if patched_content != content:
+                    operation_map[file_path] = DraftFileOperation(
+                        file_path=file_path,
+                        operation="replace",
+                        content=patched_content,
+                        reason="Pre-apply contract sync: let the resource route reuse the actual schema prefix declared in schemas.py.",
+                    )
+                    content = patched_content
             if (
                 Path(file_path).stem not in self._FEATURE_ROUTE_EXCLUDED_STEMS
                 and self._needs_canonical_resource_route_repair(content, Path(file_path).stem)
@@ -257,10 +336,7 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
                     reason=f"Pre-apply contract sync: keep {resource_stem}.py aligned with the generic workflow resource contract instead of drifting into route-local models.",
                 )
                 continue
-            for match in re.finditer(r"from\s+app\.schemas\s+import\s+\((.*?)\)", content, flags=re.DOTALL):
-                imported_names.update({part.strip() for part in match.group(1).replace("\n", " ").split(",") if part.strip()})
-            for match in re.finditer(r"from\s+app\.schemas\s+import\s+([A-Za-z0-9_, ]+)", content):
-                imported_names.update({part.strip() for part in match.group(1).split(",") if part.strip()})
+            imported_names.update(self._normalized_imported_schema_names(content))
         if not self._needs_route_schema_contract_repair(imported_names, schemas_content):
             return list(operation_map.values())
         updated_schemas = schemas_content

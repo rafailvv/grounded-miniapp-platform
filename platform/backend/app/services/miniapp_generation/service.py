@@ -476,7 +476,7 @@ class GenerationService(
                 if missing_corpora:
                     return self._block_with_messages(job, missing_corpora, code="generation.missing_corpora", event_type="job_failed", failure_reason="Required corpora or template clone is missing.")
                 if not self.openrouter_client.enabled:
-                    return self._block_with_messages(job, ["Agentic app generation now requires OpenAI configuration for every run.", "Set OPENAI_API_KEY before creating or editing a mini-app workspace."], code="generation.llm_required", event_type="job_failed", failure_reason="Generation requires OpenAI because the workspace now uses the agentic direct code generation loop.")
+                    return self._block_with_messages(job, ["Agentic app generation requires an LLM provider for every run.", "Set OPENAI_API_KEY or OPENROUTER_API_KEY before creating or editing a mini-app workspace."], code="generation.llm_required", event_type="job_failed", failure_reason="Generation requires an LLM provider because the workspace now uses the agentic direct code generation loop.")
                 if resume_bundle is not None:
                     if request.resume_from_run_id and draft_run_id != request.resume_from_run_id and self.workspace_service.draft_exists(workspace_id, request.resume_from_run_id):
                         self.workspace_service.clone_draft(workspace_id, request.resume_from_run_id, draft_run_id)

@@ -91,25 +91,154 @@ class WorkspaceService:
             if workspace_root.exists():
                 raise RuntimeError(f"Workspace directory still exists after deletion: {workspace_root}")
 
-        self.store.delete("workspaces", workspace_id)
-        self.store.delete("previews", workspace_id)
+        run_ids = {
+            key
+            for key, payload in self.store.items("runs")
+            if payload.get("workspace_id") == workspace_id
+        }
+        job_ids = {
+            key
+            for key, payload in self.store.items("jobs")
+            if payload.get("workspace_id") == workspace_id
+        }
 
-        for collection in ["documents", "chat_turns", "jobs", "runs", "exports"]:
-            for key, payload in self.store.items(collection):
-                if payload.get("workspace_id") != workspace_id:
-                    continue
-                if collection == "exports":
-                    file_path = payload.get("file_path")
-                    if isinstance(file_path, str) and file_path:
-                        try:
-                            Path(file_path).unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                self.store.delete(collection, key)
+        self.store.delete_many("workspaces", [workspace_id])
+        self.store.delete_many("previews", [workspace_id])
 
-        for report_key, _ in self.store.items("reports"):
-            if report_key.endswith(f":{workspace_id}"):
-                self.store.delete("reports", report_key)
+        for collection in ["documents", "chat_turns", "jobs", "runs"]:
+            keys_to_delete = [
+                key
+                for key, payload in self.store.items(collection)
+                if payload.get("workspace_id") == workspace_id
+            ]
+            self.store.delete_many(collection, keys_to_delete)
+
+        export_keys_to_delete: list[str] = []
+        for key, payload in self.store.items("exports"):
+            if payload.get("workspace_id") != workspace_id:
+                continue
+            file_path = payload.get("file_path")
+            if isinstance(file_path, str) and file_path:
+                try:
+                    Path(file_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            export_keys_to_delete.append(key)
+        self.store.delete_many("exports", export_keys_to_delete)
+
+        report_keys_to_delete = [
+            key
+            for key, payload in self.store.items("reports")
+            if key.endswith(f":{workspace_id}")
+            or payload.get("workspace_id") == workspace_id
+            or payload.get("run_id") in run_ids
+            or payload.get("job_id") in job_ids
+        ]
+        self.store.delete_many("reports", report_keys_to_delete)
+
+        code_index_keys = [f"workspace:{workspace_id}", f"docs:{workspace_id}"]
+        self.store.delete_many("code_indexes", code_index_keys)
+
+        code_chunk_keys = [
+            key
+            for key, _ in self.store.items("code_chunks")
+            if key.startswith(f"code:{workspace_id}:") or key.startswith(f"doc:{workspace_id}:")
+        ]
+        self.store.delete_many("code_chunks", code_chunk_keys)
+
+        patch_apply_keys = [
+            key
+            for key, payload in self.store.items("patch_applies")
+            if payload.get("workspace_id") == workspace_id or payload.get("run_id") in run_ids
+        ]
+        self.store.delete_many("patch_applies", patch_apply_keys)
+
+    def prune_orphaned_state(self) -> dict[str, int]:
+        workspace_ids = {key for key, _ in self.store.items("workspaces")}
+        valid_job_ids = {
+            key
+            for key, payload in self.store.items("jobs")
+            if payload.get("workspace_id") in workspace_ids
+        }
+        valid_run_ids = {
+            key
+            for key, payload in self.store.items("runs")
+            if payload.get("workspace_id") in workspace_ids
+        }
+        deleted: dict[str, int] = {}
+
+        def _delete(collection: str, keys: list[str]) -> None:
+            if not keys:
+                return
+            self.store.delete_many(collection, keys)
+            deleted[collection] = deleted.get(collection, 0) + len(keys)
+
+        workspace_collections = ["documents", "jobs", "runs", "exports"]
+        for collection in workspace_collections:
+            keys = [
+                key
+                for key, payload in self.store.items(collection)
+                if payload.get("workspace_id") not in workspace_ids
+            ]
+            _delete(collection, keys)
+
+        preview_keys = [
+            key
+            for key, payload in self.store.items("previews")
+            if key not in workspace_ids and payload.get("workspace_id") not in workspace_ids
+        ]
+        _delete("previews", preview_keys)
+
+        report_keys = [
+            key
+            for key, payload in self.store.items("reports")
+            if (
+                (payload.get("workspace_id") and payload.get("workspace_id") not in workspace_ids)
+                or (payload.get("run_id") and payload.get("run_id") not in valid_run_ids)
+                or (payload.get("job_id") and payload.get("job_id") not in valid_job_ids)
+                or any(
+                    key.endswith(f":{workspace_id}")
+                    for workspace_id in {
+                        candidate
+                        for candidate in [key.rsplit(":", 1)[-1]]
+                        if candidate.startswith("ws_") and candidate not in workspace_ids
+                    }
+                )
+            )
+        ]
+        _delete("reports", report_keys)
+
+        code_index_keys = [
+            key
+            for key, _ in self.store.items("code_indexes")
+            if (
+                (key.startswith("workspace:") and key.split(":", 1)[1] not in workspace_ids)
+                or (key.startswith("docs:") and key.split(":", 1)[1] not in workspace_ids)
+            )
+        ]
+        _delete("code_indexes", code_index_keys)
+
+        code_chunk_keys = []
+        for key, _ in self.store.items("code_chunks"):
+            parts = key.split(":", 2)
+            if len(parts) < 3:
+                continue
+            _, chunk_workspace_id, _ = parts
+            if chunk_workspace_id not in workspace_ids:
+                code_chunk_keys.append(key)
+        _delete("code_chunks", code_chunk_keys)
+
+        patch_apply_keys = [
+            key
+            for key, payload in self.store.items("patch_applies")
+            if (
+                (payload.get("workspace_id") and payload.get("workspace_id") not in workspace_ids)
+                or (payload.get("run_id") and payload.get("run_id") not in valid_run_ids)
+            )
+        ]
+        _delete("patch_applies", patch_apply_keys)
+
+        return deleted
 
     def clone_template(self, workspace_id: str) -> WorkspaceRecord:
         workspace = self.get_workspace(workspace_id)

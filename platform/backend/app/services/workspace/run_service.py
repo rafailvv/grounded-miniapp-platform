@@ -146,7 +146,7 @@ class RunService:
             target_role_scope=[role for role in request.target_role_scope if role in ROLE_SCOPE],
             model_profile=effective_model_profile,
             generation_mode=effective_generation_mode,
-            llm_provider="openai" if self.openrouter_client.enabled else None,
+            llm_provider=(self.openrouter_client.configuration().get("routing") or {}).get("provider") if self.openrouter_client.enabled else None,
             resume_from_run_id=request.resume_from_run_id,
             source_revision_id=workspace.current_revision_id,
             error_context=request.error_context,
@@ -497,6 +497,10 @@ class RunService:
             run.failure_class = job.failure_class
             run.failure_signature = job.failure_signature
             run.root_cause_summary = job.root_cause_summary
+            if not run.failure_signature and run.failure_class:
+                summary = str(run.root_cause_summary or run.failure_reason or run.failure_class).strip().lower()
+                summary = re.sub(r"[^a-z0-9]+", "_", summary).strip("_")[:80]
+                run.failure_signature = f"{run.failure_class}:{summary or 'failed'}"
             run.current_fix_phase = job.current_fix_phase
             run.current_failing_command = job.current_failing_command
             run.current_exit_code = job.current_exit_code

@@ -197,6 +197,10 @@ class ServiceLlmGroundedMiscMixins:
         job.failure_reason = failure_reason
         job.failure_class = job.failure_class or code
         job.root_cause_summary = job.root_cause_summary or (messages[0] if messages else failure_reason)
+        if not job.failure_signature:
+            summary = str(job.root_cause_summary or failure_reason or code).strip().lower()
+            summary = re.sub(r"[^a-z0-9]+", "_", summary).strip("_")[:80]
+            job.failure_signature = f"{job.failure_class}:{summary or 'blocked'}"
         self._append_event(job, event_type, failure_reason)
         self._append_trace(job.workspace_id, "job_blocked", failure_reason, {"messages": messages, "code": code})
         return job
@@ -214,6 +218,7 @@ class ServiceLlmGroundedMiscMixins:
         job.fidelity = "blocked"
         job.failure_reason = "Run stopped by user."
         job.failure_class = "stopped_by_user"
+        job.failure_signature = "stopped_by_user"
         job.root_cause_summary = "Run stopped by user."
         job.validation_snapshot = ValidationSnapshot(grounded_spec_valid=True, app_ir_valid=True, build_valid=False, blocking=False, issues=[])
         self._store_report(f"validation:{workspace_id}", job.validation_snapshot.model_dump(mode="json"))

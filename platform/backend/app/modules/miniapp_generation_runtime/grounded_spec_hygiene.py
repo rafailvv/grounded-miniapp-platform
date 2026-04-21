@@ -7,32 +7,76 @@ from app.models.grounded_spec import APIRequirement, Contradiction, EntityAttrib
 
 
 class GroundedSpecHygieneRuntime:
+    _ENTITY_PHRASE_STOPWORDS = {
+        "a",
+        "an",
+        "and",
+        "app",
+        "application",
+        "build",
+        "but",
+        "dashboard",
+        "for",
+        "help",
+        "i",
+        "in",
+        "internal",
+        "it",
+        "its",
+        "manage",
+        "mini",
+        "miniapp",
+        "of",
+        "our",
+        "page",
+        "portal",
+        "simple",
+        "system",
+        "that",
+        "the",
+        "their",
+        "this",
+        "tool",
+        "track",
+        "we",
+        "workflow",
+    }
+
     @staticmethod
     def _pascal_case(value: str) -> str:
         parts = re.split(r"[^a-zA-Z0-9]+", str(value or "").strip())
-        return "".join(part.capitalize() for part in parts if part) or "WorkflowRequest"
+        return "".join(part.capitalize() for part in parts if part) or "WorkflowRecord"
+
+    @classmethod
+    def _normalize_entity_phrase(cls, value: str) -> str:
+        phrase = str(value or "").strip().lower()
+        if not phrase:
+            return ""
+        phrase = re.split(r"\b(?:where|that|which|who|when|while|with|including|because|so)\b", phrase, maxsplit=1)[0]
+        tokens = [
+            token
+            for token in re.findall(r"[a-z0-9]+", phrase)
+            if token not in cls._ENTITY_PHRASE_STOPWORDS and len(token) > 1
+        ]
+        if not tokens:
+            return ""
+        if len(tokens) > 3:
+            tokens = tokens[-3:]
+        return " ".join(tokens)
 
     @classmethod
     def _prompt_entity_name(cls, prompt: str) -> str | None:
         lowered = str(prompt or "").lower()
-        markers = (
-            "booking",
-            "reservation",
-            "appointment",
-            "order",
-            "task",
-            "ticket",
-            "case",
-            "loan",
-            "quote",
-            "invoice",
-            "visit",
-            "approval",
-            "request",
+        phrase_patterns = (
+            r"\b(?:mini[\s-]?app|app|tool|system|workflow|portal|dashboard)\s+for\s+([^.,;\n]+)",
+            r"\bfor\s+([^.,;\n]+)",
+            r"\bto\s+(?:manage|track|coordinate|handle|review|organize|process)\s+([^.,;\n]+)",
         )
-        for marker in markers:
-            if re.search(rf"\b{re.escape(marker)}s?\b", lowered):
-                return cls._pascal_case(marker)
+        for pattern in phrase_patterns:
+            for match in re.finditer(pattern, lowered):
+                candidate = cls._normalize_entity_phrase(match.group(1))
+                if candidate:
+                    return cls._pascal_case(candidate)
         return None
 
     @staticmethod
@@ -163,38 +207,28 @@ class GroundedSpecHygieneRuntime:
 
     @staticmethod
     def infer_entity_name(prompt: str) -> str:
-        lowered = prompt.lower()
-        if GroundedSpecHygieneRuntime.is_commerce_prompt(prompt):
-            return "Order"
-        if "consultation" in lowered:
-            return "ConsultationRequest"
         prompt_entity_name = GroundedSpecHygieneRuntime._prompt_entity_name(prompt)
         if prompt_entity_name:
             return prompt_entity_name
-        return "WorkflowRequest"
+        return "WorkflowRecord"
 
     @staticmethod
     def infer_entity_attributes(prompt: str) -> list[EntityAttribute]:
         fields: list[EntityAttribute] = []
         lowered = prompt.lower()
-        if GroundedSpecHygieneRuntime.is_commerce_prompt(prompt):
+        temporal_markers = ("date", "dates", "time", "times", "slot", "range", "period", "schedule", "availability", "return", "due")
+        resource_markers = ("item", "resource", "equipment", "asset", "room", "vehicle", "device", "inventory", "product")
+        if any(marker in lowered for marker in temporal_markers):
             return [
-                EntityAttribute(name="customer_name", type="string", required=True, description="Customer full name", pii=True),
-                EntityAttribute(name="phone", type="phone", required=True, description="Customer phone number", pii=True),
-                EntityAttribute(name="product_name", type="string", required=True, description="Selected product name", pii=False),
-                EntityAttribute(name="quantity", type="string", required=True, description="Requested quantity", pii=False),
-                EntityAttribute(name="delivery_address", type="text", required=False, description="Delivery address", pii=True),
-                EntityAttribute(name="comment", type="text", required=False, description="Order comment", pii=False),
-            ]
-        if any(marker in lowered for marker in ("booking", "reservation", "appointment", "request")) and any(
-            marker in lowered for marker in ("date", "time", "slot", "range", "period", "schedule", "return", "availability")
-        ):
-            return [
-                EntityAttribute(name="request_type", type="string", required=True, description="Requested workflow item type", pii=False),
-                EntityAttribute(name="request_label", type="string", required=False, description="Optional label or reference for the requested item", pii=False),
+                EntityAttribute(name="title", type="string", required=True, description="Primary record title", pii=False),
+                *(
+                    [EntityAttribute(name="resource_label", type="string", required=False, description="Optional resource or subject reference", pii=False)]
+                    if any(marker in lowered for marker in resource_markers)
+                    else []
+                ),
                 EntityAttribute(name="start_date", type="datetime", required=True, description="Requested start date", pii=False),
                 EntityAttribute(name="end_date", type="datetime", required=True, description="Requested end date", pii=False),
-                EntityAttribute(name="reason", type="text", required=True, description="Business reason for the request", pii=False),
+                EntityAttribute(name="details", type="text", required=False, description="Additional record details", pii=False),
             ]
         mappings = [
             ("name", "string", "Requester name", True, True),

@@ -574,6 +574,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Do not collapse multiple pages into shared role-level app.js/styles.css files.",
                     "Do not leave page behavior or styling inline when page-level JS/CSS targets exist.",
                     "For frontend calls to /api/... use window.miniappApiFetch(...) from /static/preview_bridge.js instead of raw fetch(...).",
+                    "When generating HTML inside JavaScript template literals, avoid unescaped nested double quotes in attribute values; prefer single-quoted HTML attributes or escaped quotes so app.js remains valid JavaScript.",
                     "Every generated page must keep <main class=\"page-shell\"> with style=\"padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));\" so the shared shell safe-area contract is explicit in the page HTML.",
                     "For backend dependencies use Depends(get_actor_context), never Depends(lambda: get_actor_context()).",
                     "When linking to detail routes from JS, keep route templates aligned with route_manifest paths and use dynamic placeholders consistently.",

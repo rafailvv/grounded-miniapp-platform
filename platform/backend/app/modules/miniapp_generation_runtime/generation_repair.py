@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, Callable
 
+from app.ai.model_registry import task_model_overrides
 from app.models.artifacts import ValidationIssue
 from app.models.common import GenerationMode
 from app.models.domain import (
@@ -340,6 +341,7 @@ class MiniappGenerationRepair:
             preview_issue=preview_issue,
             preview_logs=list(turn_context.metadata.get("preview_logs") or []),
             attempt=attempt,
+            generation_mode=generation_mode,
             previous_turn_summary=turn_context.previous_turn_summary,
             previous_diff_summary=turn_context.previous_diff_summary,
         )
@@ -562,6 +564,7 @@ class MiniappGenerationRepair:
         preview_issue: ValidationIssue | None,
         preview_logs: list[str],
         attempt: int,
+        generation_mode: GenerationMode,
         previous_turn_summary: str | None = None,
         previous_diff_summary: str | None = None,
     ) -> dict[str, Any]:
@@ -583,6 +586,23 @@ class MiniappGenerationRepair:
             invalid_patch_feedback_note: str | None = None
             try:
                 for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
+                    backend_target_count = sum(
+                        1
+                        for path in current_target_files
+                        if isinstance(path, str)
+                        and (
+                            path.startswith("miniapp/app/routes/")
+                            or path in {"miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"}
+                        )
+                    )
+                    model_override, fallback_model_override = task_model_overrides(
+                        role="code_edit",
+                        generation_mode=generation_mode,
+                        scope_mode=scope_mode,
+                        visual_only_patch=scope_mode == "minimal_patch",
+                        target_file_count=len(current_target_files),
+                        backend_target_count=backend_target_count,
+                    )
                     payload = self.service._generate_structured_with_retry(
                         role="code_edit",
                         schema_name="generation_repair_patch_v1",
@@ -618,6 +638,8 @@ class MiniappGenerationRepair:
                                 else ""
                             )
                         ),
+                        model_override=model_override,
+                        fallback_model_override=fallback_model_override,
                     )
                     normalized = self.service._normalize_model_payload(payload["payload"])
                     tool_requests = normalize_tool_requests(normalized.get("tool_requests") or [])

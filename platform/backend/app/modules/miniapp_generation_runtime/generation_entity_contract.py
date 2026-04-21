@@ -6,6 +6,7 @@ from typing import Any
 from app.models.common import GenerationMode
 from app.models.grounded_spec import GroundedSpecModel
 
+from app.modules.miniapp_generation_runtime.grounded_spec_hygiene import GroundedSpecHygieneRuntime
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
 
 
@@ -37,48 +38,20 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
     )
     _IRREGULAR_PLURALS = {
         "analysis": "analyses",
-        "appointment": "appointments",
-        "booking": "bookings",
-        "case": "cases",
-        "entry": "entries",
-        "inventory": "inventory",
-        "order": "orders",
         "person": "people",
-        "request": "requests",
         "status": "statuses",
-        "task": "tasks",
-        "ticket": "tickets",
     }
-    _GENERIC_ENTITY_NAMES = {"workflowrequest", "workflow_request", "workflow request", "record"}
-    _GENERIC_API_STEMS = {"workflowrequests", "records", "submissions"}
-    _PROMPT_ENTITY_MARKERS = (
-        "appointments",
-        "appointment",
-        "bookings",
-        "booking",
-        "reservations",
-        "reservation",
-        "orders",
-        "order",
-        "tasks",
-        "task",
-        "tickets",
-        "ticket",
-        "cases",
-        "case",
-        "loans",
-        "loan",
-        "quotes",
-        "quote",
-        "invoices",
-        "invoice",
-        "visits",
-        "visit",
-        "approvals",
-        "approval",
-        "requests",
-        "request",
-    )
+    _GENERIC_ENTITY_NAMES = {
+        "workflowrecord",
+        "workflow_record",
+        "workflow record",
+        "workflowrequest",
+        "workflow_request",
+        "workflow request",
+        "record",
+        "item",
+    }
+    _GENERIC_API_STEMS = {"workflowrequests", "workflowrecords", "records", "submissions"}
 
     @classmethod
     def _humanize(cls, value: str) -> str:
@@ -154,10 +127,22 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
 
     @classmethod
     def _prompt_entity_slug(cls, prompt: str) -> str | None:
-        lowered = str(prompt or "").lower()
-        for marker in cls._PROMPT_ENTITY_MARKERS:
-            if re.search(rf"\b{re.escape(marker)}\b", lowered):
-                return cls._singularize_slug(cls._slugify(marker))
+        entity_name = GroundedSpecHygieneRuntime.infer_entity_name(prompt)
+        focus_parts = [part for part in cls._humanize(entity_name).lower().split() if part]
+        if len(focus_parts) > 1:
+            for candidate in reversed(focus_parts):
+                normalized_candidate = cls._singularize_slug(cls._slugify(candidate))
+                if normalized_candidate and normalized_candidate not in cls._GENERIC_ENTITY_NAMES:
+                    normalized = normalized_candidate
+                    break
+            else:
+                normalized = cls._singularize_slug(cls._slugify(entity_name))
+        else:
+            normalized = cls._singularize_slug(cls._slugify(entity_name))
+        if normalized in cls._GENERIC_ENTITY_NAMES:
+            return None
+        if normalized:
+            return normalized
         return None
 
     def extract_entity_contract(
@@ -170,7 +155,7 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
         dominant_entity_name = str(
             (grounded_spec.domain_entities[0].name if grounded_spec.domain_entities else "")
             or self._infer_entity_name(prompt)
-        ).strip() or "WorkflowRequest"
+        ).strip() or "WorkflowRecord"
         prompt_entity_slug = self._prompt_entity_slug(prompt)
         api_path = self._dominant_api_path(grounded_spec)
         dominant_name_slug = self._singularize_slug(self._slugify(dominant_entity_name))

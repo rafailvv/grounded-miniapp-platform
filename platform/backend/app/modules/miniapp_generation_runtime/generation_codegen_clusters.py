@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from app.ai.model_registry import task_model_overrides
 from app.models.common import GenerationMode
 from app.models.domain import DraftFileOperation
 from app.models.grounded_spec import GroundedSpecModel
@@ -231,7 +232,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
             "targets": list(dict.fromkeys(requested_targets)),
             "error": (
                 "Do not use list_files or pre-patch run_checks for backend_support. "
-                "This cluster already has enough template/runtime context to emit db.py, schemas.py, profiles.py, "
+                "This cluster already has enough template/runtime context to emit db.py and schemas.py while keeping profiles.py as reference-only infrastructure context, "
                 "and runtime manifest operations directly. Generated manifests are derived artifacts, not prerequisites."
             ),
         }
@@ -337,7 +338,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                 "miniapp/app/routes/manager.py",
                 "miniapp/app/generated/route_manifest.json",
             ]
-        elif cluster_name.startswith("backend_route_"):
+        elif cluster_name == "backend_routes" or cluster_name.startswith("backend_route_"):
             support_targets = [
                 "miniapp/app/main.py",
                 "miniapp/app/db.py",
@@ -467,12 +468,28 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                     if context_reuse_recovery_note:
                         system_prompt = f"{system_prompt.rstrip()}\n\n{context_reuse_recovery_note}".strip()
                         user_prompt = f"{user_prompt.rstrip()}\n\n{context_reuse_recovery_note}".strip()
+                    backend_target_count = sum(
+                        1
+                        for path in cluster_targets
+                        if isinstance(path, str) and path.startswith("miniapp/app/routes/")
+                    )
+                    model_override, fallback_model_override = task_model_overrides(
+                        role="code_edit",
+                        generation_mode=GenerationMode.FAST if compact_recovery_used else generation_mode,
+                        scope_mode=scope_mode,
+                        visual_only_patch=scope_mode == "minimal_patch",
+                        target_file_count=len(cluster_targets),
+                        backend_target_count=backend_target_count,
+                        cluster_name=cluster_name,
+                    )
                     payload = self._generate_structured_with_retry(
                         role="code_edit",
                         schema_name=self._whole_file_bundle_schema_name(cluster_name),
                         schema=self._code_edit_schema(),
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
+                        model_override=model_override,
+                        fallback_model_override=fallback_model_override,
                     )
                     normalized = self._normalize_model_payload(payload["payload"])
                     tool_requests = normalize_tool_requests(normalized.get("tool_requests") or [])
@@ -487,7 +504,8 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                             context_reuse_recovery_note = (
                                 "Backend support recovery mode:\n"
                                 "- Do not use list_files or pre-patch run_checks for backend_support.\n"
-                                "- db.py, schemas.py, profiles.py, and generated manifests are owned by this cluster.\n"
+                                "- db.py and schemas.py are owned by this cluster.\n"
+                                "- profiles.py and generated manifests are reference-only infrastructure context unless they are explicitly targeted.\n"
                                 "- Route files and generated manifests are reference-only supporting context.\n"
                                 "- Emit operations for the allowed backend_support targets now.\n"
                             )
@@ -738,12 +756,31 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                     if context_reuse_recovery_note:
                         system_prompt = f"{system_prompt.rstrip()}\n\n{context_reuse_recovery_note}".strip()
                         user_prompt = f"{user_prompt.rstrip()}\n\n{context_reuse_recovery_note}".strip()
+                    backend_target_count = sum(
+                        1
+                        for path in target_files
+                        if isinstance(path, str)
+                        and (
+                            path.startswith("miniapp/app/routes/")
+                            or path in {"miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"}
+                        )
+                    )
+                    model_override, fallback_model_override = task_model_overrides(
+                        role="code_edit",
+                        generation_mode=prompt_mode,
+                        scope_mode=scope_mode,
+                        visual_only_patch=scope_mode == "minimal_patch",
+                        target_file_count=len(target_files),
+                        backend_target_count=backend_target_count,
+                    )
                     payload = self._generate_structured_with_retry(
                         role="code_edit",
                         schema_name="composition_bundle_v1",
                         schema=self._code_edit_schema(),
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
+                        model_override=model_override,
+                        fallback_model_override=fallback_model_override,
                     )
                     normalized = self._normalize_model_payload(payload["payload"])
                     tool_requests = normalize_tool_requests(normalized.get("tool_requests") or [])

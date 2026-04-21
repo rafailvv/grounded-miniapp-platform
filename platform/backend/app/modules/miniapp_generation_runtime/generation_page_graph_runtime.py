@@ -70,7 +70,7 @@ class MiniappGenerationPageGraphRuntime(MiniappGenerationRuntimeOwner):
     def _build_generation_clusters(cls, target_files: list[str]) -> list[dict[str, Any]]:
         backend_targets: list[str] = []
         shared_static_targets: list[str] = []
-        role_page_groups: dict[tuple[str, str], list[str]] = {}
+        role_page_groups: dict[str, list[str]] = {}
         for path in target_files:
             if path.startswith("miniapp/"):
                 if path.startswith("miniapp/app/static/shared/"):
@@ -85,8 +85,7 @@ class MiniappGenerationPageGraphRuntime(MiniappGenerationRuntimeOwner):
                 else:
                     backend_targets.append(path)
                     continue
-                cluster_suffix = cls._static_cluster_suffix_for_path(path)
-                role_page_groups.setdefault((role, cluster_suffix), []).append(path)
+                role_page_groups.setdefault(role, []).append(path)
                 continue
         clusters: list[dict[str, Any]] = []
         if shared_static_targets:
@@ -105,17 +104,19 @@ class MiniappGenerationPageGraphRuntime(MiniappGenerationRuntimeOwner):
                 if cluster_name == "backend_support":
                     support_targets.append(path)
                     continue
+                if cluster_name.startswith("backend_route_"):
+                    cluster_name = "backend_routes"
                 backend_groups.setdefault(cluster_name, []).append(path)
             if support_targets:
                 clusters.append({"cluster_name": "backend_support", "target_files": support_targets})
             for cluster_name in sorted(backend_groups):
                 clusters.append({"cluster_name": cluster_name, "target_files": backend_groups[cluster_name]})
         role_priority = {"manager": 0, "specialist": 1, "client": 2}
-        for (role, cluster_suffix), paths in sorted(
+        for role, paths in sorted(
             role_page_groups.items(),
-            key=lambda item: (role_priority.get(item[0][0], 99), 1 if item[0][1] == "root" else 0, item[0][1]),
+            key=lambda item: role_priority.get(item[0], 99),
         ):
-            clusters.append({"cluster_name": f"role_{role}_ui_{cluster_suffix}", "target_files": list(dict.fromkeys(paths))})
+            clusters.append({"cluster_name": f"role_{role}_ui_bundle", "target_files": list(dict.fromkeys(paths))})
         return clusters
 
     @staticmethod

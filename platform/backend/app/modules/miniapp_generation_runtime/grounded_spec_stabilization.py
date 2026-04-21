@@ -14,29 +14,78 @@ from app.models.grounded_spec import (
     Unknown,
     UserFlow,
 )
+from app.modules.miniapp_generation_runtime.grounded_spec_hygiene import GroundedSpecHygieneRuntime
 
 
 class GroundedSpecStabilizationRuntime:
+    _GENERIC_RESOURCE_SLUGS = {"app", "data", "flow", "miniapp", "page", "record", "workflow", "workflows"}
+
     @staticmethod
-    def _default_api_resource_slug(spec: GroundedSpecModel) -> str:
+    def _slugify(value: str) -> str:
+        humanized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+        return re.sub(r"[^a-z0-9]+", "_", humanized.lower()).strip("_")
+
+    @classmethod
+    def _singularize_slug(cls, value: str) -> str:
+        slug = cls._slugify(value)
+        if slug.endswith("ies") and len(slug) > 3:
+            return f"{slug[:-3]}y"
+        if slug.endswith("s") and not slug.endswith("ss") and len(slug) > 3:
+            return slug[:-1]
+        return slug
+
+    @classmethod
+    def _pluralize_slug(cls, value: str) -> str:
+        slug = cls._singularize_slug(value)
+        if not slug:
+            return "records"
+        if slug.endswith("y") and len(slug) > 1 and slug[-2] not in "aeiou":
+            return f"{slug[:-1]}ies"
+        if slug.endswith(("s", "x", "z", "ch", "sh")):
+            return f"{slug}es"
+        return f"{slug}s"
+
+    @classmethod
+    def _focus_resource_slug(cls, value: str) -> str:
+        parts = [part for part in re.split(r"[^a-z0-9]+", str(value or "").lower()) if part]
+        if len(parts) > 1:
+            for candidate in reversed(parts):
+                normalized = cls._singularize_slug(candidate)
+                if normalized and normalized not in cls._GENERIC_RESOURCE_SLUGS:
+                    return normalized
+        return cls._singularize_slug(value)
+
+    @classmethod
+    def _default_api_resource_slug(cls, spec: GroundedSpecModel) -> str:
         candidates: list[str] = []
         if spec.domain_entities:
             candidates.append(str(spec.domain_entities[0].name or ""))
-        candidates.extend(
-            match.group(1)
-            for match in re.finditer(
-                r"\b(bookings?|requests?|submissions?|orders?|tasks?|appointments?|tickets?|records?|cases?|items?)\b",
-                str(spec.product_goal or "").lower(),
-            )
-        )
+        prompt_entity = GroundedSpecHygieneRuntime.infer_entity_name(str(spec.product_goal or ""))
+        if prompt_entity:
+            candidates.append(prompt_entity)
         for candidate in candidates:
-            normalized = re.sub(r"[^a-z0-9]+", "_", candidate.lower()).strip("_")
-            if not normalized or normalized in {"data", "page", "flow", "miniapp", "app"}:
+            singular = cls._focus_resource_slug(candidate)
+            if not singular or singular in cls._GENERIC_RESOURCE_SLUGS:
                 continue
-            if not normalized.endswith("s"):
-                normalized = f"{normalized}s"
-            return normalized
+            return cls._pluralize_slug(singular)
         return "records"
+
+    @staticmethod
+    def _default_api_request_fields(spec: GroundedSpecModel) -> list[APIField]:
+        if spec.domain_entities and spec.domain_entities[0].attributes:
+            return [
+                APIField(
+                    name=attribute.name,
+                    type=attribute.type,
+                    required=attribute.required,
+                    description=attribute.description or f"Primary {attribute.name.replace('_', ' ')} value",
+                )
+                for attribute in spec.domain_entities[0].attributes[:6]
+            ]
+        return [
+            APIField(name="title", type="string", required=True, description="Primary record title"),
+            APIField(name="details", type="text", required=False, description="Additional record details"),
+        ]
 
     def stabilize_grounded_spec(self, spec: GroundedSpecModel) -> GroundedSpecModel:
         product_goal = str(spec.product_goal or "").strip()
@@ -113,7 +162,7 @@ class GroundedSpecStabilizationRuntime:
             for item in spec.api_requirements
             if not self.is_forbidden_generated_api_requirement(item)
         ]
-        if not api_requirements and any(term in spec.product_goal.lower() for term in ("booking", "consultation", "form", "request")):
+        if not api_requirements and (spec.domain_entities or spec.persistence_requirements or spec.user_flows):
             resource_slug = self._default_api_resource_slug(spec)
             resource_path = f"/api/{resource_slug.replace('_', '-')}"
             evidence = [EvidenceLink(doc_ref_id="prompt-source", evidence_type="derived", note="Synthesized from prompt intent and canonical runtime defaults.")]
@@ -125,12 +174,7 @@ class GroundedSpecStabilizationRuntime:
                         method="POST",
                         path=resource_path,
                         purpose="Persist the primary end-user workflow record in the generated mini-app.",
-                        request_fields=[
-                            APIField(name="name", type="string", required=True, description="End-user display name"),
-                            APIField(name="phone", type="phone", required=True, description="End-user phone number"),
-                            APIField(name="preferred_date", type="datetime", required=True, description="Requested consultation date"),
-                            APIField(name="comment", type="text", required=False, description="Additional request comment"),
-                        ],
+                        request_fields=self._default_api_request_fields(spec),
                         response_fields=[
                             APIField(name="record_id", type="uuid", required=True, description="Created workflow record identifier"),
                             APIField(name="status", type="string", required=True, description="Current workflow status"),
@@ -156,13 +200,13 @@ class GroundedSpecStabilizationRuntime:
                 ]
             )
             assumptions.append(
-                Assumption(
-                    assumption_id="assume_generated_workflow_api",
-                    text=f"The generated miniapp exposes a default primary workflow API under {resource_path}.",
-                    status="active",
-                    rationale="Simple workflow prompts should compile into a usable end-to-end demo without blocking on undocumented project-specific endpoint names.",
-                    impact="medium",
-                )
+                    Assumption(
+                        assumption_id="assume_generated_workflow_api",
+                        text=f"The generated miniapp exposes a default primary workflow API under {resource_path}.",
+                        status="active",
+                        rationale="Prompt-derived workflows should compile into a usable end-to-end demo without blocking on undocumented project-specific endpoint names.",
+                        impact="medium",
+                    )
             )
 
         actors = self.expand_role_actors(spec.actors, spec.doc_refs)
@@ -191,8 +235,8 @@ class GroundedSpecStabilizationRuntime:
                 actor_id="actor_specialist",
                 name="Specialist",
                 role="specialist",
-                description="Processes incoming requests created by end-users and updates workflow status.",
-                permissions_hint=["process_request"],
+                description="Processes incoming records created by end-users and updates workflow status.",
+                permissions_hint=["process_records"],
                 evidence=evidence,
             )
         if "manager" not in role_names:
@@ -209,8 +253,8 @@ class GroundedSpecStabilizationRuntime:
                 actor_id="actor_client",
                 name="Client",
                 role="client",
-                description="Creates a new request and tracks its progress.",
-                permissions_hint=["create_request"],
+                description="Creates a new record and tracks its progress.",
+                permissions_hint=["create_record"],
                 evidence=evidence,
             )
         return list(actor_map.values())
@@ -221,20 +265,21 @@ class GroundedSpecStabilizationRuntime:
         actor_by_role = {actor.role.lower(): actor for actor in actors}
         actor_by_role.setdefault("client", next((actor for actor in actors if actor.role.lower() == "user"), actors[0]))
         evidence = [EvidenceLink(doc_ref_id="prompt-source", evidence_type="derived", note="Expanded to linked three-role runtime flow.")]
-        entity_name = spec.domain_entities[0].name.replace("_", " ") if spec.domain_entities else "request"
+        entity_name = spec.domain_entities[0].name.replace("_", " ") if spec.domain_entities else "record"
         flow_label = entity_name.lower()
+        primary_attributes = [attribute.name for attribute in spec.domain_entities[0].attributes] if spec.domain_entities else ["title", "details"]
 
-        if not any("submission" in name or "booking" in name or "request" in name for name in flow_names):
+        if not any("client" in name or "user" in name for name in flow_names):
             existing.insert(
                 0,
                 UserFlow(
-                    flow_id="flow_client_submission",
-                    name=f"Client {flow_label} submission",
-                    goal=f"Allow a client to submit a new {flow_label} and receive confirmation.",
+                    flow_id="flow_client_record_creation",
+                    name=f"Client creates {flow_label}",
+                    goal=f"Allow a client to create a new {flow_label} and receive confirmation.",
                     steps=[
-                        FlowStep(step_id="step_client_open_form", order=1, actor_id=actor_by_role["client"].actor_id, action="Open the submission form."),
-                        FlowStep(step_id="step_client_fill_form", order=2, actor_id=actor_by_role["client"].actor_id, action="Fill in the requested fields.", input_data=[attribute.name for attribute in spec.domain_entities[0].attributes]),
-                        FlowStep(step_id="step_client_submit_form", order=3, actor_id=actor_by_role["client"].actor_id, action="Submit the form to create a new record.", output_data=["submission_id", "status"]),
+                        FlowStep(step_id="step_client_open_form", order=1, actor_id=actor_by_role["client"].actor_id, action="Open the main creation form."),
+                        FlowStep(step_id="step_client_fill_form", order=2, actor_id=actor_by_role["client"].actor_id, action="Complete the required fields.", input_data=primary_attributes),
+                        FlowStep(step_id="step_client_submit_form", order=3, actor_id=actor_by_role["client"].actor_id, action="Submit the form to create a new record.", output_data=["record_id", "status"]),
                     ],
                     acceptance_criteria=["A new record is created.", "The client sees a confirmation state."],
                     evidence=evidence,

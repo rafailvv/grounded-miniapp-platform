@@ -92,10 +92,37 @@ class MiniappGenerationReporting(MiniappGenerationRuntimeOwner):
         generation_mode: GenerationMode,
         assistant_message: str,
     ) -> str:
+        safe_message = MiniappGenerationReporting._safe_success_assistant_message(assistant_message)
+        prefix = f"{safe_message} " if safe_message else ""
         return (
-            f"{assistant_message} Built a {generation_mode.value} draft for {grounded_spec.target_platform} "
+            f"{prefix}Built a {generation_mode.value} draft for {grounded_spec.target_platform} "
             f"with {len(operations)} file operations across {len(role_scope)} role views."
         )
+
+    @staticmethod
+    def _safe_success_assistant_message(assistant_message: str) -> str:
+        """Keep successful run summaries user-facing, not provider/repair diagnostics."""
+
+        message = " ".join(str(assistant_message or "").split()).strip()
+        if not message:
+            return ""
+        internal_markers = (
+            "automatic repair",
+            "can only afford",
+            "could not be generated",
+            "fallback",
+            "initial iteration diagnostics",
+            "openrouter",
+            "provider budget",
+            "provider-budget",
+            "repair attempt",
+            "requires more credits",
+            "timed out during whole-file generation",
+        )
+        lowered = message.lower()
+        if any(marker in lowered for marker in internal_markers):
+            return ""
+        return message
 
     @staticmethod
     def _compile_code_summary(operations: list[DraftFileOperation], role_scope: list[str]) -> dict[str, int | str]:

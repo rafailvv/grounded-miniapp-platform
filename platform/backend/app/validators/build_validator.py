@@ -14,6 +14,14 @@ from app.services.miniapp_generation.shell_contract import (
 
 
 class BuildValidator:
+    _RUNTIME_ROUTER_PREFIX_PATTERN = re.compile(
+        r'APIRouter\(\s*prefix\s*=\s*["\']/api/runtime(?:/)?["\']'
+    )
+    _RUNTIME_ROUTE_DECORATOR_PATTERN = re.compile(
+        r'^\s*@router\.(?:get|post|put|patch|delete)\(\s*["\']/api/runtime(?:/|["\'])',
+        re.MULTILINE,
+    )
+
     def validate(self, workspace_path: Path) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         required_files = [
@@ -785,7 +793,9 @@ class BuildValidator:
                     content = route_file.read_text(encoding="utf-8")
                 except OSError:
                     continue
-                if 'APIRouter(prefix="/api/runtime"' in content or "/api/runtime/" in content:
+                owns_runtime_prefix = bool(self._RUNTIME_ROUTER_PREFIX_PATTERN.search(content))
+                owns_runtime_decorator = bool(self._RUNTIME_ROUTE_DECORATOR_PATTERN.search(content))
+                if owns_runtime_prefix or owns_runtime_decorator:
                     runtime_owners.append(str(route_file.relative_to(workspace_path)))
         runtime_owner_set = set(runtime_owners)
         if len(runtime_owners) > 1 and runtime_owner_set != canonical_runtime_companions:
@@ -1003,32 +1013,41 @@ class BuildValidator:
     @staticmethod
     def _looks_like_persisted_form_surface(html_content: str) -> bool:
         lowered = str(html_content or "").lower()
+        mutating_markers = (
+            ">create<",
+            ">save<",
+            ">update<",
+            ">assign<",
+            ">reject<",
+            ">approve<",
+            ">confirm<",
+            ">return<",
+            "save changes",
+            "submit request",
+        )
+        filter_markers = (
+            "filter",
+            "search",
+            "sort",
+            "apply filters",
+            "reset filters",
+            "filter-form",
+            "status-filter",
+            "type-filter",
+        )
         if "<form" not in lowered:
             return (
                 "type=\"submit\"" in lowered
                 or "type='submit'" in lowered
-                or ">create<" in lowered
-                or ">save<" in lowered
-                or ">update<" in lowered
-                or ">assign<" in lowered
-                or ">reject<" in lowered
-                or ">approve<" in lowered
+                or any(marker in lowered for marker in mutating_markers)
             )
+        if any(marker in lowered for marker in filter_markers) and "<textarea" not in lowered and not any(
+            marker in lowered for marker in mutating_markers
+        ):
+            return False
         if "type=\"submit\"" in lowered or "type='submit'" in lowered:
             return True
-        if any(
-            marker in lowered
-            for marker in (
-                ">create<",
-                ">save<",
-                ">update<",
-                ">assign<",
-                ">reject<",
-                ">approve<",
-                "save changes",
-                "submit request",
-            )
-        ):
+        if any(marker in lowered for marker in mutating_markers):
             return True
         has_textual_inputs = bool(
             re.search(r"<textarea\b", lowered)
@@ -1036,11 +1055,7 @@ class BuildValidator:
         )
         if has_textual_inputs:
             return True
-        has_only_filter_controls = (
-            "<select" in lowered
-            and not has_textual_inputs
-            and any(marker in lowered for marker in ("filter", "search", "sort", "status-filter", "type-filter"))
-        )
+        has_only_filter_controls = "<select" in lowered and any(marker in lowered for marker in filter_markers)
         if has_only_filter_controls:
             return False
         return False

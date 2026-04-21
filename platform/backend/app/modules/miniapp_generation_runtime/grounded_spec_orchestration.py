@@ -24,7 +24,7 @@ class GroundedSpecOrchestrationRuntime(MiniappGenerationRuntimeOwner):
         creative_direction: dict[str, Any],
     ) -> dict[str, Any]:
         if not self.service.openrouter_client.enabled:
-            return {"error": "GroundedSpec generation requires OpenAI configuration."}
+            return {"error": "GroundedSpec generation requires an LLM provider configuration."}
         if generation_mode == GenerationMode.FAST:
             return self._resolve_grounded_spec_fast(
                 prompt=prompt,

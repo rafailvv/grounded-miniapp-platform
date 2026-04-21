@@ -9,6 +9,19 @@ from app.services.miniapp_generation.constants import ROLE_ORDER
 
 
 class ServiceStrategyMixins:
+    _EXPLICIT_MICRO_PATCH_MARKERS = (
+        "css only",
+        "styles only",
+        "styling only",
+        "visual only",
+        "layout only",
+        "avatar only",
+        "logo only",
+        "image only",
+        "spacing only",
+        "padding only",
+        "margin only",
+    )
     _VISUAL_ROLE_PATCH_MARKERS = (
         "style",
         "styles",
@@ -65,6 +78,30 @@ class ServiceStrategyMixins:
         "details screen",
         "detail screen",
     )
+    _CONTRACT_ROLE_PATCH_CORE_MARKERS = (
+        "real saved action",
+        "real persisted",
+        "persist to the real backend",
+        "persisted to the backend",
+        "shared db state",
+        "shared state",
+        "status is correctly reflected",
+        "must be able to reject",
+        "must be able to approve",
+        "save action",
+    )
+    _CONTRACT_ROLE_PATCH_ACTION_MARKERS = (
+        "status must change",
+        "status must update",
+        "reject the request",
+        "approve the request",
+        "record when",
+        "across the app",
+        "across the whole app",
+        "across specialist",
+        "across manager",
+        "across client",
+    )
     _CONTRACT_ROLE_PATCH_MARKERS = (
         "real saved action",
         "real persisted",
@@ -97,8 +134,26 @@ class ServiceStrategyMixins:
     )
 
     @staticmethod
+    def _matching_marker_count(lowered: str, markers: tuple[str, ...]) -> int:
+        return sum(1 for marker in markers if marker in lowered)
+
+    @staticmethod
+    def _looks_like_explicit_micro_patch(lowered: str) -> bool:
+        return any(marker in lowered for marker in ServiceStrategyMixins._EXPLICIT_MICRO_PATCH_MARKERS)
+
+    @staticmethod
     def _looks_like_role_flow_expansion_request(lowered: str) -> bool:
-        return any(marker in lowered for marker in ServiceStrategyMixins._UI_FLOW_ROLE_PATCH_MARKERS)
+        explicit_phrases = (
+            "open a separate page",
+            "opens a separate page",
+            "open on a separate page",
+            "separate details page",
+            "dedicated details page",
+            "full information about",
+        )
+        if any(marker in lowered for marker in explicit_phrases):
+            return True
+        return ServiceStrategyMixins._matching_marker_count(lowered, ServiceStrategyMixins._UI_FLOW_ROLE_PATCH_MARKERS) >= 2
 
     @staticmethod
     def _looks_like_visual_role_patch_request(lowered: str) -> bool:
@@ -111,7 +166,11 @@ class ServiceStrategyMixins:
 
     @staticmethod
     def _looks_like_contract_role_patch_request(lowered: str) -> bool:
-        return any(marker in lowered for marker in ServiceStrategyMixins._CONTRACT_ROLE_PATCH_MARKERS)
+        if any(marker in lowered for marker in ServiceStrategyMixins._CONTRACT_ROLE_PATCH_CORE_MARKERS):
+            return True
+        support_hits = ServiceStrategyMixins._matching_marker_count(lowered, ServiceStrategyMixins._CONTRACT_ROLE_PATCH_MARKERS)
+        action_hits = ServiceStrategyMixins._matching_marker_count(lowered, ServiceStrategyMixins._CONTRACT_ROLE_PATCH_ACTION_MARKERS)
+        return action_hits >= 1 and support_hits >= 2
 
     @staticmethod
     def _role_only_patch_kind(*, prompt: str, role_scope: list[str], intent: str) -> str | None:
@@ -138,17 +197,15 @@ class ServiceStrategyMixins:
             return "minimal_patch"
         if role_patch_kind == "visual_patch":
             return "minimal_patch"
+        if ServiceStrategyMixins._looks_like_explicit_micro_patch(lowered):
+            return "minimal_patch"
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
+            return "whole_file_build"
+        if intent == "create":
             return "whole_file_build"
         if role_patch_kind in {"ui_flow_patch", "contract_patch"}:
             return "whole_file_build"
         if len(role_scope) == 1 and intent in {"edit", "refine", "role_only_change"}:
-            return "whole_file_build"
-        if any(marker in lowered for marker in ("only ", "just ", "точечно", "только ", "without touching", "do not touch anything else")):
-            return "minimal_patch"
-        if len(role_scope) == 1 and any(marker in lowered for marker in ("change", "update", "fix", "refine", "polish")):
-            return "minimal_patch"
-        if intent == "create":
             return "whole_file_build"
         whole_file_markers = ("full implementation", "whole file", "whole files", "generate by files", "generate files", "new app surface", "catalog", "storefront", "checkout", "workspace", "dashboard", "workflow", "multi-page", "multi role", "multi-role", "refactor")
         if len(role_scope) > 1 or any(marker in lowered for marker in whole_file_markers):

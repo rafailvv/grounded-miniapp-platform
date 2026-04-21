@@ -52,7 +52,21 @@ def _candidate_table_names() -> set[str]:
 
 
 def _candidate_schema_names() -> list[str]:
-    return [SCHEMA_PREFIX]
+    candidates: list[str] = [SCHEMA_PREFIX]
+    suffixes = ("Create", "Update", "Read", "Summary", "Detail", "ListResponse")
+    for name, value in vars(schemas_module).items():
+        if not isinstance(value, type):
+            continue
+        for suffix in suffixes:
+            if name.endswith(suffix) and len(name) > len(suffix):
+                candidates.append(name[: -len(suffix)])
+                break
+    seen: list[str] = []
+    for candidate in candidates:
+        normalized = str(candidate or "").strip()
+        if normalized and normalized not in seen:
+            seen.append(normalized)
+    return seen
 
 
 def _resource_model() -> type[Any]:

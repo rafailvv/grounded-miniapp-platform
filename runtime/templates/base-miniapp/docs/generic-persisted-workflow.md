@@ -44,4 +44,4 @@ await apiFetch("/api/<feature>", {
 
 - Keep one canonical route name for the dominant entity.
 - Keep one canonical set of status literals across `db.py`, `schemas.py`, route handlers, and frontend labels.
-- If the prompt uses synonyms like booking, request, reservation, or appointment, choose one internal vocabulary and keep it consistent.
+- If the prompt uses several near-synonyms for the same primary entity, choose one internal vocabulary and keep it consistent.

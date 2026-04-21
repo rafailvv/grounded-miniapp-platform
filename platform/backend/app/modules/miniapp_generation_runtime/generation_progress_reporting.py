@@ -116,7 +116,10 @@ class GenerationProgressReportingRuntime(MiniappGenerationRuntimeOwner):
         if cluster_name.startswith("backend_route_"):
             return "backend_route"
         if cluster_name.startswith("role_") and "_ui_" in cluster_name:
-            return "serial"
+            parts = cluster_name.split("_")
+            if len(parts) >= 3:
+                return f"role_ui_{parts[1]}"
+            return "role_ui"
         return "serial"
 
     @classmethod
@@ -130,7 +133,7 @@ class GenerationProgressReportingRuntime(MiniappGenerationRuntimeOwner):
                 grouped.append([cluster])
                 index += 1
                 continue
-            batch_limit = 2 if group_name == "backend_route" else 3
+            batch_limit = 2 if group_name == "backend_route" or group_name.startswith("role_ui_") else 3
             batch = [cluster]
             index += 1
             while index < len(clusters) and len(batch) < batch_limit:
