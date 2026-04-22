@@ -231,9 +231,12 @@ class ServiceRepairReportingMixins:
             max_full_file_chars=14000 if kwargs.get("expanded_context") else 12000,
         )
         grounded_spec = kwargs["grounded_spec"]
+        generation_mode = kwargs.get("generation_mode") or GenerationMode.BALANCED
+        generation_mode_value = generation_mode.value if isinstance(generation_mode, GenerationMode) else str(generation_mode)
         return json_dumps({
             "task": "Repair build or preview failures in the generated draft",
             "attempt": kwargs["attempt"],
+            "generation_mode": generation_mode_value,
             "repair_mode": "structural_bundle" if structural_failure else "targeted_patch",
             "prompt": kwargs["prompt"],
             "role_scope": kwargs["role_scope"],

@@ -360,10 +360,39 @@ class ConnectivityValidator:
             return False
         if any(marker in content for marker in ("request-list", "queue-list", "records-list", "<table", "<tbody")):
             return False
-        if any(marker in content for marker in ("addeventlistener(\"submit\"", "addeventlistener('submit'", ".onsubmit", "formdata(")):
-            return False
-        if re.search(r"method\s*:\s*[\"'](?:post|put|patch|delete)[\"']", content, flags=re.IGNORECASE):
-            return False
+        has_form_write = any(
+            marker in content
+            for marker in ("addeventlistener(\"submit\"", "addeventlistener('submit'", ".onsubmit", "formdata(")
+        ) or bool(re.search(r"method\s*:\s*[\"'](?:post|put|patch|delete)[\"']", content, flags=re.IGNORECASE))
+        if has_form_write:
+            looks_like_profile_form = any(
+                marker in content
+                for marker in (
+                    "profile-form",
+                    "photo-input",
+                    "first_name",
+                    "last_name",
+                    "profile-photo",
+                    "preview-name",
+                )
+            )
+            has_save_or_error_feedback = any(
+                marker in content
+                for marker in (
+                    "saving",
+                    "saved",
+                    "save-state",
+                    "savebutton",
+                    "email-error",
+                    "phone-error",
+                    "role=\"alert\"",
+                    "role='alert'",
+                    "error",
+                    "unable",
+                    "failed",
+                )
+            )
+            return looks_like_profile_form and has_save_or_error_feedback
         return True
 
     @staticmethod

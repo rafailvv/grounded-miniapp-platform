@@ -253,15 +253,16 @@ def _pick_status_value(resource_slug: str) -> str:
 def _pick_progress_status_value(resource_slug: str) -> str:
     preferred = (
         "in_progress",
+        "assigned",
         "claimed",
         "in_review",
-        "active",
-        "open",
         "processing",
+        "active",
         "approved",
         "completed",
         "returned",
         "closed",
+        "open",
     )
     choices = _field_literal_choices(resource_slug, "status", suffixes=("Update", "Read", "Create"))
     for candidate in preferred:

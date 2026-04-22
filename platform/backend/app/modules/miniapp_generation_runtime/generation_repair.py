@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 from typing import TYPE_CHECKING, Any, Callable
 
 from app.ai.model_registry import task_model_overrides
@@ -631,6 +632,7 @@ class MiniappGenerationRepair:
                                 preview_issue=preview_issue,
                                 preview_logs=preview_logs,
                                 attempt=attempt,
+                                generation_mode=generation_mode,
                                 expanded_context=expanded_context,
                                 previous_turn_summary=previous_turn_summary,
                                 previous_diff_summary=previous_diff_summary,
@@ -759,6 +761,16 @@ class MiniappGenerationRepair:
                     }
             except Exception as exc:
                 last_error = exc
+                self.service._append_trace(
+                    workspace_id,
+                    "repair_exception",
+                    "Automatic repair step raised before returning operations.",
+                    {
+                        "error": str(exc),
+                        "exception_type": type(exc).__name__,
+                        "traceback": traceback.format_exc(limit=8),
+                    },
+                )
                 if expanded_context or not self.service._should_retry_repair_with_expanded_context(str(exc)):
                     break
         return {"error": f"Automatic repair step failed: {last_error}"}

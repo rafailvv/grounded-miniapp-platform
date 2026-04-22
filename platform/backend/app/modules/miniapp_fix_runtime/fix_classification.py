@@ -45,6 +45,7 @@ class FixClassificationRuntime:
             "frontend_link_route_mismatch": 90,
             "router_not_registered": 88,
             "api_endpoint_missing": 86,
+            "persistence_contract_mismatch": 84,
             "frontend_compile/type/import": 80,
             "backend_startup/import/schema": 78,
             "preview_runtime/docker_orchestration": 72,
@@ -76,6 +77,8 @@ class FixClassificationRuntime:
             return "backend_framework_mismatch"
         if "/api/runtime/" in lowered and "manifest" in lowered and ("404" in lowered or "not found" in lowered):
             return "runtime_manifest_route_missing"
+        if "shared-state update failure" in lowered or ("did not reflect" in lowered and "shared state" in lowered):
+            return "persistence_contract_mismatch"
         if ("cannot import name 'get_db'" in lowered or 'cannot import name "get_db"' in lowered or "import get_db" in lowered) and any(
             path.endswith(("/db.py", "/schemas.py", "/main.py")) for path in implicated_files
         ):
@@ -139,6 +142,8 @@ class FixClassificationRuntime:
     @classmethod
     def _looks_like_runtime_infra_failure(cls, text: str) -> bool:
         lowered = str(text or "").lower()
+        if cls._looks_like_persistence_contract_failure(lowered):
+            return False
         return any(
             marker in lowered
             for marker in (
@@ -166,6 +171,15 @@ class FixClassificationRuntime:
         )
 
     @classmethod
+    def _looks_like_persistence_contract_failure(cls, text: str) -> bool:
+        lowered = str(text or "").lower()
+        return (
+            "shared-state update failure" in lowered
+            or ("did not reflect" in lowered and "shared state" in lowered)
+            or "runtime.shared_state_update_failure" in lowered
+        )
+
+    @classmethod
     def _looks_like_ui_surface_failure(cls, text: str) -> bool:
         lowered = str(text or "").lower()
         return any(
@@ -188,11 +202,14 @@ class FixClassificationRuntime:
         filtered: list[str] = []
         saw_ui_surface = cls._looks_like_ui_surface_failure(base_text)
         saw_runtime_infra = cls._looks_like_runtime_infra_failure(base_text)
+        saw_persistence_contract = cls._looks_like_persistence_contract_failure(base_text)
         for candidate in candidates:
             normalized = str(candidate or "").strip().lstrip("./")
             if not normalized:
                 continue
             if normalized.startswith(cls._READ_ONLY_REPAIR_SURFACES):
+                continue
+            if saw_persistence_contract and normalized in {"docker/docker-compose.yml", "miniapp/requirements.txt", "miniapp/app/main.py"}:
                 continue
             if not saw_runtime_infra and normalized in {"docker/docker-compose.yml", "miniapp/requirements.txt"}:
                 continue
@@ -211,6 +228,12 @@ class FixClassificationRuntime:
             if result.status == "failed":
                 diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
                 api_failure = diagnostics.get("api_failure") if isinstance(diagnostics, dict) else None
+                shared_state_failure = diagnostics.get("shared_state_update_failure") if isinstance(diagnostics, dict) else None
+                if isinstance(shared_state_failure, dict):
+                    actor = str(shared_state_failure.get("actor") or "").strip()
+                    resource_slug = str(shared_state_failure.get("resource_slug") or "").strip()
+                    resource_label = f"/api/{resource_slug}" if resource_slug else "shared record API"
+                    return f"Generated app shared-state update failure: {resource_label} did not persist {actor or 'role'} changes."
                 if isinstance(api_failure, dict):
                     method = str(api_failure.get("method") or "").strip().upper()
                     path = str(api_failure.get("path") or "").strip()
@@ -250,6 +273,16 @@ class FixClassificationRuntime:
                         if part
                     ).strip()
                 )
+            shared_state_failure = diagnostics.get("shared_state_update_failure") if isinstance(diagnostics, dict) else None
+            if isinstance(shared_state_failure, dict):
+                resource_slug = str(shared_state_failure.get("resource_slug") or "").strip()
+                actor = str(shared_state_failure.get("actor") or "").strip()
+                marker = "runtime.shared_state_update_failure"
+                if resource_slug:
+                    marker = f"{marker}.{resource_slug}"
+                if actor:
+                    marker = f"{marker}.{actor}"
+                markers.append(marker)
             if result.name == "generated_app_python_tests":
                 missing_role_pages = diagnostics.get("missing_role_pages") if isinstance(diagnostics, dict) else None
                 if isinstance(missing_role_pages, list):
@@ -335,6 +368,21 @@ class FixClassificationRuntime:
                 normalized = re.sub(r"[^a-z0-9_]+", "", table_name.lower()).strip()
                 if normalized:
                     candidates.append(f"miniapp/app/routes/{normalized}.py")
+        shared_state_resource_match = re.search(r"runtime\.shared_state_update_failure\.([a-z0-9_]+)", lowered)
+        if shared_state_resource_match:
+            candidates.extend(self._resource_fix_targets(shared_state_resource_match.group(1)))
+        else:
+            shared_state_api_match = re.search(r"shared-state update failure:\s+(/api/[a-z0-9_/-]+)", lowered)
+            if shared_state_api_match:
+                route_segments = [segment for segment in shared_state_api_match.group(1).strip("/").split("/") if segment]
+                if len(route_segments) >= 2 and route_segments[0] == "api":
+                    candidates.extend(self._resource_fix_targets(route_segments[1]))
+            elif "did not reflect" in lowered and "shared state" in lowered:
+                for stem in re.findall(r"['\"]([a-z0-9_]+)_id['\"]", lowered):
+                    if stem not in {"record", "item", "id"}:
+                        resource = stem if stem.endswith("s") else f"{stem}s"
+                        candidates.extend(self._resource_fix_targets(resource))
+                        break
         missing_role_page_roles = [
             role
             for role in ("client", "specialist", "manager")
@@ -447,6 +495,8 @@ class FixClassificationRuntime:
     @staticmethod
     def classify_failure_text(text: str) -> str:
         lowered = text.lower()
+        if "shared-state update failure" in lowered or ("did not reflect" in lowered and "shared state" in lowered):
+            return "persistence_contract_mismatch"
         if any(marker in lowered for marker in ("npm is not available", "docker compose is not available", "tooling is unavailable", "was not found on path")):
             return "tooling/platform_misconfiguration"
         if any(marker in lowered for marker in ("could not be opened in preview", "returned unusable preview content", "preview route smoke", "connection refused")):

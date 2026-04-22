@@ -37,6 +37,10 @@ class CheckRunner:
         r"table\s+(?P<table>[A-Za-z0-9_]+)\s+has no column named\s+(?P<column>[A-Za-z0-9_]+)",
         re.IGNORECASE,
     )
+    _SHARED_STATE_UPDATE_RE = re.compile(
+        r"Updated record\s+(?P<record_id>[A-Za-z0-9_-]+)\s+did not reflect\s+(?P<actor>[A-Za-z0-9_-]+)\s+changes in shared state\.\s+Payload:\s*(?P<payload>.*)$",
+        re.IGNORECASE,
+    )
 
     def __init__(self, validation_suite: ValidationSuite, preview_service: PreviewService) -> None:
         self.validation_suite = validation_suite
@@ -171,7 +175,17 @@ class CheckRunner:
                 code = "tests.python_generated_app" if result.name == "generated_app_python_tests" else "tests.js_generated_app"
                 diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
                 api_failure = diagnostics.get("api_failure") if isinstance(diagnostics, dict) else None
-                if isinstance(api_failure, dict):
+                shared_state_failure = diagnostics.get("shared_state_update_failure") if isinstance(diagnostics, dict) else None
+                if isinstance(shared_state_failure, dict):
+                    actor = str(shared_state_failure.get("actor") or "").strip()
+                    resource_slug = str(shared_state_failure.get("resource_slug") or "").strip()
+                    resource_label = f"/api/{resource_slug}" if resource_slug else "shared record API"
+                    payload_excerpt = str(shared_state_failure.get("payload_excerpt") or "").strip()
+                    message = (
+                        f"Generated app shared-state update failure: {resource_label} did not persist "
+                        f"{actor or 'role'} changes. Payload: {payload_excerpt}"
+                    ).strip()
+                elif isinstance(api_failure, dict):
                     method = str(api_failure.get("method") or "").strip().upper()
                     path = str(api_failure.get("path") or "").strip()
                     status = api_failure.get("status_code")
@@ -772,6 +786,19 @@ class CheckRunner:
                 }
                 break
         for line in reversed(logs):
+            shared_state_match = cls._SHARED_STATE_UPDATE_RE.search(str(line or ""))
+            if not shared_state_match:
+                continue
+            payload = str(shared_state_match.group("payload") or "").strip()
+            resource_slug = cls._resource_slug_from_payload_keys(payload)
+            diagnostics["shared_state_update_failure"] = {
+                "record_id": str(shared_state_match.group("record_id") or "").strip(),
+                "actor": str(shared_state_match.group("actor") or "").strip().lower(),
+                "resource_slug": resource_slug or None,
+                "payload_excerpt": payload[:700],
+            }
+            break
+        for line in reversed(logs):
             match = cls._API_FAILURE_RE.search(str(line or ""))
             if not match:
                 continue
@@ -789,6 +816,15 @@ class CheckRunner:
             }
             break
         return diagnostics
+
+    @staticmethod
+    def _resource_slug_from_payload_keys(payload: str) -> str:
+        for raw_key in re.findall(r"['\"]([A-Za-z0-9_]+)_id['\"]", str(payload or "")):
+            stem = re.sub(r"[^a-z0-9_]+", "", raw_key.lower()).strip()
+            if not stem or stem in {"id", "record", "item"}:
+                continue
+            return stem if stem.endswith("s") else f"{stem}s"
+        return ""
 
     @staticmethod
     def _filter_build_issues(issues: list[ValidationIssue], scope_mode: str) -> list[ValidationIssue]:

@@ -1272,6 +1272,82 @@ def test_connectivity_validator_accepts_semantic_loading_and_error_state_markers
     assert "connectivity.missing_ui_error_state" not in issue_codes
 
 
+def test_connectivity_validator_accepts_form_first_profile_persistence(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    _create_workspace_scaffold(workspace_root)
+    _write_workspace_file(workspace_root, "miniapp/app/routes/profiles.py", "from fastapi import APIRouter\nrouter = APIRouter()\n")
+    _write_workspace_file(
+        workspace_root,
+        "artifacts/generated_app_graph.json",
+        json.dumps(
+            {
+                "flow_mode": "multi_page",
+                "roles": {
+                    "client": {
+                        "routes_file": "miniapp/app/static/client/index.html",
+                        "pages": [
+                            {
+                                "route_path": "/client/profile",
+                                "file_path": "miniapp/app/static/client/profile/index.html",
+                                "style_path": "miniapp/app/static/client/profile/styles.css",
+                                "script_path": "miniapp/app/static/client/profile/app.js",
+                                "title": "Profile",
+                                "data_dependencies": ["/api/profiles"],
+                                "loading_state": "Show profile form skeleton while loading.",
+                                "error_state": "Show an inline error when profile data cannot load.",
+                            }
+                        ],
+                    }
+                },
+            }
+        ),
+    )
+    _write_workspace_file(
+        workspace_root,
+        "artifacts/grounded_spec.json",
+        json.dumps({"api_requirements": [{"method": "GET", "path": "/api/profiles/{role}", "purpose": "Load role profile"}]}),
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/profile/index.html",
+        """
+        <main class="page-shell">
+          <form id="profile-form">
+            <input name="first_name" />
+            <input name="last_name" />
+            <input id="photo-input" type="file" />
+            <div id="profile-photo"></div>
+            <strong id="preview-name"></strong>
+            <span id="email-error" class="error"></span>
+            <button id="save-button" type="submit">Save</button>
+          </form>
+          <script src="/static/client/profile/app.js"></script>
+        </main>
+        """,
+    )
+    _write_workspace_file(
+        workspace_root,
+        "miniapp/app/static/client/profile/app.js",
+        """
+        const form = document.getElementById("profile-form");
+        const saveButton = document.getElementById("save-button");
+        fetch("/api/profiles/client").then((response) => response.json());
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          saveButton.textContent = "Saving...";
+          const response = await fetch("/api/profiles/client", { method: "PUT", body: JSON.stringify({}) });
+          if (!response.ok) document.getElementById("email-error").textContent = "Unable to save";
+        });
+        """,
+    )
+
+    issues = ConnectivityValidator().validate(workspace_root)
+    issue_codes = {issue.code for issue in issues}
+
+    assert "connectivity.missing_ui_loading_state" not in issue_codes
+    assert "connectivity.missing_ui_error_state" not in issue_codes
+
+
 def test_connectivity_validator_accepts_api_reference_with_matching_route(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
     _create_workspace_scaffold(workspace_root)

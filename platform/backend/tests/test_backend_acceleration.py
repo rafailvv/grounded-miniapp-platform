@@ -4692,6 +4692,8 @@ def test_generated_python_app_tests_choose_allowed_progress_status_literal(tmp_p
 
     assert "def _pick_progress_status_value(resource_slug: str) -> str:" in content
     assert '"status": _pick_progress_status_value(_resource_slug(update_path))' in content
+    progress_fn = content[content.index("def _pick_progress_status_value") :]
+    assert progress_fn.index('"assigned",') < progress_fn.index('"open",')
     assert "from enum import Enum" in content
     assert "issubclass(annotation, Enum)" in content
 
@@ -6649,12 +6651,19 @@ def test_check_runner_extracts_role_page_and_sqlite_column_diagnostics() -> None
             "ERROR: test_role_journey_round_trip_persists_shared_record (test_generated_app.GeneratedMiniAppTests.test_role_journey_round_trip_persists_shared_record)",
             "AssertionError: [] is not true : No pages declared for role specialist",
             "sqlite3.OperationalError: table requests has no column named details",
+            "AssertionError: False is not true : Updated record abc123 did not reflect specialist changes in shared state. Payload: {'items': [{'id': 'abc123', 'status': 'open', 'use_id': 'abc123'}]}",
         ]
     )
 
     assert diagnostics["failing_test_name"] == "test_role_journey_round_trip_persists_shared_record"
     assert diagnostics["missing_role_pages"] == ["specialist"]
     assert diagnostics["sqlite_missing_column"] == {"table": "requests", "column": "details"}
+    assert diagnostics["shared_state_update_failure"] == {
+        "record_id": "abc123",
+        "actor": "specialist",
+        "resource_slug": "uses",
+        "payload_excerpt": "{'items': [{'id': 'abc123', 'status': 'open', 'use_id': 'abc123'}]}",
+    }
 
 
 def test_fix_classification_implicates_role_and_resource_contract_files_for_generated_test_markers(tmp_path: Path) -> None:
@@ -6663,12 +6672,13 @@ def test_fix_classification_implicates_role_and_resource_contract_files_for_gene
     runtime = app.state.container.fix_orchestrator.fix_classification
 
     candidates = runtime.test_failure_implicated_paths(
-        "runtime.missing_role_pages.specialist\nruntime.sqlite_missing_column.requests.details"
+        "runtime.missing_role_pages.specialist\nruntime.sqlite_missing_column.requests.details\nruntime.shared_state_update_failure.uses.specialist"
     )
 
     assert "miniapp/app/routes/specialist.py" in candidates
     assert "miniapp/app/routes/role_pages.py" in candidates
     assert "miniapp/app/routes/requests.py" in candidates
+    assert "miniapp/app/routes/uses.py" in candidates
     assert "miniapp/app/db.py" in candidates
     assert "miniapp/app/schemas.py" in candidates
 
@@ -7762,6 +7772,19 @@ def test_fix_orchestrator_does_not_misclassify_preview_route_errors_as_typescrip
     )
 
     assert failure_class == "runtime_preview_boot"
+
+
+def test_fix_orchestrator_classifies_shared_state_update_failures_as_persistence(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+
+    failure_class = app.state.container.fix_orchestrator._classify_failure_text(
+        "Traceback...\n"
+        "AssertionError: False is not true : Updated record abc123 did not reflect specialist changes in shared state. "
+        "Payload: {'items': [{'id': 'abc123', 'status': 'open', 'use_id': 'abc123'}]}"
+    )
+
+    assert failure_class == "persistence_contract_mismatch"
 
 
 def test_openrouter_json_parser_recovers_first_object_from_concatenated_json() -> None:
