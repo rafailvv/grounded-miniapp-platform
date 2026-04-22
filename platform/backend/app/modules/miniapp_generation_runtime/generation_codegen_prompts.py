@@ -434,7 +434,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "If the page has data_dependencies, add only the minimum state UI needed for real post-render refresh paths.",
                     "Use loading/error ids or data-ui-state markers that match the page contract instead of decorative prose only.",
                     "Do not render generic visible loading/error copy such as 'Loading...', 'Loading data...', or 'Unable to load data. Try again.'; keep state nodes hidden/empty initially or use page-specific copy.",
-                    "Never expose implementation placeholders, numeric fragments, or broken HTML entity remnants such as 'Block 181', 'Section 181', or '181;' in visible UI.",
+                    "Never expose implementation placeholders, numeric fragments, decorative chevrons, or broken HTML entity remnants such as 'Block 181', 'Section 181', '181;', '203a', or '›' in visible UI.",
                     "Static or mostly static pages should render immediately without spinner-first UX.",
                     "Role root pages with data dependencies must render a complete business surface on first paint without pseudo-data: use real sections, actions, and honest empty states immediately.",
                     "Do not pre-render invented business records in HTML or JS. Live request cards, approval rows, queue entries, conflict items, and similar workflow records must appear only after reading real API data.",

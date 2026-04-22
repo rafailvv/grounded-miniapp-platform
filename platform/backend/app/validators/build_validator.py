@@ -147,19 +147,26 @@ class BuildValidator:
                 "Visible UI text appears to contain a broken numeric HTML entity fragment.",
             ),
             (
+                re.compile(
+                    r'class=["\'][^"\']*\bchevron\b[^"\']*["\'][^>]*>\s*(?:›|&rsaquo;|&#x?203a;?|203a|\d{2,};?)\s*<',
+                    re.IGNORECASE,
+                ),
+                "Visible UI text appears to contain a decorative chevron artifact instead of a stable aligned control.",
+            ),
+            (
                 re.compile(r">\s*(?:Block|Section|Card)\s+\d{2,}\s*<", re.IGNORECASE),
                 "Visible UI text appears to contain a generated placeholder block label.",
             ),
             (
                 re.compile(
-                    r">\s*(?:Loading(?:\s+data)?(?:\.{1,3}|…)?|Unable\s+to\s+load\s+data\.?\s*(?:Try\s+again\.?)?)\s*<",
+                    r">\s*(?:Loading\b[^<]{0,120}|(?:Couldn['’]?t|Could\s+not|Unable\s+to)\s+load\b[^<]{0,160})\s*<",
                     re.IGNORECASE,
                 ),
                 "Visible UI state text uses generic loading or error copy instead of contextual state text.",
             ),
             (
                 re.compile(
-                    r"\b(?:textContent|innerText)\s*=\s*['\"]\s*(?:Loading(?:\s+data)?(?:\.{1,3}|…)?|Unable\s+to\s+load\s+data\.?\s*(?:Try\s+again\.?)?)\s*['\"]",
+                    r"\b(?:textContent|innerText)\s*=\s*['\"]\s*(?:Loading\b[^'\"]{0,120}|(?:Couldn['’]?t|Could\s+not|Unable\s+to)\s+load\b[^'\"]{0,160})\s*['\"]",
                     re.IGNORECASE,
                 ),
                 "Scripted UI state text uses generic loading or error copy instead of contextual state text.",

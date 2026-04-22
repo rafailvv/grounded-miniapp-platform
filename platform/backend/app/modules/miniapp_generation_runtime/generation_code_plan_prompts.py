@@ -163,7 +163,7 @@ class MiniappGenerationCodePlanPrompts(MiniappGenerationRuntimeOwner):
                     "For role root pages with dynamic data dependencies, require real first-paint sections and actions with honest empty states instead of loading-first shells or pseudo-records.",
                     "For pages with dynamic data dependencies, plan only the minimum loading/error behavior that remains necessary after first paint; do not force dedicated loading shells on role root pages.",
                     "Do not plan generic visible state labels like 'Loading data...' or 'Unable to load data. Try again.'; state markers can be hidden/empty initially and filled with contextual copy only when needed.",
-                    "Do not plan visible placeholder labels, numeric block labels, or broken entity fragments such as 'Block 181', 'Section 181', or '181;'.",
+                    "Do not plan visible placeholder labels, numeric block labels, decorative chevrons, or broken entity fragments such as 'Block 181', 'Section 181', '181;', '203a', or '›'.",
                     "For pages that reference /api endpoints in data dependencies, include the matching miniapp route modules in backend_targets from the start.",
                     "For workflow or stateful apps, plan miniapp/app/db.py and miniapp/app/schemas.py as canonical backend contract files from the start.",
                     "Any mutable business data must persist through SQLAlchemy models in db.py, not route-level lists, dicts, or module globals.",

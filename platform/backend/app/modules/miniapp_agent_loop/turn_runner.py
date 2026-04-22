@@ -355,7 +355,10 @@ class WorkspaceLoopTurnRunner:
                 previous_snapshot = progress_snapshot
                 continue
 
-            synced_operations = callbacks.apply_contract_sync(list(plan.operations))
+            if bool(plan.metadata.get("skip_contract_sync")):
+                synced_operations = list(plan.operations)
+            else:
+                synced_operations = callbacks.apply_contract_sync(list(plan.operations))
             callbacks.append_event(
                 job,
                 "patch_apply_started",

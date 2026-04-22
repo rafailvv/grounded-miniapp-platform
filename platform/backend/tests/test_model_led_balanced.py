@@ -1007,21 +1007,25 @@ def test_build_validator_flags_static_ui_numeric_artifacts() -> None:
     issues = BuildValidator._static_ui_text_artifact_issues(content, "miniapp/app/static/manager/app.js")
 
     assert {issue.code for issue in issues} == {"build.static_ui_text_artifact"}
-    assert len(issues) == 3
+    assert len(issues) == 4
 
 
 def test_build_validator_flags_generic_state_copy_and_broken_entity_fragments() -> None:
     content = """
     <span class="chevron">181;</span>
+    <span class="chevron">203a</span>
+    <span class="chevron">›</span>
     <p>Block 181</p>
     <span id="loading-state">Loading...</span>
+    <span id="loading-state">Loading all client requests…</span>
+    <span id="error-state">Couldn't load the request overview. Please refresh.</span>
     stateEl.textContent = "Unable to load data. Try again.";
     """
 
     issues = BuildValidator._static_ui_text_artifact_issues(content, "miniapp/app/static/manager/index.html")
 
     assert {issue.code for issue in issues} == {"build.static_ui_text_artifact"}
-    assert len(issues) == 4
+    assert len(issues) == 5
 
 
 def test_frontend_contract_sync_maps_generic_record_aliases_to_entity_api() -> None:
@@ -1041,10 +1045,15 @@ def test_frontend_contract_sync_cleans_static_ui_text_artifacts() -> None:
     actionStatusEl.textContent = "Saving decision85";
     <div class="loading">Loading requests10141515</div>
     <span class="chevron">181;</span>
+    <span class="chevron">203a</span>
+    <span class="chevron">›</span>
     <p>Block 181</p>
     <span id="loading-state">Loading...</span>
+    <span id="loading-state">Loading all client requests…</span>
     <span id="error-state">Unable to load data. Try again.</span>
+    <span id="error-state">Couldn't load the request overview. Please refresh.</span>
     stateEl.textContent = "Loading data...";
+    errorEl.textContent = "Could not load requests. Try again soon.";
     """
 
     updated = MiniappGenerationContractFrontend._clean_static_ui_text_artifacts(content)
@@ -1054,10 +1063,15 @@ def test_frontend_contract_sync_cleans_static_ui_text_artifacts() -> None:
     assert "requests10141515" not in updated
     assert " - " in updated
     assert '"Saving decision"' in updated
-    assert ">Loading requests<" in updated
+    assert ">Loading requests<" not in updated
     assert "181;" not in updated
-    assert "&rsaquo;" in updated
+    assert "&rsaquo;" not in updated
+    assert ">203a<" not in updated
+    assert ">›<" not in updated
     assert "Block 181" not in updated
     assert ">Loading...<" not in updated
+    assert "Loading all client requests" not in updated
     assert "Unable to load data. Try again." not in updated
+    assert "Couldn't load the request overview" not in updated
+    assert "Could not load requests" not in updated
     assert 'textContent = "";' in updated

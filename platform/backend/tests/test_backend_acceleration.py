@@ -72,6 +72,138 @@ def test_workspace_loop_patch_report_omits_full_file_contents() -> None:
     assert operation["diff_omitted"] is True
 
 
+def test_workspace_loop_can_skip_contract_sync_for_deterministic_cleanup(tmp_path: Path) -> None:
+    operation = DraftFileOperation(
+        file_path="miniapp/app/static/manager/index.html",
+        operation="replace",
+        content="<main></main>",
+        reason="deterministic cleanup",
+    )
+    calls = {"checks": 0, "contract_sync": 0}
+
+    class FakeEnvelope:
+        def __init__(self, ops: list[DraftFileOperation]) -> None:
+            self.ops = list(ops)
+
+        def model_dump(self, mode: str = "json") -> dict[str, object]:
+            return {"ops": [op.model_dump(mode=mode) for op in self.ops]}
+
+    class FakeApplyResult:
+        status = "applied"
+        conflict_reason = None
+        changed_files = [operation.file_path]
+
+        def model_dump(self, mode: str = "json") -> dict[str, object]:
+            return {
+                "status": self.status,
+                "changed_files": list(self.changed_files),
+                "conflict_reason": self.conflict_reason,
+            }
+
+    class FakeWorkspaceService:
+        def build_patch_envelope_for_draft(self, workspace_id: str, run_id: str, ops: list[DraftFileOperation]) -> FakeEnvelope:
+            return FakeEnvelope(ops)
+
+        def apply_patch_envelope_to_draft(self, workspace_id: str, run_id: str, envelope: FakeEnvelope) -> FakeApplyResult:
+            assert [op.file_path for op in envelope.ops] == [operation.file_path]
+            return FakeApplyResult()
+
+    class FakeContextBuilder:
+        workspace_service = FakeWorkspaceService()
+
+        @staticmethod
+        def current_diff_summary(workspace_id: str, run_id: str) -> str:
+            return "diff"
+
+        @staticmethod
+        def store_loop_reports(**kwargs) -> None:
+            return None
+
+    def execute_checks(changed_files: list[str]):
+        calls["checks"] += 1
+        execution = CheckExecutionRecord(
+            workspace_id="ws_test",
+            run_id="run_test",
+            changed_files=changed_files,
+            results=[],
+        )
+        return execution, {"status": "skipped"}
+
+    def completion_state(results, preview_details, *, validation_snapshot):
+        return {
+            "strict_green": calls["checks"] >= 2,
+            "remaining_issues": [],
+            "non_test_failures": [],
+            "app_test_failures": [],
+        }
+
+    def plan_turn(**kwargs):
+        return SimpleNamespace(
+            outcome="patch_ready",
+            assistant_message="cleanup",
+            diagnosis="cleanup",
+            operations=[operation],
+            files_read=[operation.file_path],
+            failure_class=None,
+            failure_signature=None,
+            root_cause_summary=None,
+            fix_targets=[operation.file_path],
+            expected_verification=None,
+            rationale_by_file={},
+            metadata={"skip_contract_sync": True},
+        )
+
+    def apply_contract_sync(operations: list[DraftFileOperation]) -> list[DraftFileOperation]:
+        calls["contract_sync"] += 1
+        return [
+            *operations,
+            DraftFileOperation(
+                file_path="miniapp/app/generated/runtime_manifest.json",
+                operation="replace",
+                content="{}",
+                reason="would be broad contract sync",
+            ),
+        ]
+
+    runner = WorkspaceLoopTurnRunner(context_builder=FakeContextBuilder())
+    result = runner.run(
+        workspace_id="ws_test",
+        run_id="run_test",
+        job=SimpleNamespace(failure_class=None, failure_signature=None, root_cause_summary=None, fix_targets=[]),
+        draft_source=tmp_path,
+        role_scope=["manager"],
+        generation_mode=GenerationMode.BALANCED,
+        max_attempts=1,
+        initial_operations=[],
+        initial_assistant_message="start",
+        initial_files_read=[],
+        initial_changed_files=["miniapp"],
+        callbacks=SimpleNamespace(
+            execute_checks=execute_checks,
+            build_validation_snapshot=lambda execution: ValidationSnapshot(
+                grounded_spec_valid=True,
+                app_ir_valid=True,
+                build_valid=True,
+                blocking=False,
+                issues=[],
+            ),
+            completion_state=completion_state,
+            has_tooling_failure=lambda results: False,
+            plan_turn=plan_turn,
+            apply_contract_sync=apply_contract_sync,
+            post_apply_stabilize=None,
+            append_event=lambda *args, **kwargs: None,
+            append_trace=lambda *args, **kwargs: None,
+            store_report=lambda *args, **kwargs: None,
+            stop_if_requested=None,
+        ),
+    )
+
+    assert result.status == "completed"
+    assert calls["contract_sync"] == 0
+    assert [op.file_path for op in result.all_operations] == [operation.file_path]
+
+
 def test_role_patch_classifier_treats_text_cleanup_as_visual_patch() -> None:
     prompt = (
         "Please clean up the manager pages so the loading and action text reads naturally with no stray "

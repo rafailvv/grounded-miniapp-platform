@@ -59,8 +59,8 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
     def _clean_static_ui_text_artifacts(content: str) -> str:
         updated = str(content or "")
         updated = re.sub(
-            r'(<[^>]*class=["\'][^"\']*\bchevron\b[^"\']*["\'][^>]*>)\s*\d{2,};\s*(</[^>]+>)',
-            r"\1&rsaquo;\2",
+            r'(<[^>]*class=["\'][^"\']*\bchevron\b[^"\']*["\'][^>]*>)\s*(?:›|&rsaquo;|&#x?203a;?|203a|\d{2,};?)\s*(</[^>]+>)',
+            r"\1\2",
             updated,
             flags=re.IGNORECASE,
         )
@@ -83,14 +83,14 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             flags=re.IGNORECASE,
         )
         updated = re.sub(
-            r">\s*(?:Loading(?:\s+data)?(?:\.{1,3}|…)?|Unable\s+to\s+load\s+data\.?\s*(?:Try\s+again\.?)?)\s*<",
+            r">\s*(?:Loading\b[^<]{0,120}|(?:Couldn['’]?t|Could\s+not|Unable\s+to)\s+load\b[^<]{0,160})\s*<",
             "><",
             updated,
             flags=re.IGNORECASE,
         )
         updated = re.sub(
-            r"([\"'])\s*(?:Loading(?:\s+data)?(?:\.{1,3}|…)?|Unable\s+to\s+load\s+data\.?\s*(?:Try\s+again\.?)?)\s*\1",
-            r"\1\1",
+            r"(\b(?:textContent|innerText)\s*=\s*)([\"'])\s*(?:Loading\b[^\"']{0,120}|(?:Couldn['’]?t|Could\s+not|Unable\s+to)\s+load\b[^\"']{0,160})\s*\2",
+            r"\1\2\2",
             updated,
             flags=re.IGNORECASE,
         )
@@ -381,14 +381,17 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         operation_map = {operation.file_path: operation for operation in operations}
         target_paths = set(operation_map)
         scoped_roles = {str(role).strip() for role in (role_scope or []) if str(role).strip()}
-        if scoped_roles:
-            for entry in self.workspace_service.file_tree(workspace_id, run_id=draft_run_id):
-                file_path = str(entry.get("path") or "")
-                if entry.get("type") != "file":
-                    continue
-                if not (file_path.endswith(".js") or file_path.endswith(".html")):
-                    continue
-                if any(file_path.startswith(f"miniapp/app/static/{role}/") for role in scoped_roles):
+        for entry in self.workspace_service.file_tree(workspace_id, run_id=draft_run_id):
+            file_path = str(entry.get("path") or "")
+            if entry.get("type") != "file":
+                continue
+            if not (file_path.startswith("miniapp/app/static/") and (file_path.endswith(".js") or file_path.endswith(".html"))):
+                continue
+            if not scoped_roles or any(file_path.startswith(f"miniapp/app/static/{role}/") for role in scoped_roles):
+                target_paths.add(file_path)
+            else:
+                content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
+                if content and self._clean_static_ui_text_artifacts(content) != content:
                     target_paths.add(file_path)
         for file_path in sorted(target_paths):
             if not (file_path.startswith("miniapp/app/static/") and (file_path.endswith(".js") or file_path.endswith(".html"))):

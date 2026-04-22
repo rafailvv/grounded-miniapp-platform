@@ -202,6 +202,7 @@ function isSupportedEditorPath(path: string): boolean {
 
 const PREVIEW_BOOT_POLL_ATTEMPTS = 45;
 const PREVIEW_BOOT_POLL_INTERVAL_MS = 1000;
+const PREVIEW_FRAME_SOFT_CLEAR_MS = 6500;
 const PREVIEW_FRAME_LOAD_TIMEOUT_MS = 25000;
 const PREVIEW_STUCK_REBUILD_ATTEMPT = 18;
 
@@ -925,6 +926,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
   const previewTimeoutsRef = useRef<Record<string, number | undefined>>({});
+  const previewSoftTimeoutsRef = useRef<Record<string, number | undefined>>({});
   const previewFrameRefs = useRef<Record<RoleKey, HTMLIFrameElement | null>>({
     client: null,
     specialist: null,
@@ -1180,6 +1182,11 @@ export default function App() {
   useEffect(() => {
     return () => {
       Object.values(previewTimeoutsRef.current).forEach((timeoutId) => {
+        if (timeoutId) {
+          window.clearTimeout(timeoutId);
+        }
+      });
+      Object.values(previewSoftTimeoutsRef.current).forEach((timeoutId) => {
         if (timeoutId) {
           window.clearTimeout(timeoutId);
         }
@@ -1993,9 +2000,18 @@ export default function App() {
     if (existing) {
       window.clearTimeout(existing);
     }
+    const existingSoft = previewSoftTimeoutsRef.current[role];
+    if (existingSoft) {
+      window.clearTimeout(existingSoft);
+    }
+    previewSoftTimeoutsRef.current[role] = window.setTimeout(() => {
+      previewSoftTimeoutsRef.current[role] = undefined;
+      setPreviewLoading((current) => (current[role] ? { ...current, [role]: false } : current));
+    }, PREVIEW_FRAME_SOFT_CLEAR_MS);
     previewTimeoutsRef.current[role] = window.setTimeout(() => {
-      setPreviewLoading((current) => ({ ...current, [role]: false }));
-      setPreviewFailed((current) => ({ ...current, [role]: true }));
+      previewTimeoutsRef.current[role] = undefined;
+      setPreviewLoading((current) => (current[role] ? { ...current, [role]: false } : current));
+      setPreviewFailed((current) => (current[role] ? { ...current, [role]: false } : current));
     }, PREVIEW_FRAME_LOAD_TIMEOUT_MS);
   }
 
@@ -2004,6 +2020,11 @@ export default function App() {
     if (existing) {
       window.clearTimeout(existing);
       previewTimeoutsRef.current[role] = undefined;
+    }
+    const existingSoft = previewSoftTimeoutsRef.current[role];
+    if (existingSoft) {
+      window.clearTimeout(existingSoft);
+      previewSoftTimeoutsRef.current[role] = undefined;
     }
   }
 
