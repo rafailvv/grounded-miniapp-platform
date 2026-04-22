@@ -16,12 +16,6 @@ import app.services.check_runner as check_runner_module
 from fastapi.testclient import TestClient
 import pytest
 
-from app.ai.model_registry import (
-    TASK_PROFILES,
-    default_profile_for_generation_mode,
-    models_for_role,
-    resolve_model_profile,
-)
 from app.ai.openrouter_client import ACTIVE_WORKSPACE_LOG_CONTEXT, OpenRouterClient
 from app.main import create_app
 from app.models.common import PreviewProfile, TargetPlatform
@@ -303,27 +297,39 @@ def test_system_configuration_defaults_to_balanced(tmp_path: Path) -> None:
     assert response.json()["defaults"]["model_profile"] == "research_balanced"
 
 
-def test_model_registry_resolves_mode_aware_profiles_and_routing() -> None:
-    assert default_profile_for_generation_mode(GenerationMode.BALANCED) == "research_balanced"
-    assert default_profile_for_generation_mode(GenerationMode.QUALITY) == "openai_code_quality"
-    assert resolve_model_profile("openai_code_fast", GenerationMode.BALANCED) == "research_balanced"
-    assert resolve_model_profile("research_balanced", GenerationMode.QUALITY) == "openai_code_quality"
+def test_model_registry_resolves_mode_aware_profiles_and_routing(monkeypatch) -> None:  # noqa: ANN001
+    import app.ai.model_registry as model_registry
 
-    balanced_code_plan, balanced_code_plan_fallback = models_for_role(
-        "code_plan",
-        model_profile="openai_code_fast",
-        generation_mode=GenerationMode.BALANCED,
-    )
-    quality_code_edit, quality_code_edit_fallback = models_for_role(
-        "code_edit",
-        model_profile="research_balanced",
-        generation_mode=GenerationMode.QUALITY,
-    )
+    original_chip = os.environ.get("CHIP")
+    try:
+        monkeypatch.setenv("CHIP", "false")
+        registry = importlib.reload(model_registry)
+        assert registry.default_profile_for_generation_mode(GenerationMode.BALANCED) == "research_balanced"
+        assert registry.default_profile_for_generation_mode(GenerationMode.QUALITY) == "openai_code_quality"
+        assert registry.resolve_model_profile("openai_code_fast", GenerationMode.BALANCED) == "research_balanced"
+        assert registry.resolve_model_profile("research_balanced", GenerationMode.QUALITY) == "openai_code_quality"
 
-    assert balanced_code_plan == "gpt-5.4"
-    assert balanced_code_plan_fallback == "gpt-5.4-mini"
-    assert quality_code_edit == "gpt-5.4"
-    assert quality_code_edit_fallback == "gpt-5.4"
+        balanced_code_plan, balanced_code_plan_fallback = registry.models_for_role(
+            "code_plan",
+            model_profile="openai_code_fast",
+            generation_mode=GenerationMode.BALANCED,
+        )
+        quality_code_edit, quality_code_edit_fallback = registry.models_for_role(
+            "code_edit",
+            model_profile="research_balanced",
+            generation_mode=GenerationMode.QUALITY,
+        )
+
+        assert balanced_code_plan == "gpt-5.4"
+        assert balanced_code_plan_fallback == "gpt-5.4-mini"
+        assert quality_code_edit == "gpt-5.4"
+        assert quality_code_edit_fallback == "gpt-5.4"
+    finally:
+        if original_chip is None:
+            monkeypatch.delenv("CHIP", raising=False)
+        else:
+            monkeypatch.setenv("CHIP", original_chip)
+        importlib.reload(model_registry)
 
 
 def test_task_router_uses_mode_resolved_profile_for_balanced() -> None:
@@ -9487,32 +9493,52 @@ def test_mode_profiles_differentiate_fast_balanced_and_quality() -> None:
     assert quality.verification_depth == "deep"
 
 
-def test_task_profiles_use_quality_first_repair_routing() -> None:
-    for profile_name, profile in TASK_PROFILES.items():
-        routing = profile["routing"]
-        assert routing["spec_analysis"] == "gpt-5.4-mini"
-        expected_code_plan = "gpt-5.4-mini" if profile_name == "openai_code_fast" else "gpt-5.4"
-        assert routing["code_plan"] == expected_code_plan
-        assert routing["ir_codegen"] == "gpt-5.4"
-        assert routing["code_edit"] == "gpt-5.4"
-        assert routing["repair"] == "gpt-5.4"
-        assert routing["summarize"] == "gpt-5.4-mini"
-        assert routing["cheap_task"] == "gpt-5.4-mini"
+def test_task_profiles_use_quality_first_repair_routing(monkeypatch) -> None:  # noqa: ANN001
+    import app.ai.model_registry as model_registry
+
+    original_chip = os.environ.get("CHIP")
+    try:
+        monkeypatch.setenv("CHIP", "false")
+        registry = importlib.reload(model_registry)
+        for profile_name, profile in registry.TASK_PROFILES.items():
+            routing = profile["routing"]
+            assert routing["spec_analysis"] == "gpt-5.4-mini"
+            expected_code_plan = "gpt-5.4-mini" if profile_name == "openai_code_fast" else "gpt-5.4"
+            assert routing["code_plan"] == expected_code_plan
+            assert routing["ir_codegen"] == "gpt-5.4"
+            assert routing["code_edit"] == "gpt-5.4"
+            assert routing["repair"] == "gpt-5.4"
+            assert routing["summarize"] == "gpt-5.4-mini"
+            assert routing["cheap_task"] == "gpt-5.4-mini"
+    finally:
+        if original_chip is None:
+            monkeypatch.delenv("CHIP", raising=False)
+        else:
+            monkeypatch.setenv("CHIP", original_chip)
+        importlib.reload(model_registry)
 
 
 def test_chip_flag_switches_model_registry_to_legacy_models(monkeypatch) -> None:  # noqa: ANN001
     import app.ai.model_registry as model_registry
 
-    monkeypatch.setenv("CHIP", "true")
-    chip_registry = importlib.reload(model_registry)
-    assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["code_edit"] == "gpt-5.1-codex-max"
-    assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["summarize"] == "gpt-5-mini"
-    assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["code_edit"] == "gpt-5.1-codex-mini"
+    original_chip = os.environ.get("CHIP")
+    try:
+        monkeypatch.setenv("CHIP", "true")
+        chip_registry = importlib.reload(model_registry)
+        assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["code_edit"] == "gpt-5.1-codex-max"
+        assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["summarize"] == "gpt-5-mini"
+        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["code_edit"] == "gpt-5.1-codex-mini"
 
-    monkeypatch.setenv("CHIP", "false")
-    modern_registry = importlib.reload(model_registry)
-    assert modern_registry.TASK_PROFILES["research_balanced"]["routing"]["code_edit"] == "gpt-5.4"
-    assert modern_registry.TASK_PROFILES["research_balanced"]["routing"]["summarize"] == "gpt-5.4-mini"
+        monkeypatch.setenv("CHIP", "false")
+        modern_registry = importlib.reload(model_registry)
+        assert modern_registry.TASK_PROFILES["research_balanced"]["routing"]["code_edit"] == "gpt-5.4"
+        assert modern_registry.TASK_PROFILES["research_balanced"]["routing"]["summarize"] == "gpt-5.4-mini"
+    finally:
+        if original_chip is None:
+            monkeypatch.delenv("CHIP", raising=False)
+        else:
+            monkeypatch.setenv("CHIP", original_chip)
+        importlib.reload(model_registry)
 
 
 def test_context_pack_builder_applies_mode_budget_and_prompt_fingerprint(tmp_path: Path) -> None:

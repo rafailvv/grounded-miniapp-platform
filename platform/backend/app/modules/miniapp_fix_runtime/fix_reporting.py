@@ -143,6 +143,7 @@ class FixReportingRuntime:
             "preview_validation_started": ("rebuilding preview", 40),
             "triage_completed": ("evidence ready", 48),
             "repair_planned": ("planning repair patch", 58),
+            "fast_visual_patch": ("fast visual patch", 58),
             "patch_apply_started": ("applying repair patch", 68),
             "patch_apply_completed": ("repair patch applied", 76),
             "scope_expanded": ("expanding fix scope", 80),

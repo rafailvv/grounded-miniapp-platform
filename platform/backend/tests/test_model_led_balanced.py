@@ -5,11 +5,11 @@ from types import SimpleNamespace
 
 import httpx
 
+from app.ai import model_registry
 from app.ai.openrouter_client import OpenRouterClient
 from app.ai.model_registry import task_model_overrides
 from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
-from app.models.domain import JobRecord
-from app.models.domain import DraftFileOperation
+from app.models.domain import DraftFileOperation, JobRecord
 from app.models.grounded_spec import (
     APIRequirement,
     Actor,
@@ -173,8 +173,8 @@ def test_task_model_overrides_light_balanced_visual_patch() -> None:
         target_file_count=3,
         backend_target_count=0,
     )
-    assert primary == "gpt-5.4"
-    assert fallback == "gpt-5.4"
+    assert primary == model_registry.BALANCED_LIGHT_EDIT_MODEL
+    assert fallback == model_registry.BALANCED_LIGHT_EDIT_MODEL
 
 
 def test_task_model_overrides_ignores_backend_touch() -> None:
@@ -199,8 +199,8 @@ def test_task_model_overrides_light_balanced_shared_static_whole_file() -> None:
         backend_target_count=0,
         cluster_name="shared_static",
     )
-    assert primary == "gpt-5.4"
-    assert fallback == "gpt-5.4"
+    assert primary == model_registry.BALANCED_LIGHT_EDIT_MODEL
+    assert fallback == model_registry.BALANCED_LIGHT_EDIT_MODEL
 
 
 def test_role_only_scope_stays_whole_file_for_flow_prompt() -> None:

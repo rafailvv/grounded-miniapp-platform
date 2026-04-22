@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable
 from app.models.common import GenerationMode
 from app.models.domain import DraftFileOperation, GenerateRequest, JobRecord, ValidationSnapshot
 from app.modules.miniapp_agent_loop.types import WorkspaceLoopCallbacks, WorkspaceLoopTurnPlan
+from app.modules.miniapp_visual_patch_fast_lane import MiniappVisualPatchFastLane
 from app.modules.miniapp_agent_loop.tool_agent_runtime import (
     list_workspace_files,
     run_workspace_command,
@@ -141,6 +142,19 @@ class FixEntryRuntime:
         memory_context: str | None,
         should_stop: Callable[[], bool] | None,
     ) -> JobRecord:
+        fast_visual_job = MiniappVisualPatchFastLane(self.service).try_run(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            request=request,
+            job=job,
+            role_scope=role_scope,
+            started_at=started_at,
+            draft_source=draft_source,
+            run_mode="fix",
+        )
+        if fast_visual_job is not None:
+            return fast_visual_job
+
         del role_scope
         scope_entries = []
         scope_expansions: list[dict[str, object]] = []

@@ -99,6 +99,7 @@ class JobEvent(StrictModel):
         "fixing_code",
         "applying",
         "editing_started",
+        "fast_visual_patch",
         "iteration_ready",
         "validation_failed",
         "build_started",

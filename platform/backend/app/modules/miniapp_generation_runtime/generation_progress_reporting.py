@@ -161,6 +161,7 @@ class GenerationProgressReportingRuntime(MiniappGenerationRuntimeOwner):
             "context_pack_ready": ("context pack ready", 15),
             "generating_code": ("generating code", 16),
             "editing_started": ("generating draft edits", 16),
+            "fast_visual_patch": ("fast visual patch", 35),
             "iteration_ready": ("draft edits prepared", 78),
             "fixing_code": ("fixing generated code", 82),
             "repair_started": ("repairing after build failure", 82),

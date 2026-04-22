@@ -8,6 +8,7 @@ import re
 from typing import TYPE_CHECKING, Any, Callable
 
 from app.models.domain import GenerateRequest, JobRecord
+from app.modules.miniapp_visual_patch_fast_lane import MiniappVisualPatchFastLane
 from app.services.miniapp_generation.constants import ROLE_ORDER
 
 if TYPE_CHECKING:
@@ -38,6 +39,19 @@ class MiniappGenerationEntry:
         should_stop: Callable[[], bool] | None,
         prompt_turn_id: str,
     ) -> JobRecord:
+        fast_visual_job = MiniappVisualPatchFastLane(self.service).try_run(
+            workspace_id=workspace_id,
+            run_id=draft_run_id,
+            request=request,
+            job=job,
+            role_scope=role_scope,
+            started_at=started_at,
+            draft_source=None,
+            run_mode="generate",
+        )
+        if fast_visual_job is not None:
+            return fast_visual_job
+
         self.service._append_event(job, "building_scaffold", "Building a prompt-driven generation plan on top of the minimal template bootstrap.")
         self.service._append_trace(
             workspace_id,
