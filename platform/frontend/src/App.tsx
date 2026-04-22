@@ -119,6 +119,25 @@ function buildFixPrefill(run: Run): { prompt: string; context: FixErrorContext }
   };
 }
 
+function isGenericFixPrompt(prompt: string | null | undefined): boolean {
+  const normalized = (prompt ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  return normalized === "analyze the reported failure and apply the smallest safe fix.";
+}
+
+function displayRunPrompt(run: Run): string {
+  if (!isGenericFixPrompt(run.prompt)) {
+    return run.prompt;
+  }
+  return (
+    run.error_context?.raw_error?.trim() ||
+    run.handoff_from_failed_generate?.prompt?.trim() ||
+    run.handoff_from_failed_generate?.error_context?.raw_error?.trim() ||
+    run.failure_reason?.trim() ||
+    run.root_cause_summary?.trim() ||
+    run.prompt
+  );
+}
+
 function getRoleRootPreviewPath(role: RoleKey): string {
   return `/${role}`;
 }
@@ -2306,7 +2325,7 @@ export default function App() {
 
             <section className="run-detail-section">
               <h4>Prompt</h4>
-              <pre className="json-block">{selectedRun.prompt}</pre>
+              <pre className="json-block">{displayRunPrompt(selectedRun)}</pre>
             </section>
 
             {runDetailSummary ? (
@@ -2655,7 +2674,7 @@ export default function App() {
                             {runStatus}
                           </span>
                         </div>
-                        <p className="run-card-copy">{clampText(run.prompt, 120)}</p>
+                        <p className="run-card-copy">{clampText(displayRunPrompt(run), 120)}</p>
                         <div className="run-progress">
                           <div className="run-progress-bar">
                             <div className="run-progress-fill" style={{ width: `${visualProgress}%` }} />
