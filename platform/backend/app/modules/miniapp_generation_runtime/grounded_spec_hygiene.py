@@ -14,23 +14,58 @@ class GroundedSpecHygieneRuntime:
         "app",
         "application",
         "build",
+        "business",
         "but",
+        "card",
+        "cards",
+        "clean",
         "dashboard",
+        "data",
+        "demo",
+        "development",
+        "displayed",
+        "effect",
+        "effects",
+        "error",
+        "filters",
         "for",
+        "fully",
+        "generic",
         "help",
         "i",
         "in",
         "internal",
+        "interface",
         "it",
         "its",
+        "loaded",
+        "loading",
         "manage",
         "mini",
         "miniapp",
+        "mobile",
+        "modern",
         "of",
+        "optimized",
         "our",
         "page",
+        "pages",
         "portal",
+        "presentation",
+        "product",
+        "profile",
+        "real",
+        "role",
+        "roles",
+        "screen",
+        "screens",
         "simple",
+        "state",
+        "states",
+        "static",
+        "status",
+        "statuses",
+        "structured",
         "system",
         "that",
         "the",
@@ -38,8 +73,26 @@ class GroundedSpecHygieneRuntime:
         "this",
         "tool",
         "track",
+        "transitions",
+        "trustworthy",
+        "ui",
+        "unnecessary",
+        "use",
+        "view",
+        "views",
         "we",
         "workflow",
+    }
+    _LOW_SIGNAL_ENTITY_PHRASES = {
+        "mobile use",
+        "mobile app",
+        "business app",
+        "real business",
+        "first screen",
+        "main screen",
+        "main screens",
+        "user action",
+        "user actions",
     }
 
     @staticmethod
@@ -52,6 +105,8 @@ class GroundedSpecHygieneRuntime:
         phrase = str(value or "").strip().lower()
         if not phrase:
             return ""
+        if phrase in cls._LOW_SIGNAL_ENTITY_PHRASES:
+            return ""
         phrase = re.split(r"\b(?:where|that|which|who|when|while|with|including|because|so)\b", phrase, maxsplit=1)[0]
         tokens = [
             token
@@ -59,6 +114,9 @@ class GroundedSpecHygieneRuntime:
             if token not in cls._ENTITY_PHRASE_STOPWORDS and len(token) > 1
         ]
         if not tokens:
+            return ""
+        normalized_phrase = " ".join(tokens)
+        if normalized_phrase in cls._LOW_SIGNAL_ENTITY_PHRASES:
             return ""
         if len(tokens) > 3:
             tokens = tokens[-3:]
@@ -69,8 +127,8 @@ class GroundedSpecHygieneRuntime:
         lowered = str(prompt or "").lower()
         phrase_patterns = (
             r"\b(?:mini[\s-]?app|app|tool|system|workflow|portal|dashboard)\s+for\s+([^.,;\n]+)",
-            r"\bfor\s+([^.,;\n]+)",
-            r"\bto\s+(?:manage|track|coordinate|handle|review|organize|process)\s+([^.,;\n]+)",
+            r"\bto\s+(?:manage|track|coordinate|handle|review|organize|process|submit|create|book|reserve|request|assign|monitor)s?\s+(?:a|an|the|their|own|new\s+)?([^.,;\n]+)",
+            r"\b(?:submits?|creates?|opens?|updates?|assigns?|reviews?|process(?:es)?|tracks?|requests?)\s+(?:a|an|the|their|own|new\s+)?([^.,;\n]+)",
         )
         for pattern in phrase_patterns:
             for match in re.finditer(pattern, lowered):

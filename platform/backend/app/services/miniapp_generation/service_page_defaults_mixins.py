@@ -160,8 +160,8 @@ class ServicePageDefaultsMixins:
     @staticmethod
     def _default_state_contract(*, state_kind: str, page_label: str, marker_base: str) -> str:
         if state_kind == "loading":
-            return f"Render #{marker_base}-loading or [data-ui-state=\"loading\"] while {page_label} data is loading."
-        return f"Render #{marker_base}-error or [data-ui-state=\"error\"] when {page_label} data fails to load."
+            return f"Provide #{marker_base}-loading or [data-ui-state=\"loading\"] as a compact hidden/empty marker or contextual {page_label} refresh status; do not use generic 'Loading data...' copy."
+        return f"Provide #{marker_base}-error or [data-ui-state=\"error\"] as a compact hidden/empty marker or contextual {page_label} error status; do not use generic 'Unable to load data. Try again.' copy."
 
     @staticmethod
     def _default_routes_file(role: str) -> str:

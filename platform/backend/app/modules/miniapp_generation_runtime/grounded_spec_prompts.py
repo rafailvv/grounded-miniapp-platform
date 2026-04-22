@@ -106,6 +106,7 @@ class GroundedSpecPromptsRuntime:
                 "architecture_contract": [
                     "Identify the real business domain and the selected roles.",
                     "Extract entities, user flows, and any obvious API needs.",
+                    "Do not turn UX/platform wording such as mobile use, clean screens, interface, loading, status, or profile into the domain entity.",
                     "Keep the output compact; this is only the outline pass.",
                 ],
                 "docs": cls._compact_doc_refs(doc_refs, limit=2 if compact else 4),
@@ -137,6 +138,7 @@ class GroundedSpecPromptsRuntime:
                 "prompt_turn_id": prompt_turn_id,
                 "architecture_contract": [
                     "Model a concrete business domain with realistic entities and statuses.",
+                    "Business entities must come from workflow nouns and user actions, not from UX/platform phrases like mobile use, interface, screen, loading, status, or profile.",
                     "Define clear role boundaries and cross-role handoff points.",
                     "Specify complete role flows; screen count and depth are flexible.",
                     "Include failure handling, validation rules, and operational monitoring expectations.",

@@ -11,6 +11,7 @@ from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
 from app.models.domain import JobRecord
 from app.models.domain import DraftFileOperation
 from app.models.grounded_spec import (
+    APIRequirement,
     Actor,
     Assumption,
     Contradiction,
@@ -26,6 +27,7 @@ from app.models.grounded_spec import (
 )
 from app.modules.miniapp_generation_runtime.grounded_spec_hygiene import GroundedSpecHygieneRuntime
 from app.modules.miniapp_generation_runtime.generation_plan_runtime import MiniappGenerationPlanRuntime
+from app.modules.miniapp_generation_runtime.generation_entity_contract import MiniappGenerationEntityContract
 from app.modules.miniapp_generation_runtime.generation_progress_reporting import GenerationProgressReportingRuntime
 from app.modules.miniapp_generation_runtime.generation_page_graph_runtime import MiniappGenerationPageGraphRuntime
 from app.modules.miniapp_generation_runtime.generation_codegen import MiniappGenerationCodegen
@@ -214,6 +216,46 @@ def test_grounded_spec_hygiene_extracts_prompt_entity_without_request_bias() -> 
         "I need an internal mini-app for vehicle maintenance scheduling with a simple queue."
     )
     assert entity_name == "VehicleMaintenanceScheduling"
+
+
+def test_grounded_spec_hygiene_ignores_mobile_use_copy_when_extracting_entity() -> None:
+    entity_name = GroundedSpecHygieneRuntime.infer_entity_name(
+        "The app must be optimized for mobile use. Client role: the client should be able to submit a request, "
+        "choose a time, and track the status of their request."
+    )
+
+    assert entity_name == "Request"
+
+
+def test_entity_contract_overrides_low_signal_mobile_use_resource_with_prompt_entity() -> None:
+    spec = _minimal_spec("MobileUse")
+    spec.api_requirements = [
+        APIRequirement(
+            api_req_id="api_mobile_use_list",
+            name="List mobile use",
+            method="GET",
+            path="/api/uses",
+            purpose="Load current user records and role queues.",
+            request_fields=[],
+            response_fields=[],
+            evidence=[],
+        )
+    ]
+    runtime = MiniappGenerationEntityContract.__new__(MiniappGenerationEntityContract)
+
+    contract = runtime.extract_entity_contract(
+        prompt=(
+            "The app must be optimized for mobile use. Client role: the client submits a request, "
+            "manager reviews requests, and specialist processes assigned requests."
+        ),
+        grounded_spec=spec,
+        generation_mode=GenerationMode.BALANCED,
+    )
+
+    assert contract["entity_slug"] == "request"
+    assert contract["entity_slug_plural"] == "requests"
+    assert contract["api_path"] == "/api/requests"
+    assert contract["entity_name"] == "Request"
 
 
 def test_grounded_spec_stabilization_prefers_domain_entity_slug() -> None:
@@ -968,6 +1010,20 @@ def test_build_validator_flags_static_ui_numeric_artifacts() -> None:
     assert len(issues) == 3
 
 
+def test_build_validator_flags_generic_state_copy_and_broken_entity_fragments() -> None:
+    content = """
+    <span class="chevron">181;</span>
+    <p>Block 181</p>
+    <span id="loading-state">Loading...</span>
+    stateEl.textContent = "Unable to load data. Try again.";
+    """
+
+    issues = BuildValidator._static_ui_text_artifact_issues(content, "miniapp/app/static/manager/index.html")
+
+    assert {issue.code for issue in issues} == {"build.static_ui_text_artifact"}
+    assert len(issues) == 4
+
+
 def test_frontend_contract_sync_maps_generic_record_aliases_to_entity_api() -> None:
     content = 'const response = await window.miniappApiFetch("/api/records?status=pending");'
 
@@ -984,6 +1040,11 @@ def test_frontend_contract_sync_cleans_static_ui_text_artifacts() -> None:
     datesEl.textContent = `${formatDate(item.start_date)} 192 ${formatDate(item.end_date)}`;
     actionStatusEl.textContent = "Saving decision85";
     <div class="loading">Loading requests10141515</div>
+    <span class="chevron">181;</span>
+    <p>Block 181</p>
+    <span id="loading-state">Loading...</span>
+    <span id="error-state">Unable to load data. Try again.</span>
+    stateEl.textContent = "Loading data...";
     """
 
     updated = MiniappGenerationContractFrontend._clean_static_ui_text_artifacts(content)
@@ -994,3 +1055,9 @@ def test_frontend_contract_sync_cleans_static_ui_text_artifacts() -> None:
     assert " - " in updated
     assert '"Saving decision"' in updated
     assert ">Loading requests<" in updated
+    assert "181;" not in updated
+    assert "&rsaquo;" in updated
+    assert "Block 181" not in updated
+    assert ">Loading...<" not in updated
+    assert "Unable to load data. Try again." not in updated
+    assert 'textContent = "";' in updated

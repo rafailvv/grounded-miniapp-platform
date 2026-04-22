@@ -59,6 +59,42 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
     def _clean_static_ui_text_artifacts(content: str) -> str:
         updated = str(content or "")
         updated = re.sub(
+            r'(<[^>]*class=["\'][^"\']*\bchevron\b[^"\']*["\'][^>]*>)\s*\d{2,};\s*(</[^>]+>)',
+            r"\1&rsaquo;\2",
+            updated,
+            flags=re.IGNORECASE,
+        )
+        updated = re.sub(
+            r">\s*\d{2,};\s*<",
+            "><",
+            updated,
+            flags=re.IGNORECASE,
+        )
+        updated = re.sub(
+            r">\s*(?:Block|Section|Card)\s+\d{2,}\s*<",
+            "><",
+            updated,
+            flags=re.IGNORECASE,
+        )
+        updated = re.sub(
+            r"([\"'])\s*(?:Block|Section|Card)\s+\d{2,}\s*\1",
+            r"\1\1",
+            updated,
+            flags=re.IGNORECASE,
+        )
+        updated = re.sub(
+            r">\s*(?:Loading(?:\s+data)?(?:\.{1,3}|…)?|Unable\s+to\s+load\s+data\.?\s*(?:Try\s+again\.?)?)\s*<",
+            "><",
+            updated,
+            flags=re.IGNORECASE,
+        )
+        updated = re.sub(
+            r"([\"'])\s*(?:Loading(?:\s+data)?(?:\.{1,3}|…)?|Unable\s+to\s+load\s+data\.?\s*(?:Try\s+again\.?)?)\s*\1",
+            r"\1\1",
+            updated,
+            flags=re.IGNORECASE,
+        )
+        updated = re.sub(
             r"(\$\{\s*formatDate\([^}]+\)\s*\})\s+\d{2,}\s+(\$\{\s*formatDate\([^}]+\)\s*\})",
             r"\1 - \2",
             updated,

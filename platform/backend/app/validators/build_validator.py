@@ -142,6 +142,28 @@ class BuildValidator:
                 ),
                 "Visible UI state text appears to contain a stray numeric suffix.",
             ),
+            (
+                re.compile(r">\s*\d{2,};\s*<", re.IGNORECASE),
+                "Visible UI text appears to contain a broken numeric HTML entity fragment.",
+            ),
+            (
+                re.compile(r">\s*(?:Block|Section|Card)\s+\d{2,}\s*<", re.IGNORECASE),
+                "Visible UI text appears to contain a generated placeholder block label.",
+            ),
+            (
+                re.compile(
+                    r">\s*(?:Loading(?:\s+data)?(?:\.{1,3}|…)?|Unable\s+to\s+load\s+data\.?\s*(?:Try\s+again\.?)?)\s*<",
+                    re.IGNORECASE,
+                ),
+                "Visible UI state text uses generic loading or error copy instead of contextual state text.",
+            ),
+            (
+                re.compile(
+                    r"\b(?:textContent|innerText)\s*=\s*['\"]\s*(?:Loading(?:\s+data)?(?:\.{1,3}|…)?|Unable\s+to\s+load\s+data\.?\s*(?:Try\s+again\.?)?)\s*['\"]",
+                    re.IGNORECASE,
+                ),
+                "Scripted UI state text uses generic loading or error copy instead of contextual state text.",
+            ),
         )
         issues: list[ValidationIssue] = []
         for pattern, message in patterns:

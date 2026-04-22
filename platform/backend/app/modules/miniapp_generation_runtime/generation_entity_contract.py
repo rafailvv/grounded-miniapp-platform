@@ -52,6 +52,24 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
         "item",
     }
     _GENERIC_API_STEMS = {"workflowrequests", "workflowrecords", "records", "submissions"}
+    _LOW_SIGNAL_ENTITY_SLUGS = {
+        "app",
+        "business",
+        "dashboard",
+        "data",
+        "interface",
+        "mobile",
+        "mobile_app",
+        "mobile_use",
+        "screen",
+        "screens",
+        "status",
+        "ui",
+        "use",
+        "uses",
+        "workflow",
+    }
+    _LOW_SIGNAL_API_STEMS = {"uses", "mobileuses", "mobile_uses", "statuses", "data"}
 
     @classmethod
     def _humanize(cls, value: str) -> str:
@@ -141,6 +159,8 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
             normalized = cls._singularize_slug(cls._slugify(entity_name))
         if normalized in cls._GENERIC_ENTITY_NAMES:
             return None
+        if normalized in cls._LOW_SIGNAL_ENTITY_SLUGS:
+            return None
         if normalized:
             return normalized
         return None
@@ -164,10 +184,19 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
             or dominant_name_slug.replace("_", " ") in self._GENERIC_ENTITY_NAMES
             or dominant_name_slug.replace("_", "") in self._GENERIC_ENTITY_NAMES
         )
+        dominant_name_is_low_signal = (
+            dominant_name_slug in self._LOW_SIGNAL_ENTITY_SLUGS
+            or dominant_name_slug.replace("_", " ") in self._LOW_SIGNAL_ENTITY_SLUGS
+            or dominant_name_slug.replace("_", "") in self._LOW_SIGNAL_ENTITY_SLUGS
+        )
         if api_path:
             api_stem = api_path.removeprefix("/api/").split("/", 1)[0].strip()
             normalized_api_stem = self._slugify(api_stem)
-            if normalized_api_stem in self._GENERIC_API_STEMS and prompt_entity_slug:
+            if (
+                normalized_api_stem in self._GENERIC_API_STEMS
+                or normalized_api_stem in self._LOW_SIGNAL_API_STEMS
+                or self._singularize_slug(normalized_api_stem) in self._LOW_SIGNAL_ENTITY_SLUGS
+            ) and prompt_entity_slug:
                 entity_slug = prompt_entity_slug
                 api_path = f"/api/{self._pluralize_slug(entity_slug)}"
             else:
@@ -175,7 +204,7 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
         else:
             entity_slug = prompt_entity_slug or dominant_name_slug
             api_path = f"/api/{self._pluralize_slug(entity_slug)}"
-        if dominant_name_is_generic and prompt_entity_slug:
+        if (dominant_name_is_generic or dominant_name_is_low_signal) and prompt_entity_slug:
             dominant_entity_name = self._pascal_case(prompt_entity_slug)
         plural_slug = self._pluralize_slug(entity_slug)
         singular_label = self._humanize(dominant_entity_name) or self._humanize(entity_slug)
