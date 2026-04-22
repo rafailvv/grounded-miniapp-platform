@@ -37,14 +37,14 @@ class MiniappVisualPatchFastLane:
     _MAX_CHANGED_DIFF_LINES = 700
 
     _VISUAL_PATTERNS = (
-        r"\b(?:color|colour|background|style|css|layout|spacing|margin|padding|radius|border|shadow|font|size|width|height|align|center|move|position|header|avatar|logo|image|icon|label|copy|text|rename|bigger|smaller)\b",
+        r"\b(?:color|colour|background|theme|dark|light|style|css|layout|spacing|margin|padding|radius|border|shadow|font|size|width|height|align|center|move|position|header|avatar|logo|image|icon|label|copy|text|rename|bigger|smaller)\b",
         r"\b(?:button|card|badge|chip|title|subtitle|hero|profile)\b",
         r"(?:цвет|фон|стил|визуал|отступ|размер|шрифт|кнопк|карточк|аватар|логотип|картин|иконк|текст|надпис|переимен|перемест|располож|выровн|профил)",
     )
     _HARD_NEGATIVE_PATTERNS = (
         r"\b(?:api|backend|database|db|schema|endpoint|route|fastapi|sql|sqlite|docker|build|test|pytest|traceback|stack trace|runtime error|import error)\b",
         r"\b(?:persist|persistence|save|stored|crud|record|data model|shared state|status|approve|reject|assign|return equipment|availability|conflict)\b",
-        r"\b(?:open details?|separate page|new page|navigate|navigation|click item|list-to-detail|list to detail|page flow)\b",
+        r"\b(?:separate page|new page|navigate|navigation|click item|list-to-detail|list to detail|page flow)\b",
         r"(?:апи|бекенд|бэкенд|база|схем|маршрут|эндпоинт|докер|сборк|тест|ошибк|трейсбек|рантайм|импорт)",
         r"(?:сохран|персист|статус|подтверд|отклон|назнач|вернуть|доступност|конфликт|детальн(?:ая|ую) страниц|отдельн(?:ая|ую) страниц|навигац)",
     )
@@ -59,6 +59,10 @@ class MiniappVisualPatchFastLane:
     _DETAIL_VISUAL_PATTERNS = (
         r"\b(?:detail|details|profile)\b",
         r"(?:детал|профил)",
+    )
+    _GENERIC_FIX_PROMPTS = (
+        "analyze the reported failure and apply the smallest safe fix.",
+        "analyze the reported failure and apply the smallest safe fix",
     )
 
     def __init__(self, service: Any) -> None:
@@ -77,26 +81,55 @@ class MiniappVisualPatchFastLane:
         lowered = cls._normalize_prompt(prompt)
         if not lowered:
             return False
+        negative_scan = cls._strip_preservation_clauses(lowered)
         if intent == "create":
             return False
         if intent not in {"auto", "edit", "refine", "role_only_change"}:
             return False
         if not cls._matches_any(lowered, cls._VISUAL_PATTERNS):
             return False
-        if cls._matches_any(lowered, cls._HARD_NEGATIVE_PATTERNS):
+        if cls._matches_any(negative_scan, cls._HARD_NEGATIVE_PATTERNS):
             return False
         raw_error = str(getattr(error_context, "raw_error", "") or "")
         if raw_error.strip():
             return False
-        if run_mode == "fix" and cls._matches_any(lowered, cls._TECHNICAL_FIX_NEGATIVE_PATTERNS):
-            return False
-        if len(role_scope) > 1 and not cls._matches_any(lowered, cls._GLOBAL_PATTERNS):
+        if run_mode == "fix" and cls._matches_any(negative_scan, cls._TECHNICAL_FIX_NEGATIVE_PATTERNS):
             return False
         explicit_roles = cls._mentioned_roles(lowered)
+        if len(role_scope) > 1 and not cls._matches_any(lowered, cls._GLOBAL_PATTERNS):
+            scoped_explicit_roles = [role for role in explicit_roles if role in role_scope]
+            if len(scoped_explicit_roles) != 1:
+                return False
         explicit_page = bool(re.search(r"\b(?:page|screen|section|block|header|profile)\b|(?:страниц|экран|раздел|блок|хедер|профил)", lowered))
         if not role_scope and not explicit_roles and not explicit_page and not cls._matches_any(lowered, cls._GLOBAL_PATTERNS):
             return False
         return True
+
+    @classmethod
+    def _visual_prompt_for_request(cls, request: GenerateRequest) -> str:
+        prompt = str(getattr(request, "prompt", "") or "").strip()
+        raw_error = str(getattr(getattr(request, "error_context", None), "raw_error", "") or "").strip()
+        if raw_error and cls._is_generic_fix_prompt(prompt):
+            return raw_error
+        return prompt
+
+    @classmethod
+    def _is_generic_fix_prompt(cls, prompt: str) -> bool:
+        normalized = cls._normalize_prompt(prompt)
+        return normalized in cls._GENERIC_FIX_PROMPTS
+
+    @classmethod
+    def _strip_preservation_clauses(cls, lowered: str) -> str:
+        clauses = re.split(r"(?<=[.;!?])\s+|[;\n]+", lowered)
+        filtered: list[str] = []
+        for clause in clauses:
+            if re.search(r"\b(?:keep|preserve|leave|without changing)\b|(?:сохран|остав|не меня)", clause) and re.search(
+                r"\b(?:existing|current|same|unchanged|working)\b|(?:текущ|существ|как есть|работ)",
+                clause,
+            ):
+                continue
+            filtered.append(clause)
+        return " ".join(filtered)
 
     def try_run(
         self,
@@ -110,19 +143,20 @@ class MiniappVisualPatchFastLane:
         draft_source: Path | None = None,
         run_mode: str,
     ) -> JobRecord | None:
+        visual_prompt = self._visual_prompt_for_request(request)
         if not self.should_attempt(
-            prompt=request.prompt,
+            prompt=visual_prompt,
             intent=request.intent,
             run_mode=run_mode,
             role_scope=role_scope,
-            error_context=request.error_context,
+            error_context=None if visual_prompt != request.prompt else request.error_context,
         ):
             return None
 
         if draft_source is None:
             draft_source = self.service.workspace_service.prepare_draft(workspace_id, run_id)
             self._append_event(job, "draft_prepared", "Prepared draft workspace for a fast visual patch.")
-        targets = self._resolve_targets(workspace_id=workspace_id, run_id=run_id, prompt=request.prompt, role_scope=role_scope)
+        targets = self._resolve_targets(workspace_id=workspace_id, run_id=run_id, prompt=visual_prompt, role_scope=role_scope)
         if targets is None:
             return None
 
@@ -137,7 +171,7 @@ class MiniappVisualPatchFastLane:
             result = self._request_visual_patch(
                 workspace_id=workspace_id,
                 run_id=run_id,
-                prompt=request.prompt,
+                prompt=visual_prompt,
                 targets=targets,
             )
             operations = self._operations_from_payload(
@@ -249,15 +283,21 @@ class MiniappVisualPatchFastLane:
         if not static_paths:
             return None
         global_patch = self._is_global_patch(lowered)
-        roles = [role for role in ROLE_ORDER if role in role_scope]
-        if not roles:
-            roles = self._mentioned_roles(lowered)
+        explicit_roles = self._mentioned_roles(lowered)
+        scoped_roles = [role for role in ROLE_ORDER if role in role_scope]
+        if len(scoped_roles) > 1 and explicit_roles and not global_patch:
+            roles = [role for role in explicit_roles if role in scoped_roles]
+        elif scoped_roles:
+            roles = scoped_roles
+        else:
+            roles = explicit_roles
         if global_patch and not roles:
             roles = [role for role in ROLE_ORDER if any(path.startswith(f"miniapp/app/static/{role}/") for path in static_paths)]
         if not roles:
             return None
         if len(role_scope) > 1 and not global_patch:
-            return None
+            if len(roles) != 1:
+                return None
 
         include_detailish = self._matches_any(lowered, self._DETAIL_VISUAL_PATTERNS)
         wants_copy = bool(re.search(r"\b(?:text|label|copy|rename|title|subtitle)\b|(?:текст|надпис|переимен|заголов)", lowered))

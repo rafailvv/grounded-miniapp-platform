@@ -1659,10 +1659,7 @@ export default function App() {
         selectedRunMode === "fix"
           ? {
               mode: "fix" as const,
-              prompt:
-                trimmedPrompt.length > 180
-                  ? "Analyze the reported failure and apply the smallest safe fix."
-                  : trimmedPrompt,
+              prompt: trimmedPrompt,
               error_context: {
                 raw_error: fixErrorContext?.raw_error?.trim() || trimmedPrompt,
                 source: fixErrorContext?.source ?? inferFixSource(trimmedPrompt),
@@ -1716,8 +1713,9 @@ export default function App() {
     setStatusMessage("");
     setPreviewBooting(true);
     try {
+      const fixPrompt = handoff.prompt.trim() || "Analyze the reported failure and apply the smallest safe fix.";
       const nextRun = await createRun(workspace.workspace_id, {
-        prompt: handoff.prompt.length > 180 ? "Analyze the reported failure and apply the smallest safe fix." : handoff.prompt,
+        prompt: fixPrompt,
         mode: "fix",
         intent: "auto",
         apply_strategy: "staged_auto_apply",

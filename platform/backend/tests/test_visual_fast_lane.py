@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
-from app.models.domain import GenerateRequest, JobRecord
+from app.models.domain import ErrorContext, GenerateRequest, JobRecord
 from app.modules.miniapp_fix_runtime.fix_entry import FixEntryRuntime
 from app.modules.miniapp_generation_runtime.generation_entry import MiniappGenerationEntry
 from app.modules.miniapp_visual_patch_fast_lane import VISUAL_PATCH_MODEL, MiniappVisualPatchFastLane
@@ -33,6 +33,19 @@ def test_simple_visual_classifier_rejects_flow_or_backend_patch() -> None:
         intent="edit",
         run_mode="fix",
         role_scope=["manager"],
+    )
+
+
+def test_simple_visual_classifier_all_role_scope_allows_explicit_single_role_visual_patch() -> None:
+    assert MiniappVisualPatchFastLane.should_attempt(
+        prompt=(
+            "When I open the request details page from the manager view, the details screen appears in a dark theme. "
+            "Please fix only this manager request details page so it uses the same light visual style. "
+            "Keep the existing data, status update logic, back navigation, and page structure working exactly the same."
+        ),
+        intent="edit",
+        run_mode="fix",
+        role_scope=["client", "specialist", "manager"],
     )
 
 
@@ -80,6 +93,12 @@ class _FakeWorkspaceService:
             "miniapp/app/static/client/index.html": "<main id=\"app\"><button id=\"request-button\">Request</button></main>",
             "miniapp/app/static/client/styles.css": ".request-button { background: blue; padding: 8px; }",
             "miniapp/app/static/client/app.js": "document.getElementById('request-button');",
+            "miniapp/app/static/manager/index.html": "<main id=\"manager\"><a href=\"/manager/request/1\">Open detail</a></main>",
+            "miniapp/app/static/manager/styles.css": ".manager { background: white; }",
+            "miniapp/app/static/manager/app.js": "document.getElementById('manager');",
+            "miniapp/app/static/manager/request_detail/index.html": "<main class=\"dark-detail\"><button id=\"back\">Back</button></main>",
+            "miniapp/app/static/manager/request_detail/styles.css": ".dark-detail { background: #050912; color: #f8fafc; }",
+            "miniapp/app/static/manager/request_detail/app.js": "document.getElementById('back');",
             "miniapp/app/main.py": "print('backend')",
         }
 
@@ -192,6 +211,41 @@ def test_visual_fast_lane_applies_allowed_static_patch(tmp_path: Path) -> None:
     assert result.fix_targets == ["miniapp/app/static/client/styles.css"]
     assert service.openrouter_client.model_override == VISUAL_PATCH_MODEL
     assert service.workspace_service.files["miniapp/app/static/client/styles.css"].startswith(".request-button { background: green")
+
+
+def test_visual_fast_lane_uses_visual_error_context_when_prompt_is_generic(tmp_path: Path) -> None:
+    service = _FakeService(tmp_path, "miniapp/app/static/manager/request_detail/styles.css")
+    request = GenerateRequest(
+        prompt="Analyze the reported failure and apply the smallest safe fix.",
+        mode="fix",
+        intent="edit",
+        target_role_scope=["client", "specialist", "manager"],
+        error_context=ErrorContext(
+            source="build",
+            raw_error=(
+                "When I open the request details page from the manager view, the details screen appears in a dark theme. "
+                "Please fix only this manager request details page so it uses the same light visual style. "
+                "Keep the existing data, buttons, status update logic, back navigation, and page structure working exactly the same; "
+                "this is only a visual HTML/CSS fix for the details screen."
+            ),
+        ),
+    )
+
+    result = MiniappVisualPatchFastLane(service).try_run(
+        workspace_id="ws_test",
+        run_id="run_test",
+        request=request,
+        job=_job().model_copy(update={"mode": "fix"}),
+        role_scope=["client", "specialist", "manager"],
+        started_at=0.0,
+        draft_source=service.workspace_service.prepare_draft("ws_test", "run_test"),
+        run_mode="fix",
+    )
+
+    assert result is not None
+    assert result.status == "completed"
+    assert result.fix_targets == ["miniapp/app/static/manager/request_detail/styles.css"]
+    assert service.workspace_service.files["miniapp/app/static/client/styles.css"] == ".request-button { background: blue; padding: 8px; }"
 
 
 def test_visual_fast_lane_rejects_forbidden_file_and_falls_back(tmp_path: Path) -> None:
