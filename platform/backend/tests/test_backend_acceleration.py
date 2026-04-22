@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import importlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -319,10 +320,10 @@ def test_model_registry_resolves_mode_aware_profiles_and_routing() -> None:
         generation_mode=GenerationMode.QUALITY,
     )
 
-    assert balanced_code_plan == "gpt-5.1-codex-max"
-    assert balanced_code_plan_fallback == "gpt-5-mini"
-    assert quality_code_edit == "gpt-5.1-codex-max"
-    assert quality_code_edit_fallback == "gpt-5.1-codex-mini"
+    assert balanced_code_plan == "gpt-5.4"
+    assert balanced_code_plan_fallback == "gpt-5.4-mini"
+    assert quality_code_edit == "gpt-5.4"
+    assert quality_code_edit_fallback == "gpt-5.4"
 
 
 def test_task_router_uses_mode_resolved_profile_for_balanced() -> None:
@@ -333,7 +334,7 @@ def test_task_router_uses_mode_resolved_profile_for_balanced() -> None:
     )
 
     assert snapshot["resolved_profile_name"] == "research_balanced"
-    assert snapshot["routing"]["code_edit"] == "gpt-5.1-codex-max"
+    assert snapshot["routing"]["code_edit"] == "gpt-5.4"
 
 
 def test_context_pack_preferred_anchors_exclude_generated_manifests_for_entity_workflow() -> None:
@@ -9487,13 +9488,31 @@ def test_mode_profiles_differentiate_fast_balanced_and_quality() -> None:
 
 
 def test_task_profiles_use_quality_first_repair_routing() -> None:
-    for profile in TASK_PROFILES.values():
+    for profile_name, profile in TASK_PROFILES.items():
         routing = profile["routing"]
-        assert routing["spec_analysis"] == "gpt-5-mini"
-        assert routing["code_plan"] == "gpt-5-mini"
-        assert routing["ir_codegen"] == "gpt-5.1-codex-mini"
-        assert routing["code_edit"] == "gpt-5.1-codex-mini"
-        assert routing["repair"] == "gpt-5.1-codex-max"
+        assert routing["spec_analysis"] == "gpt-5.4-mini"
+        expected_code_plan = "gpt-5.4-mini" if profile_name == "openai_code_fast" else "gpt-5.4"
+        assert routing["code_plan"] == expected_code_plan
+        assert routing["ir_codegen"] == "gpt-5.4"
+        assert routing["code_edit"] == "gpt-5.4"
+        assert routing["repair"] == "gpt-5.4"
+        assert routing["summarize"] == "gpt-5.4-mini"
+        assert routing["cheap_task"] == "gpt-5.4-mini"
+
+
+def test_chip_flag_switches_model_registry_to_legacy_models(monkeypatch) -> None:  # noqa: ANN001
+    import app.ai.model_registry as model_registry
+
+    monkeypatch.setenv("CHIP", "true")
+    chip_registry = importlib.reload(model_registry)
+    assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["code_edit"] == "gpt-5.1-codex-max"
+    assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["summarize"] == "gpt-5-mini"
+    assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["code_edit"] == "gpt-5.1-codex-mini"
+
+    monkeypatch.setenv("CHIP", "false")
+    modern_registry = importlib.reload(model_registry)
+    assert modern_registry.TASK_PROFILES["research_balanced"]["routing"]["code_edit"] == "gpt-5.4"
+    assert modern_registry.TASK_PROFILES["research_balanced"]["routing"]["summarize"] == "gpt-5.4-mini"
 
 
 def test_context_pack_builder_applies_mode_budget_and_prompt_fingerprint(tmp_path: Path) -> None:

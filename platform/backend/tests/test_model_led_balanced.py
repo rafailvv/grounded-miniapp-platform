@@ -173,8 +173,8 @@ def test_task_model_overrides_light_balanced_visual_patch() -> None:
         target_file_count=3,
         backend_target_count=0,
     )
-    assert primary == "gpt-5.1-codex-mini"
-    assert fallback == "gpt-5.1-codex-mini"
+    assert primary == "gpt-5.4"
+    assert fallback == "gpt-5.4"
 
 
 def test_task_model_overrides_ignores_backend_touch() -> None:
@@ -199,8 +199,8 @@ def test_task_model_overrides_light_balanced_shared_static_whole_file() -> None:
         backend_target_count=0,
         cluster_name="shared_static",
     )
-    assert primary == "gpt-5.1-codex-mini"
-    assert fallback == "gpt-5.1-codex-mini"
+    assert primary == "gpt-5.4"
+    assert fallback == "gpt-5.4"
 
 
 def test_role_only_scope_stays_whole_file_for_flow_prompt() -> None:
@@ -532,13 +532,13 @@ def test_openrouter_rescue_prefers_fast_model_for_mini_overrides(monkeypatch) ->
         schema={"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False},
         system_prompt="system",
         user_prompt="user",
-        model_override="gpt-5.1-codex-mini",
-        fallback_model_override="gpt-5.1-codex-mini",
+        model_override="gpt-5.4-mini",
+        fallback_model_override="gpt-5.4-mini",
     )
 
     assert result["model"] == "anthropic/claude-haiku-4.5"
     assert provider_calls == [
-        "openai:gpt-5.1-codex-mini",
+        "openai:gpt-5.4-mini",
         "openrouter:anthropic/claude-haiku-4.5",
     ]
 

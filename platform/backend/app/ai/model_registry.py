@@ -1,12 +1,49 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from app.models.common import GenerationMode
 
-PLANNING_MODEL = "gpt-5-mini"
-FAST_CODE_MODEL = "gpt-5.1-codex-mini"
-STRONG_CODE_MODEL = "gpt-5.1-codex-max"
+
+def _load_chip_from_repo_env() -> None:
+    if "CHIP" in os.environ:
+        return
+    dotenv_path = Path(__file__).resolve().parents[4] / ".env"
+    try:
+        lines = dotenv_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() != "CHIP":
+            continue
+        parsed = value.strip()
+        if parsed and parsed[0] == parsed[-1] and parsed[0] in {'"', "'"}:
+            parsed = parsed[1:-1]
+        os.environ["CHIP"] = parsed
+        return
+
+
+def _chip_enabled() -> bool:
+    _load_chip_from_repo_env()
+    return str(os.getenv("CHIP", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+if _chip_enabled():
+    PLANNING_MODEL = "gpt-5-mini"
+    FAST_CODE_MODEL = "gpt-5.1-codex-mini"
+    STRONG_CODE_MODEL = "gpt-5.1-codex-max"
+    SUMMARY_MODEL = "gpt-5-mini"
+else:
+    PLANNING_MODEL = "gpt-5.4-mini"
+    FAST_CODE_MODEL = "gpt-5.4"
+    STRONG_CODE_MODEL = "gpt-5.4"
+    SUMMARY_MODEL = "gpt-5.4-mini"
 REPAIR_MODEL = STRONG_CODE_MODEL
-SUMMARY_MODEL = "gpt-5-mini"
 BALANCED_LIGHT_PLAN_MODEL = PLANNING_MODEL
 BALANCED_LIGHT_EDIT_MODEL = FAST_CODE_MODEL
 
@@ -46,7 +83,7 @@ TASK_PROFILES = {
         "provider": "openai",
         "description": "Highest-confidence profile for grounded artifact generation and repair.",
         "routing": {
-            "spec_analysis": STRONG_CODE_MODEL,
+            "spec_analysis": PLANNING_MODEL,
             "ir_codegen": STRONG_CODE_MODEL,
             "code_plan": STRONG_CODE_MODEL,
             "code_edit": STRONG_CODE_MODEL,
@@ -85,7 +122,7 @@ MODEL_REGISTRY = {
     },
     "cheap_task": {
         "primary": TASK_PROFILES["research_balanced"]["routing"]["cheap_task"],
-        "fallback": "gpt-5-mini",
+        "fallback": SUMMARY_MODEL,
     },
     "embedding": {
         "primary": "text-embedding-3-large",

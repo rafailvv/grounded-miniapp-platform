@@ -1422,7 +1422,7 @@ class OpenRouterClient:
         if (
             role in {"cheap_task", "summarize"}
             or "mini" in normalized_preferred
-            or normalized_preferred in {"gpt-5-mini", "gpt-5.1-codex-mini"}
+            or normalized_preferred in {"gpt-5-mini", "gpt-5.1-codex-mini", "gpt-5.4-mini"}
         ):
             return os.getenv("OPENROUTER_FAST_FALLBACK_MODEL", "anthropic/claude-haiku-4.5")
         return os.getenv("OPENROUTER_CODE_FALLBACK_MODEL", "anthropic/claude-sonnet-4.6")
