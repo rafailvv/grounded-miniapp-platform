@@ -171,6 +171,13 @@ class BuildValidator:
                 ),
                 "Scripted UI state text uses generic loading or error copy instead of contextual state text.",
             ),
+            (
+                re.compile(
+                    r"<(?P<tag>div|span|p)(?![^>]*\b(?:aria-label|title)\s*=)[^>]*class=[\"'][^\"']*\b(?:chip|pill|badge|tag|indicator|dot)\b[^\"']*[\"'][^>]*>\s*(?:&nbsp;|&#160;|&#8203;|<!--.*?-->)*\s*</(?P=tag)>",
+                    re.IGNORECASE | re.DOTALL,
+                ),
+                "Visible UI renders empty chip or pill indicators with no message text.",
+            ),
         )
         issues: list[ValidationIssue] = []
         for pattern, message in patterns:

@@ -95,6 +95,18 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             flags=re.IGNORECASE,
         )
         updated = re.sub(
+            r"<(?P<tag>div|span|p)(?![^>]*\b(?:aria-label|title)\s*=)[^>]*class=[\"'][^\"']*\b(?:chip|pill|badge|tag|indicator|dot)\b[^\"']*[\"'][^>]*>\s*(?:&nbsp;|&#160;|&#8203;|<!--.*?-->)*\s*</(?P=tag)>",
+            "",
+            updated,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        updated = re.sub(
+            r"<(?P<tag>div|section|p)(?![^>]*\b(?:id|aria-live)\s*=)[^>]*class=[\"'][^\"']*\b(?:message|notice|status|indicator|legend|feedback|alert)\b[^\"']*[\"'][^>]*>\s*</(?P=tag)>",
+            "",
+            updated,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        updated = re.sub(
             r"(\$\{\s*formatDate\([^}]+\)\s*\})\s+\d{2,}\s+(\$\{\s*formatDate\([^}]+\)\s*\})",
             r"\1 - \2",
             updated,

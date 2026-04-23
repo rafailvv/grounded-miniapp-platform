@@ -1028,6 +1028,25 @@ def test_build_validator_flags_generic_state_copy_and_broken_entity_fragments() 
     assert len(issues) == 5
 
 
+def test_build_validator_flags_empty_status_indicator_placeholders() -> None:
+    content = """
+    <div class="filters">
+      <button class="chip chip-active">Open</button>
+      <button class="chip">In progress</button>
+      <button class="chip">Done</button>
+    </div>
+    <div class="filter-feedback">
+      <span class="status-pill status-pill-info"></span>
+      <span class="status-pill status-pill-danger"></span>
+    </div>
+    """
+
+    issues = BuildValidator._static_ui_text_artifact_issues(content, "miniapp/app/static/manager/index.html")
+
+    assert {issue.code for issue in issues} == {"build.static_ui_text_artifact"}
+    assert len(issues) == 1
+
+
 def test_frontend_contract_sync_maps_generic_record_aliases_to_entity_api() -> None:
     content = 'const response = await window.miniappApiFetch("/api/records?status=pending");'
 
@@ -1075,3 +1094,24 @@ def test_frontend_contract_sync_cleans_static_ui_text_artifacts() -> None:
     assert "Couldn't load the request overview" not in updated
     assert "Could not load requests" not in updated
     assert 'textContent = "";' in updated
+
+
+def test_frontend_contract_sync_removes_empty_status_indicator_placeholders() -> None:
+    content = """
+    <div class="filters">
+      <button class="chip chip-active">Open</button>
+      <button class="chip">In progress</button>
+      <button class="chip">Done</button>
+    </div>
+    <div class="filter-feedback">
+      <span class="status-pill status-pill-info"></span>
+      <span class="status-pill status-pill-danger"></span>
+    </div>
+    """
+
+    updated = MiniappGenerationContractFrontend._clean_static_ui_text_artifacts(content)
+
+    assert "status-pill-info" not in updated
+    assert "status-pill-danger" not in updated
+    assert "filter-feedback" not in updated
+    assert "chip-active" in updated
