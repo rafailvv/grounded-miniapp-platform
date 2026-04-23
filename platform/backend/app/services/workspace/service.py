@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -668,10 +669,73 @@ class WorkspaceService:
         )
         if result.returncode not in {0, 1}:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Unable to diff draft.")
-        output = result.stdout
-        output = output.replace(str(source_dir), "source")
-        output = output.replace(str(draft_source), "draft")
-        return output
+        output = self._normalize_draft_diff_paths(
+            result.stdout,
+            source_dir=source_dir,
+            draft_source=draft_source,
+        )
+        return self._filter_ignored_draft_diff_blocks(output)
+
+    @classmethod
+    def _normalize_draft_diff_paths(cls, output: str, *, source_dir: Path, draft_source: Path) -> str:
+        source = str(source_dir)
+        draft = str(draft_source)
+        replacements = (
+            (f"a{source}", "a/source"),
+            (f"b{source}", "b/source"),
+            (f"a{draft}", "a/draft"),
+            (f"b{draft}", "b/draft"),
+            (source, "source"),
+            (draft, "draft"),
+        )
+        normalized = output
+        for previous, current in replacements:
+            normalized = normalized.replace(previous, current)
+        return normalized
+
+    @classmethod
+    def _filter_ignored_draft_diff_blocks(cls, output: str) -> str:
+        if not output.strip():
+            return output
+        blocks: list[str] = []
+        current: list[str] = []
+        for line in output.splitlines(keepends=True):
+            if line.startswith("diff --git ") and current:
+                blocks.append("".join(current))
+                current = [line]
+            else:
+                current.append(line)
+        if current:
+            blocks.append("".join(current))
+
+        filtered: list[str] = []
+        for block in blocks:
+            if not block.startswith("diff --git "):
+                filtered.append(block)
+                continue
+            paths = cls._paths_from_draft_diff_header(block.splitlines()[0])
+            if paths and all(cls._is_ignored_workspace_path(Path(path)) for path in paths):
+                continue
+            filtered.append(block)
+        return "".join(filtered)
+
+    @staticmethod
+    def _paths_from_draft_diff_header(header: str) -> list[str]:
+        match = re.match(r"^diff --git a/(.+?) b/(.+)$", header.strip())
+        if not match:
+            return []
+        paths: list[str] = []
+        for candidate in match.groups():
+            normalized = candidate.strip().strip('"')
+            if normalized in {"/dev/null", "dev/null"}:
+                continue
+            if normalized.startswith("source/"):
+                normalized = normalized.split("source/", 1)[-1]
+            elif normalized.startswith("draft/"):
+                normalized = normalized.split("draft/", 1)[-1]
+            if normalized:
+                paths.append(normalized)
+        return list(dict.fromkeys(paths))
 
     @staticmethod
     def _copy_tree(source_dir: Path, destination_dir: Path) -> None:

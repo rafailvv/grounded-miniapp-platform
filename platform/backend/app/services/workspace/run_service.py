@@ -544,6 +544,7 @@ class RunService:
                         workspace_id=run.workspace_id,
                         run=run,
                         change_plan=change_plan,
+                        job=job,
                     )
                     if not meaningful_paths:
                         self._mark_run_without_meaningful_diff(run, job)
@@ -562,6 +563,7 @@ class RunService:
                     workspace_id=run.workspace_id,
                     run=run,
                     change_plan=change_plan,
+                    job=job,
                 )
                 if self._complete_blocked_noop_run_from_green_source(
                     run=run,
@@ -1491,6 +1493,7 @@ class RunService:
         workspace_id: str,
         run: RunRecord,
         change_plan: CodeChangePlan,
+        job: Any | None = None,
     ) -> list[str]:
         candidate_diff = (self.generation_service.current_report(workspace_id, "candidate_diff") or {}).get("diff", "")
         diff_text = candidate_diff
@@ -1500,6 +1503,15 @@ class RunService:
         paths = self._paths_from_diff(diff_text)
         if not paths:
             paths = [target.file_path for target in change_plan.targets if target.file_path]
+        if not paths and job is not None:
+            apply_result = getattr(job, "apply_result", None) or {}
+            if isinstance(apply_result, dict):
+                changed_files = apply_result.get("changed_files")
+                if isinstance(changed_files, list):
+                    paths.extend(str(path) for path in changed_files if str(path).strip())
+            fix_targets = getattr(job, "fix_targets", None)
+            if isinstance(fix_targets, list):
+                paths.extend(str(path) for path in fix_targets if str(path).strip())
         return [path for path in list(dict.fromkeys(paths)) if self._is_meaningful_source_path(path)]
 
     @staticmethod
