@@ -38,8 +38,8 @@ class MiniappVisualPatchFastLane:
 
     _VISUAL_PATTERNS = (
         r"\b(?:color|colour|background|theme|dark|light|style|css|layout|spacing|margin|padding|radius|border|shadow|font|size|width|height|align|center|move|position|header|avatar|logo|image|icon|label|copy|text|rename|bigger|smaller)\b",
-        r"\b(?:button|card|badge|chip|title|subtitle|hero|profile)\b",
-        r"(?:цвет|фон|стил|визуал|отступ|размер|шрифт|кнопк|карточк|аватар|логотип|картин|иконк|текст|надпис|переимен|перемест|располож|выровн|профил)",
+        r"\b(?:button|card|badge|chip|pill|placeholder|indicator|filter|title|subtitle|hero|profile)\b",
+        r"(?:цвет|фон|стил|визуал|отступ|размер|шрифт|кнопк|карточк|аватар|логотип|картин|иконк|текст|надпис|переимен|перемест|располож|выровн|профил|плашк|индикатор|фильтр)",
     )
     _HARD_NEGATIVE_PATTERNS = (
         r"\b(?:api|backend|database|db|schema|endpoint|route|fastapi|sql|sqlite|docker|build|test|pytest|traceback|stack trace|runtime error|import error)\b",

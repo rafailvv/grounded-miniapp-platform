@@ -49,6 +49,18 @@ def test_simple_visual_classifier_all_role_scope_allows_explicit_single_role_vis
     )
 
 
+def test_simple_visual_classifier_accepts_empty_indicator_cleanup() -> None:
+    assert MiniappVisualPatchFastLane.should_attempt(
+        prompt=(
+            "On the manager overview page, remove the two small colored pill placeholders directly below the All, Open, "
+            "Assigned, and Completed filter row. Nothing should be visible there when there is no active message."
+        ),
+        intent="edit",
+        run_mode="generate",
+        role_scope=["manager"],
+    )
+
+
 def test_visual_patch_model_respects_chip(monkeypatch) -> None:  # noqa: ANN001
     import app.ai.model_registry as model_registry
 
@@ -56,7 +68,7 @@ def test_visual_patch_model_respects_chip(monkeypatch) -> None:  # noqa: ANN001
     try:
         monkeypatch.setenv("CHIP", "false")
         reloaded = importlib.reload(model_registry)
-        assert reloaded.VISUAL_PATCH_MODEL == "gpt-5.4-mini"
+        assert reloaded.VISUAL_PATCH_MODEL == reloaded.FAST_CODE_MODEL
 
         monkeypatch.setenv("CHIP", "true")
         reloaded = importlib.reload(model_registry)
