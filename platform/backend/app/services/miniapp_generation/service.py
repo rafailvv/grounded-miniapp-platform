@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -95,14 +96,14 @@ class GenerationService(
     RuntimeDispatchMixin,
     metaclass=RuntimeOwnerMeta,
 ):
-    GROUNDED_SPEC_SECTION_TIMEOUT_SECONDS = 90
-    GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS = 120
-    CODE_PLAN_SECTION_TIMEOUT_SECONDS = 120
-    CODE_PLAN_TOTAL_TIMEOUT_SECONDS = 150
-    WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS = 240
-    WHOLE_FILE_UI_CLUSTER_TIMEOUT_SECONDS = 420
-    STRUCTURED_LLM_TIMEOUT_SECONDS = 180
-    JSON_OBJECT_LLM_TIMEOUT_SECONDS = 120
+    GROUNDED_SPEC_SECTION_TIMEOUT_SECONDS = int(os.getenv("GROUNDED_SPEC_SECTION_TIMEOUT_SEC", "300"))
+    GROUNDED_SPEC_TOTAL_TIMEOUT_SECONDS = int(os.getenv("GROUNDED_SPEC_TOTAL_TIMEOUT_SEC", "600"))
+    CODE_PLAN_SECTION_TIMEOUT_SECONDS = int(os.getenv("CODE_PLAN_SECTION_TIMEOUT_SEC", "300"))
+    CODE_PLAN_TOTAL_TIMEOUT_SECONDS = int(os.getenv("CODE_PLAN_TOTAL_TIMEOUT_SEC", "600"))
+    WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS = int(os.getenv("WHOLE_FILE_CLUSTER_TIMEOUT_SEC", "900"))
+    WHOLE_FILE_UI_CLUSTER_TIMEOUT_SECONDS = int(os.getenv("WHOLE_FILE_UI_CLUSTER_TIMEOUT_SEC", "1800"))
+    STRUCTURED_LLM_TIMEOUT_SECONDS = int(os.getenv("STRUCTURED_LLM_TIMEOUT_SEC", "900"))
+    JSON_OBJECT_LLM_TIMEOUT_SECONDS = int(os.getenv("JSON_OBJECT_LLM_TIMEOUT_SEC", "600"))
 
     @classmethod
     def _runtime_owner_factories(cls) -> dict[str, Any]:

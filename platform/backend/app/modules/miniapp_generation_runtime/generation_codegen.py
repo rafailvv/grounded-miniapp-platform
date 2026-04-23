@@ -725,10 +725,6 @@ function escapeHtml(value) {{
             if is_ui_batch
             else self.WHOLE_FILE_CLUSTER_TIMEOUT_SECONDS
         )
-        if generation_mode == GenerationMode.FAST:
-            return min(default_timeout, 120 if is_ui_batch else 90)
-        if generation_mode == GenerationMode.BALANCED:
-            return default_timeout
         return default_timeout
 
     def _whole_file_timeout_fallback_result(

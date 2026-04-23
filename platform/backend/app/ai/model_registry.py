@@ -33,9 +33,12 @@ def _chip_enabled() -> bool:
     return str(os.getenv("CHIP", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
 
-if _chip_enabled():
+CHIP_ENABLED = _chip_enabled()
+
+
+if CHIP_ENABLED:
     PLANNING_MODEL = "gpt-5-mini"
-    FAST_CODE_MODEL = "gpt-5.1-codex-mini"
+    FAST_CODE_MODEL = "gpt-5.1-codex-max"
     STRONG_CODE_MODEL = "gpt-5.1-codex-max"
     SUMMARY_MODEL = "gpt-5-mini"
 else:
@@ -56,7 +59,7 @@ TASK_PROFILES = {
         "routing": {
             "spec_analysis": PLANNING_MODEL,
             "ir_codegen": FAST_CODE_MODEL,
-            "code_plan": PLANNING_MODEL,
+            "code_plan": STRONG_CODE_MODEL if CHIP_ENABLED else PLANNING_MODEL,
             "code_edit": FAST_CODE_MODEL,
             "repair": REPAIR_MODEL,
             "summarize": SUMMARY_MODEL,

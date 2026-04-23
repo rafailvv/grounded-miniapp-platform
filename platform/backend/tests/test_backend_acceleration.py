@@ -9525,9 +9525,12 @@ def test_chip_flag_switches_model_registry_to_legacy_models(monkeypatch) -> None
     try:
         monkeypatch.setenv("CHIP", "true")
         chip_registry = importlib.reload(model_registry)
+        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["code_plan"] == "gpt-5.1-codex-max"
+        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["ir_codegen"] == "gpt-5.1-codex-max"
+        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["code_edit"] == "gpt-5.1-codex-max"
         assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["code_edit"] == "gpt-5.1-codex-max"
         assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["summarize"] == "gpt-5-mini"
-        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["code_edit"] == "gpt-5.1-codex-mini"
+        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["summarize"] == "gpt-5-mini"
 
         monkeypatch.setenv("CHIP", "false")
         modern_registry = importlib.reload(model_registry)
