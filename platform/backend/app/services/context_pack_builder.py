@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from typing import Iterable
 from typing import Any
 
 from app.models.common import GenerationMode
@@ -36,8 +37,24 @@ class ContextPackBuilder:
         grounded_spec: GroundedSpecModel | None = None,
         execution_class: str | None = None,
         run_id: str | None = None,
+        intent: str | None = None,
     ) -> ContextPack:
-        code_limit, doc_limit = self._retrieval_limits(generation_mode)
+        budget = (
+            self.context_budget_manager.build_budget(
+                generation_mode=generation_mode,
+                target_file_count=len(target_files or []),
+                run_mode="generate",
+            )
+            if self.context_budget_manager is not None
+            else {}
+        )
+        if (
+            generation_mode == GenerationMode.FAST
+            and str(intent or "").strip().lower() in {"edit", "refine", "role_only_change"}
+            and int(budget.get("recent_diff_chars", 0) or 0) <= 0
+        ):
+            budget["recent_diff_chars"] = 1500
+        code_limit, doc_limit = self._retrieval_limits(generation_mode, budget=budget)
         preferred_paths = self._preferred_anchor_paths(
             grounded_spec=grounded_spec,
             execution_class=execution_class,
@@ -51,11 +68,12 @@ class ContextPackBuilder:
             doc_limit=doc_limit,
             active_paths=retrieval_active_paths,
             recent_paths=self._recent_paths(workspace),
+            budget=budget,
         )
         targeted_files: dict[str, str] = {}
         file_targets = list(target_files or [])
         if generation_mode == GenerationMode.FAST:
-            file_targets = file_targets[:8]
+            file_targets = file_targets[: max(1, int(budget.get("targeted_file_limit", 5) or 5))]
         for file_path in file_targets:
             try:
                 content = self.workspace_service.try_read_text_file(workspace.workspace_id, file_path, run_id=run_id)
@@ -66,15 +84,6 @@ class ContextPackBuilder:
             targeted_files[file_path] = content
         stable_prefix = self.stable_prefix(workspace, model_profile)
         retrieval_stats = dict(retrieval["stats"])  # type: ignore[arg-type]
-        budget = (
-            self.context_budget_manager.build_budget(
-                generation_mode=generation_mode,
-                target_file_count=len(file_targets),
-                run_mode="generate",
-            )
-            if self.context_budget_manager is not None
-            else {}
-        )
         mode_profile = ModeProfiles.resolve(generation_mode).to_dict()
         prompt_fingerprint = (
             self.prompt_state_manager.fingerprint(
@@ -102,7 +111,16 @@ class ContextPackBuilder:
             system_prefix=stable_prefix,
             workspace_summary=self._workspace_summary(workspace),
             current_task=prompt.strip(),
-            recent_diff=self.workspace_service.diff(workspace.workspace_id, run_id=run_id) if workspace.template_cloned else "",
+            recent_diff=self._build_recent_diff(
+                workspace=workspace,
+                run_id=run_id,
+                generation_mode=generation_mode,
+                execution_class=execution_class,
+                intent=intent,
+                target_files=file_targets,
+                active_paths=retrieval_active_paths,
+                budget=budget,
+            ),
             code_chunks=[CodeChunkRecord.model_validate(item) for item in retrieval["code"]],  # type: ignore[index]
             doc_chunks=[CodeChunkRecord.model_validate(item) for item in retrieval["docs"]],  # type: ignore[index]
             targeted_files=targeted_files,
@@ -141,12 +159,81 @@ class ContextPackBuilder:
         return [revision.message.split(": ", 1)[-1] for revision in workspace.revisions[-5:] if ": " in revision.message]
 
     @staticmethod
-    def _retrieval_limits(generation_mode: GenerationMode) -> tuple[int, int]:
+    def _retrieval_limits(generation_mode: GenerationMode, budget: dict[str, Any] | None = None) -> tuple[int, int]:
+        budget = budget or {}
         if generation_mode == GenerationMode.FAST:
-            return 3, 2
+            return max(1, int(budget.get("retrieval_chunks", 2) or 2)), 0
         if generation_mode == GenerationMode.BALANCED:
             return 6, 4
         return 7, 5
+
+    def _build_recent_diff(
+        self,
+        *,
+        workspace: WorkspaceRecord,
+        run_id: str | None,
+        generation_mode: GenerationMode,
+        execution_class: str | None,
+        intent: str | None,
+        target_files: list[str],
+        active_paths: list[str],
+        budget: dict[str, Any],
+    ) -> str:
+        if not workspace.template_cloned or not run_id:
+            return ""
+        diff_budget = max(0, int(budget.get("recent_diff_chars", 0) or 0))
+        if diff_budget <= 0:
+            return ""
+        diff_text = self.workspace_service.diff(workspace.workspace_id, run_id=run_id)
+        if not diff_text.strip():
+            return ""
+        filtered_diff = diff_text
+        if generation_mode == GenerationMode.FAST:
+            if str(intent or "").strip().lower() not in {"edit", "refine", "role_only_change"}:
+                return ""
+            focus_paths = list(
+                dict.fromkeys(
+                    [
+                        *list(target_files or [])[:4],
+                        *list(active_paths or [])[:2],
+                    ]
+                )
+            )
+            filtered_diff = self._filter_diff_to_paths(diff_text, focus_paths) if focus_paths else ""
+            if execution_class == "entity_workflow_app" and not target_files:
+                filtered_diff = ""
+        if not filtered_diff.strip():
+            return ""
+        return filtered_diff[:diff_budget]
+
+    @staticmethod
+    def _filter_diff_to_paths(diff_text: str, paths: Iterable[str]) -> str:
+        normalized_paths = {
+            str(path).strip().replace("\\", "/")
+            for path in paths
+            if str(path).strip()
+        }
+        if not normalized_paths:
+            return ""
+        kept_sections: list[str] = []
+        current_lines: list[str] = []
+        current_path: str | None = None
+        for line in diff_text.splitlines():
+            if line.startswith("diff --git "):
+                if current_lines and current_path in normalized_paths:
+                    kept_sections.append("\n".join(current_lines))
+                current_lines = [line]
+                current_path = None
+                if " b/" in line:
+                    current_path = line.split(" b/", 1)[1].strip()
+                    if "/" in current_path:
+                        current_path = current_path.split("/", 1)[1]
+                continue
+            if current_lines:
+                current_lines.append(line)
+        if current_lines and current_path in normalized_paths:
+            kept_sections.append("\n".join(current_lines))
+        return "\n".join(section for section in kept_sections if section).strip()
 
     @staticmethod
     def _preferred_anchor_paths(

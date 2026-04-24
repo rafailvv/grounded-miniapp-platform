@@ -449,8 +449,27 @@ class MiniappGenerationRepair:
             raise RuntimeError("Workspace loop engine is required for generation mode.")
         visual_only_patch = bool(plan_result.get("visual_only_patch"))
         refresh_runtime_artifacts = bool(plan_result.get("refresh_runtime_artifacts"))
-        active_repair_targets = list(plan_result.get("critic_implicated_files") or plan_result["target_files"])
         fallback_changed_files = [operation.file_path for operation in initial_operations]
+        active_repair_targets = list(
+            dict.fromkeys(
+                list(plan_result.get("critic_implicated_files") or [])
+                or list(plan_result.get("target_files") or [])
+            )
+        )
+        if generation_mode == GenerationMode.FAST and request.intent in {"edit", "refine", "role_only_change"}:
+            focused_operation_targets = [
+                operation.file_path
+                for operation in initial_operations
+                if not self._is_read_only_repair_surface(operation.file_path)
+            ]
+            active_repair_targets = list(
+                dict.fromkeys(
+                    [
+                        *list(plan_result.get("critic_implicated_files") or []),
+                        *focused_operation_targets,
+                    ]
+                )
+            ) or active_repair_targets
 
         def _execute_checks(changed_files: list[str]) -> tuple[CheckExecutionRecord, dict[str, Any]]:
             return self._execute_generation_checks(

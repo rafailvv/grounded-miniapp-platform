@@ -167,29 +167,39 @@ class CodeIndexService:
             )
         candidate_chunks: list[CodeChunkRecord] = []
         unchanged_reads = 0
+        indexed_reuse_hit = False
         manifest_payload = self.store.get("reports", f"file_manifest:{workspace_id}") or {}
         fingerprint_index = {
             str(item.get("path")): str(item.get("fingerprint"))
             for item in (manifest_payload.get("files") or [])
             if isinstance(item, dict) and item.get("path")
         }
-        for relative_path in candidate_paths:
-            file_path = source_dir / relative_path
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError):
-                continue
-            unchanged_reads += 1 if self._cached_fingerprint_matches(fingerprint_index, relative_path, file_path) else 0
-            candidate_chunks.extend(
-                self._chunk_text(
-                    workspace_id=workspace_id,
-                    revision_id=revision_id,
-                    relative_path=relative_path,
-                    content=content,
-                    kind="code",
-                    source_type="workspace_code",
+        indexed_chunks = self._indexed_candidate_chunks(
+            workspace_id=workspace_id,
+            revision_id=revision_id,
+            candidate_paths=candidate_paths,
+        )
+        if indexed_chunks:
+            indexed_reuse_hit = True
+            candidate_chunks.extend(indexed_chunks)
+        else:
+            for relative_path in candidate_paths:
+                file_path = source_dir / relative_path
+                try:
+                    content = file_path.read_text(encoding="utf-8")
+                except (UnicodeDecodeError, OSError):
+                    continue
+                unchanged_reads += 1 if self._cached_fingerprint_matches(fingerprint_index, relative_path, file_path) else 0
+                candidate_chunks.extend(
+                    self._chunk_text(
+                        workspace_id=workspace_id,
+                        revision_id=revision_id,
+                        relative_path=relative_path,
+                        content=content,
+                        kind="code",
+                        source_type="workspace_code",
+                    )
                 )
-            )
         code = self._rank_chunks(candidate_chunks, query_terms, query_embedding, active, recent)[:code_limit]
         docs: list[CodeChunkRecord] = []
         return {
@@ -204,9 +214,30 @@ class CodeIndexService:
                 "candidate_files": len(candidate_paths),
                 "candidate_cache_hit": candidate_cache_hit,
                 "unchanged_file_reads": unchanged_reads,
+                "indexed_chunk_reuse_hit": indexed_reuse_hit,
                 "budget_applied": bool(budget),
             },
         }
+
+    def _indexed_candidate_chunks(
+        self,
+        *,
+        workspace_id: str,
+        revision_id: str,
+        candidate_paths: list[str],
+    ) -> list[CodeChunkRecord]:
+        status = self.get_workspace_status(workspace_id)
+        if status.status != "ready" or status.revision_id != revision_id or status.chunk_count <= 0:
+            return []
+        candidate_set = {str(path).strip() for path in candidate_paths if str(path).strip()}
+        if not candidate_set:
+            return []
+        indexed_chunks = self.get_chunks(workspace_id, kind="code")
+        return [
+            chunk
+            for chunk in indexed_chunks
+            if chunk.revision_id == revision_id and chunk.path in candidate_set
+        ]
 
     def _store_index(self, workspace_id: str, revision_id: str, chunks: list[CodeChunkRecord]) -> IndexStatusRecord:
         self._replace_kind_chunks(workspace_id, "code", chunks)

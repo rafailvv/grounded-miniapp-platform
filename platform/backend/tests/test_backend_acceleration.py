@@ -232,6 +232,22 @@ def test_role_patch_classifier_treats_button_action_bug_as_interaction_patch() -
     )
 
 
+def test_role_patch_classifier_defaults_generic_single_role_edit_to_role_patch() -> None:
+    prompt = (
+        "Please improve the manager request screen so it feels cleaner and easier to use, "
+        "but keep the rest of the app and the current workflow intact."
+    )
+
+    assert (
+        ServiceStrategyMixins._role_only_patch_kind(
+            prompt=prompt,
+            role_scope=["manager"],
+            intent="role_only_change",
+        )
+        == "role_patch"
+    )
+
+
 def _install_llm_stub(app) -> None:
     helper_path = Path(__file__).with_name("test_api_smoke.py")
     spec = importlib.util.spec_from_file_location("test_api_smoke_helper", helper_path)
@@ -354,9 +370,24 @@ def test_task_router_uses_mode_resolved_profile_for_balanced() -> None:
         generation_mode=GenerationMode.BALANCED,
         run_mode="generate",
     )
+    balanced_snapshot = TaskRouter().profile_snapshot(
+        model_profile="research_balanced",
+        generation_mode=GenerationMode.BALANCED,
+        run_mode="generate",
+    )
 
     assert snapshot["resolved_profile_name"] == "research_balanced"
-    assert snapshot["routing"]["code_edit"] == "gpt-5.4"
+    assert snapshot["routing"]["code_edit"] == balanced_snapshot["routing"]["code_edit"]
+
+
+def test_fast_mode_forces_openai_code_fast_profile() -> None:
+    snapshot = TaskRouter().profile_snapshot(
+        model_profile="research_balanced",
+        generation_mode=GenerationMode.FAST,
+        run_mode="generate",
+    )
+
+    assert snapshot["resolved_profile_name"] == "openai_code_fast"
 
 
 def test_context_pack_preferred_anchors_exclude_generated_manifests_for_entity_workflow() -> None:
@@ -1218,23 +1249,120 @@ def test_run_service_recovers_orphaned_active_runs_after_restart(tmp_path: Path)
         current_stage="stopping",
         updated_at=datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc),
     )
+    stale_running_job = JobRecord(
+        workspace_id=workspace.workspace_id,
+        prompt=stale_running.prompt,
+        target_platform=workspace.target_platform,
+        preview_profile=workspace.preview_profile,
+        linked_run_id=stale_running.run_id,
+        status="running",
+    )
+    stale_stopping_job = JobRecord(
+        workspace_id=workspace.workspace_id,
+        prompt=stale_stopping.prompt,
+        target_platform=workspace.target_platform,
+        preview_profile=workspace.preview_profile,
+        linked_run_id=stale_stopping.run_id,
+        status="running",
+    )
+    stale_running.linked_job_id = stale_running_job.job_id
+    stale_stopping.linked_job_id = stale_stopping_job.job_id
     run_service._save_run(stale_running)
     run_service._save_run(stale_stopping)
+    run_service.store.upsert("jobs", stale_running_job.job_id, stale_running_job.model_dump(mode="json"))
+    run_service.store.upsert("jobs", stale_stopping_job.job_id, stale_stopping_job.model_dump(mode="json"))
 
     run_service._recover_orphaned_active_runs()
 
     recovered_running = run_service.get_run(stale_running.run_id)
     recovered_stopping = run_service.get_run(stale_stopping.run_id)
+    recovered_running_job = app.state.container.generation_service.get_job(stale_running_job.job_id)
+    recovered_stopping_job = app.state.container.generation_service.get_job(stale_stopping_job.job_id)
 
     assert recovered_running.status == "failed"
     assert recovered_running.apply_status == "failed"
     assert recovered_running.current_stage == "failed"
     assert "stale" in (recovered_running.failure_reason or "").lower()
+    assert recovered_running_job.status == "failed"
+    assert "stale" in (recovered_running_job.failure_reason or "").lower()
 
     assert recovered_stopping.status == "blocked"
     assert recovered_stopping.apply_status == "blocked"
     assert recovered_stopping.current_stage == "stopped"
     assert "stop" in (recovered_stopping.failure_reason or "").lower()
+    assert recovered_stopping_job.status == "blocked"
+    assert "stop" in (recovered_stopping_job.failure_reason or "").lower()
+
+
+def test_run_service_recovers_running_job_for_already_terminal_run(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Recovery Job Workspace",
+            description="Running jobs should be synchronized when the linked run is already terminal.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_recovery_job").resolve()),
+        )
+    )
+
+    run = RunRecord(
+        workspace_id=workspace.workspace_id,
+        prompt="Terminal run",
+        intent="edit",
+        status="failed",
+        apply_status="failed",
+        current_stage="failed",
+        failure_reason="Run failed before restart recovery finished.",
+    )
+    job = JobRecord(
+        workspace_id=workspace.workspace_id,
+        prompt=run.prompt,
+        target_platform=workspace.target_platform,
+        preview_profile=workspace.preview_profile,
+        linked_run_id=run.run_id,
+        status="running",
+    )
+    run.linked_job_id = job.job_id
+    run_service._save_run(run)
+    run_service.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
+
+    run_service._recover_orphaned_terminal_jobs()
+
+    recovered_job = app.state.container.generation_service.get_job(job.job_id)
+    assert recovered_job.status == "failed"
+    assert recovered_job.linked_run_id == run.run_id
+    assert "failed" in (recovered_job.failure_reason or "").lower()
+
+
+def test_run_service_infers_specialist_role_scope_from_russian_edit_prompt(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Role Scope Workspace",
+            description="Role scope should be inferred from role-specific edit prompts.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_role_scope").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    workspace = workspace_service.get_workspace(workspace.workspace_id)
+
+    request = CreateRunRequest(
+        prompt="У мойщика вместо одной кнопки завершения сначала должна быть кнопка «Принял машину», а потом уже кнопка «Завершить».",
+        generation_mode=GenerationMode.FAST,
+    )
+
+    inferred_scope = run_service._resolve_target_role_scope(request)
+    resolved_intent = run_service._resolve_intent(workspace, request, resolved_role_scope=inferred_scope)
+
+    assert inferred_scope == ["specialist"]
+    assert resolved_intent == "role_only_change"
 
 
 def test_run_service_hot_paths_do_not_rescan_orphaned_runs_after_startup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1360,6 +1488,56 @@ def test_fix_case_accepts_container_published_port_metadata(tmp_path: Path) -> N
     assert fix_case.container_statuses
     assert fix_case.container_statuses[0].service == "preview-app"
     assert fix_case.container_statuses[0].published_port == "16435"
+
+
+def test_queue_preview_refresh_persists_preview_latency_breakdown(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    workspace_service = app.state.container.workspace_service
+    run_service = app.state.container.run_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Preview Latency Workspace",
+            description="Preview latency should be persisted on run completion.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_preview_latency").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+
+    run = RunRecord(
+        workspace_id=workspace.workspace_id,
+        prompt="Build a simple workflow app.",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        linked_job_id=None,
+        status="completed",
+        apply_status="applied",
+    )
+    run_service._save_run(run)
+
+    def _rebuild_async(workspace_id: str, *, source_dir: Path, draft_run_id: str | None, on_complete):  # noqa: ANN001
+        assert workspace_id == workspace.workspace_id
+        assert source_dir == workspace_service.source_dir(workspace.workspace_id)
+        assert draft_run_id is None
+        preview = PreviewRecord(
+            workspace_id=workspace.workspace_id,
+            status="running",
+            stage="running",
+            progress_percent=100,
+            url="http://localhost:19999",
+            latency_breakdown={"last_rebuild_ms": 321},
+        )
+        on_complete(preview)
+        return preview
+
+    monkeypatch.setattr(run_service.preview_service, "rebuild_async", _rebuild_async)
+
+    run_service._queue_preview_refresh(run, reason="test preview rebuild")
+
+    updated = run_service.get_run(run.run_id)
+    assert updated.latency_breakdown.get("preview_enqueue_ms", 0) >= 0
+    assert updated.latency_breakdown["preview_ms"] == 321
 
 
 def test_resolve_intent_prefers_create_for_workflow_heavy_app_requests(tmp_path: Path) -> None:
@@ -9607,6 +9785,62 @@ def test_context_pack_builder_applies_mode_budget_and_prompt_fingerprint(tmp_pat
     assert "combined_hash" in fast_pack.retrieval_stats["prompt_fingerprint"]
 
 
+def test_context_pack_builder_limits_recent_diff_to_fast_targets(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    workspace_service = app.state.container.workspace_service
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Fast Diff Workspace",
+            description="FAST mode should keep recent diff focused on touched files.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_fast_diff").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    draft_run_id = "run_fast_diff"
+    workspace_service.ensure_draft(workspace.workspace_id, draft_run_id)
+    workspace_service.apply_draft_operations(
+        workspace.workspace_id,
+        draft_run_id,
+        [
+            DraftFileOperation(
+                file_path="miniapp/app/static/client/index.html",
+                operation="replace",
+                content="<main>client</main>\n",
+                reason="client change",
+            ),
+            DraftFileOperation(
+                file_path="miniapp/app/static/manager/index.html",
+                operation="replace",
+                content="<main>manager</main>\n",
+                reason="manager change",
+            ),
+        ],
+    )
+
+    fast_pack = app.state.container.context_pack_builder.build(
+        workspace=workspace_service.get_workspace(workspace.workspace_id),
+        prompt="Adjust the client request screen only.",
+        model_profile="openai_code_fast",
+        generation_mode=GenerationMode.FAST,
+        target_files=["miniapp/app/static/client/index.html"],
+        run_id=draft_run_id,
+        intent="edit",
+    )
+    balanced_pack = app.state.container.context_pack_builder.build(
+        workspace=workspace_service.get_workspace(workspace.workspace_id),
+        prompt="Adjust the client request screen only.",
+        model_profile="research_balanced",
+        generation_mode=GenerationMode.BALANCED,
+        target_files=["miniapp/app/static/client/index.html"],
+        run_id=draft_run_id,
+    )
+
+    assert "miniapp/app/static/client/index.html" in fast_pack.recent_diff
+    assert "miniapp/app/static/manager/index.html" not in fast_pack.recent_diff
+    assert "miniapp/app/static/manager/index.html" in balanced_pack.recent_diff
+
+
 def test_code_index_retrieval_records_candidate_cache_hits(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -9646,6 +9880,100 @@ def test_code_index_retrieval_records_candidate_cache_hits(tmp_path: Path) -> No
 
     assert first["stats"]["candidate_cache_hit"] is False
     assert second["stats"]["candidate_cache_hit"] is True
+
+
+def test_code_index_retrieval_reuses_indexed_chunks_when_available(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Indexed Chunk Workspace",
+            "description": "FAST retrieval should reuse indexed chunks instead of rereading files.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    client.post(f"/workspaces/{workspace_id}/clone-template")
+    client.post(
+        f"/workspaces/{workspace_id}/files/save",
+        json={
+            "relative_path": "miniapp/app/routes/repair_queue.py",
+            "content": "def repair_queue_status(ticket_id: str) -> str:\n    return f'repair:{ticket_id}'\n",
+        },
+    )
+    client.post(f"/workspaces/{workspace_id}/index")
+
+    code_index: CodeIndexService = app.state.container.code_index_service
+    retrieval = code_index.retrieve(
+        workspace_id=workspace_id,
+        prompt="Inspect the repair queue route",
+        code_limit=4,
+    )
+
+    assert retrieval["stats"]["indexed_chunk_reuse_hit"] is True
+
+
+def test_fast_edit_repair_attempt_limit_defaults_to_five() -> None:
+    from app.modules.miniapp_materialization.materialization import MiniappMaterializationService
+
+    assert MiniappMaterializationService.repair_attempt_limit(GenerationMode.FAST, "edit") == 5
+
+
+def test_workspace_loop_fast_context_mode_expands_before_full_bundle() -> None:
+    assert WorkspaceLoopTurnRunner._next_fast_context_mode(
+        next_attempt=1,
+        made_progress=False,
+        signature_changed=False,
+    ) == "minimal"
+    assert WorkspaceLoopTurnRunner._next_fast_context_mode(
+        next_attempt=3,
+        made_progress=False,
+        signature_changed=False,
+    ) == "expanded"
+    assert WorkspaceLoopTurnRunner._next_fast_context_mode(
+        next_attempt=5,
+        made_progress=True,
+        signature_changed=False,
+    ) == "full_bundle"
+
+
+def test_generation_codegen_prefers_deterministic_fast_clusters_for_simple_create(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    grounded_spec = SimpleNamespace(
+        domain_entities=[SimpleNamespace(name="repair_request")],
+        persistence_requirements=[SimpleNamespace()],
+        api_requirements=[SimpleNamespace()],
+        user_flows=[SimpleNamespace()],
+    )
+
+    assert service._should_prefer_deterministic_fast_cluster(
+        generation_mode=GenerationMode.FAST,
+        intent="create",
+        grounded_spec=grounded_spec,
+        role_scope=["client", "specialist", "manager"],
+        cluster_name="backend_support",
+    ) is True
+    assert service._should_prefer_deterministic_fast_cluster(
+        generation_mode=GenerationMode.FAST,
+        intent="create",
+        grounded_spec=grounded_spec,
+        role_scope=["client", "specialist", "manager"],
+        cluster_name="role_client_ui_root",
+    ) is True
+    assert service._should_prefer_deterministic_fast_cluster(
+        generation_mode=GenerationMode.BALANCED,
+        intent="create",
+        grounded_spec=grounded_spec,
+        role_scope=["client", "specialist", "manager"],
+        cluster_name="backend_support",
+    ) is False
 
 
 def test_run_artifacts_expose_engine_diagnostics_reports(tmp_path: Path) -> None:

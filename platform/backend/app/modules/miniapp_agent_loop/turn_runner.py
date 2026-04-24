@@ -48,6 +48,21 @@ class WorkspaceLoopTurnRunner:
         payload["ops"] = compact_ops
         return payload
 
+    @staticmethod
+    def _next_fast_context_mode(
+        *,
+        next_attempt: int,
+        made_progress: bool,
+        signature_changed: bool,
+    ) -> LoopContextMode:
+        if next_attempt <= 2:
+            return "minimal"
+        if next_attempt <= 4:
+            return "expanded"
+        if made_progress or signature_changed:
+            return "full_bundle"
+        return "expanded"
+
     def run(
         self,
         *,
@@ -114,7 +129,14 @@ class WorkspaceLoopTurnRunner:
                 latest_preview_details,
                 validation_snapshot,
             )
-            made_progress = previous_snapshot is None or self.feedback.is_progress(previous_snapshot, progress_snapshot)
+            previous_signature = self.feedback.progress_signature(previous_snapshot) if previous_snapshot is not None else None
+            current_signature = self.feedback.progress_signature(progress_snapshot)
+            signature_changed = previous_signature is not None and current_signature != previous_signature
+            made_progress = (
+                previous_snapshot is None
+                or signature_changed
+                or self.feedback.is_progress(previous_snapshot, progress_snapshot)
+            )
             repeated_no_progress = 0 if made_progress else repeated_no_progress + 1
 
             iteration_message = latest_assistant_message or f"workspace loop attempt {attempt}"
@@ -201,31 +223,6 @@ class WorkspaceLoopTurnRunner:
                     turn_history=turn_history,
                 )
 
-            if attempt > 0 and not made_progress:
-                if context_mode == "minimal":
-                    context_mode = "expanded"
-                elif context_mode == "expanded":
-                    context_mode = "full_bundle"
-                elif repeated_no_progress >= full_bundle_no_progress_limit:
-                    return self.results.failed(
-                        outcome_kind="blocked_generation",
-                        summary="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
-                        failure_reason="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
-                        failure_class=job.failure_class or progress_snapshot.get("failure_class"),
-                        failure_signature=job.failure_signature or self.feedback.progress_signature(progress_snapshot),
-                        root_cause_summary=job.root_cause_summary or progress_snapshot.get("failure_summary"),
-                        current_phase="failed",
-                        remaining_issues=list(completion_state.get("remaining_issues") or []),
-                        latest_execution=latest_execution,
-                        latest_preview_details=latest_preview_details,
-                        latest_apply_result=latest_apply_result,
-                        iterations=iterations,
-                        repair_iterations=repair_iterations,
-                        all_operations=all_operations,
-                        last_assistant_message=latest_assistant_message,
-                        turn_history=turn_history,
-                    )
-
             if attempt >= max_attempts:
                 return self.results.failed(
                     outcome_kind="blocked_generation",
@@ -245,6 +242,62 @@ class WorkspaceLoopTurnRunner:
                     last_assistant_message=latest_assistant_message,
                     turn_history=turn_history,
                 )
+
+            next_attempt = attempt + 1
+            if generation_mode == GenerationMode.FAST:
+                context_mode = self._next_fast_context_mode(
+                    next_attempt=next_attempt,
+                    made_progress=made_progress,
+                    signature_changed=signature_changed,
+                )
+                if (
+                    next_attempt >= 5
+                    and context_mode != "full_bundle"
+                    and repeated_no_progress >= 2
+                    and not signature_changed
+                ):
+                    return self.results.failed(
+                        outcome_kind="blocked_generation",
+                        summary="Workspace loop stopped after repeated failure signatures in FAST mode without meaningful progress.",
+                        failure_reason="Workspace loop stopped after repeated failure signatures in FAST mode without meaningful progress.",
+                        failure_class=job.failure_class or progress_snapshot.get("failure_class"),
+                        failure_signature=job.failure_signature or current_signature,
+                        root_cause_summary=job.root_cause_summary or progress_snapshot.get("failure_summary"),
+                        current_phase="failed",
+                        remaining_issues=list(completion_state.get("remaining_issues") or []),
+                        latest_execution=latest_execution,
+                        latest_preview_details=latest_preview_details,
+                        latest_apply_result=latest_apply_result,
+                        iterations=iterations,
+                        repair_iterations=repair_iterations,
+                        all_operations=all_operations,
+                        last_assistant_message=latest_assistant_message,
+                        turn_history=turn_history,
+                    )
+            elif attempt > 0 and not made_progress:
+                if context_mode == "minimal":
+                    context_mode = "expanded"
+                elif context_mode == "expanded":
+                    context_mode = "full_bundle"
+                elif repeated_no_progress >= full_bundle_no_progress_limit:
+                    return self.results.failed(
+                        outcome_kind="blocked_generation",
+                        summary="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
+                        failure_reason="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
+                        failure_class=job.failure_class or progress_snapshot.get("failure_class"),
+                        failure_signature=job.failure_signature or current_signature,
+                        root_cause_summary=job.root_cause_summary or progress_snapshot.get("failure_summary"),
+                        current_phase="failed",
+                        remaining_issues=list(completion_state.get("remaining_issues") or []),
+                        latest_execution=latest_execution,
+                        latest_preview_details=latest_preview_details,
+                        latest_apply_result=latest_apply_result,
+                        iterations=iterations,
+                        repair_iterations=repair_iterations,
+                        all_operations=all_operations,
+                        last_assistant_message=latest_assistant_message,
+                        turn_history=turn_history,
+                    )
 
             plan = self.edit_validator.normalize_plan(
                 callbacks.plan_turn(

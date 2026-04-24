@@ -18,6 +18,7 @@ from app.models.domain import (
     CreateRunRequest,
     GenerateRequest,
     JobEvent,
+    JobRecord,
     RunChecksSummary,
     RunRecord,
     WorkspaceRecord,
@@ -76,6 +77,11 @@ WORKSPACE_NAME_STOPWORDS = {
     "to",
     "with",
 }
+ROLE_SCOPE_HINTS: dict[str, tuple[str, ...]] = {
+    "client": ("client", "customer", "user", "клиент", "пользователь", "заказчик"),
+    "specialist": ("specialist", "worker", "master", "executor", "washer", "специалист", "мастер", "исполнитель", "мойщик"),
+    "manager": ("manager", "admin", "administrator", "operator", "менеджер", "администратор", "оператор", "админ"),
+}
 
 
 class RunService:
@@ -103,6 +109,7 @@ class RunService:
         self._active_workers: dict[str, threading.Thread] = {}
         self._startup_started_at = datetime.now(timezone.utc)
         self._recover_orphaned_active_runs()
+        self._recover_orphaned_terminal_jobs()
 
     def stop_run(self, run_id: str) -> RunRecord:
         run = self.get_run(run_id)
@@ -133,7 +140,8 @@ class RunService:
         suggested_workspace_name = self._derive_workspace_name_from_prompt(request.prompt)
         if suggested_workspace_name:
             workspace = self.workspace_service.rename_workspace(workspace_id, suggested_workspace_name)
-        resolved_intent = self._resolve_intent(workspace, request)
+        resolved_role_scope = self._resolve_target_role_scope(request)
+        resolved_intent = self._resolve_intent(workspace, request, resolved_role_scope=resolved_role_scope)
         effective_generation_mode = self._resolve_generation_mode(workspace, request, resolved_intent)
         effective_model_profile = self._resolve_model_profile(request.model_profile, effective_generation_mode)
         run = RunRecord(
@@ -143,7 +151,7 @@ class RunService:
             intent=resolved_intent,
             apply_strategy=request.apply_strategy,
             approval_required=request.apply_strategy == "manual_approve",
-            target_role_scope=[role for role in request.target_role_scope if role in ROLE_SCOPE],
+            target_role_scope=resolved_role_scope,
             model_profile=effective_model_profile,
             generation_mode=effective_generation_mode,
             llm_provider=(self.openrouter_client.configuration().get("routing") or {}).get("provider") if self.openrouter_client.enabled else None,
@@ -249,6 +257,7 @@ class RunService:
             run.progress_percent = 100
             run.updated_at = now
             self._save_run(run)
+            self._sync_linked_job_to_terminal_run_state(run, reason="stale_run_recovery")
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
             logger.warning(
                 "recovered_orphaned_run run_id=%s workspace_id=%s status=%s stage=%s",
@@ -257,6 +266,81 @@ class RunService:
                 run.status,
                 run.current_stage,
             )
+
+    def _recover_orphaned_terminal_jobs(self) -> None:
+        for item in self.store.list("jobs"):
+            job = JobRecord.model_validate(item)
+            if job.status not in {"pending", "running"}:
+                continue
+            run_id = str(job.linked_run_id or "").strip()
+            if not run_id:
+                continue
+            run_payload = self.store.get("runs", run_id)
+            if not run_payload:
+                continue
+            run = RunRecord.model_validate(run_payload)
+            if run.status not in {"completed", "blocked", "failed"}:
+                continue
+            self._sync_linked_job_to_terminal_run_state(run, reason="terminal_run_job_sync")
+            logger.warning(
+                "recovered_orphaned_job job_id=%s run_id=%s workspace_id=%s job_status=%s run_status=%s",
+                job.job_id,
+                run.run_id,
+                run.workspace_id,
+                job.status,
+                run.status,
+            )
+
+    def _sync_linked_job_to_terminal_run_state(self, run: RunRecord, *, reason: str) -> None:
+        job_id = str(run.linked_job_id or "").strip()
+        if not job_id:
+            return
+        payload = self.store.get("jobs", job_id)
+        if not payload:
+            return
+        job = JobRecord.model_validate(payload)
+        if run.status == "completed":
+            target_status = "completed"
+            event_type = "job_completed"
+            message = run.summary or "Job was synchronized to the completed run state."
+            job.failure_reason = None
+            job.failure_class = None
+            job.failure_signature = None
+            job.root_cause_summary = None
+        elif run.status == "blocked":
+            target_status = "blocked"
+            event_type = "job_failed"
+            message = run.failure_reason or run.summary or "Job was synchronized to the blocked run state."
+            job.failure_reason = run.failure_reason or message
+            job.failure_class = run.failure_class
+            job.failure_signature = run.failure_signature
+            job.root_cause_summary = run.root_cause_summary
+        elif run.status == "failed":
+            target_status = "failed"
+            event_type = "job_failed"
+            message = run.failure_reason or run.summary or "Job was synchronized to the failed run state."
+            job.failure_reason = run.failure_reason or message
+            job.failure_class = run.failure_class
+            job.failure_signature = run.failure_signature
+            job.root_cause_summary = run.root_cause_summary
+        else:
+            return
+        if job.status == target_status and (
+            target_status == "completed" or (job.failure_reason or "") == (run.failure_reason or "")
+        ):
+            return
+        job.status = target_status
+        job.outcome_kind = run.outcome_kind
+        job.summary = message
+        job.linked_run_id = run.run_id
+        job.updated_at = datetime.now(timezone.utc)
+        self.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
+        self._append_job_event(
+            job.job_id,
+            event_type,
+            message,
+            {"reason": reason, "run_id": run.run_id, "run_status": run.status},
+        )
 
     def get_run_artifacts(self, run_id: str) -> dict[str, Any]:
         payload = self.store.get("reports", f"run_artifacts:{run_id}")
@@ -792,6 +876,11 @@ class RunService:
         source_dir = self.workspace_service.source_dir(run.workspace_id)
 
         def on_complete(preview: Any) -> None:
+            actual_preview_ms = int(
+                getattr(preview, "latency_breakdown", {}).get("last_rebuild_ms")
+                or getattr(preview, "latency_breakdown", {}).get("last_start_ms")
+                or 0
+            )
             if preview.status == "running":
                 self._append_job_event(
                     run.linked_job_id,
@@ -824,6 +913,14 @@ class RunService:
                     if key in {"status", "stage", "progress_percent", "runtime_mode", "url", "role_urls", "draft_run_id"}
                 }
                 self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
+            run_payload = self.store.get("runs", run.run_id)
+            if run_payload is not None:
+                latency_breakdown = dict(run_payload.get("latency_breakdown") or {})
+                if actual_preview_ms > 0:
+                    latency_breakdown["preview_ms"] = actual_preview_ms
+                run_payload["latency_breakdown"] = latency_breakdown
+                run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self.store.upsert("runs", run.run_id, run_payload)
 
         preview = self.preview_service.rebuild_async(
             run.workspace_id,
@@ -831,7 +928,10 @@ class RunService:
             draft_run_id=None,
             on_complete=on_complete,
         )
-        run.latency_breakdown["preview_enqueue_ms"] = int((time.perf_counter() - queue_started_at) * 1000)
+        latency_breakdown = dict((self.store.get("runs", run.run_id) or {}).get("latency_breakdown") or run.latency_breakdown)
+        latency_breakdown["preview_enqueue_ms"] = int((time.perf_counter() - queue_started_at) * 1000)
+        latency_breakdown.setdefault("preview_ms", latency_breakdown["preview_enqueue_ms"])
+        run.latency_breakdown = latency_breakdown
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
         artifacts_payload = self.store.get("reports", f"run_artifacts:{run.run_id}")
@@ -1020,13 +1120,13 @@ class RunService:
         }
         self.store.upsert("reports", f"run_artifacts:{run.run_id}", payload)
 
-    def _resolve_intent(self, workspace: WorkspaceRecord, request: CreateRunRequest) -> str:
+    def _resolve_intent(self, workspace: WorkspaceRecord, request: CreateRunRequest, *, resolved_role_scope: list[str] | None = None) -> str:
         if request.intent != "auto":
             return request.intent
         if request.mode == "fix":
             return "edit"
         prompt = request.prompt.lower()
-        role_scope = [role for role in request.target_role_scope if role in ROLE_SCOPE]
+        role_scope = list(resolved_role_scope if resolved_role_scope is not None else self._resolve_target_role_scope(request))
         if self._looks_like_fix_request(prompt):
             return "edit"
         if GenerationService._looks_like_create_surface_request(prompt, role_scope):
@@ -1039,6 +1139,19 @@ class RunService:
         if has_existing_build or any(token in prompt for token in ("change", "update", "edit", "modify", "rewrite", "fix", "исправ", "ошиб")):
             return "edit"
         return "create"
+
+    @classmethod
+    def _resolve_target_role_scope(cls, request: CreateRunRequest) -> list[str]:
+        explicit_scope = [role for role in request.target_role_scope if role in ROLE_SCOPE]
+        if explicit_scope:
+            return explicit_scope
+        prompt = str(request.prompt or "").lower()
+        inferred_scope: list[str] = []
+        for role in ("client", "specialist", "manager"):
+            hints = ROLE_SCOPE_HINTS.get(role) or ()
+            if any(hint in prompt for hint in hints):
+                inferred_scope.append(role)
+        return inferred_scope
 
     def _resolve_generation_mode(
         self,

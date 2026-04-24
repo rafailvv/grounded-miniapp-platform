@@ -152,9 +152,11 @@ def default_profile_for_generation_mode(generation_mode: GenerationMode | str | 
 def resolve_model_profile(requested_profile: str | None, generation_mode: GenerationMode | str | None) -> str:
     normalized = str(requested_profile or "").strip()
     default_profile = default_profile_for_generation_mode(generation_mode)
+    mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(str(generation_mode or GenerationMode.BALANCED.value))
+    if mode == GenerationMode.FAST:
+        return default_profile
     if not normalized or normalized not in TASK_PROFILES:
         return default_profile
-    mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(str(generation_mode or GenerationMode.BALANCED.value))
     if mode == GenerationMode.BALANCED and normalized == "openai_code_fast":
         return default_profile
     if mode == GenerationMode.QUALITY and normalized in {"openai_code_fast", "research_balanced"}:

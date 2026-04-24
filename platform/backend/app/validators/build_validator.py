@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import re
 import json
 from pathlib import Path
-import re
 
 from app.models.grounded_spec import GroundedSpecModel
 from app.models.artifacts import ValidationIssue
@@ -48,6 +48,7 @@ class BuildValidator:
                 )
         issues.extend(self._validate_generated_app_shape(workspace_path))
         issues.extend(self._validate_contract_drift(workspace_path))
+        issues.extend(self._validate_status_alias_contract(workspace_path))
         issues.extend(self._validate_route_module_import_safety(workspace_path))
         issues.extend(self._validate_persistent_storage_contract(workspace_path))
         issues.extend(self._validate_runtime_provider_contract(workspace_path))
@@ -1429,6 +1430,54 @@ class BuildValidator:
                     )
                 )
 
+        return issues
+
+    @staticmethod
+    def _schema_status_literals(workspace_path: Path) -> list[str]:
+        schema_path = workspace_path / "miniapp" / "app" / "schemas.py"
+        if not schema_path.exists():
+            return []
+        content = schema_path.read_text(encoding="utf-8")
+        patterns = (
+            re.compile(r"\bRecordStatus\s*=\s*Literal\[(?P<body>[^\]]+)\]", flags=re.IGNORECASE | re.DOTALL),
+            re.compile(r"\bstatus\s*:\s*Literal\[(?P<body>[^\]]+)\]", flags=re.IGNORECASE | re.DOTALL),
+        )
+        for pattern in patterns:
+            match = pattern.search(content)
+            if not match:
+                continue
+            body = str(match.group("body") or "")
+            values = [value.strip().lower() for value in re.findall(r'["\']([^"\']+)["\']', body)]
+            if values:
+                return list(dict.fromkeys(values))
+        return []
+
+    def _validate_status_alias_contract(self, workspace_path: Path) -> list[ValidationIssue]:
+        from app.modules.miniapp_generation_runtime.generation_contract_frontend import MiniappGenerationContractFrontend
+
+        status_literals = self._schema_status_literals(workspace_path)
+        if not status_literals:
+            return []
+        static_root = workspace_path / "miniapp" / "app" / "static"
+        issues: list[ValidationIssue] = []
+        for file_path in static_root.rglob("*.js"):
+            content = file_path.read_text(encoding="utf-8")
+            alias_map = MiniappGenerationContractFrontend._status_read_alias_map(
+                content,
+                {"status_literals": status_literals},
+            )
+            if not alias_map:
+                continue
+            if "__groundNormalizeStatusPayload" in content and "__GROUND_STATUS_READ_ALIASES__" in content:
+                continue
+            issues.append(
+                ValidationIssue(
+                    code="build.status_alias_bridge_missing",
+                    message="Generated frontend uses non-canonical status aliases without the runtime status-alias bridge required to stay aligned with schema literals.",
+                    severity="high",
+                    location=str(file_path.relative_to(workspace_path)),
+                )
+            )
         return issues
 
     @staticmethod

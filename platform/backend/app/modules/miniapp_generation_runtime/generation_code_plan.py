@@ -159,7 +159,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 workspace_tree=workspace_tree,
             )
             planned["workspace_id"] = workspace_id
-            if len(role_scope) == 1 and role_patch_kind in {"ui_flow_patch", "contract_patch"}:
+            if len(role_scope) == 1 and role_patch_kind in {"ui_flow_patch", "contract_patch", "role_patch"}:
                 planned = self._stabilize_single_role_flow_expansion_plan(
                     planned,
                     prompt=prompt,
@@ -171,7 +171,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 or (
                     len(role_scope) == 1
                     and intent in {"edit", "refine", "role_only_change"}
-                    and role_patch_kind in {"ui_flow_patch", "contract_patch"}
+                    and role_patch_kind in {"ui_flow_patch", "contract_patch", "role_patch"}
                 )
             ):
                 planned = self._prune_minimal_patch_plan_to_focused_role(
@@ -289,6 +289,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         ui_flow_patch = role_patch_kind == "ui_flow_patch"
         contract_patch = role_patch_kind == "contract_patch"
         interaction_patch = role_patch_kind == "interaction_patch"
+        role_scoped_patch = role_patch_kind == "role_patch"
         if visual_only_patch:
             source_role_pages = self._source_role_pages_for_focus(workspace_id=planned.get("workspace_id"), role=focused_role)
             for page in source_role_pages:
@@ -366,7 +367,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             for path in (planned.get("backend_targets") or [])
             if path not in non_focused_route_files
         ]
-        if ui_flow_patch or contract_patch or interaction_patch:
+        if ui_flow_patch or contract_patch or interaction_patch or role_scoped_patch:
             feature_stems = {
                 stem
                 for stem in (
@@ -473,7 +474,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                     or path.startswith("miniapp/app/static/shared/")
                 )
             ]
-        elif ui_flow_patch:
+        elif ui_flow_patch or role_scoped_patch:
             role_support_targets = {
                 str(path)
                 for page in focused_pages

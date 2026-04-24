@@ -276,9 +276,11 @@ class MiniappMaterializationService:
     @staticmethod
     def repair_attempt_limit(generation_mode: GenerationMode, intent: str) -> int:
         if intent in {"edit", "refine", "role_only_change"}:
+            if generation_mode == GenerationMode.FAST:
+                return max(1, int(os.getenv("FAST_EDIT_AUTO_REPAIR_ATTEMPTS", "5")))
             return max(1, int(os.getenv("EDIT_AUTO_REPAIR_ATTEMPTS", "4")))
         if generation_mode == GenerationMode.FAST:
-            return max(1, int(os.getenv("FAST_AUTO_REPAIR_ATTEMPTS", "3")))
+            return max(1, int(os.getenv("FAST_AUTO_REPAIR_ATTEMPTS", "4")))
         if generation_mode == GenerationMode.QUALITY:
             return max(1, int(os.getenv("QUALITY_AUTO_REPAIR_ATTEMPTS", "6")))
         if generation_mode == GenerationMode.BALANCED:

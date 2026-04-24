@@ -219,19 +219,25 @@ def _normalize_status(value: Any) -> Any:
     status_aliases = {{
         "done": "completed",
         "complete": "completed",
+        "canceled": "cancelled",
     }}
     normalized = status_aliases.get(status, status)
     allowed = _status_literals()
     if not allowed or normalized in allowed:
         return normalized
-    if normalized == "completed":
-        for candidate in ("completed", "closed", "resolved"):
+    status_families = (
+        ("not_started", ("scheduled", "open", "new", "created", "accepted", "pending", "submitted", "queued", "draft")),
+        ("in_progress", ("in_progress", "started", "working", "processing", "active", "claimed", "assigned", "in_review", "issued")),
+        ("completed", ("completed", "done", "finished", "closed", "resolved", "approved", "returned")),
+        ("cancelled", ("cancelled", "canceled", "rejected")),
+    )
+    for _family_name, candidates in status_families:
+        if normalized not in candidates:
+            continue
+        for candidate in candidates:
             if candidate in allowed:
                 return candidate
-    if normalized == "in_progress":
-        for candidate in ("claimed", "in_review", "issued", "open", "active", "processing"):
-            if candidate in allowed:
-                return candidate
+        break
     return allowed[0]
 
 

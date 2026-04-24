@@ -709,6 +709,81 @@ function escapeHtml(value) {{
             "fallback_used": True,
         }
 
+    @staticmethod
+    def _should_prefer_deterministic_fast_cluster(
+        *,
+        generation_mode: GenerationMode,
+        intent: str,
+        grounded_spec: GroundedSpecModel,
+        role_scope: list[str],
+        cluster_name: str,
+    ) -> bool:
+        if generation_mode != GenerationMode.FAST or intent != "create":
+            return False
+        if len(role_scope) > 3:
+            return False
+        entity_count = len(list(getattr(grounded_spec, "domain_entities", []) or []))
+        persistence_count = len(list(getattr(grounded_spec, "persistence_requirements", []) or []))
+        api_count = len(list(getattr(grounded_spec, "api_requirements", []) or []))
+        flow_count = len(list(getattr(grounded_spec, "user_flows", []) or []))
+        if entity_count > 2 or persistence_count > 5 or api_count > 6 or flow_count > 4:
+            return False
+        return (
+            cluster_name == "shared_static"
+            or cluster_name in {"backend_support", "backend_routes"}
+            or cluster_name.startswith("backend_route_")
+            or (cluster_name.startswith("role_") and "_ui_" in cluster_name)
+        )
+
+    def _deterministic_fast_cluster_result(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        cluster_name: str,
+        cluster_targets: list[str],
+        entity_contract: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if cluster_name == "shared_static":
+            fallback = self._whole_file_static_reuse_fallback_result(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                cluster_name=cluster_name,
+                cluster_targets=cluster_targets,
+                timeout_seconds=0,
+            )
+            if fallback is not None:
+                fallback["assistant_message"] = (
+                    f"{cluster_name} used the FAST deterministic-first path and kept the existing shared static surface."
+                )
+            return fallback
+        if cluster_name in {"backend_support", "backend_routes"} or cluster_name.startswith("backend_route_"):
+            fallback = self._whole_file_timeout_fallback_result(
+                cluster_name=cluster_name,
+                cluster_targets=cluster_targets,
+                timeout_seconds=0,
+            )
+            if fallback is not None:
+                fallback["assistant_message"] = (
+                    f"{cluster_name} used the FAST deterministic-first path and applied the canonical backend contract."
+                )
+            return fallback
+        if cluster_name.startswith("role_") and "_ui_" in cluster_name:
+            fallback = self._whole_file_role_ui_fallback_result(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                cluster_name=cluster_name,
+                cluster_targets=cluster_targets,
+                entity_contract=entity_contract,
+                timeout_seconds=0,
+            )
+            if fallback is not None:
+                fallback["assistant_message"] = (
+                    f"{cluster_name} used the FAST deterministic-first path and materialized a neutral DB-backed role surface."
+                )
+            return fallback
+        return None
+
     def _whole_file_batch_timeout_seconds(
         self,
         batch: list[dict[str, Any]],
@@ -1117,6 +1192,23 @@ function escapeHtml(value) {{
             for cluster in batch:
                 cluster_name = str(cluster["cluster_name"])
                 cluster_targets = list(cluster["target_files"])
+                if self._should_prefer_deterministic_fast_cluster(
+                    generation_mode=kwargs["generation_mode"],
+                    intent=kwargs["intent"],
+                    grounded_spec=kwargs["grounded_spec"],
+                    role_scope=kwargs["role_scope"],
+                    cluster_name=cluster_name,
+                ):
+                    fast_result = self._deterministic_fast_cluster_result(
+                        workspace_id=kwargs["workspace_id"],
+                        draft_run_id=kwargs["draft_run_id"],
+                        cluster_name=cluster_name,
+                        cluster_targets=cluster_targets,
+                        entity_contract=kwargs.get("entity_contract") or {},
+                    )
+                    if fast_result is not None:
+                        immediate_results.append(fast_result)
+                        continue
                 if cluster_name == "shared_static":
                     reuse_result = self._whole_file_static_reuse_fallback_result(
                         workspace_id=kwargs["workspace_id"],

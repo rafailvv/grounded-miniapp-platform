@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,19 @@ CANONICAL_ENDPOINT_ALIASES: dict[str, str] = {}
 
 
 class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
+    _STATUS_FAMILIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("not_started", ("scheduled", "open", "new", "created", "accepted", "pending", "submitted", "queued", "draft")),
+        ("in_progress", ("in_progress", "started", "working", "processing", "active", "claimed", "assigned", "in_review", "issued")),
+        ("completed", ("completed", "done", "finished", "closed", "resolved", "approved", "returned")),
+        ("cancelled", ("cancelled", "canceled", "rejected")),
+    )
+    _STATUS_UI_ALIAS_PREFERENCE: dict[str, tuple[str, ...]] = {
+        "not_started": ("open", "new", "scheduled", "pending", "created", "accepted", "submitted", "queued", "draft"),
+        "in_progress": ("in_progress", "processing", "started", "working", "claimed", "assigned", "in_review", "issued"),
+        "completed": ("completed", "done", "finished", "closed", "resolved", "approved", "returned"),
+        "cancelled": ("cancelled", "canceled", "rejected"),
+    }
+
     @staticmethod
     def _compact_slug(value: str) -> str:
         text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
@@ -139,6 +153,149 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
                 updated,
                 flags=re.IGNORECASE,
             )
+        return updated
+
+    @classmethod
+    def _entity_status_literals(cls, entity_contract: dict[str, Any] | None) -> list[str]:
+        seen: list[str] = []
+        for raw_value in list((entity_contract or {}).get("status_literals") or []):
+            value = str(raw_value or "").strip().lower()
+            if value and value not in seen:
+                seen.append(value)
+        return seen
+
+    @staticmethod
+    def _schema_status_literals_from_text(content: str) -> list[str]:
+        source = str(content or "")
+        patterns = (
+            re.compile(r"\bRecordStatus\s*=\s*Literal\[(?P<body>[^\]]+)\]", flags=re.IGNORECASE | re.DOTALL),
+            re.compile(r"\bstatus\s*:\s*Literal\[(?P<body>[^\]]+)\]", flags=re.IGNORECASE | re.DOTALL),
+        )
+        for pattern in patterns:
+            match = pattern.search(source)
+            if not match:
+                continue
+            body = str(match.group("body") or "")
+            values = [value.strip().lower() for value in re.findall(r'["\']([^"\']+)["\']', body)]
+            if values:
+                return list(dict.fromkeys(values))
+        return []
+
+    def _effective_entity_contract(
+        self,
+        workspace_id: str,
+        draft_run_id: str,
+        operation_map: dict[str, DraftFileOperation],
+        entity_contract: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        effective_contract = dict(entity_contract or {})
+        schema_content = self._operation_or_workspace_content(
+            workspace_id,
+            draft_run_id,
+            operation_map,
+            "miniapp/app/schemas.py",
+        )
+        schema_status_literals = self._schema_status_literals_from_text(schema_content or "")
+        if schema_status_literals:
+            effective_contract["status_literals"] = schema_status_literals
+        return effective_contract
+
+    @classmethod
+    def _status_literals_referenced_in_text(cls, content: str) -> set[str]:
+        lowered = str(content or "").lower()
+        found: set[str] = set()
+        for _family_name, candidates in cls._STATUS_FAMILIES:
+            for candidate in candidates:
+                patterns = (
+                    rf'["\'`]{re.escape(candidate)}["\'`]',
+                    rf"\bdata-status=[\"']{re.escape(candidate)}[\"']",
+                )
+                if any(re.search(pattern, lowered) for pattern in patterns):
+                    found.add(candidate)
+        return found
+
+    @classmethod
+    def _status_read_alias_map(cls, content: str, entity_contract: dict[str, Any] | None) -> dict[str, str]:
+        allowed = cls._entity_status_literals(entity_contract)
+        if not allowed:
+            return {}
+        allowed_set = set(allowed)
+        referenced = cls._status_literals_referenced_in_text(content)
+        mapping: dict[str, str] = {}
+        for family_name, candidates in cls._STATUS_FAMILIES:
+            allowed_candidates = [candidate for candidate in allowed if candidate in candidates]
+            if not allowed_candidates:
+                continue
+            alias = next(
+                (
+                    candidate
+                    for candidate in cls._STATUS_UI_ALIAS_PREFERENCE.get(family_name, candidates)
+                    if candidate in referenced and candidate not in allowed_set
+                ),
+                None,
+            )
+            if not alias:
+                continue
+            canonical = allowed_candidates[0]
+            if canonical != alias:
+                mapping[canonical] = alias
+        return mapping
+
+    @classmethod
+    def _status_alias_bridge_source(cls, read_alias_map: dict[str, str]) -> str:
+        payload = json.dumps(read_alias_map, ensure_ascii=False, sort_keys=True)
+        return (
+            "// grounded-status-alias-bridge:start\n"
+            f"const __GROUND_STATUS_READ_ALIASES__ = {payload};\n"
+            "function __groundNormalizeStatusValue(value) {\n"
+            "  if (typeof value !== \"string\") {\n"
+            "    return value;\n"
+            "  }\n"
+            "  const normalized = value.trim().toLowerCase();\n"
+            "  return __GROUND_STATUS_READ_ALIASES__[normalized] ?? normalized;\n"
+            "}\n"
+            "function __groundNormalizeStatusPayload(payload) {\n"
+            "  if (Array.isArray(payload)) {\n"
+            "    return payload.map((item) => __groundNormalizeStatusPayload(item));\n"
+            "  }\n"
+            "  if (!payload || typeof payload !== \"object\") {\n"
+            "    return payload;\n"
+            "  }\n"
+            "  const result = {};\n"
+            "  Object.entries(payload).forEach(([key, value]) => {\n"
+            "    if (key === \"status\") {\n"
+            "      result[key] = __groundNormalizeStatusValue(value);\n"
+            "      return;\n"
+            "    }\n"
+            "    result[key] = __groundNormalizeStatusPayload(value);\n"
+            "  });\n"
+            "  return result;\n"
+            "}\n"
+            "// grounded-status-alias-bridge:end\n\n"
+        )
+
+    @classmethod
+    def _inject_status_alias_bridge(cls, file_path: str, content: str, entity_contract: dict[str, Any] | None) -> str:
+        if not str(file_path or "").endswith(".js"):
+            return str(content or "")
+        updated = str(content or "")
+        read_alias_map = cls._status_read_alias_map(updated, entity_contract)
+        if not read_alias_map:
+            return updated
+        bridge_block = cls._status_alias_bridge_source(read_alias_map)
+        bridge_pattern = re.compile(
+            r"// grounded-status-alias-bridge:start\n.*?// grounded-status-alias-bridge:end\n\n?",
+            flags=re.DOTALL,
+        )
+        if bridge_pattern.search(updated):
+            updated = re.sub(bridge_pattern, bridge_block, updated, count=1)
+        else:
+            updated = f"{bridge_block}{updated}"
+        updated = re.sub(
+            r"(?<!__groundNormalizeStatusPayload\()await\s+([A-Za-z_$][\w$.]*)\.json\(\)",
+            lambda match: f"__groundNormalizeStatusPayload(await {match.group(1)}.json())",
+            updated,
+        )
         return updated
 
     @staticmethod
@@ -391,6 +548,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         contract_sync_mode: str = "repair_invariants",
     ) -> list[DraftFileOperation]:
         operation_map = {operation.file_path: operation for operation in operations}
+        effective_entity_contract = self._effective_entity_contract(workspace_id, draft_run_id, operation_map, entity_contract)
         target_paths = set(operation_map)
         scoped_roles = {str(role).strip() for role in (role_scope or []) if str(role).strip()}
         for entry in self.workspace_service.file_tree(workspace_id, run_id=draft_run_id):
@@ -412,7 +570,8 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             if not content:
                 continue
             updated = self._normalize_api_aliases_in_text(content)
-            updated = self._normalize_entity_api_paths(updated, entity_contract)
+            updated = self._normalize_entity_api_paths(updated, effective_entity_contract)
+            updated = self._inject_status_alias_bridge(file_path, updated, effective_entity_contract)
             updated = self._clean_static_ui_text_artifacts(updated)
             if not self._needs_frontend_api_contract_repair(file_path, content) and updated == content:
                 continue

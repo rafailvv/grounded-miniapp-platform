@@ -569,6 +569,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             "context_pack_started",
             f"Collecting targeted file context for {len(plan_result['target_files'])} planned files.",
         )
+        context_pack_started_at = time.perf_counter()
         context_pack = service.context_pack_builder.build(
             workspace=workspace,
             prompt=effective_prompt,
@@ -579,6 +580,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             grounded_spec=grounded_spec,
             execution_class=execution_class,
             run_id=draft_run_id,
+            intent=request.intent,
         )
         files_read = sorted(
             set(plan_result["files_to_read"]) | set(context_pack.targeted_files.keys()) | {chunk.path for chunk in context_pack.code_chunks}
@@ -608,7 +610,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 **dict((context_pack.retrieval_stats or {}).get("anchor_report") or {}),
             },
         )
-        job.latency_breakdown["context_pack_ms"] = max(0, int((time.perf_counter() - started_at) * 1000) - retrieval_ms)
+        job.latency_breakdown["context_pack_ms"] = int((time.perf_counter() - context_pack_started_at) * 1000)
         service._append_event(
             job,
             "context_pack_ready",
@@ -619,6 +621,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
 
         service._append_event(job, "generating_code", "Generating backend and page bundles.")
         service._append_event(job, "editing_started", "Generating draft file edits.")
+        generation_stage_started_at = time.perf_counter()
         edit_result = service._resolve_code_edits(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
@@ -926,7 +929,8 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 f"{loop_seed_message}\n\nInitial iteration diagnostics:\n- "
                 + "\n- ".join(dict.fromkeys(initial_loop_diagnostics))
             ).strip()
-        job.latency_breakdown["patch_apply_ms"] = max(0, int((time.perf_counter() - started_at) * 1000) - retrieval_ms)
+        job.latency_breakdown["generation_ms"] = int((time.perf_counter() - generation_stage_started_at) * 1000)
+        workspace_loop_started_at = time.perf_counter()
         loop_result = service.generation_repair.run_generation_workspace_loop(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
@@ -946,6 +950,18 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
             initial_operations=list(operations),
             initial_assistant_message=loop_seed_message,
             should_stop=should_stop,
+        )
+        job.latency_breakdown["workspace_loop_ms"] = int((time.perf_counter() - workspace_loop_started_at) * 1000)
+        latest_checks_ms = (
+            int(loop_result.latest_execution.duration_ms or 0)
+            if loop_result.latest_execution is not None
+            else int(initial_exact_execution.duration_ms or 0)
+        )
+        job.latency_breakdown["checks_ms"] = latest_checks_ms
+        job.latency_breakdown["patch_apply_ms"] = (
+            int(job.latency_breakdown.get("generation_ms", 0) or 0)
+            + int(job.latency_breakdown.get("workspace_loop_ms", 0) or 0)
+            + latest_checks_ms
         )
         latest_preview = service.preview_service.get(workspace_id)
         latest_assistant_message = loop_result.last_assistant_message or edit_result["assistant_message"]

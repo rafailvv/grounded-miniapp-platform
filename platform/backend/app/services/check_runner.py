@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -92,54 +93,74 @@ class CheckRunner:
         static_result.duration_ms = int((time.perf_counter() - static_started) * 1000)
         results.append(static_result)
 
-        python_tests_started = time.perf_counter()
-        python_tests_result = self._run_python_app_tests(backend_dir)
-        python_tests_result.duration_ms = int((time.perf_counter() - python_tests_started) * 1000)
-        results.append(python_tests_result)
-
-        js_tests_started = time.perf_counter()
-        js_tests_result = self._run_js_app_tests(backend_dir)
-        js_tests_result.duration_ms = int((time.perf_counter() - js_tests_started) * 1000)
-        results.append(js_tests_result)
-
-        preview_started = time.perf_counter()
-        preview = self.preview_service.get(workspace_id)
         should_skip_preview = (
             bool(filtered_issues)
             or bool(connectivity_issues)
             or static_result.status == "failed"
         )
-        if should_skip_preview:
-            preview_status = "skipped"
-            preview_details = "Preview smoke skipped because validator or build checks already failed."
-            preview_logs: list[str] = []
-            connectivity_result = RunCheckResult(
-                name="preview_connectivity_smoke",
-                status="skipped",
-                details="Preview connectivity smoke skipped because validator or build checks already failed.",
-                command="preview route smoke (current session)",
-                logs=[],
+
+        def _run_python_tests() -> RunCheckResult:
+            python_tests_started = time.perf_counter()
+            python_tests_result = self._run_python_app_tests(backend_dir)
+            python_tests_result.duration_ms = int((time.perf_counter() - python_tests_started) * 1000)
+            return python_tests_result
+
+        def _run_js_tests() -> RunCheckResult:
+            js_tests_started = time.perf_counter()
+            js_tests_result = self._run_js_app_tests(backend_dir)
+            js_tests_result.duration_ms = int((time.perf_counter() - js_tests_started) * 1000)
+            return js_tests_result
+
+        def _run_preview_checks() -> tuple[RunCheckResult, RunCheckResult]:
+            preview_started = time.perf_counter()
+            preview = self.preview_service.get(workspace_id)
+            if should_skip_preview:
+                duration_ms = int((time.perf_counter() - preview_started) * 1000)
+                preview_boot_result = RunCheckResult(
+                    name="preview_boot_smoke",
+                    status="skipped",
+                    details="Preview smoke skipped because validator or build checks already failed.",
+                    duration_ms=duration_ms,
+                    command="preview smoke (current session)",
+                    logs=[],
+                )
+                connectivity_result = RunCheckResult(
+                    name="preview_connectivity_smoke",
+                    status="skipped",
+                    details="Preview connectivity smoke skipped because validator or build checks already failed.",
+                    duration_ms=duration_ms,
+                    command="preview route smoke (current session)",
+                    logs=[],
+                )
+                return preview_boot_result, connectivity_result
+            preview_boot_result = RunCheckResult(
+                name="preview_boot_smoke",
+                status="skipped" if preview.status in {"stopped", "error"} else "passed",
+                details="Draft preview smoke recorded using the current preview session.",
+                command="preview smoke (current session)",
+                logs=preview.logs[-12:],
             )
-        else:
-            preview_status = "skipped" if preview.status in {"stopped", "error"} else "passed"
-            preview_details = "Draft preview smoke recorded using the current preview session."
-            preview_logs = preview.logs[-12:]
             connectivity_result = self._preview_connectivity_smoke(
                 source_dir=source_dir,
                 preview=preview,
                 preview_run_id=preview_run_id,
             )
-        results.append(
-            RunCheckResult(
-                name="preview_boot_smoke",
-                status=preview_status,
-                details=preview_details,
-                duration_ms=int((time.perf_counter() - preview_started) * 1000),
-                command="preview smoke (current session)",
-                logs=preview_logs,
-            )
-        )
-        connectivity_result.duration_ms = int((time.perf_counter() - preview_started) * 1000)
+            duration_ms = int((time.perf_counter() - preview_started) * 1000)
+            preview_boot_result.duration_ms = duration_ms
+            connectivity_result.duration_ms = duration_ms
+            return preview_boot_result, connectivity_result
+
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="check-runner") as executor:
+            python_future = executor.submit(_run_python_tests)
+            js_future = executor.submit(_run_js_tests)
+            preview_future = executor.submit(_run_preview_checks)
+            python_tests_result = python_future.result()
+            js_tests_result = js_future.result()
+            preview_boot_result, connectivity_result = preview_future.result()
+
+        results.append(python_tests_result)
+        results.append(js_tests_result)
+        results.append(preview_boot_result)
         results.append(connectivity_result)
 
         completed_at = utc_now()

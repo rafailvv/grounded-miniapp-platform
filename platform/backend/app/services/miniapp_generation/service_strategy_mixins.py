@@ -319,7 +319,7 @@ class ServiceStrategyMixins:
             return "contract_patch"
         if ServiceStrategyMixins._looks_like_role_flow_expansion_request(lowered):
             return "ui_flow_patch"
-        return None
+        return "role_patch"
 
     @staticmethod
     def _scope_mode(intent: str, prompt: str, role_scope: list[str]) -> str:
@@ -360,6 +360,8 @@ class ServiceStrategyMixins:
             return "The request expands an existing single-role UI flow, so generation uses bounded role regeneration instead of a micro-patch."
         if role_patch_kind == "contract_patch":
             return "The request changes a single-role contract-backed behavior, so generation uses bounded role regeneration with related runtime files when needed."
+        if role_patch_kind == "role_patch":
+            return "The request changes one existing role surface, so generation stays bounded to that role bundle instead of reworking the whole app."
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
             return "The request describes a new workflow-heavy app surface, so generation uses whole-file bundles."
         if len(role_scope) > 1:
@@ -384,6 +386,8 @@ class ServiceStrategyMixins:
             return False
         if role_patch_kind == "ui_flow_patch":
             return True
+        if role_patch_kind == "role_patch":
+            return False
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
             return True
         if intent in {"edit", "refine", "role_only_change"}:

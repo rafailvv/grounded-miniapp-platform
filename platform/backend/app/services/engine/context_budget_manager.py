@@ -17,12 +17,17 @@ class ContextBudgetManager:
         retrieval_chunks = profile.planning_code_limit + max(1, target_file_count // 3)
         file_bodies = min(profile.targeted_file_limit, max(target_file_count, profile.planning_code_limit))
         failure_packet = 9000 if run_mode == "fix" else 3000
+        recent_diff_chars = 8000
+        if profile.mode == "fast":
+            recent_diff_chars = 1500 if run_mode == "fix" else 0
+        elif profile.mode == "balanced":
+            recent_diff_chars = 5000
         return {
             "stable_prefix": 2500,
             "workspace_summary": 800,
             "retrieval_chunks": retrieval_chunks,
             "file_bodies": file_bodies,
-            "recent_diff_chars": 8000 if profile.mode != "fast" else 3000,
+            "recent_diff_chars": recent_diff_chars,
             "failure_packet_chars": failure_packet,
             "compact_summary_chars": 1200 if profile.mode == "fast" else 2400 if profile.mode == "balanced" else 4200,
             "narrow_path": narrow_path,

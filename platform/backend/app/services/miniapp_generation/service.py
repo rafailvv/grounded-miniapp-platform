@@ -292,6 +292,8 @@ class GenerationService(
             "_resolve_code_edits": "generation_codegen",
             "_resolve_whole_file_code_edits": "generation_codegen",
             "_resolve_page_file_edits_async": "generation_codegen",
+            "_should_prefer_deterministic_fast_cluster": "generation_codegen",
+            "_deterministic_fast_cluster_result": "generation_codegen",
             "_whole_file_cluster_user_prompt": "generation_codegen_prompts",
             "_resolve_whole_file_cluster": "generation_codegen_clusters",
             "_timed_whole_file_cluster": "generation_codegen_clusters",

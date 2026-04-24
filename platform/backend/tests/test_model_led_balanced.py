@@ -924,10 +924,11 @@ def test_deterministic_crud_route_normalizes_done_alias_to_completed() -> None:
 
     assert "status_aliases = {" in source
     assert '"done": "completed"' in source
+    assert '"canceled": "cancelled"' in source
     assert 'normalized = status_aliases.get(status, status)' in source
-    assert 'if not allowed or normalized in allowed:' in source
-    assert 'if normalized == "completed":' in source
-    assert 'for candidate in ("completed", "closed", "resolved"):' in source
+    assert 'status_families = (' in source
+    assert '("not_started", ("scheduled", "open", "new", "created", "accepted", "pending", "submitted", "queued", "draft"))' in source
+    assert '("cancelled", ("cancelled", "canceled", "rejected"))' in source
 
 
 def test_stabilizer_preserves_valid_refresh_ui_changes(tmp_path: Path) -> None:
@@ -1127,3 +1128,69 @@ def test_frontend_contract_sync_removes_empty_status_indicator_placeholders() ->
     assert "status-pill-danger" not in updated
     assert "filter-feedback" not in updated
     assert "chip-active" in updated
+
+
+def test_frontend_contract_sync_injects_status_alias_bridge_for_noncanonical_schema_literals() -> None:
+    content = """
+    const response = await window.miniappApiFetch("/api/records");
+    const data = await response.json();
+    const status = item.status || "open";
+    """
+
+    updated = MiniappGenerationContractFrontend._inject_status_alias_bridge(
+        "miniapp/app/static/specialist/app.js",
+        content,
+        {"status_literals": ["scheduled", "in_progress", "completed", "cancelled"]},
+    )
+
+    assert "__GROUND_STATUS_READ_ALIASES__" in updated
+    assert '"scheduled": "open"' in updated
+    assert "__groundNormalizeStatusPayload(await response.json())" in updated
+
+
+def test_frontend_contract_sync_prefers_schema_status_literals_over_prompt_contract() -> None:
+    schema_content = 'RecordStatus = Literal["scheduled", "in_progress", "completed", "cancelled"]'
+
+    assert MiniappGenerationContractFrontend._schema_status_literals_from_text(schema_content) == [
+        "scheduled",
+        "in_progress",
+        "completed",
+        "cancelled",
+    ]
+
+
+def test_frontend_contract_sync_does_not_treat_active_css_class_as_status_alias() -> None:
+    content = """
+    <button class="chip active" data-status="open">Open</button>
+    const activeFilter = "all";
+    const status = item.status || "open";
+    """
+
+    alias_map = MiniappGenerationContractFrontend._status_read_alias_map(
+        content,
+        {"status_literals": ["scheduled", "in_progress", "completed", "cancelled"]},
+    )
+
+    assert alias_map == {"scheduled": "open"}
+
+
+def test_build_validator_flags_missing_status_alias_bridge_for_noncanonical_schema_literals(tmp_path: Path) -> None:
+    workspace = tmp_path
+    static_dir = workspace / "miniapp" / "app" / "static" / "specialist"
+    static_dir.mkdir(parents=True)
+    schemas_path = workspace / "miniapp" / "app" / "schemas.py"
+    schemas_path.parent.mkdir(parents=True, exist_ok=True)
+    schemas_path.write_text(
+        'from typing import Literal\nRecordStatus = Literal["scheduled", "in_progress", "completed", "cancelled"]\n',
+        encoding="utf-8",
+    )
+    (static_dir / "app.js").write_text(
+        'const response = await window.miniappApiFetch("/api/records");\n'
+        'const data = await response.json();\n'
+        'const status = item.status || "open";\n',
+        encoding="utf-8",
+    )
+
+    issues = BuildValidator()._validate_status_alias_contract(workspace)
+
+    assert any(issue.code == "build.status_alias_bridge_missing" for issue in issues)
