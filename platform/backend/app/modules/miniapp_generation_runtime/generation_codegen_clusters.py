@@ -657,6 +657,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                             return {
                                 "assistant_message": str(normalized.get("diagnosis") or normalized.get("assistant_message") or "").strip() or f"{cluster_name} already matches the requested workspace state.",
                                 "operations": [],
+                                "target_files": list(cluster_targets),
                                 "model": payload["model"],
                                 "outcome": "no_op",
                                 "tool_results": list(tool_results_for_attempt),
@@ -690,6 +691,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                     return {
                         "assistant_message": str(normalized.get("diagnosis") or normalized.get("assistant_message") or "").strip(),
                         "operations": operations,
+                        "target_files": list(cluster_targets),
                         "model": payload["model"],
                         "tool_results": list(tool_results_for_attempt),
                     }
@@ -711,7 +713,12 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
             result = self._resolve_whole_file_cluster(**kwargs)
         except Exception as exc:
             return {"error": f"Whole-file cluster failed for {kwargs['cluster_name']}: {exc}"}
-        return {**result, "cluster_name": kwargs["cluster_name"], "target_files": kwargs["cluster_targets"], "duration_ms": int((time.perf_counter() - started) * 1000)}
+        return {
+            **result,
+            "cluster_name": kwargs["cluster_name"],
+            "target_files": list(result.get("target_files") or kwargs["cluster_targets"]),
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
 
     def _resolve_composition_edit(
         self,
@@ -893,6 +900,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                         return {
                             "assistant_message": diagnosis or f"{stage_name.capitalize()} stage completed without backend changes.",
                             "operations": [],
+                            "target_files": list(target_files),
                             "model": payload["model"],
                             "tool_results": list(tool_results_for_attempt),
                         }
@@ -908,6 +916,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                     return {
                         "assistant_message": str(normalized.get("diagnosis") or normalized.get("assistant_message") or "").strip(),
                         "operations": operations,
+                        "target_files": list(target_files),
                         "model": payload["model"],
                         "tool_results": list(tool_results_for_attempt),
                     }
@@ -930,7 +939,12 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
         result = self._resolve_composition_edit(**{k: v for k, v in kwargs.items() if k != "cluster_name"})
         if "error" in result:
             return result
-        return {**result, "cluster_name": kwargs["cluster_name"], "target_files": kwargs["target_files"], "duration_ms": int((time.perf_counter() - started) * 1000)}
+        return {
+            **result,
+            "cluster_name": kwargs["cluster_name"],
+            "target_files": list(result.get("target_files") or kwargs["target_files"]),
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
 
     def _execute_tool_requested_checks(
         self,

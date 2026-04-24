@@ -10,7 +10,6 @@ from app.ai.openrouter_client import OpenRouterClient
 from app.ai.model_registry import resolve_model_profile
 from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
 from app.models.domain import ChatTurnRecord, GenerateRequest, JobRecord
-from app.models.grounded_spec import GroundedSpecModel
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
 from app.services.code_index_service import CodeIndexService
@@ -18,7 +17,7 @@ from app.services.context_pack_builder import ContextPackBuilder
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.miniapp_generation.artifact_builder import MiniappArtifactBuilder
 from app.services.miniapp_generation.runtime_dispatch import RuntimeDispatchMixin, RuntimeOwnerMeta
-from app.services.miniapp_generation.constants import DESIGN_REFERENCE_FILES, ROLE_ORDER
+from app.services.miniapp_generation.constants import ROLE_ORDER
 from app.services.miniapp_generation.service_contract_materialization_mixins import ServiceContractMaterializationMixins
 from app.services.miniapp_generation.service_llm_grounded_misc_mixins import ServiceLlmGroundedMiscMixins
 from app.services.miniapp_generation.service_page_defaults_mixins import ServicePageDefaultsMixins
@@ -63,12 +62,6 @@ from app.modules.miniapp_generation_runtime import (
     MiniappGenerationRepair,
     MiniappGenerationShellContract,
     MiniappGroundedSpecBuilder,
-    compile_prompt_to_scaffold,
-    mentions_schedule_or_time,
-    scaffold_backend_targets_from_spec,
-    scaffold_page_slug_for_route,
-    scaffold_role_pages_for_role,
-    scaffold_role_responsibility,
     select_creative_direction,
 )
 from app.modules.miniapp_materialization.materialization import MiniappMaterializationService
@@ -529,42 +522,6 @@ class GenerationService(
             ACTIVE_LLM_CACHE_CONTEXT.reset(cache_context_token)
             ACTIVE_LLM_CACHE_STATS.reset(cache_stats_token)
 
-    def _compile_prompt_to_scaffold(self, *, prompt: str, grounded_spec: GroundedSpecModel, entity_contract: dict[str, Any] | None, role_scope: list[str], workspace_tree: list[dict[str, str]]) -> tuple[dict[str, Any], dict[str, Any]]:
-        return compile_prompt_to_scaffold(
-            prompt=prompt,
-            grounded_spec=grounded_spec,
-            entity_contract=entity_contract,
-            role_scope=role_scope,
-            workspace_tree=workspace_tree,
-            design_reference_files=DESIGN_REFERENCE_FILES,
-            default_page_file=self._default_page_file,
-            default_page_asset_path=self._default_page_asset_path,
-            default_handoff_paths_for_page_kind=self._default_handoff_paths_for_page_kind,
-            canonicalize_target_files=self._canonicalize_target_files,
-            sanitize_planner_target_files=self._sanitize_planner_target_files,
-            sanitize_backend_targets=self._sanitize_backend_targets,
-            collect_files_to_read=self._collect_files_to_read,
-            build_generation_clusters=self._build_generation_clusters,
-            build_execution_plan=self._build_execution_plan,
-        )
-
-    def _scaffold_role_pages_for_role(self, *, role: str, prompt: str, grounded_spec: GroundedSpecModel) -> list[dict[str, Any]]:
-        return scaffold_role_pages_for_role(role=role, prompt=prompt, grounded_spec=grounded_spec, default_page_file=self._default_page_file, default_page_asset_path=self._default_page_asset_path, default_handoff_paths_for_page_kind=self._default_handoff_paths_for_page_kind)
-
-    @staticmethod
-    def _scaffold_page_slug_for_route(route_path: str) -> str:
-        return scaffold_page_slug_for_route(route_path)
-
-    def _scaffold_backend_targets_from_spec(self, *, prompt: str, grounded_spec: GroundedSpecModel, role_scope: list[str]) -> list[str]:
-        return scaffold_backend_targets_from_spec(prompt=prompt, grounded_spec=grounded_spec, role_scope=role_scope)
-
-    @staticmethod
-    def _mentions_schedule_or_time(prompt: str, grounded_spec: GroundedSpecModel) -> bool:
-        return mentions_schedule_or_time(prompt, grounded_spec)
-
-    @staticmethod
-    def _scaffold_role_responsibility(role: str, grounded_spec: GroundedSpecModel) -> str:
-        return scaffold_role_responsibility(role, grounded_spec)
 
     def _store_resume_checkpoint(self, *, workspace_id: str, draft_run_id: str, request: GenerateRequest, role_scope: list[str], role_contract: dict[str, Any], plan_result: dict[str, Any]) -> None:
         self.generation_resume.store_resume_checkpoint(workspace_id=workspace_id, draft_run_id=draft_run_id, request=request, role_scope=role_scope, role_contract=role_contract, plan_result=plan_result)

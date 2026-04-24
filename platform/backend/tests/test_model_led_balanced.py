@@ -685,7 +685,7 @@ def test_backend_route_targets_group_into_one_backend_routes_cluster() -> None:
     ]
 
 
-def test_provider_budget_role_ui_fallback_materializes_contract_pages() -> None:
+def test_provider_budget_role_ui_fallback_is_disabled() -> None:
     runtime = object.__new__(MiniappGenerationCodegen)
     runtime.workspace_service = _DummyWorkspaceService(
         {"miniapp/app/static/manager/profile/index.html": "<!doctype html><html></html>"}
@@ -714,19 +714,10 @@ def test_provider_budget_role_ui_fallback_materializes_contract_pages() -> None:
         },
     )
 
-    assert result is not None
-    operations = result["operations"]
-    paths = {operation.file_path for operation in operations}
-    assert "miniapp/app/static/manager/index.html" in paths
-    assert "miniapp/app/static/manager/details/app.js" in paths
-    assert "miniapp/app/static/manager/profile/index.html" not in paths
-    joined = "\n".join(str(operation.content or "") for operation in operations)
-    assert "/api/cases" in joined
-    assert "customer_name" in joined
-    assert "Booking" not in joined
+    assert result is None
 
 
-def test_split_role_ui_timeout_fallback_materializes_contract_pages() -> None:
+def test_split_role_ui_timeout_fallback_is_disabled() -> None:
     runtime = object.__new__(MiniappGenerationCodegen)
     runtime.workspace_service = _DummyWorkspaceService()
 
@@ -749,16 +740,7 @@ def test_split_role_ui_timeout_fallback_materializes_contract_pages() -> None:
         timeout_seconds=420,
     )
 
-    assert result is not None
-    assert result["fallback_used"] is True
-    assert {operation.file_path for operation in result["operations"]} == {
-        "miniapp/app/static/client/details/index.html",
-        "miniapp/app/static/client/details/styles.css",
-        "miniapp/app/static/client/details/app.js",
-    }
-    joined = "\n".join(str(operation.content or "") for operation in result["operations"])
-    assert "/api/cases" in joined
-    assert "customer_name" in joined
+    assert result is None
 
 
 def test_balanced_role_ui_timeout_uses_service_default_not_short_cap() -> None:

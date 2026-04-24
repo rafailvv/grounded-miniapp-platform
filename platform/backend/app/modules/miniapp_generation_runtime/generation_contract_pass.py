@@ -114,12 +114,6 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
         )
         ensured = self._normalize_sqlalchemy_db_defaults(operations=ensured)
         ensured = self._remove_seeded_generated_artifacts(operations=ensured)
-        ensured = self._synchronize_minimal_workflow_route_contracts(
-            workspace_id,
-            draft_run_id,
-            ensured,
-            contract_sync_mode=contract_sync_mode,
-        )
         if contract_sync_mode == "repair_invariants":
             ensured = self._synchronize_profile_schema_contract(
                 workspace_id,

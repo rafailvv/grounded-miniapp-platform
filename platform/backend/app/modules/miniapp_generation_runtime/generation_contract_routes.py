@@ -92,50 +92,8 @@ class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
         operations: list[DraftFileOperation],
         contract_sync_mode: str = "bootstrap_only",
     ) -> list[DraftFileOperation]:
-        operation_map = {operation.file_path: operation for operation in operations}
-        bootstrap_route_templates = {
-            "miniapp/app/routes/client.py": MiniappGenerationContractPageSources._deterministic_client_page_route_source(),
-            "miniapp/app/routes/specialist.py": MiniappGenerationContractPageSources._deterministic_specialist_page_route_source(),
-            "miniapp/app/routes/manager.py": MiniappGenerationContractPageSources._deterministic_manager_page_route_source(),
-            "miniapp/app/routes/profiles.py": MiniappGenerationContractApiRoutesSupport._deterministic_profiles_route_source(),
-            "miniapp/app/routes/runtime.py": MiniappGenerationContractApiRoutesRuntime._deterministic_runtime_route_source(),
-        }
-        for file_path, template in bootstrap_route_templates.items():
-            content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, file_path)
-            if content is None:
-                operation_map[file_path] = DraftFileOperation(
-                    file_path=file_path,
-                    operation="replace",
-                    content=template,
-                    reason="Pre-apply contract sync: bootstrap a missing runtime route module from the template contract.",
-                )
-                continue
-            if self._route_module_needs_stub(content):
-                operation_map[file_path] = DraftFileOperation(
-                    file_path=file_path,
-                    operation="replace",
-                    content=template,
-                    reason="Pre-apply contract sync: replace an empty route stub with a minimal bootstrap contract.",
-                )
-                continue
-            if self._route_module_requires_db_backed_repair(file_path, content):
-                operation_map[file_path] = DraftFileOperation(
-                    file_path=file_path,
-                    operation="replace",
-                    content=template,
-                    reason="Pre-apply contract sync: restore a hard-invariant DB-backed route module when placeholder persistence leaked into the draft.",
-                )
-                continue
-            if file_path.endswith("/runtime.py"):
-                normalized = self._normalize_runtime_route_module_source(content)
-                if normalized != content:
-                    operation_map[file_path] = DraftFileOperation(
-                        file_path=file_path,
-                        operation="replace",
-                        content=normalized,
-                        reason="Pre-apply contract sync: normalize runtime route module invariants without regenerating the whole app route layer.",
-                    )
-        return list(operation_map.values())
+        del workspace_id, draft_run_id, contract_sync_mode
+        return list(operations)
 
     @staticmethod
     def _route_module_needs_stub(content: str) -> bool:

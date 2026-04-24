@@ -658,56 +658,8 @@ function escapeHtml(value) {{
         entity_contract: dict[str, Any],
         timeout_seconds: int = 0,
     ) -> dict[str, Any] | None:
-        if not (cluster_name.startswith("role_") and "_ui_" in cluster_name):
-            return None
-        target_parts = [self._role_ui_target_parts(target) for target in cluster_targets]
-        if not target_parts or any(parts is None for parts in target_parts):
-            return None
-        operations: list[DraftFileOperation] = []
-        for target, parts in zip(cluster_targets, target_parts, strict=False):
-            assert parts is not None
-            role, slug, name = parts
-            if slug == "profile":
-                existing = self.workspace_service.try_read_text_file(workspace_id, target, run_id=draft_run_id)
-                if existing is not None:
-                    continue
-            if name == "index.html":
-                content = self._role_ui_fallback_html(
-                    role=role,
-                    slug=slug,
-                    file_path=target,
-                    entity_contract=entity_contract,
-                )
-            elif name == "styles.css":
-                content = self._role_ui_fallback_css()
-            else:
-                content = self._role_ui_fallback_js(
-                    role=role,
-                    slug=slug,
-                    entity_contract=entity_contract,
-                )
-            operations.append(
-                DraftFileOperation(
-                    file_path=target,
-                    operation="replace",
-                    content=content,
-                    reason=(
-                        "Provider-budget fallback: materialize a neutral DB-backed role page from the "
-                        "extracted entity contract instead of blocking the run."
-                    ),
-                )
-            )
-        return {
-            "cluster_name": cluster_name,
-            "target_files": list(cluster_targets),
-            "assistant_message": (
-                f"{cluster_name} could not be generated because the LLM provider had insufficient output budget, "
-                "so neutral DB-backed role pages were materialized from the entity contract."
-            ),
-            "operations": operations,
-            "duration_ms": int(timeout_seconds * 1000),
-            "fallback_used": True,
-        }
+        del workspace_id, draft_run_id, cluster_name, cluster_targets, entity_contract, timeout_seconds
+        return None
 
     @staticmethod
     def _should_prefer_deterministic_fast_cluster(
@@ -718,22 +670,8 @@ function escapeHtml(value) {{
         role_scope: list[str],
         cluster_name: str,
     ) -> bool:
-        if generation_mode != GenerationMode.FAST or intent != "create":
-            return False
-        if len(role_scope) > 3:
-            return False
-        entity_count = len(list(getattr(grounded_spec, "domain_entities", []) or []))
-        persistence_count = len(list(getattr(grounded_spec, "persistence_requirements", []) or []))
-        api_count = len(list(getattr(grounded_spec, "api_requirements", []) or []))
-        flow_count = len(list(getattr(grounded_spec, "user_flows", []) or []))
-        if entity_count > 2 or persistence_count > 5 or api_count > 6 or flow_count > 4:
-            return False
-        return (
-            cluster_name == "shared_static"
-            or cluster_name in {"backend_support", "backend_routes"}
-            or cluster_name.startswith("backend_route_")
-            or (cluster_name.startswith("role_") and "_ui_" in cluster_name)
-        )
+        del generation_mode, intent, grounded_spec, role_scope, cluster_name
+        return False
 
     def _deterministic_fast_cluster_result(
         self,
@@ -744,44 +682,7 @@ function escapeHtml(value) {{
         cluster_targets: list[str],
         entity_contract: dict[str, Any],
     ) -> dict[str, Any] | None:
-        if cluster_name == "shared_static":
-            fallback = self._whole_file_static_reuse_fallback_result(
-                workspace_id=workspace_id,
-                draft_run_id=draft_run_id,
-                cluster_name=cluster_name,
-                cluster_targets=cluster_targets,
-                timeout_seconds=0,
-            )
-            if fallback is not None:
-                fallback["assistant_message"] = (
-                    f"{cluster_name} used the FAST deterministic-first path and kept the existing shared static surface."
-                )
-            return fallback
-        if cluster_name in {"backend_support", "backend_routes"} or cluster_name.startswith("backend_route_"):
-            fallback = self._whole_file_timeout_fallback_result(
-                cluster_name=cluster_name,
-                cluster_targets=cluster_targets,
-                timeout_seconds=0,
-            )
-            if fallback is not None:
-                fallback["assistant_message"] = (
-                    f"{cluster_name} used the FAST deterministic-first path and applied the canonical backend contract."
-                )
-            return fallback
-        if cluster_name.startswith("role_") and "_ui_" in cluster_name:
-            fallback = self._whole_file_role_ui_fallback_result(
-                workspace_id=workspace_id,
-                draft_run_id=draft_run_id,
-                cluster_name=cluster_name,
-                cluster_targets=cluster_targets,
-                entity_contract=entity_contract,
-                timeout_seconds=0,
-            )
-            if fallback is not None:
-                fallback["assistant_message"] = (
-                    f"{cluster_name} used the FAST deterministic-first path and materialized a neutral DB-backed role surface."
-                )
-            return fallback
+        del workspace_id, draft_run_id, cluster_name, cluster_targets, entity_contract
         return None
 
     def _whole_file_batch_timeout_seconds(
@@ -809,33 +710,8 @@ function escapeHtml(value) {{
         cluster_targets: list[str],
         timeout_seconds: int = 0,
     ) -> dict[str, Any] | None:
-        operations: list[DraftFileOperation] = []
-        for target in cluster_targets:
-            deterministic_source = self.generation_contract_routes._deterministic_route_source_for_path(target)
-            if deterministic_source is None:
-                return None
-            operations.append(
-                DraftFileOperation(
-                    file_path=target,
-                    operation="replace",
-                    content=deterministic_source,
-                    reason=(
-                        "Whole-file generation timeout fallback: restore this canonical route module "
-                        "from the deterministic contract source instead of blocking the entire run."
-                    ),
-                )
-            )
-        return {
-            "cluster_name": cluster_name,
-            "target_files": list(cluster_targets),
-            "assistant_message": (
-                f"{cluster_name} timed out during whole-file generation, so the canonical deterministic "
-                "route contract was applied instead."
-            ),
-            "operations": operations,
-            "duration_ms": int(timeout_seconds * 1000),
-            "fallback_used": True,
-        }
+        del cluster_name, cluster_targets, timeout_seconds
+        return None
 
     def _whole_file_static_reuse_fallback_result(
         self,
@@ -874,53 +750,14 @@ function escapeHtml(value) {{
         error_message: str,
         entity_contract: dict[str, Any],
     ) -> dict[str, Any] | None:
-        lowered = str(error_message or "").lower()
-        if self._is_provider_budget_error(error_message) and (
-            cluster_name == "backend_support"
-            or cluster_name == "backend_routes"
-            or cluster_name.startswith("backend_route_")
-        ):
-            fallback = self._whole_file_timeout_fallback_result(
-                cluster_name=cluster_name,
-                cluster_targets=cluster_targets,
-            )
-            if fallback is not None:
-                fallback["assistant_message"] = (
-                    f"{cluster_name} could not be generated because the LLM provider had insufficient output budget, "
-                    "so the deterministic backend contract was applied instead."
-                )
-                return fallback
-        if self._is_provider_budget_error(error_message):
-            fallback = self._whole_file_role_ui_fallback_result(
-                workspace_id=workspace_id,
-                draft_run_id=draft_run_id,
-                cluster_name=cluster_name,
-                cluster_targets=cluster_targets,
-                entity_contract=entity_contract,
-            )
-            if fallback is not None:
-                return fallback
-        if not any(
-            marker in lowered
-            for marker in (
-                "returned no file operations",
-                "exhausted the tool-request budget",
-                "requested files that were already present in the current context",
-                "repeated identical tool requests",
-            )
-        ):
-            return None
-        fallback = self._whole_file_timeout_fallback_result(
+        del error_message, entity_contract
+        return self._whole_file_static_reuse_fallback_result(
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
             cluster_name=cluster_name,
             cluster_targets=cluster_targets,
+            timeout_seconds=0,
         )
-        if fallback is None:
-            return None
-        fallback["assistant_message"] = (
-            f"{cluster_name} failed during whole-file generation, so the canonical deterministic "
-            "route contract was applied instead."
-        )
-        return fallback
 
     def _resolve_code_edits(
         self,

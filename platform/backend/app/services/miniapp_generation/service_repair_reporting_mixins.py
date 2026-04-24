@@ -119,14 +119,12 @@ class ServiceRepairReportingMixins:
     def _expand_repair_targets_for_safe_companions(cls, *, target_files: list[str], invalid_paths: list[str], build_issues: list[ValidationIssue]) -> list[str] | None:
         if not invalid_paths:
             return list(dict.fromkeys(target_files))
-        issue_static_paths: set[str] = set()
+        issue_implicated_paths: set[str] = set()
         for issue in build_issues:
             location = str(issue.location or "").strip().lstrip("./")
-            issue_static_paths.update(cls._safe_static_companion_paths(location))
-        issue_text = " ".join(f"{issue.code} {issue.message}" for issue in build_issues).lower()
-        if not any(marker in issue_text for marker in ("shared", "static asset", "script", "dom", "loading", "error state", "ui")):
-            if not issue_static_paths:
-                return None
+            if cls._is_canonical_target_path(location):
+                issue_implicated_paths.add(location)
+            issue_implicated_paths.update(cls._safe_static_companion_paths(location))
         additions: list[str] = []
         for path in invalid_paths:
             if not isinstance(path, str):
@@ -134,7 +132,7 @@ class ServiceRepairReportingMixins:
             if not cls._is_canonical_target_path(path):
                 return None
             normalized_path = path.strip().lstrip("./")
-            if normalized_path in issue_static_paths:
+            if normalized_path in issue_implicated_paths:
                 additions.append(normalized_path)
                 continue
             if not normalized_path.startswith("miniapp/app/static/shared/"):

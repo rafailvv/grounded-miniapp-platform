@@ -79,9 +79,9 @@ WORKSPACE_NAME_STOPWORDS = {
     "with",
 }
 ROLE_SCOPE_HINTS: dict[str, tuple[str, ...]] = {
-    "client": ("client", "customer", "user", "клиент", "пользователь", "заказчик"),
-    "specialist": ("specialist", "worker", "master", "executor", "washer", "специалист", "мастер", "исполнитель", "мойщик"),
-    "manager": ("manager", "admin", "administrator", "operator", "менеджер", "администратор", "оператор", "админ"),
+    "client": ("client", "customer", "buyer", "shopper", "user", "клиент", "покупатель", "покупательница", "пользователь", "заказчик"),
+    "specialist": ("specialist", "worker", "staff", "employee", "master", "executor", "washer", "seller", "agent", "специалист", "сотрудник", "мастер", "исполнитель", "мойщик", "продавец", "операционист"),
+    "manager": ("manager", "admin", "administrator", "operator", "owner", "менеджер", "администратор", "оператор", "админ", "руководитель", "владелец"),
 }
 
 

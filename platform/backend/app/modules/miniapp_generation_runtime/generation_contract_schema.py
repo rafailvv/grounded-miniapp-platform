@@ -3,9 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import MiniappGenerationContractApiRoutesCrud
 from app.modules.miniapp_generation_runtime.generation_plan_runtime import FORBIDDEN_ROUTE_MODULE_STEMS
-from app.modules.miniapp_generation_runtime.generation_contract_api_routes_support import MiniappGenerationContractApiRoutesSupport
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
 from app.models.domain import DraftFileOperation
 
@@ -193,14 +191,6 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
         schemas_content = self._operation_or_workspace_content(workspace_id, draft_run_id, operation_map, schemas_path)
         if not profiles_content or not schemas_content:
             return operations
-        if self._needs_profile_contract_repair(profiles_content):
-            operation_map[profiles_path] = DraftFileOperation(
-                file_path=profiles_path,
-                operation="replace",
-                content=MiniappGenerationContractApiRoutesSupport._deterministic_profiles_route_source(),
-                reason="Pre-apply contract sync: strip placeholder profile persistence and restore DB-backed empty-profile behavior.",
-            )
-            profiles_content = operation_map[profiles_path].content
         if "from app.schemas import" not in profiles_content or "RoleProfile" not in profiles_content:
             return operations
         updated_schemas = schemas_content
@@ -324,18 +314,6 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
                         reason="Pre-apply contract sync: let the resource route reuse the actual schema prefix declared in schemas.py.",
                     )
                     content = patched_content
-            if (
-                Path(file_path).stem not in self._FEATURE_ROUTE_EXCLUDED_STEMS
-                and self._needs_canonical_resource_route_repair(content, Path(file_path).stem)
-            ):
-                resource_stem = Path(file_path).stem
-                operation_map[file_path] = DraftFileOperation(
-                    file_path=file_path,
-                    operation="replace",
-                    content=MiniappGenerationContractApiRoutesCrud._deterministic_resource_route_source(resource_stem),
-                    reason=f"Pre-apply contract sync: keep {resource_stem}.py aligned with the generic workflow resource contract instead of drifting into route-local models.",
-                )
-                continue
             imported_names.update(self._normalized_imported_schema_names(content))
         if not self._needs_route_schema_contract_repair(imported_names, schemas_content):
             return list(operation_map.values())

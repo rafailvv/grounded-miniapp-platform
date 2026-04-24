@@ -52,7 +52,7 @@ class MiniappGenerationEntry:
         if fast_visual_job is not None:
             return fast_visual_job
 
-        self.service._append_event(job, "building_scaffold", "Building a prompt-driven generation plan on top of the minimal template bootstrap.")
+        self.service._append_event(job, "building_scaffold", "Building a planner-driven generation surface on top of the minimal template bootstrap.")
         self.service._append_trace(
             workspace_id,
             "generation_loop_started",
@@ -72,7 +72,7 @@ class MiniappGenerationEntry:
         self.service._append_trace(
             workspace_id,
             "grounded_spec_ready",
-            "Grounded spec compiled before prompt-driven scaffold planning.",
+            "Grounded spec compiled before planner-driven file targeting.",
             {"llm_spec_stage_removed": True},
         )
         grounded_spec = self.service._stabilize_grounded_spec(grounded_spec)
@@ -135,7 +135,6 @@ class MiniappGenerationEntry:
         draft_source = self.service.workspace_service.prepare_draft(workspace_id, draft_run_id)
         self.service._append_event(job, "draft_prepared", "Prepared draft workspace from the current revision.")
 
-        workspace_tree = self.service.workspace_service.file_tree(workspace_id, run_id=draft_run_id)
         role_contract_result = self.service._resolve_role_contract(
             prompt=effective_prompt,
             grounded_spec=grounded_spec,
@@ -171,25 +170,18 @@ class MiniappGenerationEntry:
             generation_mode=generation_mode,
             creative_direction=creative_direction,
         )
-        inferred_role_contract, inferred_plan_result = self.service._compile_prompt_to_scaffold(
-            prompt=effective_prompt,
-            grounded_spec=grounded_spec,
-            entity_contract=entity_contract,
-            role_scope=role_scope,
-            workspace_tree=workspace_tree,
-        )
         role_contract, plan_result = self._merge_advisory_generation_inputs(
             role_contract=role_contract,
-            inferred_role_contract=inferred_role_contract,
+            inferred_role_contract={},
             advisory_plan_result=advisory_plan_result,
-            inferred_plan_result=inferred_plan_result,
+            inferred_plan_result={},
         )
         plan_error = str(advisory_plan_result.get("error") or "").strip()
-        self.service._append_event(job, "scaffold_ready", "Bootstrap targets and advisory generation hints are ready.")
+        self.service._append_event(job, "scaffold_ready", "Planner targets and advisory generation hints are ready.")
         self.service._append_trace(
             workspace_id,
             "generation_plan_advisory",
-            "Normal generation merged prompt/template inference with advisory planner hints before tool-owned code generation.",
+            "Normal generation used planner hints directly without Python-authored app scaffolding before tool-owned code generation.",
             {
                 "planner_error": plan_error or None,
                 "target_files": len(plan_result["target_files"]),
@@ -208,7 +200,7 @@ class MiniappGenerationEntry:
         self.service._append_trace(
             workspace_id,
             "generation_runtime_ready",
-            "Bootstrap targets and advisory generation inputs were prepared before code generation.",
+            "Planner targets and advisory generation inputs were prepared before code generation.",
             {
                 "target_files": len(plan_result["target_files"]),
                 "backend_targets": len(plan_result["backend_targets"]),
@@ -364,6 +356,12 @@ class MiniappGenerationEntry:
             for path in advisory_target_files
             if path.startswith("miniapp/app/static/")
         ]
+        runtime_bootstrap_targets = {
+            "miniapp/app/main.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/routes/runtime.py",
+        }
         visual_only_patch = bool(advisory_plan_result.get("visual_only_patch"))
         ui_flow_patch = bool(advisory_plan_result.get("ui_flow_patch") or inferred_plan_result.get("ui_flow_patch"))
         suppress_role_route_targets = bool(advisory_plan_result.get("suppress_role_route_targets"))
@@ -375,12 +373,23 @@ class MiniappGenerationEntry:
         advisory_scope_uses_targeted_merge = bool(
             scope_mode in {"minimal_patch", "workflow_partial_build"} and (advisory_page_targets or advisory_backend_targets)
         )
+        advisory_has_explicit_surface = bool(
+            scope_mode == "whole_file_build"
+            and (
+                advisory_page_targets
+                or advisory_backend_targets
+                or any(
+                    isinstance(payload, dict) and (payload.get("pages") or [])
+                    for payload in (advisory_graph.get("roles") or {}).values()
+                )
+            )
+        )
         merged_page_targets = (
             list(dict.fromkeys(advisory_page_targets))
             if advisory_scope_uses_targeted_merge and advisory_page_targets
             else self._page_graph_target_files(current_graph)
         )
-        for key in ("backend_targets", "shared_files", "files_to_read"):
+        for key in ("shared_files", "files_to_read"):
             merged_plan[key] = list(
                 dict.fromkeys(
                     [
@@ -389,6 +398,23 @@ class MiniappGenerationEntry:
                     ]
                 )
             )
+        inferred_runtime_targets = [
+            path
+            for path in (inferred_plan_result.get("backend_targets") or [])
+            if isinstance(path, str) and path in runtime_bootstrap_targets
+        ]
+        merged_plan["backend_targets"] = list(
+            dict.fromkeys(
+                [
+                    *(
+                        inferred_runtime_targets
+                        if advisory_has_explicit_surface
+                        else (inferred_plan_result.get("backend_targets") or [])
+                    ),
+                    *(advisory_plan_result.get("backend_targets") or []),
+                ]
+            )
+        )
         page_target_roles = set(self._roles_for_static_targets(merged_page_targets))
         explicit_role_route_targets = [
             str(role_payload.get("routes_file"))
@@ -424,8 +450,12 @@ class MiniappGenerationEntry:
             for path in (advisory_plan_result.get("target_files") or [])
             if not str(path).startswith("miniapp/app/static/")
         ]
-        if advisory_scope_uses_targeted_merge:
-            inferred_non_page_targets = []
+        if advisory_scope_uses_targeted_merge or advisory_has_explicit_surface:
+            inferred_non_page_targets = [
+                path
+                for path in inferred_non_page_targets
+                if path in runtime_bootstrap_targets
+            ]
         merged_plan["target_files"] = list(
             dict.fromkeys(
                 [

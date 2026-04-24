@@ -249,6 +249,12 @@ class MiniappGenerationRepair:
         check_issues = CheckRunner.failing_issues(latest_execution.results)
         build_issues = [issue for issue in check_issues if issue.location != "preview"]
         preview_issue = next((issue for issue in check_issues if issue.location == "preview"), None)
+        for path in list(latest_execution.changed_files or []):
+            normalized_path = str(path or "").strip()
+            if not normalized_path or self._is_read_only_repair_surface(normalized_path):
+                continue
+            if normalized_path not in active_repair_targets:
+                active_repair_targets.append(normalized_path)
         failure_class = self.service.check_runner.classify_failure(latest_execution.results)
         failure_signature = self.service._failure_signature_for_issues(build_issues, preview_issue)
         structural_failure = self.service._is_structural_contract_failure(build_issues)
@@ -452,23 +458,26 @@ class MiniappGenerationRepair:
         visual_only_patch = bool(plan_result.get("visual_only_patch"))
         refresh_runtime_artifacts = bool(plan_result.get("refresh_runtime_artifacts"))
         fallback_changed_files = [operation.file_path for operation in initial_operations]
+        initial_operation_targets = [
+            operation.file_path
+            for operation in initial_operations
+            if not self._is_read_only_repair_surface(operation.file_path)
+        ]
         active_repair_targets = list(
             dict.fromkeys(
-                list(plan_result.get("critic_implicated_files") or [])
-                or list(plan_result.get("target_files") or [])
+                [
+                    *list(plan_result.get("critic_implicated_files") or []),
+                    *list(plan_result.get("target_files") or []),
+                    *initial_operation_targets,
+                ]
             )
         )
         if generation_mode == GenerationMode.FAST and request.intent in {"edit", "refine", "role_only_change"}:
-            focused_operation_targets = [
-                operation.file_path
-                for operation in initial_operations
-                if not self._is_read_only_repair_surface(operation.file_path)
-            ]
             active_repair_targets = list(
                 dict.fromkeys(
                     [
                         *list(plan_result.get("critic_implicated_files") or []),
-                        *focused_operation_targets,
+                        *initial_operation_targets,
                     ]
                 )
             ) or active_repair_targets

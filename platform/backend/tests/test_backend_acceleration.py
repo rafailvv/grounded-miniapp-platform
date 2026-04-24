@@ -380,6 +380,26 @@ def test_task_router_uses_mode_resolved_profile_for_balanced() -> None:
     assert snapshot["routing"]["code_edit"] == balanced_snapshot["routing"]["code_edit"]
 
 
+def test_run_service_resolves_common_store_role_synonyms_to_all_three_roles() -> None:
+    request = CreateRunRequest(
+        prompt=(
+            "Мне нужно простое приложение для интернет-магазина. "
+            "Покупатель оформляет заказ, сотрудник обрабатывает его, "
+            "а администратор управляет товарами."
+        ),
+        mode="generate",
+        intent="create",
+        apply_strategy="staged_auto_apply",
+        target_role_scope=[],
+        model_profile="openai_code_fast",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        generation_mode=GenerationMode.FAST,
+    )
+
+    assert RunService._resolve_target_role_scope(request) == ["client", "specialist", "manager"]
+
+
 def test_fast_mode_forces_openai_code_fast_profile() -> None:
     snapshot = TaskRouter().profile_snapshot(
         model_profile="research_balanced",
@@ -449,20 +469,21 @@ def test_role_ui_cluster_gets_one_recovery_round_for_satisfied_read_request() ->
     )
 
 
-def test_whole_file_error_fallback_does_not_require_timeout_argument(tmp_path: Path) -> None:
+def test_whole_file_error_fallback_does_not_materialize_backend_routes(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     codegen = app.state.container.generation_service.generation_codegen
 
     fallback = codegen._whole_file_error_fallback_result(
+        workspace_id="ws_test",
+        draft_run_id="run_test",
         cluster_name="backend_route_bookings",
         cluster_targets=["miniapp/app/routes/bookings.py"],
         error_message="returned no file operations",
+        entity_contract={},
     )
 
-    assert fallback is not None
-    assert fallback["cluster_name"] == "backend_route_bookings"
-    assert fallback["duration_ms"] == 0
+    assert fallback is None
 
 
 def test_whole_file_bundle_schema_name_stays_within_openai_limit() -> None:
@@ -3626,6 +3647,94 @@ def test_merge_advisory_generation_inputs_prefers_advisory_pages_for_editing_tar
     assert "role_specialist_ui_request_detail" in cluster_names
 
 
+def test_merge_advisory_generation_inputs_uses_inferred_scaffold_only_as_runtime_bootstrap_for_explicit_whole_file_surface(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    _role_contract, plan_result = service.generation_entry._merge_advisory_generation_inputs(
+        role_contract={"roles": {"client": {"responsibility": "Sell products."}}},
+        inferred_role_contract={"roles": {}},
+        advisory_plan_result={
+            "target_files": [
+                "miniapp/app/routes/products.py",
+                "miniapp/app/static/client/index.html",
+                "miniapp/app/static/client/styles.css",
+                "miniapp/app/static/client/app.js",
+            ],
+            "backend_targets": ["miniapp/app/routes/products.py"],
+            "shared_files": ["miniapp/app/static/shared/base.css"],
+            "files_to_read": ["miniapp/app/routes/products.py"],
+            "page_graph": {
+                "roles": {
+                    "client": {
+                        "routes_file": "miniapp/app/routes/client.py",
+                        "pages": [
+                            {
+                                "page_id": "client_index",
+                                "route_path": "/",
+                                "file_path": "miniapp/app/static/client/index.html",
+                                "style_path": "miniapp/app/static/client/styles.css",
+                                "script_path": "miniapp/app/static/client/app.js",
+                                "page_kind": "landing",
+                            }
+                        ],
+                    }
+                }
+            },
+            "scope_mode": "whole_file_build",
+            "flow_mode": "multi_page",
+            "require_multi_page": True,
+        },
+        inferred_plan_result={
+            "target_files": [
+                "miniapp/app/main.py",
+                "miniapp/app/db.py",
+                "miniapp/app/schemas.py",
+                "miniapp/app/routes/runtime.py",
+                "miniapp/app/routes/records.py",
+            ],
+            "backend_targets": [
+                "miniapp/app/main.py",
+                "miniapp/app/db.py",
+                "miniapp/app/schemas.py",
+                "miniapp/app/routes/runtime.py",
+                "miniapp/app/routes/records.py",
+            ],
+            "shared_files": [],
+            "files_to_read": ["miniapp/app/routes/records.py"],
+            "page_graph": {
+                "roles": {
+                    "client": {
+                        "routes_file": "miniapp/app/routes/client.py",
+                        "pages": [
+                            {
+                                "page_id": "client_index",
+                                "route_path": "/",
+                                "file_path": "miniapp/app/static/client/index.html",
+                                "style_path": "miniapp/app/static/client/styles.css",
+                                "script_path": "miniapp/app/static/client/app.js",
+                                "page_kind": "landing",
+                            }
+                        ],
+                    }
+                }
+            },
+            "scope_mode": "whole_file_build",
+            "flow_mode": "multi_page",
+            "require_multi_page": True,
+        },
+    )
+
+    assert "miniapp/app/routes/products.py" in plan_result["backend_targets"]
+    assert "miniapp/app/routes/records.py" not in plan_result["backend_targets"]
+    assert "miniapp/app/routes/records.py" not in plan_result["target_files"]
+    assert "miniapp/app/main.py" in plan_result["target_files"]
+    assert "miniapp/app/db.py" in plan_result["target_files"]
+    assert "miniapp/app/schemas.py" in plan_result["target_files"]
+    assert "miniapp/app/routes/runtime.py" in plan_result["target_files"]
+
+
 def test_minimal_patch_focus_role_prunes_non_focused_static_targets(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -4236,6 +4345,25 @@ def test_expand_repair_targets_for_safe_companions_allows_issue_located_static_p
 
     assert expanded is not None
     assert "miniapp/app/static/client/requests/index.html" in expanded
+
+
+def test_expand_repair_targets_for_safe_companions_allows_issue_located_route_files() -> None:
+    expanded = GenerationService._expand_repair_targets_for_safe_companions(
+        target_files=["miniapp/app/routes/records.py"],
+        invalid_paths=["miniapp/app/routes/products.py"],
+        build_issues=[
+            ValidationIssue(
+                code="critic.split_entity_routes",
+                message="Draft introduces multiple feature route stems for what should usually be one dominant entity lifecycle: products, records",
+                severity="high",
+                location="miniapp/app/routes/products.py",
+                blocking=True,
+            )
+        ],
+    )
+
+    assert expanded is not None
+    assert "miniapp/app/routes/products.py" in expanded
 
 
 def test_whole_file_batch_timeout_seconds_respects_generation_mode(tmp_path: Path) -> None:
@@ -7964,6 +8092,63 @@ def test_generation_repair_allows_safe_shared_static_companion_targets(tmp_path:
     assert [operation.file_path for operation in result["operations"]] == ["miniapp/app/static/shared/ui.js"]
 
 
+def test_generation_repair_turn_context_adds_latest_changed_files_to_active_targets(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    client = TestClient(app)
+    service: GenerationService = app.state.container.generation_service
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Repair Scope Workspace",
+            "description": "Repair target expansion should track changed files.",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    workspace_id = workspace["workspace_id"]
+    assert client.post(f"/workspaces/{workspace_id}/clone-template").status_code == 200
+
+    draft_run_id = "run_repair_scope"
+    draft_source = app.state.container.workspace_service.prepare_draft(workspace_id, draft_run_id)
+    route_path = draft_source / "miniapp" / "app" / "routes" / "products.py"
+    route_path.parent.mkdir(parents=True, exist_ok=True)
+    route_path.write_text("from fastapi import APIRouter\n\nrouter = APIRouter()\n", encoding="utf-8")
+
+    latest_execution = CheckExecutionRecord(
+        workspace_id=workspace_id,
+        run_id=draft_run_id,
+        changed_files=["miniapp/app/routes/products.py"],
+        results=[
+            RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                details="route lifecycle is inconsistent",
+                logs=["products route needs follow-up repair"],
+            )
+        ],
+    )
+    active_targets = ["miniapp/app/routes/records.py"]
+
+    turn_context, preview_issue = service.generation_repair._build_generation_repair_turn_context(
+        workspace_id=workspace_id,
+        draft_run_id=draft_run_id,
+        latest_execution=latest_execution,
+        latest_preview_details={"logs": []},
+        active_repair_targets=active_targets,
+        scope_mode="whole_file_build",
+        attempt=2,
+        repeated_no_progress=0,
+        last_turn_summary=None,
+        latest_diff_summary=None,
+    )
+
+    assert preview_issue is None
+    assert "miniapp/app/routes/products.py" in active_targets
+    assert "miniapp/app/routes/products.py" in turn_context.file_contexts
+
+
 def test_generation_repair_retries_with_expanded_context_when_first_patch_is_empty(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -10484,7 +10669,7 @@ def test_workspace_loop_fast_context_mode_expands_before_full_bundle() -> None:
     ) == "full_bundle"
 
 
-def test_generation_codegen_prefers_deterministic_fast_clusters_for_simple_create(tmp_path: Path) -> None:
+def test_generation_codegen_does_not_use_python_fast_prefill_for_any_cluster(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
@@ -10501,21 +10686,28 @@ def test_generation_codegen_prefers_deterministic_fast_clusters_for_simple_creat
         intent="create",
         grounded_spec=grounded_spec,
         role_scope=["client", "specialist", "manager"],
+        cluster_name="shared_static",
+    ) is False
+    assert service._should_prefer_deterministic_fast_cluster(
+        generation_mode=GenerationMode.FAST,
+        intent="create",
+        grounded_spec=grounded_spec,
+        role_scope=["client", "specialist", "manager"],
         cluster_name="backend_support",
-    ) is True
+    ) is False
     assert service._should_prefer_deterministic_fast_cluster(
         generation_mode=GenerationMode.FAST,
         intent="create",
         grounded_spec=grounded_spec,
         role_scope=["client", "specialist", "manager"],
         cluster_name="role_client_ui_root",
-    ) is True
+    ) is False
     assert service._should_prefer_deterministic_fast_cluster(
         generation_mode=GenerationMode.BALANCED,
         intent="create",
         grounded_spec=grounded_spec,
         role_scope=["client", "specialist", "manager"],
-        cluster_name="backend_support",
+        cluster_name="shared_static",
     ) is False
 
 
@@ -11001,60 +11193,13 @@ def test_build_validator_flags_invalid_actor_dependency(tmp_path: Path) -> None:
     assert any(issue.code == "build.invalid_actor_dependency" for issue in issues)
 
 
-def test_compile_prompt_to_scaffold_builds_role_local_targets_and_excludes_manifests(tmp_path: Path) -> None:
+def test_generation_service_removes_prompt_scaffold_entrypoints(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
 
-    spec = service._build_grounded_spec(
-        workspace_id="ws_test",
-        prompt="Create a request management app for client, specialist, and manager roles.",
-        target_platform=TargetPlatform.TELEGRAM,
-        preview_profile=PreviewProfile.TELEGRAM_MOCK,
-        doc_refs=[],
-        template_revision_id="template",
-        prompt_turn_id="turn_1",
-        generation_mode=GenerationMode.BALANCED,
-    )
-    role_contract, plan_result = service._compile_prompt_to_scaffold(
-        prompt=spec.product_goal,
-        grounded_spec=spec,
-        role_scope=["client", "specialist", "manager"],
-        workspace_tree=[],
-    )
-
-    assert role_contract["source"] == "prompt_scaffold"
-    assert plan_result["scope_mode"] == "whole_file_build"
-    assert "miniapp/app/generated/route_manifest.json" not in plan_result["target_files"]
-    assert "miniapp/app/generated/runtime_manifest.json" not in plan_result["target_files"]
-    assert "miniapp/app/routes/client.py" in plan_result["backend_targets"]
-    assert "miniapp/app/routes/manager.py" in plan_result["backend_targets"]
-    assert any(path == "miniapp/app/static/client/index.html" for path in plan_result["target_files"])
-    assert any(path == "miniapp/app/static/manager/profile/index.html" for path in plan_result["target_files"])
-
-
-def test_scaffold_backend_targets_do_not_infer_business_routes_from_prompt_tokens(tmp_path: Path) -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
-    service: GenerationService = app.state.container.generation_service
-
-    spec = service._build_grounded_spec(
-        workspace_id="ws_test",
-        prompt="Clients submit requests, choose time slots, managers assign specialists, specialists leave comments.",
-        target_platform=TargetPlatform.TELEGRAM,
-        preview_profile=PreviewProfile.TELEGRAM_MOCK,
-        doc_refs=[],
-        template_revision_id="template",
-        prompt_turn_id="turn_1",
-        generation_mode=GenerationMode.BALANCED,
-    )
-    targets = service._scaffold_backend_targets_from_spec(
-        prompt=spec.product_goal,
-        grounded_spec=spec,
-        role_scope=["client", "specialist", "manager"],
-    )
-
-    assert targets == []
+    assert not hasattr(service, "_compile_prompt_to_scaffold")
+    assert not hasattr(service, "_scaffold_backend_targets_from_spec")
 
 
 def test_fix_scope_builder_does_not_auto_expand_page_triplet_scope(tmp_path: Path) -> None:
@@ -11194,7 +11339,7 @@ def test_endpoint_aliases_canonicalize_to_requests() -> None:
     assert GenerationService._route_module_path_for_endpoint_name("booking") == "miniapp/app/routes/requests.py"
 
 
-def test_route_contract_bootstrap_only_limits_missing_routes_to_core_skeleton(tmp_path: Path) -> None:
+def test_route_contract_bootstrap_only_does_not_inject_python_route_scaffolds(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service = app.state.container.generation_service
@@ -11206,16 +11351,7 @@ def test_route_contract_bootstrap_only_limits_missing_routes_to_core_skeleton(tm
         contract_sync_mode="bootstrap_only",
     )
 
-    paths = {operation.file_path for operation in operations}
-
-    assert "miniapp/app/routes/runtime.py" in paths
-    assert "miniapp/app/routes/profiles.py" in paths
-    assert "miniapp/app/routes/client.py" in paths
-    assert "miniapp/app/routes/specialist.py" in paths
-    assert "miniapp/app/routes/manager.py" in paths
-    assert "miniapp/app/routes/requests.py" not in paths
-    assert "miniapp/app/routes/comments.py" not in paths
-    assert "miniapp/app/routes/assignments.py" not in paths
+    assert operations == []
 
 
 def test_role_page_routes_with_jinja_templates_are_not_forced_through_invariant_repair() -> None:

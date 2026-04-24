@@ -36,12 +36,6 @@ from app.modules.miniapp_generation_runtime.generation_shell_contract import Min
 from app.modules.miniapp_generation_runtime.generation_targeting import MiniappGenerationTargeting
 from app.modules.miniapp_generation_runtime.generation_scaffold import (
     build_route_manifest,
-    compile_prompt_to_scaffold,
-    mentions_schedule_or_time,
-    scaffold_backend_targets_from_spec,
-    scaffold_page_slug_for_route,
-    scaffold_role_pages_for_role,
-    scaffold_role_responsibility,
     select_creative_direction,
 )
 
@@ -83,11 +77,5 @@ __all__ = [
     "MiniappGenerationShellContract",
     "MiniappGenerationTargeting",
     "build_route_manifest",
-    "compile_prompt_to_scaffold",
-    "mentions_schedule_or_time",
-    "scaffold_backend_targets_from_spec",
-    "scaffold_page_slug_for_route",
-    "scaffold_role_pages_for_role",
-    "scaffold_role_responsibility",
     "select_creative_direction",
 ]
