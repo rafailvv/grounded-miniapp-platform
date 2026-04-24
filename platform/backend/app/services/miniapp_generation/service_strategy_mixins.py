@@ -151,6 +151,82 @@ class ServiceStrategyMixins:
         "save action",
         "status is correctly reflected",
     )
+    _INTERACTION_PATCH_TRIGGER_MARKERS = (
+        "button",
+        "buttons",
+        "click",
+        "clicks",
+        "clicked",
+        "tap",
+        "taps",
+        "pressed",
+        "press",
+        "pressing",
+        "when i click",
+        "when the user clicks",
+        "when the client clicks",
+        "when the specialist clicks",
+        "when the manager clicks",
+        "when i press",
+        "when pressing",
+        "on click",
+        "при нажатии",
+        "по нажатию",
+        "когда нажимаю",
+        "нажимаю на кнопку",
+        "кнопк",
+    )
+    _INTERACTION_PATCH_RESULT_MARKERS = (
+        "should change",
+        "should update",
+        "should open",
+        "should save",
+        "should trigger",
+        "should submit",
+        "should become",
+        "must change",
+        "must update",
+        "must open",
+        "must save",
+        "does not change",
+        "doesn't change",
+        "stays",
+        "stays the same",
+        "remains",
+        "instead of",
+        "не меняется",
+        "не изменяется",
+        "остается",
+        "остаётся",
+        "должен меняться",
+        "должна меняться",
+        "должно меняться",
+        "должен открывать",
+        "должна открывать",
+        "должно открывать",
+        "должен вызывать",
+        "должна вызывать",
+        "должно вызывать",
+        "должен отправлять",
+        "должна отправлять",
+        "должно отправлять",
+    )
+    _INTERACTION_PATCH_BROAD_MARKERS = (
+        "separate page",
+        "details page",
+        "detail page",
+        "dedicated page",
+        "details screen",
+        "detail screen",
+        "new page",
+        "new screen",
+        "across the app",
+        "across the whole app",
+        "across specialist",
+        "across manager",
+        "across client",
+        "all roles",
+    )
 
     @staticmethod
     def _matching_marker_count(lowered: str, markers: tuple[str, ...]) -> int:
@@ -202,6 +278,31 @@ class ServiceStrategyMixins:
         return action_hits >= 1 and support_hits >= 2
 
     @staticmethod
+    def _looks_like_narrow_interaction_patch_request(lowered: str) -> bool:
+        if not lowered.strip():
+            return False
+        if ServiceStrategyMixins._looks_like_role_flow_expansion_request(lowered):
+            return False
+        if any(marker in lowered for marker in ServiceStrategyMixins._INTERACTION_PATCH_BROAD_MARKERS):
+            return False
+        trigger_hits = ServiceStrategyMixins._matching_marker_count(lowered, ServiceStrategyMixins._INTERACTION_PATCH_TRIGGER_MARKERS)
+        result_hits = ServiceStrategyMixins._matching_marker_count(lowered, ServiceStrategyMixins._INTERACTION_PATCH_RESULT_MARKERS)
+        if trigger_hits == 0:
+            return False
+        if result_hits >= 1:
+            return True
+        return bool(
+            re.search(
+                r"\b(?:button|click|tap|press|handler|action)\b.*\b(?:status|open|save|submit|change|update|trigger|select)\b",
+                lowered,
+            )
+            or re.search(
+                r"(?:кнопк|нажати|нажимаю).*(?:статус|открыва|сохраня|отправля|меня|обновля)",
+                lowered,
+            )
+        )
+
+    @staticmethod
     def _role_only_patch_kind(*, prompt: str, role_scope: list[str], intent: str) -> str | None:
         if len(role_scope) != 1:
             return None
@@ -212,6 +313,8 @@ class ServiceStrategyMixins:
             return None
         if ServiceStrategyMixins._looks_like_visual_role_patch_request(lowered):
             return "visual_patch"
+        if ServiceStrategyMixins._looks_like_narrow_interaction_patch_request(lowered):
+            return "interaction_patch"
         if ServiceStrategyMixins._looks_like_contract_role_patch_request(lowered):
             return "contract_patch"
         if ServiceStrategyMixins._looks_like_role_flow_expansion_request(lowered):
@@ -225,6 +328,8 @@ class ServiceStrategyMixins:
         if ServiceStrategyMixins._looks_like_fix_request(lowered):
             return "minimal_patch"
         if role_patch_kind == "visual_patch":
+            return "minimal_patch"
+        if role_patch_kind == "interaction_patch":
             return "minimal_patch"
         if ServiceStrategyMixins._looks_like_explicit_micro_patch(lowered):
             return "minimal_patch"
@@ -249,6 +354,8 @@ class ServiceStrategyMixins:
             return "Intent=create requires a whole-file build for the primary app surface."
         if role_patch_kind == "visual_patch":
             return "The request is a single-role visual patch, so generation stays in minimal patch mode."
+        if role_patch_kind == "interaction_patch":
+            return "The request is a narrow single-role interaction fix, so generation keeps the existing surface and changes only the smallest in-place behavior."
         if role_patch_kind == "ui_flow_patch":
             return "The request expands an existing single-role UI flow, so generation uses bounded role regeneration instead of a micro-patch."
         if role_patch_kind == "contract_patch":

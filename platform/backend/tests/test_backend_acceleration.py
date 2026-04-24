@@ -216,6 +216,22 @@ def test_role_patch_classifier_treats_text_cleanup_as_visual_patch() -> None:
     )
 
 
+def test_role_patch_classifier_treats_button_action_bug_as_interaction_patch() -> None:
+    prompt = (
+        "When I press the Mark done button, the specialist status does not change and stays open. "
+        "It should change only this action so the existing button updates the status correctly."
+    )
+
+    assert (
+        ServiceStrategyMixins._role_only_patch_kind(
+            prompt=prompt,
+            role_scope=["specialist"],
+            intent="role_only_change",
+        )
+        == "interaction_patch"
+    )
+
+
 def _install_llm_stub(app) -> None:
     helper_path = Path(__file__).with_name("test_api_smoke.py")
     spec = importlib.util.spec_from_file_location("test_api_smoke_helper", helper_path)
@@ -662,6 +678,14 @@ def test_scope_mode_uses_bounded_role_regeneration_for_non_visual_role_changes(t
             "role_only_change",
             "Please fix the client avatar so it stays inside the avatar container and does not stretch full-screen.",
             ["client"],
+        )
+        == "minimal_patch"
+    )
+    assert (
+        service._scope_mode(
+            "role_only_change",
+            "When I press the Mark done button on the specialist page, the status stays open instead of changing to done. Fix only this existing action.",
+            ["specialist"],
         )
         == "minimal_patch"
     )

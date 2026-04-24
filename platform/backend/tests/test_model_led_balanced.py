@@ -31,6 +31,7 @@ from app.modules.miniapp_generation_runtime.generation_entity_contract import Mi
 from app.modules.miniapp_generation_runtime.generation_progress_reporting import GenerationProgressReportingRuntime
 from app.modules.miniapp_generation_runtime.generation_page_graph_runtime import MiniappGenerationPageGraphRuntime
 from app.modules.miniapp_generation_runtime.generation_codegen import MiniappGenerationCodegen
+from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import MiniappGenerationContractApiRoutesCrud
 from app.modules.miniapp_generation_runtime.generation_contract_frontend import MiniappGenerationContractFrontend
 from app.modules.miniapp_generation_runtime.generation_contract_schema import MiniappGenerationContractSchema
 from app.modules.miniapp_generation_runtime.generation_normal_loop import MiniappGenerationNormalLoop
@@ -916,6 +917,17 @@ def test_generated_python_tests_use_progress_status_when_schema_choices_are_unav
     )
 
     assert 'return choices[0] if choices else "in_progress"' in source
+
+
+def test_deterministic_crud_route_normalizes_done_alias_to_completed() -> None:
+    source = MiniappGenerationContractApiRoutesCrud._deterministic_resource_route_source("records")
+
+    assert "status_aliases = {" in source
+    assert '"done": "completed"' in source
+    assert 'normalized = status_aliases.get(status, status)' in source
+    assert 'if not allowed or normalized in allowed:' in source
+    assert 'if normalized == "completed":' in source
+    assert 'for candidate in ("completed", "closed", "resolved"):' in source
 
 
 def test_stabilizer_preserves_valid_refresh_ui_changes(tmp_path: Path) -> None:

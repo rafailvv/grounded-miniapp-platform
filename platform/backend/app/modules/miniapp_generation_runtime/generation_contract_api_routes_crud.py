@@ -213,13 +213,22 @@ def _status_literals() -> list[str]:
 def _normalize_status(value: Any) -> Any:
     if value is None:
         return None
-    status = str(value).strip()
+    status = str(value).strip().lower()
     if not status:
         return None
+    status_aliases = {{
+        "done": "completed",
+        "complete": "completed",
+    }}
+    normalized = status_aliases.get(status, status)
     allowed = _status_literals()
-    if not allowed or status in allowed:
-        return status
-    if status == "in_progress":
+    if not allowed or normalized in allowed:
+        return normalized
+    if normalized == "completed":
+        for candidate in ("completed", "closed", "resolved"):
+            if candidate in allowed:
+                return candidate
+    if normalized == "in_progress":
         for candidate in ("claimed", "in_review", "issued", "open", "active", "processing"):
             if candidate in allowed:
                 return candidate

@@ -288,6 +288,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         )
         ui_flow_patch = role_patch_kind == "ui_flow_patch"
         contract_patch = role_patch_kind == "contract_patch"
+        interaction_patch = role_patch_kind == "interaction_patch"
         if visual_only_patch:
             source_role_pages = self._source_role_pages_for_focus(workspace_id=planned.get("workspace_id"), role=focused_role)
             for page in source_role_pages:
@@ -365,7 +366,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             for path in (planned.get("backend_targets") or [])
             if path not in non_focused_route_files
         ]
-        if ui_flow_patch or contract_patch:
+        if ui_flow_patch or contract_patch or interaction_patch:
             feature_stems = {
                 stem
                 for stem in (
