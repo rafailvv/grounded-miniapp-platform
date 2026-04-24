@@ -7085,6 +7085,549 @@ def test_fix_orchestrator_allows_optimistic_completion_for_generated_test_tail()
     assert completion["remaining_issues"]
 
 
+def test_service_strategy_routes_existing_workflow_edits_to_workflow_partial_build() -> None:
+    scope_mode = ServiceStrategyMixins._scope_mode(
+        "edit",
+        "Добавь возможность отменить запись, если исполнитель ещё не начал работу.",
+        [],
+    )
+
+    assert scope_mode == "workflow_partial_build"
+
+
+def test_workflow_partial_plan_prunes_unrelated_role_targets(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    generation_service = app.state.container.generation_service
+    planned = {
+        "workspace_id": "ws_partial",
+        "target_files": [
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/manager.py",
+            "miniapp/app/routes/runtime.py",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/specialist/app.js",
+            "miniapp/app/static/manager/index.html",
+            "miniapp/app/static/manager/app.js",
+            "miniapp/app/static/shared/base.css",
+        ],
+        "backend_targets": [
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/manager.py",
+            "miniapp/app/routes/runtime.py",
+        ],
+        "shared_files": ["miniapp/app/static/shared/base.css"],
+        "files_to_read": [
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/manager/index.html",
+            "miniapp/app/static/shared/base.css",
+        ],
+        "page_graph": {
+            "roles": {
+                "client": {
+                    "routes_file": "miniapp/app/routes/client.py",
+                    "pages": [
+                        {
+                            "page_id": "client_root",
+                            "page_kind": "role_root",
+                            "route_path": "/client",
+                            "file_path": "miniapp/app/static/client/index.html",
+                            "script_path": "miniapp/app/static/client/app.js",
+                        }
+                    ],
+                },
+                "specialist": {
+                    "routes_file": "miniapp/app/routes/specialist.py",
+                    "pages": [
+                        {
+                            "page_id": "specialist_root",
+                            "page_kind": "role_root",
+                            "route_path": "/specialist",
+                            "file_path": "miniapp/app/static/specialist/index.html",
+                            "script_path": "miniapp/app/static/specialist/app.js",
+                        }
+                    ],
+                },
+                "manager": {
+                    "routes_file": "miniapp/app/routes/manager.py",
+                    "pages": [
+                        {
+                            "page_id": "manager_root",
+                            "page_kind": "role_root",
+                            "route_path": "/manager",
+                            "file_path": "miniapp/app/static/manager/index.html",
+                            "script_path": "miniapp/app/static/manager/app.js",
+                        }
+                    ],
+                },
+            }
+        },
+    }
+
+    pruned = generation_service.generation_code_plan._prune_workflow_partial_plan(
+        planned,
+        prompt="У администратора добавь фильтр по новым заявкам и отдельный счётчик новых заявок.",
+        role_scope=[],
+        role_patch_kind=None,
+    )
+
+    assert pruned["active_role_scope"] == ["manager"]
+    assert "miniapp/app/static/manager/index.html" in pruned["target_files"]
+    assert "miniapp/app/static/client/index.html" not in pruned["target_files"]
+    assert "miniapp/app/static/specialist/index.html" not in pruned["target_files"]
+
+
+def test_workflow_partial_plan_skips_role_routes_for_ui_only_workflow_prompt(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    generation_service = app.state.container.generation_service
+    planned = {
+        "workspace_id": "ws_partial",
+        "target_files": [
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/manager.py",
+            "miniapp/app/routes/runtime.py",
+            "miniapp/app/main.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/specialist/app.js",
+            "miniapp/app/static/manager/index.html",
+            "miniapp/app/static/manager/app.js",
+            "miniapp/app/static/shared/base.css",
+        ],
+        "backend_targets": [
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/manager.py",
+            "miniapp/app/routes/runtime.py",
+            "miniapp/app/main.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+        ],
+        "shared_files": ["miniapp/app/static/shared/base.css"],
+        "files_to_read": [
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/manager/index.html",
+            "miniapp/app/static/shared/base.css",
+        ],
+        "page_graph": {
+            "roles": {
+                "client": {
+                    "routes_file": "miniapp/app/routes/client.py",
+                    "pages": [
+                        {
+                            "page_id": "client_root",
+                            "page_kind": "role_root",
+                            "route_path": "/client",
+                            "file_path": "miniapp/app/static/client/index.html",
+                            "script_path": "miniapp/app/static/client/app.js",
+                        }
+                    ],
+                },
+                "specialist": {
+                    "routes_file": "miniapp/app/routes/specialist.py",
+                    "pages": [
+                        {
+                            "page_id": "specialist_root",
+                            "page_kind": "role_root",
+                            "route_path": "/specialist",
+                            "file_path": "miniapp/app/static/specialist/index.html",
+                            "script_path": "miniapp/app/static/specialist/app.js",
+                        }
+                    ],
+                },
+                "manager": {
+                    "routes_file": "miniapp/app/routes/manager.py",
+                    "pages": [
+                        {
+                            "page_id": "manager_root",
+                            "page_kind": "role_root",
+                            "route_path": "/manager",
+                            "file_path": "miniapp/app/static/manager/index.html",
+                            "script_path": "miniapp/app/static/manager/app.js",
+                        }
+                    ],
+                },
+            }
+        },
+    }
+
+    pruned = generation_service.generation_code_plan._prune_workflow_partial_plan(
+        planned,
+        prompt="У мастера сделай сначала кнопку «Выехал», а потом кнопку завершения.",
+        role_scope=["specialist"],
+        role_patch_kind="ui_flow_patch",
+    )
+
+    assert "miniapp/app/routes/specialist.py" not in pruned["target_files"]
+    assert "miniapp/app/main.py" not in pruned["target_files"]
+    assert "miniapp/app/schemas.py" not in pruned["target_files"]
+    assert "miniapp/app/static/specialist/index.html" in pruned["target_files"]
+    assert "miniapp/app/static/specialist/app.js" in pruned["target_files"]
+
+
+def test_workflow_partial_plan_recovers_missing_roles_from_source_graph(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    workspace_service = app.state.container.workspace_service
+    generation_service = app.state.container.generation_service
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Workflow Partial Source Graph",
+            description="test",
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+            path=str((tmp_path / "data" / "workspaces" / "ws_partial_source_graph").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    source_dir = workspace_service.source_dir(workspace.workspace_id)
+    (source_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+    (source_dir / "artifacts" / "generated_app_graph.json").write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "client": {
+                        "routes_file": "miniapp/app/routes/client.py",
+                        "pages": [
+                            {
+                                "page_id": "client_root",
+                                "page_kind": "role_root",
+                                "route_path": "/client",
+                                "file_path": "miniapp/app/static/client/index.html",
+                                "script_path": "miniapp/app/static/client/app.js",
+                            }
+                        ],
+                    },
+                    "specialist": {
+                        "routes_file": "miniapp/app/routes/specialist.py",
+                        "pages": [
+                            {
+                                "page_id": "specialist_root",
+                                "page_kind": "role_root",
+                                "route_path": "/specialist",
+                                "file_path": "miniapp/app/static/specialist/index.html",
+                                "script_path": "miniapp/app/static/specialist/app.js",
+                            }
+                        ],
+                    },
+                    "manager": {
+                        "routes_file": "miniapp/app/routes/manager.py",
+                        "pages": [
+                            {
+                                "page_id": "manager_root",
+                                "page_kind": "role_root",
+                                "route_path": "/manager",
+                                "file_path": "miniapp/app/static/manager/index.html",
+                                "script_path": "miniapp/app/static/manager/app.js",
+                            }
+                        ],
+                    },
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    planned = {
+        "workspace_id": workspace.workspace_id,
+        "target_files": [
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/specialist/app.js",
+            "miniapp/app/static/shared/base.css",
+        ],
+        "backend_targets": ["miniapp/app/routes/specialist.py"],
+        "shared_files": ["miniapp/app/static/shared/base.css"],
+        "files_to_read": [
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/shared/base.css",
+        ],
+        "page_graph": {
+            "roles": {
+                "specialist": {
+                    "routes_file": "miniapp/app/routes/specialist.py",
+                    "pages": [
+                        {
+                            "page_id": "specialist_root",
+                            "page_kind": "role_root",
+                            "route_path": "/specialist",
+                            "file_path": "miniapp/app/static/specialist/index.html",
+                            "script_path": "miniapp/app/static/specialist/app.js",
+                        }
+                    ],
+                }
+            }
+        },
+    }
+
+    pruned = generation_service.generation_code_plan._prune_workflow_partial_plan(
+        planned,
+        prompt="Добавь возможность отменить запись клиенту, если исполнитель ещё не начал работу.",
+        role_scope=["specialist"],
+        role_patch_kind="role_patch",
+    )
+
+    assert pruned["active_role_scope"] == ["client", "specialist", "manager"]
+    assert "miniapp/app/static/client/index.html" in pruned["target_files"]
+    assert "miniapp/app/static/manager/index.html" in pruned["target_files"]
+
+
+def test_workflow_partial_supplements_missing_page_graph_roles_before_normalization(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    workspace_service = app.state.container.workspace_service
+    generation_service = app.state.container.generation_service
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Workflow Partial Normalize",
+            description="test",
+            target_platform="telegram_mini_app",
+            preview_profile="telegram_mock",
+            path=str((tmp_path / "data" / "workspaces" / "ws_partial_normalize").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    source_dir = workspace_service.source_dir(workspace.workspace_id)
+    (source_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+    (source_dir / "artifacts" / "generated_app_graph.json").write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "client": {
+                        "routes_file": "miniapp/app/routes/client.py",
+                        "pages": [{"page_id": "client_root", "page_kind": "role_root", "route_path": "/client", "file_path": "miniapp/app/static/client/index.html", "script_path": "miniapp/app/static/client/app.js"}],
+                    },
+                    "specialist": {
+                        "routes_file": "miniapp/app/routes/specialist.py",
+                        "pages": [{"page_id": "specialist_root", "page_kind": "role_root", "route_path": "/specialist", "file_path": "miniapp/app/static/specialist/index.html", "script_path": "miniapp/app/static/specialist/app.js"}],
+                    },
+                    "manager": {
+                        "routes_file": "miniapp/app/routes/manager.py",
+                        "pages": [{"page_id": "manager_root", "page_kind": "role_root", "route_path": "/manager", "file_path": "miniapp/app/static/manager/index.html", "script_path": "miniapp/app/static/manager/app.js"}],
+                    },
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    supplemented = generation_service.generation_code_plan._supplement_workflow_partial_page_graph_roles(
+        {
+            "page_graph": {
+                "roles": {
+                    "client": {
+                        "routes_file": "miniapp/app/routes/client.py",
+                        "pages": [{"page_id": "client_root", "page_kind": "role_root", "route_path": "/client", "file_path": "miniapp/app/static/client/index.html", "script_path": "miniapp/app/static/client/app.js"}],
+                    }
+                }
+            }
+        },
+        workspace_id=workspace.workspace_id,
+        role_scope=["client", "specialist", "manager"],
+    )
+
+    roles = supplemented["page_graph"]["roles"]
+    assert set(roles) == {"client", "specialist", "manager"}
+    assert roles["specialist"]["pages"][0]["file_path"] == "miniapp/app/static/specialist/index.html"
+
+
+def test_workflow_partial_composition_allows_empty_backend_patch_when_diagnosis_is_explicit() -> None:
+    assert (
+        MiniappGenerationCodegenClusters._allow_empty_partial_composition(
+            scope_mode="workflow_partial_build",
+            target_files=["miniapp/app/routes/specialist.py"],
+            diagnosis="The current backend already supports this flow; no backend changes are required.",
+            outcome_hint="no_progress",
+        )
+        is True
+    )
+    assert (
+        MiniappGenerationCodegenClusters._allow_empty_partial_composition(
+            scope_mode="workflow_partial_build",
+            target_files=["miniapp/app/routes/specialist.py"],
+            diagnosis="",
+            outcome_hint="no_progress",
+        )
+        is True
+    )
+    assert (
+        MiniappGenerationCodegenClusters._allow_empty_partial_composition(
+            scope_mode="minimal_patch",
+            target_files=["miniapp/app/routes/specialist.py"],
+            diagnosis="The current backend already supports this flow; no backend changes are required.",
+            outcome_hint="no_progress",
+        )
+        is False
+    )
+
+
+def test_fix_orchestrator_allows_optimistic_completion_for_fast_gate_tail() -> None:
+    from app.services.fix_orchestrator import FixOrchestrator
+
+    results = [
+        RunCheckResult(name="schema_validators", status="passed", details="ok"),
+        RunCheckResult(name="connectivity_validators", status="passed", details="ok"),
+        RunCheckResult(name="changed_files_static", status="passed", details="ok"),
+        RunCheckResult(name="workflow_canonical_smoke", status="passed", details="ok"),
+        RunCheckResult(name="generated_app_python_tests", status="skipped", details="deferred"),
+        RunCheckResult(name="generated_app_js_tests", status="skipped", details="deferred"),
+        RunCheckResult(name="preview_boot_smoke", status="skipped", details="deferred"),
+        RunCheckResult(name="preview_connectivity_smoke", status="skipped", details="deferred"),
+    ]
+
+    completion = FixOrchestrator._completion_state_from_results(
+        results,
+        {"status": "skipped", "stage": "deferred"},
+        validation_snapshot=ValidationSnapshot(
+            grounded_spec_valid=True,
+            app_ir_valid=True,
+            build_valid=True,
+            blocking=False,
+            issues=[],
+        ),
+    )
+
+    assert completion["strict_green"] is False
+    assert completion["optimistic_complete"] is True
+    assert completion["canonical_smoke_ok"] is True
+
+
+def test_check_runner_fast_gate_defers_generated_tests_and_preview() -> None:
+    preview = SimpleNamespace(status="running", url="http://preview.local", logs=["preview ok"], draft_run_id="run_gate")
+    preview_service = SimpleNamespace(get=lambda _workspace_id: preview)
+    validation_suite = SimpleNamespace(validate_build=lambda _source_dir: [], validate_connectivity=lambda _source_dir: [])
+    runner = check_runner_module.CheckRunner(validation_suite, preview_service)
+    calls = {"python": 0, "js": 0, "preview": 0}
+    runner._static_check = lambda **_kwargs: RunCheckResult(name="changed_files_static", status="passed", details="static ok", logs=[])  # type: ignore[method-assign]
+    runner._workflow_canonical_smoke = lambda **_kwargs: RunCheckResult(name="workflow_canonical_smoke", status="passed", details="workflow ok", logs=[])  # type: ignore[method-assign]
+
+    def _python_tests(_backend_dir):
+        calls["python"] += 1
+        return RunCheckResult(name="generated_app_python_tests", status="passed", details="python ok", logs=[])
+
+    def _js_tests(_backend_dir):
+        calls["js"] += 1
+        return RunCheckResult(name="generated_app_js_tests", status="passed", details="js ok", logs=[])
+
+    def _preview_smoke(**_kwargs):
+        calls["preview"] += 1
+        return RunCheckResult(name="preview_connectivity_smoke", status="passed", details="preview ok", logs=[])
+
+    runner._run_python_app_tests = _python_tests  # type: ignore[method-assign]
+    runner._run_js_app_tests = _js_tests  # type: ignore[method-assign]
+    runner._preview_connectivity_smoke = _preview_smoke  # type: ignore[method-assign]
+
+    execution = runner.run(
+        workspace_id="ws_fast_gate",
+        run_id="run_gate",
+        source_dir=Path("/tmp"),
+        changed_files=["miniapp/app/static/manager/app.js"],
+        preview_run_id="run_gate",
+        scope_mode="workflow_partial_build",
+        check_profile="fast_gate",
+    )
+
+    assert calls == {"python": 0, "js": 0, "preview": 0}
+    assert next(result for result in execution.results if result.name == "generated_app_python_tests").status == "skipped"
+    assert next(result for result in execution.results if result.name == "preview_boot_smoke").status == "skipped"
+
+
+def test_run_service_async_followup_updates_parent_state_after_auto_fix(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+    parent_run = RunRecord(
+        run_id="run_parent",
+        workspace_id="ws_followup",
+        prompt="edit prompt",
+        mode="generate",
+        intent="edit",
+        target_role_scope=["manager"],
+        model_profile="openai_code_fast",
+        generation_mode=GenerationMode.FAST,
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/app/static/manager/app.js"],
+    )
+    followup_request = CreateRunRequest(
+        prompt="На экране администратора добавь фильтр только по новым заявкам.",
+        mode="generate",
+        intent="edit",
+        generation_mode=GenerationMode.FAST,
+    )
+    updates: list[dict[str, str | None]] = []
+    followup_run = RunRecord(
+        run_id="run_followup_fix",
+        workspace_id="ws_followup",
+        prompt="fix prompt",
+        mode="fix",
+        intent="edit",
+        status="completed",
+        apply_status="applied",
+    )
+    checks = iter(
+        [
+            (
+                CheckExecutionRecord(
+                    workspace_id="ws_followup",
+                    run_id="run_parent",
+                    results=[RunCheckResult(name="generated_app_python_tests", status="failed", details="python fail", logs=["fail"])],
+                    duration_ms=1,
+                ),
+                ValidationSnapshot(grounded_spec_valid=True, app_ir_valid=True, build_valid=True, blocking=True, issues=[{"code": "tests.python_generated_app", "blocking": True}]),
+            ),
+            (
+                CheckExecutionRecord(
+                    workspace_id="ws_followup",
+                    run_id="run_parent",
+                    results=[
+                        RunCheckResult(name="schema_validators", status="passed", details="ok"),
+                        RunCheckResult(name="connectivity_validators", status="passed", details="ok"),
+                        RunCheckResult(name="changed_files_static", status="passed", details="ok"),
+                        RunCheckResult(name="workflow_canonical_smoke", status="passed", details="ok"),
+                        RunCheckResult(name="generated_app_python_tests", status="passed", details="ok"),
+                        RunCheckResult(name="generated_app_js_tests", status="passed", details="ok"),
+                        RunCheckResult(name="preview_boot_smoke", status="passed", details="ok"),
+                        RunCheckResult(name="preview_connectivity_smoke", status="passed", details="ok"),
+                    ],
+                    duration_ms=1,
+                ),
+                ValidationSnapshot(grounded_spec_valid=True, app_ir_valid=True, build_valid=True, blocking=False, issues=[]),
+            ),
+        ]
+    )
+
+    run_service.get_run = lambda run_id: followup_run if run_id == "run_followup_fix" else parent_run  # type: ignore[method-assign]
+    run_service._set_followup_status = lambda run_id, **kwargs: updates.append({"run_id": run_id, **kwargs})  # type: ignore[method-assign]
+    run_service._run_followup_checks = lambda _run: next(checks)  # type: ignore[method-assign]
+    run_service._should_auto_fix_followup_failure = lambda execution, validation_snapshot: True  # type: ignore[method-assign]
+    run_service.create_run_sync = lambda workspace_id, request: followup_run  # type: ignore[method-assign]
+    run_service._followup_checks_passed = lambda run, execution, validation_snapshot: all(result.status != "failed" for result in execution.results)  # type: ignore[method-assign]
+
+    run_service._run_async_followup_verification(
+        parent_run.run_id,
+        followup_request.model_dump(mode="python"),
+    )
+
+    assert updates[0]["followup_status"] == "pending"
+    assert updates[1]["followup_status"] == "failed"
+    assert updates[2]["auto_fix_status"] == "pending"
+    assert updates[3]["followup_run_id"] == "run_followup_fix"
+    assert updates[3]["auto_fix_status"] == "passed"
+    assert updates[4]["followup_status"] == "passed"
+
+
 def test_structural_repeated_signature_guard_detects_expandable_scope() -> None:
     from app.services.fix_orchestrator import FixOrchestrator
 

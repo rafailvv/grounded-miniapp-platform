@@ -75,7 +75,7 @@ class MiniappGenerationCodePlanNormalization(MiniappGenerationRuntimeOwner):
             )
         )
         raw_target_files = self._normalize_path_list(payload.get("target_files"), [])
-        if scope_mode == "minimal_patch" and raw_target_files:
+        if scope_mode in {"minimal_patch", "workflow_partial_build"} and raw_target_files:
             computed_target_set = set(computed_targets)
             intersection = [path for path in raw_target_files if path in computed_target_set]
             if computed_targets and not intersection:

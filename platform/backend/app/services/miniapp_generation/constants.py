@@ -39,7 +39,7 @@ SHARED_GENERATED_FILES = (
     "miniapp/app/generated/route_manifest.json",
     "miniapp/app/generated/runtime_manifest.json",
 )
-WRITE_STRATEGIES = ("minimal_patch", "whole_file_build")
+WRITE_STRATEGIES = ("minimal_patch", "workflow_partial_build", "whole_file_build")
 CANONICAL_FRONTEND_ROOTS = (
     "miniapp/app/static/client/",
     "miniapp/app/static/specialist/",

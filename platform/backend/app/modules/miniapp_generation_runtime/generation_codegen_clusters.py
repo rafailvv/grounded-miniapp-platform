@@ -84,6 +84,50 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
         )
 
     @staticmethod
+    def _is_backend_composition_target(path: str) -> bool:
+        normalized = str(path or "").strip().lstrip("./")
+        return normalized.startswith("miniapp/app/routes/") or normalized in {
+            "miniapp/app/main.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+        }
+
+    @classmethod
+    def _allow_empty_partial_composition(
+        cls,
+        *,
+        scope_mode: str,
+        target_files: list[str],
+        diagnosis: str,
+        outcome_hint: str,
+    ) -> bool:
+        if scope_mode != "workflow_partial_build":
+            return False
+        if not target_files or not all(cls._is_backend_composition_target(path) for path in target_files):
+            return False
+        normalized = str(diagnosis or "").strip().lower()
+        normalized_outcome = str(outcome_hint or "").strip().lower()
+        if normalized_outcome in {"", "no_progress", "patch_ready", "done", "completed", "success"}:
+            return True
+        if cls._is_existing_content_noop_diagnosis(normalized, normalized_outcome):
+            return True
+        return any(
+            marker in normalized
+            for marker in (
+                "no backend changes",
+                "no backend patch",
+                "backend already supports",
+                "current backend already supports",
+                "existing backend already supports",
+                "frontend-only",
+                "front-end only",
+                "page-level edits already satisfy",
+                "no changes required for these files",
+                "no changes needed for these files",
+            )
+        )
+
+    @staticmethod
     def _tool_request_signature(tool_requests: list[dict[str, Any]]) -> str:
         if not tool_requests:
             return ""
@@ -839,6 +883,19 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                         raise ValueError(f"Composition stage {stage_name} exhausted the tool-request budget without returning operations.")
                     if not isinstance(raw_operations, list):
                         raise ValueError("Composition did not return operations.")
+                    diagnosis = str(normalized.get("diagnosis") or normalized.get("assistant_message") or "").strip()
+                    if not raw_operations and self._allow_empty_partial_composition(
+                        scope_mode=scope_mode,
+                        target_files=target_files,
+                        diagnosis=diagnosis,
+                        outcome_hint=outcome_hint,
+                    ):
+                        return {
+                            "assistant_message": diagnosis or f"{stage_name.capitalize()} stage completed without backend changes.",
+                            "operations": [],
+                            "model": payload["model"],
+                            "tool_results": list(tool_results_for_attempt),
+                        }
                     operations = self._sanitize_draft_operations([DraftFileOperation.model_validate(item) for item in raw_operations])
                     invalid = [
                         operation.file_path

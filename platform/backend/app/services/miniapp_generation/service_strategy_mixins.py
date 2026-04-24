@@ -10,6 +10,73 @@ from app.services.miniapp_generation.constants import ROLE_ORDER
 
 
 class ServiceStrategyMixins:
+    _WORKFLOW_PARTIAL_PATCH_MARKERS = (
+        "cancel",
+        "cancellation",
+        "reschedule",
+        "before start",
+        "before the worker starts",
+        "before the specialist starts",
+        "before the master starts",
+        "status transition",
+        "intermediate status",
+        "intermediate step",
+        "new status",
+        "status flow",
+        "workflow",
+        "filter",
+        "counter",
+        "badge count",
+        "new requests counter",
+        "open requests filter",
+        "write path",
+        "save through the existing api",
+        "use the existing api",
+        "existing workflow",
+        "existing flow",
+        "transition",
+        "статус",
+        "статусы",
+        "отмена",
+        "отменить",
+        "до начала",
+        "фильтр",
+        "счётчик",
+        "счетчик",
+        "переход",
+        "этап",
+        "не начал",
+        "еще не начал",
+        "ещё не начал",
+    )
+    _WORKFLOW_PARTIAL_NEW_SURFACE_MARKERS = (
+        "new entity",
+        "new entities",
+        "new integration",
+        "upload file",
+        "file upload",
+        "new page",
+        "new pages",
+        "separate page",
+        "details page",
+        "dedicated page",
+        "catalog",
+        "storefront",
+        "checkout",
+        "workspace",
+        "dashboard from scratch",
+        "integrate with",
+        "calendar sync",
+        "payment",
+        "auth",
+        "login",
+        "регистрация",
+        "загрузка файлов",
+        "новая сущность",
+        "новая страница",
+        "новый экран",
+        "интеграция",
+    )
     _EXPLICIT_MICRO_PATCH_MARKERS = (
         "css only",
         "styles only",
@@ -303,6 +370,26 @@ class ServiceStrategyMixins:
         )
 
     @staticmethod
+    def _looks_like_workflow_partial_patch_request(*, lowered: str, intent: str, role_scope: list[str]) -> bool:
+        if intent not in {"edit", "refine", "role_only_change"}:
+            return False
+        if not lowered.strip():
+            return False
+        if ServiceStrategyMixins._looks_like_fix_request(lowered):
+            return False
+        if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
+            return False
+        if ServiceStrategyMixins._looks_like_visual_role_patch_request(lowered):
+            return False
+        if ServiceStrategyMixins._looks_like_narrow_interaction_patch_request(lowered):
+            return False
+        if any(marker in lowered for marker in ServiceStrategyMixins._WORKFLOW_PARTIAL_NEW_SURFACE_MARKERS):
+            return False
+        workflow_hits = ServiceStrategyMixins._matching_marker_count(lowered, ServiceStrategyMixins._WORKFLOW_PARTIAL_PATCH_MARKERS)
+        contract_hits = ServiceStrategyMixins._matching_marker_count(lowered, ServiceStrategyMixins._CONTRACT_ROLE_PATCH_MARKERS)
+        return workflow_hits >= 2 or (workflow_hits >= 1 and contract_hits >= 1)
+
+    @staticmethod
     def _role_only_patch_kind(*, prompt: str, role_scope: list[str], intent: str) -> str | None:
         if len(role_scope) != 1:
             return None
@@ -338,7 +425,13 @@ class ServiceStrategyMixins:
         if intent == "create":
             return "whole_file_build"
         if role_patch_kind in {"ui_flow_patch", "contract_patch"}:
-            return "whole_file_build"
+            return "workflow_partial_build"
+        if ServiceStrategyMixins._looks_like_workflow_partial_patch_request(
+            lowered=lowered,
+            intent=intent,
+            role_scope=role_scope,
+        ):
+            return "workflow_partial_build"
         if len(role_scope) == 1 and intent in {"edit", "refine", "role_only_change"}:
             return "whole_file_build"
         whole_file_markers = ("full implementation", "whole file", "whole files", "generate by files", "generate files", "new app surface", "catalog", "storefront", "checkout", "workspace", "dashboard", "workflow", "multi-page", "multi role", "multi-role", "refactor")
@@ -357,11 +450,17 @@ class ServiceStrategyMixins:
         if role_patch_kind == "interaction_patch":
             return "The request is a narrow single-role interaction fix, so generation keeps the existing surface and changes only the smallest in-place behavior."
         if role_patch_kind == "ui_flow_patch":
-            return "The request expands an existing single-role UI flow, so generation uses bounded role regeneration instead of a micro-patch."
+            return "The request expands an existing single-role UI flow, so generation uses workflow-partial regeneration instead of a full app rebuild."
         if role_patch_kind == "contract_patch":
-            return "The request changes a single-role contract-backed behavior, so generation uses bounded role regeneration with related runtime files when needed."
+            return "The request changes an existing contract-backed workflow, so generation uses workflow-partial regeneration with only the related runtime files."
         if role_patch_kind == "role_patch":
             return "The request changes one existing role surface, so generation stays bounded to that role bundle instead of reworking the whole app."
+        if ServiceStrategyMixins._looks_like_workflow_partial_patch_request(
+            lowered=lowered,
+            intent=intent,
+            role_scope=role_scope,
+        ):
+            return "The request changes an existing workflow without introducing a new surface, so generation uses workflow-partial regeneration instead of whole-file bundles."
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):
             return "The request describes a new workflow-heavy app surface, so generation uses whole-file bundles."
         if len(role_scope) > 1:
@@ -386,6 +485,12 @@ class ServiceStrategyMixins:
             return False
         if role_patch_kind == "ui_flow_patch":
             return True
+        if ServiceStrategyMixins._looks_like_workflow_partial_patch_request(
+            lowered=lowered,
+            intent=intent,
+            role_scope=role_scope,
+        ):
+            return False
         if role_patch_kind == "role_patch":
             return False
         if ServiceStrategyMixins._looks_like_create_surface_request(lowered, role_scope):

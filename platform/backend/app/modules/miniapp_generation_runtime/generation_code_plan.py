@@ -151,6 +151,12 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 role_patch_kind=role_patch_kind,
             )
             normalized = self._normalize_model_payload(payload["payload"])
+            if scope_mode == "workflow_partial_build":
+                normalized = self._supplement_workflow_partial_page_graph_roles(
+                    normalized,
+                    workspace_id=workspace_id,
+                    role_scope=role_scope,
+                )
             planned = self._normalize_page_plan(
                 normalized,
                 role_scope=role_scope,
@@ -164,6 +170,13 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                     planned,
                     prompt=prompt,
                     focused_role=role_scope[0],
+                )
+            if scope_mode == "workflow_partial_build":
+                planned = self._prune_workflow_partial_plan(
+                    planned,
+                    prompt=prompt,
+                    role_scope=role_scope,
+                    role_patch_kind=role_patch_kind,
                 )
             focused_role = self._focused_minimal_patch_role(prompt=prompt, role_scope=role_scope)
             if focused_role and (
@@ -514,6 +527,347 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             "role_patch_kind": role_patch_kind,
             "suppress_role_route_targets": visual_only_patch,
         }
+
+    def _prune_workflow_partial_plan(
+        self,
+        planned: dict[str, Any],
+        *,
+        prompt: str,
+        role_scope: list[str],
+        role_patch_kind: str | None,
+    ) -> dict[str, Any]:
+        page_graph = dict(planned.get("page_graph") or {})
+        roles = {
+            str(role): payload
+            for role, payload in dict(page_graph.get("roles") or {}).items()
+            if isinstance(payload, dict)
+        }
+        source_roles = self._source_roles_for_workflow_partial(
+            workspace_id=planned.get("workspace_id"),
+        )
+        if source_roles:
+            merged_roles: dict[str, dict[str, Any]] = {role: dict(payload) for role, payload in source_roles.items()}
+            for role, payload in roles.items():
+                existing_payload = dict(merged_roles.get(role) or {})
+                merged_payload = {
+                    **existing_payload,
+                    **payload,
+                }
+                merged_pages = self._merge_role_pages(
+                    list(existing_payload.get("pages") or []),
+                    list(payload.get("pages") or []),
+                )
+                if merged_pages:
+                    merged_payload["pages"] = merged_pages
+                merged_roles[role] = merged_payload
+            roles = merged_roles
+            page_graph["roles"] = roles
+        if not roles:
+            return planned
+        impacted_roles = self._workflow_partial_roles(
+            prompt=prompt,
+            role_scope=role_scope,
+            available_roles=list(roles.keys()),
+        )
+        if not impacted_roles:
+            return planned
+
+        prompt_tokens = self._prompt_focus_tokens(prompt)
+        profile_prompt_tokens = {"profile", "settings", "account", "avatar", "photo", "logo", "image", "picture"}
+        include_profile = bool(profile_prompt_tokens & prompt_tokens)
+        workflow_page_targets: set[str] = set()
+        selected_pages_by_role: dict[str, list[dict[str, Any]]] = {}
+        feature_stems: set[str] = set()
+
+        for role in impacted_roles:
+            role_payload = roles.get(role) or {}
+            pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
+            selected_pages: list[dict[str, Any]] = []
+            for page in pages:
+                if self._is_profile_like_page(page) and not include_profile:
+                    continue
+                page_targets = self._page_static_targets(page)
+                if not page_targets:
+                    continue
+                selected_pages.append(page)
+                workflow_page_targets.update(page_targets)
+                stem = self._page_feature_stem(focused_role=role, page=page)
+                if stem:
+                    feature_stems.add(stem)
+            if not selected_pages:
+                selected_pages = list(pages)
+                for page in selected_pages:
+                    workflow_page_targets.update(self._page_static_targets(page))
+                    stem = self._page_feature_stem(focused_role=role, page=page)
+                    if stem:
+                        feature_stems.add(stem)
+            selected_pages_by_role[role] = selected_pages
+
+        prompt_lowered = str(prompt or "").lower()
+        contract_markers = (
+            "status",
+            "cancel",
+            "assign",
+            "approve",
+            "reject",
+            "api",
+            "backend",
+            "persist",
+            "состояни",
+            "статус",
+            "отмен",
+            "назнач",
+            "сохран",
+        )
+        backend_route_markers = (
+            "api",
+            "backend",
+            "database",
+            "db",
+            "schema",
+            "persist",
+            "persistence",
+            "endpoint",
+            "route",
+            "write path",
+            "write-path",
+            "payload",
+            "request body",
+            "response body",
+            "save action",
+            "real api",
+            "реальный api",
+            "бэкенд",
+            "бекенд",
+            "база данных",
+            "схема",
+            "эндпоинт",
+            "роут",
+            "маршрут",
+            "payload",
+        )
+        include_contract_targets = role_patch_kind == "contract_patch" or any(
+            marker in prompt_lowered for marker in contract_markers
+        )
+        include_route_targets = role_patch_kind == "contract_patch" or any(
+            marker in prompt_lowered for marker in backend_route_markers
+        )
+        route_targets = {
+            path
+            for path in [*(planned.get("target_files") or []), *(planned.get("backend_targets") or [])]
+            if include_route_targets
+            and isinstance(path, str)
+            and path.startswith("miniapp/app/routes/")
+            and path.removeprefix("miniapp/app/routes/").removesuffix(".py") in {
+                *impacted_roles,
+                "runtime",
+                *feature_stems,
+            }
+        }
+        contract_targets = {
+            path
+            for path in [*(planned.get("target_files") or []), *(planned.get("backend_targets") or [])]
+            if include_contract_targets
+            and isinstance(path, str)
+            and path in {"miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"}
+        }
+        shared_targets = [
+            path
+            for path in (planned.get("shared_files") or [])
+            if isinstance(path, str)
+            and (
+                path.startswith("miniapp/app/static/shared/")
+                or path.startswith("miniapp/app/generated/")
+            )
+        ]
+        pruned_target_files = self._sanitize_planner_target_files(
+            target_files=list(
+                dict.fromkeys(
+                    [
+                        *sorted(shared_targets),
+                        *sorted(route_targets),
+                        *sorted(contract_targets),
+                        *sorted(workflow_page_targets),
+                    ]
+                )
+            ),
+            backend_targets=list(dict.fromkeys([*sorted(route_targets), *sorted(contract_targets)])),
+            page_graph={
+                "roles": {
+                    role: {
+                        **roles[role],
+                        "pages": list(selected_pages_by_role.get(role) or []),
+                    }
+                    for role in impacted_roles
+                    if role in roles
+                }
+            },
+        )
+        target_set = set(pruned_target_files)
+        pruned_backend_targets = [
+            path
+            for path in [*sorted(route_targets), *sorted(contract_targets)]
+            if path in target_set
+        ]
+        pruned_shared_files = [path for path in shared_targets if path in target_set]
+        pruned_files_to_read = [
+            path
+            for path in (planned.get("files_to_read") or [])
+            if isinstance(path, str)
+            and (
+                path in target_set
+                or path.startswith("miniapp/app/static/shared/")
+                or path.startswith("miniapp/app/generated/")
+            )
+        ]
+        filtered_roles = {
+            role: {
+                **roles[role],
+                "pages": list(selected_pages_by_role.get(role) or []),
+            }
+            for role in impacted_roles
+            if role in roles
+        }
+        page_graph["roles"] = filtered_roles
+        generation_clusters = self._build_generation_clusters(pruned_target_files)
+        execution_plan = self._build_execution_plan(
+            role_scope=impacted_roles,
+            roles=filtered_roles,
+            shared_files=pruned_shared_files,
+            backend_targets=pruned_backend_targets,
+            target_files=pruned_target_files,
+            generation_clusters=generation_clusters,
+        )
+        return {
+            **planned,
+            "page_graph": page_graph,
+            "target_files": pruned_target_files,
+            "backend_targets": pruned_backend_targets,
+            "shared_files": pruned_shared_files,
+            "files_to_read": list(dict.fromkeys([*pruned_files_to_read, *pruned_target_files])),
+            "generation_clusters": generation_clusters,
+            "active_role_scope": execution_plan["active_role_scope"],
+            "execution_plan": execution_plan,
+            "workflow_partial_build": True,
+            "role_patch_kind": role_patch_kind,
+        }
+
+    def _supplement_workflow_partial_page_graph_roles(
+        self,
+        payload: dict[str, Any],
+        *,
+        workspace_id: str,
+        role_scope: list[str],
+    ) -> dict[str, Any]:
+        source_roles = self._source_roles_for_workflow_partial(workspace_id=workspace_id)
+        if not source_roles:
+            return payload
+        raw_graph = dict(payload.get("page_graph") or {})
+        raw_roles = raw_graph.get("roles")
+        merged_roles: dict[str, dict[str, Any]] = {}
+        if isinstance(raw_roles, list):
+            for item in raw_roles:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").strip().lower()
+                if not role:
+                    continue
+                merged_roles[role] = dict(item)
+        elif isinstance(raw_roles, dict):
+            for role, item in raw_roles.items():
+                if isinstance(item, dict):
+                    merged_roles[str(role).strip().lower()] = dict(item)
+        for role in role_scope:
+            source_payload = source_roles.get(role)
+            if not source_payload:
+                continue
+            existing_payload = dict(merged_roles.get(role) or {})
+            merged_payload = {
+                **source_payload,
+                **existing_payload,
+            }
+            merged_pages = self._merge_role_pages(
+                list(source_payload.get("pages") or []),
+                list(existing_payload.get("pages") or []),
+            )
+            if merged_pages:
+                merged_payload["pages"] = merged_pages
+            merged_roles[role] = merged_payload
+        raw_graph["roles"] = merged_roles
+        return {
+            **payload,
+            "page_graph": raw_graph,
+        }
+
+    @staticmethod
+    def _merge_role_pages(source_pages: list[Any], planned_pages: list[Any]) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for page in [*source_pages, *planned_pages]:
+            if not isinstance(page, dict):
+                continue
+            signature = (
+                str(page.get("page_id") or "").strip(),
+                str(page.get("route_path") or "").strip(),
+                str(page.get("file_path") or "").strip(),
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            merged.append(page)
+        return merged
+
+    def _source_roles_for_workflow_partial(self, *, workspace_id: str | None) -> dict[str, dict[str, Any]]:
+        if not workspace_id:
+            return {}
+        try:
+            source_dir = self.workspace_service.source_dir(workspace_id)
+        except Exception:
+            return {}
+        artifacts_path = Path(source_dir) / "artifacts" / "generated_app_graph.json"
+        if not artifacts_path.exists():
+            return {}
+        try:
+            payload = json.loads(artifacts_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        roles = payload.get("roles")
+        if not isinstance(roles, dict):
+            return {}
+        return {
+            str(role): dict(role_payload)
+            for role, role_payload in roles.items()
+            if isinstance(role_payload, dict)
+        }
+
+    @classmethod
+    def _workflow_partial_roles(
+        cls,
+        *,
+        prompt: str,
+        role_scope: list[str],
+        available_roles: list[str],
+    ) -> list[str]:
+        available = [role for role in ("client", "specialist", "manager") if role in set(available_roles)]
+        impacted: set[str] = {role for role in role_scope if role in available}
+        lowered = str(prompt or "").lower()
+        role_hints = {
+            "client": ("client", "customer", "user", "клиент", "пользователь", "заказчик"),
+            "specialist": ("specialist", "worker", "master", "executor", "washer", "специалист", "мастер", "исполнитель", "мойщик"),
+            "manager": ("manager", "admin", "administrator", "operator", "менеджер", "администратор", "оператор", "админ"),
+        }
+        for role, hints in role_hints.items():
+            if role in available and any(hint in lowered for hint in hints):
+                impacted.add(role)
+        lifecycle_markers = ("status", "assign", "cancel", "approve", "reject", "queue", "workflow", "статус", "назнач", "отмен", "очеред")
+        if any(marker in lowered for marker in lifecycle_markers):
+            impacted.update(available)
+        manager_markers = ("filter", "counter", "dashboard", "queue", "фильтр", "счётчик", "счетчик")
+        if any(marker in lowered for marker in manager_markers) and "manager" in available:
+            impacted.add("manager")
+        if not impacted:
+            impacted.update(available)
+        return [role for role in ("client", "specialist", "manager") if role in impacted]
 
     def _stabilize_single_role_flow_expansion_plan(
         self,

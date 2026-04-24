@@ -180,6 +180,7 @@ class MiniappGenerationRepair:
         role_scope: list[str],
         scope_mode: str,
         mode: str = "exact",
+        allow_fast_gate: bool = False,
     ) -> tuple[CheckExecutionRecord, dict[str, Any]]:
         changed = sorted(set(changed_files or fallback_changed_files))
         preflight_issues = self.service._preflight_generation_issues(
@@ -217,6 +218,7 @@ class MiniappGenerationRepair:
             changed_files=changed,
             preview_run_id=draft_run_id,
             scope_mode="whole_file_build" if mode == "final" else scope_mode,
+            check_profile="fast_gate" if allow_fast_gate and mode != "final" else "full",
         )
         preview = self.service.preview_service.get(workspace_id)
         preview_details = {
@@ -481,6 +483,10 @@ class MiniappGenerationRepair:
                 page_graph=page_graph,
                 role_scope=role_scope,
                 scope_mode=plan_result["scope_mode"],
+                allow_fast_gate=(
+                    generation_mode != GenerationMode.QUALITY
+                    and request.intent in {"edit", "refine", "role_only_change"}
+                ),
             )
 
         def _plan_turn(
@@ -559,6 +565,10 @@ class MiniappGenerationRepair:
             append_event=self.service._append_event,
             append_trace=self.service._append_trace,
             store_report=self.service._store_report,
+            allow_optimistic_completion=(
+                generation_mode != GenerationMode.QUALITY
+                and request.intent in {"edit", "refine", "role_only_change"}
+            ),
             stop_if_requested=should_stop,
         )
         return self.service.workspace_loop_engine.run(

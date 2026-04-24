@@ -191,7 +191,9 @@ class WorkspaceLoopTurnRunner:
                 },
             )
 
-            if completion_state.get("strict_green"):
+            if completion_state.get("strict_green") or (
+                callbacks.allow_optimistic_completion and completion_state.get("optimistic_complete")
+            ):
                 return self.results.completed(
                     latest_execution=latest_execution,
                     latest_preview_details=latest_preview_details,

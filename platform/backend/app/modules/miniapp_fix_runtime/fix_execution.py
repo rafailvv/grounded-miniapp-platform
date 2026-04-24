@@ -75,11 +75,13 @@ class FixExecutionRuntime:
     ) -> tuple[CheckExecutionRecord, dict[str, Any]]:
         self.service._append_event(job, "frontend_build_started", "Running exact frontend/build verification.")
         self.service._append_event(job, "backend_compile_started", "Running exact miniapp compile verification.")
-        self._refresh_derived_app_tests(
-            workspace_id=workspace_id,
-            run_id=run_id,
-            draft_source=draft_source,
-        )
+        use_fast_gate = job.generation_mode != GenerationMode.QUALITY
+        if not use_fast_gate:
+            self._refresh_derived_app_tests(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                draft_source=draft_source,
+            )
         execution = self.service.check_runner.run(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -87,6 +89,7 @@ class FixExecutionRuntime:
             changed_files=changed_files,
             preview_run_id=run_id,
             scope_mode="fix_agentic",
+            check_profile="fast_gate" if use_fast_gate else "full",
         )
         results = [item for item in execution.results if item.name not in {"preview_boot_smoke", "preview_connectivity_smoke"}]
         preview_details: dict[str, Any] = {"status": "skipped", "containers": [], "container_logs": {}, "logs": [], "last_error": None}
@@ -290,7 +293,18 @@ class FixExecutionRuntime:
     def is_fix_success(results: list[RunCheckResult], preview_details: dict[str, Any]) -> bool:
         validators_ok = all(result.status != "failed" for result in results if result.name in {"schema_validators", "connectivity_validators"})
         build_ok = all(result.status != "failed" for result in results if result.name == "changed_files_static")
-        app_tests_ok = all(result.status != "failed" for result in results if result.name in {"generated_app_python_tests", "generated_app_js_tests"})
+        canonical_smoke_ok = all(
+            result.status != "failed"
+            for result in results
+            if result.name == "workflow_canonical_smoke"
+        )
+        app_test_results = [
+            result
+            for result in results
+            if result.name in {"generated_app_python_tests", "generated_app_js_tests"}
+        ]
+        app_tests_ok = all(result.status != "failed" for result in app_test_results)
+        app_tests_complete = not any(result.status == "skipped" for result in app_test_results)
         preview_result = next((result for result in results if result.name == "preview_boot_smoke"), None)
         preview_connectivity_result = next((result for result in results if result.name == "preview_connectivity_smoke"), None)
         preview_deferred = (
@@ -307,7 +321,7 @@ class FixExecutionRuntime:
             and preview_connectivity_result.status == "passed"
             and preview_details.get("status") == "running"
         )
-        return validators_ok and build_ok and app_tests_ok and (preview_ok or preview_deferred)
+        return validators_ok and build_ok and canonical_smoke_ok and app_tests_ok and app_tests_complete and (preview_ok or preview_deferred)
 
     @classmethod
     def completion_state_from_results(
@@ -339,6 +353,11 @@ class FixExecutionRuntime:
         if only_non_blocking_validator_tail:
             validators_ok = True
         build_ok = all(result.status != "failed" for result in results if result.name == "changed_files_static")
+        canonical_smoke_ok = all(
+            result.status != "failed"
+            for result in results
+            if result.name == "workflow_canonical_smoke"
+        )
         app_test_failures = [
             result
             for result in results
@@ -369,10 +388,11 @@ class FixExecutionRuntime:
             )
         return {
             "strict_green": strict_green,
-            "optimistic_complete": False,
+            "optimistic_complete": validators_ok and build_ok and canonical_smoke_ok and not non_test_failures and not app_test_failures,
             "preview_ok": preview_ok,
             "validators_ok": validators_ok,
             "build_ok": build_ok,
+            "canonical_smoke_ok": canonical_smoke_ok,
             "non_test_failures": non_test_failures,
             "app_test_failures": app_test_failures,
             "remaining_issues": remaining_issues,

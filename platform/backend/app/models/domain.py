@@ -470,6 +470,10 @@ class RunChecksSummary(StrictModel):
     validators: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
     build: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
     preview: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
+    gate_status: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
+    followup_status: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
+    followup_run_id: str | None = None
+    auto_fix_status: Literal["pending", "passed", "failed", "blocked", "skipped"] = "skipped"
     issues: list[dict[str, Any]] = Field(default_factory=list)
 
 

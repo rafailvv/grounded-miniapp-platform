@@ -215,7 +215,7 @@ class MiniappGenerationRoleContract:
             if not jobs:
                 issues.append(f"{role} is missing primary jobs.")
             normalized_responsibilities.append(re.sub(r"\s+", " ", responsibility.lower()))
-        if scope_mode == "minimal_patch":
+        if scope_mode in {"minimal_patch", "workflow_partial_build"}:
             return issues
         if len(normalized_responsibilities) > 1 and len(set(normalized_responsibilities)) == 1:
             issues.append("All selected roles still have the same responsibility in the role contract.")

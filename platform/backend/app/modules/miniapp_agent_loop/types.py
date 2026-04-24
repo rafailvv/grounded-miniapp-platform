@@ -80,6 +80,7 @@ class WorkspaceLoopCallbacks:
     append_event: Callable[[JobRecord, str, str, dict[str, Any] | None], None]
     append_trace: Callable[[str, str, str, dict[str, Any] | None], None]
     store_report: Callable[[str, dict[str, Any]], None]
+    allow_optimistic_completion: bool = False
     stop_if_requested: Callable[[], bool] | None = None
 
 

@@ -653,6 +653,7 @@ class FixEntryRuntime:
             append_event=self.service._append_event,
             append_trace=self.service._append_trace,
             store_report=self.service._store_report,
+            allow_optimistic_completion=effective_mode != GenerationMode.QUALITY,
             stop_if_requested=should_stop,
         )
         loop_result = self.service.workspace_loop_engine.run(

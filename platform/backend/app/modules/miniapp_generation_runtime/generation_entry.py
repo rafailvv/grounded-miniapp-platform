@@ -372,12 +372,12 @@ class MiniappGenerationEntry:
             or str(inferred_plan_result.get("role_patch_kind") or "").strip()
             or None
         )
-        minimal_patch_uses_advisory_scope = bool(
-            scope_mode == "minimal_patch" and (advisory_page_targets or advisory_backend_targets)
+        advisory_scope_uses_targeted_merge = bool(
+            scope_mode in {"minimal_patch", "workflow_partial_build"} and (advisory_page_targets or advisory_backend_targets)
         )
         merged_page_targets = (
             list(dict.fromkeys(advisory_page_targets))
-            if minimal_patch_uses_advisory_scope and advisory_page_targets
+            if advisory_scope_uses_targeted_merge and advisory_page_targets
             else self._page_graph_target_files(current_graph)
         )
         for key in ("backend_targets", "shared_files", "files_to_read"):
@@ -397,7 +397,7 @@ class MiniappGenerationEntry:
             and isinstance(role_payload.get("routes_file"), str)
             and not suppress_role_route_targets
             and (
-                not minimal_patch_uses_advisory_scope
+                not advisory_scope_uses_targeted_merge
                 or role in page_target_roles
             )
         ]
@@ -406,7 +406,7 @@ class MiniappGenerationEntry:
                 [
                     *(
                         advisory_backend_targets
-                        if minimal_patch_uses_advisory_scope
+                        if advisory_scope_uses_targeted_merge
                         else (merged_plan.get("backend_targets") or [])
                     ),
                     *explicit_role_route_targets,
@@ -424,7 +424,7 @@ class MiniappGenerationEntry:
             for path in (advisory_plan_result.get("target_files") or [])
             if not str(path).startswith("miniapp/app/static/")
         ]
-        if minimal_patch_uses_advisory_scope:
+        if advisory_scope_uses_targeted_merge:
             inferred_non_page_targets = []
         merged_plan["target_files"] = list(
             dict.fromkeys(

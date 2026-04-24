@@ -13,6 +13,7 @@ from app.ai.model_registry import resolve_model_profile
 from app.ai.openrouter_client import OpenRouterClient
 from app.models.common import GenerationMode
 from app.models.domain import (
+    CheckExecutionRecord,
     CodeChangePlan,
     CodeChangeTarget,
     CreateRunRequest,
@@ -489,6 +490,15 @@ class RunService:
             run.current_stage = "starting"
             run.progress_percent = max(run.progress_percent, 5)
             run.updated_at = datetime.now(timezone.utc)
+            should_queue_followup_verification = self._should_queue_async_followup_verification(request, run)
+            if should_queue_followup_verification:
+                run.checks_summary = self._build_checks_summary(
+                    job.validation_snapshot,
+                    preview.status,
+                    gate_status="passed",
+                    followup_status="pending",
+                    auto_fix_status="skipped",
+                )
             self._save_run(run)
             self.workspace_log_service.append(
                 run.workspace_id,
@@ -676,6 +686,15 @@ class RunService:
                     job=job,
                     meaningful_paths=meaningful_paths,
                 ):
+                    should_queue_followup_verification = self._should_queue_async_followup_verification(request, run)
+                    if should_queue_followup_verification:
+                        run.checks_summary = self._build_checks_summary(
+                            job.validation_snapshot,
+                            self.preview_service.get(run.workspace_id).status,
+                            gate_status="passed",
+                            followup_status="pending",
+                            auto_fix_status="skipped",
+                        )
                     self._save_run(run)
                     self._store_run_artifacts(run, change_plan, job, self.preview_service.get(run.workspace_id))
                     self.store.delete("reports", f"run_stop_request:{run.run_id}")
@@ -693,7 +712,12 @@ class RunService:
                         payload={"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status},
                     )
                     if run.status == "completed" and run.apply_status == "applied":
-                        self._queue_preview_refresh(run, reason="run completion", draft_run_id=None)
+                        self._queue_preview_refresh(
+                            run,
+                            reason="run completion",
+                            draft_run_id=None,
+                            followup_request=request if should_queue_followup_verification else None,
+                        )
                     return
                 if job.status == "blocked":
                     run.status = "blocked"
@@ -757,7 +781,12 @@ class RunService:
             if run.status == "completed" and run.apply_status == "applied":
                 self._queue_resume_generation_from_checkpoint_if_needed(run, request)
             if queue_preview_reason is not None:
-                self._queue_preview_refresh(run, reason=queue_preview_reason, draft_run_id=None)
+                self._queue_preview_refresh(
+                    run,
+                    reason=queue_preview_reason,
+                    draft_run_id=None,
+                    followup_request=request if should_queue_followup_verification else None,
+                )
         except Exception as exc:
             run.status = "failed"
             run.apply_status = "failed"
@@ -864,7 +893,14 @@ class RunService:
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.store.upsert("jobs", job_id, payload)
 
-    def _queue_preview_refresh(self, run: RunRecord, *, reason: str, draft_run_id: str | None = None) -> None:
+    def _queue_preview_refresh(
+        self,
+        run: RunRecord,
+        *,
+        reason: str,
+        draft_run_id: str | None = None,
+        followup_request: CreateRunRequest | None = None,
+    ) -> None:
         queue_started_at = time.perf_counter()
         self._append_job_event(
             run.linked_job_id,
@@ -921,6 +957,8 @@ class RunService:
                 run_payload["latency_breakdown"] = latency_breakdown
                 run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
                 self.store.upsert("runs", run.run_id, run_payload)
+            if followup_request is not None:
+                self._launch_async_followup_verification(parent_run_id=run.run_id, request=followup_request)
 
         preview = self.preview_service.rebuild_async(
             run.workspace_id,
@@ -943,6 +981,178 @@ class RunService:
                 if key in {"status", "stage", "progress_percent", "runtime_mode", "url", "role_urls", "draft_run_id"}
             }
             self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
+
+    def _launch_async_followup_verification(self, *, parent_run_id: str, request: CreateRunRequest) -> None:
+        marker_key = f"followup_started:{parent_run_id}"
+        if self.store.get("reports", marker_key):
+            return
+        self.store.upsert(
+            "reports",
+            marker_key,
+            {"run_id": parent_run_id, "started_at": datetime.now(timezone.utc).isoformat()},
+        )
+        worker = threading.Thread(
+            target=self._run_async_followup_verification,
+            args=(parent_run_id, request.model_dump(mode="python")),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_async_followup_verification(self, parent_run_id: str, request_payload: dict[str, Any]) -> None:
+        try:
+            parent_run = self.get_run(parent_run_id)
+        except KeyError:
+            return
+        request = CreateRunRequest.model_validate(request_payload)
+        self._set_followup_status(parent_run_id, followup_status="pending")
+        execution, validation_snapshot = self._run_followup_checks(parent_run)
+        if self._followup_checks_passed(parent_run, execution, validation_snapshot):
+            self._set_followup_status(parent_run_id, followup_status="passed")
+            return
+        self._set_followup_status(parent_run_id, followup_status="failed")
+        if not self._should_auto_fix_followup_failure(execution, validation_snapshot):
+            self._set_followup_status(parent_run_id, auto_fix_status="skipped")
+            return
+        self._set_followup_status(parent_run_id, auto_fix_status="pending")
+        try:
+            followup_run = self.create_run_sync(
+                parent_run.workspace_id,
+                self._build_followup_fix_request(parent_run=parent_run, request=request, execution=execution),
+            )
+        except Exception:
+            self._set_followup_status(parent_run_id, auto_fix_status="failed")
+            return
+        self._set_followup_status(
+            parent_run_id,
+            followup_run_id=followup_run.run_id,
+            auto_fix_status="passed" if followup_run.status == "completed" and followup_run.apply_status == "applied" else "failed",
+        )
+        if not (followup_run.status == "completed" and followup_run.apply_status == "applied"):
+            return
+        refreshed_parent = self.get_run(parent_run_id)
+        post_fix_execution, _post_fix_validation = self._run_followup_checks(refreshed_parent)
+        self._set_followup_status(
+            parent_run_id,
+            followup_status="passed" if self._followup_checks_passed(refreshed_parent, post_fix_execution, _post_fix_validation) else "failed",
+        )
+
+    def _run_followup_checks(self, run: RunRecord) -> tuple[CheckExecutionRecord, Any]:
+        source_dir = self.workspace_service.source_dir(run.workspace_id)
+        execution = self.check_runner.run(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            source_dir=source_dir,
+            changed_files=list(run.touched_files or ["miniapp"]),
+            preview_run_id=None,
+            scope_mode="whole_file_build",
+            check_profile="full",
+        )
+        validation_snapshot = MiniappGenerationCompletion.validation_snapshot_from_execution(execution)
+        self.store.upsert(
+            "reports",
+            f"followup_checks:{run.run_id}",
+            {
+                "execution": execution.model_dump(mode="json"),
+                "validation": validation_snapshot.model_dump(mode="json"),
+            },
+        )
+        return execution, validation_snapshot
+
+    def _followup_checks_passed(self, run: RunRecord, execution: CheckExecutionRecord, validation_snapshot: Any) -> bool:
+        completion = MiniappGenerationCompletion.workspace_loop_completion_state(
+            execution.results,
+            self._preview_snapshot(run.workspace_id),
+            validation_snapshot,
+        )
+        return bool(completion.get("strict_green"))
+
+    def _should_auto_fix_followup_failure(self, execution: CheckExecutionRecord, validation_snapshot: Any) -> bool:
+        if CheckRunner.has_tooling_failure(execution.results):
+            return False
+        failed_names = {result.name for result in execution.results if result.status == "failed"}
+        if not failed_names:
+            return False
+        repairable_failures = {
+            "schema_validators",
+            "connectivity_validators",
+            "changed_files_static",
+            "workflow_canonical_smoke",
+            "generated_app_python_tests",
+            "generated_app_js_tests",
+            "preview_boot_smoke",
+            "preview_connectivity_smoke",
+        }
+        if not failed_names.issubset(repairable_failures):
+            return False
+        if validation_snapshot is None:
+            return True
+        if not getattr(validation_snapshot, "build_valid", True):
+            return True
+        return any(
+            isinstance(issue, dict) and issue.get("blocking", False)
+            for issue in getattr(validation_snapshot, "issues", [])
+        )
+
+    def _build_followup_fix_request(
+        self,
+        *,
+        parent_run: RunRecord,
+        request: CreateRunRequest,
+        execution: CheckExecutionRecord,
+    ) -> CreateRunRequest:
+        raw_error = "\n".join(
+            [
+                str(result.details or "").strip()
+                for result in execution.results
+                if result.status == "failed" and str(result.details or "").strip()
+            ]
+        ).strip() or "Follow-up verification failed after apply."
+        failing_result = next((result for result in execution.results if result.status == "failed"), None)
+        failing_target = str(failing_result.name if failing_result is not None else "followup_verification")
+        error_source = "preview" if failing_target.startswith("preview_") else "runtime"
+        return CreateRunRequest(
+            prompt="Analyze the follow-up verification failure and apply the smallest safe fix.",
+            mode="fix",
+            intent="edit",
+            apply_strategy="staged_auto_apply",
+            target_role_scope=list(parent_run.target_role_scope),
+            model_profile=parent_run.model_profile,
+            generation_mode=parent_run.generation_mode if parent_run.generation_mode != GenerationMode.QUALITY else GenerationMode.BALANCED,
+            resume_from_run_id=parent_run.run_id,
+            error_context={
+                "raw_error": raw_error,
+                "source": error_source,
+                "failing_target": failing_target,
+            },
+        )
+
+    def _set_followup_status(
+        self,
+        run_id: str,
+        *,
+        followup_status: str | None = None,
+        followup_run_id: str | None = None,
+        auto_fix_status: str | None = None,
+    ) -> None:
+        run_payload = self.store.get("runs", run_id)
+        if run_payload is None:
+            return
+        checks_payload = dict(run_payload.get("checks_summary") or {})
+        if followup_status is not None:
+            checks_payload["followup_status"] = followup_status
+        if followup_run_id is not None:
+            checks_payload["followup_run_id"] = followup_run_id
+        if auto_fix_status is not None:
+            checks_payload["auto_fix_status"] = auto_fix_status
+        run_payload["checks_summary"] = checks_payload
+        run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.store.upsert("runs", run_id, run_payload)
+        artifacts_payload = self.store.get("reports", f"run_artifacts:{run_id}")
+        if artifacts_payload is not None:
+            run_snapshot = dict(artifacts_payload.get("run") or {})
+            run_snapshot["checks_summary"] = checks_payload
+            artifacts_payload["run"] = run_snapshot
+            self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts_payload)
 
     def _queue_resume_generation_from_checkpoint_if_needed(self, run: RunRecord, request: CreateRunRequest) -> None:
         checkpoint = self.store.get("reports", f"resume_checkpoint:{run.workspace_id}")
@@ -1536,6 +1746,16 @@ class RunService:
         )
         return True
 
+    @staticmethod
+    def _should_queue_async_followup_verification(request: CreateRunRequest, run: RunRecord) -> bool:
+        if request.mode == "fix":
+            return False
+        if run.status != "completed" or run.apply_status != "applied":
+            return False
+        if run.generation_mode == GenerationMode.QUALITY:
+            return False
+        return run.intent in {"edit", "refine", "role_only_change"}
+
     def _should_apply_best_effort_after_failed_repairs(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
         del run, job, meaningful_paths
         return False
@@ -1676,7 +1896,15 @@ class RunService:
         return list(dict.fromkeys(paths))
 
     @staticmethod
-    def _build_checks_summary(validation_snapshot: Any, preview_status: str) -> RunChecksSummary:
+    def _build_checks_summary(
+        validation_snapshot: Any,
+        preview_status: str,
+        *,
+        gate_status: str | None = None,
+        followup_status: str | None = None,
+        followup_run_id: str | None = None,
+        auto_fix_status: str | None = None,
+    ) -> RunChecksSummary:
         issues = []
         validators = "pending"
         build = "pending"
@@ -1691,7 +1919,8 @@ class RunService:
             has_generation_block = any(code.startswith("generation.") for code in issue_codes)
             has_build_issue = any(code.startswith("build.") for code in issue_codes)
             has_preview_issue = any(code.startswith("preview.") for code in issue_codes)
-            if getattr(validation_snapshot, "blocking", False) and has_generation_block:
+            has_workflow_issue = any(code.startswith("workflow.") for code in issue_codes)
+            if getattr(validation_snapshot, "blocking", False) and (has_generation_block or has_workflow_issue):
                 validators = "blocked"
             elif has_build_issue or has_preview_issue:
                 validators = "passed"
@@ -1712,4 +1941,31 @@ class RunService:
             preview = "passed"
         elif preview_status == "error":
             preview = "failed"
-        return RunChecksSummary(validators=validators, build=build, preview=preview, issues=issues)
+        resolved_gate_status = gate_status
+        if resolved_gate_status is None:
+            if validators in {"failed", "blocked"} or build == "failed":
+                resolved_gate_status = "failed"
+            elif validators == "passed" and build == "passed":
+                resolved_gate_status = "passed"
+            else:
+                resolved_gate_status = "pending"
+        resolved_followup_status = followup_status
+        if resolved_followup_status is None:
+            if preview == "passed":
+                resolved_followup_status = "passed"
+            elif preview == "failed":
+                resolved_followup_status = "failed"
+            elif preview == "skipped":
+                resolved_followup_status = "skipped"
+            else:
+                resolved_followup_status = "pending"
+        return RunChecksSummary(
+            validators=validators,
+            build=build,
+            preview=preview,
+            gate_status=resolved_gate_status,
+            followup_status=resolved_followup_status,
+            followup_run_id=followup_run_id,
+            auto_fix_status=auto_fix_status or "skipped",
+            issues=issues,
+        )

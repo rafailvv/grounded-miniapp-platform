@@ -109,6 +109,11 @@ class MiniappGenerationCompletion:
             if result.name in {"schema_validators", "connectivity_validators"}
         )
         build_ok = all(result.status != "failed" for result in results if result.name == "changed_files_static")
+        canonical_smoke_ok = all(
+            result.status != "failed"
+            for result in results
+            if result.name == "workflow_canonical_smoke"
+        )
         preview_result = next((result for result in results if result.name == "preview_boot_smoke"), None)
         preview_connectivity_result = next((result for result in results if result.name == "preview_connectivity_smoke"), None)
         preview_ok = (
@@ -137,9 +142,22 @@ class MiniappGenerationCompletion:
             for issue in validation_snapshot.issues:
                 if isinstance(issue, dict) and not issue.get("blocking", False):
                     remaining_issues.append(issue)
-        strict_green = validators_ok and build_ok and not app_test_failures and preview_ok
+        non_gate_failures = [
+            result
+            for result in results
+            if result.status == "failed"
+            and result.name not in {
+                "generated_app_python_tests",
+                "generated_app_js_tests",
+                "preview_boot_smoke",
+                "preview_connectivity_smoke",
+            }
+        ]
+        strict_green = validators_ok and build_ok and canonical_smoke_ok and not app_test_failures and preview_ok
+        optimistic_complete = validators_ok and build_ok and canonical_smoke_ok and not non_gate_failures and not app_test_failures
         return {
             "strict_green": strict_green,
-            "optimistic_complete": False,
+            "optimistic_complete": optimistic_complete,
+            "canonical_smoke_ok": canonical_smoke_ok,
             "remaining_issues": remaining_issues,
         }

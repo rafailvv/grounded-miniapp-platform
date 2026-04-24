@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 
 from app.models.artifacts import ValidationIssue
 from app.models.domain import CheckExecutionRecord, RunCheckResult, utc_now
+from app.modules.miniapp_validation.generation_preflight_validation import GenerationPreflightValidation
 from app.services.workspace.preview_service import PreviewService
 from app.validators.suite import ValidationSuite
 
@@ -56,6 +57,7 @@ class CheckRunner:
         changed_files: list[str],
         preview_run_id: str | None = None,
         scope_mode: str = "whole_file_build",
+        check_profile: str = "full",
     ) -> CheckExecutionRecord:
         started = time.perf_counter()
         results: list[RunCheckResult] = []
@@ -93,11 +95,65 @@ class CheckRunner:
         static_result.duration_ms = int((time.perf_counter() - static_started) * 1000)
         results.append(static_result)
 
+        canonical_started = time.perf_counter()
+        workflow_smoke_result = self._workflow_canonical_smoke(
+            source_dir=source_dir,
+            changed_files=changed_files,
+            scope_mode=scope_mode,
+        )
+        workflow_smoke_result.duration_ms = int((time.perf_counter() - canonical_started) * 1000)
+        results.append(workflow_smoke_result)
+
         should_skip_preview = (
             bool(filtered_issues)
             or bool(connectivity_issues)
             or static_result.status == "failed"
+            or workflow_smoke_result.status == "failed"
         )
+
+        if check_profile == "fast_gate":
+            results.extend(
+                [
+                    RunCheckResult(
+                        name="generated_app_python_tests",
+                        status="skipped",
+                        details="Generated Python app tests were deferred until follow-up verification.",
+                        command=f"{sys.executable} -m unittest discover -s tests -p test_generated_app.py",
+                        logs=[],
+                    ),
+                    RunCheckResult(
+                        name="generated_app_js_tests",
+                        status="skipped",
+                        details="Generated JS app tests were deferred until follow-up verification.",
+                        command="node --test tests/generated_app.test.mjs",
+                        logs=[],
+                    ),
+                    RunCheckResult(
+                        name="preview_boot_smoke",
+                        status="skipped",
+                        details="Preview rebuild was deferred until follow-up verification.",
+                        command="preview deferred during fast gate",
+                        logs=[],
+                    ),
+                    RunCheckResult(
+                        name="preview_connectivity_smoke",
+                        status="skipped",
+                        details="Preview connectivity smoke was deferred until follow-up verification.",
+                        command="preview deferred during fast gate",
+                        logs=[],
+                    ),
+                ]
+            )
+            completed_at = utc_now()
+            return CheckExecutionRecord(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                changed_files=changed_files,
+                results=results,
+                started_at=utc_now(),
+                completed_at=completed_at,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
 
         def _run_python_tests() -> RunCheckResult:
             python_tests_started = time.perf_counter()
@@ -191,6 +247,10 @@ class CheckRunner:
                 message = next((line for line in result.logs if line.strip()), message)
             if result.name == "changed_files_static":
                 message = next((line for line in result.logs if line.strip()), message)
+            if result.name == "workflow_canonical_smoke":
+                location = "miniapp/app"
+                code = "workflow.canonical_smoke"
+                message = next((line for line in result.logs if line.strip()), message)
             if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
                 location = "tests"
                 code = "tests.python_generated_app" if result.name == "generated_app_python_tests" else "tests.js_generated_app"
@@ -247,6 +307,8 @@ class CheckRunner:
             return "validator/domain_constraint"
         if "changed_files_static" in failed_names:
             return "syntax/build"
+        if "workflow_canonical_smoke" in failed_names:
+            return "validator/domain_constraint"
         if "generated_app_python_tests" in failed_names or "generated_app_js_tests" in failed_names:
             return "app/runtime_test"
         if "preview_boot_smoke" in failed_names or "preview_connectivity_smoke" in failed_names:
@@ -399,6 +461,129 @@ class CheckRunner:
             normalized = role_route if role_route.startswith("/") else f"/{role_route}"
             routes.append(f"/{role}{normalized}")
         return list(dict.fromkeys(route for route in routes if route))
+
+    def _workflow_canonical_smoke(
+        self,
+        *,
+        source_dir: Path,
+        changed_files: list[str],
+        scope_mode: str,
+    ) -> RunCheckResult:
+        relevant_changed = [
+            str(path)
+            for path in changed_files
+            if isinstance(path, str)
+            and path.startswith("miniapp/app/")
+        ]
+        if not relevant_changed:
+            return RunCheckResult(
+                name="workflow_canonical_smoke",
+                status="skipped",
+                details="Workflow canonical smoke skipped because no app files changed.",
+                command="workflow canonical smoke",
+                logs=[],
+            )
+        issues: list[ValidationIssue] = []
+        if any(
+            path.startswith("miniapp/app/routes/")
+            or path in {"miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"}
+            or path.startswith("miniapp/app/generated/")
+            for path in relevant_changed
+        ):
+            issues.extend(GenerationPreflightValidation.preflight_profile_schema_issues(source_dir))
+            issues.extend(GenerationPreflightValidation.preflight_route_schema_issues(source_dir))
+            page_graph = self._load_generated_page_graph(source_dir)
+            role_scope = [
+                str(role)
+                for role in ((page_graph.get("roles") or {}).keys() if isinstance(page_graph, dict) else [])
+                if str(role) in {"client", "specialist", "manager"}
+            ]
+            if role_scope:
+                issues.extend(
+                    GenerationPreflightValidation.preflight_route_manifest_link_issues(
+                        source_dir,
+                        page_graph,
+                        role_scope,
+                        normalize_local_route_ref=GenerationPreflightValidation._normalize_local_route_ref,
+                    )
+                )
+        issues.extend(self._workflow_dom_contract_issues(source_dir=source_dir, changed_files=relevant_changed))
+        issues = self._dedupe_validation_issues(issues)
+        return RunCheckResult(
+            name="workflow_canonical_smoke",
+            status="failed" if issues else "passed",
+            details="Workflow canonical smoke validated lightweight route/schema and DOM invariants for the edited surface.",
+            command="workflow canonical smoke",
+            logs=self._validation_logs(issues) if issues else ["Workflow canonical smoke passed."],
+        )
+
+    @staticmethod
+    def _load_generated_page_graph(source_dir: Path) -> dict[str, object]:
+        graph_path = source_dir / "artifacts" / "generated_app_graph.json"
+        if not graph_path.exists():
+            return {}
+        try:
+            payload = json.loads(graph_path.read_text(encoding="utf-8"))
+        except ValueError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @classmethod
+    def _workflow_dom_contract_issues(cls, *, source_dir: Path, changed_files: list[str]) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        js_files = [
+            str(path)
+            for path in changed_files
+            if path.startswith("miniapp/app/static/") and path.endswith(".js")
+        ]
+        for relative_path in js_files:
+            js_path = source_dir / relative_path
+            if not js_path.exists():
+                continue
+            html_candidates = [
+                js_path.with_name("index.html"),
+                js_path.with_suffix(".html"),
+            ]
+            html_path = next((candidate for candidate in html_candidates if candidate.exists()), None)
+            if html_path is None:
+                continue
+            try:
+                js_source = js_path.read_text(encoding="utf-8")
+                html_source = html_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            available_dom_ids = set(re.findall(r'id=["\']([A-Za-z0-9_-]+)["\']', html_source))
+            required_dom_ids = set(
+                re.findall(r'querySelector(?:All)?\(\s*["\']#([A-Za-z0-9_-]+)', js_source)
+            )
+            required_dom_ids.update(
+                re.findall(r'getElementById\(\s*["\']([A-Za-z0-9_-]+)', js_source)
+            )
+            missing_ids = sorted(required_dom_ids - available_dom_ids)
+            if not missing_ids:
+                continue
+            issues.append(
+                ValidationIssue(
+                    code="workflow.missing_dom_id",
+                    message=f"{relative_path} references missing DOM ids in {html_path.relative_to(source_dir).as_posix()}: {', '.join(missing_ids)}.",
+                    severity="high",
+                    location=relative_path,
+                    blocking=True,
+                )
+            )
+        return issues
+
+    @staticmethod
+    def _dedupe_validation_issues(issues: list[ValidationIssue]) -> list[ValidationIssue]:
+        deduped: list[ValidationIssue] = []
+        seen: set[tuple[str, str]] = set()
+        for issue in issues:
+            key = (issue.code, issue.location)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(issue)
+        return deduped
 
     def _static_check(self, *, source_dir: Path, changed_files: list[str]) -> RunCheckResult:
         frontend_dir = source_dir / "frontend"
@@ -849,7 +1034,7 @@ class CheckRunner:
 
     @staticmethod
     def _filter_build_issues(issues: list[ValidationIssue], scope_mode: str) -> list[ValidationIssue]:
-        if scope_mode not in {"minimal_patch", "fix_agentic"}:
+        if scope_mode not in {"minimal_patch", "workflow_partial_build", "fix_agentic"}:
             return issues
         ignored_prefixes = ("build.placeholder_",)
         ignored_codes = {"build.missing_entrypoint"}
