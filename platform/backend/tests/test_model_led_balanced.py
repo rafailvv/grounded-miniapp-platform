@@ -213,6 +213,28 @@ def test_task_model_overrides_light_balanced_shared_static_whole_file() -> None:
     assert fallback is None
 
 
+def test_task_model_overrides_fast_uses_light_models_for_code_plan() -> None:
+    primary, fallback = task_model_overrides(
+        role="code_plan",
+        generation_mode=GenerationMode.FAST,
+        scope_mode="whole_file_build",
+    )
+    assert primary == model_registry.FAST_PLAN_MODEL
+    assert fallback == model_registry.FAST_PLAN_MODEL
+
+
+def test_task_model_overrides_fast_uses_light_models_for_frontend_only_edit() -> None:
+    primary, fallback = task_model_overrides(
+        role="code_edit",
+        generation_mode=GenerationMode.FAST,
+        scope_mode="minimal_patch",
+        target_file_count=3,
+        backend_target_count=0,
+    )
+    assert primary == model_registry.FAST_CODE_MODEL
+    assert fallback == model_registry.FAST_CODE_MODEL
+
+
 def test_role_only_scope_stays_whole_file_for_flow_prompt() -> None:
     prompt = (
         "Please update the client flow so clicking a record from the list opens a separate details page "
@@ -895,6 +917,33 @@ def test_generated_python_tests_use_progress_status_when_schema_choices_are_unav
 
 def test_generation_normal_loop_no_longer_exposes_source_stabilizer() -> None:
     assert not hasattr(MiniappGenerationNormalLoop, _removed_symbol_name("stabilize_", "draft_contract_", "from_source"))
+
+
+def test_generation_normal_loop_fast_completes_after_clean_initial_checks() -> None:
+    assert MiniappGenerationNormalLoop._should_complete_fast_after_initial_checks(
+        generation_mode=GenerationMode.FAST,
+        intent="create",
+        initial_loop_diagnostics=[],
+        initial_completion_state={"strict_green": True, "optimistic_complete": True},
+    )
+    assert MiniappGenerationNormalLoop._should_complete_fast_after_initial_checks(
+        generation_mode=GenerationMode.FAST,
+        intent="edit",
+        initial_loop_diagnostics=[],
+        initial_completion_state={"strict_green": False, "optimistic_complete": True},
+    )
+    assert not MiniappGenerationNormalLoop._should_complete_fast_after_initial_checks(
+        generation_mode=GenerationMode.BALANCED,
+        intent="edit",
+        initial_loop_diagnostics=[],
+        initial_completion_state={"strict_green": True, "optimistic_complete": True},
+    )
+    assert not MiniappGenerationNormalLoop._should_complete_fast_after_initial_checks(
+        generation_mode=GenerationMode.FAST,
+        intent="create",
+        initial_loop_diagnostics=["needs repair"],
+        initial_completion_state={"strict_green": True, "optimistic_complete": True},
+    )
 
 
 def test_route_manifest_dedupes_duplicate_file_paths_preferring_detail_page() -> None:

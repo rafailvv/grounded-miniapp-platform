@@ -18,6 +18,23 @@ from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerati
 class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
 
     @staticmethod
+    def _should_complete_fast_after_initial_checks(
+        *,
+        generation_mode: GenerationMode,
+        intent: str,
+        initial_loop_diagnostics: list[str],
+        initial_completion_state: dict[str, Any],
+    ) -> bool:
+        if generation_mode != GenerationMode.FAST or initial_loop_diagnostics:
+            return False
+        if bool(initial_completion_state.get("strict_green")):
+            return True
+        return (
+            intent in {"edit", "refine", "role_only_change"}
+            and bool(initial_completion_state.get("optimistic_complete"))
+        )
+
+    @staticmethod
     def _load_json_file(path: Path) -> dict[str, Any] | None:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -588,7 +605,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 },
             )
             initial_loop_diagnostics.extend(edit_gate_issues)
-        initial_exact_execution, _initial_exact_preview = service.generation_repair._execute_generation_checks(
+        initial_exact_execution, initial_exact_preview = service.generation_repair._execute_generation_checks(
             workspace_id=workspace_id,
             draft_run_id=draft_run_id,
             draft_source=draft_source,
@@ -627,27 +644,74 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 + "\n- ".join(dict.fromkeys(initial_loop_diagnostics))
             ).strip()
         job.latency_breakdown["generation_ms"] = int((time.perf_counter() - generation_stage_started_at) * 1000)
-        workspace_loop_started_at = time.perf_counter()
-        loop_result = service.generation_repair.run_generation_workspace_loop(
-            workspace_id=workspace_id,
-            draft_run_id=draft_run_id,
-            job=job,
-            request=request,
-            draft_source=draft_source,
-            prompt=effective_prompt,
-            grounded_spec=grounded_spec,
-            role_scope=role_scope,
-            role_contract=role_contract,
-            page_graph=plan_result["page_graph"],
-            plan_result=plan_result,
-            entity_contract=entity_contract,
-            generation_mode=generation_mode,
-            creative_direction=creative_direction,
-            files_read=files_read,
-            initial_operations=list(operations),
-            initial_assistant_message=loop_seed_message,
-            should_stop=should_stop,
+        initial_validation_snapshot = service.generation_completion.validation_snapshot_from_execution(initial_exact_execution)
+        initial_completion_state = service.generation_completion.workspace_loop_completion_state(
+            initial_exact_execution.results,
+            initial_exact_preview,
+            validation_snapshot=initial_validation_snapshot,
         )
+        fast_initial_complete = self._should_complete_fast_after_initial_checks(
+            generation_mode=generation_mode,
+            intent=request.intent,
+            initial_loop_diagnostics=initial_loop_diagnostics,
+            initial_completion_state=initial_completion_state,
+        )
+        workspace_loop_started_at = time.perf_counter()
+        if fast_initial_complete:
+            from app.modules.miniapp_agent_loop.types import WorkspaceLoopResult
+
+            service._append_event(
+                job,
+                "checks_completed",
+                "Fast generation completed after the initial exact checks.",
+                {"attempt": 0, "fast_tail_shortcut": True},
+            )
+            service._append_trace(
+                workspace_id,
+                "fast_tail_shortcut_completed",
+                "Fast generation skipped the workspace loop because the initial exact checks were already complete.",
+                {"check_count": len(initial_exact_execution.results), "intent": request.intent},
+            )
+            loop_result = WorkspaceLoopResult(
+                status="completed",
+                outcome_kind="applied",
+                summary="Fast generation completed after initial exact checks.",
+                failure_reason=None,
+                failure_class=None,
+                failure_signature=None,
+                root_cause_summary=None,
+                current_phase="completed",
+                remaining_issues=[],
+                latest_execution=initial_exact_execution,
+                latest_preview_details=initial_exact_preview,
+                latest_apply_result=None,
+                iterations=[],
+                repair_iterations=[],
+                all_operations=list(operations),
+                last_assistant_message=loop_seed_message,
+                turn_history=[],
+            )
+        else:
+            loop_result = service.generation_repair.run_generation_workspace_loop(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                job=job,
+                request=request,
+                draft_source=draft_source,
+                prompt=effective_prompt,
+                grounded_spec=grounded_spec,
+                role_scope=role_scope,
+                role_contract=role_contract,
+                page_graph=plan_result["page_graph"],
+                plan_result=plan_result,
+                entity_contract=entity_contract,
+                generation_mode=generation_mode,
+                creative_direction=creative_direction,
+                files_read=files_read,
+                initial_operations=list(operations),
+                initial_assistant_message=loop_seed_message,
+                should_stop=should_stop,
+            )
         job.latency_breakdown["workspace_loop_ms"] = int((time.perf_counter() - workspace_loop_started_at) * 1000)
         latest_checks_ms = (
             int(loop_result.latest_execution.duration_ms or 0)

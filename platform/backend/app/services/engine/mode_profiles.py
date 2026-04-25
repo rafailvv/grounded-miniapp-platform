@@ -32,7 +32,7 @@ class ModeProfiles:
             planning_doc_limit=0,
             targeted_file_limit=5,
             edit_iteration_limit=1,
-            repair_attempt_limit=4,
+            repair_attempt_limit=2,
             verification_depth="fast",
             compact_aggressiveness="high",
             planner_effort="low",

@@ -678,9 +678,9 @@ def test_model_registry_resolves_mode_aware_profiles_and_routing(monkeypatch) ->
         )
 
         assert balanced_code_plan == "gpt-5.4"
-        assert balanced_code_plan_fallback == "gpt-5.4"
+        assert balanced_code_plan_fallback == "gpt-5.4-mini"
         assert quality_code_edit == "gpt-5.4"
-        assert quality_code_edit_fallback == "gpt-5.4"
+        assert quality_code_edit_fallback == "gpt-5.4-mini"
     finally:
         if original_chip is None:
             monkeypatch.delenv("CHIP", raising=False)
@@ -2426,6 +2426,78 @@ def test_code_plan_sections_merge_successful_parts_when_one_section_times_out(tm
     assert normalized["target_files"] == []
     assert "page_graph" in normalized
     assert normalized["summary"]
+
+
+def test_fast_code_plan_uses_single_graph_section(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    spec = service._build_grounded_spec(
+        workspace_id="ws_code_plan_fast",
+        prompt="Create a workflow app for clients, specialists, and managers.",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        doc_refs=[],
+        template_revision_id="rev_test",
+        prompt_turn_id="turn_test",
+        generation_mode=GenerationMode.FAST,
+    )
+    schema_names: list[str] = []
+
+    def _stub_generate_structured_with_retry(*, schema_name: str, **_kwargs):
+        schema_names.append(schema_name)
+        if schema_name != "page_graph_structure_v1":
+            raise AssertionError(f"Unexpected schema_name {schema_name}")
+        return {
+            "model": "fake-fast-graph",
+            "payload": {
+                "summary": "Role-aware workflow pages.",
+                "flow_mode": "multi_page",
+                "page_graph": {
+                    "summary": "Role-aware workflow pages.",
+                    "roles": {
+                        role: {
+                            "entry_path": "/",
+                            "landing_page_id": f"{role}_home",
+                            "routes_file": f"miniapp/app/routes/{role}.py",
+                            "pages": [
+                                {
+                                    "page_id": f"{role}_home",
+                                    "route_path": "/",
+                                    "file_path": f"miniapp/app/static/{role}/index.html",
+                                    "title": f"{role.title()} Home",
+                                }
+                            ],
+                        }
+                        for role in ("client", "specialist", "manager")
+                    },
+                },
+            },
+            "cache_stats": {},
+        }
+
+    monkeypatch.setattr(service, "_generate_structured_with_retry", _stub_generate_structured_with_retry)
+
+    payload = service._generate_code_plan_sections(
+        workspace_id="ws_code_plan_fast",
+        prompt="Create a workflow app for clients, specialists, and managers.",
+        grounded_spec=spec,
+        doc_refs=[],
+        role_scope=["client", "specialist", "manager"],
+        role_contract={},
+        scope_mode="whole_file_build",
+        require_multi_page=True,
+        workspace_tree=[],
+        generation_mode=GenerationMode.FAST,
+        creative_direction={},
+        role_patch_kind=None,
+    )
+
+    assert schema_names == ["page_graph_structure_v1"]
+    assert payload["model"] == "fake-fast-graph"
+    assert payload["response_mode"] == "code_plan_fast_graph_only"
+    assert payload["payload"]["target_files"] == []
 
 
 def test_grounded_spec_sections_fail_when_one_section_times_out(tmp_path: Path, monkeypatch) -> None:
@@ -11641,8 +11713,17 @@ def test_task_profiles_use_quality_first_repair_routing(monkeypatch) -> None:  #
     try:
         monkeypatch.setenv("CHIP", "false")
         registry = importlib.reload(model_registry)
-        for profile_name, profile in registry.TASK_PROFILES.items():
-            routing = profile["routing"]
+        fast_routing = registry.TASK_PROFILES["openai_code_fast"]["routing"]
+        assert fast_routing["spec_analysis"] == "gpt-5.4-mini"
+        assert fast_routing["code_plan"] == "gpt-5.4-mini"
+        assert fast_routing["ir_codegen"] == "gpt-5.4-mini"
+        assert fast_routing["code_edit"] == "gpt-5.4-mini"
+        assert fast_routing["repair"] == "gpt-5.4"
+        assert fast_routing["summarize"] == "gpt-5.4-mini"
+        assert fast_routing["cheap_task"] == "gpt-5.4-mini"
+
+        for profile_name in ("research_balanced", "openai_code_quality"):
+            routing = registry.TASK_PROFILES[profile_name]["routing"]
             assert routing["spec_analysis"] == "gpt-5.4-mini"
             assert routing["code_plan"] == "gpt-5.4"
             assert routing["ir_codegen"] == "gpt-5.4"
@@ -11856,10 +11937,10 @@ def test_code_index_retrieval_reuses_indexed_chunks_when_available(tmp_path: Pat
     assert retrieval["stats"]["indexed_chunk_reuse_hit"] is True
 
 
-def test_fast_edit_repair_attempt_limit_defaults_to_five() -> None:
+def test_fast_edit_repair_attempt_limit_defaults_to_two() -> None:
     from app.modules.miniapp_materialization.materialization import MiniappMaterializationService
 
-    assert MiniappMaterializationService.repair_attempt_limit(GenerationMode.FAST, "edit") == 5
+    assert MiniappMaterializationService.repair_attempt_limit(GenerationMode.FAST, "edit") == 2
 
 
 def test_workspace_loop_fast_context_mode_expands_before_full_bundle() -> None:

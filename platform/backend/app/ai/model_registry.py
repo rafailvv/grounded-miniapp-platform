@@ -43,11 +43,12 @@ if CHIP_ENABLED:
     SUMMARY_MODEL = "gpt-5.1-codex-mini"
 else:
     PLANNING_MODEL = "gpt-5.4-mini"
-    FAST_CODE_MODEL = "gpt-5.4"
+    FAST_CODE_MODEL = "gpt-5.4-mini"
     STRONG_CODE_MODEL = "gpt-5.4"
     SUMMARY_MODEL = "gpt-5.4-mini"
 VISUAL_PATCH_MODEL = PLANNING_MODEL
 REPAIR_MODEL = STRONG_CODE_MODEL
+FAST_PLAN_MODEL = PLANNING_MODEL
 
 TASK_PROFILES = {
     "openai_code_fast": {
@@ -57,8 +58,8 @@ TASK_PROFILES = {
         "routing": {
             "spec_analysis": PLANNING_MODEL,
             "ir_codegen": FAST_CODE_MODEL,
-            "code_plan": STRONG_CODE_MODEL,
-            "code_edit": STRONG_CODE_MODEL,
+            "code_plan": FAST_PLAN_MODEL,
+            "code_edit": FAST_CODE_MODEL,
             "repair": REPAIR_MODEL,
             "summarize": SUMMARY_MODEL,
             "cheap_task": SUMMARY_MODEL,
@@ -193,5 +194,21 @@ def task_model_overrides(
     backend_target_count: int = 0,
     cluster_name: str | None = None,
 ) -> tuple[str | None, str | None]:
-    del role, generation_mode, scope_mode, visual_only_patch, target_file_count, backend_target_count, cluster_name
+    del visual_only_patch
+    if generation_mode is None:
+        return None, None
+    mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(str(generation_mode))
+    normalized_cluster = str(cluster_name or "").strip()
+    if mode == GenerationMode.FAST:
+        if role == "code_plan":
+            return FAST_PLAN_MODEL, FAST_PLAN_MODEL
+        if role in {"code_edit", "ir_codegen"} and backend_target_count == 0:
+            return FAST_CODE_MODEL, FAST_CODE_MODEL
+        if (
+            role in {"code_edit", "ir_codegen"}
+            and scope_mode == "whole_file_build"
+            and normalized_cluster == "shared_static"
+            and 0 < target_file_count <= 2
+        ):
+            return FAST_CODE_MODEL, FAST_CODE_MODEL
     return None, None

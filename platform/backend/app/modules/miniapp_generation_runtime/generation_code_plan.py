@@ -539,7 +539,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         *,
         prompt: str,
         role_scope: list[str],
-        role_patch_kind: str | None,
+        role_patch_kind: str | None = None,
     ) -> dict[str, Any]:
         page_graph = dict(planned.get("page_graph") or {})
         roles = {
@@ -1438,10 +1438,11 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         workspace_tree: list[dict[str, str]],
         generation_mode: GenerationMode,
         creative_direction: dict[str, Any],
-        role_patch_kind: str | None,
+        role_patch_kind: str | None = None,
     ) -> dict[str, Any]:
         sections_started = time.perf_counter()
-        executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="code-plan")
+        fast_graph_only = generation_mode == GenerationMode.FAST
+        executor = ThreadPoolExecutor(max_workers=1 if fast_graph_only else 2, thread_name_prefix="code-plan")
         model_override, fallback_model_override = task_model_overrides(
             role="code_plan",
             generation_mode=generation_mode,
@@ -1480,7 +1481,9 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 model_override=model_override,
                 fallback_model_override=fallback_model_override,
             ),
-            "targeting": self._submit_with_context(
+        }
+        if not fast_graph_only:
+            futures["targeting"] = self._submit_with_context(
                 executor,
                 self._generate_structured_with_retry,
                 role="code_plan",
@@ -1508,8 +1511,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 ),
                 model_override=model_override,
                 fallback_model_override=fallback_model_override,
-            ),
-        }
+            )
         section_timeout = float(self.CODE_PLAN_SECTION_TIMEOUT_SECONDS)
         completed, pending = wait(set(futures.values()), timeout=section_timeout, return_when=ALL_COMPLETED)
         section_payloads: dict[str, dict[str, Any]] = {}
@@ -1567,6 +1569,27 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 "model": winning_model,
                 "payload": merged_payload,
                 "response_mode": "code_plan_sections_partial_merge",
+            }
+
+        if fast_graph_only:
+            graph_payload_normalized = self._normalize_model_payload(section_payloads["graph"]["payload"])
+            graph_payload_normalized.setdefault("files_to_read", [])
+            graph_payload_normalized.setdefault("target_files", [])
+            graph_payload_normalized.setdefault("shared_files", [])
+            graph_payload_normalized.setdefault("backend_targets", [])
+            self._append_trace(
+                workspace_id,
+                "code_plan_fast_graph_only",
+                "Fast code plan used a single page-graph section and derived file targets locally.",
+                {
+                    "duration_ms": int((time.perf_counter() - sections_started) * 1000),
+                    "sections": ["graph"],
+                },
+            )
+            return {
+                "model": section_payloads.get("graph", {}).get("model") or "code-plan-fast-graph",
+                "payload": graph_payload_normalized,
+                "response_mode": "code_plan_fast_graph_only",
             }
 
         self._append_trace(
