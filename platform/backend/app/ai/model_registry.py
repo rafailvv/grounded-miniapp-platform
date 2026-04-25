@@ -1,49 +1,12 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 from app.models.common import GenerationMode
 
 
-def _load_chip_from_repo_env() -> None:
-    if "CHIP" in os.environ:
-        return
-    dotenv_path = Path(__file__).resolve().parents[4] / ".env"
-    try:
-        lines = dotenv_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        if key.strip() != "CHIP":
-            continue
-        parsed = value.strip()
-        if parsed and parsed[0] == parsed[-1] and parsed[0] in {'"', "'"}:
-            parsed = parsed[1:-1]
-        os.environ["CHIP"] = parsed
-        return
-
-
-def _chip_enabled() -> bool:
-    _load_chip_from_repo_env()
-    return str(os.getenv("CHIP", "false")).strip().lower() in {"1", "true", "yes", "on"}
-
-
-CHIP_ENABLED = _chip_enabled()
-
-
-if CHIP_ENABLED:
-    FAST_CODE_MODEL = "gpt-5.1-codex-mini"
-    STRONG_CODE_MODEL = "gpt-5.1-codex-mini"
-    SUMMARY_MODEL = "gpt-5.1-codex-mini"
-else:
-    FAST_CODE_MODEL = "gpt-5.4-mini"
-    STRONG_CODE_MODEL = "gpt-5.4"
-    SUMMARY_MODEL = "gpt-5.4-mini"
+CODEX_MINI_MODEL = "gpt-5.1-codex-mini"
+FAST_CODE_MODEL = CODEX_MINI_MODEL
+STRONG_CODE_MODEL = CODEX_MINI_MODEL
+SUMMARY_MODEL = CODEX_MINI_MODEL
 REPAIR_MODEL = STRONG_CODE_MODEL
 
 TASK_PROFILES = {
