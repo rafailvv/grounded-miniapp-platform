@@ -441,7 +441,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Never expose implementation placeholders, numeric fragments, decorative chevrons, or broken HTML entity remnants such as 'Block 181', 'Section 181', '181;', '203a', or '›' in visible UI.",
                     "Static or mostly static pages should render immediately without spinner-first UX.",
                     "Role root pages with data dependencies must render a complete business surface on first paint without pseudo-data: use real sections, actions, and honest empty states immediately.",
-                    "Do not pre-render invented business records in HTML or JS. Live request cards, approval rows, queue entries, conflict items, and similar workflow records must appear only after reading real API data.",
+                    "Do not pre-render invented business items in HTML or JS. Live request cards, approval rows, queue entries, conflict items, and similar domain items must appear only after reading real API data.",
                     "Dropdown options, filter chips, and static guidance copy are allowed, but example request cards, seeded workflow rows, and pre-filled live rows are not allowed.",
                     "Keep role root pages complete on first paint and preserve any explicit nested feature routes that are already present in the writable surface.",
                     "Role root pages may use compact loading/error state nodes for post-render refreshes, but the main surface must already be complete on first render.",

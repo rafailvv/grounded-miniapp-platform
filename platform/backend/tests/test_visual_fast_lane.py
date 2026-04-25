@@ -281,7 +281,7 @@ def test_visual_fast_lane_rejects_forbidden_file_and_falls_back(tmp_path: Path) 
 
     assert result is None
     assert service.workspace_service.files["miniapp/app/main.py"] == "print('backend')"
-    assert any(trace["stage"] == "fast_visual_patch_fallback" for trace in service.traces)
+    assert any(trace["stage"] == "fast_visual_patch_defer_to_main_pipeline" for trace in service.traces)
 
 
 def test_visual_fast_lane_model_error_falls_back(tmp_path: Path) -> None:

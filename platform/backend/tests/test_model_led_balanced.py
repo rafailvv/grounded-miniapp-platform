@@ -173,8 +173,8 @@ def test_task_model_overrides_light_balanced_visual_patch() -> None:
         target_file_count=3,
         backend_target_count=0,
     )
-    assert primary == model_registry.BALANCED_LIGHT_EDIT_MODEL
-    assert fallback == model_registry.BALANCED_LIGHT_EDIT_MODEL
+    assert primary is None
+    assert fallback is None
 
 
 def test_task_model_overrides_ignores_backend_touch() -> None:
@@ -199,8 +199,8 @@ def test_task_model_overrides_light_balanced_shared_static_whole_file() -> None:
         backend_target_count=0,
         cluster_name="shared_static",
     )
-    assert primary == model_registry.BALANCED_LIGHT_EDIT_MODEL
-    assert fallback == model_registry.BALANCED_LIGHT_EDIT_MODEL
+    assert primary is None
+    assert fallback is None
 
 
 def test_role_only_scope_stays_whole_file_for_flow_prompt() -> None:
@@ -216,6 +216,10 @@ def test_grounded_spec_hygiene_extracts_prompt_entity_without_request_bias() -> 
         "I need an internal mini-app for vehicle maintenance scheduling with a simple queue."
     )
     assert entity_name == "VehicleMaintenanceScheduling"
+
+
+def test_grounded_spec_hygiene_uses_neutral_entity_fallback() -> None:
+    assert GroundedSpecHygieneRuntime.infer_entity_name("Сделай простое приложение с ролями и формами.") == "Entity"
 
 
 def test_grounded_spec_hygiene_ignores_mobile_use_copy_when_extracting_entity() -> None:
@@ -256,6 +260,17 @@ def test_entity_contract_overrides_low_signal_mobile_use_resource_with_prompt_en
     assert contract["entity_slug_plural"] == "requests"
     assert contract["api_path"] == "/api/requests"
     assert contract["entity_name"] == "Request"
+
+
+def test_grounded_spec_stabilization_does_not_inject_default_records_api() -> None:
+    spec = _minimal_spec("StoreOrder")
+    spec.api_requirements = []
+    spec.user_flows = []
+    spec.persistence_requirements = []
+
+    stabilized = GroundedSpecStabilizationRuntime().stabilize_grounded_spec(spec)
+
+    assert stabilized.api_requirements == []
 
 
 def test_grounded_spec_stabilization_prefers_domain_entity_slug() -> None:

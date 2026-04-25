@@ -237,137 +237,6 @@ def test_workspace_loop_patch_report_omits_full_file_contents() -> None:
     assert operation["diff_omitted"] is True
 
 
-def test_workspace_loop_can_skip_contract_sync_for_deterministic_cleanup(tmp_path: Path) -> None:
-    operation = DraftFileOperation(
-        file_path="miniapp/app/static/manager/index.html",
-        operation="replace",
-        content="<main></main>",
-        reason="deterministic cleanup",
-    )
-    calls = {"checks": 0, "contract_sync": 0}
-
-    class FakeEnvelope:
-        def __init__(self, ops: list[DraftFileOperation]) -> None:
-            self.ops = list(ops)
-
-        def model_dump(self, mode: str = "json") -> dict[str, object]:
-            return {"ops": [op.model_dump(mode=mode) for op in self.ops]}
-
-    class FakeApplyResult:
-        status = "applied"
-        conflict_reason = None
-        changed_files = [operation.file_path]
-
-        def model_dump(self, mode: str = "json") -> dict[str, object]:
-            return {
-                "status": self.status,
-                "changed_files": list(self.changed_files),
-                "conflict_reason": self.conflict_reason,
-            }
-
-    class FakeWorkspaceService:
-        def build_patch_envelope_for_draft(self, workspace_id: str, run_id: str, ops: list[DraftFileOperation]) -> FakeEnvelope:
-            return FakeEnvelope(ops)
-
-        def apply_patch_envelope_to_draft(self, workspace_id: str, run_id: str, envelope: FakeEnvelope) -> FakeApplyResult:
-            assert [op.file_path for op in envelope.ops] == [operation.file_path]
-            return FakeApplyResult()
-
-    class FakeContextBuilder:
-        workspace_service = FakeWorkspaceService()
-
-        @staticmethod
-        def current_diff_summary(workspace_id: str, run_id: str) -> str:
-            return "diff"
-
-        @staticmethod
-        def store_loop_reports(**kwargs) -> None:
-            return None
-
-    def execute_checks(changed_files: list[str]):
-        calls["checks"] += 1
-        execution = CheckExecutionRecord(
-            workspace_id="ws_test",
-            run_id="run_test",
-            changed_files=changed_files,
-            results=[],
-        )
-        return execution, {"status": "skipped"}
-
-    def completion_state(results, preview_details, *, validation_snapshot):
-        return {
-            "strict_green": calls["checks"] >= 2,
-            "remaining_issues": [],
-            "non_test_failures": [],
-            "app_test_failures": [],
-        }
-
-    def plan_turn(**kwargs):
-        return SimpleNamespace(
-            outcome="patch_ready",
-            assistant_message="cleanup",
-            diagnosis="cleanup",
-            operations=[operation],
-            files_read=[operation.file_path],
-            failure_class=None,
-            failure_signature=None,
-            root_cause_summary=None,
-            fix_targets=[operation.file_path],
-            expected_verification=None,
-            rationale_by_file={},
-            metadata={"skip_contract_sync": True},
-        )
-
-    def apply_contract_sync(operations: list[DraftFileOperation]) -> list[DraftFileOperation]:
-        calls["contract_sync"] += 1
-        return [
-            *operations,
-            DraftFileOperation(
-                file_path="miniapp/app/generated/runtime_manifest.json",
-                operation="replace",
-                content="{}",
-                reason="would be broad contract sync",
-            ),
-        ]
-
-    runner = WorkspaceLoopTurnRunner(context_builder=FakeContextBuilder())
-    result = runner.run(
-        workspace_id="ws_test",
-        run_id="run_test",
-        job=SimpleNamespace(failure_class=None, failure_signature=None, root_cause_summary=None, fix_targets=[]),
-        draft_source=tmp_path,
-        role_scope=["manager"],
-        generation_mode=GenerationMode.BALANCED,
-        max_attempts=1,
-        initial_operations=[],
-        initial_assistant_message="start",
-        initial_files_read=[],
-        initial_changed_files=["miniapp"],
-        callbacks=SimpleNamespace(
-            execute_checks=execute_checks,
-            build_validation_snapshot=lambda execution: ValidationSnapshot(
-                grounded_spec_valid=True,
-                app_ir_valid=True,
-                build_valid=True,
-                blocking=False,
-                issues=[],
-            ),
-            completion_state=completion_state,
-            has_tooling_failure=lambda results: False,
-            plan_turn=plan_turn,
-            apply_contract_sync=apply_contract_sync,
-            post_apply_stabilize=None,
-            append_event=lambda *args, **kwargs: None,
-            append_trace=lambda *args, **kwargs: None,
-            store_report=lambda *args, **kwargs: None,
-            stop_if_requested=None,
-        ),
-    )
-
-    assert result.status == "completed"
-    assert calls["contract_sync"] == 0
-    assert [op.file_path for op in result.all_operations] == [operation.file_path]
-
 
 def test_role_patch_classifier_treats_text_cleanup_as_visual_patch() -> None:
     prompt = (
@@ -432,6 +301,7 @@ def test_runtime_map_no_longer_exposes_active_deterministic_business_helpers() -
     assert "_deterministic_profiles_route_source" not in owner_map
     assert "_deterministic_runtime_route_source" not in owner_map
     assert "_deterministic_main_runtime_source" not in owner_map
+    assert "_synchronize_main_runtime_contract" not in owner_map
 
 
 def test_generation_codegen_no_longer_exposes_legacy_python_fallback_entrypoints() -> None:
@@ -669,9 +539,47 @@ def test_model_registry_resolves_mode_aware_profiles_and_routing(monkeypatch) ->
         )
 
         assert balanced_code_plan == "gpt-5.4"
-        assert balanced_code_plan_fallback == "gpt-5.4-mini"
+        assert balanced_code_plan_fallback == "gpt-5.4"
         assert quality_code_edit == "gpt-5.4"
         assert quality_code_edit_fallback == "gpt-5.4"
+    finally:
+        if original_chip is None:
+            monkeypatch.delenv("CHIP", raising=False)
+        else:
+            monkeypatch.setenv("CHIP", original_chip)
+        importlib.reload(model_registry)
+
+
+def test_model_registry_routes_chip_true_noncritical_to_codex_mini(monkeypatch) -> None:  # noqa: ANN001
+    import app.ai.model_registry as model_registry
+
+    original_chip = os.environ.get("CHIP")
+    try:
+        monkeypatch.setenv("CHIP", "true")
+        registry = importlib.reload(model_registry)
+
+        spec_primary, spec_fallback = registry.models_for_role(
+            "spec_analysis",
+            model_profile="research_balanced",
+            generation_mode=GenerationMode.BALANCED,
+        )
+        summarize_primary, summarize_fallback = registry.models_for_role(
+            "summarize",
+            model_profile="research_balanced",
+            generation_mode=GenerationMode.BALANCED,
+        )
+        code_primary, code_fallback = registry.models_for_role(
+            "code_edit",
+            model_profile="openai_code_fast",
+            generation_mode=GenerationMode.FAST,
+        )
+
+        assert spec_primary == "gpt-5.1-codex-mini"
+        assert spec_fallback == "gpt-5.1-codex-mini"
+        assert summarize_primary == "gpt-5.1-codex-mini"
+        assert summarize_fallback == "gpt-5.1-codex-mini"
+        assert code_primary == "gpt-5.1-codex-mini"
+        assert code_fallback == "gpt-5.1-codex-mini"
     finally:
         if original_chip is None:
             monkeypatch.delenv("CHIP", raising=False)
@@ -2860,7 +2768,6 @@ def test_pre_apply_contract_pass_preserves_existing_roles_for_partial_scope(tmp_
     monkeypatch.setattr(contract_pass, "_synchronize_minimal_workflow_route_contracts", _identity_operations, raising=False)
     monkeypatch.setattr(contract_pass, "_synchronize_profile_schema_contract", _identity_operations, raising=False)
     monkeypatch.setattr(service.runtime_contract_sync, "synchronize", _identity_operations)
-    monkeypatch.setattr(contract_pass, "_synchronize_main_runtime_contract", _identity_operations, raising=False)
     monkeypatch.setattr(contract_pass, "_synchronize_route_schema_contract", _identity_operations, raising=False)
     monkeypatch.setattr(contract_pass, "_synchronize_frontend_api_contract", _identity_operations, raising=False)
     monkeypatch.setattr(contract_pass, "_synchronize_basic_page_state_contract", _identity_operations, raising=False)
@@ -4671,11 +4578,11 @@ def test_role_only_visual_patch_preserves_existing_source_entity_contract_from_s
     )
 
     extracted = {
-        "api_path": "/api/records",
-        "route_file": "miniapp/app/routes/records.py",
-        "entity_slug": "record",
-        "entity_slug_plural": "records",
-        "schema_prefix": "Record",
+        "api_path": "/api/entities",
+        "route_file": "miniapp/app/routes/entities.py",
+        "entity_slug": "entity",
+        "entity_slug_plural": "entities",
+        "schema_prefix": "Entity",
         "key_fields": [
             {"name": "title", "type": "string", "required": True},
             {"name": "details", "type": "text", "required": False},
@@ -4743,8 +4650,8 @@ def test_role_only_ui_flow_patch_preserves_source_entity_contract_but_merges_pag
     preserved = service.generation_entry._preserve_source_entity_contract_for_role_patch(
         workspace_id=workspace.workspace_id,
         extracted_entity_contract={
-            "api_path": "/api/records",
-            "route_file": "miniapp/app/routes/records.py",
+            "api_path": "/api/entities",
+            "route_file": "miniapp/app/routes/entities.py",
             "page_contract": {
                 "list_page_expected": True,
                 "detail_page_expected": True,
@@ -11338,8 +11245,7 @@ def test_task_profiles_use_quality_first_repair_routing(monkeypatch) -> None:  #
         for profile_name, profile in registry.TASK_PROFILES.items():
             routing = profile["routing"]
             assert routing["spec_analysis"] == "gpt-5.4-mini"
-            expected_code_plan = "gpt-5.4-mini" if profile_name == "openai_code_fast" else "gpt-5.4"
-            assert routing["code_plan"] == expected_code_plan
+            assert routing["code_plan"] == "gpt-5.4"
             assert routing["ir_codegen"] == "gpt-5.4"
             assert routing["code_edit"] == "gpt-5.4"
             assert routing["repair"] == "gpt-5.4"
@@ -11360,12 +11266,13 @@ def test_chip_flag_switches_model_registry_to_legacy_models(monkeypatch) -> None
     try:
         monkeypatch.setenv("CHIP", "true")
         chip_registry = importlib.reload(model_registry)
-        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["code_plan"] == "gpt-5.1-codex-max"
-        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["ir_codegen"] == "gpt-5.1-codex-max"
-        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["code_edit"] == "gpt-5.1-codex-max"
-        assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["code_edit"] == "gpt-5.1-codex-max"
-        assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["summarize"] == "gpt-5-mini"
-        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["summarize"] == "gpt-5-mini"
+        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["spec_analysis"] == "gpt-5.1-codex-mini"
+        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["code_plan"] == "gpt-5.1-codex-mini"
+        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["ir_codegen"] == "gpt-5.1-codex-mini"
+        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["code_edit"] == "gpt-5.1-codex-mini"
+        assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["code_edit"] == "gpt-5.1-codex-mini"
+        assert chip_registry.TASK_PROFILES["research_balanced"]["routing"]["summarize"] == "gpt-5.1-codex-mini"
+        assert chip_registry.TASK_PROFILES["openai_code_fast"]["routing"]["summarize"] == "gpt-5.1-codex-mini"
 
         monkeypatch.setenv("CHIP", "false")
         modern_registry = importlib.reload(model_registry)

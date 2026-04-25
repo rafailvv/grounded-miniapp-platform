@@ -168,7 +168,7 @@ class GroundedSpecHygieneRuntime:
     @staticmethod
     def _pascal_case(value: str) -> str:
         parts = re.split(r"[^a-zA-Z0-9]+", str(value or "").strip())
-        return "".join(part.capitalize() for part in parts if part) or "WorkflowRecord"
+        return "".join(part.capitalize() for part in parts if part) or "Entity"
 
     @classmethod
     def _normalize_entity_phrase(cls, value: str) -> str:
@@ -351,7 +351,7 @@ class GroundedSpecHygieneRuntime:
         keyword_entity_name = GroundedSpecHygieneRuntime._keyword_entity_name(prompt)
         if keyword_entity_name:
             return keyword_entity_name
-        return "WorkflowRecord"
+        return "Entity"
 
     @staticmethod
     def infer_entity_attributes(prompt: str) -> list[EntityAttribute]:
@@ -361,7 +361,7 @@ class GroundedSpecHygieneRuntime:
         resource_markers = ("item", "resource", "equipment", "asset", "room", "vehicle", "device", "inventory", "product")
         if any(marker in lowered for marker in temporal_markers):
             return [
-                EntityAttribute(name="title", type="string", required=True, description="Primary record title", pii=False),
+                EntityAttribute(name="title", type="string", required=True, description="Primary item title", pii=False),
                 *(
                     [EntityAttribute(name="resource_label", type="string", required=False, description="Optional resource or subject reference", pii=False)]
                     if any(marker in lowered for marker in resource_markers)
@@ -369,7 +369,7 @@ class GroundedSpecHygieneRuntime:
                 ),
                 EntityAttribute(name="start_date", type="datetime", required=True, description="Requested start date", pii=False),
                 EntityAttribute(name="end_date", type="datetime", required=True, description="Requested end date", pii=False),
-                EntityAttribute(name="details", type="text", required=False, description="Additional record details", pii=False),
+                EntityAttribute(name="details", type="text", required=False, description="Additional item details", pii=False),
             ]
         mappings = [
             ("name", "string", "Requester name", True, True),
@@ -393,8 +393,8 @@ class GroundedSpecHygieneRuntime:
                 )
         if not fields:
             fields = [
-                EntityAttribute(name="title", type="string", required=True, description="Primary request title"),
-                EntityAttribute(name="details", type="text", required=False, description="Primary request details"),
+                EntityAttribute(name="title", type="string", required=True, description="Primary item title"),
+                EntityAttribute(name="details", type="text", required=False, description="Primary item details"),
             ]
         return fields
 

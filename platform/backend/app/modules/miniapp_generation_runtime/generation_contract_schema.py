@@ -262,18 +262,6 @@ class MiniappGenerationContractSchema(MiniappGenerationRuntimeOwner):
             operations=operations,
         )
 
-    def _synchronize_main_runtime_contract(
-        self,
-        workspace_id: str,
-        draft_run_id: str,
-        operations: list[DraftFileOperation],
-    ) -> list[DraftFileOperation]:
-        return self.runtime_contract_sync.synchronize_main_runtime_contract(
-            workspace_id=workspace_id,
-            draft_run_id=draft_run_id,
-            operations=operations,
-        )
-
     def _synchronize_route_schema_contract(
         self,
         workspace_id: str,

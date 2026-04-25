@@ -148,7 +148,7 @@ class GroundedSpecPayloadsRuntime:
         return {
             "assumption_id": normalized.get("assumption_id") or f"assumption_{abs(hash(text)) % 100000}",
             "text": text,
-            "rationale": str(normalized.get("rationale") or normalized.get("reason") or "Assumed for deterministic generation.").strip(),
+            "rationale": str(normalized.get("rationale") or normalized.get("reason") or "Assumed during generation.").strip(),
             "status": str(normalized.get("status") or "active").strip() or "active",
             "impact": str(normalized.get("impact") or "medium").strip() or "medium",
         }

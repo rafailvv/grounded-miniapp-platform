@@ -181,7 +181,7 @@ class MiniappGenerationEntry:
         self.service._append_trace(
             workspace_id,
             "generation_plan_advisory",
-            "Normal generation used planner hints directly without Python-authored app scaffolding before tool-owned code generation.",
+            "Normal generation used planner hints directly without Python-authored app bootstrapping before tool-owned code generation.",
             {
                 "planner_error": plan_error or None,
                 "target_files": len(plan_result["target_files"]),

@@ -47,7 +47,7 @@ class MiniappArtifactBuilder(
                     file_path=file_path,
                     operation="replace",
                     content=content,
-                    reason="Provide deterministic generated app-level tests for the synthesized miniapp workspace.",
+                    reason="Provide generated app-level tests for the synthesized miniapp workspace.",
                 )
             )
         return ensured_operations

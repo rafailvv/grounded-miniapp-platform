@@ -41,7 +41,7 @@ class BuildValidator:
                 issues.append(
                     ValidationIssue(
                         code="build.missing_entrypoint",
-                        message=f"Required scaffold or entrypoint is missing: {file_path.name}",
+                        message=f"Required shell asset or entrypoint is missing: {file_path.name}",
                         severity="high",
                         location=str(file_path.relative_to(workspace_path)),
                     )
@@ -282,7 +282,7 @@ class BuildValidator:
                 return [
                     ValidationIssue(
                         code="build.missing_entrypoint",
-                        message="Required scaffold or entrypoint is missing: route_manifest.json",
+                        message="Required shell artifact or entrypoint is missing: route_manifest.json",
                         severity="high",
                         location="miniapp/app/generated/route_manifest.json",
                     )
@@ -1073,7 +1073,7 @@ class BuildValidator:
                 issues.append(
                     ValidationIssue(
                         code="build.mock_business_data",
-                        message=f"{path.name} still contains mock or fallback business data marker: {hit}.",
+                        message=f"{path.name} still contains mock or placeholder business data marker: {hit}.",
                         severity="high",
                         location=str(path.relative_to(workspace_path)),
                     )
@@ -1125,7 +1125,7 @@ class BuildValidator:
                         issues.append(
                             ValidationIssue(
                                 code="build.seeded_live_markup",
-                                message=f"{Path(file_path_raw).name} pre-renders filled workflow records in HTML instead of starting from real API data or an honest empty state.",
+                                message=f"{Path(file_path_raw).name} pre-renders filled business items in HTML instead of starting from real API data or an honest empty state.",
                                 severity="high",
                                 location=file_path_raw,
                             )

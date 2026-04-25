@@ -37,16 +37,16 @@ CHIP_ENABLED = _chip_enabled()
 
 
 if CHIP_ENABLED:
-    PLANNING_MODEL = "gpt-5-mini"
-    FAST_CODE_MODEL = "gpt-5.1-codex-max"
-    STRONG_CODE_MODEL = "gpt-5.1-codex-max"
-    SUMMARY_MODEL = "gpt-5-mini"
+    PLANNING_MODEL = "gpt-5.1-codex-mini"
+    FAST_CODE_MODEL = "gpt-5.1-codex-mini"
+    STRONG_CODE_MODEL = "gpt-5.1-codex-mini"
+    SUMMARY_MODEL = "gpt-5.1-codex-mini"
 else:
     PLANNING_MODEL = "gpt-5.4-mini"
     FAST_CODE_MODEL = "gpt-5.4"
     STRONG_CODE_MODEL = "gpt-5.4"
     SUMMARY_MODEL = "gpt-5.4-mini"
-VISUAL_PATCH_MODEL = FAST_CODE_MODEL
+VISUAL_PATCH_MODEL = PLANNING_MODEL
 REPAIR_MODEL = STRONG_CODE_MODEL
 
 TASK_PROFILES = {

@@ -91,43 +91,6 @@ class FixEntryRuntime:
                     return False
         return saw_read
 
-    @staticmethod
-    def _has_static_ui_text_artifact_failure(latest_execution) -> bool:
-        for result in getattr(latest_execution, "results", []) or []:
-            if getattr(result, "status", None) != "failed":
-                continue
-            if getattr(result, "name", None) != "schema_validators":
-                continue
-            if any("build.static_ui_text_artifact" in str(line) for line in (getattr(result, "logs", []) or [])):
-                return True
-        return False
-
-    def _static_ui_artifact_repair_operations(
-        self,
-        *,
-        workspace_id: str,
-        run_id: str,
-        role_scope: list[str],
-    ) -> list[DraftFileOperation]:
-        generation_service = getattr(self.service, "generation_service", None)
-        if generation_service is None:
-            return []
-        entity_contract_report = generation_service.current_report(workspace_id, "entity_contract") or {}
-        entity_contract = dict(entity_contract_report.get("entity_contract") or {})
-        try:
-            return list(
-                generation_service._synchronize_frontend_api_contract(
-                    workspace_id,
-                    run_id,
-                    [],
-                    entity_contract=entity_contract,
-                    role_scope=role_scope,
-                    contract_sync_mode="repair_invariants",
-                )
-            )
-        except Exception:
-            return []
-
     def generate_with_workspace_loop(
         self,
         *,
@@ -408,38 +371,6 @@ class FixEntryRuntime:
                     "repeated_no_progress": repeated_no_progress,
                 },
             )
-            if self._has_static_ui_text_artifact_failure(latest_execution):
-                deterministic_operations = self._static_ui_artifact_repair_operations(
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                    role_scope=self.service._role_scope_for_fix_request(workspace_id, run_id, request),
-                )
-                if deterministic_operations:
-                    return WorkspaceLoopTurnPlan(
-                        outcome="patch_ready",
-                        assistant_message=(
-                            "Applied deterministic static UI text cleanup for validator-reported "
-                            "chevron/loading/error artifacts."
-                        ),
-                        diagnosis=(
-                            "The failing validator reported mechanically repairable static UI text artifacts. "
-                            "Patch those files directly before invoking model-led repair."
-                        ),
-                        operations=deterministic_operations,
-                        files_read=[operation.file_path for operation in deterministic_operations],
-                        failure_class=fix_turn.failure_class,
-                        failure_signature=fix_turn.failure_signature,
-                        root_cause_summary=fix_turn.root_cause_summary,
-                        fix_targets=list(fix_turn.implicated_files),
-                        expected_verification="schema_validators should pass after static UI artifact cleanup.",
-                        rationale_by_file={
-                            operation.file_path: operation.reason for operation in deterministic_operations
-                        },
-                        metadata={
-                            "deterministic_repair": "static_ui_text_artifact_cleanup",
-                            "skip_contract_sync": True,
-                        },
-                    )
             extra_paths_for_attempt: list[str] = []
             tool_results_for_attempt: list[dict[str, object]] = []
             last_prompt_context = None

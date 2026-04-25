@@ -29,7 +29,7 @@ class GroundedSpecModelingRuntime:
     def _humanize_entity_name(value: str) -> str:
         text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
         text = text.replace("-", " ").replace("_", " ")
-        return re.sub(r"\s+", " ", text).strip() or "Record"
+        return re.sub(r"\s+", " ", text).strip() or "Entity"
 
     @classmethod
     def _entity_slug(cls, value: str) -> str:
@@ -37,7 +37,7 @@ class GroundedSpecModelingRuntime:
         if len(parts) > 1:
             slug = parts[-1]
         else:
-            slug = parts[0] if parts else "record"
+            slug = parts[0] if parts else "entity"
         if slug.endswith("ies") and len(slug) > 3:
             return f"{slug[:-3]}y"
         if slug.endswith("s") and not slug.endswith("ss") and len(slug) > 3:
@@ -93,7 +93,7 @@ class GroundedSpecModelingRuntime:
                     name="End user",
                     role="client",
                     description=f"Starts the primary {shared_entity_label.lower()} flow and reviews their own state.",
-                    permissions_hint=["create", "view_own_records", "continue_flow"],
+                    permissions_hint=["create", "view_own_items", "continue_flow"],
                     evidence=evidence,
                 ),
                 Actor(
@@ -101,7 +101,7 @@ class GroundedSpecModelingRuntime:
                     name="Specialist",
                     role="specialist",
                     description=f"Works on shared {shared_entity_label.lower()} items and updates progress.",
-                    permissions_hint=["review_assigned_records", "change_status", "respond"],
+                    permissions_hint=["review_assigned_items", "change_status", "respond"],
                     evidence=evidence,
                 ),
                 Actor(
@@ -109,7 +109,7 @@ class GroundedSpecModelingRuntime:
                     name="Manager",
                     role="manager",
                     description=f"Oversees cross-role {shared_entity_label.lower()} activity and monitors the shared system state.",
-                    permissions_hint=["view_metrics", "review_all_records", "intervene"],
+                    permissions_hint=["view_metrics", "review_all_items", "intervene"],
                     evidence=evidence,
                 ),
             ],
@@ -176,7 +176,7 @@ class GroundedSpecModelingRuntime:
                     name=f"Create {shared_entity_label}",
                     method="POST",
                     path=f"/api/{shared_entity_slug_plural}",
-                    purpose=f"Persist workflow records and expose them across the role-specific surfaces for {shared_entity_label.lower()} work.",
+                    purpose=f"Persist shared {shared_entity_label.lower()} data and expose it across the role-specific surfaces.",
                     request_fields=[APIField(name=field.name, type=field.type, required=field.required) for field in entity_attributes],
                     response_fields=[
                         APIField(name=f"{shared_entity_slug}_id", type="uuid", required=True),
@@ -286,9 +286,9 @@ class GroundedSpecModelingRuntime:
                 ),
                 Assumption(
                     assumption_id="assume_runtime_dataset",
-                    text="Balanced/basic generation should render honest empty states until persisted records exist.",
+                    text="Balanced/basic generation should render honest empty states until persisted shared data exists.",
                     status="active",
-                    rationale="The canonical runtime must stay DB-backed and must not inject demo workflow records.",
+                    rationale="The canonical runtime must stay DB-backed and must not inject demo business data.",
                     impact="medium",
                 ),
             ],

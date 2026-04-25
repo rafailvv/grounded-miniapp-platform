@@ -213,7 +213,7 @@ class MiniappVisualPatchFastLane:
                 self.service.workspace_service.prepare_draft(workspace_id, run_id)
             self._append_trace(
                 workspace_id,
-                "fast_visual_patch_fallback",
+                "fast_visual_patch_defer_to_main_pipeline",
                 "Fast visual patch fell back to the normal pipeline.",
                 {"reason": str(exc), "run_mode": run_mode},
             )
@@ -223,7 +223,7 @@ class MiniappVisualPatchFastLane:
                 self.service.workspace_service.prepare_draft(workspace_id, run_id)
             self._append_trace(
                 workspace_id,
-                "fast_visual_patch_fallback",
+                "fast_visual_patch_defer_to_main_pipeline",
                 "Fast visual patch errored and fell back to the normal pipeline.",
                 {"reason": str(exc), "run_mode": run_mode, "exception_type": type(exc).__name__},
             )

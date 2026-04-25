@@ -140,11 +140,6 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
             operations=ensured,
             contract_sync_mode=contract_sync_mode,
         )
-        ensured = self._synchronize_main_runtime_contract(
-            workspace_id,
-            draft_run_id,
-            ensured,
-        )
         ensured = self._synchronize_route_schema_contract(
             workspace_id,
             draft_run_id,

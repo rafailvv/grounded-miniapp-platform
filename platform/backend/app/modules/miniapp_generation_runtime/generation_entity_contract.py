@@ -42,6 +42,8 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
         "status": "statuses",
     }
     _GENERIC_ENTITY_NAMES = {
+        "entity",
+        "item",
         "workflowrecord",
         "workflow_record",
         "workflow record",
@@ -51,13 +53,15 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
         "record",
         "item",
     }
-    _GENERIC_API_STEMS = {"workflowrequests", "workflowrecords", "records", "submissions"}
+    _GENERIC_API_STEMS = {"data", "entities", "entries", "items", "records", "submissions", "workflowrequests", "workflowrecords"}
     _LOW_SIGNAL_ENTITY_SLUGS = {
         "app",
         "business",
         "dashboard",
         "data",
+        "entity",
         "interface",
+        "item",
         "mobile",
         "mobile_app",
         "mobile_use",
@@ -80,13 +84,13 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
     @classmethod
     def _slugify(cls, value: str) -> str:
         slug = re.sub(r"[^a-z0-9]+", "_", cls._humanize(value).lower()).strip("_")
-        return slug or "record"
+        return slug or "entity"
 
     @classmethod
     def _singularize_slug(cls, slug: str) -> str:
         normalized = str(slug or "").strip().lower()
         if not normalized:
-            return "record"
+            return "entity"
         if normalized.endswith("ies") and len(normalized) > 3:
             return f"{normalized[:-3]}y"
         if normalized.endswith("ses") and len(normalized) > 4 and normalized[:-2].endswith("s"):
@@ -108,7 +112,7 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
 
     @classmethod
     def _pascal_case(cls, value: str) -> str:
-        return "".join(part.capitalize() for part in cls._humanize(value).split()) or "Record"
+        return "".join(part.capitalize() for part in cls._humanize(value).split()) or "Entity"
 
     @classmethod
     def _dominant_api_path(cls, grounded_spec: GroundedSpecModel) -> str | None:
@@ -175,7 +179,7 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
         dominant_entity_name = str(
             (grounded_spec.domain_entities[0].name if grounded_spec.domain_entities else "")
             or self._infer_entity_name(prompt)
-        ).strip() or "WorkflowRecord"
+        ).strip() or "Entity"
         prompt_entity_slug = self._prompt_entity_slug(prompt)
         api_path = self._dominant_api_path(grounded_spec)
         dominant_name_slug = self._singularize_slug(self._slugify(dominant_entity_name))

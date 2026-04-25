@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 
 class MiniappGenerationPlanRuntime:
-    _GENERIC_ENTITY_STEMS = {"workflowrequests", "records", "submissions"}
+    _GENERIC_ENTITY_STEMS = {"data", "entities", "entries", "items", "records", "submissions", "workflowrequests", "workflowrecords"}
 
     def __init__(self, service: "GenerationService") -> None:
         self.service = service

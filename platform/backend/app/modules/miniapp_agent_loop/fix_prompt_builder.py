@@ -179,7 +179,7 @@ class FixPromptBuilder:
                     "Treat failing_checks, failing_file_paths, file_contexts, and hard runtime invariants as the source of truth for repair scope.",
                     "Only change generated app code. Generated tests, generated manifests, and platform runtime assets are read-only.",
                     "Do not modify miniapp/tests/*; default to repairing app code instead of test code.",
-                    "Do not modify generated manifests such as route_manifest.json or generated_app_graph.json; repair the application bundle so the deterministic manifest builder stays correct.",
+                    "Do not modify generated manifests such as route_manifest.json or generated_app_graph.json; repair the application bundle so manifest generation remains correct.",
                     "Do not replace route modules with placeholder text/html responses to satisfy navigation tests; repair real route wiring and page surfaces.",
                     "Strict-green is the ideal target, but the immediate goal is to remove blocking runtime, compile, routing, and preview failures first.",
                     "Preserve existing endpoints, router wiring, and static file serving unless the evidence shows they are broken.",

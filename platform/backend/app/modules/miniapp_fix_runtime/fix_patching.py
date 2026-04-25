@@ -152,7 +152,7 @@ class FixPatchingRuntime:
         repair_feedback: str | None = None,
     ) -> dict[str, Any]:
         if not self.service.openrouter_client.enabled:
-            return {"error": "Fix mode requires an enabled LLM provider or a deterministic local repair path."}
+            return {"error": "Fix mode requires an enabled LLM provider."}
         job.current_fix_phase = "patching"
         self.service._save_job(job)
         prompt_cache_key = self.service._prompt_cache_key(prompt_context)

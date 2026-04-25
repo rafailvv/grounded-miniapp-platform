@@ -269,7 +269,6 @@ class GenerationService(
             "_synchronize_db_session_contract": "generation_contract_schema",
             "_synchronize_runtime_route_contract": "generation_contract_schema",
             "_synchronize_backend_dependency_contract": "generation_contract_schema",
-            "_synchronize_main_runtime_contract": "generation_contract_schema",
             "_synchronize_minimal_workflow_route_contracts": "generation_contract_routes",
             "_synchronize_route_schema_contract": "generation_contract_schema",
             "_synchronize_frontend_api_contract": "generation_contract_frontend",
