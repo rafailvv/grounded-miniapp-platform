@@ -63,28 +63,18 @@ READ_ONLY_WRITE_PREFIXES = (
 )
 SEED_CONTEXT_PATHS = (
     "README.md",
-    "docs/README.md",
-    "docs/generation-contract.md",
+    "docs/agent-guidelines.md",
     "miniapp/app/main.py",
     "miniapp/app/db.py",
     "miniapp/app/schemas.py",
     "miniapp/app/routes/client.py",
     "miniapp/app/routes/specialist.py",
     "miniapp/app/routes/manager.py",
-    "miniapp/app/routes/profiles.py",
     "miniapp/app/routes/role_pages.py",
     "miniapp/app/static/shared/base.css",
     "miniapp/app/static/client/index.html",
     "miniapp/app/static/client/app.js",
-    "miniapp/app/static/client/styles.css",
-    "miniapp/app/static/specialist/index.html",
-    "miniapp/app/static/specialist/app.js",
-    "miniapp/app/static/specialist/styles.css",
-    "miniapp/app/static/manager/index.html",
-    "miniapp/app/static/manager/app.js",
-    "miniapp/app/static/manager/styles.css",
     "miniapp/app/generated/route_manifest.json",
-    "miniapp/app/generated/runtime_manifest.json",
 )
 
 
@@ -587,7 +577,7 @@ class WorkspaceCodeAgentRuntime:
             "Work like a coding agent: inspect files, edit source, run checks, and converge to a working app. "
             "The user's prompt is the only source of product semantics. Do not impose any generic queue, ticketing, lifecycle, or CRUD product model unless the prompt explicitly asks for it. "
             "Existing template docs and files are technical shell context only. They must not override the user's domain. "
-            "Preserve the FastAPI + static-file shell, profile routes, preview bridge, and role roots unless the user asks otherwise. "
+            "Preserve the FastAPI + static-file shell, preview bridge, and role-root routing unless the user asks otherwise. "
             "For create tasks, build a complete domain-specific app from the prompt. For e-commerce prompts, prefer products, catalog, cart, orders, and management surfaces, never generic intake or application tracking. "
             "Use hunk patches when small edits are enough. Use full-file create/replace only when creating or substantially rewriting a file. "
             "Do not edit generated app tests or generated manifests to hide failures. Repair app code and platform invariants instead. "

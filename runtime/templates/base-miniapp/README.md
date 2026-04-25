@@ -1,19 +1,9 @@
-# Canonical Base Mini-App Template
+# Base Miniapp Template
 
-Minimal Telegram-first starter used as the canonical workspace baseline.
+Neutral FastAPI + static frontend shell for generated Telegram mini-apps.
 
-## Template shape
-
-- `miniapp/`: FastAPI service that serves the UI, static assets, health endpoint, and persistent API endpoints.
-- `docs/`: lightweight template notes and environment examples.
-- `docker/`: single-service preview compose for the backend app.
-- `miniapp/app`: simplified to `main.py`, `db.py`, `schemas.py`, `routes/`, and `static/`.
-- `miniapp/app/static/<role>/<page>/`: each starter page keeps its own `index.html`, `styles.css`, and `app.js`.
-
-## Baseline contract
-
-- Three roles are always available: `client`, `specialist`, `manager`.
-- Persistent models and sessions live in `db.py`, and routers should extend that storage instead of inventing route-local data stores.
-- The UI is plain HTML, CSS, and JS served by FastAPI, with page-local assets stored in separate folders.
-- Only home and profile flows are included by default.
-- No authentication or domain-specific business logic is included.
+- Product meaning must come from the user's prompt, not this template.
+- Starter role roots are preview entrypoints only.
+- Generated apps should replace starter screens with the requested app surface.
+- Keep FastAPI startup, static mounting, `/health`, `/static/shared/base.css`, `/static/preview_bridge.js`, and `route_manifest.json` valid.
+- See `docs/agent-guidelines.md` for the compact agent guide.

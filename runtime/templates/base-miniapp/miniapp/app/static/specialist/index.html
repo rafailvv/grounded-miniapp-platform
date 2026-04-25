@@ -3,33 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Specialist</title>
+    <title>Specialist Preview</title>
     <link rel="stylesheet" href="/static/shared/base.css" />
     <link rel="stylesheet" href="/static/specialist/styles.css" />
   </head>
   <body>
     <main class="page-shell">
-      <section class="page">
-        <a class="card-link" href="/specialist/profile" aria-label="Open specialist profile">
-          <article class="card">
-            <div class="avatar-wrap" id="profile-avatar"></div>
-            <div class="info">
-              <span class="caption">Personal workspace</span>
-              <strong class="name" id="profile-name"></strong>
-              <span class="role">Specialist</span>
-            </div>
-            <span class="chevron" aria-hidden="true">›</span>
-          </article>
-        </a>
-
-        <section class="feature-block">
-          <div class="feature-content">
-            <span class="feature-title">Specialist workspace</span>
-          </div>
-        </section>
+      <section class="page" data-role="specialist">
+        <div class="shell-panel">
+          <p class="shell-eyebrow">Preview entry</p>
+          <h1 class="shell-title">Specialist surface</h1>
+          <p class="shell-copy">This neutral starter screen should be replaced by the generated app.</p>
+        </div>
       </section>
     </main>
     <script src="/static/preview_bridge.js" defer></script>
     <script src="/static/specialist/app.js" defer></script>
   </body>
-  </html>
+</html>

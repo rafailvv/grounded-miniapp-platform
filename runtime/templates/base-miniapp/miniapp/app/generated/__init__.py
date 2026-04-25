@@ -18,8 +18,3 @@ def _load_json(name: str) -> dict[str, Any]:
 
 
 route_manifest = _load_json("route_manifest.json")
-runtime_manifest = _load_json("runtime_manifest.json")
-static_runtime_manifest = _load_json("static_runtime_manifest.json")
-role_seed = _load_json("role_seed.json")
-role_experience = _load_json("role_experience.json")
-

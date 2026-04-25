@@ -12,7 +12,6 @@ from app.db import Base, engine
 from app.routes.client import router as client_router
 from app.routes.health import router as health_router
 from app.routes.manager import router as manager_router
-from app.routes.profiles import router as profiles_router
 from app.routes.specialist import router as specialist_router
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -27,7 +26,6 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(health_router)
-app.include_router(profiles_router)
 app.include_router(client_router)
 app.include_router(specialist_router)
 app.include_router(manager_router)

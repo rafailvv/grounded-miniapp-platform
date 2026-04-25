@@ -15,6 +15,9 @@ body {
 
 body {
   padding-top: var(--telegram-top-safe-offset);
+  font-family: "Inter", "Segoe UI", sans-serif;
+  background: #f6f7f9;
+  color: #17202a;
 }
 
 .page-shell {
@@ -22,4 +25,39 @@ body {
   min-height: 100vh;
   margin: 0 auto;
   padding-top: 76px;
+}
+
+.page {
+  display: grid;
+  place-items: center;
+  min-height: calc(100vh - 100px);
+}
+
+.shell-panel {
+  width: min(100%, 440px);
+  border: 1px solid #dde2ea;
+  border-radius: 12px;
+  padding: 24px;
+  background: #ffffff;
+  box-shadow: 0 16px 40px rgba(23, 32, 42, 0.08);
+}
+
+.shell-eyebrow {
+  margin: 0 0 8px;
+  color: #607086;
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.shell-title {
+  margin: 0;
+  font-size: 26px;
+  line-height: 1.15;
+}
+
+.shell-copy {
+  margin: 12px 0 0;
+  color: #526173;
+  line-height: 1.5;
 }

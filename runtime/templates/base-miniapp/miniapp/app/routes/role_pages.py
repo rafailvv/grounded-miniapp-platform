@@ -77,9 +77,6 @@ def resolve_default_role_page(role: str, actual_path: str) -> Path | None:
     if actual_path == f"/{role}":
         page_file = STATIC_DIR / role / "index.html"
         return page_file if page_file.exists() else None
-    if actual_path == f"/{role}/profile":
-        page_file = STATIC_DIR / role / "profile" / "index.html"
-        return page_file if page_file.exists() else None
     slug_parts = [segment for segment in actual_path.removeprefix(f"/{role}").split("/") if segment]
     if len(slug_parts) == 1:
         page_file = STATIC_DIR / role / slug_parts[0] / "index.html"
