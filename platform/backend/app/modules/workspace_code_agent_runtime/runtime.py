@@ -250,7 +250,13 @@ class WorkspaceCodeAgentRuntime:
         def _execute_checks(changed_files: list[str]) -> tuple[CheckExecutionRecord, dict[str, Any]]:
             nonlocal last_changed_files
             last_changed_files = list(changed_files or last_changed_files)
-            self._append_event(job, "frontend_build_started", "Running platform invariant checks.")
+            has_draft_diff = bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
+            self._append_event(
+                job,
+                "frontend_build_started",
+                "Running platform invariant checks.",
+                {"attempt": 1 if has_draft_diff else 0, "changed_files": list(last_changed_files)},
+            )
             check_profile = "full" if generation_mode == GenerationMode.QUALITY else "fast_gate"
             execution = self.check_runner.run(
                 workspace_id=workspace_id,
@@ -266,7 +272,12 @@ class WorkspaceCodeAgentRuntime:
                 and self._fast_gate_passed(execution.results)
                 and self.workspace_service.diff(workspace_id, run_id=run_id).strip()
             ):
-                self._append_event(job, "frontend_build_started", "Running final generated app checks.")
+                self._append_event(
+                    job,
+                    "frontend_build_started",
+                    "Running final generated app checks.",
+                    {"attempt": 1, "changed_files": list(last_changed_files)},
+                )
                 execution = self.check_runner.run(
                     workspace_id=workspace_id,
                     run_id=run_id,
@@ -1002,7 +1013,7 @@ class WorkspaceCodeAgentRuntime:
     def _append_event(self, job: JobRecord, event_type: str, message: str, details: dict[str, Any] | None = None) -> None:
         job.events.append(JobEvent(event_type=event_type, message=message, details=details or {}))
         job.updated_at = datetime.now(timezone.utc)
-        self._sync_run_progress(job, event_type, message)
+        self._sync_run_progress(job, event_type, message, details or {})
         self._save_job(job)
         self.workspace_log_service.append(job.workspace_id, source=f"agent.{event_type}", message=message, payload=details or {})
 
@@ -1024,14 +1035,13 @@ class WorkspaceCodeAgentRuntime:
         self._store_report(report_key, current)
         self.workspace_log_service.append(workspace_id, source=f"agent.trace.{stage}", message=message, payload=payload or {})
 
-    def _sync_run_progress(self, job: JobRecord, event_type: str, message: str) -> None:
-        del message
+    def _sync_run_progress(self, job: JobRecord, event_type: str, message: str, details: dict[str, Any]) -> None:
         if not job.linked_run_id:
             return
         payload = self.store.get("runs", job.linked_run_id)
         if not payload:
             return
-        stage, progress = self._run_progress_for_event(event_type)
+        stage, progress = self._run_progress_for_event(event_type, details=details, message=message)
         payload["linked_job_id"] = job.job_id
         payload["current_stage"] = stage
         payload["progress_percent"] = max(int(payload.get("progress_percent", 0)), progress)
@@ -1046,24 +1056,69 @@ class WorkspaceCodeAgentRuntime:
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.store.upsert("runs", job.linked_run_id, payload)
 
-    @staticmethod
-    def _run_progress_for_event(event_type: str) -> tuple[str, int]:
+    @classmethod
+    def _run_progress_for_event(
+        cls,
+        event_type: str,
+        *,
+        details: dict[str, Any] | None = None,
+        message: str = "",
+    ) -> tuple[str, int]:
+        details = details or {}
+        attempt = cls._safe_int(details.get("attempt"), default=0)
+        is_after_patch = attempt > 0
         progress_map = {
-            "job_started": ("running", 6),
-            "running_checks": ("checks", 14),
-            "build_started": ("checks", 16),
-            "frontend_build_started": ("checks", 18),
-            "backend_compile_started": ("checks", 22),
-            "checks_completed": ("checks", 35),
-            "agent_turn_started": ("agent_turn", 48),
-            "scope_expanded": ("agent_turn", 54),
-            "patch_apply_started": ("applying", 70),
-            "patch_apply_completed": ("checks", 82),
-            "repair_iteration": ("agent_turn", 88),
-            "job_completed": ("complete", 99),
-            "job_failed": ("failed", 100),
+            "job_started": ("Starting code agent", 4),
+            "running_checks": ("Running final checks" if is_after_patch else "Checking workspace shell", 66 if is_after_patch else 8),
+            "build_started": ("Validating generated app" if is_after_patch else "Validating workspace shell", 70 if is_after_patch else 10),
+            "frontend_build_started": ("Building generated frontend" if is_after_patch else "Checking frontend baseline", 74 if is_after_patch else 12),
+            "backend_compile_started": ("Checking backend imports" if is_after_patch else "Checking backend baseline", 76 if is_after_patch else 14),
+            "checks_completed": (cls._checks_stage(details), 82 if is_after_patch else 22),
+            "agent_turn_started": (cls._agent_turn_stage(details), 32 if attempt <= 1 else min(64, 32 + attempt * 8)),
+            "scope_expanded": ("Reading more workspace context", 38 if attempt <= 1 else min(68, 38 + attempt * 8)),
+            "patch_apply_started": (cls._files_stage("Applying patch", details, key="files"), 48 if attempt <= 1 else min(78, 48 + attempt * 8)),
+            "patch_apply_completed": (cls._files_stage("Patch applied", details, key="changed_files"), 58 if attempt <= 1 else min(84, 58 + attempt * 6)),
+            "repair_iteration": ("Refining patch with more context", 44 if attempt <= 1 else min(72, 44 + attempt * 8)),
+            "final_checks_started": ("Running final checks", 86),
+            "apply_completed": ("Applied to workspace", 98),
+            "preview_rebuild_completed": ("Preview refreshed", 98),
+            "job_completed": ("Complete", 99),
+            "job_failed": ("Failed", 100),
         }
-        return progress_map.get(event_type, ("processing", 20))
+        if event_type in progress_map:
+            return progress_map[event_type]
+        clean_message = " ".join(str(message or "").split()).strip()
+        return clean_message[:80] if clean_message else "Processing", 18
+
+    @staticmethod
+    def _safe_int(value: Any, *, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _checks_stage(cls, details: dict[str, Any]) -> str:
+        failed_checks = details.get("failed_checks")
+        if isinstance(failed_checks, list) and failed_checks:
+            return f"Checks found {len(failed_checks)} issue{'s' if len(failed_checks) != 1 else ''}"
+        return "Checks passed"
+
+    @classmethod
+    def _agent_turn_stage(cls, details: dict[str, Any]) -> str:
+        attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
+        tool_round = cls._safe_int(details.get("tool_round"), default=0)
+        if tool_round > 0:
+            return f"Reading context for turn {attempt}"
+        return f"Planning code edit {attempt}"
+
+    @staticmethod
+    def _files_stage(prefix: str, details: dict[str, Any], *, key: str) -> str:
+        raw_files = details.get(key)
+        files = [str(item) for item in raw_files if str(item).strip()] if isinstance(raw_files, list) else []
+        if not files:
+            return prefix
+        return f"{prefix} • {len(set(files))} file{'s' if len(set(files)) != 1 else ''}"
 
     @staticmethod
     def _paths_from_diff(diff_text: str) -> list[str]:

@@ -248,6 +248,10 @@ function clampText(value: string, maxLength = 180): string {
   return `${normalized.slice(0, maxLength - 1).trimEnd()}…`;
 }
 
+function pluralize(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
 function asRecordArray(value: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) {
     return [];
@@ -449,26 +453,26 @@ function progressCeilingForRun(run: Run): number {
   if (run.status === "completed" || run.status === "failed" || run.status === "blocked" || run.status === "awaiting_approval") {
     return 100;
   }
-  if (stage.includes("retrieving context")) {
-    return 28;
+  if (stage.includes("starting")) {
+    return 12;
   }
-  if (stage.includes("building grounded spec")) {
-    return 48;
+  if (stage.includes("checking workspace") || stage.includes("baseline")) {
+    return 24;
   }
-  if (stage.includes("planning code changes")) {
-    return 68;
+  if (stage.includes("planning code edit") || stage.includes("reading context")) {
+    return 44;
   }
-  if (stage.includes("editing draft files")) {
-    return 84;
+  if (stage.includes("applying patch")) {
+    return 58;
   }
-  if (stage.includes("repairing draft")) {
-    return 89;
+  if (stage.includes("patch applied")) {
+    return 66;
   }
-  if (stage.includes("running validation and build")) {
-    return 95;
+  if (stage.includes("running final") || stage.includes("validating generated") || stage.includes("building generated")) {
+    return 90;
   }
-  if (stage.includes("refreshing preview")) {
-    return 99;
+  if (stage.includes("preview")) {
+    return 98;
   }
   return Math.min(96, Math.max(18, (run.progress_percent || 0) + 8));
 }
@@ -484,10 +488,9 @@ function nextVisualProgress(current: number, run: Run): number {
   const floor = Math.max(actual, 4);
   const ceiling = Math.max(floor, progressCeilingForRun(run));
   const isEarlyPhase =
-    stage.includes("retrieving context") ||
-    stage.includes("building grounded spec") ||
-    stage.includes("spec") ||
-    stage.includes("starting");
+    stage.includes("starting") ||
+    stage.includes("checking workspace") ||
+    stage.includes("baseline");
   if (current < actual) {
     const catchUpStep = isEarlyPhase
       ? Math.max(0.55, (actual - current) * 0.18)
@@ -499,15 +502,13 @@ function nextVisualProgress(current: number, run: Run): number {
   }
 
   let driftStep = 0.18;
-  if (stage.includes("retrieving context")) {
+  if (stage.includes("starting") || stage.includes("checking workspace")) {
     driftStep = 0.08;
-  } else if (stage.includes("building grounded spec") || stage.includes("spec")) {
+  } else if (stage.includes("planning code edit") || stage.includes("reading context")) {
     driftStep = 0.1;
-  } else if (stage.includes("planning")) {
-    driftStep = 0.16;
-  } else if (stage.includes("editing")) {
+  } else if (stage.includes("applying patch")) {
     driftStep = 0.2;
-  } else if (stage.includes("validation") || stage.includes("preview")) {
+  } else if (stage.includes("checks") || stage.includes("validating") || stage.includes("building") || stage.includes("preview")) {
     driftStep = 0.12;
   }
   return Math.min(ceiling, current + driftStep);
@@ -526,6 +527,56 @@ function displayProgressForRun(run: Run, progressDisplay: RunProgressDisplayMap)
     return actual;
   }
   return Math.max(actual, Math.min(100, Math.round(visual)));
+}
+
+function runTimelineTitle(run: Run): string {
+  const status = displayRunStatus(run);
+  if (status === "running") {
+    return run.current_stage || "Running";
+  }
+  if (status === "completed" && run.apply_status === "applied") {
+    return "Generated and applied";
+  }
+  if (status === "failed" || status === "blocked") {
+    return run.failure_class || run.failure_reason || status;
+  }
+  return run.intent.replaceAll("_", " ");
+}
+
+function runTimelineDescription(run: Run): string {
+  const status = displayRunStatus(run);
+  if (status === "running") {
+    const parts = [run.generation_mode ? `${run.generation_mode} mode` : "", run.llm_model ? `model ${run.llm_model}` : ""].filter(Boolean);
+    return parts.length ? parts.join(" • ") : "Code agent is editing and checking the draft.";
+  }
+  if (status === "completed") {
+    const count = run.touched_files.length;
+    const filesText = count ? pluralize(count, "file") : "no source files";
+    return run.summary?.trim() || `${filesText} changed and applied to the workspace.`;
+  }
+  if (status === "failed" || status === "blocked") {
+    return run.failure_reason?.trim() || run.root_cause_summary?.trim() || "Run stopped before a valid draft was applied.";
+  }
+  return clampText(displayRunPrompt(run), 140);
+}
+
+function runTimelineMeta(run: Run): string {
+  const status = displayRunStatus(run);
+  if (status === "running") {
+    return run.iteration_count > 0 ? pluralize(run.iteration_count, "turn") : "active";
+  }
+  return formatTimestamp(run.created_at);
+}
+
+function runTimelineFileMeta(run: Run): string {
+  const changedFileCount = run.touched_files.length;
+  if (changedFileCount > 0) {
+    return pluralize(changedFileCount, "file");
+  }
+  if (displayRunStatus(run) === "running") {
+    return "editing draft";
+  }
+  return "0 files";
 }
 
 function ensureChildrenMap(node: FileTreeNode): Map<string, FileTreeNode> {
@@ -2668,12 +2719,12 @@ export default function App() {
                         onClick={() => openRunDetails(run.run_id)}
                       >
                         <div className="run-card-top">
-                          <strong>{run.intent.replaceAll("_", " ")}</strong>
+                          <strong>{runTimelineTitle(run)}</strong>
                           <span className={`run-status ${runStatus === "rolled_back" ? "rolled-back" : runStatus}`}>
                             {runStatus}
                           </span>
                         </div>
-                        <p className="run-card-copy">{clampText(displayRunPrompt(run), 120)}</p>
+                        <p className="run-card-copy">{clampText(runTimelineDescription(run), 140)}</p>
                         <div className="run-progress">
                           <div className="run-progress-bar">
                             <div className="run-progress-fill" style={{ width: `${visualProgress}%` }} />
@@ -2684,8 +2735,8 @@ export default function App() {
                           </div>
                         </div>
                         <div className="run-card-meta">
-                          <span>{formatTimestamp(run.created_at)}</span>
-                          <span>{run.touched_files.length} files</span>
+                          <span>{runTimelineMeta(run)}</span>
+                          <span>{runTimelineFileMeta(run)}</span>
                         </div>
                       </button>
                       {run.status === "completed" || canStopRun || run.status === "failed" || run.status === "blocked" ? (
