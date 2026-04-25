@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from app.modules.miniapp_contract.runtime_contract_sync import MiniappRuntimeContractSync
+from app.modules.miniapp_contract.runtime_contract_normalization import MiniappRuntimeContractNormalization
 from app.models.domain import DraftFileOperation
 
 from app.modules.miniapp_generation_runtime.generation_shell_contract import MiniappGenerationShellContract
@@ -62,7 +62,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
         compact_route_stem = cls._compact_slug(route_stem)
         if compact_route_stem:
             aliases.add(compact_route_stem)
-        aliases.update({"record", "records", "item", "items", "workflow", "workflows"})
+        aliases.update({"item", "items"})
         aliases.discard("")
         if canonical_slug:
             aliases.discard(canonical_slug)
@@ -540,7 +540,7 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
 
     @staticmethod
     def _canonicalize_local_role_links_in_text(content: str) -> str:
-        return MiniappRuntimeContractSync.canonicalize_local_role_links_in_text(content)
+        return MiniappRuntimeContractNormalization.canonicalize_local_role_links_in_text(content)
 
     @staticmethod
     def _ensure_fastapi_import_symbol(content: str, symbol: str) -> str:

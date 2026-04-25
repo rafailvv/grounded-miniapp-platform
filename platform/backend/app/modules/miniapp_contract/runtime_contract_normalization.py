@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 
-class MiniappRuntimeContractSync:
+class MiniappRuntimeContractNormalization:
     _HELPER_ONLY_ROUTE_MODULES = {"role_pages"}
 
     @staticmethod
@@ -173,4 +173,4 @@ class MiniappRuntimeContractSync:
         return updated
 
 
-__all__ = ["MiniappRuntimeContractSync"]
+__all__ = ["MiniappRuntimeContractNormalization"]

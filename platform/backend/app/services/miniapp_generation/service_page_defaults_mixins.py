@@ -128,7 +128,7 @@ class ServicePageDefaultsMixins:
             return "profile"
         if any(token in slug for token in ("/workspace", "workspace.html", "detail", "details", "feature")):
             return "workspace"
-        if any(token in slug for token in ("/workbench", "workbench.html", "queue", "list", "records", "orders")):
+        if any(token in slug for token in ("/workbench", "workbench.html", "queue", "list", "items", "orders")):
             return "list"
         if any(token in slug for token in ("form", "create", "edit")):
             return "form"

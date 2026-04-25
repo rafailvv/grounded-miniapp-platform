@@ -427,13 +427,13 @@ def _workflow_api_requirements(grounded_spec: dict) -> list[dict]:
             requirements.extend(
                 [
                     {
-                        "name": str((ENTITY_CONTRACT or {}).get("plural_label") or "records"),
+                        "name": str((ENTITY_CONTRACT or {}).get("plural_label") or "items"),
                         "path": entity_api_path,
                         "method": "POST",
                         "fields": entity_key_fields,
                     },
                     {
-                        "name": str((ENTITY_CONTRACT or {}).get("plural_label") or "records"),
+                        "name": str((ENTITY_CONTRACT or {}).get("plural_label") or "items"),
                         "path": entity_api_path,
                         "method": "GET",
                         "fields": [],
@@ -443,7 +443,7 @@ def _workflow_api_requirements(grounded_spec: dict) -> list[dict]:
         if entity_detail_api_path and entity_detail_api_path not in existing_paths:
             requirements.append(
                 {
-                    "name": str((ENTITY_CONTRACT or {}).get("singular_label") or "record"),
+                    "name": str((ENTITY_CONTRACT or {}).get("singular_label") or "item"),
                     "path": entity_detail_api_path,
                     "method": "PATCH",
                     "fields": [{"name": "status"}],
@@ -586,7 +586,7 @@ class GeneratedMiniAppTests(unittest.TestCase):
             tokens_any=workflow_tokens,
             preferred_resource=preferred_resource,
         )
-        self.assertIsNotNone(create_requirement, "Generated app must expose a POST workflow API for creating persisted records.")
+        self.assertIsNotNone(create_requirement, "Generated app must expose a POST workflow API for creating persisted items.")
         preferred_resource = preferred_resource or _resource_slug(str(create_requirement.get("path") or ""))
         list_requirement = _pick_workflow_api(
             self.workflow_api_requirements,
@@ -600,8 +600,8 @@ class GeneratedMiniAppTests(unittest.TestCase):
             tokens_any=workflow_tokens,
             preferred_resource=preferred_resource,
         )
-        self.assertIsNotNone(list_requirement, "Generated app must expose a GET workflow API for reading persisted records.")
-        self.assertIsNotNone(update_requirement, "Generated app must expose a PUT or PATCH workflow API for updating persisted records.")
+        self.assertIsNotNone(list_requirement, "Generated app must expose a GET workflow API for reading persisted items.")
+        self.assertIsNotNone(update_requirement, "Generated app must expose a PUT or PATCH workflow API for updating persisted items.")
 
         create_path = _sample_route_path(str(create_requirement.get("path") or ""))
         create_payload = _payload_for_api(create_requirement, create_path, str(create_requirement.get("method") or "POST")) or {}

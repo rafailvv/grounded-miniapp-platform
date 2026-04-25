@@ -554,7 +554,7 @@ class ServiceStrategyMixins:
             "content_first_required": self._is_role_root_page(role, page) and dependency_count > 0,
             "loading_policy": "do_not_force_dedicated_loading_blocks_on_role_roots" if dependency_count > 0 else "secondary_only",
             "required_surface_sections": self._first_paint_required_sections(role),
-            "empty_state_policy": "show honest business empty states instead of pseudo-records",
+            "empty_state_policy": "show honest business empty states instead of pseudo-data rows",
             "product_goal": product_goal,
         }
 

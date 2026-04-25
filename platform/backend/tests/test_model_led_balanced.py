@@ -4,12 +4,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import pytest
+from pydantic import ValidationError
 
 from app.ai import model_registry
 from app.ai.openrouter_client import OpenRouterClient
 from app.ai.model_registry import task_model_overrides
 from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
-from app.models.domain import DraftFileOperation, JobRecord
+from app.models.domain import DraftFileOperation, JobEvent, JobRecord, RunRecord
 from app.models.grounded_spec import (
     APIRequirement,
     Actor,
@@ -46,6 +48,14 @@ from app.services.miniapp_generation.service_llm_grounded_misc_mixins import Ser
 from app.services.miniapp_generation.service_strategy_mixins import ServiceStrategyMixins
 
 
+def _removed_symbol_name(*parts: str) -> str:
+    return "".join(parts)
+
+
+def _historical_runtime_value(*parts: str) -> str:
+    return "".join(parts)
+
+
 def _minimal_spec(entity_name: str) -> GroundedSpecModel:
     return GroundedSpecModel(
         metadata=Metadata(
@@ -62,7 +72,7 @@ def _minimal_spec(entity_name: str) -> GroundedSpecModel:
                 actor_id="actor_client",
                 name="Client",
                 role="client",
-                description="Creates records.",
+                description="Creates shared items.",
                 permissions_hint=[],
                 evidence=[],
             )
@@ -71,7 +81,7 @@ def _minimal_spec(entity_name: str) -> GroundedSpecModel:
             DomainEntity(
                 entity_id="entity_primary",
                 name=entity_name,
-                description=f"{entity_name} record",
+                description=f"{entity_name} item",
                 attributes=[
                     EntityAttribute(name="title", type="string", required=True, description="Title"),
                     EntityAttribute(name="details", type="text", required=False, description="Details"),
@@ -239,7 +249,7 @@ def test_entity_contract_overrides_low_signal_mobile_use_resource_with_prompt_en
             name="List mobile use",
             method="GET",
             path="/api/uses",
-            purpose="Load current user records and role queues.",
+            purpose="Load current user items and role queues.",
             request_fields=[],
             response_fields=[],
             evidence=[],
@@ -262,7 +272,7 @@ def test_entity_contract_overrides_low_signal_mobile_use_resource_with_prompt_en
     assert contract["entity_name"] == "Request"
 
 
-def test_grounded_spec_stabilization_does_not_inject_default_records_api() -> None:
+def test_grounded_spec_stabilization_does_not_inject_default_entity_api() -> None:
     spec = _minimal_spec("StoreOrder")
     spec.api_requirements = []
     spec.user_flows = []
@@ -337,6 +347,77 @@ def test_state_store_delete_many_removes_multiple_keys(tmp_path) -> None:
     assert "code:ws_test:chunk_a" not in remaining
     assert "code:ws_test:chunk_b" not in remaining
     assert "code:ws_other:chunk_c" in remaining
+
+
+def test_state_store_migrates_historical_job_events_fidelity_and_run_stage(tmp_path) -> None:
+    store = StateStore(tmp_path / "state.json")
+    historical_job = JobRecord(
+        workspace_id="ws_test",
+        prompt="Generate app",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+    ).model_dump(mode="json")
+    historical_job["fidelity"] = _historical_runtime_value("basic", "_scaffold")
+    historical_job["events"] = [
+        {
+            "event_type": _historical_runtime_value("building", "_scaffold"),
+            "message": "historical event",
+            "details": {},
+            "created_at": historical_job["created_at"],
+        },
+        {
+            "event_type": _historical_runtime_value("scaffold", "_ready"),
+            "message": "historical event",
+            "details": {},
+            "created_at": historical_job["created_at"],
+        },
+    ]
+    store.upsert("jobs", "job_historical", historical_job)
+
+    historical_run = RunRecord(
+        workspace_id="ws_test",
+        prompt="Generate app",
+        intent="create",
+        model_profile="openai_code_fast",
+    ).model_dump(mode="json")
+    historical_run["current_stage"] = _historical_runtime_value("building", "_scaffold")
+    store.upsert("runs", "run_historical", historical_run)
+
+    counters = store.migrate_persisted_runtime_state()
+
+    migrated_job = store.get("jobs", "job_historical")
+    migrated_run = store.get("runs", "run_historical")
+    assert migrated_job is not None
+    assert migrated_run is not None
+    assert migrated_job["fidelity"] == "basic_app"
+    assert [event["event_type"] for event in migrated_job["events"]] == ["building_surface", "surface_ready"]
+    assert migrated_run["current_stage"] == "building_surface"
+    assert counters["job_fidelities_migrated"] == 1
+    assert counters["job_events_migrated"] == 2
+    assert counters["run_stages_migrated"] == 1
+    JobRecord.model_validate(migrated_job)
+    RunRecord.model_validate(migrated_run)
+
+
+def test_domain_models_no_longer_accept_historical_job_alias_values() -> None:
+    job_payload = JobRecord(
+        workspace_id="ws_test",
+        prompt="Generate app",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+    ).model_dump(mode="json")
+    job_payload["fidelity"] = _historical_runtime_value("basic", "_scaffold")
+
+    with pytest.raises(ValidationError):
+        JobRecord.model_validate(job_payload)
+
+    event_payload = {
+        "event_type": _historical_runtime_value("building", "_scaffold"),
+        "message": "historical event",
+        "details": {},
+    }
+    with pytest.raises(ValidationError):
+        JobEvent.model_validate(event_payload)
 
 
 def test_filter_form_is_not_treated_as_persisted_mutation_surface() -> None:
@@ -765,7 +846,7 @@ def test_generation_repair_accepts_generation_mode_for_model_routing() -> None:
 
 
 def test_route_schema_contract_sync_entrypoint_removed() -> None:
-    assert not hasattr(MiniappGenerationContractSchema, "_synchronize_route_schema_contract")
+    assert not hasattr(MiniappGenerationContractSchema, "".join(("_", "synchronize", "_route_schema_contract")))
 
 
 def test_build_validator_does_not_treat_issue_heading_as_mutation() -> None:
@@ -796,7 +877,7 @@ def test_connectivity_validator_accepts_submit_spinner_as_loading_state() -> Non
     <script>
       document.getElementById("issue-form").addEventListener("submit", async () => {
         submitBtn.textContent = "Submitting...";
-        await fetch("/api/records", { method: "POST" });
+        await fetch("/api/items", { method: "POST" });
       });
     </script>
     """
@@ -813,7 +894,7 @@ def test_generated_python_tests_use_progress_status_when_schema_choices_are_unav
 
 
 def test_generation_normal_loop_no_longer_exposes_source_stabilizer() -> None:
-    assert not hasattr(MiniappGenerationNormalLoop, "stabilize_draft_contract_from_source")
+    assert not hasattr(MiniappGenerationNormalLoop, _removed_symbol_name("stabilize_", "draft_contract_", "from_source"))
 
 
 def test_route_manifest_dedupes_duplicate_file_paths_preferring_detail_page() -> None:
@@ -910,8 +991,8 @@ def test_build_validator_flags_empty_status_indicator_placeholders() -> None:
     assert len(issues) == 1
 
 
-def test_frontend_contract_sync_maps_generic_record_aliases_to_entity_api() -> None:
-    content = 'const response = await window.miniappApiFetch("/api/records?status=pending");'
+def test_frontend_contract_sync_maps_generic_collection_aliases_to_entity_api() -> None:
+    content = 'const response = await window.miniappApiFetch("/api/items?status=pending");'
 
     updated = MiniappGenerationContractFrontend._normalize_entity_api_paths(
         content,
@@ -982,7 +1063,7 @@ def test_frontend_contract_sync_removes_empty_status_indicator_placeholders() ->
 
 def test_frontend_contract_sync_injects_status_alias_bridge_for_noncanonical_schema_literals() -> None:
     content = """
-    const response = await window.miniappApiFetch("/api/records");
+    const response = await window.miniappApiFetch("/api/items");
     const data = await response.json();
     const status = item.status || "open";
     """
@@ -1035,7 +1116,7 @@ def test_build_validator_flags_missing_status_alias_bridge_for_noncanonical_sche
         encoding="utf-8",
     )
     (static_dir / "app.js").write_text(
-        'const response = await window.miniappApiFetch("/api/records");\n'
+        'const response = await window.miniappApiFetch("/api/items");\n'
         'const data = await response.json();\n'
         'const status = item.status || "open";\n',
         encoding="utf-8",

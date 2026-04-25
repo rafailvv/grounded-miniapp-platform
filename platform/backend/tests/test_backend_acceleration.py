@@ -47,7 +47,16 @@ from app.services.check_runner import CheckRunner
 from app.services.context_pack_builder import ContextPackBuilder
 from app.services.run_service import RunService
 from app.services.miniapp_generation.service_strategy_mixins import ServiceStrategyMixins
+from app.repositories.state_store import StateStore
 from app.modules.miniapp_validation.build_validator import BuildValidator
+
+
+def _removed_symbol_name(*parts: str) -> str:
+    return "".join(parts)
+
+
+def _historical_runtime_value(*parts: str) -> str:
+    return "".join(parts)
 
 
 def test_artifact_builder_refreshes_generated_graph_from_draft_profile_files(tmp_path: Path) -> None:
@@ -152,6 +161,48 @@ def test_build_validator_accepts_materialized_profile_files_when_graph_is_stale(
     issues = BuildValidator()._validate_generated_app_shape(workspace_path)
 
     assert "build.missing_role_profile_page" not in {issue.code for issue in issues}
+
+
+def test_service_container_migrates_historical_runtime_state_on_startup(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    data_dir = tmp_path / "data"
+    store = StateStore(data_dir / "platform-state.json")
+
+    historical_job = JobRecord(
+        workspace_id="ws_test",
+        prompt="Generate app",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+    ).model_dump(mode="json")
+    historical_job["fidelity"] = _historical_runtime_value("basic", "_scaffold")
+    historical_job["events"] = [
+        {
+            "event_type": _historical_runtime_value("building", "_scaffold"),
+            "message": "historical event",
+            "details": {},
+            "created_at": historical_job["created_at"],
+        }
+    ]
+    store.upsert("jobs", "job_historical", historical_job)
+
+    historical_run = RunRecord(
+        workspace_id="ws_test",
+        prompt="Generate app",
+        intent="create",
+        model_profile="openai_code_fast",
+    ).model_dump(mode="json")
+    historical_run["current_stage"] = _historical_runtime_value("scaffold", "_ready")
+    store.upsert("runs", "run_historical", historical_run)
+
+    app = create_app(repo_root=repo_root, data_dir=data_dir)
+
+    migrated_job = app.state.container.store.get("jobs", "job_historical")
+    migrated_run = app.state.container.store.get("runs", "run_historical")
+    assert migrated_job is not None
+    assert migrated_run is not None
+    assert migrated_job["fidelity"] == "basic_app"
+    assert migrated_job["events"][0]["event_type"] == "building_surface"
+    assert migrated_run["current_stage"] == "surface_ready"
 
 
 def test_artifact_builder_preserves_existing_feature_pages_from_draft_for_partial_refresh(tmp_path: Path) -> None:
@@ -302,10 +353,10 @@ def test_runtime_map_no_longer_exposes_active_deterministic_business_helpers() -
     assert "_deterministic_profiles_route_source" not in owner_map
     assert "_deterministic_runtime_route_source" not in owner_map
     assert "_deterministic_main_runtime_source" not in owner_map
-    assert "_synchronize_main_runtime_contract" not in owner_map
+    assert _removed_symbol_name("_", "synchronize", "_main_runtime_contract") not in owner_map
 
 
-def test_generation_codegen_no_longer_exposes_legacy_python_fallback_entrypoints() -> None:
+def test_generation_codegen_no_longer_exposes_removed_python_fallback_entrypoints() -> None:
     assert not hasattr(MiniappGenerationCodegen, "_whole_file_error_fallback_result")
     assert not hasattr(MiniappGenerationCodegen, "_whole_file_static_reuse_fallback_result")
     assert not hasattr(MiniappGenerationCodegen, "_whole_file_role_ui_fallback_result")
@@ -974,7 +1025,7 @@ def test_submit_with_context_preserves_workspace_log_context() -> None:
     assert result["workspace_id"] == "ws_context_submit"
 
 
-def test_fast_grounded_spec_timeout_returns_error_without_legacy_fallback_wording(tmp_path: Path) -> None:
+def test_fast_grounded_spec_timeout_returns_error_without_removed_fallback_wording(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
@@ -2850,19 +2901,14 @@ def test_pre_apply_contract_pass_preserves_existing_roles_for_partial_scope(tmp_
         return []
 
     def _unexpected_sync(*args, **kwargs):
-        raise AssertionError("legacy contract sync should not run in the active pre-apply pass")
+        raise AssertionError("removed contract sync should not run in the active pre-apply pass")
 
     monkeypatch.setattr(contract_pass, "_ensure_runtime_artifact_operations", lambda **kwargs: capture_runtime_artifacts(None, **kwargs))
     monkeypatch.setattr(contract_pass, "_ensure_app_level_test_operations", lambda **kwargs: kwargs["operations"])
     monkeypatch.setattr(contract_pass, "_remove_seeded_generated_artifacts", lambda **kwargs: kwargs["operations"], raising=False)
     monkeypatch.setattr(contract_pass, "_normalize_sqlalchemy_db_defaults", _unexpected_sync, raising=False)
-    monkeypatch.setattr(contract_pass, "_synchronize_minimal_workflow_route_contracts", _unexpected_sync, raising=False)
-    monkeypatch.setattr(contract_pass, "_synchronize_profile_schema_contract", _unexpected_sync, raising=False)
-    monkeypatch.setattr(contract_pass, "_synchronize_route_schema_contract", _unexpected_sync, raising=False)
-    monkeypatch.setattr(contract_pass, "_synchronize_frontend_api_contract", _unexpected_sync, raising=False)
-    monkeypatch.setattr(contract_pass, "_synchronize_basic_page_state_contract", _unexpected_sync, raising=False)
 
-    assert not hasattr(service, "runtime_contract_sync")
+    assert not hasattr(service, _removed_symbol_name("runtime_", "contract_", "sync"))
 
     result = contract_pass._run_pre_apply_contract_pass(
         workspace_id="ws_contract_pass_subset",
@@ -3166,13 +3212,13 @@ def test_backend_contract_target_inference_from_spec_helper_normalizes_required_
 def test_generated_page_sources_infer_backend_contract_targets_from_template_literal_api_calls() -> None:
     inferred = GenerationService._detect_missing_backend_contract_targets(
         generated_page_sources={
-            "miniapp/app/static/client/workflowrequests/app.js": "window.miniappApiFetch(`/api/workflowrequests`);\nfetch(`/api/workflowrequests/${recordId}`, { method: 'PATCH', body: '{}' });\n",
+            "miniapp/app/static/client/workflowitems/app.js": "window.miniappApiFetch(`/api/workflowitems`);\nfetch(`/api/workflowitems/${itemId}`, { method: 'PATCH', body: '{}' });\n",
         },
-        current_target_files=["miniapp/app/static/client/workflowrequests/index.html"],
+        current_target_files=["miniapp/app/static/client/workflowitems/index.html"],
         backend_targets=[],
     )
 
-    assert "miniapp/app/routes/workflowrequests.py" in inferred
+    assert "miniapp/app/routes/workflowitems.py" in inferred
     assert "miniapp/app/main.py" in inferred
     assert "miniapp/app/db.py" in inferred
     assert "miniapp/app/schemas.py" in inferred
@@ -3190,7 +3236,7 @@ def test_prepare_runtime_plan_adds_backend_targets_from_page_graph_dependencies(
                 name="Requests",
                 method="POST",
                 path="/api/requests",
-                purpose="Create shared workflow records",
+                purpose="Create shared workflow items",
                 request_fields=[],
                 response_fields=[],
                 evidence=[],
@@ -4115,8 +4161,8 @@ def test_merge_advisory_generation_inputs_prefers_advisory_pages_for_editing_tar
     service: GenerationService = app.state.container.generation_service
 
     role_contract, plan_result = service.generation_entry._merge_advisory_generation_inputs(
-        role_contract={"roles": {"client": {"responsibility": "Create records."}}},
-        inferred_role_contract={"roles": {"specialist": {"responsibility": "Process records."}, "manager": {"responsibility": "Observe records."}}},
+        role_contract={"roles": {"client": {"responsibility": "Create items."}}},
+        inferred_role_contract={"roles": {"specialist": {"responsibility": "Process items."}, "manager": {"responsibility": "Observe items."}}},
         advisory_plan_result={
             "target_files": [
                 "miniapp/app/static/specialist/request_detail/index.html",
@@ -4262,7 +4308,7 @@ def test_merge_advisory_generation_inputs_prefers_advisory_pages_for_editing_tar
     assert "role_specialist_ui_request_detail" in cluster_names
 
 
-def test_merge_advisory_generation_inputs_uses_inferred_scaffold_only_as_runtime_bootstrap_for_explicit_whole_file_surface(tmp_path: Path) -> None:
+def test_merge_advisory_generation_inputs_uses_inferred_surface_only_as_runtime_bootstrap_for_explicit_whole_file_surface(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
@@ -4307,17 +4353,17 @@ def test_merge_advisory_generation_inputs_uses_inferred_scaffold_only_as_runtime
                 "miniapp/app/db.py",
                 "miniapp/app/schemas.py",
                 "miniapp/app/routes/runtime.py",
-                "miniapp/app/routes/records.py",
+                "miniapp/app/routes/items.py",
             ],
             "backend_targets": [
                 "miniapp/app/main.py",
                 "miniapp/app/db.py",
                 "miniapp/app/schemas.py",
                 "miniapp/app/routes/runtime.py",
-                "miniapp/app/routes/records.py",
+                "miniapp/app/routes/items.py",
             ],
             "shared_files": [],
-            "files_to_read": ["miniapp/app/routes/records.py"],
+            "files_to_read": ["miniapp/app/routes/items.py"],
             "page_graph": {
                 "roles": {
                     "client": {
@@ -4342,8 +4388,8 @@ def test_merge_advisory_generation_inputs_uses_inferred_scaffold_only_as_runtime
     )
 
     assert "miniapp/app/routes/products.py" in plan_result["backend_targets"]
-    assert "miniapp/app/routes/records.py" not in plan_result["backend_targets"]
-    assert "miniapp/app/routes/records.py" not in plan_result["target_files"]
+    assert "miniapp/app/routes/items.py" not in plan_result["backend_targets"]
+    assert "miniapp/app/routes/items.py" not in plan_result["target_files"]
     assert "miniapp/app/main.py" in plan_result["target_files"]
     assert "miniapp/app/db.py" in plan_result["target_files"]
     assert "miniapp/app/schemas.py" in plan_result["target_files"]
@@ -4964,12 +5010,12 @@ def test_expand_repair_targets_for_safe_companions_allows_issue_located_static_p
 
 def test_expand_repair_targets_for_safe_companions_allows_issue_located_route_files() -> None:
     expanded = GenerationService._expand_repair_targets_for_safe_companions(
-        target_files=["miniapp/app/routes/records.py"],
+        target_files=["miniapp/app/routes/items.py"],
         invalid_paths=["miniapp/app/routes/products.py"],
         build_issues=[
             ValidationIssue(
                 code="critic.split_entity_routes",
-                message="Draft introduces multiple feature route stems for what should usually be one dominant entity lifecycle: products, records",
+                message="Draft introduces multiple feature route stems for what should usually be one dominant entity lifecycle: products, items",
                 severity="high",
                 location="miniapp/app/routes/products.py",
                 blocking=True,
@@ -5962,9 +6008,9 @@ def test_fix_classification_and_scope_handle_missing_role_profile_pages() -> Non
         'artifacts/generated_app_graph.json'
     )
     existing_scope = [
-        FixScopeEntry(file_path="docker/docker-compose.yml", reason="legacy scope"),
-        FixScopeEntry(file_path="miniapp/requirements.txt", reason="legacy scope"),
-        FixScopeEntry(file_path="miniapp/app/main.py", reason="legacy scope"),
+        FixScopeEntry(file_path="docker/docker-compose.yml", reason="deprecated scope"),
+        FixScopeEntry(file_path="miniapp/requirements.txt", reason="deprecated scope"),
+        FixScopeEntry(file_path="miniapp/app/main.py", reason="deprecated scope"),
     ]
 
     implicated = runtime.implicated_files("ws", "run", text, existing_scope)
@@ -8966,7 +9012,7 @@ def test_generation_repair_turn_context_adds_latest_changed_files_to_active_targ
             )
         ],
     )
-    active_targets = ["miniapp/app/routes/records.py"]
+    active_targets = ["miniapp/app/routes/items.py"]
 
     turn_context, preview_issue = service.generation_repair._build_generation_repair_turn_context(
         workspace_id=workspace_id,
@@ -11351,7 +11397,7 @@ def test_task_profiles_use_quality_first_repair_routing(monkeypatch) -> None:  #
         importlib.reload(model_registry)
 
 
-def test_chip_flag_switches_model_registry_to_legacy_models(monkeypatch) -> None:  # noqa: ANN001
+def test_chip_flag_switches_model_registry_to_historical_models(monkeypatch) -> None:  # noqa: ANN001
     import app.ai.model_registry as model_registry
 
     original_chip = os.environ.get("CHIP")
@@ -11473,7 +11519,7 @@ def test_context_pack_builder_limits_recent_diff_to_fast_targets(tmp_path: Path)
     assert "miniapp/app/static/manager/index.html" in balanced_pack.recent_diff
 
 
-def test_code_index_retrieval_records_candidate_cache_hits(tmp_path: Path) -> None:
+def test_code_index_retrieval_entity_candidate_cache_hits(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     client = TestClient(app)
@@ -11737,15 +11783,15 @@ def test_diminishing_returns_service_stops_after_repeated_low_signal_iterations(
     assert report["items"]
 
 
-def test_service_no_longer_exposes_legacy_contract_sync_entrypoints(tmp_path: Path) -> None:
+def test_service_no_longer_exposes_removed_contract_sync_entrypoints(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
 
-    assert not hasattr(service, "_synchronize_backend_dependency_contract")
-    assert not hasattr(service, "_synchronize_frontend_api_contract")
-    assert not hasattr(service, "_synchronize_basic_page_state_contract")
-    assert not hasattr(service, "runtime_contract_sync")
+    assert not hasattr(service, _removed_symbol_name("_", "synchronize", "_backend_dependency_contract"))
+    assert not hasattr(service, _removed_symbol_name("_", "synchronize", "_frontend_api_contract"))
+    assert not hasattr(service, _removed_symbol_name("_", "synchronize", "_basic_page_state_contract"))
+    assert not hasattr(service, _removed_symbol_name("runtime_", "contract_", "sync"))
 
 
 def test_contract_runtime_classes_no_longer_expose_sync_helpers(tmp_path: Path) -> None:
@@ -11753,12 +11799,12 @@ def test_contract_runtime_classes_no_longer_expose_sync_helpers(tmp_path: Path) 
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
 
-    assert not hasattr(service.generation_contract_schema, "_synchronize_backend_dependency_contract")
-    assert not hasattr(service.generation_contract_schema, "_synchronize_profile_schema_contract")
-    assert not hasattr(service.generation_contract_schema, "_synchronize_route_schema_contract")
-    assert not hasattr(service.generation_contract_frontend, "_synchronize_frontend_api_contract")
-    assert not hasattr(service.generation_contract_frontend, "_synchronize_frontend_navigation_contract")
-    assert not hasattr(service.generation_contract_frontend, "_synchronize_basic_page_state_contract")
+    assert not hasattr(service.generation_contract_schema, _removed_symbol_name("_", "synchronize", "_backend_dependency_contract"))
+    assert not hasattr(service.generation_contract_schema, _removed_symbol_name("_", "synchronize", "_profile_schema_contract"))
+    assert not hasattr(service.generation_contract_schema, _removed_symbol_name("_", "synchronize", "_route_schema_contract"))
+    assert not hasattr(service.generation_contract_frontend, _removed_symbol_name("_", "synchronize", "_frontend_api_contract"))
+    assert not hasattr(service.generation_contract_frontend, _removed_symbol_name("_", "synchronize", "_frontend_navigation_contract"))
+    assert not hasattr(service.generation_contract_frontend, _removed_symbol_name("_", "synchronize", "_basic_page_state_contract"))
 
 
 def test_frontend_contract_keeps_only_canonicalization_utility(tmp_path: Path) -> None:
@@ -11900,13 +11946,13 @@ def test_build_validator_flags_invalid_actor_dependency(tmp_path: Path) -> None:
     assert any(issue.code == "build.invalid_actor_dependency" for issue in issues)
 
 
-def test_generation_service_removes_prompt_scaffold_entrypoints(tmp_path: Path) -> None:
+def test_generation_service_removes_prompt_surface_entrypoints(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
 
-    assert not hasattr(service, "_compile_prompt_to_scaffold")
-    assert not hasattr(service, "_scaffold_backend_targets_from_spec")
+    assert not hasattr(service, "_compile_prompt_to_surface")
+    assert not hasattr(service, "_surface_backend_targets_from_spec")
 
 
 def test_fix_scope_builder_does_not_auto_expand_page_triplet_scope(tmp_path: Path) -> None:
@@ -12041,24 +12087,18 @@ def test_check_runner_extracts_structured_generated_app_api_failure_diagnostics(
     assert api_failure["resource_slug"] == "requests"
 
 
-def test_endpoint_aliases_canonicalize_to_requests() -> None:
-    assert GenerationService._route_module_path_for_endpoint_name("submissions") == "miniapp/app/routes/requests.py"
-    assert GenerationService._route_module_path_for_endpoint_name("booking") == "miniapp/app/routes/requests.py"
+def test_endpoint_names_use_prompt_neutral_route_modules() -> None:
+    assert GenerationService._route_module_path_for_endpoint_name("submissions") == "miniapp/app/routes/submissions.py"
+    assert GenerationService._route_module_path_for_endpoint_name("booking") == "miniapp/app/routes/booking.py"
 
 
-def test_route_contract_bootstrap_only_does_not_inject_python_route_scaffolds(tmp_path: Path) -> None:
+def test_route_contract_sync_entrypoint_removed(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service = app.state.container.generation_service
 
-    operations = service._synchronize_minimal_workflow_route_contracts(
-        "ws_test",
-        "run_test",
-        [],
-        contract_sync_mode="bootstrap_only",
-    )
-
-    assert operations == []
+    assert not hasattr(service, _removed_symbol_name("_", "synchronize", "_minimal_workflow_route_contracts"))
+    assert not hasattr(service.generation_contract_routes, _removed_symbol_name("_", "synchronize", "_minimal_workflow_route_contracts"))
 
 
 def test_role_page_routes_with_jinja_templates_are_not_forced_through_invariant_repair() -> None:

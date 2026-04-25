@@ -2,22 +2,11 @@ from __future__ import annotations
 
 import re
 
-from app.modules.miniapp_contract.runtime_contract_sync import MiniappRuntimeContractSync
-from app.models.domain import DraftFileOperation
+from app.modules.miniapp_contract.runtime_contract_normalization import MiniappRuntimeContractNormalization
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
 
 
 class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
-    def _synchronize_minimal_workflow_route_contracts(
-        self,
-        workspace_id: str,
-        draft_run_id: str,
-        operations: list[DraftFileOperation],
-        contract_sync_mode: str = "bootstrap_only",
-    ) -> list[DraftFileOperation]:
-        del workspace_id, draft_run_id, contract_sync_mode
-        return list(operations)
-
     @staticmethod
     def _route_module_needs_stub(content: str) -> bool:
         normalized = str(content or "").strip()
@@ -48,8 +37,8 @@ class MiniappGenerationContractRoutes(MiniappGenerationRuntimeOwner):
 
     @staticmethod
     def _strip_noncanonical_runtime_route_handlers(content: str) -> str:
-        return MiniappRuntimeContractSync.strip_noncanonical_runtime_route_handlers(content)
+        return MiniappRuntimeContractNormalization.strip_noncanonical_runtime_route_handlers(content)
 
     @staticmethod
     def _normalize_runtime_route_module_source(content: str) -> str:
-        return MiniappRuntimeContractSync.normalize_runtime_route_module_source(content)
+        return MiniappRuntimeContractNormalization.normalize_runtime_route_module_source(content)

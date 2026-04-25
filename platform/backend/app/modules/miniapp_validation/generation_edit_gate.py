@@ -57,9 +57,9 @@ class GenerationEditGate:
         unexpected_paths = [path for path in operation_paths if path not in allowed_target_paths]
         if unexpected_paths:
             issues.append(f"Generated draft touched files outside the planned target scope: {', '.join(unexpected_paths[:5])}")
-        legacy_paths = [path for path in operation_paths if any(path.startswith(marker) for marker in DISALLOWED_ARCHITECTURE_MARKERS)]
-        if legacy_paths:
-            issues.append(f"Generated draft reintroduced legacy architecture paths: {', '.join(sorted(legacy_paths)[:5])}")
+        deprecated_paths = [path for path in operation_paths if any(path.startswith(marker) for marker in DISALLOWED_ARCHITECTURE_MARKERS)]
+        if deprecated_paths:
+            issues.append(f"Generated draft reintroduced deprecated architecture paths: {', '.join(sorted(deprecated_paths)[:5])}")
         non_canonical_paths = [
             path
             for path in operation_paths

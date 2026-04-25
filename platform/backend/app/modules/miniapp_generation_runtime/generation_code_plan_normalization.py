@@ -302,7 +302,7 @@ class MiniappGenerationCodePlanNormalization(MiniappGenerationRuntimeOwner):
             if not error_state:
                 error_state = self._default_state_contract(state_kind="error", page_label=page_label, marker_base=state_marker_base)
             if not empty_state:
-                empty_state = f"Show an empty-state container after {page_label} data loads but returns no records."
+                empty_state = f"Show an empty-state container after {page_label} data loads but returns no items."
         return {
             "page_id": str(payload.get("page_id") or f"{role}_{index + 1}").strip() or f"{role}_{index + 1}",
             "route_path": route_path,

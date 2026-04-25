@@ -38,6 +38,7 @@ class ServiceContainer:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self.store = StateStore(self.settings.data_dir / "platform-state.json")
+        self.store.migrate_persisted_runtime_state()
         self.workspace_log_service = WorkspaceLogService(self.settings)
         self.workspace_service = WorkspaceService(self.settings, self.store, self.workspace_log_service)
         self.code_index_service = CodeIndexService(self.settings, self.store)

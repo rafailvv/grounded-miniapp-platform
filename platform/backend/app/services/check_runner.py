@@ -240,7 +240,7 @@ class CheckRunner:
             code = f"check.{result.name}"
             message = result.details or f"{result.name} failed."
             if result.name in {"schema_validators", "connectivity_validators"}:
-                parsed = CheckRunner._validation_issues_from_logs(result.logs, fallback_code=code, fallback_location=location)
+                parsed = CheckRunner._validation_issues_from_logs(result.logs, default_code=code, default_location=location)
                 if parsed:
                     issues.extend(parsed)
                     continue
@@ -337,8 +337,8 @@ class CheckRunner:
     def _validation_issues_from_logs(
         logs: list[str],
         *,
-        fallback_code: str,
-        fallback_location: str,
+        default_code: str,
+        default_location: str,
     ) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         for line in logs:
@@ -358,10 +358,10 @@ class CheckRunner:
             return []
         return [
             ValidationIssue(
-                code=fallback_code,
+                code=default_code,
                 message=next((line for line in logs if line.strip()), "Validation failed."),
                 severity="high",
-                location=fallback_location,
+                location=default_location,
                 blocking=True,
             )
         ]

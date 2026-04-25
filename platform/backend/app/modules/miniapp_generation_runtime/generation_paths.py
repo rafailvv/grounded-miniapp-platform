@@ -71,9 +71,9 @@ class MiniappGenerationPaths(MiniappGenerationRuntimeOwner):
         return candidate
 
     @classmethod
-    def _normalize_path_list(cls, value: Any, fallback: list[str] | None = None) -> list[str]:
+    def _normalize_path_list(cls, value: Any, default_paths: list[str] | None = None) -> list[str]:
         if not isinstance(value, list):
-            return list(fallback or [])
+            return list(default_paths or [])
         normalized: list[str] = []
         for item in value:
             if not isinstance(item, str):

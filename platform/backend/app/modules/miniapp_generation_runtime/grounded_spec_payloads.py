@@ -132,7 +132,7 @@ class GroundedSpecPayloadsRuntime:
             normalized.setdefault("status", "active")
             normalized.setdefault("impact", "medium")
             return normalized
-        fallback_key = next(
+        text_key = next(
             (
                 key
                 for key in normalized.keys()
@@ -140,9 +140,9 @@ class GroundedSpecPayloadsRuntime:
             ),
             None,
         )
-        if fallback_key is None:
+        if text_key is None:
             return normalized
-        text = str(normalized.get(fallback_key) or "").strip()
+        text = str(normalized.get(text_key) or "").strip()
         if not text:
             return normalized
         return {

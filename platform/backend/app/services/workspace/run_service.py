@@ -347,20 +347,20 @@ class RunService:
         direct_job_id = str(run.linked_job_id or "").strip()
         if direct_job_id:
             return direct_job_id
-        fallback_job: JobRecord | None = None
+        latest_linked_job: JobRecord | None = None
         for item in self.store.list("jobs"):
             if str(item.get("linked_run_id") or "").strip() != run.run_id:
                 continue
             candidate = JobRecord.model_validate(item)
-            if fallback_job is None or candidate.updated_at > fallback_job.updated_at:
-                fallback_job = candidate
-        if fallback_job is None:
+            if latest_linked_job is None or candidate.updated_at > latest_linked_job.updated_at:
+                latest_linked_job = candidate
+        if latest_linked_job is None:
             return ""
-        if run.linked_job_id != fallback_job.job_id:
-            run.linked_job_id = fallback_job.job_id
+        if run.linked_job_id != latest_linked_job.job_id:
+            run.linked_job_id = latest_linked_job.job_id
             run.updated_at = datetime.now(timezone.utc)
             self._save_run(run)
-        return fallback_job.job_id
+        return latest_linked_job.job_id
 
     def get_run_artifacts(self, run_id: str) -> dict[str, Any]:
         payload = self.store.get("reports", f"run_artifacts:{run_id}")
@@ -1563,12 +1563,12 @@ class RunService:
                 paths = list(dict.fromkeys([*paths, *inherited]))
         if paths:
             return list(dict.fromkeys(paths))
-        fallback_paths = [target.file_path for target in change_plan.targets if target.file_path]
+        candidate_paths = [target.file_path for target in change_plan.targets if target.file_path]
         if request.mode == "fix":
             inherited = self._inherited_touched_files_for_fix(workspace_id=workspace_id, run=run)
             if inherited:
-                fallback_paths = list(dict.fromkeys([*fallback_paths, *inherited]))
-        return fallback_paths
+                candidate_paths = list(dict.fromkeys([*candidate_paths, *inherited]))
+        return candidate_paths
 
     def _revision_commit_sha(self, workspace: WorkspaceRecord, revision_id: str | None) -> str | None:
         if not revision_id:

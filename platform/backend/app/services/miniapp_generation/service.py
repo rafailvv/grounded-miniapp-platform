@@ -264,7 +264,6 @@ class GenerationService(
             "_ensure_app_level_test_operations": "generation_contract_pass",
             "_run_pre_apply_contract_pass": "generation_contract_pass",
             "_resolve_grounded_spec_for_contract_pass": "generation_contract_pass",
-            "_synchronize_minimal_workflow_route_contracts": "generation_contract_routes",
             "_operation_or_workspace_content": "generation_contract_schema",
             "_collect_files_to_read": "generation_targeting",
             "_canonicalize_target_files": "generation_targeting",

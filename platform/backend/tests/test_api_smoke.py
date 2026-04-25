@@ -29,8 +29,11 @@ def _install_llm_stub(app) -> None:
         user_prompt: str,
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
+        model_override: str | None = None,
+        fallback_model_override: str | None = None,
+        **_: object,
     ) -> dict:
-        del role, schema, system_prompt, prompt_cache_key, stable_prefix
+        del role, schema, system_prompt, prompt_cache_key, stable_prefix, model_override, fallback_model_override
         payload = json.loads(user_prompt)
         if schema_name == "grounded_spec_outline_v1":
             return {
@@ -44,7 +47,7 @@ def _install_llm_stub(app) -> None:
                     ],
                     "entities": ["Request", "Profile", "Status"],
                     "flows": [{"name": "Primary flow", "goal": "Move through the main app journey.", "roles": ["client", "specialist", "manager"]}],
-                    "api_needs": ["Read records", "Update statuses"],
+                    "api_needs": ["Read items", "Update statuses"],
                     "risks": ["Provider instability"],
                 },
             }
@@ -143,14 +146,14 @@ def _grounded_spec_payload(prompt: str) -> dict:
                 "actor_id": "actor_client",
                 "name": "Client",
                 "role": "client",
-                "description": "Creates and tracks the primary record flow.",
+                "description": "Creates and tracks the primary shared item flow.",
                 "evidence": [{"doc_ref_id": "prompt-source", "evidence_type": "explicit"}],
             },
             {
                 "actor_id": "actor_specialist",
                 "name": "Specialist",
                 "role": "specialist",
-                "description": "Reviews and updates the same persisted record.",
+                "description": "Reviews and updates the same persisted item.",
                 "evidence": [{"doc_ref_id": "prompt-source", "evidence_type": "explicit"}],
             },
             {
@@ -178,7 +181,7 @@ def _grounded_spec_payload(prompt: str) -> dict:
                 "steps": [{"step_id": "step_1", "order": 1, "actor_id": "actor_client", "action": "Open the app"}],
                 "acceptance_criteria": [
                     "The generated app exposes real routed pages.",
-                    "The same record persists across client, specialist, and manager views.",
+                    "The same shared item persists across client, specialist, and manager views.",
                 ],
                 "evidence": [{"doc_ref_id": "prompt-source", "evidence_type": "explicit"}],
             }
@@ -194,25 +197,25 @@ def _grounded_spec_payload(prompt: str) -> dict:
         ],
         "api_requirements": [
             {
-                "api_req_id": "api_records_create",
-                "name": "Create record",
+                "api_req_id": "api_items_create",
+                "name": "Create item",
                 "method": "POST",
                 "path": "/api/orders",
-                "purpose": "Persist the primary record from the client flow.",
+                "purpose": "Persist the primary item from the client flow.",
             },
             {
-                "api_req_id": "api_records_list",
-                "name": "List records",
+                "api_req_id": "api_items_list",
+                "name": "List items",
                 "method": "GET",
                 "path": "/api/orders",
-                "purpose": "Read the persisted records across role dashboards.",
+                "purpose": "Read the persisted items across role dashboards.",
             },
             {
-                "api_req_id": "api_records_update",
-                "name": "Update record",
+                "api_req_id": "api_items_update",
+                "name": "Update item",
                 "method": "PUT",
                 "path": "/api/orders/{item_id}",
-                "purpose": "Update the persisted record from specialist and manager actions.",
+                "purpose": "Update the persisted item from specialist and manager actions.",
             },
         ],
         "persistence_requirements": [
@@ -267,16 +270,16 @@ def _role_contract_payload(role_scope: list[str]) -> dict:
         "client": {
             "responsibility": "Own the end-user journey and complete the primary shared flow.",
             "entry_goal": "Start from a real landing screen and continue into the main user flow.",
-            "primary_jobs": ["Review records", "Open details", "Submit data", "Track status"],
+            "primary_jobs": ["Review items", "Open details", "Submit data", "Track status"],
             "key_entities": ["Request", "Profile", "Status"],
             "ui_style_notes": ["Use clear entry language", "Make primary actions obvious"],
             "success_states": ["Action submitted", "Status visible"],
             "must_differ_from": ["specialist", "manager"],
         },
         "specialist": {
-            "responsibility": "Handle incoming shared records, progress them, and resolve blockers.",
-            "entry_goal": "Surface the active queue and the next record to process.",
-            "primary_jobs": ["Review queue", "Open record", "Change status", "Resolve blockers"],
+            "responsibility": "Handle incoming shared items, progress them, and resolve blockers.",
+            "entry_goal": "Surface the active queue and the next item to process.",
+            "primary_jobs": ["Review queue", "Open item", "Change status", "Resolve blockers"],
             "key_entities": ["Queue", "Task", "Issue"],
             "ui_style_notes": ["Keep the desk dense but readable", "Expose action context quickly"],
             "success_states": ["Record updated", "Queue pressure reduced"],
@@ -302,7 +305,7 @@ def _role_contract_payload(role_scope: list[str]) -> dict:
 
 
 def _page_graph_payload(*, prompt: str, role_scope: list[str], scope_mode: str) -> dict:
-    feature_slug = "orders" if "book" in prompt.lower() or "order" in prompt.lower() or "consult" in prompt.lower() else "records"
+    feature_slug = "orders" if "book" in prompt.lower() or "order" in prompt.lower() or "consult" in prompt.lower() else "items"
     route_templates = {
         "client": [
             _page("client_home", "/client", "Home", "client_index", "miniapp/app/static/client/index.html", "Client home", "Role-distinct landing page for the client journey."),
@@ -628,8 +631,8 @@ def key_error_handler(_, exc: KeyError) -> JSONResponse:
 def _stub_db_source(feature_stems: list[str]) -> str:
     del feature_stems
     workflow_model = """
-class WorkflowRecord(Base):
-    __tablename__ = 'workflow_records'
+class ResourceEntry(Base):
+    __tablename__ = 'resource_entries'
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     route_key: Mapped[str] = mapped_column(String(64), index=True)
     title: Mapped[str] = mapped_column(String(255), default='')
@@ -672,7 +675,7 @@ def get_db():
 def _stub_schemas_source(feature_stems: list[str]) -> str:
     del feature_stems
     workflow_schema = """
-class WorkflowRecordPayload(BaseModel):
+class ResourceEntryPayload(BaseModel):
     id: str | None = None
     title: str = ''
     status: str = 'new'
@@ -704,35 +707,35 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 
-from app.db import SessionLocal, WorkflowRecord
-from app.schemas import WorkflowRecordPayload
+from app.db import SessionLocal, ResourceEntry
+from app.schemas import ResourceEntryPayload
 
 router = APIRouter(prefix='/api/{route_key}', tags=['{route_key}'])
 
 
-def _to_schema(record: WorkflowRecord) -> WorkflowRecordPayload:
-    return WorkflowRecordPayload(
-        id=record.id,
-        title=record.title,
-        status=record.status,
-        comment=record.comment,
-        updated_at=record.updated_at,
+def _to_schema(item: ResourceEntry) -> ResourceEntryPayload:
+    return ResourceEntryPayload(
+        id=item.id,
+        title=item.title,
+        status=item.status,
+        comment=item.comment,
+        updated_at=item.updated_at,
     )
 
 
-@router.get('', response_model=list[WorkflowRecordPayload])
-def list_records() -> list[WorkflowRecordPayload]:
+@router.get('', response_model=list[ResourceEntryPayload])
+def list_items() -> list[ResourceEntryPayload]:
     with SessionLocal() as session:
-        records = session.execute(
-            select(WorkflowRecord).where(WorkflowRecord.route_key == '{route_key}').order_by(WorkflowRecord.updated_at.asc())
+        items = session.execute(
+            select(ResourceEntry).where(ResourceEntry.route_key == '{route_key}').order_by(ResourceEntry.updated_at.asc())
         ).scalars().all()
-        return [_to_schema(record) for record in records]
+        return [_to_schema(item) for item in items]
 
 
-@router.post('', response_model=WorkflowRecordPayload)
-def create_record(payload: WorkflowRecordPayload) -> WorkflowRecordPayload:
+@router.post('', response_model=ResourceEntryPayload)
+def create_item(payload: ResourceEntryPayload) -> ResourceEntryPayload:
     with SessionLocal() as session:
-        record = WorkflowRecord(
+        item = ResourceEntry(
             id=payload.id or uuid4().hex,
             route_key='{route_key}',
             title=payload.title,
@@ -740,43 +743,43 @@ def create_record(payload: WorkflowRecordPayload) -> WorkflowRecordPayload:
             comment=payload.comment or '',
             updated_at=datetime.now(timezone.utc),
         )
-        session.add(record)
+        session.add(item)
         session.commit()
-        session.refresh(record)
-        return _to_schema(record)
+        session.refresh(item)
+        return _to_schema(item)
 
 
-def _update_record(item_id: str, payload: WorkflowRecordPayload) -> WorkflowRecordPayload:
+def _update_item(item_id: str, payload: ResourceEntryPayload) -> ResourceEntryPayload:
     with SessionLocal() as session:
-        record = None
+        item = None
         if item_id.startswith('{{') and item_id.endswith('}}'):
-            record = session.execute(
-                select(WorkflowRecord).where(WorkflowRecord.route_key == '{route_key}').order_by(WorkflowRecord.updated_at.asc())
+            item = session.execute(
+                select(ResourceEntry).where(ResourceEntry.route_key == '{route_key}').order_by(ResourceEntry.updated_at.asc())
             ).scalars().first()
-        if record is None:
-            record = session.get(WorkflowRecord, item_id)
-        if record is None or record.route_key != '{route_key}':
-            raise HTTPException(status_code=404, detail='record_not_found')
+        if item is None:
+            item = session.get(ResourceEntry, item_id)
+        if item is None or item.route_key != '{route_key}':
+            raise HTTPException(status_code=404, detail='item_not_found')
         if payload.title:
-            record.title = payload.title
+            item.title = payload.title
         if payload.status:
-            record.status = payload.status
+            item.status = payload.status
         if payload.comment:
-            record.comment = payload.comment
-        record.updated_at = datetime.now(timezone.utc)
+            item.comment = payload.comment
+        item.updated_at = datetime.now(timezone.utc)
         session.commit()
-        session.refresh(record)
-        return _to_schema(record)
+        session.refresh(item)
+        return _to_schema(item)
 
 
-@router.patch('/{{item_id}}', response_model=WorkflowRecordPayload)
-def patch_record(item_id: str, payload: WorkflowRecordPayload) -> WorkflowRecordPayload:
-    return _update_record(item_id, payload)
+@router.patch('/{{item_id}}', response_model=ResourceEntryPayload)
+def patch_item(item_id: str, payload: ResourceEntryPayload) -> ResourceEntryPayload:
+    return _update_item(item_id, payload)
 
 
-@router.put('/{{item_id}}', response_model=WorkflowRecordPayload)
-def put_record(item_id: str, payload: WorkflowRecordPayload) -> WorkflowRecordPayload:
-    return _update_record(item_id, payload)
+@router.put('/{{item_id}}', response_model=ResourceEntryPayload)
+def put_item(item_id: str, payload: ResourceEntryPayload) -> ResourceEntryPayload:
+    return _update_item(item_id, payload)
 """
 
 

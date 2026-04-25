@@ -44,16 +44,9 @@ class MiniappGenerationEntityContract(MiniappGenerationRuntimeOwner):
     _GENERIC_ENTITY_NAMES = {
         "entity",
         "item",
-        "workflowrecord",
-        "workflow_record",
-        "workflow record",
-        "workflowrequest",
-        "workflow_request",
-        "workflow request",
         "record",
-        "item",
     }
-    _GENERIC_API_STEMS = {"data", "entities", "entries", "items", "records", "submissions", "workflowrequests", "workflowrecords"}
+    _GENERIC_API_STEMS = {"data", "entities", "entries", "items", "submissions"}
     _LOW_SIGNAL_ENTITY_SLUGS = {
         "app",
         "business",

@@ -31,7 +31,7 @@ from app.modules.miniapp_generation_runtime.grounded_spec_prompts import Grounde
 from app.modules.miniapp_generation_runtime.generation_repair import MiniappGenerationRepair
 from app.modules.miniapp_generation_runtime.generation_shell_contract import MiniappGenerationShellContract
 from app.modules.miniapp_generation_runtime.generation_targeting import MiniappGenerationTargeting
-from app.modules.miniapp_generation_runtime.generation_scaffold import (
+from app.modules.miniapp_generation_runtime.generation_surface_helpers import (
     build_route_manifest,
     select_creative_direction,
 )

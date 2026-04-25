@@ -52,7 +52,7 @@ class BuildValidator:
         issues.extend(self._validate_route_module_import_safety(workspace_path))
         issues.extend(self._validate_persistent_storage_contract(workspace_path))
         issues.extend(self._validate_runtime_provider_contract(workspace_path))
-        issues.extend(self._validate_mock_and_fallback_contract(workspace_path))
+        issues.extend(self._validate_mock_and_placeholder_contract(workspace_path))
         issues.extend(self._validate_frontend_backend_surface_contract(workspace_path))
         return issues
 
@@ -960,7 +960,7 @@ class BuildValidator:
             )
         return issues
 
-    def _validate_mock_and_fallback_contract(self, workspace_path: Path) -> list[ValidationIssue]:
+    def _validate_mock_and_placeholder_contract(self, workspace_path: Path) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         mock_markers = (
             "DEMO_REQUESTS",
@@ -1116,7 +1116,7 @@ class BuildValidator:
                         issues.append(
                             ValidationIssue(
                                 code="build.hardcoded_live_list",
-                                message=f"{Path(file_path_raw).name} renders a live workflow list from hardcoded in-memory data instead of reading persisted records through the API.",
+                                message=f"{Path(file_path_raw).name} renders a live workflow list from hardcoded in-memory data instead of reading persisted business data through the API.",
                                 severity="high",
                                 location=script_path_raw,
                             )
@@ -1134,7 +1134,7 @@ class BuildValidator:
                         issues.append(
                             ValidationIssue(
                                 code="build.seeded_live_collection",
-                                message=f"{Path(script_path_raw).name} still contains seeded business records for a live workflow surface. Keep dropdown/filter options only and load real records from the API.",
+                                message=f"{Path(script_path_raw).name} still contains seeded business items for a live workflow surface. Keep dropdown/filter options only and load real data from the API.",
                                 severity="high",
                                 location=script_path_raw,
                             )
@@ -1448,7 +1448,7 @@ class BuildValidator:
         nginx_conf = workspace_path / "docker" / "nginx.conf"
         nginx_content = nginx_conf.read_text(encoding="utf-8") if nginx_conf.exists() else ""
         frontend_only_proxy = "proxy_pass http://frontend" in nginx_content and "location /api" not in nginx_content
-        legacy_dirs = [
+        deprecated_structure_dirs = [
             frontend_root,
             workspace_path / "miniapp" / "app" / "api",
             workspace_path / "miniapp" / "app" / "application",
@@ -1456,16 +1456,14 @@ class BuildValidator:
             workspace_path / "miniapp" / "app" / "infrastructure",
         ]
 
-        for legacy_dir in legacy_dirs:
-            if legacy_dir == frontend_root and (frontend_root / ".grounded-compat-scaffold").exists():
-                continue
-            if legacy_dir.exists() and any(item.is_file() for item in legacy_dir.rglob("*")):
+        for deprecated_dir in deprecated_structure_dirs:
+            if deprecated_dir.exists() and any(item.is_file() for item in deprecated_dir.rglob("*")):
                 issues.append(
                     ValidationIssue(
-                        code="build.legacy_architecture_root",
-                        message=f"Legacy architecture root is still present: {legacy_dir.relative_to(workspace_path)}",
+                        code="build.deprecated_architecture_root",
+                        message=f"Deprecated architecture root is still present: {deprecated_dir.relative_to(workspace_path)}",
                         severity="high",
-                        location=str(legacy_dir.relative_to(workspace_path)),
+                        location=str(deprecated_dir.relative_to(workspace_path)),
                     )
                 )
 
@@ -1491,8 +1489,6 @@ class BuildValidator:
             if file_path.suffix not in {".js", ".jsx", ".ts", ".tsx", ".html"}:
                 continue
             relative = str(file_path.relative_to(workspace_path))
-            if relative.startswith("frontend/") and (frontend_root / ".grounded-compat-scaffold").exists():
-                continue
             content = file_path.read_text(encoding="utf-8")
             if re.search(r"""from\s+["']next/""", content):
                 issues.append(

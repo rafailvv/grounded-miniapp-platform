@@ -169,8 +169,6 @@ class GenerationProgressReportingRuntime(MiniappGenerationRuntimeOwner):
             "retrieval_completed": ("retrieval complete", 6),
             "building_surface": ("building generation surface", 7),
             "surface_ready": ("generation surface ready", 12),
-            "building_scaffold": ("building generation surface", 7),
-            "scaffold_ready": ("generation surface ready", 12),
             "spec_started": ("building grounded spec", 7),
             "spec_ready": ("grounded spec ready", 9),
             "draft_prepared": ("preparing draft workspace", 10),

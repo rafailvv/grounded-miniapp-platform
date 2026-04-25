@@ -347,7 +347,7 @@ def _write_workspace_file(workspace_root: Path, relative_path: str, content: str
     destination.write_text(content, encoding="utf-8")
 
 
-def _create_workspace_scaffold(workspace_root: Path) -> None:
+def _create_workspace_surface_fixture(workspace_root: Path) -> None:
     _write_workspace_file(workspace_root, "miniapp/app/main.py", "app = object()\n")
     _write_workspace_file(workspace_root, "miniapp/requirements.txt", "fastapi\n")
     _write_workspace_file(workspace_root, "miniapp/app/static/client/index.html", "<link rel=\"stylesheet\" href=\"/static/client/styles.css\" /><script src=\"/static/client/app.js\"></script><main>client</main>\n")
@@ -641,7 +641,7 @@ def test_app_ir_validator_blocks_trusted_user_input() -> None:
 
 def test_build_validator_accepts_distinct_multi_page_role_graph(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     graph = _multi_page_graph()
     for role_payload in graph["roles"].values():
         pages = role_payload.get("pages") or []
@@ -677,7 +677,7 @@ def test_build_validator_accepts_distinct_multi_page_role_graph(tmp_path: Path) 
 
 def test_build_validator_flags_placeholder_role_pages_without_identical_page_rail(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     graph = _multi_page_graph()
     for role_payload in graph["roles"].values():
         pages = role_payload.get("pages") or []
@@ -702,7 +702,7 @@ def test_build_validator_flags_placeholder_role_pages_without_identical_page_rai
 
 def test_build_validator_flags_loading_first_role_root_surface(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     graph = _multi_page_graph()
     for role_payload in graph["roles"].values():
         pages = role_payload.get("pages") or []
@@ -728,7 +728,7 @@ def test_build_validator_flags_loading_first_role_root_surface(tmp_path: Path) -
 
 def test_build_validator_accepts_content_first_root_surface_without_pseudo_data(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     graph = _multi_page_graph()
     for role_payload in graph["roles"].values():
         pages = role_payload.get("pages") or []
@@ -754,7 +754,7 @@ def test_build_validator_accepts_content_first_root_surface_without_pseudo_data(
 
 def test_build_validator_flags_route_self_import(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_workspace_file(
         workspace_root,
         "miniapp/app/routes/time_slots.py",
@@ -768,7 +768,7 @@ def test_build_validator_flags_route_self_import(tmp_path: Path) -> None:
 
 def test_build_validator_flags_in_memory_route_store_for_workflow_app(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_workspace_file(
         workspace_root,
         "artifacts/grounded_spec.json",
@@ -810,7 +810,7 @@ def test_build_validator_flags_in_memory_route_store_for_workflow_app(tmp_path: 
 
 def test_build_validator_flags_inline_route_schema_model_for_workflow_app(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_workspace_file(
         workspace_root,
         "artifacts/grounded_spec.json",
@@ -852,7 +852,7 @@ def test_build_validator_flags_inline_route_schema_model_for_workflow_app(tmp_pa
 
 def test_build_validator_flags_profile_contract_db_drift(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_workspace_file(
         workspace_root,
         "artifacts/grounded_spec.json",
@@ -898,7 +898,7 @@ def test_build_validator_flags_profile_contract_db_drift(tmp_path: Path) -> None
 
 def test_build_validator_flags_unexpected_auth_reference(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_workspace_file(
         workspace_root,
         "miniapp/app/static/client/app.js",
@@ -912,7 +912,7 @@ def test_build_validator_flags_unexpected_auth_reference(tmp_path: Path) -> None
 
 def test_build_validator_flags_duplicate_runtime_route_owners(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_workspace_file(
         workspace_root,
         "miniapp/app/routes/runtime.py",
@@ -931,7 +931,7 @@ def test_build_validator_flags_duplicate_runtime_route_owners(tmp_path: Path) ->
 
 def test_build_validator_flags_runtime_action_writes_and_seeded_artifacts(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_workspace_file(
         workspace_root,
         "miniapp/app/static/client/app.js",
@@ -951,7 +951,7 @@ def test_build_validator_flags_runtime_action_writes_and_seeded_artifacts(tmp_pa
 
 def test_build_validator_flags_placeholder_persistence_handlers(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_workspace_file(
         workspace_root,
         "miniapp/app/routes/requests.py",
@@ -977,7 +977,7 @@ def test_build_validator_flags_placeholder_persistence_handlers(tmp_path: Path) 
 
 def test_build_validator_flags_fake_persistence_form_without_api_write(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     graph = _multi_page_graph()
     _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
     _write_workspace_file(workspace_root, "miniapp/app/generated/route_manifest.json", json.dumps(graph))
@@ -1003,7 +1003,7 @@ def test_build_validator_flags_fake_persistence_form_without_api_write(tmp_path:
 
 def test_build_validator_flags_hardcoded_live_list_without_api_read(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     graph = _multi_page_graph()
     _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(graph))
     _write_workspace_file(workspace_root, "miniapp/app/generated/route_manifest.json", json.dumps(graph))
@@ -1029,7 +1029,7 @@ def test_build_validator_flags_hardcoded_live_list_without_api_read(tmp_path: Pa
 
 def test_build_validator_accepts_profile_persistence_via_template_literal_api_contract(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     graph = _multi_page_graph()
     client_pages = graph["roles"]["client"]["pages"]
     client_pages[0]["route_path"] = "/profile"
@@ -1061,7 +1061,7 @@ def test_build_validator_accepts_profile_persistence_via_template_literal_api_co
 
 def test_build_validator_flags_missing_shell_style_and_dom_contract_drift(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     graph = _multi_page_graph()
     for role_payload in graph["roles"].values():
         pages = role_payload.get("pages") or []
@@ -1116,7 +1116,7 @@ def test_build_validator_flags_missing_shell_style_and_dom_contract_drift(tmp_pa
 
 def test_connectivity_validator_flags_missing_backend_route_for_dynamic_page(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_connectivity_artifacts(workspace_root)
     _write_workspace_file(
         workspace_root,
@@ -1136,7 +1136,7 @@ def test_connectivity_validator_flags_missing_backend_route_for_dynamic_page(tmp
 
 def test_connectivity_validator_reads_page_specific_script_dependencies(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_connectivity_artifacts(workspace_root)
     _write_workspace_file(
         workspace_root,
@@ -1166,7 +1166,7 @@ def test_connectivity_validator_reads_page_specific_script_dependencies(tmp_path
 
 def test_connectivity_validator_flags_missing_static_asset_reference(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_workspace_file(workspace_root, "artifacts/generated_app_graph.json", json.dumps(_multi_page_graph()))
     _write_workspace_file(
         workspace_root,
@@ -1185,7 +1185,7 @@ def test_connectivity_validator_flags_missing_static_asset_reference(tmp_path: P
 
 def test_connectivity_validator_flags_unwired_dynamic_page(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_connectivity_artifacts(workspace_root)
     _write_workspace_file(workspace_root, "miniapp/app/routes/orders.py", "from fastapi import APIRouter\nrouter = APIRouter()\n")
     _write_workspace_file(
@@ -1208,7 +1208,7 @@ def test_connectivity_validator_flags_unwired_dynamic_page(tmp_path: Path) -> No
 
 def test_connectivity_validator_flags_missing_loading_and_error_states(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_connectivity_artifacts(workspace_root)
     _write_workspace_file(workspace_root, "miniapp/app/routes/orders.py", "from fastapi import APIRouter\nrouter = APIRouter()\n")
     _write_workspace_file(
@@ -1235,7 +1235,7 @@ def test_connectivity_validator_flags_missing_loading_and_error_states(tmp_path:
 
 def test_connectivity_validator_accepts_semantic_loading_and_error_state_markers(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_connectivity_artifacts(workspace_root)
     _write_workspace_file(workspace_root, "miniapp/app/routes/orders.py", "from fastapi import APIRouter\nrouter = APIRouter()\n")
     _write_workspace_file(
@@ -1274,7 +1274,7 @@ def test_connectivity_validator_accepts_semantic_loading_and_error_state_markers
 
 def test_connectivity_validator_accepts_form_first_profile_persistence(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_workspace_file(workspace_root, "miniapp/app/routes/profiles.py", "from fastapi import APIRouter\nrouter = APIRouter()\n")
     _write_workspace_file(
         workspace_root,
@@ -1350,7 +1350,7 @@ def test_connectivity_validator_accepts_form_first_profile_persistence(tmp_path:
 
 def test_connectivity_validator_accepts_api_reference_with_matching_route(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_connectivity_artifacts(workspace_root, api_path="/api/categories")
     _write_workspace_file(workspace_root, "miniapp/app/routes/categories.py", "from fastapi import APIRouter\nrouter = APIRouter()\n")
     _write_workspace_file(
@@ -1381,7 +1381,7 @@ def test_connectivity_validator_accepts_api_reference_with_matching_route(tmp_pa
 
 def test_connectivity_validator_does_not_infer_route_names_from_plain_english_dependencies(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     graph = {
         "flow_mode": "multi_page",
         "roles": {
@@ -1440,7 +1440,7 @@ def test_connectivity_validator_does_not_infer_route_names_from_plain_english_de
 
 def test_build_validator_flags_invalid_route_import_root(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
-    _create_workspace_scaffold(workspace_root)
+    _create_workspace_surface_fixture(workspace_root)
     _write_workspace_file(
         workspace_root,
         "miniapp/app/db.py",

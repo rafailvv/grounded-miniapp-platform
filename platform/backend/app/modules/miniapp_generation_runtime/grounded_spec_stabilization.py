@@ -187,7 +187,7 @@ class GroundedSpecStabilizationRuntime(GroundedSpecHygieneRuntime):
                     goal=f"Allow a manager to monitor the {flow_label} pipeline and intervene when necessary.",
                     steps=[
                         FlowStep(step_id="step_manager_open_dashboard", order=1, actor_id=actor_by_role["manager"].actor_id, action="Open the dashboard with aggregate metrics."),
-                        FlowStep(step_id="step_manager_review_records", order=2, actor_id=actor_by_role["manager"].actor_id, action="Review shared items by status, owner, and completion stage."),
+                        FlowStep(step_id="step_manager_review_items", order=2, actor_id=actor_by_role["manager"].actor_id, action="Review shared items by status, owner, and completion stage."),
                         FlowStep(step_id="step_manager_rebalance", order=3, actor_id=actor_by_role["manager"].actor_id, action="Trigger balancing or refresh actions when workload distribution requires it."),
                     ],
                     acceptance_criteria=["The manager sees pipeline metrics.", "The manager can inspect and refresh operational items."],

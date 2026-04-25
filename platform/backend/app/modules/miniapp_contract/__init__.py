@@ -1,4 +1,3 @@
-from app.modules.miniapp_contract.runtime_contract_sync import MiniappRuntimeContractSync
+from app.modules.miniapp_contract.runtime_contract_normalization import MiniappRuntimeContractNormalization
 
-__all__ = ["MiniappRuntimeContractSync"]
-
+__all__ = ["MiniappRuntimeContractNormalization"]

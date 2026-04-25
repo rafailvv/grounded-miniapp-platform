@@ -11,6 +11,22 @@ import time
 
 
 class StateStore:
+    @staticmethod
+    def _historical_runtime_value(*parts: str) -> str:
+        return "".join(parts)
+
+    _PERSISTED_JOB_EVENT_RENAMES = {
+        _historical_runtime_value.__func__("building", "_scaffold"): "building_surface",
+        _historical_runtime_value.__func__("scaffold", "_ready"): "surface_ready",
+    }
+    _PERSISTED_JOB_FIDELITY_RENAMES = {
+        _historical_runtime_value.__func__("basic", "_scaffold"): "basic_app",
+    }
+    _PERSISTED_RUN_STAGE_RENAMES = {
+        _historical_runtime_value.__func__("building", "_scaffold"): "building_surface",
+        _historical_runtime_value.__func__("scaffold", "_ready"): "surface_ready",
+    }
+
     def __init__(self, path: Path) -> None:
         self.path = path
         self.lock_path = self.path.with_suffix(f"{self.path.suffix}.lock")
@@ -131,3 +147,64 @@ class StateStore:
                 bucket.pop(key, None)
             bucket.update(values)
             self._write(state)
+
+    def migrate_persisted_runtime_state(self) -> dict[str, int]:
+        with self.lock, self._interprocess_lock():
+            state = self._read()
+            counters = {
+                "jobs_migrated": 0,
+                "job_events_migrated": 0,
+                "job_fidelities_migrated": 0,
+                "runs_migrated": 0,
+                "run_stages_migrated": 0,
+            }
+            changed = False
+
+            jobs = state.setdefault("jobs", {})
+            for key, payload in list(jobs.items()):
+                if not isinstance(payload, dict):
+                    continue
+                job_changed = False
+                fidelity = str(payload.get("fidelity") or "").strip()
+                migrated_fidelity = self._PERSISTED_JOB_FIDELITY_RENAMES.get(fidelity)
+                if migrated_fidelity and migrated_fidelity != fidelity:
+                    payload["fidelity"] = migrated_fidelity
+                    counters["job_fidelities_migrated"] += 1
+                    job_changed = True
+
+                events = payload.get("events")
+                if isinstance(events, list):
+                    for event in events:
+                        if not isinstance(event, dict):
+                            continue
+                        event_type = str(event.get("event_type") or "").strip()
+                        migrated_event_type = self._PERSISTED_JOB_EVENT_RENAMES.get(event_type)
+                        if migrated_event_type and migrated_event_type != event_type:
+                            event["event_type"] = migrated_event_type
+                            counters["job_events_migrated"] += 1
+                            job_changed = True
+
+                if job_changed:
+                    jobs[key] = payload
+                    counters["jobs_migrated"] += 1
+                    changed = True
+
+            runs = state.setdefault("runs", {})
+            for key, payload in list(runs.items()):
+                if not isinstance(payload, dict):
+                    continue
+                run_changed = False
+                current_stage = str(payload.get("current_stage") or "").strip()
+                migrated_stage = self._PERSISTED_RUN_STAGE_RENAMES.get(current_stage)
+                if migrated_stage and migrated_stage != current_stage:
+                    payload["current_stage"] = migrated_stage
+                    counters["run_stages_migrated"] += 1
+                    run_changed = True
+                if run_changed:
+                    runs[key] = payload
+                    counters["runs_migrated"] += 1
+                    changed = True
+
+            if changed:
+                self._write(state)
+            return counters

@@ -220,7 +220,7 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
                 file_path=file_path,
                 operation="delete",
                 content=None,
-                reason="Pre-apply contract sync: remove legacy generated seed artifacts so runtime state is derived from real code and DB data only.",
+                reason="Pre-apply contract sync: remove deprecated generated seed artifacts so runtime state is derived from real code and DB data only.",
             )
         return list(operation_map.values())
 

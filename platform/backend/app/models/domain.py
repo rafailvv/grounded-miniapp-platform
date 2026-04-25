@@ -88,8 +88,6 @@ class JobEvent(StrictModel):
         "retrieval_completed",
         "building_surface",
         "surface_ready",
-        "building_scaffold",
-        "scaffold_ready",
         "spec_started",
         "spec_ready",
         "spec_blocked",
@@ -137,7 +135,6 @@ class JobEvent(StrictModel):
     details: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
 
-
 class ValidationSnapshot(StrictModel):
     grounded_spec_valid: bool = False
     app_ir_valid: bool = False
@@ -166,7 +163,7 @@ class JobRecord(StrictModel):
     target_platform: TargetPlatform
     preview_profile: PreviewProfile
     current_revision_id: str | None = None
-    fidelity: Literal["fast_app", "quality_app", "balanced_app", "basic_app", "basic_scaffold", "blocked"] = "blocked"
+    fidelity: Literal["fast_app", "quality_app", "balanced_app", "basic_app", "blocked"] = "blocked"
     llm_enabled: bool = False
     llm_provider: str | None = None
     llm_model: str | None = None
@@ -204,7 +201,6 @@ class JobRecord(StrictModel):
     apply_result: dict[str, Any] | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
-
 
 class PreviewRecord(StrictModel):
     preview_id: str = Field(default_factory=lambda: new_id("preview"))
