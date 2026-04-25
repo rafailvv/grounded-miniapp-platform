@@ -125,42 +125,7 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
             if grounded_spec is not None
             else list(operations)
         )
-        ensured = self._normalize_sqlalchemy_db_defaults(operations=ensured)
         ensured = self._remove_seeded_generated_artifacts(operations=ensured)
-        if contract_sync_mode == "repair_invariants":
-            ensured = self._synchronize_profile_schema_contract(
-                workspace_id,
-                draft_run_id,
-                ensured,
-                contract_sync_mode=contract_sync_mode,
-            )
-        ensured = self.runtime_contract_sync.synchronize(
-            workspace_id=workspace_id,
-            draft_run_id=draft_run_id,
-            operations=ensured,
-            contract_sync_mode=contract_sync_mode,
-        )
-        ensured = self._synchronize_route_schema_contract(
-            workspace_id,
-            draft_run_id,
-            ensured,
-            contract_sync_mode="repair_invariants",
-        )
-        ensured = self._synchronize_frontend_api_contract(
-            workspace_id,
-            draft_run_id,
-            ensured,
-            entity_contract=entity_contract,
-            role_scope=role_scope,
-            contract_sync_mode="repair_invariants",
-        )
-        ensured = self._synchronize_basic_page_state_contract(
-            workspace_id,
-            draft_run_id,
-            page_graph=page_graph,
-            operations=ensured,
-            contract_sync_mode="repair_invariants",
-        )
         if grounded_spec is not None:
             ensured = self._ensure_runtime_artifact_operations(
                 grounded_spec=grounded_spec,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from app.services.generation_runtime_config import (
     ACTIVE_GENERATION_QUERY_CONFIG,
@@ -47,17 +47,17 @@ class GenerationQueryRuntime:
         )
         return config, turn_state
 
-    def run_new_query(self, *, workspace_id: str, job: "JobRecord", request: Any, kwargs: dict[str, Any]) -> "JobRecord":
-        config, turn_state = self._capture_config(
-            workspace_id=workspace_id,
-            run_id=str(kwargs.get("draft_run_id") or job.linked_run_id or job.job_id),
-            prompt=str(kwargs.get("effective_prompt") or request.prompt),
-            intent=str(request.intent),
-            model_profile=str(job.model_profile or ""),
-            generation_mode=kwargs.get("generation_mode"),
-            target_role_scope=list(kwargs.get("role_scope") or []),
-            preview_profile=kwargs.get("preview_profile"),
-        )
+    def _run_with_config(
+        self,
+        *,
+        workspace_id: str,
+        config: GenerationQueryConfig,
+        turn_state: GenerationTurnState,
+        lifecycle_event: str,
+        lifecycle_message: str,
+        lifecycle_payload: dict[str, Any],
+        executor: Callable[[], "JobRecord"],
+    ) -> "JobRecord":
         self.service._store_report(
             f"query_config:{workspace_id}",
             {
@@ -78,27 +78,29 @@ class GenerationQueryRuntime:
         )
         self.service._append_trace(
             workspace_id,
-            "query_runtime_started",
-            "Generation query runtime started with an immutable config snapshot and mutable turn state.",
-            {
-                "run_id": config.run_id,
-                "intent": config.intent,
-                "generation_mode": config.generation_mode,
-                "model_profile": config.model_profile,
-                "target_role_scope": config.target_role_scope,
-            },
+            lifecycle_event,
+            lifecycle_message,
+            lifecycle_payload,
         )
         config_token = ACTIVE_GENERATION_QUERY_CONFIG.set(config)
         turn_token = ACTIVE_GENERATION_TURN_STATE.set(turn_state)
         try:
-            result = self.service.generation_entry.generate_with_agent_loop(**kwargs)
+            result = executor()
             self._merge_turn_state_metrics(result, turn_state)
             return result
         finally:
             ACTIVE_GENERATION_TURN_STATE.reset(turn_token)
             ACTIVE_GENERATION_QUERY_CONFIG.reset(config_token)
 
-    def resume_query(self, *, workspace_id: str, job: "JobRecord", request: Any, kwargs: dict[str, Any]) -> "JobRecord":
+    def run_query(
+        self,
+        *,
+        workspace_id: str,
+        job: "JobRecord",
+        request: Any,
+        kwargs: dict[str, Any],
+        resume_bundle: dict[str, Any] | None = None,
+    ) -> "JobRecord":
         config, turn_state = self._capture_config(
             workspace_id=workspace_id,
             run_id=str(kwargs.get("draft_run_id") or job.linked_run_id or job.job_id),
@@ -106,29 +108,53 @@ class GenerationQueryRuntime:
             intent=str(request.intent),
             model_profile=str(job.model_profile or ""),
             generation_mode=kwargs.get("generation_mode"),
-            target_role_scope=list((kwargs.get("plan_result") or {}).get("page_graph", {}).get("role_scope") or []),
-            preview_profile=job.preview_profile,
+            target_role_scope=list((resume_bundle or {}).get("role_scope") or kwargs.get("role_scope") or []),
+            preview_profile=kwargs.get("preview_profile") or job.preview_profile,
         )
-        self.service._append_trace(
-            workspace_id,
-            "query_runtime_resumed",
-            "Generation query runtime resumed from an existing grounded plan.",
-            {
+        if resume_bundle is not None:
+            prepared = {
+                **kwargs,
+                "grounded_spec": resume_bundle["grounded_spec"],
+                "role_scope": list(resume_bundle.get("role_scope") or kwargs.get("role_scope") or []),
+                "role_contract": resume_bundle["role_contract"],
+                "plan_result": resume_bundle["plan_result"],
+            }
+            return self._run_with_config(
+                workspace_id=workspace_id,
+                config=config,
+                turn_state=turn_state,
+                lifecycle_event="query_runtime_resumed",
+                lifecycle_message="Generation query runtime resumed from an existing grounded plan.",
+                lifecycle_payload={
+                    "run_id": config.run_id,
+                    "intent": config.intent,
+                    "generation_mode": config.generation_mode,
+                    "model_profile": config.model_profile,
+                },
+                executor=lambda: self.service.generation_entry.continue_generation_from_plan(**prepared),
+            )
+
+        return self._run_with_config(
+            workspace_id=workspace_id,
+            config=config,
+            turn_state=turn_state,
+            lifecycle_event="query_runtime_started",
+            lifecycle_message="Generation query runtime started with an immutable config snapshot and mutable turn state.",
+            lifecycle_payload={
                 "run_id": config.run_id,
                 "intent": config.intent,
                 "generation_mode": config.generation_mode,
                 "model_profile": config.model_profile,
+                "target_role_scope": config.target_role_scope,
             },
+            executor=lambda: self._run_new_query_from_surface(kwargs),
         )
-        config_token = ACTIVE_GENERATION_QUERY_CONFIG.set(config)
-        turn_token = ACTIVE_GENERATION_TURN_STATE.set(turn_state)
-        try:
-            result = self.service.generation_entry.continue_generation_from_plan(**kwargs)
-            self._merge_turn_state_metrics(result, turn_state)
-            return result
-        finally:
-            ACTIVE_GENERATION_TURN_STATE.reset(turn_token)
-            ACTIVE_GENERATION_QUERY_CONFIG.reset(config_token)
+
+    def _run_new_query_from_surface(self, kwargs: dict[str, Any]) -> "JobRecord":
+        prepared = self.service.generation_entry.prepare_generation_surface(**kwargs)
+        if not isinstance(prepared, dict):
+            return prepared
+        return self.service.generation_entry.continue_generation_from_plan(**prepared)
 
     @staticmethod
     def _merge_turn_state_metrics(job: "JobRecord", turn_state: GenerationTurnState) -> None:

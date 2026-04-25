@@ -583,16 +583,7 @@ class MiniappGenerationRepair:
             has_tooling_failure=CheckRunner.has_tooling_failure,
             plan_turn=_plan_turn,
             apply_contract_sync=(
-                (
-                    lambda operations: self.service._synchronize_frontend_api_contract(
-                        workspace_id,
-                        draft_run_id,
-                        list(operations),
-                        entity_contract=entity_contract,
-                        role_scope=role_scope,
-                        contract_sync_mode="repair_invariants",
-                    )
-                )
+                (lambda operations: list(operations))
                 if visual_only_patch and not refresh_runtime_artifacts
                 else (
                     lambda operations: self.service._run_pre_apply_contract_pass(
@@ -607,16 +598,7 @@ class MiniappGenerationRepair:
                     )
                 )
             ),
-            post_apply_stabilize=(
-                (lambda _current_workspace_id, _run_id, _current_draft_source, _changed_files: [])
-                if visual_only_patch and not refresh_runtime_artifacts
-                else (
-                    lambda current_workspace_id, _run_id, current_draft_source, _changed_files: self.service.generation_normal_loop.stabilize_draft_contract_from_source(
-                        workspace_id=current_workspace_id,
-                        draft_source=current_draft_source,
-                    )
-                )
-            ),
+            post_apply_stabilize=(lambda _current_workspace_id, _run_id, _current_draft_source, _changed_files: []),
             append_event=self.service._append_event,
             append_trace=self.service._append_trace,
             store_report=self.service._store_report,

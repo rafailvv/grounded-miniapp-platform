@@ -19,7 +19,7 @@ class MiniappGenerationEntry:
     def __init__(self, service: "GenerationService") -> None:
         self.service = service
 
-    def generate_with_agent_loop(
+    def prepare_generation_surface(
         self,
         *,
         workspace,
@@ -38,7 +38,7 @@ class MiniappGenerationEntry:
         creative_direction: dict[str, Any],
         should_stop: Callable[[], bool] | None,
         prompt_turn_id: str,
-    ) -> JobRecord:
+    ) -> JobRecord | dict[str, Any]:
         fast_visual_job = MiniappVisualPatchFastLane(self.service).try_run(
             workspace_id=workspace_id,
             run_id=draft_run_id,
@@ -214,26 +214,68 @@ class MiniappGenerationEntry:
         if stopped is not None:
             return stopped
 
-        return self.continue_generation_from_plan(
+        return {
+            "workspace": workspace,
+            "workspace_id": workspace_id,
+            "job": job,
+            "request": request,
+            "draft_run_id": draft_run_id,
+            "draft_source": draft_source,
+            "effective_prompt": effective_prompt,
+            "grounded_spec": grounded_spec,
+            "entity_contract": entity_contract,
+            "role_scope": role_scope,
+            "role_contract": role_contract,
+            "plan_result": plan_result,
+            "execution_class": execution_class,
+            "generation_mode": generation_mode,
+            "creative_direction": creative_direction,
+            "retrieval_ms": retrieval_ms,
+            "started_at": started_at,
+            "should_stop": should_stop,
+        }
+
+    def generate_with_agent_loop(
+        self,
+        *,
+        workspace,
+        workspace_id: str,
+        job: JobRecord,
+        request: GenerateRequest,
+        draft_run_id: str,
+        effective_prompt: str,
+        target_platform,
+        preview_profile,
+        generation_mode,
+        role_scope: list[str],
+        doc_refs: list[Any],
+        retrieval_ms: int,
+        started_at: float,
+        creative_direction: dict[str, Any],
+        should_stop: Callable[[], bool] | None,
+        prompt_turn_id: str,
+    ) -> JobRecord:
+        prepared = self.prepare_generation_surface(
             workspace=workspace,
             workspace_id=workspace_id,
             job=job,
             request=request,
             draft_run_id=draft_run_id,
-            draft_source=draft_source,
             effective_prompt=effective_prompt,
-            grounded_spec=grounded_spec,
-            entity_contract=entity_contract,
-            role_scope=role_scope,
-            role_contract=role_contract,
-            plan_result=plan_result,
-            execution_class=execution_class,
+            target_platform=target_platform,
+            preview_profile=preview_profile,
             generation_mode=generation_mode,
-            creative_direction=creative_direction,
+            role_scope=role_scope,
+            doc_refs=doc_refs,
             retrieval_ms=retrieval_ms,
             started_at=started_at,
+            creative_direction=creative_direction,
             should_stop=should_stop,
+            prompt_turn_id=prompt_turn_id,
         )
+        if isinstance(prepared, JobRecord):
+            return prepared
+        return self.continue_generation_from_plan(**prepared)
 
     def _preserve_source_entity_contract_for_role_patch(
         self,

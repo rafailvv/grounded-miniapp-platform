@@ -570,17 +570,10 @@ class FixEntryRuntime:
                 generation_mode=effective_mode,
                 operations=list(operations),
                 contract_sync_mode="repair_invariants",
-            )
+                )
             if self.service.generation_service is not None
             else list(operations),
-            post_apply_stabilize=lambda current_workspace_id, _run_id, current_draft_source, _changed_files: (
-                self.service.generation_service.generation_normal_loop.stabilize_draft_contract_from_source(
-                    workspace_id=current_workspace_id,
-                    draft_source=current_draft_source,
-                )
-                if self.service.generation_service is not None
-                else []
-            ),
+            post_apply_stabilize=lambda _current_workspace_id, _run_id, _current_draft_source, _changed_files: [],
             append_event=self.service._append_event,
             append_trace=self.service._append_trace,
             store_report=self.service._store_report,

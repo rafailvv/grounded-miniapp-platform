@@ -33,6 +33,7 @@ from app.modules.miniapp_generation_runtime.generation_code_plan import MiniappG
 from app.modules.miniapp_generation_runtime.generation_codegen import MiniappGenerationCodegen
 from app.modules.miniapp_generation_runtime.generation_codegen_clusters import MiniappGenerationCodegenClusters
 from app.modules.miniapp_generation_runtime.generation_codegen_selection import MiniappGenerationCodegenSelection
+from app.modules.miniapp_generation_runtime.generation_query_runtime import GenerationQueryRuntime
 from app.modules.miniapp_generation_runtime.generation_repair import MiniappGenerationRepair
 from app.core.config import get_settings
 from app.services.code_index_service import CodeIndexService
@@ -424,6 +425,93 @@ def test_tool_orchestrator_batches_parallel_reads_before_serial_mutations() -> N
         ("serial", 1),
         ("serial", 1),
     ]
+
+
+def test_generation_query_runtime_uses_prepare_surface_for_new_queries() -> None:
+    result_job = JobRecord(
+        workspace_id="ws_query",
+        prompt="Create a simple store app.",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        generation_mode=GenerationMode.FAST,
+    )
+    captured: dict[str, object] = {"prepared": False, "continued": False}
+    request = SimpleNamespace(prompt="Create a simple store app.", intent="create")
+
+    def _prepare_generation_surface(**kwargs):
+        captured["prepared"] = True
+        return {
+            "workspace": kwargs["workspace"],
+            "workspace_id": kwargs["workspace_id"],
+            "job": kwargs["job"],
+            "request": kwargs["request"],
+            "draft_run_id": kwargs["draft_run_id"],
+            "draft_source": Path("/tmp/ws_query_draft"),
+            "effective_prompt": kwargs["effective_prompt"],
+            "grounded_spec": SimpleNamespace(),
+            "entity_contract": {"api_path": "/api/orders", "route_file": "miniapp/app/routes/orders.py"},
+            "role_scope": list(kwargs["role_scope"]),
+            "role_contract": {"roles": {}},
+            "plan_result": {"page_graph": {"roles": {}}, "target_files": [], "backend_targets": [], "generation_clusters": []},
+            "execution_class": "data_crud_app",
+            "generation_mode": kwargs["generation_mode"],
+            "creative_direction": kwargs["creative_direction"],
+            "retrieval_ms": kwargs["retrieval_ms"],
+            "started_at": kwargs["started_at"],
+            "should_stop": kwargs["should_stop"],
+        }
+
+    def _continue_generation_from_plan(**_kwargs):
+        captured["continued"] = True
+        return result_job
+
+    runtime = GenerationQueryRuntime(
+        SimpleNamespace(
+            _store_report=lambda *_args, **_kwargs: None,
+            _append_trace=lambda *_args, **_kwargs: None,
+            generation_entry=SimpleNamespace(
+                prepare_generation_surface=_prepare_generation_surface,
+                continue_generation_from_plan=_continue_generation_from_plan,
+            ),
+        )
+    )
+    job = JobRecord(
+        workspace_id="ws_query",
+        prompt="Create a simple store app.",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        generation_mode=GenerationMode.FAST,
+        model_profile="openai_code_fast",
+    )
+
+    output = runtime.run_query(
+        workspace_id="ws_query",
+        job=job,
+        request=request,
+        kwargs={
+            "workspace": SimpleNamespace(current_revision_id="rev_1"),
+            "workspace_id": "ws_query",
+            "job": job,
+            "request": request,
+            "draft_run_id": "run_query",
+            "effective_prompt": "Create a simple store app.",
+            "target_platform": TargetPlatform.TELEGRAM,
+            "preview_profile": PreviewProfile.TELEGRAM_MOCK,
+            "generation_mode": GenerationMode.FAST,
+            "role_scope": ["client", "specialist", "manager"],
+            "doc_refs": [],
+            "retrieval_ms": 0,
+            "started_at": 0.0,
+            "creative_direction": {},
+            "should_stop": None,
+            "prompt_turn_id": "turn_1",
+        },
+        resume_bundle=None,
+    )
+
+    assert output is result_job
+    assert captured["prepared"] is True
+    assert captured["continued"] is True
 
 
 def test_fast_profile_uses_quality_first_code_models() -> None:
@@ -2761,16 +2849,20 @@ def test_pre_apply_contract_pass_preserves_existing_roles_for_partial_scope(tmp_
                 return value
         return []
 
+    def _unexpected_sync(*args, **kwargs):
+        raise AssertionError("legacy contract sync should not run in the active pre-apply pass")
+
     monkeypatch.setattr(contract_pass, "_ensure_runtime_artifact_operations", lambda **kwargs: capture_runtime_artifacts(None, **kwargs))
     monkeypatch.setattr(contract_pass, "_ensure_app_level_test_operations", lambda **kwargs: kwargs["operations"])
-    monkeypatch.setattr(contract_pass, "_normalize_sqlalchemy_db_defaults", lambda **kwargs: kwargs["operations"], raising=False)
     monkeypatch.setattr(contract_pass, "_remove_seeded_generated_artifacts", lambda **kwargs: kwargs["operations"], raising=False)
-    monkeypatch.setattr(contract_pass, "_synchronize_minimal_workflow_route_contracts", _identity_operations, raising=False)
-    monkeypatch.setattr(contract_pass, "_synchronize_profile_schema_contract", _identity_operations, raising=False)
-    monkeypatch.setattr(service.runtime_contract_sync, "synchronize", _identity_operations)
-    monkeypatch.setattr(contract_pass, "_synchronize_route_schema_contract", _identity_operations, raising=False)
-    monkeypatch.setattr(contract_pass, "_synchronize_frontend_api_contract", _identity_operations, raising=False)
-    monkeypatch.setattr(contract_pass, "_synchronize_basic_page_state_contract", _identity_operations, raising=False)
+    monkeypatch.setattr(contract_pass, "_normalize_sqlalchemy_db_defaults", _unexpected_sync, raising=False)
+    monkeypatch.setattr(contract_pass, "_synchronize_minimal_workflow_route_contracts", _unexpected_sync, raising=False)
+    monkeypatch.setattr(contract_pass, "_synchronize_profile_schema_contract", _unexpected_sync, raising=False)
+    monkeypatch.setattr(contract_pass, "_synchronize_route_schema_contract", _unexpected_sync, raising=False)
+    monkeypatch.setattr(contract_pass, "_synchronize_frontend_api_contract", _unexpected_sync, raising=False)
+    monkeypatch.setattr(contract_pass, "_synchronize_basic_page_state_contract", _unexpected_sync, raising=False)
+
+    assert not hasattr(service, "runtime_contract_sync")
 
     result = contract_pass._run_pre_apply_contract_pass(
         workspace_id="ws_contract_pass_subset",
@@ -11645,191 +11737,36 @@ def test_diminishing_returns_service_stops_after_repeated_low_signal_iterations(
     assert report["items"]
 
 
-def test_pre_apply_contract_pass_rewrites_actor_dependency_and_api_fetch_and_injects_error_state(tmp_path: Path) -> None:
+def test_service_no_longer_exposes_legacy_contract_sync_entrypoints(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
 
-    operations = [
-        DraftFileOperation(
-            file_path="miniapp/app/routes/requests.py",
-            operation="replace",
-            content='from fastapi import Depends\n\ndef get_actor_context():\n    return None\n\ndef handler(actor=Depends(lambda: get_actor_context())):\n    return actor\n',
-            reason="test fixture",
-        ),
-        DraftFileOperation(
-            file_path="miniapp/app/static/client/index.html",
-            operation="replace",
-            content='<html><body><main class="page-shell"></main><script src="/static/client/app.js"></script></body></html>',
-            reason="test fixture",
-        ),
-        DraftFileOperation(
-            file_path="miniapp/app/static/client/app.js",
-            operation="replace",
-            content='const errorState = document.getElementById("error-state");\nwindow.setupPreviewBridge?.("client");\nfetch("/api/requests");\n',
-            reason="test fixture",
-        ),
-    ]
-
-    result = service._synchronize_backend_dependency_contract("ws_test", "run_test", operations)
-    result = service._synchronize_frontend_api_contract("ws_test", "run_test", result)
-    result = service._synchronize_basic_page_state_contract(
-        "ws_test",
-        "run_test",
-        page_graph={"roles": {"client": {"pages": [{"file_path": "miniapp/app/static/client/index.html", "error_state": "error", "loading_state": ""}]}}},
-        operations=result,
-    )
-    operation_map = {operation.file_path: operation for operation in result}
-    assert "Depends(get_actor_context)" in (operation_map["miniapp/app/routes/requests.py"].content or "")
-    assert 'window.miniappApiFetch("/api/requests")' in (operation_map["miniapp/app/static/client/app.js"].content or "")
-    assert 'id="error-state"' not in (operation_map["miniapp/app/static/client/index.html"].content or "")
+    assert not hasattr(service, "_synchronize_backend_dependency_contract")
+    assert not hasattr(service, "_synchronize_frontend_api_contract")
+    assert not hasattr(service, "_synchronize_basic_page_state_contract")
+    assert not hasattr(service, "runtime_contract_sync")
 
 
-def test_basic_page_contract_normalizes_shell_assets_and_role_local_links_and_depends_import(tmp_path: Path) -> None:
+def test_contract_runtime_classes_no_longer_expose_sync_helpers(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
 
-    operations = [
-        DraftFileOperation(
-            file_path="miniapp/app/routes/attachments.py",
-            operation="replace",
-            content=(
-                "from fastapi import APIRouter, File, UploadFile, Header, HTTPException\n\n"
-                "router = APIRouter()\n"
-                "def _get_caller():\n    return ('client', 'c_1')\n"
-                "@router.post('/api/attachments')\n"
-                "def upload(file: UploadFile = File(...), uploader: tuple[str, str] = Depends(_get_caller)):\n    return {'ok': True}\n"
-            ),
-            reason="test fixture",
-        ),
-        DraftFileOperation(
-            file_path="miniapp/app/static/client/index.html",
-            operation="replace",
-            content=(
-                "<html><head>"
-                '<link rel="stylesheet" href="/static/shell.css" />'
-                "</head><body><main class='page-shell'>"
-                '<a href="/profile">Profile</a>'
-                '<a href="/create">Create</a>'
-                "</main></body></html>"
-            ),
-            reason="test fixture",
-        ),
-        DraftFileOperation(
-            file_path="miniapp/app/static/client/app.js",
-            operation="replace",
-            content='console.log("client");\n',
-            reason="test fixture",
-        ),
-    ]
-
-    result = service._synchronize_backend_dependency_contract("ws_test", "run_test", operations)
-    result = service._synchronize_basic_page_state_contract(
-        "ws_test",
-        "run_test",
-        page_graph={
-            "roles": {
-                "client": {
-                    "pages": [
-                        {
-                            "file_path": "miniapp/app/static/client/index.html",
-                            "style_path": "miniapp/app/static/client/styles.css",
-                            "script_path": "miniapp/app/static/client/app.js",
-                            "route_path": "/",
-                            "loading_state": "",
-                            "error_state": "",
-                        },
-                        {
-                            "file_path": "miniapp/app/static/client/create/index.html",
-                            "style_path": "miniapp/app/static/client/create/styles.css",
-                            "script_path": "miniapp/app/static/client/create/app.js",
-                            "route_path": "/create",
-                            "loading_state": "",
-                            "error_state": "",
-                        },
-                        {
-                            "file_path": "miniapp/app/static/client/profile/index.html",
-                            "style_path": "miniapp/app/static/client/profile/styles.css",
-                            "script_path": "miniapp/app/static/client/profile/app.js",
-                            "route_path": "/profile",
-                            "loading_state": "",
-                            "error_state": "",
-                        },
-                    ]
-                }
-            }
-        },
-        operations=result,
-    )
-    operation_map = {operation.file_path: operation for operation in result}
-    attachments = operation_map["miniapp/app/routes/attachments.py"].content or ""
-    html = operation_map["miniapp/app/static/client/index.html"].content or ""
-
-    assert "from fastapi import APIRouter, File, UploadFile, Header, HTTPException, Depends" in attachments
-    assert '/static/shared/base.css' in html
-    assert '/static/preview_bridge.js' in html
-    assert '/static/client/styles.css' in html
-    assert '/static/client/app.js' in html
-    assert 'href="/client/profile"' in html
-    assert 'href="/client/create"' in html
-    assert 'class="page-shell"' in html or 'class=\'page-shell\'' in html
-    assert 'padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));' in html
+    assert not hasattr(service.generation_contract_schema, "_synchronize_backend_dependency_contract")
+    assert not hasattr(service.generation_contract_schema, "_synchronize_profile_schema_contract")
+    assert not hasattr(service.generation_contract_schema, "_synchronize_route_schema_contract")
+    assert not hasattr(service.generation_contract_frontend, "_synchronize_frontend_api_contract")
+    assert not hasattr(service.generation_contract_frontend, "_synchronize_frontend_navigation_contract")
+    assert not hasattr(service.generation_contract_frontend, "_synchronize_basic_page_state_contract")
 
 
-def test_basic_page_contract_upgrades_generated_main_to_shell_root_and_bridge(tmp_path: Path) -> None:
+def test_frontend_contract_keeps_only_canonicalization_utility(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     service: GenerationService = app.state.container.generation_service
 
-    operations = [
-        DraftFileOperation(
-            file_path="miniapp/app/static/manager/workload/index.html",
-            operation="replace",
-            content=(
-                "<!doctype html><html><head>"
-                '<link rel="stylesheet" href="/static/shared/base.css" />'
-                "</head><body><main class='page' id='app'></main>"
-                '<script src="/static/manager/workload/app.js" defer></script>'
-                "</body></html>"
-            ),
-            reason="test fixture",
-        ),
-        DraftFileOperation(
-            file_path="miniapp/app/static/manager/workload/app.js",
-            operation="replace",
-            content='console.log("workload");\n',
-            reason="test fixture",
-        ),
-    ]
-
-    result = service._synchronize_basic_page_state_contract(
-        "ws_test",
-        "run_test",
-        page_graph={
-            "roles": {
-                "manager": {
-                    "pages": [
-                        {
-                            "file_path": "miniapp/app/static/manager/workload/index.html",
-                            "style_path": "miniapp/app/static/manager/workload/styles.css",
-                            "script_path": "miniapp/app/static/manager/workload/app.js",
-                            "route_path": "/workload",
-                            "loading_state": "",
-                            "error_state": "",
-                        }
-                    ]
-                }
-            }
-        },
-        operations=operations,
-    )
-    operation_map = {operation.file_path: operation for operation in result}
-    html = operation_map["miniapp/app/static/manager/workload/index.html"].content or ""
-
-    assert '/static/preview_bridge.js' in html
-    assert "page-shell" in html
-    assert 'padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));' in html
+    assert service.generation_contract_frontend._canonicalize_local_role_links_in_text('href="/client/profile/"') == 'href="/client/profile"'
 
 
 def test_selected_pages_for_edit_infers_minimal_pages_from_target_files(tmp_path: Path) -> None:

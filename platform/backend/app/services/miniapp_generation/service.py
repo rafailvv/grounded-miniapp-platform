@@ -29,7 +29,6 @@ from app.services.patch_service import PatchService
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.service import WorkspaceService
-from app.modules.miniapp_contract.runtime_contract_sync import MiniappRuntimeContractSync
 from app.modules.miniapp_generation_runtime import (
     GenerationProgressReportingRuntime,
     GroundedSpecOrchestrationRuntime,
@@ -265,15 +264,7 @@ class GenerationService(
             "_ensure_app_level_test_operations": "generation_contract_pass",
             "_run_pre_apply_contract_pass": "generation_contract_pass",
             "_resolve_grounded_spec_for_contract_pass": "generation_contract_pass",
-            "_synchronize_profile_schema_contract": "generation_contract_schema",
-            "_synchronize_db_session_contract": "generation_contract_schema",
-            "_synchronize_runtime_route_contract": "generation_contract_schema",
-            "_synchronize_backend_dependency_contract": "generation_contract_schema",
             "_synchronize_minimal_workflow_route_contracts": "generation_contract_routes",
-            "_synchronize_route_schema_contract": "generation_contract_schema",
-            "_synchronize_frontend_api_contract": "generation_contract_frontend",
-            "_synchronize_frontend_navigation_contract": "generation_contract_frontend",
-            "_synchronize_basic_page_state_contract": "generation_contract_frontend",
             "_operation_or_workspace_content": "generation_contract_schema",
             "_collect_files_to_read": "generation_targeting",
             "_canonicalize_target_files": "generation_targeting",
@@ -364,7 +355,6 @@ class GenerationService(
         self.generation_contract_routes = MiniappGenerationContractRoutes(self)
         self.generation_contract_frontend = MiniappGenerationContractFrontend(self)
         self.generation_shell_contract = MiniappGenerationShellContract(self)
-        self.runtime_contract_sync = MiniappRuntimeContractSync(workspace_service=self.workspace_service, read_content=self._operation_or_workspace_content)
         self.grounded_spec_builder = MiniappGroundedSpecBuilder(self)
         self.grounded_spec_orchestration = GroundedSpecOrchestrationRuntime(self)
         self.generation_completion = MiniappGenerationCompletion()
@@ -481,7 +471,7 @@ class GenerationService(
                     if request.resume_from_run_id and draft_run_id != request.resume_from_run_id and self.workspace_service.draft_exists(workspace_id, request.resume_from_run_id):
                         self.workspace_service.clone_draft(workspace_id, request.resume_from_run_id, draft_run_id)
                     draft_source = self.workspace_service.ensure_draft(workspace_id, draft_run_id)
-                    return self.generation_query_runtime.resume_query(
+                    return self.generation_query_runtime.run_query(
                         workspace_id=workspace_id,
                         job=job,
                         request=request,
@@ -493,23 +483,21 @@ class GenerationService(
                             "draft_run_id": draft_run_id,
                             "draft_source": draft_source,
                             "effective_prompt": effective_prompt,
-                            "grounded_spec": resume_bundle["grounded_spec"],
                             "role_scope": list(resume_bundle.get("role_scope") or role_scope),
-                            "role_contract": resume_bundle["role_contract"],
-                            "plan_result": resume_bundle["plan_result"],
                             "generation_mode": generation_mode,
                             "creative_direction": self._select_creative_direction(effective_prompt),
                             "retrieval_ms": 0,
                             "started_at": started_at,
                             "should_stop": should_stop,
                         },
+                        resume_bundle=resume_bundle,
                     )
                 doc_refs = self.document_service.retrieve(workspace_id=workspace_id, prompt=effective_prompt, target_platform=target_platform.value)
                 retrieval_ms = int((time.perf_counter() - started_at) * 1000)
                 chat_turn = ChatTurnRecord(workspace_id=workspace_id, role="user", content=request.prompt, linked_job_id=job.job_id, linked_run_id=request.linked_run_id)
                 self.store.upsert("chat_turns", chat_turn.turn_id, chat_turn.model_dump(mode="json"))
                 creative_direction = self._select_creative_direction(effective_prompt)
-                return self.generation_query_runtime.run_new_query(
+                return self.generation_query_runtime.run_query(
                     workspace_id=workspace_id,
                     job=job,
                     request=request,
@@ -531,6 +519,7 @@ class GenerationService(
                         "should_stop": should_stop,
                         "prompt_turn_id": chat_turn.turn_id,
                     },
+                    resume_bundle=None,
                 )
         finally:
             ACTIVE_LLM_CACHE_CONTEXT.reset(cache_context_token)

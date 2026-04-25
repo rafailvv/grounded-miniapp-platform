@@ -764,53 +764,8 @@ def test_generation_repair_accepts_generation_mode_for_model_routing() -> None:
     assert "generation_mode" in signature.parameters
 
 
-def test_route_schema_contract_adds_actual_schema_prefix_candidate() -> None:
-    runtime = object.__new__(MiniappGenerationContractSchema)
-    runtime.workspace_service = _DummyWorkspaceService(
-        {
-            "miniapp/app/schemas.py": (
-                "from datetime import datetime\n"
-                "from pydantic import BaseModel\n\n"
-                "class CompanyVehicleMaintenanceCreate(BaseModel):\n"
-                "    start_date: datetime\n\n"
-                "class CompanyVehicleMaintenanceRead(CompanyVehicleMaintenanceCreate):\n"
-                "    id: str\n"
-            ),
-            "miniapp/app/routes/maintenances.py": (
-                'SCHEMA_PREFIX = "Maintenance"\n\n'
-                "def _candidate_schema_names() -> list[str]:\n"
-                "    return [SCHEMA_PREFIX]\n\n"
-                "def _schema_model(suffixes: tuple[str, ...]):\n"
-                "    return None\n\n"
-                "@router.get(\"/maintenances\")\n"
-                "def list_records(): pass\n\n"
-                "@router.post(\"/maintenances\")\n"
-                "def create_record(): pass\n\n"
-                "@router.get(\"/maintenances/{item_id}\")\n"
-                "def get_record(item_id: str): pass\n\n"
-                "@router.put(\"/maintenances/{item_id}\")\n"
-                "@router.patch(\"/maintenances/{item_id}\")\n"
-                "def update_record(item_id: str): pass\n"
-            ),
-        }
-    )
-
-    operations = runtime._synchronize_route_schema_contract(
-        "ws_test",
-        "run_test",
-        [
-            DraftFileOperation(
-                file_path="miniapp/app/routes/maintenances.py",
-                operation="replace",
-                content=runtime.workspace_service.existing["miniapp/app/routes/maintenances.py"],
-                reason="test",
-            )
-        ],
-    )
-
-    route_content = next(operation.content for operation in operations if operation.file_path == "miniapp/app/routes/maintenances.py")
-    assert "CompanyVehicleMaintenance" in route_content
-    assert "return seen" in route_content
+def test_route_schema_contract_sync_entrypoint_removed() -> None:
+    assert not hasattr(MiniappGenerationContractSchema, "_synchronize_route_schema_contract")
 
 
 def test_build_validator_does_not_treat_issue_heading_as_mutation() -> None:
@@ -857,39 +812,8 @@ def test_generated_python_tests_use_progress_status_when_schema_choices_are_unav
     assert 'return choices[0] if choices else "in_progress"' in source
 
 
-def test_stabilizer_preserves_valid_refresh_ui_changes(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    draft = tmp_path / "draft"
-    source_page = source / "miniapp/app/static/client"
-    draft_page = draft / "miniapp/app/static/client"
-    for path in (source_page, draft_page):
-        path.mkdir(parents=True)
-    (source / "miniapp/app").mkdir(parents=True, exist_ok=True)
-    (draft / "miniapp/app").mkdir(parents=True, exist_ok=True)
-    (source / "miniapp/app/schemas.py").write_text("class RecordRead:\n    pass\n", encoding="utf-8")
-    (draft / "miniapp/app/schemas.py").write_text("class RecordRead:\n    pass\n", encoding="utf-8")
-    (source_page / "index.html").write_text(
-        '<main><section id="records"></section></main><script src="/static/client/app.js"></script>',
-        encoding="utf-8",
-    )
-    (source_page / "app.js").write_text('document.getElementById("records");', encoding="utf-8")
-    (source_page / "styles.css").write_text(".page{}\n", encoding="utf-8")
-    (draft_page / "index.html").write_text(
-        '<main><button id="refresh-action">Refresh</button><section id="records"></section></main><script src="/static/client/app.js"></script>',
-        encoding="utf-8",
-    )
-    (draft_page / "app.js").write_text(
-        'document.getElementById("records"); document.getElementById("refresh-action");',
-        encoding="utf-8",
-    )
-    (draft_page / "styles.css").write_text(".page{}.refresh{}\n", encoding="utf-8")
-
-    runtime = MiniappGenerationNormalLoop(SimpleNamespace(workspace_service=_PathWorkspaceService(source)))
-    changed = runtime.stabilize_draft_contract_from_source(workspace_id="ws_test", draft_source=draft)
-
-    assert "miniapp/app/static/client/index.html" not in changed
-    assert "refresh-action" in (draft_page / "index.html").read_text(encoding="utf-8")
-    assert "refresh-action" in (draft_page / "app.js").read_text(encoding="utf-8")
+def test_generation_normal_loop_no_longer_exposes_source_stabilizer() -> None:
+    assert not hasattr(MiniappGenerationNormalLoop, "stabilize_draft_contract_from_source")
 
 
 def test_route_manifest_dedupes_duplicate_file_paths_preferring_detail_page() -> None:
