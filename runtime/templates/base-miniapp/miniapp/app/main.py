@@ -9,10 +9,8 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.db import Base, engine
-from app.routes.client import router as client_router
 from app.routes.health import router as health_router
-from app.routes.manager import router as manager_router
-from app.routes.specialist import router as specialist_router
+from app.routes.role_routes import router as role_router
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -26,9 +24,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(health_router)
-app.include_router(client_router)
-app.include_router(specialist_router)
-app.include_router(manager_router)
+app.include_router(role_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
