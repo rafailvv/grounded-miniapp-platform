@@ -64,6 +64,7 @@ class FixPromptBuilder:
             "frontend_link_route_mismatch",
             "db_dependency_export_missing",
             "loading_first_root_surface",
+            "role_profile_surface_missing",
         }
         if fix_turn.generation_mode == GenerationMode.QUALITY:
             if repeated_signature_without_progress >= 1 or route_runtime_failure:
@@ -85,6 +86,7 @@ class FixPromptBuilder:
             "frontend_link_route_mismatch",
             "db_dependency_export_missing",
             "loading_first_root_surface",
+            "role_profile_surface_missing",
         }
 
     @staticmethod
@@ -138,7 +140,8 @@ class FixPromptBuilder:
             "Preserve the existing backend architecture, routers, and static mounting unless the evidence explicitly implicates them. "
             "Never replace a functioning FastAPI backend or route module with placeholder HTML handlers, stub pages, or a simplified demo app. "
             "Do not rewrite generated tests or generated manifests to make the app pass; repair the application code and runtime contract instead. "
-            "When generated app tests report a create/update API failure, treat the primary repair cluster as app/routes/<resource>.py plus app/schemas.py and app/db.py before touching broader runtime files."
+            "When generated app tests report a create/update API failure, treat the primary repair cluster as app/routes/<resource>.py plus app/schemas.py and app/db.py before touching broader runtime files. "
+            "When validation reports a missing role profile page or missing profile route, repair the role-local profile page surface and the supporting role_pages/profiles route modules before touching main.py."
         )
 
     @staticmethod
@@ -182,6 +185,7 @@ class FixPromptBuilder:
                     "Preserve existing endpoints, router wiring, and static file serving unless the evidence shows they are broken.",
                     "Do not replace main.py, route modules, or backend services with placeholder HTML stubs or hard-coded pages.",
                     "If generated_app_python_tests reports a create/update API failure, prioritize the resource route module plus app/schemas.py and app/db.py before touching main.py or unrelated runtime files.",
+                    "If validation reports a missing role profile page or missing profile route, prioritize the role-local profile static triplet plus app/routes/role_pages.py and app/routes/profiles.py before touching main.py.",
                     "If a FastAPI route raises HTTPException from ValidationError, keep the detail JSON-safe instead of passing through raw Python exceptions.",
                     "Every create or replace operation must include the full resulting file content.",
                     "Use the tool-owned repair loop: ask for tool actions first when evidence is insufficient, then return a patch only after you have enough context.",

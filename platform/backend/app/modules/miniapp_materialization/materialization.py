@@ -202,7 +202,7 @@ class MiniappMaterializationService:
         scope_mode: str,
         generation_mode: GenerationMode,
     ) -> tuple[str, list[str]] | None:
-        if scope_mode == "minimal_patch":
+        if scope_mode in {"minimal_patch", "role_partial_build"}:
             return None
         fast_mode = generation_mode == GenerationMode.FAST
         if report.collapsed_surface:
@@ -262,7 +262,7 @@ class MiniappMaterializationService:
 
     @staticmethod
     def filter_non_blocking_build_issues(build_issues: list[ValidationIssue], *, scope_mode: str) -> list[ValidationIssue]:
-        if scope_mode != "minimal_patch":
+        if scope_mode not in {"minimal_patch", "role_partial_build"}:
             return build_issues
         ignored_codes = {
             "build.invalid_generated_app_graph",

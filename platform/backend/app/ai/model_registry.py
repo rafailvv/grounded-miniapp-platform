@@ -48,8 +48,6 @@ else:
     SUMMARY_MODEL = "gpt-5.4-mini"
 VISUAL_PATCH_MODEL = FAST_CODE_MODEL
 REPAIR_MODEL = STRONG_CODE_MODEL
-BALANCED_LIGHT_PLAN_MODEL = PLANNING_MODEL
-BALANCED_LIGHT_EDIT_MODEL = FAST_CODE_MODEL
 
 TASK_PROFILES = {
     "openai_code_fast": {
@@ -59,8 +57,8 @@ TASK_PROFILES = {
         "routing": {
             "spec_analysis": PLANNING_MODEL,
             "ir_codegen": FAST_CODE_MODEL,
-            "code_plan": STRONG_CODE_MODEL if CHIP_ENABLED else PLANNING_MODEL,
-            "code_edit": FAST_CODE_MODEL,
+            "code_plan": STRONG_CODE_MODEL,
+            "code_edit": STRONG_CODE_MODEL,
             "repair": REPAIR_MODEL,
             "summarize": SUMMARY_MODEL,
             "cheap_task": SUMMARY_MODEL,
@@ -195,26 +193,5 @@ def task_model_overrides(
     backend_target_count: int = 0,
     cluster_name: str | None = None,
 ) -> tuple[str | None, str | None]:
-    if generation_mode is None:
-        return None, None
-    mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(str(generation_mode))
-    if mode != GenerationMode.BALANCED:
-        return None, None
-    normalized_cluster = str(cluster_name or "").strip()
-    if (
-        role in {"code_edit", "ir_codegen"}
-        and scope_mode == "whole_file_build"
-        and normalized_cluster == "shared_static"
-        and backend_target_count == 0
-        and 0 < target_file_count <= 2
-    ):
-        return BALANCED_LIGHT_EDIT_MODEL, BALANCED_LIGHT_EDIT_MODEL
-    if not visual_only_patch or scope_mode != "minimal_patch":
-        return None, None
-    if backend_target_count > 0 or target_file_count <= 0 or target_file_count > 6:
-        return None, None
-    if role == "code_plan":
-        return BALANCED_LIGHT_PLAN_MODEL, BALANCED_LIGHT_PLAN_MODEL
-    if role in {"code_edit", "ir_codegen"}:
-        return BALANCED_LIGHT_EDIT_MODEL, BALANCED_LIGHT_EDIT_MODEL
+    del role, generation_mode, scope_mode, visual_only_patch, target_file_count, backend_target_count, cluster_name
     return None, None

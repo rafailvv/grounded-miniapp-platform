@@ -426,6 +426,8 @@ class ServiceStrategyMixins:
             return "whole_file_build"
         if role_patch_kind in {"ui_flow_patch", "contract_patch"}:
             return "workflow_partial_build"
+        if role_patch_kind == "role_patch":
+            return "role_partial_build"
         if ServiceStrategyMixins._looks_like_workflow_partial_patch_request(
             lowered=lowered,
             intent=intent,
@@ -433,7 +435,7 @@ class ServiceStrategyMixins:
         ):
             return "workflow_partial_build"
         if len(role_scope) == 1 and intent in {"edit", "refine", "role_only_change"}:
-            return "whole_file_build"
+            return "role_partial_build"
         whole_file_markers = ("full implementation", "whole file", "whole files", "generate by files", "generate files", "new app surface", "catalog", "storefront", "checkout", "workspace", "dashboard", "workflow", "multi-page", "multi role", "multi-role", "refactor")
         if len(role_scope) > 1 or any(marker in lowered for marker in whole_file_markers):
             return "whole_file_build"
@@ -468,7 +470,7 @@ class ServiceStrategyMixins:
         if require_multi_page:
             return "The request implies multiple pages or flows, so generation uses whole-file bundles."
         if len(role_scope) == 1 and intent in {"edit", "refine", "role_only_change"}:
-            return "A single-role change should stay bounded to that role and feature family, but not be forced into a micro-patch."
+            return "A single-role change should stay bounded to that role bundle and only expand further when the evidence shows a shared contract drift."
         if any(marker in lowered for marker in ("catalog", "storefront", "checkout", "workspace", "dashboard", "full implementation", "refactor")):
             return "The request introduces a new app surface, so generation uses whole-file bundles."
         return "The request is narrow enough to stay in minimal patch mode."
@@ -565,14 +567,66 @@ class ServiceStrategyMixins:
     def _looks_like_create_surface_request(prompt: str, role_scope: list[str]) -> bool:
         if ServiceStrategyMixins._looks_like_fix_request(prompt):
             return False
-        creation_markers = ("create ", "build ", "generate ", "make ", "new mini app", "new app", "from scratch", "application should", "app should")
-        workflow_markers = ("mini app", "mini-app", "multi-page", "multi page", "multi-role", "multi role", "role-based", "role based", "storefront", "catalog", "checkout", "cart", "order", "orders", "workspace", "dashboard", "customer-facing", "customer side")
+        creation_markers = (
+            "create ",
+            "build ",
+            "generate ",
+            "make ",
+            "new mini app",
+            "new app",
+            "from scratch",
+            "application should",
+            "app should",
+            "сделай ",
+            "создай ",
+            "сгенерируй ",
+            "нужно приложение",
+            "мне нужно приложение",
+            "хочу приложение",
+            "простое приложение",
+            "рабочее приложение",
+        )
+        workflow_markers = (
+            "mini app",
+            "mini-app",
+            "multi-page",
+            "multi page",
+            "multi-role",
+            "multi role",
+            "role-based",
+            "role based",
+            "storefront",
+            "catalog",
+            "checkout",
+            "cart",
+            "order",
+            "orders",
+            "workspace",
+            "dashboard",
+            "customer-facing",
+            "customer side",
+            "приложение",
+            "мини-приложение",
+            "интернет-магазин",
+            "магазин",
+            "каталог",
+            "товар",
+            "товары",
+            "корзин",
+            "заказ",
+            "заказы",
+            "оформ",
+            "панель",
+            "витрина",
+        )
         role_mentions = sum(1 for role in ROLE_ORDER if role in prompt)
         has_creation_signal = any(marker in prompt for marker in creation_markers)
         has_workflow_signal = any(marker in prompt for marker in workflow_markers)
         if has_creation_signal and (has_workflow_signal or len(role_scope) > 1 or role_mentions > 1):
             return True
-        if len(role_scope) > 1 and has_workflow_signal and any(marker in prompt for marker in ("should", "support", "application", "app")):
+        if len(role_scope) > 1 and has_workflow_signal and any(
+            marker in prompt for marker in ("should", "support", "application", "app", "должен", "должна", "нужно", "надо", "хочу")
+        ):
             return True
         return False
 

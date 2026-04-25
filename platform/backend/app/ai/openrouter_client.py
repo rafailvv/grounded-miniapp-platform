@@ -21,6 +21,7 @@ from app.ai.model_registry import (
 )
 from app.core.config import Settings
 from app.models.common import GenerationMode
+from app.services.generation_runtime_config import ACTIVE_GENERATION_TURN_STATE, RetryPolicy, TimeoutProfile
 from app.services.workspace.log_service import WorkspaceLogService
 
 logger = logging.getLogger(__name__)
@@ -43,10 +44,12 @@ class OpenRouterClient:
         self.openrouter_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         self.openrouter_app_name = os.getenv("OPENROUTER_APP_NAME", settings.openrouter_app_name)
         self.openrouter_site_url = os.getenv("OPENROUTER_SITE_URL", settings.openrouter_site_url)
-        self.connect_timeout_sec = float(os.getenv("OPENAI_CONNECT_TIMEOUT_SEC", "10"))
-        self.read_timeout_sec = float(os.getenv("OPENAI_READ_TIMEOUT_SEC", "120"))
-        self.write_timeout_sec = float(os.getenv("OPENAI_WRITE_TIMEOUT_SEC", "60"))
-        self.pool_timeout_sec = float(os.getenv("OPENAI_POOL_TIMEOUT_SEC", "60"))
+        self.timeout_profile = TimeoutProfile.from_env()
+        self.retry_policy = RetryPolicy.from_env()
+        self.connect_timeout_sec = self.timeout_profile.openai_connect_sec
+        self.read_timeout_sec = self.timeout_profile.openai_read_sec
+        self.write_timeout_sec = self.timeout_profile.openai_write_sec
+        self.pool_timeout_sec = self.timeout_profile.openai_pool_sec
         self.openai_quota_disable_sec = float(os.getenv("OPENAI_QUOTA_DISABLE_SEC", "900"))
         self._openai_direct_disabled_until = 0.0
         # Compatibility aliases for older callers that only inspect one active provider.
@@ -372,9 +375,14 @@ class OpenRouterClient:
                 prompt_cache_key=prompt_cache_key,
                 stable_prefix=stable_prefix,
             )
-        model_config = MODEL_REGISTRY[role]
-        primary_model = model_config["primary"]
-        fallback_model = model_config["fallback"]
+        routing_context = ACTIVE_LLM_ROUTING_CONTEXT.get() or {}
+        requested_profile = str(routing_context.get("model_profile") or "").strip() or None
+        generation_mode = str(routing_context.get("generation_mode") or "").strip() or None
+        primary_model, fallback_model = models_for_role(
+            role,
+            model_profile=requested_profile,
+            generation_mode=generation_mode,
+        )
         models = [primary_model] if fallback_model == primary_model else [primary_model, fallback_model]
         last_error: Exception | None = None
         openrouter_rescue_attempted = False
@@ -994,7 +1002,7 @@ class OpenRouterClient:
         last_error: Exception | None = None
         provider_label = "OpenRouter" if provider == "openrouter" else "OpenAI"
         base_url = self.openrouter_base_url.rstrip("/") if provider == "openrouter" else self.openai_base_url.rstrip("/")
-        for attempt in range(3):
+        for attempt in range(1, self.retry_policy.max_attempts + 1):
             try:
                 started = time.perf_counter()
                 with httpx.Client(
@@ -1031,7 +1039,7 @@ class OpenRouterClient:
                                 "endpoint": endpoint,
                                 "model": model,
                                 "provider": provider,
-                                "attempt": attempt + 1,
+                                "attempt": attempt,
                                 "max_tokens": reduced_max_tokens,
                             },
                         )
@@ -1040,6 +1048,10 @@ class OpenRouterClient:
                     return response.json()
             except Exception as exc:
                 last_error = exc
+                error_class = self.retry_policy.classify_error(exc)
+                turn_state = ACTIVE_GENERATION_TURN_STATE.get()
+                if turn_state is not None:
+                    turn_state.last_error_class = error_class
                 self._append_workspace_api_log(
                     source="llm.error",
                     message=f"{provider_label} request failed for {endpoint}.",
@@ -1047,15 +1059,26 @@ class OpenRouterClient:
                         "endpoint": endpoint,
                         "model": model,
                         "provider": provider,
-                        "attempt": attempt + 1,
+                        "attempt": attempt,
                         "error": str(exc),
                         "error_type": type(exc).__name__,
+                        "error_class": error_class,
                     },
                 )
-                if attempt == 2 or not self._is_retryable_request_error(exc):
+                if not self.retry_policy.should_retry(exc, attempt):
                     raise
-                logger.warning("Retrying OpenAI request endpoint=%s model=%s after transient failure: %s", endpoint, model, exc)
-                time.sleep(0.8 * (attempt + 1))
+                delay_seconds = self.retry_policy.backoff_seconds(attempt)
+                if turn_state is not None:
+                    turn_state.llm_retry_ms += int(delay_seconds * 1000)
+                logger.warning(
+                    "Retrying %s request endpoint=%s model=%s after %s failure: %s",
+                    provider_label,
+                    endpoint,
+                    model,
+                    error_class,
+                    exc,
+                )
+                time.sleep(delay_seconds)
         assert last_error is not None
         raise last_error
 

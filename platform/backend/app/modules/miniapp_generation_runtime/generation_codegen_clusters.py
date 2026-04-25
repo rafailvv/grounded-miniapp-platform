@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
     MAX_TOOL_ROUNDS = 5
-    COMMAND_TIMEOUT_SECONDS = 20
     _HELPER_DISCOVERY_TARGETS = {
         "miniapp/app/static/shared/runtime.js",
         "miniapp/app/static/shared/api.js",
@@ -101,7 +100,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
         diagnosis: str,
         outcome_hint: str,
     ) -> bool:
-        if scope_mode != "workflow_partial_build":
+        if scope_mode not in {"role_partial_build", "workflow_partial_build"}:
             return False
         if not target_files or not all(cls._is_backend_composition_target(path) for path in target_files):
             return False
@@ -575,19 +574,22 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                             raise ValueError(
                                 f"Whole-file cluster {cluster_name} kept searching for nonexistent runtime/api helper files instead of using the current context."
                             )
+                        request_signature = self._tool_request_signature(tool_requests)
                         if self._read_request_already_satisfied(tool_requests, current_file_contexts):
+                            if request_signature and request_signature in seen_tool_request_signatures:
+                                tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
+                                raise ValueError(
+                                    f"Whole-file cluster {cluster_name} repeated identical tool requests without returning operations."
+                                )
                             context_reuse_recovery_note = self._already_available_context_note(tool_requests)
                             tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
-                            if not self._should_fail_fast_on_satisfied_request(
-                                cluster_name=cluster_name,
-                                tool_round=tool_round,
-                                tool_requests=tool_requests,
-                            ) and tool_round < self.MAX_TOOL_ROUNDS:
+                            if request_signature:
+                                seen_tool_request_signatures.add(request_signature)
+                            if tool_round < self.MAX_TOOL_ROUNDS:
                                 continue
                             raise ValueError(
                                 f"Whole-file cluster {cluster_name} requested files that were already present in the current context."
                             )
-                        request_signature = self._tool_request_signature(tool_requests)
                         if request_signature and request_signature in seen_tool_request_signatures:
                             tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
                             if tool_round < self.MAX_TOOL_ROUNDS:
@@ -612,7 +614,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                                 scope_mode=scope_mode,
                                 mode=mode,
                             ),
-                            command_timeout_seconds=self.COMMAND_TIMEOUT_SECONDS,
+                            command_timeout_seconds=int(getattr(self.service.timeout_profile, "tool_command_sec", 180)),
                         )
                         if request_signature:
                             seen_tool_request_signatures.add(request_signature)
@@ -838,19 +840,22 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                     raw_operations = normalized.get("operations")
                     outcome_hint = str(normalized.get("outcome") or "").strip().lower()
                     if outcome_hint == "tool_request" or tool_requests:
+                        request_signature = self._tool_request_signature(tool_requests)
                         if self._read_request_already_satisfied(tool_requests, current_file_contexts):
+                            if request_signature and request_signature in seen_tool_request_signatures:
+                                tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
+                                raise ValueError(
+                                    f"Composition stage {stage_name} repeated identical tool requests without returning operations."
+                                )
                             context_reuse_recovery_note = self._already_available_context_note(tool_requests)
                             tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
-                            if not self._should_fail_fast_on_satisfied_request(
-                                cluster_name=stage_name,
-                                tool_round=tool_round,
-                                tool_requests=tool_requests,
-                            ) and tool_round < self.MAX_TOOL_ROUNDS:
+                            if request_signature:
+                                seen_tool_request_signatures.add(request_signature)
+                            if tool_round < self.MAX_TOOL_ROUNDS:
                                 continue
                             raise ValueError(
                                 f"Composition stage {stage_name} requested files that were already present in the current context."
                             )
-                        request_signature = self._tool_request_signature(tool_requests)
                         if request_signature and request_signature in seen_tool_request_signatures:
                             tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
                             if tool_round < self.MAX_TOOL_ROUNDS:
@@ -875,7 +880,7 @@ class MiniappGenerationCodegenClusters(MiniappGenerationRuntimeOwner):
                                 scope_mode=scope_mode,
                                 mode=mode,
                             ),
-                            command_timeout_seconds=self.COMMAND_TIMEOUT_SECONDS,
+                                command_timeout_seconds=int(getattr(self.service.timeout_profile, "tool_command_sec", 180)),
                         )
                         if request_signature:
                             seen_tool_request_signatures.add(request_signature)

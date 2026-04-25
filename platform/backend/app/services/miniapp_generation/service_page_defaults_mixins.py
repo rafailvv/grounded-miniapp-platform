@@ -279,7 +279,10 @@ class ServicePageDefaultsMixins:
 
     @staticmethod
     def _page_edit_parallelism(*, scope_mode: str, generation_mode: GenerationMode) -> int:
-        default = "2" if generation_mode == GenerationMode.FAST or scope_mode in {"minimal_patch", "workflow_partial_build"} else "3"
+        if scope_mode in {"minimal_patch", "role_partial_build", "workflow_partial_build"}:
+            default = "3"
+        else:
+            default = "2" if generation_mode == GenerationMode.FAST else "3"
         configured = max(1, int(os.getenv("PAGE_EDIT_MAX_PARALLELISM", default)))
         return configured
 

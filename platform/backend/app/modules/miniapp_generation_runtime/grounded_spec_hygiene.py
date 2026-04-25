@@ -94,6 +94,76 @@ class GroundedSpecHygieneRuntime:
         "user action",
         "user actions",
     }
+    _KEYWORD_ENTITY_HINTS = (
+        (
+            "Order",
+            (
+                " order",
+                "orders",
+                "checkout",
+                "cart",
+                "purchase",
+                "заказ",
+                "заказы",
+                "оформлять заказ",
+                "новые заказы",
+                "покупатель",
+            ),
+        ),
+        (
+            "Booking",
+            (
+                "booking",
+                "bookings",
+                "reservation",
+                "reserve",
+                "appointment",
+                "запись",
+                "записи",
+                "бронир",
+                "бронь",
+                "аренд",
+            ),
+        ),
+        (
+            "Request",
+            (
+                "request",
+                "requests",
+                "ticket",
+                "tickets",
+                "case",
+                "cases",
+                "заявк",
+                "обращен",
+                "тикет",
+                "тикеты",
+            ),
+        ),
+        (
+            "Task",
+            (
+                "task",
+                "tasks",
+                "job",
+                "jobs",
+                "задач",
+                "работ",
+            ),
+        ),
+        (
+            "Product",
+            (
+                "product",
+                "products",
+                "catalog",
+                "catalogue",
+                "товар",
+                "товары",
+                "каталог",
+            ),
+        ),
+    )
 
     @staticmethod
     def _pascal_case(value: str) -> str:
@@ -129,12 +199,22 @@ class GroundedSpecHygieneRuntime:
             r"\b(?:mini[\s-]?app|app|tool|system|workflow|portal|dashboard)\s+for\s+([^.,;\n]+)",
             r"\bto\s+(?:manage|track|coordinate|handle|review|organize|process|submit|create|book|reserve|request|assign|monitor)s?\s+(?:a|an|the|their|own|new\s+)?([^.,;\n]+)",
             r"\b(?:submits?|creates?|opens?|updates?|assigns?|reviews?|process(?:es)?|tracks?|requests?)\s+(?:a|an|the|their|own|new\s+)?([^.,;\n]+)",
+            r"\b(?:приложени[ея]|мини[- ]?приложени[ея]|сервис)\s+для\s+([^.,;\n]+)",
+            r"\b(?:клиент|покупатель|пользователь|исполнитель|сотрудник|администратор)\s+должен\s+[^.,;\n]*?(?:создавать|оформлять|видеть|менять|обрабатывать|управлять)\s+([^.,;\n]+)",
         )
         for pattern in phrase_patterns:
             for match in re.finditer(pattern, lowered):
                 candidate = cls._normalize_entity_phrase(match.group(1))
                 if candidate:
                     return cls._pascal_case(candidate)
+        return None
+
+    @classmethod
+    def _keyword_entity_name(cls, prompt: str) -> str | None:
+        lowered = f" {str(prompt or '').lower()} "
+        for entity_name, markers in cls._KEYWORD_ENTITY_HINTS:
+            if any(marker in lowered for marker in markers):
+                return entity_name
         return None
 
     @staticmethod
@@ -268,6 +348,9 @@ class GroundedSpecHygieneRuntime:
         prompt_entity_name = GroundedSpecHygieneRuntime._prompt_entity_name(prompt)
         if prompt_entity_name:
             return prompt_entity_name
+        keyword_entity_name = GroundedSpecHygieneRuntime._keyword_entity_name(prompt)
+        if keyword_entity_name:
+            return keyword_entity_name
         return "WorkflowRecord"
 
     @staticmethod

@@ -9,18 +9,13 @@ DESIGN_REFERENCE_FILES = (
     "docs/components.md",
     "docs/generation-contract.md",
     "docs/ownership-contract.md",
-    "docs/generic-persisted-workflow.md",
     "docs/anti-patterns.md",
-    "docs/entity-naming-contract.md",
-    "docs/detail-page-pattern.md",
-    "docs/status-lifecycle-pattern.md",
     "miniapp/app/main.py",
     "miniapp/app/db.py",
     "miniapp/app/schemas.py",
     "miniapp/app/routes/client.py",
     "miniapp/app/routes/specialist.py",
     "miniapp/app/routes/manager.py",
-    "miniapp/app/routes/profiles.py",
     "miniapp/app/routes/role_pages.py",
     "miniapp/app/generated/__init__.py",
     "miniapp/app/static/shared/base.css",
@@ -39,7 +34,7 @@ SHARED_GENERATED_FILES = (
     "miniapp/app/generated/route_manifest.json",
     "miniapp/app/generated/runtime_manifest.json",
 )
-WRITE_STRATEGIES = ("minimal_patch", "workflow_partial_build", "whole_file_build")
+WRITE_STRATEGIES = ("minimal_patch", "role_partial_build", "workflow_partial_build", "whole_file_build")
 CANONICAL_FRONTEND_ROOTS = (
     "miniapp/app/static/client/",
     "miniapp/app/static/specialist/",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import importlib
 import json
@@ -20,24 +21,193 @@ from app.ai.openrouter_client import ACTIVE_WORKSPACE_LOG_CONTEXT, OpenRouterCli
 from app.main import create_app
 from app.models.common import PreviewProfile, TargetPlatform
 from app.models.artifacts import PatchEnvelope, PatchOperationModel, ValidationIssue
-from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RunCheckResult, RunRecord, ValidationSnapshot, WorkspaceRecord
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftFileOperation, FixScopeEntry, GenerateRequest, GenerationMode, JobRecord, PreviewRecord, RunCheckResult, RunRecord, ValidationSnapshot, WorkspaceRecord, utc_now
 from app.models.grounded_spec import APIRequirement
 from app.modules.miniapp_agent_loop.fix_prompt_builder import FixPromptBuilder
 from app.modules.miniapp_agent_loop.fix_scope_builder import FixScopeBuilder
 from app.modules.miniapp_agent_loop.fix_types import FixPromptContext, FixTurnContext
 from app.modules.miniapp_agent_loop.turn_runner import WorkspaceLoopTurnRunner
-from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import MiniappGenerationContractApiRoutesCrud
+from app.modules.miniapp_fix_runtime.fix_classification import FixClassificationRuntime
+from app.modules.miniapp_fix_runtime.fix_execution import FixExecutionRuntime
+from app.modules.miniapp_generation_runtime.generation_code_plan import MiniappGenerationCodePlan
+from app.modules.miniapp_generation_runtime.generation_codegen import MiniappGenerationCodegen
 from app.modules.miniapp_generation_runtime.generation_codegen_clusters import MiniappGenerationCodegenClusters
+from app.modules.miniapp_generation_runtime.generation_codegen_selection import MiniappGenerationCodegenSelection
+from app.modules.miniapp_generation_runtime.generation_repair import MiniappGenerationRepair
 from app.core.config import get_settings
 from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
+from app.services.generation_runtime_config import RetryPolicy, TimeoutProfile
+from app.services.generation_tool_orchestrator import GenerationToolOrchestrator
 from app.services.engine.task_router import TaskRouter
+from app.services.miniapp_generation.artifact_builder import MiniappArtifactBuilder
 from app.services.generation_service import DESIGN_REFERENCE_FILES, SHARED_GENERATED_FILES, GenerationService
 from app.services.check_runner import CheckRunner
 from app.services.context_pack_builder import ContextPackBuilder
 from app.services.run_service import RunService
 from app.services.miniapp_generation.service_strategy_mixins import ServiceStrategyMixins
 from app.modules.miniapp_validation.build_validator import BuildValidator
+
+
+def test_artifact_builder_refreshes_generated_graph_from_draft_profile_files(tmp_path: Path) -> None:
+    draft_source = tmp_path / "draft"
+    profile_html = draft_source / "miniapp/app/static/client/profile/index.html"
+    profile_html.parent.mkdir(parents=True, exist_ok=True)
+    profile_html.write_text("<main>profile</main>", encoding="utf-8")
+    (draft_source / "miniapp/app/static/client/profile/styles.css").write_text("", encoding="utf-8")
+    (draft_source / "miniapp/app/static/client/profile/app.js").write_text("", encoding="utf-8")
+    root_html = draft_source / "miniapp/app/static/client/index.html"
+    root_html.parent.mkdir(parents=True, exist_ok=True)
+    root_html.write_text("<main>root</main>", encoding="utf-8")
+    (draft_source / "miniapp/app/static/client/styles.css").write_text("", encoding="utf-8")
+    (draft_source / "miniapp/app/static/client/app.js").write_text("", encoding="utf-8")
+
+    builder = MiniappArtifactBuilder(
+        normalize_role_route_path=lambda _role, path: path or "/",
+        absolute_role_route_path=lambda role, path: path if str(path).startswith(f"/{role}") else f"/{role}{path if str(path).startswith('/') else f'/{path}'}",
+        default_page_asset_path=lambda file_path, asset_kind: file_path.replace("index.html", "styles.css" if asset_kind == "css" else "app.js"),
+        normalize_runtime_python_path=lambda path: path,
+    )
+    page_graph = {
+        "app_title": "Store",
+        "summary": "Simple store",
+        "roles": {
+            "client": {
+                "entry_path": "/client",
+                "pages": [
+                    {
+                        "page_id": "client_home",
+                        "route_path": "/",
+                        "file_path": "miniapp/app/static/client/index.html",
+                        "style_path": "miniapp/app/static/client/styles.css",
+                        "script_path": "miniapp/app/static/client/app.js",
+                        "page_kind": "role_root",
+                        "title": "Home",
+                        "navigation_label": "Home",
+                        "is_entry": True,
+                    }
+                ],
+            }
+        },
+    }
+
+    operations = builder.ensure_runtime_artifact_operations(
+        grounded_spec=SimpleNamespace(product_goal="Simple store", target_platform="telegram_mini_app"),
+        page_graph=page_graph,
+        role_scope=["client"],
+        generation_mode=GenerationMode.FAST,
+        operations=[],
+        draft_source=draft_source,
+    )
+
+    graph_payload = json.loads(next(op.content for op in operations if op.file_path == "artifacts/generated_app_graph.json"))
+    route_manifest = json.loads(next(op.content for op in operations if op.file_path == "miniapp/app/generated/route_manifest.json"))
+    graph_routes = {str(page.get("route_path") or "") for page in graph_payload["roles"]["client"]["pages"]}
+    manifest_routes = {str(page.get("route_path") or "") for page in route_manifest["roles"]["client"]["pages"]}
+
+    assert "/client/profile" in graph_routes
+    assert "/client/profile" in manifest_routes
+
+
+def test_build_validator_accepts_materialized_profile_files_when_graph_is_stale(tmp_path: Path) -> None:
+    workspace_path = tmp_path / "workspace"
+    (workspace_path / "artifacts").mkdir(parents=True, exist_ok=True)
+    (workspace_path / "miniapp/app/routes").mkdir(parents=True, exist_ok=True)
+    (workspace_path / "miniapp/app/static/client/profile").mkdir(parents=True, exist_ok=True)
+    (workspace_path / "miniapp/app/static/client").mkdir(parents=True, exist_ok=True)
+    (workspace_path / "miniapp/app/generated").mkdir(parents=True, exist_ok=True)
+
+    (workspace_path / "miniapp/app/routes/client.py").write_text("from fastapi import APIRouter\nrouter = APIRouter()\n", encoding="utf-8")
+    (workspace_path / "miniapp/app/static/client/index.html").write_text("<main>root</main>", encoding="utf-8")
+    (workspace_path / "miniapp/app/static/client/styles.css").write_text("", encoding="utf-8")
+    (workspace_path / "miniapp/app/static/client/app.js").write_text("", encoding="utf-8")
+    (workspace_path / "miniapp/app/static/client/profile/index.html").write_text("<main>profile</main>", encoding="utf-8")
+    (workspace_path / "miniapp/app/static/client/profile/styles.css").write_text("", encoding="utf-8")
+    (workspace_path / "miniapp/app/static/client/profile/app.js").write_text("", encoding="utf-8")
+    (workspace_path / "artifacts/generated_app_graph.json").write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "client": {
+                        "routes_file": "miniapp/app/routes/client.py",
+                        "pages": [
+                            {
+                                "page_id": "client_home",
+                                "route_path": "/",
+                                "file_path": "miniapp/app/static/client/index.html",
+                                "style_path": "miniapp/app/static/client/styles.css",
+                                "script_path": "miniapp/app/static/client/app.js",
+                                "page_kind": "role_root",
+                                "is_entry": True,
+                            }
+                        ],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    issues = BuildValidator()._validate_generated_app_shape(workspace_path)
+
+    assert "build.missing_role_profile_page" not in {issue.code for issue in issues}
+
+
+def test_artifact_builder_preserves_existing_feature_pages_from_draft_for_partial_refresh(tmp_path: Path) -> None:
+    draft_source = tmp_path / "draft"
+    products_html = draft_source / "miniapp/app/static/manager/products/index.html"
+    products_html.parent.mkdir(parents=True, exist_ok=True)
+    products_html.write_text("<main>products</main>", encoding="utf-8")
+    (draft_source / "miniapp/app/static/manager/products/styles.css").write_text("", encoding="utf-8")
+    (draft_source / "miniapp/app/static/manager/products/app.js").write_text("", encoding="utf-8")
+    root_html = draft_source / "miniapp/app/static/manager/index.html"
+    root_html.parent.mkdir(parents=True, exist_ok=True)
+    root_html.write_text("<main>root</main>", encoding="utf-8")
+    (draft_source / "miniapp/app/static/manager/styles.css").write_text("", encoding="utf-8")
+    (draft_source / "miniapp/app/static/manager/app.js").write_text("", encoding="utf-8")
+
+    builder = MiniappArtifactBuilder(
+        normalize_role_route_path=lambda _role, path: path or "/",
+        absolute_role_route_path=lambda role, path: path if str(path).startswith(f"/{role}") else f"/{role}{path if str(path).startswith('/') else f'/{path}'}",
+        default_page_asset_path=lambda file_path, asset_kind: file_path.replace("index.html", "styles.css" if asset_kind == "css" else "app.js"),
+        normalize_runtime_python_path=lambda path: path,
+    )
+    page_graph = {
+        "app_title": "Store",
+        "summary": "Simple store",
+        "roles": {
+            "manager": {
+                "entry_path": "/manager",
+                "pages": [
+                    {
+                        "page_id": "manager_home",
+                        "route_path": "/",
+                        "file_path": "miniapp/app/static/manager/index.html",
+                        "style_path": "miniapp/app/static/manager/styles.css",
+                        "script_path": "miniapp/app/static/manager/app.js",
+                        "page_kind": "role_root",
+                        "title": "Home",
+                        "navigation_label": "Home",
+                        "is_entry": True,
+                    }
+                ],
+            }
+        },
+    }
+
+    operations = builder.ensure_runtime_artifact_operations(
+        grounded_spec=SimpleNamespace(product_goal="Simple store", target_platform="telegram_mini_app"),
+        page_graph=page_graph,
+        role_scope=["manager"],
+        generation_mode=GenerationMode.FAST,
+        operations=[],
+        draft_source=draft_source,
+    )
+
+    route_manifest = json.loads(next(op.content for op in operations if op.file_path == "miniapp/app/generated/route_manifest.json"))
+    manifest_routes = {str(page.get("route_path") or "") for page in route_manifest["roles"]["manager"]["pages"]}
+
+    assert "/manager/products" in manifest_routes
 
 
 def test_workspace_loop_patch_report_omits_full_file_contents() -> None:
@@ -248,6 +418,152 @@ def test_role_patch_classifier_defaults_generic_single_role_edit_to_role_patch()
     )
 
 
+def test_scope_mode_uses_role_partial_build_for_generic_single_role_edits() -> None:
+    prompt = "Сделай у администратора экран заказов понятнее, но не трогай остальные роли и общую архитектуру."
+
+    assert ServiceStrategyMixins._scope_mode("role_only_change", prompt, ["manager"]) == "role_partial_build"
+
+
+def test_runtime_map_no_longer_exposes_active_deterministic_business_helpers() -> None:
+    owner_map = GenerationService._runtime_class_owner_map()
+    assert "_deterministic_client_page_route_source" not in owner_map
+    assert "_deterministic_specialist_page_route_source" not in owner_map
+    assert "_deterministic_manager_page_route_source" not in owner_map
+    assert "_deterministic_profiles_route_source" not in owner_map
+    assert "_deterministic_runtime_route_source" not in owner_map
+    assert "_deterministic_main_runtime_source" not in owner_map
+
+
+def test_generation_codegen_no_longer_exposes_legacy_python_fallback_entrypoints() -> None:
+    assert not hasattr(MiniappGenerationCodegen, "_whole_file_error_fallback_result")
+    assert not hasattr(MiniappGenerationCodegen, "_whole_file_static_reuse_fallback_result")
+    assert not hasattr(MiniappGenerationCodegen, "_whole_file_role_ui_fallback_result")
+    assert not hasattr(MiniappGenerationCodegen, "_whole_file_timeout_fallback_result")
+    assert not hasattr(MiniappGenerationCodegen, "_should_prefer_deterministic_fast_cluster")
+    assert not hasattr(MiniappGenerationCodegen, "_deterministic_fast_cluster_result")
+
+
+def test_backend_runtime_has_no_multi_argument_append_calls() -> None:
+    root = Path(__file__).resolve().parents[1] / "app"
+    offenders: list[str] = []
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "append"
+                and len(node.args) != 1
+            ):
+                offenders.append(f"{path}:{node.lineno}")
+    assert offenders == []
+
+
+def test_timeout_profile_large_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in (
+        "OPENAI_CONNECT_TIMEOUT_SEC",
+        "OPENAI_READ_TIMEOUT_SEC",
+        "OPENAI_WRITE_TIMEOUT_SEC",
+        "OPENAI_POOL_TIMEOUT_SEC",
+        "PREVIEW_START_TIMEOUT_SEC",
+        "STRUCTURED_LLM_TIMEOUT_SEC",
+        "JSON_OBJECT_LLM_TIMEOUT_SEC",
+        "WHOLE_FILE_CLUSTER_TIMEOUT_SEC",
+        "WHOLE_FILE_UI_CLUSTER_TIMEOUT_SEC",
+        "TOOL_COMMAND_TIMEOUT_SEC",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    profile = TimeoutProfile.from_env()
+    assert profile.openai_connect_sec == 30
+    assert profile.openai_read_sec == 3600
+    assert profile.openai_write_sec == 1800
+    assert profile.preview_start_sec == 1200
+    assert profile.structured_llm_sec == 2700
+    assert profile.tool_command_sec == 180
+
+
+def test_retry_policy_classification() -> None:
+    policy = RetryPolicy.from_env()
+    assert policy.classify_error(RuntimeError("OpenAI responses returned 503: upstream unavailable")) == "transient_provider"
+    assert policy.classify_error(RuntimeError("OpenAI responses returned 401: invalid api key")) == "auth_or_config"
+    assert policy.classify_error(RuntimeError("OpenAI responses returned 402: can only afford 12000 completion tokens")) == "quota_or_budget"
+    assert policy.classify_error(RuntimeError("OpenAI responses returned empty text instead of JSON.")) == "empty_model_output"
+    assert policy.classify_error(RuntimeError("tool-request budget exhausted without returning operations")) == "tool_budget_exhausted"
+    assert policy.should_retry(RuntimeError("OpenAI responses returned 503: upstream unavailable"), 1) is True
+    assert policy.should_retry(RuntimeError("OpenAI responses returned 401: invalid api key"), 1) is False
+
+
+def test_fix_execution_fast_gate_exact_checks_use_generation_mode_enum() -> None:
+    execution = CheckExecutionRecord(
+        workspace_id="ws_fix",
+        run_id="run_fix",
+        changed_files=["miniapp"],
+        results=[
+            RunCheckResult(name="schema_validators", status="passed"),
+            RunCheckResult(name="connectivity_validators", status="passed"),
+            RunCheckResult(name="changed_files_static", status="passed"),
+            RunCheckResult(name="workflow_canonical_smoke", status="passed"),
+            RunCheckResult(name="generated_app_python_tests", status="skipped"),
+            RunCheckResult(name="generated_app_js_tests", status="skipped"),
+        ],
+    )
+
+    class _DummyCheckRunner:
+        def run(self, **_kwargs):
+            return execution
+
+    service = SimpleNamespace(
+        _append_event=lambda *_args, **_kwargs: None,
+        check_runner=_DummyCheckRunner(),
+    )
+    runtime = FixExecutionRuntime(service=service)
+    job = JobRecord(
+        workspace_id="ws_fix",
+        prompt="Fix the existing generated app.",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        generation_mode=GenerationMode.FAST,
+    )
+
+    result, preview_details = runtime.execute_exact_checks(
+        job=job,
+        workspace_id="ws_fix",
+        run_id="run_fix",
+        draft_source=Path("/tmp"),
+        changed_files=["miniapp"],
+    )
+
+    statuses = {item.name: item.status for item in result.results}
+    assert statuses["preview_boot_smoke"] == "skipped"
+    assert statuses["preview_connectivity_smoke"] == "skipped"
+    assert preview_details["status"] == "skipped"
+
+
+def test_tool_orchestrator_batches_parallel_reads_before_serial_mutations() -> None:
+    orchestrator = GenerationToolOrchestrator(max_concurrency=4)
+    batches = orchestrator.build_batches(
+        [
+            {"tool": "read_files", "targets": ["a"]},
+            {"tool": "search_files", "targets": ["b"]},
+            {"tool": "run_checks", "targets": ["miniapp"]},
+            {"tool": "run_command", "targets": []},
+        ]
+    )
+    assert [(batch.kind, len(batch.requests)) for batch in batches] == [
+        ("parallel_read", 2),
+        ("serial", 1),
+        ("serial", 1),
+    ]
+
+
+def test_fast_profile_uses_quality_first_code_models() -> None:
+    from app.ai.model_registry import TASK_PROFILES
+
+    routing = TASK_PROFILES["openai_code_fast"]["routing"]
+    assert routing["code_plan"] == routing["repair"]
+    assert routing["code_edit"] == routing["repair"]
+
+
 def _install_llm_stub(app) -> None:
     helper_path = Path(__file__).with_name("test_api_smoke.py")
     spec = importlib.util.spec_from_file_location("test_api_smoke_helper", helper_path)
@@ -440,50 +756,142 @@ def test_get_settings_loads_repo_root_dotenv(monkeypatch: pytest.MonkeyPatch, tm
     assert settings.preview_base_url == "http://127.0.0.1:9000"
 
 
-def test_role_ui_cluster_gets_one_recovery_round_for_satisfied_read_request() -> None:
-    tool_requests = [{"tool": "read_files", "targets": ["miniapp/app/static/client/app.js"]}]
+def test_composition_edit_retries_once_when_requested_context_is_already_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = MiniappGenerationCodegenClusters(SimpleNamespace(timeout_profile=SimpleNamespace(tool_command_sec=180)))
+    calls = {"count": 0}
 
-    assert (
-        MiniappGenerationCodegenClusters._should_fail_fast_on_satisfied_request(
-            cluster_name="role_client_ui_profile",
-            tool_round=0,
-            tool_requests=tool_requests,
-        )
-        is False
+    monkeypatch.setattr(runtime, "_preload_existing_target_contexts", lambda **kwargs: dict(kwargs["file_contexts"]), raising=False)
+    monkeypatch.setattr(runtime, "_composition_system_prompt", lambda stage_name: "system", raising=False)
+    monkeypatch.setattr(runtime, "_composition_user_prompt", lambda **kwargs: "user", raising=False)
+    monkeypatch.setattr(runtime, "_code_edit_schema", lambda: {}, raising=False)
+    monkeypatch.setattr(runtime, "_normalize_model_payload", lambda payload: payload, raising=False)
+    monkeypatch.setattr(
+        runtime,
+        "_sanitize_draft_operations",
+        lambda operations: [DraftFileOperation.model_validate(item) for item in operations],
+        raising=False,
     )
-    assert (
-        MiniappGenerationCodegenClusters._should_fail_fast_on_satisfied_request(
-            cluster_name="role_client_ui_root",
-            tool_round=1,
-            tool_requests=tool_requests,
-        )
-        is True
-    )
-    assert (
-        MiniappGenerationCodegenClusters._should_fail_fast_on_satisfied_request(
-            cluster_name="backend_route_requests",
-            tool_round=0,
-            tool_requests=tool_requests,
-        )
-        is True
-    )
+    monkeypatch.setattr(runtime, "_validate_targeted_operations", lambda **kwargs: None, raising=False)
+    monkeypatch.setattr(runtime, "_is_retryable_llm_error", lambda exc: False, raising=False)
 
+    def fake_generate(**kwargs: object) -> dict[str, object]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {
+                "model": "test-model",
+                "payload": {
+                    "outcome": "tool_request",
+                    "tool_requests": [{"tool": "read_files", "targets": ["miniapp/app/routes/orders.py"]}],
+                },
+            }
+        return {
+            "model": "test-model",
+            "payload": {
+                "assistant_message": "patched",
+                "operations": [
+                    {
+                        "file_path": "miniapp/app/routes/orders.py",
+                        "operation": "replace",
+                        "content": "from fastapi import APIRouter\nrouter = APIRouter()\n",
+                        "reason": "update route",
+                    }
+                ],
+            },
+        }
 
-def test_whole_file_error_fallback_does_not_materialize_backend_routes(tmp_path: Path) -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
-    codegen = app.state.container.generation_service.generation_codegen
+    monkeypatch.setattr(runtime, "_generate_structured_with_retry", fake_generate, raising=False)
 
-    fallback = codegen._whole_file_error_fallback_result(
-        workspace_id="ws_test",
-        draft_run_id="run_test",
-        cluster_name="backend_route_bookings",
-        cluster_targets=["miniapp/app/routes/bookings.py"],
-        error_message="returned no file operations",
+    result = runtime._resolve_composition_edit(
+        prompt="Добавь отмену заказа",
+        grounded_spec=SimpleNamespace(),
         entity_contract={},
+        role_scope=["client", "specialist", "manager"],
+        role_contract={},
+        page_graph={},
+        scope_mode="workflow_partial_build",
+        intent="edit",
+        stage_name="miniapp",
+        target_files=["miniapp/app/routes/orders.py"],
+        file_contexts={"miniapp/app/routes/orders.py": "from fastapi import APIRouter\nrouter = APIRouter()\n"},
+        generated_page_sources={},
+        generated_support_sources={},
+        generation_mode=GenerationMode.FAST,
+        creative_direction={},
     )
 
-    assert fallback is None
+    assert calls["count"] == 2
+    assert result["operations"][0].file_path == "miniapp/app/routes/orders.py"
+
+
+def test_page_edit_retries_once_when_requested_context_is_already_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = MiniappGenerationCodegenSelection(SimpleNamespace(timeout_profile=SimpleNamespace(tool_command_sec=180)))
+    calls = {"count": 0}
+    page = {
+        "page_id": "client_home",
+        "file_path": "miniapp/app/static/client/index.html",
+        "style_path": "miniapp/app/static/client/styles.css",
+        "script_path": "miniapp/app/static/client/app.js",
+        "page_kind": "role_root",
+    }
+
+    monkeypatch.setattr(runtime, "_preload_existing_page_contexts", lambda **kwargs: dict(kwargs["file_contexts"]), raising=False)
+    monkeypatch.setattr(runtime, "_page_edit_system_prompt", lambda: "system", raising=False)
+    monkeypatch.setattr(runtime, "_page_edit_user_prompt", lambda **kwargs: "user", raising=False)
+    monkeypatch.setattr(runtime, "_code_edit_schema", lambda: {}, raising=False)
+    monkeypatch.setattr(runtime, "_normalize_model_payload", lambda payload: payload, raising=False)
+    monkeypatch.setattr(
+        runtime,
+        "_sanitize_draft_operations",
+        lambda operations: [DraftFileOperation.model_validate(item) for item in operations],
+        raising=False,
+    )
+    monkeypatch.setattr(runtime, "_is_retryable_llm_error", lambda exc: False, raising=False)
+    monkeypatch.setattr(runtime, "_is_recoverable_page_error", lambda exc: False, raising=False)
+
+    def fake_generate(**kwargs: object) -> dict[str, object]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {
+                "model": "test-model",
+                "payload": {
+                    "outcome": "tool_request",
+                    "tool_requests": [{"tool": "read_files", "targets": ["miniapp/app/static/client/index.html"]}],
+                },
+            }
+        return {
+            "model": "test-model",
+            "payload": {
+                "assistant_message": "patched",
+                "operations": [
+                    {
+                        "file_path": "miniapp/app/static/client/index.html",
+                        "operation": "replace",
+                        "content": "<main>Updated</main>",
+                        "reason": "update page",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(runtime, "_generate_structured_with_retry", fake_generate, raising=False)
+
+    result = runtime._resolve_page_file_edit(
+        prompt="Обнови экран",
+        grounded_spec=SimpleNamespace(),
+        entity_contract={},
+        role="client",
+        page=page,
+        page_graph={},
+        role_contract={},
+        scope_mode="minimal_patch",
+        intent="edit",
+        file_contexts={"miniapp/app/static/client/index.html": "<main>Current</main>"},
+        generation_mode=GenerationMode.FAST,
+        creative_direction={},
+    )
+
+    assert calls["count"] == 2
+    assert result["operations"][0].file_path == "miniapp/app/static/client/index.html"
 
 
 def test_whole_file_bundle_schema_name_stays_within_openai_limit() -> None:
@@ -645,13 +1053,32 @@ def test_generation_clusters_grouped_for_safe_parallel_execution() -> None:
 
     assert names == [
         ["backend_support"],
-        ["backend_route_assignments", "backend_route_comments"],
-        ["backend_route_requests"],
-        ["role_manager_ui_root"],
-        ["role_manager_ui_profile"],
-        ["role_manager_ui_requests"],
-        ["role_specialist_ui_root"],
+        ["backend_route_assignments", "backend_route_comments", "backend_route_requests"],
+        [
+            "role_manager_ui_root",
+            "role_manager_ui_profile",
+            "role_manager_ui_requests",
+            "role_specialist_ui_root",
+        ],
         ["shared_static"],
+    ]
+
+
+def test_generation_clusters_use_role_specific_batch_limit_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    clusters = [
+        {"cluster_name": "role_manager_ui_root", "target_files": ["miniapp/app/static/manager/index.html"]},
+        {"cluster_name": "role_manager_ui_profile", "target_files": ["miniapp/app/static/manager/profile/index.html"]},
+        {"cluster_name": "role_manager_ui_products", "target_files": ["miniapp/app/static/manager/products/index.html"]},
+    ]
+
+    monkeypatch.setenv("WHOLE_FILE_ROLE_UI_BATCH_LIMIT", "2")
+
+    grouped = GenerationService._group_generation_clusters_for_execution(clusters)
+    names = [[item["cluster_name"] for item in batch] for batch in grouped]
+
+    assert names == [
+        ["role_manager_ui_root", "role_manager_ui_profile"],
+        ["role_manager_ui_products"],
     ]
 
 
@@ -687,6 +1114,41 @@ def test_entity_contract_uses_prompt_derived_slug_for_booking_prompt(tmp_path: P
     assert contract["entity_slug_plural"] == "bookings"
     assert contract["api_path"] == "/api/bookings"
     assert contract["route_file"] == "miniapp/app/routes/bookings.py"
+
+
+def test_entity_contract_uses_order_slug_for_russian_commerce_prompt(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service: GenerationService = app.state.container.generation_service
+
+    prompt = (
+        "Мне нужно простое приложение для небольшого интернет-магазина. "
+        "Покупатель должен смотреть товары и оформлять заказ, сотрудник должен видеть новые заказы "
+        "и менять их статус, а администратор должен управлять товарами и видеть все заказы."
+    )
+    grounded_spec = service._stabilize_grounded_spec(
+        service._build_grounded_spec(
+            workspace_id="ws_entity_contract_ru_commerce",
+            prompt=prompt,
+            target_platform=TargetPlatform.TELEGRAM,
+            preview_profile=PreviewProfile.TELEGRAM_MOCK,
+            doc_refs=[],
+            template_revision_id="template-test",
+            prompt_turn_id="turn_entity_contract_ru_commerce",
+            generation_mode=GenerationMode.BALANCED,
+        )
+    )
+
+    contract = service.generation_entity_contract.extract_entity_contract(
+        prompt=prompt,
+        grounded_spec=grounded_spec,
+        generation_mode=GenerationMode.BALANCED,
+    )
+
+    assert contract["entity_slug"] == "order"
+    assert contract["entity_slug_plural"] == "orders"
+    assert contract["api_path"] == "/api/orders"
+    assert contract["route_file"] == "miniapp/app/routes/orders.py"
 
 
 def test_role_only_patch_kind_distinguishes_visual_ui_flow_and_contract(tmp_path: Path) -> None:
@@ -1358,6 +1820,47 @@ def test_run_service_recovers_running_job_for_already_terminal_run(tmp_path: Pat
     assert "failed" in (recovered_job.failure_reason or "").lower()
 
 
+def test_run_service_resolves_linked_job_from_job_store_when_run_pointer_is_missing(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Linked Job Workspace",
+            description="Run should recover its linked job from the job store when the direct pointer is missing.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_linked_job_lookup").resolve()),
+        )
+    )
+
+    run = RunRecord(
+        workspace_id=workspace.workspace_id,
+        prompt="Terminal run",
+        intent="edit",
+        status="failed",
+        apply_status="failed",
+        current_stage="failed",
+        failure_reason="Unexpected exception",
+    )
+    job = JobRecord(
+        workspace_id=workspace.workspace_id,
+        prompt=run.prompt,
+        target_platform=workspace.target_platform,
+        preview_profile=workspace.preview_profile,
+        linked_run_id=run.run_id,
+        status="running",
+    )
+    run_service._save_run(run)
+    run_service.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
+
+    resolved_job_id = run_service._resolve_linked_job_id(run)
+    refreshed_run = run_service.get_run(run.run_id)
+
+    assert resolved_job_id == job.job_id
+    assert refreshed_run.linked_job_id == job.job_id
+
+
 def test_run_service_infers_specialist_role_scope_from_russian_edit_prompt(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -1384,6 +1887,32 @@ def test_run_service_infers_specialist_role_scope_from_russian_edit_prompt(tmp_p
 
     assert inferred_scope == ["specialist"]
     assert resolved_intent == "role_only_change"
+
+
+def test_run_service_expands_russian_workflow_edit_to_all_roles(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+    workspace_service = app.state.container.workspace_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Workflow Scope Workspace",
+            description="Workflow lifecycle edits should expand to all roles.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_workflow_scope").resolve()),
+        )
+    )
+    workspace_service.clone_template(workspace.workspace_id)
+    workspace = workspace_service.get_workspace(workspace.workspace_id)
+
+    request = CreateRunRequest(
+        prompt="Добавь возможность отменить заказ, если сотрудник ещё не начал обработку.",
+        generation_mode=GenerationMode.BALANCED,
+    )
+
+    inferred_scope = run_service._resolve_target_role_scope(request)
+
+    assert inferred_scope == ["client", "specialist", "manager"]
 
 
 def test_run_service_hot_paths_do_not_rescan_orphaned_runs_after_startup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1584,6 +2113,41 @@ def test_resolve_intent_prefers_create_for_workflow_heavy_app_requests(tmp_path:
     )
 
     intent = app.state.container.run_service._resolve_intent(workspace, request)
+
+    assert intent == "create"
+
+
+def test_resolve_intent_keeps_first_russian_store_prompt_as_create_after_template_clone(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    workspace_service = app.state.container.workspace_service
+    run_service = app.state.container.run_service
+
+    workspace = workspace_service.create_workspace(
+        WorkspaceRecord(
+            name="Store Workspace",
+            description="The first Russian commerce prompt should stay in create mode.",
+            path=str((tmp_path / "data" / "workspaces" / "ws_store_intent").resolve()),
+        )
+    )
+    workspace = workspace_service.clone_template(workspace.workspace_id)
+    workspace = workspace_service.get_workspace(workspace.workspace_id)
+    workspace.revisions.append(workspace.revisions[-1].model_copy())
+    workspace.updated_at = utc_now()
+    workspace_service.store.upsert("workspaces", workspace.workspace_id, workspace.model_dump(mode="json"))
+
+    request = CreateRunRequest(
+        prompt=(
+            "Мне нужно простое приложение для небольшого интернет-магазина. "
+            "Покупатель должен смотреть товары и оформлять заказ, сотрудник должен видеть новые заказы "
+            "и менять их статус, а администратор должен управлять товарами и видеть все заказы. "
+            "Главное, чтобы это был самый простой, но реально рабочий вариант без лишней сложности."
+        ),
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+    )
+
+    intent = run_service._resolve_intent(workspace, request)
 
     assert intent == "create"
 
@@ -3244,6 +3808,58 @@ def test_causal_and_structural_repair_targets_normalize_hyphenated_api_paths(tmp
     assert "miniapp/app/routes/time_slots.py" in added
 
 
+def test_write_path_validator_failures_expand_repair_surface_to_page_script_and_routes(tmp_path: Path) -> None:
+    service = create_app(
+        repo_root=Path(__file__).resolve().parents[3],
+        data_dir=tmp_path / "data",
+    ).state.container.generation_service
+    active_targets = [
+        "miniapp/app/db.py",
+        "miniapp/app/main.py",
+        "miniapp/app/schemas.py",
+        "miniapp/app/routes/orders.py",
+        "miniapp/app/static/client/order_new/index.html",
+        "miniapp/app/static/client/order_new/app.js",
+        "miniapp/app/static/client/order_new/styles.css",
+    ]
+    issues = [
+        SimpleNamespace(
+            code="build.fake_persistence_flow",
+            message="index.html renders a create/update form without a real API-backed write path.",
+            location="miniapp/app/static/client/order_new/index.html",
+        ),
+        SimpleNamespace(
+            code="build.dead_frontend_action",
+            message="index.html exposes a mutating UI action without a reachable API-backed write path in its page script.",
+            location="miniapp/app/static/client/order_new/index.html",
+        ),
+    ]
+
+    causal = service._causal_surface_for_issues(
+        build_issues=issues,
+        check_results=[],
+        active_targets=active_targets,
+    )
+    expanded, added = service._expand_structural_repair_targets(
+        active_targets=active_targets,
+        build_issues=issues,
+    )
+    selected = service._repair_targets_for_attempt(
+        active_targets=expanded,
+        check_results=[],
+        attempt=1,
+        causal_surface=causal,
+        scope_mode="workflow_partial_build",
+        structural_failure=True,
+    )
+
+    assert "miniapp/app/static/client/order_new/app.js" in causal
+    assert "miniapp/app/routes/orders.py" in causal
+    assert "miniapp/app/static/client/order_new/app.js" in expanded
+    assert "miniapp/app/routes/orders.py" in selected
+    assert "miniapp/app/static/client/order_new/app.js" in selected
+
+
 def test_generated_paths_use_underscores_for_static_and_route_files() -> None:
     normalized = GenerationService._normalize_path_list(
         [
@@ -4366,6 +4982,35 @@ def test_expand_repair_targets_for_safe_companions_allows_issue_located_route_fi
     assert "miniapp/app/routes/products.py" in expanded
 
 
+def test_expand_repair_targets_for_safe_companions_allows_role_profile_triplets_for_manifest_failures() -> None:
+    expanded = GenerationService._expand_repair_targets_for_safe_companions(
+        target_files=[
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/profiles.py",
+            "miniapp/app/static/client/index.html",
+        ],
+        invalid_paths=[
+            "miniapp/app/static/client/profile/index.html",
+            "miniapp/app/static/specialist/profile/index.html",
+            "miniapp/app/static/manager/profile/index.html",
+        ],
+        build_issues=[
+            ValidationIssue(
+                code="build.missing_role_profile_page",
+                message="client is missing the required profile page.",
+                severity="high",
+                location="artifacts/generated_app_graph.json",
+                blocking=True,
+            )
+        ],
+    )
+
+    assert expanded is not None
+    assert "miniapp/app/static/client/profile/index.html" in expanded
+    assert "miniapp/app/static/specialist/profile/index.html" in expanded
+    assert "miniapp/app/static/manager/profile/index.html" in expanded
+
+
 def test_whole_file_batch_timeout_seconds_respects_generation_mode(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -4378,40 +5023,6 @@ def test_whole_file_batch_timeout_seconds_respects_generation_mode(tmp_path: Pat
 
     assert fast_timeout <= balanced_timeout <= quality_timeout
     assert balanced_timeout == 180
-
-
-def test_whole_file_static_reuse_fallback_result_allows_existing_page_triplet(tmp_path: Path) -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
-    service: GenerationService = app.state.container.generation_service
-    workspace_service = app.state.container.workspace_service
-
-    workspace = workspace_service.create_workspace(
-        WorkspaceRecord(
-            name="Static Fallback Workspace",
-            description="Whole-file fallback should reuse existing static triplets when they already exist.",
-            path=str((tmp_path / "data" / "workspaces" / "ws_static_reuse").resolve()),
-        )
-    )
-    workspace_service.clone_template(workspace.workspace_id)
-    draft_run_id = "run_static_reuse"
-    workspace_service.prepare_draft(workspace.workspace_id, draft_run_id)
-
-    fallback = service.generation_codegen._whole_file_static_reuse_fallback_result(
-        workspace_id=workspace.workspace_id,
-        draft_run_id=draft_run_id,
-        cluster_name="role_client_ui_root",
-        cluster_targets=[
-            "miniapp/app/static/client/index.html",
-            "miniapp/app/static/client/styles.css",
-            "miniapp/app/static/client/app.js",
-        ],
-        timeout_seconds=180,
-    )
-
-    assert fallback is not None
-    assert fallback["operations"] == []
-    assert fallback["fallback_used"] is True
 
 
 def test_merge_advisory_generation_inputs_keeps_visual_role_only_patch_frontend_only(tmp_path: Path) -> None:
@@ -4821,6 +5432,7 @@ def test_generation_repair_turn_skips_backend_sync_for_visual_only_patch(tmp_pat
     plan = generation_repair._plan_generation_repair_turn(
         workspace_id="ws_visual",
         draft_run_id="run_visual",
+        draft_source=tmp_path / "draft_visual",
         prompt="Polish only the specialist booking details page styling.",
         grounded_spec=None,
         role_scope=["specialist"],
@@ -4901,6 +5513,7 @@ def test_generation_repair_turn_preserves_existing_roles_when_refreshing_runtime
     plan = generation_repair._plan_generation_repair_turn(
         workspace_id="ws_subset_scope",
         draft_run_id="run_subset_scope",
+        draft_source=tmp_path / "draft_subset_scope",
         prompt="Add a dedicated details page for client requests without changing specialist pages.",
         grounded_spec=SimpleNamespace(),
         role_scope=["client"],
@@ -5134,20 +5747,6 @@ def test_non_root_page_file_path_is_rewritten_when_model_returns_js_path(tmp_pat
     assert page["script_path"] == "miniapp/app/static/client/requests/app.js"
 
 
-def test_deterministic_resource_route_source_builds_dynamic_model_when_db_surface_is_missing() -> None:
-    source = MiniappGenerationContractApiRoutesCrud._deterministic_resource_route_source("requests")
-
-    assert "_DYNAMIC_RESOURCE_MODEL" in source
-    assert "_REFLECTED_RESOURCE_MODEL" in source
-    assert "Table(str(table_name), metadata, autoload_with=engine)" in source
-    assert "Base.metadata.create_all(bind=engine)" in source
-    assert 'mapped_column(String(255), default="")' in source
-    assert "def _passthrough_read_fields() -> set[str]:" in source
-    assert "if field in payload and field not in serialized:" in source
-    assert 'if "status" in data:' in source
-    assert "validated = schema_model.model_validate(data)" in source
-
-
 def test_generated_python_app_tests_choose_allowed_progress_status_literal(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -5247,6 +5846,70 @@ def test_finalize_role_pages_does_not_reinsert_profile_page(tmp_path: Path) -> N
     assert "/profile" not in route_paths
 
 
+def test_normalize_page_plan_hydrates_template_backed_profile_page_without_targeting_it(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    planned = service._normalize_page_plan(
+        {
+            "summary": "Client storefront flow.",
+            "page_graph": {
+                "app_title": "Store",
+                "summary": "Simple store.",
+                "flow_mode": "multi_page",
+                "roles": [
+                    {
+                        "role": "client",
+                        "entry_path": "/client",
+                        "landing_page_id": "client_home",
+                        "routes_file": "miniapp/app/routes/client.py",
+                        "pages": [
+                            {
+                                "page_id": "client_home",
+                                "route_path": "/",
+                                "file_path": "miniapp/app/static/client/index.html",
+                                "title": "Home",
+                                "description": "Home",
+                                "purpose": "Home",
+                                "page_kind": "dashboard",
+                                "navigation_label": "Home",
+                                "component_name": "ClientHomePage",
+                                "primary_actions": [],
+                                "handoff_paths": [],
+                                "data_dependencies": [],
+                                "loading_state": "",
+                                "empty_state": "",
+                                "error_state": "",
+                            }
+                        ],
+                    }
+                ],
+            },
+            "target_files": ["miniapp/app/static/client/index.html"],
+            "shared_files": [],
+            "backend_targets": ["miniapp/app/main.py"],
+            "files_to_read": [],
+        },
+        role_scope=["client"],
+        scope_mode="whole_file_build",
+        require_multi_page=True,
+        workspace_tree=[
+            {"path": "miniapp/app/static/client/profile/index.html"},
+            {"path": "miniapp/app/static/client/profile/styles.css"},
+            {"path": "miniapp/app/static/client/profile/app.js"},
+        ],
+    )
+
+    page_routes = {
+        str(page.get("route_path") or "")
+        for page in planned["page_graph"]["roles"]["client"]["pages"]
+        if isinstance(page, dict)
+    }
+    assert "/profile" in page_routes
+    assert "miniapp/app/static/client/profile/index.html" not in planned["target_files"]
+
+
 def test_endpoint_names_from_dependency_text_supports_non_api_paths() -> None:
     endpoints = GenerationService._endpoint_names_from_dependency_text("GET /users?role=specialist")
     assert endpoints == {"users"}
@@ -5284,6 +5947,73 @@ def test_structural_repair_targets_stay_broad_for_profile_and_manifest_failures(
     assert "miniapp/app/generated/route_manifest.json" in selected
     assert "miniapp/app/routes/profiles.py" in selected
     assert "miniapp/app/db.py" in selected
+
+
+def test_fix_classification_and_scope_handle_missing_role_profile_pages() -> None:
+    service = SimpleNamespace(
+        _resolve_frontend_module=lambda *args, **kwargs: None,
+        _resolve_backend_module=lambda *args, **kwargs: None,
+        _file_exists=lambda *args, **kwargs: True,
+        _allow_missing_scope_path=lambda _path: True,
+    )
+    runtime = FixClassificationRuntime(service)
+    text = (
+        'build.missing_role_profile_page: client is missing the required profile page.\n'
+        'route_manifest.missing_profile_route\n'
+        'artifacts/generated_app_graph.json'
+    )
+    existing_scope = [
+        FixScopeEntry(file_path="docker/docker-compose.yml", reason="legacy scope"),
+        FixScopeEntry(file_path="miniapp/requirements.txt", reason="legacy scope"),
+        FixScopeEntry(file_path="miniapp/app/main.py", reason="legacy scope"),
+    ]
+
+    implicated = runtime.implicated_files("ws", "run", text, existing_scope)
+    failure_class = runtime.specialized_failure_class(
+        workspace_id="ws",
+        run_id="run",
+        results=[],
+        combined_text=text,
+        implicated_files=implicated,
+    )
+    scope_builder = FixScopeBuilder(file_exists=lambda *args, **kwargs: True)
+    bundle = scope_builder.structural_scope_bundle(
+        workspace_id="ws",
+        run_id="run",
+        implicated_files=implicated,
+        failure_class=failure_class or "role_profile_surface_missing",
+        allow_missing_scope_path=lambda _path: True,
+    )
+
+    assert failure_class == "role_profile_surface_missing"
+    assert "miniapp/app/routes/client.py" in implicated
+    assert "miniapp/app/routes/profiles.py" in implicated
+    assert "miniapp/app/static/client/profile/index.html" in implicated
+    assert "docker/docker-compose.yml" not in implicated
+    assert "miniapp/requirements.txt" not in implicated
+    assert "miniapp/app/main.py" not in implicated
+    assert "miniapp/app/routes/role_pages.py" in bundle
+    assert "miniapp/app/routes/profiles.py" in bundle
+    assert "miniapp/app/static/client/profile/app.js" in bundle
+
+
+def test_generation_repair_force_patch_only_recovery_requires_existing_context() -> None:
+    assert (
+        MiniappGenerationRepair._has_meaningful_repair_context(
+            current_file_contexts={"miniapp/app/routes/client.py": "router = APIRouter()"},
+            initial_file_contexts={},
+            tool_results_for_attempt=[],
+        )
+        is True
+    )
+    assert (
+        MiniappGenerationRepair._has_meaningful_repair_context(
+            current_file_contexts={},
+            initial_file_contexts={},
+            tool_results_for_attempt=[],
+        )
+        is False
+    )
 
 
 def test_plan_expands_page_triplet_targets() -> None:
@@ -7404,6 +8134,123 @@ def test_workflow_partial_plan_skips_role_routes_for_ui_only_workflow_prompt(tmp
     assert "miniapp/app/static/specialist/app.js" in pruned["target_files"]
 
 
+def test_workflow_partial_plan_keeps_root_pages_and_excludes_unmatched_feature_pages(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    generation_service = app.state.container.generation_service
+    planned = {
+        "workspace_id": "ws_partial",
+        "target_files": [
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/manager.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/specialist/app.js",
+            "miniapp/app/static/manager/index.html",
+            "miniapp/app/static/manager/app.js",
+            "miniapp/app/static/manager/products/index.html",
+            "miniapp/app/static/manager/products/app.js",
+            "miniapp/app/static/shared/base.css",
+        ],
+        "backend_targets": [
+            "miniapp/app/routes/client.py",
+            "miniapp/app/routes/specialist.py",
+            "miniapp/app/routes/manager.py",
+            "miniapp/app/schemas.py",
+        ],
+        "shared_files": ["miniapp/app/static/shared/base.css"],
+        "files_to_read": [
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/manager/index.html",
+            "miniapp/app/static/manager/products/index.html",
+            "miniapp/app/static/shared/base.css",
+        ],
+        "page_graph": {
+            "roles": {
+                "client": {
+                    "routes_file": "miniapp/app/routes/client.py",
+                    "pages": [
+                        {
+                            "page_id": "client_home",
+                            "page_kind": "role_root",
+                            "route_path": "/",
+                            "title": "Каталог и заказ",
+                            "file_path": "miniapp/app/static/client/index.html",
+                            "script_path": "miniapp/app/static/client/app.js",
+                            "data_dependencies": ["/api/orders (GET)", "/api/orders (POST)"],
+                        }
+                    ],
+                },
+                "specialist": {
+                    "routes_file": "miniapp/app/routes/specialist.py",
+                    "pages": [
+                        {
+                            "page_id": "specialist_queue",
+                            "page_kind": "role_root",
+                            "route_path": "/",
+                            "title": "Очередь заказов",
+                            "file_path": "miniapp/app/static/specialist/index.html",
+                            "script_path": "miniapp/app/static/specialist/app.js",
+                            "data_dependencies": ["/api/orders/{item_id} (PUT)"],
+                        }
+                    ],
+                },
+                "manager": {
+                    "routes_file": "miniapp/app/routes/manager.py",
+                    "pages": [
+                        {
+                            "page_id": "manager_dashboard",
+                            "page_kind": "role_root",
+                            "route_path": "/",
+                            "title": "Все заказы",
+                            "file_path": "miniapp/app/static/manager/index.html",
+                            "script_path": "miniapp/app/static/manager/app.js",
+                            "data_dependencies": ["/api/orders (GET)"],
+                        },
+                        {
+                            "page_id": "manager_products",
+                            "page_kind": "management",
+                            "route_path": "/products",
+                            "title": "Управление товарами",
+                            "file_path": "miniapp/app/static/manager/products/index.html",
+                            "script_path": "miniapp/app/static/manager/products/app.js",
+                            "data_dependencies": ["/api/products (GET)"],
+                        },
+                    ],
+                },
+            }
+        },
+    }
+
+    pruned = generation_service.generation_code_plan._prune_workflow_partial_plan(
+        planned,
+        prompt="Добавь возможность отменить заказ, если сотрудник ещё не начал обработку.",
+        role_scope=["client", "specialist", "manager"],
+        role_patch_kind="contract_patch",
+    )
+
+    assert "miniapp/app/static/client/index.html" in pruned["target_files"]
+    assert "miniapp/app/static/specialist/index.html" in pruned["target_files"]
+    assert "miniapp/app/static/manager/index.html" in pruned["target_files"]
+    assert "miniapp/app/static/manager/products/index.html" not in pruned["target_files"]
+    assert "miniapp/app/static/manager/products/app.js" not in pruned["target_files"]
+
+
+def test_prompt_focus_tokens_support_russian_terms() -> None:
+    tokens = MiniappGenerationCodePlan._prompt_focus_tokens(
+        "Добавь фильтр новых заказов и счётчик товаров у администратора."
+    )
+
+    assert "заказов" in tokens
+    assert "заказ" in tokens
+    assert "товаров" in tokens
+    assert "товар" in tokens
+
+
 def test_workflow_partial_plan_recovers_missing_roles_from_source_graph(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
@@ -7803,15 +8650,6 @@ def test_generation_service_route_module_stub_detection_catches_inline_models_an
     assert GenerationService._route_module_needs_stub(
         "from fastapi import APIRouter\nrouter = APIRouter()\n@router.get('/')\ndef ok(): return {}"
     ) is False
-
-
-def test_generation_service_bootstrap_runtime_source_includes_runtime_manifest_endpoint() -> None:
-    content = GenerationService._deterministic_main_runtime_source(["requests", "assignments"])
-
-    assert 'ROUTE_MANIFEST_PATH = GENERATED_DIR / "route_manifest.json"' in content
-    assert "def _load_route_manifest() -> dict:" in content
-    assert "def _resolve_declared_page_file(role: str, actual_path: str) -> Path | None:" in content
-    assert "return RedirectResponse(url=\"/client\", status_code=307)" in content
 
 
 def test_run_completes_before_async_preview_rebuild_finishes(tmp_path: Path) -> None:
@@ -9252,6 +10090,7 @@ def test_page_generation_accepts_multiple_same_file_operations_and_uses_last_val
     result = service._resolve_page_file_edit(
         prompt="Build the catalog page.",
         grounded_spec=None,  # type: ignore[arg-type]
+        entity_contract={},
         role="client",
         page={"page_id": "catalog", "file_path": "miniapp/app/static/client/catalog.html"},
         page_graph={"roles": {}},
@@ -9266,6 +10105,72 @@ def test_page_generation_accepts_multiple_same_file_operations_and_uses_last_val
     assert "error" not in result
     assert result["operation"].file_path == "miniapp/app/static/client/catalog.html"
     assert "Final catalog page" in result["operation"].content
+
+
+def test_page_generation_accepts_js_only_patch_when_html_is_already_present(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    service = app.state.container.generation_service
+
+    service._page_edit_system_prompt = lambda: "page-system"  # type: ignore[method-assign]
+    service._page_edit_user_prompt = lambda **kwargs: "page-user"  # type: ignore[method-assign]
+    service._generate_structured_with_retry = lambda **kwargs: {  # type: ignore[method-assign]
+        "payload": {
+            "assistant_message": "Only JS changed.",
+            "operations": [
+                {
+                    "file_path": "miniapp/app/static/manager/app.js",
+                    "operation": "replace",
+                    "content": "console.log('cancel flow');\n",
+                    "reason": "wire cancel action",
+                }
+            ],
+        },
+        "model": "stub-model",
+    }
+
+    result = service._resolve_page_file_edit(
+        prompt="Add a cancel action to the manager page.",
+        grounded_spec=None,  # type: ignore[arg-type]
+        entity_contract={},
+        role="manager",
+        page={
+            "page_id": "manager_home",
+            "file_path": "miniapp/app/static/manager/index.html",
+            "script_path": "miniapp/app/static/manager/app.js",
+            "style_path": "miniapp/app/static/manager/styles.css",
+        },
+        page_graph={"roles": {}},
+        role_contract={},
+        scope_mode="workflow_partial_build",
+        intent="edit",
+        file_contexts={
+            "miniapp/app/static/manager/index.html": "<main><section>Manager</section></main>\n",
+        },
+        generation_mode=GenerationMode.BALANCED,
+        creative_direction={},
+    )
+
+    assert "error" not in result
+    assert "operation" not in result
+    assert [operation.file_path for operation in result["operations"]] == ["miniapp/app/static/manager/app.js"]
+
+
+def test_green_draft_auto_apply_does_not_mask_edit_llm_failure(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
+    run_service = app.state.container.run_service
+
+    run = RunRecord(
+        workspace_id="ws_test",
+        prompt="Add cancellation.",
+        mode="generate",
+        intent="edit",
+        apply_strategy="staged_auto_apply",
+    )
+    job = SimpleNamespace(failure_class="generation.edit.llm_failure")
+
+    assert run_service._complete_failed_run_from_green_draft(run=run, job=job, meaningful_paths=["miniapp/app/static/client/app.js"]) is False
 
 
 def test_page_graph_gate_accepts_root_and_profile_only_multi_page_flows(tmp_path: Path) -> None:
@@ -10667,48 +11572,6 @@ def test_workspace_loop_fast_context_mode_expands_before_full_bundle() -> None:
         made_progress=True,
         signature_changed=False,
     ) == "full_bundle"
-
-
-def test_generation_codegen_does_not_use_python_fast_prefill_for_any_cluster(tmp_path: Path) -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
-    service: GenerationService = app.state.container.generation_service
-
-    grounded_spec = SimpleNamespace(
-        domain_entities=[SimpleNamespace(name="repair_request")],
-        persistence_requirements=[SimpleNamespace()],
-        api_requirements=[SimpleNamespace()],
-        user_flows=[SimpleNamespace()],
-    )
-
-    assert service._should_prefer_deterministic_fast_cluster(
-        generation_mode=GenerationMode.FAST,
-        intent="create",
-        grounded_spec=grounded_spec,
-        role_scope=["client", "specialist", "manager"],
-        cluster_name="shared_static",
-    ) is False
-    assert service._should_prefer_deterministic_fast_cluster(
-        generation_mode=GenerationMode.FAST,
-        intent="create",
-        grounded_spec=grounded_spec,
-        role_scope=["client", "specialist", "manager"],
-        cluster_name="backend_support",
-    ) is False
-    assert service._should_prefer_deterministic_fast_cluster(
-        generation_mode=GenerationMode.FAST,
-        intent="create",
-        grounded_spec=grounded_spec,
-        role_scope=["client", "specialist", "manager"],
-        cluster_name="role_client_ui_root",
-    ) is False
-    assert service._should_prefer_deterministic_fast_cluster(
-        generation_mode=GenerationMode.BALANCED,
-        intent="create",
-        grounded_spec=grounded_spec,
-        role_scope=["client", "specialist", "manager"],
-        cluster_name="shared_static",
-    ) is False
 
 
 def test_run_artifacts_expose_engine_diagnostics_reports(tmp_path: Path) -> None:

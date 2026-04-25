@@ -7,6 +7,7 @@ from app.models.artifacts import ValidationIssue
 from app.models.common import GenerationMode
 from app.models.domain import DraftFileOperation, RunCheckResult
 from app.modules.miniapp_agent_loop.tool_agent_runtime import tool_patch_schema
+from app.services.miniapp_generation.constants import ROLE_ORDER
 from app.services.workspace.service import json_dumps
 from app.modules.miniapp_generation_runtime import MiniappGenerationReporting, MiniappGenerationReportingCompaction, MiniappGenerationReportingRepair
 
@@ -125,6 +126,7 @@ class ServiceRepairReportingMixins:
             if cls._is_canonical_target_path(location):
                 issue_implicated_paths.add(location)
             issue_implicated_paths.update(cls._safe_static_companion_paths(location))
+            issue_implicated_paths.update(cls._safe_repair_companion_paths_for_issue(issue))
         additions: list[str] = []
         for path in invalid_paths:
             if not isinstance(path, str):
@@ -143,6 +145,56 @@ class ServiceRepairReportingMixins:
         if not additions:
             return None
         return list(dict.fromkeys([*target_files, *additions]))
+
+    @classmethod
+    def _safe_repair_companion_paths_for_issue(cls, issue: ValidationIssue) -> set[str]:
+        code = str(issue.code or "").strip().lower()
+        message = str(issue.message or "").strip().lower()
+        location = str(issue.location or "").strip().lower()
+        markers = (
+            "build.missing_role_profile_page",
+            "route_manifest.missing_profile_route",
+            "runtime.missing_role_pages",
+        )
+        is_profile_surface_issue = code in {
+            "build.missing_role_profile_page",
+            "route_manifest.missing_profile_route",
+        } or any(marker in message for marker in markers) or any(marker in location for marker in markers)
+        if not is_profile_surface_issue:
+            return set()
+        roles = cls._roles_implicated_by_issue(issue)
+        paths: set[str] = {
+            "miniapp/app/routes/profiles.py",
+            "miniapp/app/routes/role_pages.py",
+            "miniapp/app/routes/runtime.py",
+        }
+        for role in roles:
+            profile_base = f"miniapp/app/static/{role}/profile/"
+            paths.update(
+                {
+                    f"{profile_base}index.html",
+                    f"{profile_base}styles.css",
+                    f"{profile_base}app.js",
+                    f"miniapp/app/routes/{role}.py",
+                }
+            )
+        return paths
+
+    @staticmethod
+    def _roles_implicated_by_issue(issue: ValidationIssue) -> tuple[str, ...]:
+        code = str(issue.code or "").strip().lower()
+        location = str(issue.location or "").strip().lower()
+        if code in {"build.missing_role_profile_page", "route_manifest.missing_profile_route"}:
+            return tuple(ROLE_ORDER)
+        if location in {"artifacts/generated_app_graph.json", "miniapp/app/generated/route_manifest.json"}:
+            return tuple(ROLE_ORDER)
+        haystacks = (
+            code,
+            str(issue.message or "").strip().lower(),
+            location,
+        )
+        matched = tuple(role for role in ROLE_ORDER if any(role in haystack for haystack in haystacks))
+        return matched or tuple(ROLE_ORDER)
 
     @staticmethod
     def _safe_static_companion_paths(path: str) -> set[str]:

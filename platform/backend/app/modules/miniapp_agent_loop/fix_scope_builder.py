@@ -42,6 +42,30 @@ class FixScopeBuilder:
         allow_missing_scope_path,
     ) -> list[str]:
         bundle: list[str] = []
+        if failure_class == "role_profile_surface_missing":
+            profile_roles = self._roles_from_implicated_paths(implicated_files)
+            if not profile_roles:
+                profile_roles = ["client", "specialist", "manager"]
+            structural_candidates = [
+                "miniapp/app/routes/profiles.py",
+                "miniapp/app/routes/role_pages.py",
+                "miniapp/app/routes/runtime.py",
+                "miniapp/app/schemas.py",
+                "miniapp/app/db.py",
+            ]
+            for candidate in structural_candidates:
+                if candidate in implicated_files:
+                    continue
+                if self._file_exists(workspace_id, run_id, candidate) or allow_missing_scope_path(candidate):
+                    bundle.append(candidate)
+            for role in profile_roles:
+                role_route = f"miniapp/app/routes/{role}.py"
+                if self._file_exists(workspace_id, run_id, role_route) or allow_missing_scope_path(role_route):
+                    bundle.append(role_route)
+                for suffix in ("index.html", "styles.css", "app.js"):
+                    candidate = f"miniapp/app/static/{role}/profile/{suffix}"
+                    if self._file_exists(workspace_id, run_id, candidate) or allow_missing_scope_path(candidate):
+                        bundle.append(candidate)
         needs_route_registration_context = any(path.startswith("miniapp/app/routes/") and path.endswith(".py") for path in implicated_files)
         if needs_route_registration_context or ("route" in failure_class or "contract" in failure_class):
             structural_candidates = ["miniapp/app/db.py", "miniapp/app/schemas.py"]
@@ -69,6 +93,17 @@ class FixScopeBuilder:
                 )
             )
         return list(dict.fromkeys(bundle))
+
+    @staticmethod
+    def _roles_from_implicated_paths(implicated_files: list[str]) -> list[str]:
+        roles: list[str] = []
+        for file_path in implicated_files:
+            normalized = str(file_path or "").strip().replace("\\", "/")
+            for role in ("client", "specialist", "manager"):
+                if f"/{role}/" in normalized or normalized.endswith(f"/{role}.py"):
+                    if role not in roles:
+                        roles.append(role)
+        return roles
 
     def _static_page_scope_bundle(
         self,

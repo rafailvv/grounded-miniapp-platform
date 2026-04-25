@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from app.ai.model_registry import default_profile_for_generation_mode
+from app.models.common import GenerationMode
 from app.models.domain import (
     CheckExecutionRecord,
     FixAttemptRecord,

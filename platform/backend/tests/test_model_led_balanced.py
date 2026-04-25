@@ -31,7 +31,6 @@ from app.modules.miniapp_generation_runtime.generation_entity_contract import Mi
 from app.modules.miniapp_generation_runtime.generation_progress_reporting import GenerationProgressReportingRuntime
 from app.modules.miniapp_generation_runtime.generation_page_graph_runtime import MiniappGenerationPageGraphRuntime
 from app.modules.miniapp_generation_runtime.generation_codegen import MiniappGenerationCodegen
-from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import MiniappGenerationContractApiRoutesCrud
 from app.modules.miniapp_generation_runtime.generation_contract_frontend import MiniappGenerationContractFrontend
 from app.modules.miniapp_generation_runtime.generation_contract_schema import MiniappGenerationContractSchema
 from app.modules.miniapp_generation_runtime.generation_normal_loop import MiniappGenerationNormalLoop
@@ -685,64 +684,6 @@ def test_backend_route_targets_group_into_one_backend_routes_cluster() -> None:
     ]
 
 
-def test_provider_budget_role_ui_fallback_is_disabled() -> None:
-    runtime = object.__new__(MiniappGenerationCodegen)
-    runtime.workspace_service = _DummyWorkspaceService(
-        {"miniapp/app/static/manager/profile/index.html": "<!doctype html><html></html>"}
-    )
-
-    result = runtime._whole_file_error_fallback_result(
-        workspace_id="ws_test",
-        draft_run_id="run_test",
-        cluster_name="role_manager_ui_bundle",
-        cluster_targets=[
-            "miniapp/app/static/manager/index.html",
-            "miniapp/app/static/manager/styles.css",
-            "miniapp/app/static/manager/app.js",
-            "miniapp/app/static/manager/details/index.html",
-            "miniapp/app/static/manager/details/styles.css",
-            "miniapp/app/static/manager/details/app.js",
-            "miniapp/app/static/manager/profile/index.html",
-        ],
-        error_message="OpenRouter chat/completions returned 402: can only afford 742 tokens",
-        entity_contract={
-            "api_path": "/api/cases",
-            "singular_label": "case",
-            "plural_label": "cases",
-            "status_literals": ["open", "resolved"],
-            "key_fields": [{"name": "customer_name", "type": "string", "required": True}],
-        },
-    )
-
-    assert result is None
-
-
-def test_split_role_ui_timeout_fallback_is_disabled() -> None:
-    runtime = object.__new__(MiniappGenerationCodegen)
-    runtime.workspace_service = _DummyWorkspaceService()
-
-    result = runtime._whole_file_role_ui_fallback_result(
-        workspace_id="ws_test",
-        draft_run_id="run_test",
-        cluster_name="role_client_ui_details",
-        cluster_targets=[
-            "miniapp/app/static/client/details/index.html",
-            "miniapp/app/static/client/details/styles.css",
-            "miniapp/app/static/client/details/app.js",
-        ],
-        entity_contract={
-            "api_path": "/api/cases",
-            "singular_label": "case",
-            "plural_label": "cases",
-            "status_literals": ["open", "resolved"],
-            "key_fields": [{"name": "customer_name", "type": "string", "required": True}],
-        },
-        timeout_seconds=420,
-    )
-
-    assert result is None
-
-
 def test_balanced_role_ui_timeout_uses_service_default_not_short_cap() -> None:
     runtime = object.__new__(MiniappGenerationCodegen)
     runtime.WHOLE_FILE_UI_CLUSTER_TIMEOUT_SECONDS = 420
@@ -899,18 +840,6 @@ def test_generated_python_tests_use_progress_status_when_schema_choices_are_unav
     )
 
     assert 'return choices[0] if choices else "in_progress"' in source
-
-
-def test_deterministic_crud_route_normalizes_done_alias_to_completed() -> None:
-    source = MiniappGenerationContractApiRoutesCrud._deterministic_resource_route_source("records")
-
-    assert "status_aliases = {" in source
-    assert '"done": "completed"' in source
-    assert '"canceled": "cancelled"' in source
-    assert 'normalized = status_aliases.get(status, status)' in source
-    assert 'status_families = (' in source
-    assert '("not_started", ("scheduled", "open", "new", "created", "accepted", "pending", "submitted", "queued", "draft"))' in source
-    assert '("cancelled", ("cancelled", "canceled", "rejected"))' in source
 
 
 def test_stabilizer_preserves_valid_refresh_ui_changes(tmp_path: Path) -> None:

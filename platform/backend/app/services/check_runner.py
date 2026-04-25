@@ -1034,7 +1034,7 @@ class CheckRunner:
 
     @staticmethod
     def _filter_build_issues(issues: list[ValidationIssue], scope_mode: str) -> list[ValidationIssue]:
-        if scope_mode not in {"minimal_patch", "workflow_partial_build", "fix_agentic"}:
+        if scope_mode not in {"minimal_patch", "role_partial_build", "workflow_partial_build", "fix_agentic"}:
             return issues
         ignored_prefixes = ("build.placeholder_",)
         ignored_codes = {"build.missing_entrypoint"}

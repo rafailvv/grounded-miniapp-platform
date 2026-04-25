@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 from app.models.common import GenerationMode
@@ -13,6 +14,153 @@ ROLE_ORDER = ("client", "specialist", "manager")
 
 
 class ArtifactManifestsMixin:
+    def _page_graph_page_key(self, role: str, page: dict[str, Any]) -> tuple[str, str]:
+        route_path = str(page.get("route_path") or "").strip()
+        file_path = str(page.get("file_path") or "").strip().replace("\\", "/")
+        if file_path:
+            return ("file", file_path)
+        normalized_role_route = self._normalize_role_route_path(role, route_path)
+        absolute_route = self._absolute_role_route_path(role, normalized_role_route)
+        return ("route", absolute_route)
+
+    def _merge_page_graph_pages(
+        self,
+        *,
+        role: str,
+        existing_pages: list[dict[str, Any]],
+        supplement_pages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for page in [*existing_pages, *supplement_pages]:
+            if not isinstance(page, dict):
+                continue
+            key = self._page_graph_page_key(role, page)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(dict(page))
+        return merged
+
+    def _supplement_role_pages_from_draft(
+        self,
+        *,
+        draft_source: Path,
+        role: str,
+        pages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        supplements: list[dict[str, Any]] = []
+        role_static_dir = draft_source / f"miniapp/app/static/{role}"
+        if not role_static_dir.exists():
+            return pages
+        for html_path in sorted(role_static_dir.glob("**/index.html")):
+            rel_html = html_path.relative_to(draft_source).as_posix()
+            rel_dir = html_path.parent.relative_to(role_static_dir).as_posix()
+            if rel_dir == ".":
+                route_path = f"/{role}"
+                page_id = f"{role}_home"
+                page_kind = "role_root"
+                title = role.title()
+                navigation_label = role.title()
+                is_entry = True
+            else:
+                slug = rel_dir.strip("/")
+                route_segments: list[str] = []
+                for segment in slug.split("/"):
+                    tokens = [token for token in segment.split("_") if token]
+                    if not tokens:
+                        continue
+                    rebuilt: list[str] = []
+                    index = 0
+                    while index < len(tokens):
+                        token = tokens[index]
+                        if index + 1 < len(tokens) and tokens[index + 1] == "id":
+                            rebuilt.append(f"{{{token}_id}}")
+                            index += 2
+                            continue
+                        if token.endswith("id") and token != "id":
+                            rebuilt.append(f"{{{token}}}")
+                        else:
+                            rebuilt.append(token)
+                        index += 1
+                    route_segments.extend(rebuilt)
+                route_path = f"/{role}/{'/'.join(route_segments)}" if route_segments else f"/{role}"
+                page_id = f"{role}_{slug.replace('/', '_')}".strip("_")
+                normalized_slug = slug.lower()
+                if normalized_slug == "profile":
+                    page_kind = "profile"
+                    navigation_label = "Profile"
+                elif any(marker in normalized_slug for marker in ("detail", "{", "}", "_id")):
+                    page_kind = "detail"
+                    navigation_label = Path(rel_dir).name.replace("_", " ").title() or "Detail"
+                else:
+                    page_kind = "page"
+                    navigation_label = Path(rel_dir).name.replace("_", " ").title() or "Open"
+                title = Path(rel_dir).name.replace("_", " ").title() or role.title()
+                is_entry = False
+            supplements.append(
+                {
+                    "page_id": page_id,
+                    "route_path": route_path,
+                    "file_path": rel_html,
+                    "style_path": self._default_page_asset_path(rel_html, "css"),
+                    "script_path": self._default_page_asset_path(rel_html, "js"),
+                    "page_kind": page_kind,
+                    "title": title,
+                    "navigation_label": navigation_label,
+                    "is_entry": is_entry,
+                }
+            )
+        return self._merge_page_graph_pages(role=role, existing_pages=pages, supplement_pages=supplements)
+
+    def _supplement_page_graph_from_draft(
+        self,
+        *,
+        page_graph: dict[str, Any],
+        draft_source: Path | None,
+        role_scope: list[str],
+        existing_generated_graph: dict[str, Any] | None,
+        preserve_existing_roles: bool,
+    ) -> dict[str, Any]:
+        if draft_source is None:
+            return dict(page_graph)
+        merged_graph = dict(page_graph)
+        merged_roles: dict[str, Any] = {}
+        if preserve_existing_roles and isinstance(existing_generated_graph, dict):
+            merged_roles.update(
+                {
+                    str(role): dict(payload)
+                    for role, payload in dict(existing_generated_graph.get("roles") or {}).items()
+                    if isinstance(payload, dict)
+                }
+            )
+        merged_roles.update(
+            {
+                str(role): dict(payload)
+                for role, payload in dict(page_graph.get("roles") or {}).items()
+                if isinstance(payload, dict)
+            }
+        )
+        for role in role_scope:
+            role_payload = dict(merged_roles.get(role) or {})
+            role_pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
+            role_payload["pages"] = self._supplement_role_pages_from_draft(
+                draft_source=draft_source,
+                role=role,
+                pages=role_pages,
+            )
+            role_payload["entry_path"] = str(role_payload.get("entry_path") or f"/{role}")
+            merged_roles[role] = role_payload
+        ordered_roles: dict[str, Any] = {}
+        for role in ROLE_ORDER:
+            if role in merged_roles:
+                ordered_roles[role] = merged_roles[role]
+        for role, payload in merged_roles.items():
+            if role not in ordered_roles:
+                ordered_roles[role] = payload
+        merged_graph["roles"] = ordered_roles
+        return merged_graph
+
     @staticmethod
     def _route_manifest_page_key(page: dict[str, Any]) -> str:
         route_path = str(page.get("route_path") or "").strip()
@@ -188,8 +336,17 @@ class ArtifactManifestsMixin:
         operations: list[DraftFileOperation],
         existing_route_manifest: dict[str, Any] | None = None,
         existing_runtime_manifest: dict[str, Any] | None = None,
+        existing_generated_graph: dict[str, Any] | None = None,
         preserve_existing_roles: bool = False,
+        draft_source: Path | None = None,
     ) -> list[DraftFileOperation]:
+        page_graph = self._supplement_page_graph_from_draft(
+            page_graph=page_graph,
+            draft_source=draft_source,
+            role_scope=role_scope,
+            existing_generated_graph=existing_generated_graph,
+            preserve_existing_roles=preserve_existing_roles,
+        )
         route_manifest = self.route_manifest_from_page_graph(page_graph, role_scope)
         runtime_manifest = self.runtime_manifest_from_page_graph(route_manifest, grounded_spec, generation_mode)
         if preserve_existing_roles:
@@ -200,6 +357,7 @@ class ArtifactManifestsMixin:
             )
             runtime_manifest = self.runtime_manifest_from_page_graph(route_manifest, grounded_spec, generation_mode)
         required_artifacts = {
+            "artifacts/generated_app_graph.json": (page_graph, "Persist the effective page graph after draft-aware runtime artifact normalization."),
             "miniapp/app/generated/route_manifest.json": (route_manifest, "Persist the canonical route manifest for the generated role pages."),
             "miniapp/app/generated/runtime_manifest.json": (runtime_manifest, "Persist the lightweight runtime manifest for the generated role pages."),
         }

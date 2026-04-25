@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import logging
+import os
 from typing import Any
 
 from app.models.domain import JobEvent, JobRecord, utc_now
@@ -116,9 +117,6 @@ class GenerationProgressReportingRuntime(MiniappGenerationRuntimeOwner):
         if cluster_name.startswith("backend_route_"):
             return "backend_route"
         if cluster_name.startswith("role_") and "_ui_" in cluster_name:
-            parts = cluster_name.split("_")
-            if len(parts) >= 3:
-                return f"role_ui_{parts[1]}"
             return "role_ui"
         return "serial"
 
@@ -133,7 +131,24 @@ class GenerationProgressReportingRuntime(MiniappGenerationRuntimeOwner):
                 grouped.append([cluster])
                 index += 1
                 continue
-            batch_limit = 2 if group_name == "backend_route" or group_name.startswith("role_ui_") else 3
+            if group_name == "backend_route":
+                env_name = "WHOLE_FILE_BACKEND_ROUTE_BATCH_LIMIT"
+                default_limit = 3
+            elif group_name == "role_ui":
+                env_name = "WHOLE_FILE_ROLE_UI_BATCH_LIMIT"
+                default_limit = 6
+            else:
+                env_name = "WHOLE_FILE_CLUSTER_BATCH_LIMIT"
+                default_limit = 3
+            batch_limit = max(
+                1,
+                int(
+                    os.getenv(
+                        env_name,
+                        os.getenv("WHOLE_FILE_CLUSTER_BATCH_LIMIT", str(default_limit)),
+                    )
+                ),
+            )
             batch = [cluster]
             index += 1
             while index < len(clusters) and len(batch) < batch_limit:
@@ -152,8 +167,10 @@ class GenerationProgressReportingRuntime(MiniappGenerationRuntimeOwner):
             "indexing_started": ("indexing workspace", 3),
             "retrieval_started": ("retrieving context", 4),
             "retrieval_completed": ("retrieval complete", 6),
-            "building_scaffold": ("building scaffold", 7),
-            "scaffold_ready": ("scaffold ready", 12),
+            "building_surface": ("building generation surface", 7),
+            "surface_ready": ("generation surface ready", 12),
+            "building_scaffold": ("building generation surface", 7),
+            "scaffold_ready": ("generation surface ready", 12),
             "spec_started": ("building grounded spec", 7),
             "spec_ready": ("grounded spec ready", 9),
             "draft_prepared": ("preparing draft workspace", 10),

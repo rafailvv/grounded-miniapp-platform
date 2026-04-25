@@ -9,6 +9,8 @@ from app.modules.miniapp_agent_loop.tool_agent_runtime import (
     search_workspace_files,
     summarize_read_file_payloads,
 )
+from app.services.generation_runtime_config import ACTIVE_GENERATION_QUERY_CONFIG, ACTIVE_GENERATION_TURN_STATE
+from app.services.generation_tool_orchestrator import GenerationToolOrchestrator
 
 if TYPE_CHECKING:
     from app.services.miniapp_generation.service import GenerationService
@@ -66,7 +68,8 @@ class GenerationRepairToolRuntime:
         additional_targets: list[str] = []
         tool_results: list[dict[str, object]] = []
         extra_contexts: dict[str, str] = {}
-        for request_item in tool_requests:
+
+        def _execute_single_request(request_item: dict[str, Any]) -> tuple[list[str], dict[str, object] | None, dict[str, str]]:
             tool_name = str(request_item.get("tool") or "").strip().lower()
             targets = [
                 str(item or "").strip().lstrip("./")
@@ -83,16 +86,16 @@ class GenerationRepairToolRuntime:
                 missing_targets: list[str] = []
                 loaded_contents: dict[str, str] = {}
                 for path in approved:
-                    if path not in additional_targets:
-                        additional_targets.append(path)
                     content = self.service.workspace_service.try_read_text_file(workspace_id, path, run_id=draft_run_id)
                     if content is not None:
-                        extra_contexts[path] = content
                         loaded_contents[path] = content
                         continue
                     missing_targets.append(path)
-                    extra_contexts[path] = self._missing_file_context(path)
-                tool_results.append(
+                read_contexts = dict(loaded_contents)
+                for path in missing_targets:
+                    read_contexts[path] = self._missing_file_context(path)
+                return (
+                    list(approved),
                     {
                         "tool": "read_files",
                         "targets": list(targets),
@@ -100,20 +103,22 @@ class GenerationRepairToolRuntime:
                         "missing_targets": missing_targets,
                         "files": summarize_read_file_payloads(file_contents=loaded_contents),
                         "reason": reason,
-                    }
+                    },
+                    read_contexts,
                 )
-                continue
             if tool_name == "list_files":
-                tool_results.append(
+                return (
+                    [],
                     {
                         **list_workspace_files(workspace_tree=workspace_tree, targets=targets),
                         "reason": reason,
-                    }
+                    },
+                    {},
                 )
-                continue
             if tool_name == "search_files":
                 pattern = str(request_item.get("pattern") or "").strip()
-                tool_results.append(
+                return (
+                    [],
                     {
                         **search_workspace_files(
                             workspace_tree=workspace_tree,
@@ -126,11 +131,12 @@ class GenerationRepairToolRuntime:
                             targets=targets,
                         ),
                         "reason": reason,
-                    }
+                    },
+                    {},
                 )
-                continue
             if tool_name == "run_command":
-                tool_results.append(
+                return (
+                    [],
                     {
                         **run_workspace_command(
                             draft_source=draft_source,
@@ -138,9 +144,9 @@ class GenerationRepairToolRuntime:
                             timeout_seconds=command_timeout_seconds,
                         ),
                         "reason": reason,
-                    }
+                    },
+                    {},
                 )
-                continue
             if tool_name == "run_checks":
                 requested_changed_files = list(targets or fallback_targets or ["miniapp"])
                 mode = str(request_item.get("mode") or "exact").strip().lower() or "exact"
@@ -165,4 +171,24 @@ class GenerationRepairToolRuntime:
                         "preview_logs": list((preview_details.get("logs") or [])[-8:]),
                     }
                 )
+            return ([], None, {})
+
+        query_config = ACTIVE_GENERATION_QUERY_CONFIG.get()
+        orchestrator = GenerationToolOrchestrator(
+            max_concurrency=getattr(query_config, "max_tool_concurrency", 8),
+        )
+        executed_batches, orchestration_ms = orchestrator.execute(
+            tool_requests=tool_requests,
+            run_request=_execute_single_request,
+        )
+        turn_state = ACTIVE_GENERATION_TURN_STATE.get()
+        if turn_state is not None:
+            turn_state.tool_orchestration_ms += orchestration_ms
+        for batch_targets, batch_result, batch_contexts in executed_batches:
+            for path in batch_targets:
+                if path not in additional_targets:
+                    additional_targets.append(path)
+            if batch_result is not None:
+                tool_results.append(batch_result)
+            extra_contexts.update(batch_contexts)
         return additional_targets, tool_results, extra_contexts

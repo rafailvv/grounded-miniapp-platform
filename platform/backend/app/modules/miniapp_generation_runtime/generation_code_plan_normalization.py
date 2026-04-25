@@ -42,6 +42,7 @@ class MiniappGenerationCodePlanNormalization(MiniappGenerationRuntimeOwner):
         backend_targets = self._normalize_path_list(raw_graph.get("backend_targets") or payload.get("backend_targets"), [])
         roles: dict[str, dict[str, Any]] = {}
         graph_page_targets: list[str] = []
+        workspace_tree_paths = self._workspace_tree_paths(workspace_tree)
 
         for role in role_scope:
             role_payload = roles_source.get(role)
@@ -52,6 +53,11 @@ class MiniappGenerationCodePlanNormalization(MiniappGenerationRuntimeOwner):
                 raise ValueError(f"Page graph is missing page definitions for {role}.")
             pages = [self._normalize_page_definition(role, page, index) for index, page in enumerate(pages_raw)]
             pages = self._finalize_role_pages(role, pages, require_multi_page=require_multi_page)
+            pages = self._ensure_template_backed_profile_page(
+                role,
+                pages,
+                workspace_tree_paths=workspace_tree_paths,
+            )
             route_candidates = self._normalize_path_list([role_payload.get("routes_file")], [])
             routes_file = route_candidates[0] if route_candidates else self._default_routes_file(role)
             roles[role] = {
@@ -60,7 +66,11 @@ class MiniappGenerationCodePlanNormalization(MiniappGenerationRuntimeOwner):
                 "routes_file": routes_file,
                 "pages": pages,
             }
-            graph_page_targets.extend(page["file_path"] for page in pages)
+            graph_page_targets.extend(
+                page["file_path"]
+                for page in pages
+                if not bool(page.get("_template_backed"))
+            )
 
         proactive_backend_targets: list[str] = []
 
@@ -75,7 +85,7 @@ class MiniappGenerationCodePlanNormalization(MiniappGenerationRuntimeOwner):
             )
         )
         raw_target_files = self._normalize_path_list(payload.get("target_files"), [])
-        if scope_mode in {"minimal_patch", "workflow_partial_build"} and raw_target_files:
+        if scope_mode in {"minimal_patch", "role_partial_build", "workflow_partial_build"} and raw_target_files:
             computed_target_set = set(computed_targets)
             intersection = [path for path in raw_target_files if path in computed_target_set]
             if computed_targets and not intersection:
@@ -136,6 +146,62 @@ class MiniappGenerationCodePlanNormalization(MiniappGenerationRuntimeOwner):
             "scope_mode": scope_mode,
             "require_multi_page": require_multi_page,
         }
+
+    @staticmethod
+    def _workspace_tree_paths(workspace_tree: list[dict[str, Any]]) -> set[str]:
+        paths: set[str] = set()
+        for entry in workspace_tree:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path") or "").strip().lstrip("./")
+            if path:
+                paths.add(path)
+        return paths
+
+    def _ensure_template_backed_profile_page(
+        self,
+        role: str,
+        pages: list[dict[str, Any]],
+        *,
+        workspace_tree_paths: set[str],
+    ) -> list[dict[str, Any]]:
+        if any(
+            str(page.get("route_path") or "").strip().lower() == "/profile"
+            or str(page.get("file_path") or "").strip().replace("\\", "/").endswith(f"/{role}/profile/index.html")
+            or str(page.get("page_kind") or "").strip().lower() in {"role_profile", "profile"}
+            for page in pages
+        ):
+            return pages
+        profile_index = f"miniapp/app/static/{role}/profile/index.html"
+        profile_styles = f"miniapp/app/static/{role}/profile/styles.css"
+        profile_script = f"miniapp/app/static/{role}/profile/app.js"
+        if profile_index not in workspace_tree_paths:
+            return pages
+        normalized = self._normalize_page_definition(
+            role,
+            {
+                "page_id": f"{role}_profile",
+                "route_path": "/profile",
+                "navigation_label": "Profile",
+                "component_name": f"{role.title()}ProfilePage",
+                "file_path": profile_index,
+                "style_path": profile_styles,
+                "script_path": profile_script,
+                "title": f"{role.title()} profile",
+                "description": f"{role.title()} profile page.",
+                "purpose": f"{role.title()} profile page.",
+                "page_kind": "profile",
+                "primary_actions": [f"{role}_profile_save"],
+                "handoff_paths": ["/"],
+                "data_dependencies": [],
+                "loading_state": "",
+                "empty_state": "",
+                "error_state": "",
+            },
+            len(pages),
+        )
+        normalized["_template_backed"] = True
+        return [*pages, normalized]
 
     def _finalize_role_pages(self, role: str, pages: list[dict[str, Any]], *, require_multi_page: bool) -> list[dict[str, Any]]:
         if not pages:

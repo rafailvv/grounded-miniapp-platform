@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.services.generation_runtime_config import TimeoutProfile
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -52,6 +54,7 @@ def get_settings(
 ) -> Settings:
     root = repo_root or Path(__file__).resolve().parents[4]
     _load_repo_env(root / ".env")
+    timeout_profile = TimeoutProfile.from_env()
     preview_base_url = os.getenv("PREVIEW_BASE_URL", preview_base_url)
     resolved_data_dir = data_dir or Path(os.getenv("PLATFORM_DATA_DIR", str(root / "data")))
     resolved_host_data_dir = Path(os.getenv("PLATFORM_HOST_DATA_DIR", str(resolved_data_dir)))
@@ -67,7 +70,7 @@ def get_settings(
         preview_base_url=preview_base_url,
         preview_runtime_mode=os.getenv("PREVIEW_RUNTIME_MODE", "auto"),
         preview_port_base=int(os.getenv("PREVIEW_PORT_BASE", "16000")),
-        preview_start_timeout_sec=int(os.getenv("PREVIEW_START_TIMEOUT_SEC", "120")),
+        preview_start_timeout_sec=timeout_profile.preview_start_sec,
         openrouter_app_name=os.getenv("OPENROUTER_APP_NAME", "Grounded Mini-App Platform"),
         openrouter_site_url=os.getenv("OPENROUTER_SITE_URL", "http://localhost:5173"),
     )

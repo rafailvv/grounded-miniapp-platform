@@ -1,10 +1,6 @@
 from app.modules.miniapp_generation_runtime.generation_completion import MiniappGenerationCompletion
 from app.modules.miniapp_generation_runtime.generation_contract_critic import MiniappGenerationContractCritic
 from app.modules.miniapp_generation_runtime.generation_contract_frontend import MiniappGenerationContractFrontend
-from app.modules.miniapp_generation_runtime.generation_contract_api_routes_crud import MiniappGenerationContractApiRoutesCrud
-from app.modules.miniapp_generation_runtime.generation_contract_api_routes_runtime import MiniappGenerationContractApiRoutesRuntime
-from app.modules.miniapp_generation_runtime.generation_contract_api_routes_support import MiniappGenerationContractApiRoutesSupport
-from app.modules.miniapp_generation_runtime.generation_contract_page_sources import MiniappGenerationContractPageSources
 from app.modules.miniapp_generation_runtime.generation_contract_pass import MiniappGenerationContractPass
 from app.modules.miniapp_generation_runtime.generation_contract_routes import MiniappGenerationContractRoutes
 from app.modules.miniapp_generation_runtime.generation_contract_schema import MiniappGenerationContractSchema
@@ -21,6 +17,7 @@ from app.modules.miniapp_generation_runtime.generation_normal_loop import Miniap
 from app.modules.miniapp_generation_runtime.generation_page_graph_runtime import MiniappGenerationPageGraphRuntime
 from app.modules.miniapp_generation_runtime.generation_plan_runtime import MiniappGenerationPlanRuntime
 from app.modules.miniapp_generation_runtime.generation_progress_reporting import GenerationProgressReportingRuntime
+from app.modules.miniapp_generation_runtime.generation_query_runtime import GenerationQueryRuntime
 from app.modules.miniapp_generation_runtime.generation_paths import MiniappGenerationPaths
 from app.modules.miniapp_generation_runtime.generation_reporting import MiniappGenerationReporting
 from app.modules.miniapp_generation_runtime.generation_reporting_compaction import MiniappGenerationReportingCompaction
@@ -43,10 +40,6 @@ __all__ = [
     "MiniappGenerationCompletion",
     "MiniappGenerationContractCritic",
     "MiniappGenerationContractFrontend",
-    "MiniappGenerationContractApiRoutesCrud",
-    "MiniappGenerationContractApiRoutesRuntime",
-    "MiniappGenerationContractApiRoutesSupport",
-    "MiniappGenerationContractPageSources",
     "MiniappGenerationContractPass",
     "MiniappGenerationContractRoutes",
     "MiniappGenerationContractSchema",
@@ -63,6 +56,7 @@ __all__ = [
     "MiniappGenerationPageGraphRuntime",
     "MiniappGenerationPlanRuntime",
     "GenerationProgressReportingRuntime",
+    "GenerationQueryRuntime",
     "MiniappGenerationPaths",
     "MiniappGenerationReporting",
     "MiniappGenerationReportingCompaction",

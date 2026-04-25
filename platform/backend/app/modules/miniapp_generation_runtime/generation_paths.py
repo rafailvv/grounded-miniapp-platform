@@ -143,10 +143,6 @@ class MiniappGenerationPaths(MiniappGenerationRuntimeOwner):
             return "/"
         if role == "client" and normalized in {"/new", "/request_new", "/request_create"}:
             return "/create"
-        if role == "specialist" and normalized in {"/tasks", "/assigned", "/queue"}:
-            return "/requests"
-        if role == "manager" and normalized in {"/tasks", "/queue", "/overview"}:
-            return "/requests"
         return normalized
 
     @staticmethod

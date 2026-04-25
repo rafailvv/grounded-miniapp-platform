@@ -53,6 +53,7 @@ class BuildValidator:
         issues.extend(self._validate_persistent_storage_contract(workspace_path))
         issues.extend(self._validate_runtime_provider_contract(workspace_path))
         issues.extend(self._validate_mock_and_fallback_contract(workspace_path))
+        issues.extend(self._validate_frontend_backend_surface_contract(workspace_path))
         return issues
 
     @staticmethod
@@ -66,6 +67,54 @@ class BuildValidator:
             or file_path == f"miniapp/app/static/{role}/index.html"
             or page_kind in {"home", "dashboard", "landing"}
         )
+
+    @staticmethod
+    def _materialized_role_pages(
+        *,
+        workspace_path: Path,
+        role: str,
+        pages: list[dict],
+    ) -> list[dict]:
+        materialized = [dict(page) for page in pages if isinstance(page, dict)]
+        known_signatures = {
+            (
+                str(page.get("route_path") or "").strip().rstrip("/"),
+                str(page.get("file_path") or "").strip().replace("\\", "/"),
+            )
+            for page in materialized
+        }
+        shell_candidates = (
+            (
+                workspace_path / f"miniapp/app/static/{role}/index.html",
+                f"/{role}",
+                f"miniapp/app/static/{role}/index.html",
+                "role_root",
+                True,
+            ),
+            (
+                workspace_path / f"miniapp/app/static/{role}/profile/index.html",
+                f"/{role}/profile",
+                f"miniapp/app/static/{role}/profile/index.html",
+                "profile",
+                False,
+            ),
+        )
+        for html_path, route_path, file_path, page_kind, is_entry in shell_candidates:
+            signature = (route_path.rstrip("/"), file_path)
+            if signature in known_signatures or not html_path.exists():
+                continue
+            materialized.append(
+                {
+                    "route_path": route_path,
+                    "file_path": file_path,
+                    "style_path": file_path.replace("index.html", "styles.css"),
+                    "script_path": file_path.replace("index.html", "app.js"),
+                    "page_kind": page_kind,
+                    "is_entry": is_entry,
+                }
+            )
+            known_signatures.add(signature)
+        return materialized
 
     @staticmethod
     def _has_visible_loading_surface(content: str) -> bool:
@@ -296,7 +345,11 @@ class BuildValidator:
                     )
                 )
                 continue
-            pages = role_payload.get("pages") or []
+            pages = self._materialized_role_pages(
+                workspace_path=workspace_path,
+                role=role,
+                pages=role_payload.get("pages") or [],
+            )
             routes_file_raw = role_payload.get("routes_file")
             if isinstance(routes_file_raw, str) and routes_file_raw:
                 routes_file = workspace_path / routes_file_raw
@@ -519,7 +572,11 @@ class BuildValidator:
         for role, role_payload in (route_manifest.get("roles") or {}).items():
             if not isinstance(role_payload, dict):
                 continue
-            pages = role_payload.get("pages") or []
+            pages = self._materialized_role_pages(
+                workspace_path=workspace_path,
+                role=role,
+                pages=role_payload.get("pages") or [],
+            )
             root_pages = [
                 page
                 for page in pages
@@ -1084,6 +1141,45 @@ class BuildValidator:
                         )
         return issues
 
+    def _validate_frontend_backend_surface_contract(self, workspace_path: Path) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        route_manifest = self._read_json(workspace_path / "miniapp" / "app" / "generated" / "route_manifest.json")
+        if not isinstance(route_manifest, dict):
+            return issues
+        for role_payload in (route_manifest.get("roles") or {}).values():
+            if not isinstance(role_payload, dict):
+                continue
+            for page in role_payload.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                file_path_raw = str(page.get("file_path") or "")
+                script_path_raw = str(page.get("script_path") or "")
+                if not file_path_raw or not script_path_raw:
+                    continue
+                html_path = workspace_path / file_path_raw
+                script_path = workspace_path / script_path_raw
+                if not html_path.exists() or not script_path.exists():
+                    continue
+                try:
+                    html_content = html_path.read_text(encoding="utf-8")
+                    script_content = script_path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if (
+                    self._looks_like_mutating_action_surface(html_content)
+                    and not self._contains_real_api_write(script_content)
+                    and not self._uses_canonical_profile_contract(page, script_content)
+                ):
+                    issues.append(
+                        ValidationIssue(
+                            code="build.dead_frontend_action",
+                            message=f"{Path(file_path_raw).name} exposes a mutating UI action without a reachable API-backed write path in its page script.",
+                            severity="high",
+                            location=file_path_raw,
+                        )
+                    )
+        return issues
+
     @staticmethod
     def _looks_like_persisted_form_surface(html_content: str) -> bool:
         lowered = str(html_content or "").lower()
@@ -1133,6 +1229,29 @@ class BuildValidator:
         if has_only_filter_controls:
             return False
         return False
+
+    @staticmethod
+    def _looks_like_mutating_action_surface(html_content: str) -> bool:
+        lowered = str(html_content or "").lower()
+        action_markers = (
+            ">create<",
+            ">save<",
+            ">update<",
+            ">assign<",
+            ">approve<",
+            ">reject<",
+            ">cancel<",
+            ">submit<",
+            ">confirm<",
+            ">complete<",
+            "save changes",
+            "create order",
+            "place order",
+        )
+        if BuildValidator._looks_like_persisted_form_surface(html_content):
+            return True
+        has_button = "<button" in lowered or "role=\"button\"" in lowered or "role='button'" in lowered
+        return has_button and any(marker in lowered for marker in action_markers)
 
     @staticmethod
     def _looks_like_live_collection_surface(html_content: str) -> bool:

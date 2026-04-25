@@ -52,7 +52,7 @@ class MiniappGenerationEntry:
         if fast_visual_job is not None:
             return fast_visual_job
 
-        self.service._append_event(job, "building_scaffold", "Building a planner-driven generation surface on top of the minimal template bootstrap.")
+        self.service._append_event(job, "building_surface", "Building a planner-driven generation surface on top of the minimal template bootstrap.")
         self.service._append_trace(
             workspace_id,
             "generation_loop_started",
@@ -157,7 +157,7 @@ class MiniappGenerationEntry:
                 "Role contract analysis produced soft guidance issues; continuing with prompt-driven planning.",
                 {"issues": role_contract_issues},
             )
-        self.service._append_event(job, "scaffold_ready", "Role guidance compiled as advisory input for file-first generation.")
+        self.service._append_event(job, "surface_ready", "Role guidance compiled as advisory input for file-first generation.")
 
         advisory_plan_result = self.service._resolve_code_plan(
             workspace_id=workspace_id,
@@ -177,7 +177,7 @@ class MiniappGenerationEntry:
             inferred_plan_result={},
         )
         plan_error = str(advisory_plan_result.get("error") or "").strip()
-        self.service._append_event(job, "scaffold_ready", "Planner targets and advisory generation hints are ready.")
+        self.service._append_event(job, "surface_ready", "Planner targets and advisory generation hints are ready.")
         self.service._append_trace(
             workspace_id,
             "generation_plan_advisory",
@@ -371,7 +371,7 @@ class MiniappGenerationEntry:
             or None
         )
         advisory_scope_uses_targeted_merge = bool(
-            scope_mode in {"minimal_patch", "workflow_partial_build"} and (advisory_page_targets or advisory_backend_targets)
+            scope_mode in {"minimal_patch", "role_partial_build", "workflow_partial_build"} and (advisory_page_targets or advisory_backend_targets)
         )
         advisory_has_explicit_surface = bool(
             scope_mode == "whole_file_build"

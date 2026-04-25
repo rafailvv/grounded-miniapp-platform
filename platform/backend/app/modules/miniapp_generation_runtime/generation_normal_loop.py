@@ -704,6 +704,7 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
         ]
         existing_route_manifest = self._load_json_file(draft_source / "miniapp/app/generated/route_manifest.json")
         existing_runtime_manifest = self._load_json_file(draft_source / "miniapp/app/generated/runtime_manifest.json")
+        existing_generated_graph = self._load_json_file(draft_source / "artifacts/generated_app_graph.json")
         preserve_existing_roles = (
             bool(role_scope)
             and set(role_scope) < {"client", "specialist", "manager"}
@@ -723,7 +724,9 @@ class MiniappGenerationNormalLoop(MiniappGenerationRuntimeOwner):
                 operations=operations,
                 existing_route_manifest=existing_route_manifest,
                 existing_runtime_manifest=existing_runtime_manifest,
+                existing_generated_graph=existing_generated_graph,
                 preserve_existing_roles=preserve_existing_roles,
+                draft_source=draft_source,
             )
         if not visual_only_patch:
             operations = service._ensure_app_level_test_operations(

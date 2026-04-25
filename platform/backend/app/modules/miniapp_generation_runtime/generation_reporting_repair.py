@@ -11,6 +11,24 @@ from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerati
 
 class MiniappGenerationReportingRepair(MiniappGenerationRuntimeOwner):
     @staticmethod
+    def _static_page_companion_paths(location: str) -> list[str]:
+        normalized = str(location or "").strip().replace("\\", "/")
+        if not normalized.startswith("miniapp/app/static/"):
+            return []
+        companions: list[str] = []
+        if normalized.endswith("/index.html"):
+            page_dir = normalized.rsplit("/", 1)[0]
+            companions.extend([f"{page_dir}/app.js", f"{page_dir}/styles.css"])
+        elif normalized.endswith(".html"):
+            companions.extend(
+                [
+                    normalized[:-5] + ".js",
+                    normalized[:-5] + ".css",
+                ]
+            )
+        return companions
+
+    @staticmethod
     def _stateful_page_contracts(page_graph: dict[str, Any], role_scope: list[str]) -> list[dict[str, Any]]:
         roles = page_graph.get("roles") or {}
         contracts: list[dict[str, Any]] = []
@@ -61,6 +79,8 @@ class MiniappGenerationReportingRepair(MiniappGenerationRuntimeOwner):
                 "connectivity.missing_ui_error_state",
                 "tests.python_generated_app",
                 "tests.js_generated_app",
+                "build.fake_persistence_flow",
+                "build.dead_frontend_action",
             }:
                 return True
             lowered = issue.message.lower()
@@ -99,6 +119,18 @@ class MiniappGenerationReportingRepair(MiniappGenerationRuntimeOwner):
         for issue in build_issues:
             if issue.location in active_target_set:
                 causal.add(issue.location)
+            if issue.code in {"build.fake_persistence_flow", "build.dead_frontend_action"}:
+                for companion in self._static_page_companion_paths(issue.location):
+                    if companion in active_target_set:
+                        causal.add(companion)
+                for candidate in active_targets:
+                    normalized = str(candidate or "").replace("\\", "/")
+                    if normalized in {
+                        "miniapp/app/db.py",
+                        "miniapp/app/main.py",
+                        "miniapp/app/schemas.py",
+                    } or normalized.startswith("miniapp/app/routes/"):
+                        causal.add(candidate)
             if issue.code in {"build.placeholder_role_surface", "build.placeholder_page"}:
                 for candidate in active_targets:
                     normalized = candidate.replace("\\", "/")
@@ -131,6 +163,21 @@ class MiniappGenerationReportingRepair(MiniappGenerationRuntimeOwner):
                         expanded.append(candidate)
                         added.append(candidate)
             message = str(issue.message or "").lower()
+            if issue.code in {"build.fake_persistence_flow", "build.dead_frontend_action"}:
+                for companion in self._static_page_companion_paths(issue.location):
+                    if companion not in expanded:
+                        expanded.append(companion)
+                        added.append(companion)
+                for candidate in active_targets:
+                    normalized = str(candidate or "").replace("\\", "/")
+                    if normalized in {
+                        "miniapp/app/db.py",
+                        "miniapp/app/main.py",
+                        "miniapp/app/schemas.py",
+                    } or normalized.startswith("miniapp/app/routes/"):
+                        if candidate not in expanded:
+                            expanded.append(candidate)
+                            added.append(candidate)
             is_ui_contract_issue = issue.code in {
                 "build.page_missing_script_link",
                 "build.page_script_dom_contract",

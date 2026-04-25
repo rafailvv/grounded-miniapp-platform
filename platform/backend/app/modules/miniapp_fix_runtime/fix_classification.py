@@ -42,6 +42,7 @@ class FixClassificationRuntime:
             "db_dependency_export_missing": 95,
             "backend_framework_mismatch": 94,
             "loading_first_root_surface": 92,
+            "role_profile_surface_missing": 91,
             "frontend_link_route_mismatch": 90,
             "router_not_registered": 88,
             "api_endpoint_missing": 86,
@@ -79,6 +80,13 @@ class FixClassificationRuntime:
             return "runtime_manifest_route_missing"
         if "shared-state update failure" in lowered or ("did not reflect" in lowered and "shared state" in lowered):
             return "persistence_contract_mismatch"
+        if (
+            "build.missing_role_profile_page" in issue_codes
+            or "missing the required profile page" in lowered
+            or "route_manifest.missing_profile_route" in lowered
+            or "runtime.missing_role_pages." in lowered
+        ):
+            return "role_profile_surface_missing"
         if ("cannot import name 'get_db'" in lowered or 'cannot import name "get_db"' in lowered or "import get_db" in lowered) and any(
             path.endswith(("/db.py", "/schemas.py", "/main.py")) for path in implicated_files
         ):
@@ -193,6 +201,11 @@ class FixClassificationRuntime:
                 "page_missing_script_link",
                 "placeholder_role_surface",
                 "placeholder_page",
+                "missing_role_profile_page",
+                "required profile page",
+                "missing profile page",
+                "runtime.missing_role_pages",
+                "route_manifest.missing_profile_route",
                 "route referenced",
             )
         )
@@ -393,12 +406,21 @@ class FixClassificationRuntime:
                 r"no(?: declared)? pages? (?:for role )?(client|specialist|manager)",
                 lowered,
             )
+        if not missing_role_page_roles:
+            missing_role_page_roles = re.findall(
+                r"(client|specialist|manager)\s+is missing the required profile page",
+                lowered,
+            )
         for role in missing_role_page_roles:
             candidates.extend(
                 [
                     f"miniapp/app/routes/{role}.py",
+                    f"miniapp/app/static/{role}/profile/index.html",
+                    f"miniapp/app/static/{role}/profile/styles.css",
+                    f"miniapp/app/static/{role}/profile/app.js",
                     "miniapp/app/routes/role_pages.py",
                     "miniapp/app/routes/runtime.py",
+                    "miniapp/app/routes/profiles.py",
                     f"miniapp/app/static/{role}/index.html",
                 ]
             )
@@ -501,6 +523,16 @@ class FixClassificationRuntime:
             return "tooling/platform_misconfiguration"
         if any(marker in lowered for marker in ("could not be opened in preview", "returned unusable preview content", "preview route smoke", "connection refused")):
             return "runtime_preview_boot"
+        if any(
+            marker in lowered
+            for marker in (
+                "build.missing_role_profile_page",
+                "missing the required profile page",
+                "route_manifest.missing_profile_route",
+                "runtime.missing_role_pages.",
+            )
+        ):
+            return "role_profile_surface_missing"
         if any(
             marker in lowered
             for marker in (

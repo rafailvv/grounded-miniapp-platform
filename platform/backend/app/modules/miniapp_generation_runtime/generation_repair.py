@@ -30,7 +30,6 @@ if TYPE_CHECKING:
 
 class MiniappGenerationRepair:
     MAX_TOOL_ROUNDS = 5
-    COMMAND_TIMEOUT_SECONDS = 20
     _READ_ONLY_REPAIR_SURFACE_PREFIXES = (
         "miniapp/tests/",
         "miniapp/app/generated/",
@@ -40,6 +39,16 @@ class MiniappGenerationRepair:
     def __init__(self, service: "GenerationService") -> None:
         self.service = service
         self.tool_runtime = GenerationRepairToolRuntime(service)
+
+    @staticmethod
+    def _load_json_file(path) -> dict[str, Any] | None:
+        try:
+            if path is None or not path.exists():
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     @classmethod
     def _is_read_only_repair_surface(cls, file_path: str) -> bool:
@@ -116,6 +125,26 @@ class MiniappGenerationRepair:
         )
 
     @staticmethod
+    def _force_patch_only_recovery_note(tool_requests: list[dict[str, Any]]) -> str:
+        requested_targets = [
+            str(target or "").strip().lstrip("./")
+            for item in tool_requests
+            for target in list(item.get("targets") or [])
+            if str(target or "").strip()
+        ]
+        distinct_targets = list(dict.fromkeys(requested_targets))
+        rendered_targets = "\n".join(f"- {target}" for target in distinct_targets[:12]) if distinct_targets else "- no additional targets"
+        return (
+            "Forced patch-only recovery mode:\n"
+            "- Tool-request budget is exhausted for this repair attempt.\n"
+            "- Do not request more tools.\n"
+            "- Use the existing file_contexts and prior tool_results to return create/replace operations for the allowed targets now.\n"
+            "- The last requested targets were:\n"
+            f"{rendered_targets}\n"
+            "- If you still cannot produce a safe patch from the current evidence, return outcome=no_progress with a short diagnosis.\n"
+        )
+
+    @staticmethod
     def _read_request_already_satisfied(
         tool_requests: list[dict[str, Any]],
         file_contexts: dict[str, str],
@@ -157,6 +186,19 @@ class MiniappGenerationRepair:
                 "import block",
             )
         )
+
+    @staticmethod
+    def _has_meaningful_repair_context(
+        *,
+        current_file_contexts: dict[str, str],
+        initial_file_contexts: dict[str, str],
+        tool_results_for_attempt: list[dict[str, object]],
+    ) -> bool:
+        if tool_results_for_attempt:
+            return True
+        if len(current_file_contexts) > len(initial_file_contexts):
+            return True
+        return current_file_contexts != initial_file_contexts
 
     @staticmethod
     def _invalid_patch_feedback(message: str) -> str:
@@ -305,6 +347,7 @@ class MiniappGenerationRepair:
         *,
         workspace_id: str,
         draft_run_id: str,
+        draft_source,
         prompt: str,
         grounded_spec,
         role_scope: list[str],
@@ -399,7 +442,9 @@ class MiniappGenerationRepair:
                 role_scope=role_scope,
                 generation_mode=generation_mode,
                 operations=operations,
+                existing_generated_graph=self._load_json_file(draft_source / "artifacts/generated_app_graph.json"),
                 preserve_existing_roles=preserve_existing_roles,
+                draft_source=draft_source,
             )
         if not visual_only_patch:
             operations = self.service._ensure_app_level_test_operations(
@@ -513,6 +558,7 @@ class MiniappGenerationRepair:
             return self._plan_generation_repair_turn(
                 workspace_id=workspace_id,
                 draft_run_id=draft_run_id,
+                draft_source=draft_source,
                 prompt=prompt,
                 grounded_spec=grounded_spec,
                 role_scope=role_scope,
@@ -632,8 +678,10 @@ class MiniappGenerationRepair:
             seen_tool_request_signatures: set[str] = set()
             context_reuse_recovery_note: str | None = None
             invalid_patch_feedback_note: str | None = None
+            forced_patch_only_note: str | None = None
             try:
-                for tool_round in range(self.MAX_TOOL_ROUNDS + 1):
+                for tool_round in range(self.MAX_TOOL_ROUNDS + 2):
+                    force_patch_only = tool_round > self.MAX_TOOL_ROUNDS
                     backend_target_count = sum(
                         1
                         for path in current_target_files
@@ -686,6 +734,11 @@ class MiniappGenerationRepair:
                                 if invalid_patch_feedback_note
                                 else ""
                             )
+                            + (
+                                f"\n\n{forced_patch_only_note}"
+                                if forced_patch_only_note
+                                else ""
+                            )
                         ),
                         model_override=model_override,
                         fallback_model_override=fallback_model_override,
@@ -695,16 +748,32 @@ class MiniappGenerationRepair:
                     outcome_hint = str(normalized.get("outcome") or "").strip().lower()
                     raw_operations = normalized.get("operations")
                     if outcome_hint == "tool_request" or tool_requests:
+                        if force_patch_only:
+                            raise ValueError("Repair step exhausted the tool-request budget and still requested more tools.")
                         if self._read_request_already_satisfied(tool_requests, current_file_contexts):
                             context_reuse_recovery_note = self._already_available_context_note(tool_requests)
                             tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
                             if tool_round < self.MAX_TOOL_ROUNDS:
+                                continue
+                            if self._has_meaningful_repair_context(
+                                current_file_contexts=current_file_contexts,
+                                initial_file_contexts=file_contexts,
+                                tool_results_for_attempt=tool_results_for_attempt,
+                            ):
+                                forced_patch_only_note = self._force_patch_only_recovery_note(tool_requests)
                                 continue
                             raise ValueError("Repair step exhausted the tool-request budget without returning operations.")
                         request_signature = self._tool_request_signature(tool_requests)
                         if request_signature and request_signature in seen_tool_request_signatures:
                             tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
                             if tool_round < self.MAX_TOOL_ROUNDS:
+                                continue
+                            if self._has_meaningful_repair_context(
+                                current_file_contexts=current_file_contexts,
+                                initial_file_contexts=file_contexts,
+                                tool_results_for_attempt=tool_results_for_attempt,
+                            ):
+                                forced_patch_only_note = self._force_patch_only_recovery_note(tool_requests)
                                 continue
                             raise ValueError("Repair step exhausted the tool-request budget without returning operations.")
                         requested_targets, executed_tool_results, extra_contexts = self.tool_runtime.execute_tool_requests(
@@ -725,7 +794,7 @@ class MiniappGenerationRepair:
                                 scope_mode=scope_mode,
                                 mode=mode,
                             ),
-                            command_timeout_seconds=self.COMMAND_TIMEOUT_SECONDS,
+                            command_timeout_seconds=int(getattr(self.service.timeout_profile, "tool_command_sec", 180)),
                         )
                         for path in requested_targets:
                             if path not in current_target_files:
@@ -736,6 +805,13 @@ class MiniappGenerationRepair:
                         if request_signature:
                             seen_tool_request_signatures.add(request_signature)
                         if tool_round < self.MAX_TOOL_ROUNDS and (requested_targets or executed_tool_results):
+                            continue
+                        if self._has_meaningful_repair_context(
+                            current_file_contexts=current_file_contexts,
+                            initial_file_contexts=file_contexts,
+                            tool_results_for_attempt=tool_results_for_attempt,
+                        ):
+                            forced_patch_only_note = self._force_patch_only_recovery_note(tool_requests)
                             continue
                         raise ValueError("Repair step exhausted the tool-request budget without returning operations.")
                     if not isinstance(raw_operations, list):

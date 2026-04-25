@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Literal
 
 from app.models.common import GenerationMode
@@ -29,7 +30,9 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
         operations: list[DraftFileOperation],
         existing_route_manifest: dict[str, object] | None = None,
         existing_runtime_manifest: dict[str, object] | None = None,
+        existing_generated_graph: dict[str, object] | None = None,
         preserve_existing_roles: bool = False,
+        draft_source: Path | None = None,
     ) -> list[DraftFileOperation]:
         builder = getattr(self, "artifact_builder", None) or self._artifact_builder()
         return builder.ensure_runtime_artifact_operations(
@@ -40,7 +43,9 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
             operations=operations,
             existing_route_manifest=existing_route_manifest,
             existing_runtime_manifest=existing_runtime_manifest,
+            existing_generated_graph=existing_generated_graph,
             preserve_existing_roles=preserve_existing_roles,
+            draft_source=draft_source,
         )
 
     def _ensure_app_level_test_operations(
@@ -77,6 +82,7 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
         )
         existing_route_manifest: dict[str, object] | None = None
         existing_runtime_manifest: dict[str, object] | None = None
+        existing_generated_graph: dict[str, object] | None = None
         if preserve_existing_roles:
             existing_route_manifest = self._load_existing_contract_artifact(
                 workspace_id=workspace_id,
@@ -87,6 +93,11 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
                 workspace_id=workspace_id,
                 draft_run_id=draft_run_id,
                 file_path="miniapp/app/generated/runtime_manifest.json",
+            )
+            existing_generated_graph = self._load_existing_contract_artifact(
+                workspace_id=workspace_id,
+                draft_run_id=draft_run_id,
+                file_path="artifacts/generated_app_graph.json",
             )
         grounded_spec: GroundedSpecModel | None = None
         try:
@@ -107,7 +118,9 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
                 operations=operations,
                 existing_route_manifest=existing_route_manifest,
                 existing_runtime_manifest=existing_runtime_manifest,
+                existing_generated_graph=existing_generated_graph,
                 preserve_existing_roles=preserve_existing_roles,
+                draft_source=self.workspace_service.draft_source_dir(workspace_id, draft_run_id),
             )
             if grounded_spec is not None
             else list(operations)
@@ -162,7 +175,9 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
                 operations=ensured,
                 existing_route_manifest=existing_route_manifest,
                 existing_runtime_manifest=existing_runtime_manifest,
+                existing_generated_graph=existing_generated_graph,
                 preserve_existing_roles=preserve_existing_roles,
+                draft_source=self.workspace_service.draft_source_dir(workspace_id, draft_run_id),
             )
         ensured = self._ensure_app_level_test_operations(
             page_graph=page_graph,

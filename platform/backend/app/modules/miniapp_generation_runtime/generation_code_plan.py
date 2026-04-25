@@ -151,7 +151,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 role_patch_kind=role_patch_kind,
             )
             normalized = self._normalize_model_payload(payload["payload"])
-            if scope_mode == "workflow_partial_build":
+            if scope_mode in {"role_partial_build", "workflow_partial_build"}:
                 normalized = self._supplement_workflow_partial_page_graph_roles(
                     normalized,
                     workspace_id=workspace_id,
@@ -171,7 +171,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                     prompt=prompt,
                     focused_role=role_scope[0],
                 )
-            if scope_mode == "workflow_partial_build":
+            if scope_mode in {"role_partial_build", "workflow_partial_build"}:
                 planned = self._prune_workflow_partial_plan(
                     planned,
                     prompt=prompt,
@@ -180,7 +180,7 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                 )
             focused_role = self._focused_minimal_patch_role(prompt=prompt, role_scope=role_scope)
             if focused_role and (
-                scope_mode == "minimal_patch"
+                scope_mode in {"minimal_patch", "role_partial_build"}
                 or (
                     len(role_scope) == 1
                     and intent in {"edit", "refine", "role_only_change"}
@@ -193,6 +193,11 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
                     focused_role=focused_role,
                     role_scope=role_scope,
                     role_patch_kind=role_patch_kind,
+                )
+            if generation_mode == GenerationMode.FAST and intent == "create":
+                planned = self._prune_fast_create_plan(
+                    planned,
+                    role_scope=role_scope,
                 )
             plan_gate_issues = self._page_graph_gate_issues(
                 planned["page_graph"],
@@ -582,25 +587,17 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
         for role in impacted_roles:
             role_payload = roles.get(role) or {}
             pages = [page for page in (role_payload.get("pages") or []) if isinstance(page, dict)]
-            selected_pages: list[dict[str, Any]] = []
-            for page in pages:
-                if self._is_profile_like_page(page) and not include_profile:
-                    continue
-                page_targets = self._page_static_targets(page)
-                if not page_targets:
-                    continue
-                selected_pages.append(page)
-                workflow_page_targets.update(page_targets)
+            selected_pages = self._select_workflow_partial_pages_for_role(
+                role=role,
+                pages=pages,
+                prompt_tokens=prompt_tokens,
+                include_profile=include_profile,
+            )
+            for page in selected_pages:
+                workflow_page_targets.update(self._page_static_targets(page))
                 stem = self._page_feature_stem(focused_role=role, page=page)
                 if stem:
                     feature_stems.add(stem)
-            if not selected_pages:
-                selected_pages = list(pages)
-                for page in selected_pages:
-                    workflow_page_targets.update(self._page_static_targets(page))
-                    stem = self._page_feature_stem(focused_role=role, page=page)
-                    if stem:
-                        feature_stems.add(stem)
             selected_pages_by_role[role] = selected_pages
 
         prompt_lowered = str(prompt or "").lower()
@@ -750,6 +747,156 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
             "execution_plan": execution_plan,
             "workflow_partial_build": True,
             "role_patch_kind": role_patch_kind,
+        }
+
+    def _select_workflow_partial_pages_for_role(
+        self,
+        *,
+        role: str,
+        pages: list[dict[str, Any]],
+        prompt_tokens: set[str],
+        include_profile: bool,
+    ) -> list[dict[str, Any]]:
+        if not pages:
+            return []
+        selected: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def add_page(page: dict[str, Any]) -> None:
+            signature = (
+                str(page.get("page_id") or "").strip(),
+                str(page.get("route_path") or "").strip(),
+                str(page.get("file_path") or "").strip(),
+            )
+            if signature in seen:
+                return
+            page_targets = self._page_static_targets(page)
+            if not page_targets:
+                return
+            seen.add(signature)
+            selected.append(page)
+
+        for page in pages:
+            if self.service._is_role_root_page(role, page):
+                add_page(page)
+
+        if include_profile:
+            for page in pages:
+                if self._is_profile_like_page(page):
+                    add_page(page)
+
+        matched_detail_pages: list[dict[str, Any]] = []
+        for page in pages:
+            if self._is_profile_like_page(page) and not include_profile:
+                continue
+            if self.service._is_role_root_page(role, page):
+                continue
+            score = self._score_page_focus(
+                prompt_tokens=prompt_tokens,
+                focused_role=role,
+                page=page,
+            )
+            stem = self._page_feature_stem(focused_role=role, page=page)
+            stem_tokens = self._prompt_focus_tokens(stem.replace("_", " ")) if stem else set()
+            dependency_tokens = self._prompt_focus_tokens(
+                " ".join(str(item) for item in (page.get("data_dependencies") or []))
+            )
+            if score <= 0 and not (prompt_tokens & stem_tokens) and not (prompt_tokens & dependency_tokens):
+                continue
+            add_page(page)
+            if self._is_detail_like_page(page):
+                matched_detail_pages.append(page)
+
+        for page in self._companion_list_pages_for_detail_pages(
+            focused_role=role,
+            pages=pages,
+            detail_pages=matched_detail_pages,
+        ):
+            add_page(page)
+
+        if selected:
+            return selected
+        for page in pages:
+            if self.service._is_role_root_page(role, page):
+                add_page(page)
+        if selected:
+            return selected
+        add_page(pages[0])
+        return selected
+
+    def _prune_fast_create_plan(
+        self,
+        planned: dict[str, Any],
+        *,
+        role_scope: list[str],
+    ) -> dict[str, Any]:
+        target_files = list(planned.get("target_files") or [])
+        if len(target_files) <= 18:
+            return planned
+        page_graph = dict(planned.get("page_graph") or {})
+        roles = dict(page_graph.get("roles") or {})
+        kept_roles: dict[str, dict[str, Any]] = {}
+        kept_targets: list[str] = []
+        kept_backend_targets = list(dict.fromkeys(planned.get("backend_targets") or []))
+        kept_shared_files = list(dict.fromkeys(planned.get("shared_files") or []))
+
+        for role in role_scope:
+            payload = dict(roles.get(role) or {})
+            pages = list(payload.get("pages") or [])
+            if not pages:
+                continue
+            selected_page = next(
+                (
+                    page
+                    for page in pages
+                    if str(page.get("route_path") or "").strip() in {"/", f"/{role}"}
+                    or str(page.get("file_path") or "").strip() == f"miniapp/app/static/{role}/index.html"
+                ),
+                pages[0],
+            )
+            payload["pages"] = [selected_page]
+            payload["landing_page_id"] = str(selected_page.get("page_id") or payload.get("landing_page_id") or "")
+            kept_roles[role] = payload
+            for key in ("routes_file",):
+                value = str(payload.get(key) or "").strip()
+                if value:
+                    kept_targets.append(value)
+            for key in ("file_path", "style_path", "script_path"):
+                value = str(selected_page.get(key) or "").strip()
+                if value:
+                    kept_targets.append(value)
+
+        pruned_target_files = list(
+            dict.fromkeys(
+                [
+                    *kept_shared_files,
+                    *kept_backend_targets,
+                    *kept_targets,
+                ]
+            )
+        )
+        generation_clusters = self._build_generation_clusters(pruned_target_files)
+        execution_plan = self._build_execution_plan(
+            role_scope=role_scope,
+            roles=kept_roles,
+            shared_files=kept_shared_files,
+            backend_targets=kept_backend_targets,
+            target_files=pruned_target_files,
+            generation_clusters=generation_clusters,
+        )
+        page_graph["roles"] = kept_roles
+        page_graph["shared_files"] = kept_shared_files
+        page_graph["backend_targets"] = kept_backend_targets
+        return {
+            **planned,
+            "target_files": pruned_target_files,
+            "files_to_read": list(dict.fromkeys([*planned.get("files_to_read", []), *pruned_target_files])),
+            "shared_files": kept_shared_files,
+            "backend_targets": kept_backend_targets,
+            "generation_clusters": generation_clusters,
+            "active_role_scope": execution_plan["active_role_scope"],
+            "execution_plan": execution_plan,
+            "page_graph": page_graph,
         }
 
     def _supplement_workflow_partial_page_graph_roles(
@@ -1158,12 +1305,49 @@ class MiniappGenerationCodePlan(MiniappGenerationRuntimeOwner):
     @classmethod
     def _prompt_focus_tokens(cls, prompt: str) -> set[str]:
         tokens: set[str] = set()
-        for raw in re.findall(r"[a-z0-9]+", str(prompt or "").lower()):
+        for raw in re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", str(prompt or "").lower()):
             if len(raw) < 3 or raw in cls._PAGE_FOCUS_STOPWORDS:
                 continue
             tokens.add(raw)
             if raw.endswith("s") and len(raw) > 4:
                 tokens.add(raw[:-1])
+            if re.search(r"[а-яё]", raw):
+                for suffix in (
+                    "иями",
+                    "ями",
+                    "ами",
+                    "ого",
+                    "ему",
+                    "ому",
+                    "ими",
+                    "ыми",
+                    "иях",
+                    "ах",
+                    "ях",
+                    "ов",
+                    "ев",
+                    "ей",
+                    "ий",
+                    "ый",
+                    "ой",
+                    "ая",
+                    "яя",
+                    "ое",
+                    "ее",
+                    "ые",
+                    "ие",
+                    "ам",
+                    "ям",
+                    "ом",
+                    "ем",
+                    "ы",
+                    "и",
+                    "а",
+                    "я",
+                ):
+                    if raw.endswith(suffix) and len(raw) - len(suffix) >= 3:
+                        tokens.add(raw[: -len(suffix)])
+                        break
         return tokens
 
     @classmethod

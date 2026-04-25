@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 class MiniappGenerationCodegenSelection(MiniappGenerationRuntimeOwner):
     MAX_TOOL_ROUNDS = 5
-    COMMAND_TIMEOUT_SECONDS = 20
     _HELPER_DISCOVERY_TARGETS = {
         "miniapp/app/static/shared/runtime.js",
         "miniapp/app/static/shared/api.js",
@@ -376,6 +375,7 @@ class MiniappGenerationCodegenSelection(MiniappGenerationRuntimeOwner):
                     raw_operations = normalized.get("operations")
                     outcome_hint = str(normalized.get("outcome") or "").strip().lower()
                     if outcome_hint == "tool_request" or tool_requests:
+                        request_signature = self._tool_request_signature(tool_requests)
                         if self._is_runtime_helper_discovery_request(page=page, tool_requests=tool_requests):
                             context_reuse_recovery_note = (
                                 "Runtime helper recovery mode:\n"
@@ -389,12 +389,16 @@ class MiniappGenerationCodegenSelection(MiniappGenerationRuntimeOwner):
                                 continue
                             raise ValueError(f"{page['file_path']} kept searching for nonexistent runtime/api helper files instead of using current context.")
                         if self._read_request_already_satisfied(tool_requests, current_file_contexts):
+                            if request_signature and request_signature in seen_tool_request_signatures:
+                                tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
+                                raise ValueError(f"{page['file_path']} repeated identical tool requests without returning operations.")
                             context_reuse_recovery_note = self._already_available_context_note(tool_requests)
                             tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
+                            if request_signature:
+                                seen_tool_request_signatures.add(request_signature)
                             if tool_round < self.MAX_TOOL_ROUNDS:
                                 continue
                             raise ValueError(f"{page['file_path']} requested files that were already present in the current context.")
-                        request_signature = self._tool_request_signature(tool_requests)
                         if request_signature and request_signature in seen_tool_request_signatures:
                             tool_results_for_attempt.append(self._duplicate_tool_request_feedback(tool_requests))
                             if tool_round < self.MAX_TOOL_ROUNDS:
@@ -417,7 +421,7 @@ class MiniappGenerationCodegenSelection(MiniappGenerationRuntimeOwner):
                                 scope_mode=scope_mode,
                                 mode=mode,
                             ),
-                            command_timeout_seconds=self.COMMAND_TIMEOUT_SECONDS,
+                            command_timeout_seconds=int(getattr(self.service.timeout_profile, "tool_command_sec", 180)),
                         )
                         if request_signature:
                             seen_tool_request_signatures.add(request_signature)
@@ -447,7 +451,33 @@ class MiniappGenerationCodegenSelection(MiniappGenerationRuntimeOwner):
                         if operation.file_path in allowed_paths and operation.operation in {"create", "replace"} and operation.content is not None
                     }
                     primary_operation = valid_operations.get(page["file_path"])
+                    existing_primary_content = current_file_contexts.get(page["file_path"])
+                    if existing_primary_content is None and workspace_id and draft_run_id:
+                        existing_primary_content = self.service.workspace_service.try_read_text_file(
+                            workspace_id,
+                            page["file_path"],
+                            run_id=draft_run_id,
+                        )
                     if primary_operation is None:
+                        companion_operations = [
+                            valid_operations[path]
+                            for path in sorted(path for path in allowed_paths if path != page["file_path"])
+                            if path in valid_operations
+                        ]
+                        if companion_operations and existing_primary_content is not None:
+                            return {
+                                "assistant_message": str(normalized.get("diagnosis") or normalized.get("assistant_message") or "").strip(),
+                                "operations": companion_operations,
+                                "model": payload["model"],
+                                "tool_results": list(tool_results_for_attempt),
+                            }
+                        if not valid_operations and outcome_hint in {"no_progress", "done", "completed", "patch_ready"} and existing_primary_content is not None:
+                            return {
+                                "assistant_message": str(normalized.get("diagnosis") or normalized.get("assistant_message") or "").strip(),
+                                "operations": [],
+                                "model": payload["model"],
+                                "tool_results": list(tool_results_for_attempt),
+                            }
                         raise ValueError(f"{page['file_path']} did not produce the required page HTML operation.")
                     ordered_operations = [primary_operation]
                     for companion_path in sorted(path for path in allowed_paths if path != page["file_path"]):

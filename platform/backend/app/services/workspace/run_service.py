@@ -293,7 +293,7 @@ class RunService:
             )
 
     def _sync_linked_job_to_terminal_run_state(self, run: RunRecord, *, reason: str) -> None:
-        job_id = str(run.linked_job_id or "").strip()
+        job_id = self._resolve_linked_job_id(run)
         if not job_id:
             return
         payload = self.store.get("jobs", job_id)
@@ -342,6 +342,25 @@ class RunService:
             message,
             {"reason": reason, "run_id": run.run_id, "run_status": run.status},
         )
+
+    def _resolve_linked_job_id(self, run: RunRecord) -> str:
+        direct_job_id = str(run.linked_job_id or "").strip()
+        if direct_job_id:
+            return direct_job_id
+        fallback_job: JobRecord | None = None
+        for item in self.store.list("jobs"):
+            if str(item.get("linked_run_id") or "").strip() != run.run_id:
+                continue
+            candidate = JobRecord.model_validate(item)
+            if fallback_job is None or candidate.updated_at > fallback_job.updated_at:
+                fallback_job = candidate
+        if fallback_job is None:
+            return ""
+        if run.linked_job_id != fallback_job.job_id:
+            run.linked_job_id = fallback_job.job_id
+            run.updated_at = datetime.now(timezone.utc)
+            self._save_run(run)
+        return fallback_job.job_id
 
     def get_run_artifacts(self, run_id: str) -> dict[str, Any]:
         payload = self.store.get("reports", f"run_artifacts:{run_id}")
@@ -796,7 +815,28 @@ class RunService:
             run.current_stage = "failed"
             run.progress_percent = max(run.progress_percent, 100)
             run.updated_at = datetime.now(timezone.utc)
+            linked_job_id = self._resolve_linked_job_id(run)
             self._save_run(run)
+            if linked_job_id:
+                try:
+                    job = self.generation_service.get_job(linked_job_id)
+                except KeyError:
+                    job = None
+                if job is not None:
+                    job.status = "failed"
+                    job.summary = job.summary or "Run failed with an unexpected exception."
+                    job.failure_reason = str(exc)
+                    job.current_fix_phase = "failed" if job.current_fix_phase == "completed" else job.current_fix_phase
+                    self.generation_service._append_event(
+                        job,
+                        "job_failed",
+                        "Run failed with an unexpected exception.",
+                        {
+                            "run_id": run.run_id,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        },
+                    )
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
             self.workspace_log_service.append(
                 run.workspace_id,
@@ -1345,7 +1385,7 @@ class RunService:
             return "role_only_change"
         if any(token in prompt for token in ("refine", "polish", "improve", "tighten", "cleanup")):
             return "refine"
-        has_existing_build = workspace.template_cloned and workspace.current_revision_id is not None and len(workspace.revisions) > 1
+        has_existing_build = self._workspace_has_existing_build(workspace)
         if has_existing_build or any(token in prompt for token in ("change", "update", "edit", "modify", "rewrite", "fix", "исправ", "ошиб")):
             return "edit"
         return "create"
@@ -1361,6 +1401,28 @@ class RunService:
             hints = ROLE_SCOPE_HINTS.get(role) or ()
             if any(hint in prompt for hint in hints):
                 inferred_scope.append(role)
+        workflow_markers = (
+            "status",
+            "cancel",
+            "assign",
+            "approve",
+            "reject",
+            "queue",
+            "workflow",
+            "lifecycle",
+            "order",
+            "orders",
+            "processing",
+            "статус",
+            "отмен",
+            "назнач",
+            "очеред",
+            "заказ",
+            "обработ",
+        )
+        if any(marker in prompt for marker in workflow_markers):
+            if not inferred_scope or len(inferred_scope) == 1:
+                return [role for role in ("client", "specialist", "manager") if role in ROLE_SCOPE]
         return inferred_scope
 
     def _resolve_generation_mode(
@@ -1374,12 +1436,31 @@ class RunService:
         if request.generation_mode != GenerationMode.QUALITY:
             return request.generation_mode
         prompt = request.prompt.lower()
-        has_existing_build = workspace.template_cloned and workspace.current_revision_id is not None and len(workspace.revisions) > 1
+        has_existing_build = self._workspace_has_existing_build(workspace)
         if self._looks_like_fix_request(prompt):
             return GenerationMode.BALANCED
         if resolved_intent in {"edit", "refine", "role_only_change"} and has_existing_build:
             return GenerationMode.BALANCED
         return request.generation_mode
+
+    def _workspace_has_existing_build(self, workspace: WorkspaceRecord) -> bool:
+        if not workspace.template_cloned or workspace.current_revision_id is None:
+            return False
+        if any(str(revision.source or "").strip() != "template_clone" for revision in workspace.revisions):
+            return True
+        source_dir = self.workspace_service.source_dir(workspace.workspace_id)
+        try:
+            status_output = self.workspace_service._git_output(source_dir, ["status", "--porcelain"])
+        except Exception:
+            return False
+        paths: list[str] = []
+        for line in status_output.splitlines():
+            candidate = str(line[3:] if len(line) > 3 else "").strip()
+            if " -> " in candidate:
+                candidate = candidate.split(" -> ", 1)[-1].strip()
+            if candidate:
+                paths.append(candidate)
+        return any(self._is_meaningful_source_path(path) for path in paths)
 
     @staticmethod
     def _resolve_model_profile(model_profile: str | None, generation_mode: GenerationMode) -> str:
@@ -1667,6 +1748,8 @@ class RunService:
         meaningful_paths: list[str],
     ) -> bool:
         if not meaningful_paths:
+            return False
+        if str(getattr(job, "failure_class", "") or "") == "generation.edit.llm_failure":
             return False
         if not self.workspace_service.draft_exists(run.workspace_id, run.run_id):
             return False

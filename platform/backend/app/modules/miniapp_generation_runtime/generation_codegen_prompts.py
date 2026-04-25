@@ -206,7 +206,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 "In db.py, standard SQLAlchemy declarative models must use mapped_column(default=...) instead of mapped_column(default_factory=...) unless the file explicitly configures SQLAlchemy dataclass mappings.",
                 "If app/main.py already contains working route-manifest, role-page, and static resolution helpers in target_file_contexts, preserve those helpers and symbol names instead of rewriting them from scratch.",
                 "When app/main.py already uses ROUTE_MANIFEST_PATH, _load_route_manifest, _canonicalize_role_path, _route_matches, or _resolve_role_page, keep those exact names and working signatures.",
-                "Keep main.py limited to FastAPI app bootstrap, middleware, create-all startup, and router inclusion. Do not implement workflow request CRUD or page-serving route handlers in main.py.",
+                "Keep main.py limited to FastAPI app bootstrap, middleware, create-all startup, and router inclusion. Do not implement domain CRUD or page-serving route handlers in main.py.",
                 "Do not define route-local ORM record classes, role-specific route handlers, or inline Pydantic request/response models in main.py.",
                 "app.routes.role_pages is a helper-only module for shared page resolution and does not export a FastAPI router.",
                 "Do not import router from app.routes.role_pages and do not call app.include_router(...) for role_pages in main.py.",
@@ -226,7 +226,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     [
                         "Role route modules client.py, specialist.py, and manager.py are page-serving routers only.",
                         "Keep these modules limited to APIRouter + FileResponse handlers that serve existing role HTML pages.",
-                        "Do not implement workflow request CRUD, do not declare route-local ORM models, and do not define route-local Pydantic schemas in role route modules.",
+                        "Do not implement domain CRUD in role route modules, do not declare route-local ORM models, and do not define route-local Pydantic schemas there.",
                         "Do not import shared request persistence or request/response schemas from peer role route modules. Shared persistence belongs only to app.db and app.schemas.",
                         "The canonical role entry route is /<role>, not /<role>/root.",
                         "Do not emit @router.get('/root') alias handlers and do not call resolve_role_page(role, '/<role>/root').",
@@ -239,7 +239,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                         f"For {feature_route_path}, the shared workflow entity already belongs in app.db and request/response schemas already belong in app.schemas.",
                         "Import persistence and schema types from app.db and app.schemas instead of defining inline ORM or Pydantic models in the feature route module.",
                         f"Do not declare Base subclasses, mapped_column fields, or route-local request/response models in {feature_route_path.rsplit('/', 1)[-1]}.",
-                        "Use only the canonical workflow request statuses declared in app.schemas.",
+                        "Use only the canonical status or state literals declared in app.schemas.",
                         "Do not emit alternate status spellings or inferred fallback enums in workflow API responses or defaults.",
                         "Import only request schema names that already exist in app.schemas. Preserve the exact exported names shown in target_file_contexts instead of inventing new imports.",
                         "Do not reference update fields that are absent from app.schemas. Only read or write fields that exist in the supporting db.py and schemas.py context.",
@@ -252,7 +252,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 cluster_specific_rules.extend(
                     [
                         "For backend_route_runtime, keep the module limited to runtime/init-data validation, lightweight runtime helpers, and compatibility endpoints only.",
-                        "Do not implement workflow request CRUD and do not duplicate persistence or request/response schemas already owned by app.db and app.schemas.",
+                        "Do not implement domain CRUD here and do not duplicate persistence or request/response schemas already owned by app.db and app.schemas.",
                         "If the workflow needs a persisted feature CRUD endpoint, that ownership belongs to its dedicated feature route module under miniapp/app/routes/, not runtime.py.",
                         "Do not declare role root alias screens, routes, or static_entry/file_path values under miniapp/app/static/<role>/root/index.html.",
                         "Within runtime manifests and screen helpers, canonical entry pages are /client, /specialist, and /manager only; never /client/root, /specialist/root, or /manager/root.",
@@ -262,20 +262,20 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                 cluster_specific_rules.extend(
                     [
                         "For backend_route_runtime_manifest, keep the module limited to role-aware manifest JSON for runtime navigation.",
-                        "Do not duplicate workflow request CRUD, profile persistence, or init-data verification logic that belongs in other runtime modules.",
+                        "Do not duplicate domain CRUD, profile persistence, or init-data verification logic that belongs in other runtime modules.",
                         "Do not emit handoff_paths containing /root or static file paths under miniapp/app/static/<role>/root/.",
                     ]
                 )
         elif feature_route_path and cluster_name.startswith("role_") and "_ui_" in cluster_name:
             cluster_specific_rules = [
-                "For role request UI clusters, use the current role root page, shared shell assets, and backend API routes as the primary references.",
+                "For role feature UI clusters, use the current role root page, shared shell assets, and backend API routes as the primary references.",
                 "The canonical runtime bridge is /static/preview_bridge.js. It provides window.setupPreviewBridge(role) and window.miniappApiFetch(input, init, role).",
                 "If supporting_file_contexts already include preview_bridge.js or existing role pages that call /api/... directly, use those conventions as-is and do not search for static/shared/runtime.js or static/shared/api.js.",
-                "Do not block on peer-role request pages, shared runtime helper files, or any supporting file shown as FILE_MISSING.",
-                "If peer-role request pages are unavailable, continue anyway and generate a complete role-specific request surface from the prompt, same-role root page, and live backend API contract.",
+                "Do not block on peer-role feature pages, shared runtime helper files, or any supporting file shown as FILE_MISSING.",
+                "If peer-role feature pages are unavailable, continue anyway and generate a complete role-specific feature surface from the prompt, same-role root page, and live backend API contract.",
                 "If same-role root files are present in supporting_file_contexts, use them directly as the style and navigation anchor instead of returning no_progress.",
-                "Do not return no_progress only because same-role root files were previously generated in this run; consume the available supporting_file_contexts and emit the request page operations now.",
-                "Do not render placeholder roadmap copy such as 'coming soon', 'snapshot coming soon', 'to be added', 'todo', or 'TBD' in any request page section.",
+                "Do not return no_progress only because same-role root files were previously generated in this run; consume the available supporting_file_contexts and emit the page operations now.",
+                "Do not render placeholder roadmap copy such as 'coming soon', 'snapshot coming soon', 'to be added', 'todo', or 'TBD' in any page section.",
                 "If a section has no live rows yet, render an honest empty state with concrete next actions instead of placeholder product copy.",
             ]
         elif "_ui_profile" in cluster_name:
@@ -338,8 +338,8 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Use the template runtime conventions for API access instead of raw authless fetch patterns.",
                     "Use supporting_file_contexts as read-only references for routing, manifest, or shared runtime wiring before asking to read the same files again.",
                     "Do not invent auth/login/me endpoints, auth bootstrap modules, or /api/auth references in generated app code.",
-                    "Preserve the template profile flow: root role pages may link to /<role>/profile, and profile persistence stays compatible with routes/profiles.py plus RoleProfileRecord in db.py.",
-                    "For every workflow app, implement one real shared persisted entity lifecycle: client creates it, specialist reads and updates the same record, and manager observes the same DB-backed state.",
+                    "If a role profile page already exists in the workspace or current plan, keep it compatible with the existing shared shell and role routing contracts.",
+                    "When the prompt requires a shared cross-role lifecycle, keep one real persisted business entity consistent across client, specialist, and manager instead of inventing disconnected per-role stores.",
                     "Do not ship form UI, list UI, or role dashboards unless the corresponding /api read and write paths already exist in the same draft.",
                 ]
                 + cluster_specific_rules,
@@ -445,8 +445,8 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Dropdown options, filter chips, and static guidance copy are allowed, but example request cards, seeded workflow rows, and pre-filled live rows are not allowed.",
                     "Keep role root pages complete on first paint and preserve any explicit nested feature routes that are already present in the writable surface.",
                     "Role root pages may use compact loading/error state nodes for post-render refreshes, but the main surface must already be complete on first render.",
-                    "If the page edits or lists shared records, wire it to the real DB-backed /api lifecycle for the same entity instead of local arrays or console-only handlers.",
-                    "Profile pages must keep the canonical /api/profiles/{role} read/write contract or the existing profileStore contract intact.",
+                    "If the page edits or lists shared records, wire it to the real persisted /api lifecycle for the same entity instead of local arrays or console-only handlers.",
+                    "If this page is a role profile page, keep the existing /api/profiles/{role} contract or equivalent shared profile contract intact.",
                     "For pages that create, list, or update shared records, prefer honest CRUD wiring over speculative UI polish and do not conclude without evidence that the corresponding API contract exists in the same draft.",
                     "For narrow click/button/handler fixes, preserve the existing visible controls, labels, DOM order, and layout unless the prompt explicitly asks to redesign them.",
                     "For narrow click/button/handler fixes, update the smallest existing event handler, payload, or conditional branch in place instead of replacing surrounding sections or swapping button sets.",
@@ -555,10 +555,10 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "If stage_name is frontend, wire pages, routes, and shared UI/state to the already planned miniapp surface.",
                     "Treat /static/preview_bridge.js and shared/base.css as the canonical shared shell assets when they are relevant to the target surface.",
                     "Use canonical workflow status literals from the schema or entity contract for API writes. If the UI label says 'Done', submit the canonical terminal status such as 'completed' instead of inventing a new write literal.",
-                    "For any workflow or stateful backend, use miniapp/app/db.py plus miniapp/app/schemas.py as the canonical persistence contract.",
-                    "Persist mutable business entities through SQLAlchemy models and sessions from db.py; do not keep route-level dict/list stores for app data.",
+                    "If the target surface requires persistent mutable backend state, use miniapp/app/db.py plus miniapp/app/schemas.py as the canonical persistence contract.",
+                    "When persistence is required, use the shared persistence layer instead of route-level dict/list stores for app data.",
                     "In db.py, use mapped_column(default=...) for standard declarative SQLAlchemy models; do not use mapped_column(default_factory=...) unless SQLAlchemy dataclass configuration is explicitly present.",
-                    "Define request/response models in schemas.py and import them from route modules instead of declaring inline Pydantic BaseModel classes inside routes.",
+                    "Define shared request/response models in schemas.py and import them from route modules instead of declaring inline Pydantic BaseModel classes inside routes.",
                     "If dedicated backend_route_* targets exist, keep main.py focused on app bootstrap and router wiring; do not duplicate domain CRUD handlers inside main.py.",
                     "app.routes.role_pages is a helper-only module and must not be imported as router or included via app.include_router(...) in main.py.",
                     "Route modules must import shared ORM/session objects from app.db and request/response models from app.schemas; do not redeclare route-local ORM records or inline request BaseModel classes inside miniapp/app/routes/*.py.",
@@ -571,7 +571,7 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Keep role pages usable without waiting on client-side hydration for basic navigation and structure.",
                     "Do not fill role root pages with pseudo-records or invented live metrics just to avoid an empty screen.",
                     "Do not ship seeded workflow cards, static example records, or pre-filled live list rows in HTML or JS even when a real API read path also exists.",
-                    "If the extracted entity contract implies one dominant persisted workflow entity, keep adjacent availability, conflict, approval, and summary data under that same entity contract instead of inventing a second feature route stem by default.",
+                    "Avoid inventing extra peer entities or route families unless the prompt or current source actually requires them.",
                     "Do not collapse explicit nested feature routes back into index.html when those routes are part of the writable surface.",
                     "For narrow click/button/handler fixes, preserve the existing visible controls, labels, DOM order, and layout unless the prompt explicitly asks to redesign them.",
                     "For narrow click/button/handler fixes, update the smallest existing event handler, payload, or conditional branch in place instead of replacing surrounding sections or swapping button sets.",
@@ -594,8 +594,8 @@ class MiniappGenerationCodegenPrompts(MiniappGenerationRuntimeOwner):
                     "Do not pass typing.Literal aliases directly to sqlalchemy.Enum; keep persisted status fields as string-backed columns unless a real Python Enum class is defined.",
                     "If the workspace uses miniapp/app, do not switch to miniapp/src. If the workspace uses miniapp/app/static, do not switch to a separate frontend application unless those exact files are in target_files.",
                     "Do not generate auth/login/me endpoints, auth bootstrap modules, or /api/auth references for the generated app.",
-                    "Keep the template profile contract intact: routes/profiles.py stays supported, db.py keeps RoleProfileRecord, and route manifests must retain each role's /profile page.",
-                    "Treat shared workflow persistence as mandatory: frontend pages, route modules, schemas.py, and db.py must agree on one create/list/update lifecycle for the same entity across client, specialist, and manager flows.",
+                    "If the workspace already includes role profile pages and routes/profiles.py, keep that contract intact unless the prompt explicitly replaces it.",
+                    "When the prompt requires shared persistence, keep frontend pages, route modules, schemas.py, and db.py aligned on the same create/list/update lifecycle for the same entity.",
                     "Do not leave fake save handlers, console-only submit handlers, or hardcoded live collections in the generated app.",
                 ],
             }
