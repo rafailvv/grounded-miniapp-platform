@@ -134,6 +134,90 @@ class MiniappRuntimeContractNormalization:
         replacement = f"from fastapi import {', '.join(ordered_symbols)}"
         return import_pattern.sub(replacement, updated, count=1)
 
+    @staticmethod
+    def normalize_router_prefix(content: str, desired_prefix: str) -> str:
+        updated = str(content or "")
+        prefix = str(desired_prefix or "").strip()
+        if not updated or not prefix:
+            return updated
+        router_pattern = re.compile(
+            r"(?m)^(?P<indent>\s*)router\s*=\s*APIRouter\((?P<body>[^)]*)\)"
+        )
+        match = router_pattern.search(updated)
+        if match is None:
+            return updated
+        body = str(match.group("body") or "")
+        if re.search(r"\bprefix\s*=", body):
+            normalized_body = re.sub(
+                r"""prefix\s*=\s*["'][^"']*["']""",
+                f'prefix="{prefix}"',
+                body,
+                count=1,
+            )
+        else:
+            normalized_body = body.strip()
+            if normalized_body:
+                normalized_body = f'prefix="{prefix}", {normalized_body}'
+            else:
+                normalized_body = f'prefix="{prefix}"'
+        replacement = f'{match.group("indent")}router = APIRouter({normalized_body})'
+        return updated[: match.start()] + replacement + updated[match.end() :]
+
+    @classmethod
+    def strip_top_level_class_definitions(cls, source: str, class_names: list[str] | tuple[str, ...]) -> str:
+        names = {str(name or "").strip() for name in class_names if str(name or "").strip()}
+        if not names:
+            return str(source or "")
+        lines = str(source or "").splitlines()
+        if not lines:
+            return str(source or "")
+        kept: list[str] = []
+        index = 0
+        removed_any = False
+        while index < len(lines):
+            line = lines[index]
+            class_match = re.match(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|:)", line)
+            if class_match and class_match.group(1) in names:
+                removed_any = True
+                index += 1
+                while index < len(lines):
+                    current = lines[index]
+                    if current.strip() == "":
+                        index += 1
+                        continue
+                    if not current.startswith((" ", "\t")):
+                        break
+                    index += 1
+                continue
+            kept.append(line)
+            index += 1
+        updated = "\n".join(kept)
+        if str(source or "").endswith("\n"):
+            updated += "\n"
+        if removed_any:
+            updated = re.sub(r"\n{3,}", "\n\n", updated)
+        return updated
+
+    @staticmethod
+    def top_level_base_model_class_names(source: str) -> list[str]:
+        names: list[str] = []
+        for line in str(source or "").splitlines():
+            match = re.match(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*:", line)
+            if match and "BaseModel" in str(match.group(2) or ""):
+                names.append(match.group(1))
+        return names
+
+    @staticmethod
+    def strip_top_level_assignments(source: str, names: list[str] | tuple[str, ...]) -> str:
+        assignment_names = [str(name or "").strip() for name in names if str(name or "").strip()]
+        if not assignment_names:
+            return str(source or "")
+        pattern = re.compile(
+            rf"(?m)^(?:{'|'.join(re.escape(name) for name in assignment_names)})\s*=\s*[^\n]+\n?"
+        )
+        updated = pattern.sub("", str(source or ""))
+        return re.sub(r"\n{3,}", "\n\n", updated)
+
     @classmethod
     def _replace_top_level_function(cls, source: str, function_name: str, replacement: str) -> str:
         lines = str(source or "").splitlines()

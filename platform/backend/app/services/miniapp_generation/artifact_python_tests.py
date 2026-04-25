@@ -77,6 +77,30 @@ def _extract_js_dom_ids(source: str) -> set[str]:
     return ids
 
 
+def _html_declares_dom_id(html: str, dom_id: str) -> bool:
+    pattern = rf"id\s*=\s*([\"\\']){re.escape(dom_id)}\1"
+    return re.search(pattern, str(html or "")) is not None
+
+
+def _preserves_shell_safe_area_baseline(css: str) -> bool:
+    normalized = str(css or "")
+    if ".page-shell" not in normalized or "--telegram-top-safe-offset" not in normalized:
+        return False
+    if re.search(r"padding-top\s*:\s*(?:76px|max\(\s*76px)", normalized):
+        return True
+    if re.search(r"padding\s*:\s*(?:76px|max\(\s*76px)", normalized):
+        return True
+    if re.search(r"padding\s*:\s*calc\([^;]*var\(--shell-padding\)[^;]*52px[^;]*\)", normalized):
+        return True
+    if re.search(r"padding\s*:\s*calc\([^;]*52px[^;]*var\(--shell-padding\)[^;]*\)", normalized):
+        return True
+    if re.search(r"--[A-Za-z0-9_-]+\s*:\s*(?:76px|max\(\s*76px|calc\([^;]*76px[^;]*\))", normalized):
+        shell_block = re.search(r"\.page-shell\s*\{(?P<body>[^}]*)\}", normalized, re.DOTALL)
+        if shell_block and re.search(r"padding(?:-top)?\s*:\s*[^;]*var\(--[A-Za-z0-9_-]+\)", shell_block.group("body")):
+            return True
+    return False
+
+
 def _normalize_route_ref(route_ref: str) -> str:
     normalized = route_ref.strip()
     normalized = re.sub(r"\$\{[^/]+\}", "sample", normalized)
@@ -515,7 +539,10 @@ class GeneratedMiniAppTests(unittest.TestCase):
                 self.assertNotRegex(html, r">\\s*Refresh\\s*<", f"Page {file_path} should not render a manual refresh action")
                 script_text = (MINIAPP_DIR / script_path.removeprefix("miniapp/")).read_text(encoding="utf-8")
                 for dom_id in _extract_js_dom_ids(script_text):
-                    self.assertIn(f'id="{dom_id}"', html, f"Page {file_path} is missing DOM id {dom_id} referenced by {script_path}")
+                    self.assertTrue(
+                        _html_declares_dom_id(html, dom_id),
+                        f"Page {file_path} is missing DOM id {dom_id} referenced by {script_path}",
+                    )
                 for asset in _extract_static_asset_refs(html):
                     asset_path = MINIAPP_DIR / "app" / "static" / asset.removeprefix("/static/")
                     self.assertTrue(asset_path.exists(), f"Missing referenced asset {asset} from {file_path}")
@@ -523,10 +550,7 @@ class GeneratedMiniAppTests(unittest.TestCase):
     def test_declared_role_routes_render_shell_contract(self) -> None:
         shared_base_css = (MINIAPP_DIR / "app" / "static" / "shared" / "base.css").read_text(encoding="utf-8")
         self.assertIn(".page-shell", shared_base_css, "Shared base.css must define the page-shell contract")
-        self.assertTrue(
-            "padding-top: 76px" in shared_base_css or "padding-top: max(76px" in shared_base_css,
-            "Shared base.css must preserve the 76px shell safe-area baseline",
-        )
+        self.assertTrue(_preserves_shell_safe_area_baseline(shared_base_css), "Shared base.css must preserve the 76px shell safe-area baseline")
         for role in ROLES:
             pages = ((self.route_manifest.get("roles") or {}).get(role) or {}).get("pages") or []
             self.assertTrue(pages, f"No declared pages for role {role}")

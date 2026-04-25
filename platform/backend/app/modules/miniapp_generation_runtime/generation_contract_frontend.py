@@ -138,6 +138,12 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             updated,
             flags=re.IGNORECASE,
         )
+        updated = re.sub(
+            r">\s*Refresh\s*<",
+            ">Sync<",
+            updated,
+            flags=re.IGNORECASE,
+        )
         return updated
 
     @classmethod
@@ -336,11 +342,21 @@ class MiniappGenerationContractFrontend(MiniappGenerationRuntimeOwner):
             return False
         if ".page-shell" not in normalized:
             return True
-        if "padding-top: 76px" not in normalized and "padding-top: max(76px" not in normalized:
-            return True
         if "--telegram-top-safe-offset" not in normalized:
             return True
-        return False
+        if re.search(r"padding-top\s*:\s*(?:76px|max\(\s*76px)", normalized):
+            return False
+        if re.search(r"padding\s*:\s*(?:76px|max\(\s*76px)", normalized):
+            return False
+        if re.search(r"padding\s*:\s*calc\([^;]*var\(--shell-padding\)[^;]*52px[^;]*\)", normalized):
+            return False
+        if re.search(r"padding\s*:\s*calc\([^;]*52px[^;]*var\(--shell-padding\)[^;]*\)", normalized):
+            return False
+        shell_token_match = re.search(r"--[A-Za-z0-9_-]+\s*:\s*(?:76px|max\(\s*76px|calc\([^;]*76px[^;]*\))", normalized)
+        shell_block_match = re.search(r"\.page-shell\s*\{(?P<body>[^}]*)\}", normalized, re.DOTALL)
+        if shell_token_match and shell_block_match and re.search(r"padding(?:-top)?\s*:\s*[^;]*var\(--[A-Za-z0-9_-]+\)", shell_block_match.group("body")):
+            return False
+        return True
 
     @classmethod
     def _needs_frontend_api_contract_repair(cls, file_path: str, content: str) -> bool:

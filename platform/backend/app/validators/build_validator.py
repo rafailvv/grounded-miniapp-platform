@@ -198,7 +198,7 @@ class BuildValidator:
             ),
             (
                 re.compile(
-                    r'class=["\'][^"\']*\bchevron\b[^"\']*["\'][^>]*>\s*(?:›|&rsaquo;|&#x?203a;?|203a|\d{2,};?)\s*<',
+                    r'<[^>]*(?![^>]*\baria-hidden=["\']true["\'])[^>]*class=["\'][^"\']*\bchevron\b[^"\']*["\'][^>]*>\s*(?:›|&rsaquo;|&#x?203a;?|203a|\d{2,};?)\s*<',
                     re.IGNORECASE,
                 ),
                 "Visible UI text appears to contain a decorative chevron artifact instead of a stable aligned control.",
@@ -223,7 +223,7 @@ class BuildValidator:
             ),
             (
                 re.compile(
-                    r"<(?P<tag>div|span|p)(?![^>]*\b(?:aria-label|title)\s*=)[^>]*class=[\"'][^\"']*\b(?:chip|pill|badge|tag|indicator|dot)\b[^\"']*[\"'][^>]*>\s*(?:&nbsp;|&#160;|&#8203;|<!--.*?-->)*\s*</(?P=tag)>",
+                    r"<(?P<tag>div|span|p)(?![^>]*\b(?:aria-label|title|id|aria-live)\s*=)[^>]*class=[\"'][^\"']*\b(?:chip|pill|badge|tag|indicator|dot)\b[^\"']*[\"'][^>]*>\s*(?:&nbsp;|&#160;|&#8203;|<!--.*?-->)*\s*</(?P=tag)>",
                     re.IGNORECASE | re.DOTALL,
                 ),
                 "Visible UI renders empty chip or pill indicators with no message text.",

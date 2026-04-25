@@ -156,6 +156,13 @@ class MiniappGenerationReportingRepair(MiniappGenerationRuntimeOwner):
         expanded = list(active_targets)
         added: list[str] = []
         for issue in build_issues:
+            location = str(issue.location or "").strip().lstrip("./")
+            if self._is_canonical_target_path(location):
+                companion_paths = {location, *self._safe_static_companion_paths(location)}
+                for candidate in companion_paths:
+                    if candidate not in expanded:
+                        expanded.append(candidate)
+                        added.append(candidate)
             for match in re.finditer(r"/api/([a-zA-Z0-9_-]+)", issue.message):
                 endpoint_name = match.group(1)
                 for candidate in (self._route_module_path_for_endpoint_name(endpoint_name), "miniapp/app/main.py"):

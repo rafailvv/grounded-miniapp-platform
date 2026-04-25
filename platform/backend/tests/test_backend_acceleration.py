@@ -7889,6 +7889,267 @@ def test_generated_app_test_templates_strip_route_template_expressions() -> None
     assert r"\$\{[^}]+\}" in js_test
 
 
+def test_generated_app_test_helpers_accept_single_quoted_ids_and_calc_safe_area_baseline() -> None:
+    from app.modules.miniapp_generation_runtime.generation_contract_frontend import MiniappGenerationContractFrontend
+    from app.services.miniapp_generation.artifact_builder import MiniappArtifactBuilder
+
+    builder = MiniappArtifactBuilder(
+        normalize_role_route_path=lambda role, path: path,
+        absolute_role_route_path=lambda role, path: path,
+        default_page_asset_path=lambda path, kind: path,
+        normalize_runtime_python_path=lambda path: path,
+    )
+
+    python_test = builder.python_app_level_test_content(page_graph={}, role_scope=["client"])
+    namespace: dict[str, object] = {"__file__": str(Path(__file__).resolve())}
+    exec(python_test, namespace)
+
+    html = "<strong class='name' id='profile-name'>Client workspace</strong>"
+    calc_css = (
+        ":root { --telegram-top-safe-offset: 0px; --shell-padding: 24px; }\n"
+        ".page-shell { padding: calc(var(--shell-padding) + 52px) var(--shell-padding) var(--shell-padding); }\n"
+    )
+    shorthand_css = (
+        ":root { --telegram-top-safe-offset: 0px; }\n"
+        ".page-shell { padding: 76px 20px 48px; }\n"
+    )
+
+    assert namespace["_html_declares_dom_id"](html, "profile-name") is True
+    assert namespace["_preserves_shell_safe_area_baseline"](calc_css) is True
+    assert namespace["_preserves_shell_safe_area_baseline"](shorthand_css) is True
+    assert MiniappGenerationContractFrontend._needs_shared_base_stylesheet_repair(calc_css) is False
+    assert MiniappGenerationContractFrontend._needs_shared_base_stylesheet_repair(shorthand_css) is False
+
+
+def test_route_contract_normalizer_fixes_entity_route_prefix_and_inline_schema_models() -> None:
+    from app.modules.miniapp_generation_runtime.generation_contract_routes import MiniappGenerationContractRoutes
+
+    source = """
+from __future__ import annotations
+
+from enum import Enum
+
+from fastapi import APIRouter
+from pydantic import BaseModel, Field
+
+router = APIRouter(prefix='/orders', tags=['orders'])
+
+class OrderStatus(str, Enum):
+    open = 'open'
+
+class OrderPayload(BaseModel):
+    title: str = Field(...)
+
+class OrderUpdatePayload(BaseModel):
+    status: OrderStatus | None = None
+
+class OrderRead(BaseModel):
+    title: str
+
+class OrderListResponse(BaseModel):
+    items: list[OrderRead] = Field(default_factory=list)
+
+class OrderCreateResponse(BaseModel):
+    order_id: str
+
+class OrderStatusResponse(BaseModel):
+    status: str
+
+class OrderRecord(BaseModel):
+    title: str
+
+OrderRead = OrderRecord
+
+@router.post('', response_model=OrderCreateResponse)
+def create_record(payload: OrderPayload) -> OrderCreateResponse:
+    record = {'status': OrderStatus.open.value}
+    if payload.status is not None:
+        record['status'] = payload.status.value
+    return OrderListResponse(items=[OrderRead(title=payload.title)])
+"""
+    entity_contract = {
+        "api_path": "/api/orders",
+        "schema_prefix": "Order",
+        "read_schema_name": "OrderRead",
+        "list_schema_name": "OrderListResponse",
+        "status_literals": ["open", "assigned"],
+    }
+
+    updated = MiniappGenerationContractRoutes._normalize_entity_route_module_source(source, entity_contract)
+
+    assert 'router = APIRouter(prefix="/api/orders", tags=[\'orders\'])' in updated or 'router = APIRouter(prefix="/api/orders", tags=["orders"])' in updated
+    assert "from app.schemas import" in updated
+    assert "OrderCreate as OrderPayload" in updated
+    assert "OrderUpdate as OrderUpdatePayload" in updated
+    assert "OrderRead" in updated
+    assert "OrderListResponse" in updated
+    assert "from pydantic import BaseModel, Field" not in updated
+    assert "class OrderPayload" not in updated
+    assert "class OrderUpdatePayload" not in updated
+    assert "class OrderRead" not in updated
+    assert "class OrderListResponse" not in updated
+    assert "class OrderCreateResponse" not in updated
+    assert "class OrderStatusResponse" not in updated
+    assert "class OrderRecord" not in updated
+    assert "OrderRecord = OrderRead" in updated
+    assert "response_model=OrderCreateResponse" not in updated
+    assert "-> dict[str, object]" in updated
+    assert "dict(order_id=" not in updated or "dict(" in updated
+    assert 'OrderStatus.open.value' not in updated
+    assert "payload.status.value" not in updated
+
+
+def test_route_contract_normalizer_fixes_runtime_manifest_route_module() -> None:
+    from app.modules.miniapp_generation_runtime.generation_contract_routes import MiniappGenerationContractRoutes
+
+    source = """
+from __future__ import annotations
+
+from fastapi import APIRouter
+from pydantic import BaseModel, Field
+
+router = APIRouter(prefix='/runtime', tags=['runtime'])
+
+class ScreenManifest(BaseModel):
+    slug: str
+    primary_actions: list[str] = Field(default_factory=list)
+
+class RoleManifest(BaseModel):
+    role: str
+    screens: list[ScreenManifest]
+
+def _client_screens() -> list[ScreenManifest]:
+    return [ScreenManifest(slug='client_root')]
+
+@router.get('/{role}/manifest', response_model=RoleManifest)
+def role_manifest(role: str) -> RoleManifest:
+    return RoleManifest(role=role, screens=_client_screens())
+"""
+
+    updated = MiniappGenerationContractRoutes._normalize_runtime_manifest_route_source(source)
+
+    assert 'router = APIRouter(prefix="/api/runtime", tags=[\'runtime\'])' in updated or 'router = APIRouter(prefix="/api/runtime", tags=["runtime"])' in updated
+    assert "from pydantic import BaseModel, Field" not in updated
+    assert "class ScreenManifest" not in updated
+    assert "class RoleManifest" not in updated
+    assert "response_model=RoleManifest" not in updated
+    assert "-> list[dict[str, object]]" in updated
+    assert "-> dict[str, object]" in updated
+    assert "dict(slug='client_root')" in updated
+
+
+def test_route_contract_normalizer_ensures_main_includes_entity_and_runtime_routers() -> None:
+    from app.modules.miniapp_generation_runtime.generation_contract_routes import MiniappGenerationContractRoutes
+
+    source = """
+from __future__ import annotations
+
+from fastapi import FastAPI
+from app.routes.client import router as client_router
+from app.routes.manager import router as manager_router
+
+app = FastAPI()
+app.include_router(client_router)
+app.include_router(manager_router)
+"""
+
+    updated = MiniappGenerationContractRoutes._normalize_main_app_router_includes(
+        source,
+        route_modules=["orders", "runtime"],
+    )
+
+    assert "from app.routes.orders import router as orders_router" in updated
+    assert "from app.routes.runtime import router as runtime_router" in updated
+    assert "app.include_router(orders_router)" in updated
+    assert "app.include_router(runtime_router)" in updated
+
+
+def test_frontend_contract_normalization_fixes_nested_assets_and_keeps_role_local_script_refs() -> None:
+    from app.modules.miniapp_generation_runtime.generation_contract_frontend import MiniappGenerationContractFrontend
+
+    html = """
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="../../shared/base.css" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <a href="/specialist/profile">Profile</a>
+    </div>
+    <script src="../../preview_bridge.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
+"""
+    updated = MiniappGenerationContractFrontend._clean_static_ui_text_artifacts(html)
+    updated = MiniappGenerationContractFrontend._normalize_api_aliases_in_text(updated)
+    updated = MiniappGenerationContractFrontend._ensure_head_asset_link(updated, "/static/shared/base.css")
+    updated = MiniappGenerationContractFrontend._ensure_head_asset_link(updated, "/static/specialist/orders/styles.css")
+    updated = MiniappGenerationContractFrontend._ensure_preview_bridge_ref(updated)
+    updated = MiniappGenerationContractFrontend._ensure_body_script_ref(updated, "/static/specialist/orders/app.js")
+    updated = MiniappGenerationContractFrontend._normalize_role_local_links(
+        updated,
+        role="specialist",
+        declared_routes={"/specialist", "/specialist/profile", "/specialist/orders"},
+    )
+
+    assert "/static/shared/base.css" in updated
+    assert "/static/specialist/orders/styles.css" in updated
+    assert "/static/preview_bridge.js" in updated
+    assert "/static/specialist/orders/app.js" in updated
+    assert "../../shared/base.css" not in updated
+    assert "../../preview_bridge.js" not in updated
+
+
+def test_build_validator_allows_hidden_chevrons_and_named_status_indicators() -> None:
+    html = """
+<span class="chevron" aria-hidden="true">›</span>
+<p id="api-error" class="status-indicator status-error hidden" aria-live="polite"></p>
+"""
+    issues = BuildValidator._static_ui_text_artifact_issues(html, "miniapp/app/static/client/index.html")
+    messages = {issue.message for issue in issues}
+    assert "Visible UI text appears to contain a decorative chevron artifact instead of a stable aligned control." not in messages
+    assert "Visible UI renders empty chip or pill indicators with no message text." not in messages
+
+
+def test_expand_structural_repair_targets_adds_issue_locations_and_static_companions(tmp_path: Path) -> None:
+    service = create_app(
+        repo_root=Path(__file__).resolve().parents[3],
+        data_dir=tmp_path / "data",
+    ).state.container.generation_service
+    active_targets = [
+        "miniapp/app/static/client/index.html",
+        "miniapp/app/static/client/app.js",
+    ]
+    build_issues = [
+        ValidationIssue(
+            code="build.inline_route_schema_model",
+            message="Route module orders.py defines Pydantic models inline; move shared schemas into miniapp/app/schemas.py.",
+            severity="high",
+            location="miniapp/app/routes/orders.py",
+        ),
+        ValidationIssue(
+            code="build.page_missing_style_link",
+            message="index.html does not reference its page CSS asset.",
+            severity="high",
+            location="miniapp/app/static/specialist/orders/index.html",
+        ),
+    ]
+
+    expanded, added = service._expand_structural_repair_targets(
+        active_targets=active_targets,
+        build_issues=build_issues,
+    )
+
+    assert "miniapp/app/routes/orders.py" in expanded
+    assert "miniapp/app/static/specialist/orders/index.html" in expanded
+    assert "miniapp/app/static/specialist/orders/styles.css" in expanded
+    assert "miniapp/app/static/specialist/orders/app.js" in expanded
+    assert "miniapp/app/routes/orders.py" in added
+
+
 def test_check_runner_extracts_role_page_and_sqlite_column_diagnostics() -> None:
     diagnostics = check_runner_module.CheckRunner._extract_generated_app_test_diagnostics(
         [

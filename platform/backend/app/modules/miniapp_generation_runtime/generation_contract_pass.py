@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -8,6 +9,8 @@ from app.models.common import GenerationMode
 from app.models.domain import DraftFileOperation
 from app.models.grounded_spec import GroundedSpecModel
 
+from app.modules.miniapp_generation_runtime.generation_contract_frontend import MiniappGenerationContractFrontend
+from app.modules.miniapp_generation_runtime.generation_contract_routes import MiniappGenerationContractRoutes
 from app.modules.miniapp_generation_runtime.runtime_owner import MiniappGenerationRuntimeOwner
 
 
@@ -139,6 +142,14 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
                 preserve_existing_roles=preserve_existing_roles,
                 draft_source=self.workspace_service.draft_source_dir(workspace_id, draft_run_id),
             )
+        ensured = self._normalize_sqlalchemy_db_defaults(operations=ensured)
+        ensured = self._normalize_generated_surface_operations(
+            workspace_id=workspace_id,
+            draft_run_id=draft_run_id,
+            page_graph=page_graph,
+            operations=ensured,
+            entity_contract=entity_contract,
+        )
         ensured = self._ensure_app_level_test_operations(
             page_graph=page_graph,
             role_scope=role_scope,
@@ -146,6 +157,144 @@ class MiniappGenerationContractPass(MiniappGenerationRuntimeOwner):
             operations=ensured,
         )
         return ensured
+
+    @staticmethod
+    def _declared_routes_by_role(page_graph: dict[str, object]) -> dict[str, set[str]]:
+        declared: dict[str, set[str]] = {}
+        for role, payload in (page_graph.get("roles") or {}).items():
+            if not isinstance(payload, dict):
+                continue
+            role_routes: set[str] = set()
+            for page in (payload.get("pages") or []):
+                if not isinstance(page, dict):
+                    continue
+                route_path = str(page.get("route_path") or "").strip()
+                if route_path:
+                    role_routes.add(route_path)
+            declared[str(role)] = role_routes
+        return declared
+
+    @staticmethod
+    def _static_page_contract(file_path: str) -> tuple[str | None, str | None, str]:
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        match = re.fullmatch(
+            r"miniapp/app/static/(?P<role>client|specialist|manager)(?P<suffix>(?:/[^/]+)*)/index\.html",
+            normalized,
+        )
+        if not match:
+            return None, None, ""
+        role = str(match.group("role") or "")
+        suffix = str(match.group("suffix") or "")
+        asset_base = f"miniapp/app/static/{role}{suffix}/"
+        expected_style_href = MiniappGenerationContractFrontend._static_asset_href(f"{asset_base}styles.css")
+        expected_script_src = MiniappGenerationContractFrontend._static_asset_href(f"{asset_base}app.js")
+        return expected_style_href, expected_script_src, role
+
+    def _normalize_generated_surface_operations(
+        self,
+        *,
+        workspace_id: str,
+        draft_run_id: str,
+        page_graph: dict[str, object],
+        operations: list[DraftFileOperation],
+        entity_contract: dict[str, object] | None,
+    ) -> list[DraftFileOperation]:
+        operation_map = {operation.file_path: operation for operation in operations}
+        effective_entity_contract = dict(entity_contract or {})
+        schema_operation = operation_map.get("miniapp/app/schemas.py")
+        schema_content = (
+            str(schema_operation.content or "")
+            if schema_operation is not None and schema_operation.content is not None
+            else self.workspace_service.try_read_text_file(
+                workspace_id,
+                "miniapp/app/schemas.py",
+                run_id=draft_run_id,
+            )
+        )
+        schema_status_literals = MiniappGenerationContractFrontend._schema_status_literals_from_text(schema_content or "")
+        if schema_status_literals:
+            effective_entity_contract["status_literals"] = schema_status_literals
+        declared_routes_by_role = self._declared_routes_by_role(page_graph)
+        entity_route_file = str((effective_entity_contract or {}).get("route_file") or "").strip().replace("\\", "/")
+        route_modules_to_include: list[str] = []
+        if entity_route_file.startswith("miniapp/app/routes/") and entity_route_file.endswith(".py"):
+            entity_module_name = Path(entity_route_file).stem
+            if entity_module_name not in {"", "health", "profiles", "client", "specialist", "manager", "role_pages"}:
+                route_modules_to_include.append(entity_module_name)
+        route_modules_to_include.append("runtime")
+        for file_path, operation in list(operation_map.items()):
+            if operation.content is None:
+                continue
+            normalized_path = str(file_path or "").replace("\\", "/")
+            updated = str(operation.content or "")
+            if normalized_path.startswith("miniapp/app/static/") and normalized_path.endswith("/index.html"):
+                expected_style_href, expected_script_src, role = self._static_page_contract(normalized_path)
+                updated = MiniappGenerationContractFrontend._clean_static_ui_text_artifacts(updated)
+                updated = MiniappGenerationContractFrontend._normalize_entity_api_paths(updated, effective_entity_contract)
+                updated = MiniappGenerationContractFrontend._normalize_api_aliases_in_text(updated)
+                updated = MiniappGenerationContractFrontend._ensure_head_asset_link(
+                    updated,
+                    MiniappGenerationContractFrontend._static_asset_href("miniapp/app/static/shared/base.css"),
+                )
+                if expected_style_href:
+                    updated = MiniappGenerationContractFrontend._ensure_head_asset_link(updated, expected_style_href)
+                updated = MiniappGenerationContractFrontend._ensure_preview_bridge_ref(updated)
+                if expected_script_src:
+                    updated = MiniappGenerationContractFrontend._ensure_body_script_ref(updated, expected_script_src)
+                updated = MiniappGenerationContractFrontend._ensure_page_shell_contract(updated)
+                if role:
+                    updated = MiniappGenerationContractFrontend._normalize_role_local_links(
+                        updated,
+                        role=role,
+                        declared_routes=declared_routes_by_role.get(role, set()),
+                    )
+            elif normalized_path.startswith("miniapp/app/static/") and normalized_path.endswith(".js"):
+                updated = MiniappGenerationContractFrontend._clean_static_ui_text_artifacts(updated)
+                updated = MiniappGenerationContractFrontend._normalize_entity_api_paths(updated, effective_entity_contract)
+                updated = MiniappGenerationContractFrontend._normalize_api_aliases_in_text(updated)
+                updated = MiniappGenerationContractFrontend._inject_status_alias_bridge(
+                    normalized_path,
+                    updated,
+                    effective_entity_contract,
+                )
+            elif normalized_path == entity_route_file:
+                updated = MiniappGenerationContractRoutes._normalize_entity_route_module_source(
+                    updated,
+                    effective_entity_contract,
+                )
+            elif normalized_path == "miniapp/app/routes/runtime.py":
+                updated = MiniappGenerationContractRoutes._normalize_runtime_manifest_route_source(updated)
+            if updated != str(operation.content or ""):
+                operation_map[file_path] = DraftFileOperation(
+                    file_path=file_path,
+                    operation=operation.operation,
+                    content=updated,
+                    reason="Pre-apply contract sync: normalize route and frontend shell contracts before exact checks so generated drafts keep canonical API paths, role-local assets, and runtime-safe route modules.",
+                )
+        main_file_path = "miniapp/app/main.py"
+        main_operation = operation_map.get(main_file_path)
+        main_content = (
+            str(main_operation.content or "")
+            if main_operation is not None and main_operation.content is not None
+            else self.workspace_service.try_read_text_file(
+                workspace_id,
+                main_file_path,
+                run_id=draft_run_id,
+            )
+        )
+        if main_content:
+            normalized_main = MiniappGenerationContractRoutes._normalize_main_app_router_includes(
+                main_content,
+                route_modules=route_modules_to_include,
+            )
+            if normalized_main != main_content:
+                operation_map[main_file_path] = DraftFileOperation(
+                    file_path=main_file_path,
+                    operation=main_operation.operation if main_operation is not None else "replace",
+                    content=normalized_main,
+                    reason="Pre-apply contract sync: ensure canonical entity and runtime route modules are reachable from main.py so generated backends expose the API surface used by frontend and exact checks.",
+                )
+        return list(operation_map.values())
 
     @staticmethod
     def _normalize_sqlalchemy_db_defaults(
