@@ -20,8 +20,6 @@ class Settings:
     preview_runtime_mode: str = "auto"
     preview_port_base: int = 16000
     preview_start_timeout_sec: int = 120
-    openrouter_app_name: str = "Grounded Mini-App Platform"
-    openrouter_site_url: str = "http://localhost:5173"
 
 
 def _load_repo_env(dotenv_path: Path) -> None:
@@ -69,8 +67,6 @@ def get_settings(
         preview_runtime_mode=os.getenv("PREVIEW_RUNTIME_MODE", "auto"),
         preview_port_base=int(os.getenv("PREVIEW_PORT_BASE", "16000")),
         preview_start_timeout_sec=timeout_profile.preview_start_sec,
-        openrouter_app_name=os.getenv("OPENROUTER_APP_NAME", "Grounded Mini-App Platform"),
-        openrouter_site_url=os.getenv("OPENROUTER_SITE_URL", "http://localhost:5173"),
     )
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.workspaces_dir.mkdir(parents=True, exist_ok=True)

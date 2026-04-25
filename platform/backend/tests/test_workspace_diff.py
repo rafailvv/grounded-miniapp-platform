@@ -40,13 +40,13 @@ def test_draft_diff_normalizes_source_and_draft_paths_without_git_noise(tmp_path
     assert ".git/" not in diff_text
 
 
-def test_meaningful_paths_fall_back_to_completed_job_apply_result(tmp_path: Path) -> None:
+def test_meaningful_paths_use_completed_job_apply_result(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     app = create_app(repo_root=repo_root, data_dir=tmp_path / "data")
     run_service = app.state.container.run_service
 
     run = RunRecord(
-        workspace_id="ws_apply_result_fallback",
+        workspace_id="ws_apply_result_paths",
         prompt="Remove a stray visual indicator.",
         intent="edit",
     )

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.ai.model_registry import models_for_role, resolve_model_profile
-from app.ai.openrouter_client import OpenRouterClient
+from app.ai.openai_client import OpenAIClient
 from app.models.artifacts import ValidationIssue
 from app.models.common import GenerationMode
 from app.models.domain import (
@@ -87,7 +87,7 @@ class WorkspaceCodeAgentRuntime:
         check_runner: CheckRunner,
         preview_service: PreviewService,
         runtime_manager: PreviewRuntimeManager,
-        openrouter_client: OpenRouterClient,
+        openai_client: OpenAIClient,
         workspace_log_service: WorkspaceLogService,
         workspace_loop_engine: WorkspaceLoopEngine,
     ) -> None:
@@ -96,7 +96,7 @@ class WorkspaceCodeAgentRuntime:
         self.check_runner = check_runner
         self.preview_service = preview_service
         self.runtime_manager = runtime_manager
-        self.openrouter_client = openrouter_client
+        self.openai_client = openai_client
         self.workspace_log_service = workspace_log_service
         self.workspace_loop_engine = workspace_loop_engine
 
@@ -165,8 +165,8 @@ class WorkspaceCodeAgentRuntime:
             preview_profile=request.preview_profile,
             current_revision_id=workspace.current_revision_id,
             fidelity=QUALITY_FIDELITY[generation_mode],  # type: ignore[arg-type]
-            llm_enabled=self.openrouter_client.enabled,
-            llm_provider=(self.openrouter_client.configuration().get("routing") or {}).get("provider") if self.openrouter_client.enabled else None,
+            llm_enabled=self.openai_client.enabled,
+            llm_provider=(self.openai_client.configuration().get("routing") or {}).get("provider") if self.openai_client.enabled else None,
             model_profile=model_profile,
             linked_run_id=run_id,
             error_context=request.error_context,
@@ -178,11 +178,11 @@ class WorkspaceCodeAgentRuntime:
         self._save_job(job)
         self._append_event(job, "job_started", "Workspace code agent started.", {"run_id": run_id, "mode": request.mode})
 
-        if not self.openrouter_client.enabled:
+        if not self.openai_client.enabled:
             job.status = "blocked"
             job.outcome_kind = "blocked_generation"
-            job.summary = "Workspace code agent requires an enabled LLM provider."
-            job.failure_reason = "Set OPENAI_API_KEY or OPENROUTER_API_KEY before generating or editing a workspace."
+            job.summary = "Workspace code agent requires OpenAI."
+            job.failure_reason = "Set OPENAI_API_KEY before generating or editing a workspace."
             job.failure_class = "generation.llm_required"
             job.current_fix_phase = "failed"
             job.latency_breakdown["agent_total_ms"] = int((time.perf_counter() - started_at) * 1000)
@@ -206,7 +206,7 @@ class WorkspaceCodeAgentRuntime:
             {"workspace_id": workspace_id, "execution_class": "shell_app", "runtime": "workspace_code_agent"},
         )
 
-        with self.openrouter_client.routing_context(model_profile=model_profile, generation_mode=generation_mode):
+        with self.openai_client.routing_context(model_profile=model_profile, generation_mode=generation_mode):
             loop_result = self._run_loop(
                 workspace_id=workspace_id,
                 run_id=run_id,
@@ -471,12 +471,12 @@ class WorkspaceCodeAgentRuntime:
         )
         try:
             generation_mode = self._generation_mode(request.generation_mode)
-            primary_model, _ = models_for_role(
+            primary_model = models_for_role(
                 "agent_turn",
                 model_profile=request.model_profile,
                 generation_mode=generation_mode,
             )
-            response = self.openrouter_client.generate_agent_turn(
+            response = self.openai_client.generate_agent_turn(
                 schema_name="workspace_code_agent_turn_v1",
                 schema=self._agent_turn_schema(),
                 system_prompt=self._agent_system_prompt(),
@@ -499,7 +499,6 @@ class WorkspaceCodeAgentRuntime:
                 prompt_cache_key=self._prompt_cache_key(workspace_id, run_id, request.prompt),
                 stable_prefix=self._agent_system_prompt(),
                 model_override=primary_model,
-                allow_fallbacks=False,
                 responses_tuning_override={"reasoning": {"effort": "medium" if generation_mode == GenerationMode.FAST else "high"}},
             )
             job.llm_model = str(response.get("model") or "")
@@ -1097,7 +1096,7 @@ class WorkspaceCodeAgentRuntime:
     @staticmethod
     def _max_attempts(generation_mode: GenerationMode) -> int:
         if generation_mode == GenerationMode.FAST:
-            return 4
+            return 2
         if generation_mode == GenerationMode.QUALITY:
             return 8
         return 6
@@ -1105,7 +1104,7 @@ class WorkspaceCodeAgentRuntime:
     @staticmethod
     def _tool_round_limit(generation_mode: GenerationMode) -> int:
         if generation_mode == GenerationMode.FAST:
-            return 2
+            return 1
         if generation_mode == GenerationMode.QUALITY:
             return 4
         return 3

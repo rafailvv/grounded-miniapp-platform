@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.ai.model_registry import resolve_model_profile
-from app.ai.openrouter_client import OpenRouterClient
+from app.ai.openai_client import OpenAIClient
 from app.models.common import GenerationMode
 from app.models.domain import (
     CheckExecutionRecord,
@@ -92,7 +92,7 @@ class RunService:
         code_agent_runtime: WorkspaceCodeAgentRuntime,
         preview_service: PreviewService,
         check_runner: CheckRunner,
-        openrouter_client: OpenRouterClient,
+        openai_client: OpenAIClient,
         workspace_log_service: WorkspaceLogService,
     ) -> None:
         self.store = store
@@ -100,7 +100,7 @@ class RunService:
         self.code_agent_runtime = code_agent_runtime
         self.preview_service = preview_service
         self.check_runner = check_runner
-        self.openrouter_client = openrouter_client
+        self.openai_client = openai_client
         self.workspace_log_service = workspace_log_service
         self._active_workers: dict[str, threading.Thread] = {}
         self._startup_started_at = datetime.now(timezone.utc)
@@ -150,7 +150,7 @@ class RunService:
             target_role_scope=resolved_role_scope,
             model_profile=effective_model_profile,
             generation_mode=effective_generation_mode,
-            llm_provider=(self.openrouter_client.configuration().get("routing") or {}).get("provider") if self.openrouter_client.enabled else None,
+            llm_provider=(self.openai_client.configuration().get("routing") or {}).get("provider") if self.openai_client.enabled else None,
             resume_from_run_id=request.resume_from_run_id,
             source_revision_id=workspace.current_revision_id,
             error_context=request.error_context,
@@ -540,7 +540,7 @@ class RunService:
                 resume_from_run_id=request.resume_from_run_id,
                 error_context=request.error_context,
             )
-            with self.openrouter_client.workspace_logging(run.workspace_id):
+            with self.openai_client.workspace_logging(run.workspace_id):
                 if request.mode == "fix" and self._should_resume_failed_generation_from_checkpoint(run, request):
                     self.workspace_log_service.append(
                         run.workspace_id,
@@ -582,7 +582,7 @@ class RunService:
                     "Frontend build failed during generate. Switching to fix mode automatically.",
                     {"run_id": run.run_id},
                 )
-                with self.openrouter_client.workspace_logging(run.workspace_id):
+                with self.openai_client.workspace_logging(run.workspace_id):
                     job = self.code_agent_runtime.generate(
                         run.workspace_id,
                         self._build_auto_fix_request(run=run, request=request, failed_job=job),

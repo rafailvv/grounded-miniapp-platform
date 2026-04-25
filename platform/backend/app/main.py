@@ -55,7 +55,7 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
 
     @app.get("/system/configuration")
     def system_configuration() -> dict[str, object]:
-        llm = app.state.container.openrouter_client.configuration()
+        llm = app.state.container.openai_client.configuration()
         return {
             "llm": {
                 "enabled": llm["enabled"],

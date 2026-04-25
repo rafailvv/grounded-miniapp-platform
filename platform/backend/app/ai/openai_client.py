@@ -29,7 +29,7 @@ ACTIVE_WORKSPACE_LOG_CONTEXT: ContextVar[str | None] = ContextVar("active_worksp
 ACTIVE_LLM_ROUTING_CONTEXT: ContextVar[dict[str, str] | None] = ContextVar("active_llm_routing_context", default=None)
 
 
-class OpenRouterClient:
+class OpenAIClient:
     _LOG_STRING_LIMIT = 4000
     _LOG_LIST_LIMIT = 12
     _LOG_DICT_LIMIT = 40
@@ -40,33 +40,22 @@ class OpenRouterClient:
         self.workspace_log_service = workspace_log_service
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         self.openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-        self.openrouter_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-        self.openrouter_app_name = os.getenv("OPENROUTER_APP_NAME", settings.openrouter_app_name)
-        self.openrouter_site_url = os.getenv("OPENROUTER_SITE_URL", settings.openrouter_site_url)
         self.timeout_profile = TimeoutProfile.from_env()
         self.retry_policy = RetryPolicy.from_env()
         self.connect_timeout_sec = self.timeout_profile.openai_connect_sec
         self.read_timeout_sec = self.timeout_profile.openai_read_sec
         self.write_timeout_sec = self.timeout_profile.openai_write_sec
         self.pool_timeout_sec = self.timeout_profile.openai_pool_sec
-        self.openai_quota_disable_sec = float(os.getenv("OPENAI_QUOTA_DISABLE_SEC", "900"))
-        self._openai_direct_disabled_until = 0.0
-        # Compatibility aliases for older callers that only inspect one active provider.
-        self.api_key = self.openai_api_key or self.openrouter_api_key
-        self.base_url = self.openai_base_url if self.openai_api_key else self.openrouter_base_url
+        self.api_key = self.openai_api_key
+        self.base_url = self.openai_base_url
 
     @property
     def openai_enabled(self) -> bool:
         return bool(self.openai_api_key)
 
     @property
-    def openrouter_enabled(self) -> bool:
-        return bool(self.openrouter_api_key)
-
-    @property
     def enabled(self) -> bool:
-        return self.openai_enabled or self.openrouter_enabled
+        return self.openai_enabled
 
     def configuration(self) -> dict[str, object]:
         default_profile = default_profile_for_generation_mode(GenerationMode.BALANCED)
@@ -77,8 +66,8 @@ class OpenRouterClient:
             "task_profiles": TASK_PROFILES,
             "default_coding_profile": default_profile,
             "routing": {
-                "provider": "openai" if self.openai_enabled else ("openrouter" if self.openrouter_enabled else None),
-                "providers": [provider for provider in ("openai" if self.openai_enabled else "", "openrouter" if self.openrouter_enabled else "") if provider],
+                "provider": "openai" if self.enabled else None,
+                "providers": ["openai"] if self.enabled else [],
             },
             "supports_prompt_cache_key": True,
             "mode_profiles": {
@@ -119,134 +108,39 @@ class OpenRouterClient:
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
         model_override: str | None = None,
-        fallback_model_override: str | None = None,
         responses_tuning_override: dict[str, Any] | None = None,
-        allow_fallbacks: bool = True,
     ) -> dict[str, Any]:
         if not self.enabled:
-            raise RuntimeError("No LLM provider is configured.")
+            raise RuntimeError("OpenAI API key is not configured.")
         schema_name = self._sanitize_schema_name(schema_name)
         normalized_schema = self._normalize_schema(schema)
         model_config = MODEL_REGISTRY[role]
         routing_context = ACTIVE_LLM_ROUTING_CONTEXT.get() or {}
         requested_profile = str(routing_context.get("model_profile") or "").strip() or None
         generation_mode = str(routing_context.get("generation_mode") or "").strip() or None
-        routed_primary_model, routed_fallback_model = models_for_role(
+        routed_model = models_for_role(
             role,
             model_profile=requested_profile,
             generation_mode=generation_mode,
         )
-        primary_model = str(model_override or routed_primary_model or model_config["primary"])
-        fallback_model = str(fallback_model_override or routed_fallback_model or model_config["fallback"])
-        if (not self._openai_direct_available()) and self.openrouter_enabled:
-            if self.openai_enabled and not allow_fallbacks:
-                raise RuntimeError("OpenAI direct provider is unavailable and fallback routing is disabled.")
-            return self._openrouter_rescue_structured(
-                role=role,
-                schema_name=schema_name,
-                schema=normalized_schema,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                prompt_cache_key=prompt_cache_key,
-                stable_prefix=stable_prefix,
-                preferred_model=primary_model,
-            )
-        if allow_fallbacks and self._should_bypass_strict_schema(normalized_schema):
-            logger.info(
-                "Bypassing strict json_schema upload for %s and using json_object mode due to complex schema shape.",
-                schema_name,
-            )
-            payload = self._request_json_mode(
-                role=role,
-                model=primary_model,
-                schema_name=schema_name,
-                schema=normalized_schema,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                prompt_cache_key=prompt_cache_key,
-                stable_prefix=stable_prefix,
-                provider="openai",
-            )
-            return {
-                "model": primary_model,
-                "payload": payload["payload"],
-                "response_mode": "json_object",
-                "cache_stats": payload["cache_stats"],
-            }
-        models = [primary_model] if (not allow_fallbacks or fallback_model == primary_model) else [primary_model, fallback_model]
-        last_error: Exception | None = None
-        openrouter_rescue_attempted = False
-        for model in models:
-            try:
-                payload = self._request_structured(
-                    role=role,
-                    model=model,
-                    schema_name=schema_name,
-                    schema=normalized_schema,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    prompt_cache_key=prompt_cache_key,
-                    stable_prefix=stable_prefix,
-                    responses_tuning_override=responses_tuning_override,
-                    provider="openai",
-                )
-                return {
-                    "model": model,
-                    "payload": payload["payload"],
-                    "response_mode": "strict_json_schema",
-                    "cache_stats": payload["cache_stats"],
-                }
-            except Exception as exc:
-                last_error = exc
-                if allow_fallbacks and self._is_invalid_schema_error(exc):
-                    payload = self._request_json_mode(
-                        role=role,
-                        model=model,
-                        schema_name=schema_name,
-                        schema=normalized_schema,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        prompt_cache_key=prompt_cache_key,
-                        stable_prefix=stable_prefix,
-                        responses_tuning_override=responses_tuning_override,
-                        provider="openai",
-                    )
-                    return {
-                        "model": model,
-                        "payload": payload["payload"],
-                        "response_mode": "json_object",
-                        "cache_stats": payload["cache_stats"],
-                    }
-                if allow_fallbacks and not openrouter_rescue_attempted and self.openrouter_enabled and self._is_provider_quota_error(exc):
-                    self._disable_openai_direct()
-                    openrouter_rescue_attempted = True
-                    try:
-                        return self._openrouter_rescue_structured(
-                            role=role,
-                            schema_name=schema_name,
-                            schema=normalized_schema,
-                            system_prompt=system_prompt,
-                            user_prompt=user_prompt,
-                            prompt_cache_key=prompt_cache_key,
-                            stable_prefix=stable_prefix,
-                            preferred_model=model,
-                        )
-                    except Exception as rescue_exc:
-                        last_error = rescue_exc
-                        break
-        if not openrouter_rescue_attempted and self.openrouter_enabled and not self.openai_enabled:
-            return self._openrouter_rescue_structured(
-                role=role,
-                schema_name=schema_name,
-                schema=normalized_schema,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                prompt_cache_key=prompt_cache_key,
-                stable_prefix=stable_prefix,
-                preferred_model=primary_model,
-            )
-        assert last_error is not None
-        raise last_error
+        model = str(model_override or routed_model or model_config["primary"])
+        payload = self._request_structured(
+            role=role,
+            model=model,
+            schema_name=schema_name,
+            schema=normalized_schema,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            prompt_cache_key=prompt_cache_key,
+            stable_prefix=stable_prefix,
+            responses_tuning_override=responses_tuning_override,
+        )
+        return {
+            "model": model,
+            "payload": payload["payload"],
+            "response_mode": "strict_json_schema",
+            "cache_stats": payload["cache_stats"],
+        }
 
     def generate_code_edit(
         self,
@@ -278,9 +172,7 @@ class OpenRouterClient:
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
         model_override: str | None = None,
-        fallback_model_override: str | None = None,
         responses_tuning_override: dict[str, Any] | None = None,
-        allow_fallbacks: bool = True,
     ) -> dict[str, Any]:
         return self.generate_structured(
             role="agent_turn",
@@ -291,9 +183,7 @@ class OpenRouterClient:
             prompt_cache_key=prompt_cache_key,
             stable_prefix=stable_prefix,
             model_override=model_override,
-            fallback_model_override=fallback_model_override,
             responses_tuning_override=responses_tuning_override,
-            allow_fallbacks=allow_fallbacks,
         )
 
     def generate_workspace_edits(
@@ -348,94 +238,25 @@ class OpenRouterClient:
         stable_prefix: str | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
-            raise RuntimeError("No LLM provider is configured.")
+            raise RuntimeError("OpenAI API key is not configured.")
         normalized_schema = self._normalize_schema(schema)
-        if (not self._openai_direct_available()) and self.openrouter_enabled:
-            return self._openrouter_rescue_structured(
-                role=role,
-                schema_name=schema_name,
-                schema=normalized_schema,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                prompt_cache_key=prompt_cache_key,
-                stable_prefix=stable_prefix,
-            )
         routing_context = ACTIVE_LLM_ROUTING_CONTEXT.get() or {}
         requested_profile = str(routing_context.get("model_profile") or "").strip() or None
         generation_mode = str(routing_context.get("generation_mode") or "").strip() or None
-        primary_model, fallback_model = models_for_role(
+        model = models_for_role(
             role,
             model_profile=requested_profile,
             generation_mode=generation_mode,
         )
-        models = [primary_model] if fallback_model == primary_model else [primary_model, fallback_model]
-        last_error: Exception | None = None
-        openrouter_rescue_attempted = False
-        for model in models:
-            try:
-                payload = self._request_json_mode(
-                    role=role,
-                    model=model,
-                    schema_name=schema_name,
-                    schema=normalized_schema,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    prompt_cache_key=prompt_cache_key,
-                    stable_prefix=stable_prefix,
-                    provider="openai",
-                )
-                return {
-                    "model": model,
-                    "payload": payload["payload"],
-                    "response_mode": "json_object",
-                    "cache_stats": payload["cache_stats"],
-                }
-            except Exception as exc:
-                last_error = exc
-                if not openrouter_rescue_attempted and self.openrouter_enabled and self._is_provider_quota_error(exc):
-                    self._disable_openai_direct()
-                    openrouter_rescue_attempted = True
-                    try:
-                        return self._openrouter_rescue_structured(
-                            role=role,
-                            schema_name=schema_name,
-                            schema=normalized_schema,
-                            system_prompt=system_prompt,
-                            user_prompt=user_prompt,
-                            prompt_cache_key=prompt_cache_key,
-                            stable_prefix=stable_prefix,
-                        )
-                    except Exception as rescue_exc:
-                        last_error = rescue_exc
-                        break
-        assert last_error is not None
-        raise last_error
-
-    def _openrouter_rescue_structured(
-        self,
-        *,
-        role: str,
-        schema_name: str,
-        schema: dict[str, Any],
-        system_prompt: str,
-        user_prompt: str,
-        prompt_cache_key: str | None = None,
-        stable_prefix: str | None = None,
-        preferred_model: str | None = None,
-    ) -> dict[str, Any]:
-        if not self.openrouter_enabled:
-            raise RuntimeError("OpenRouter is not configured.")
-        model = self._openrouter_rescue_model(role, preferred_model=preferred_model)
         payload = self._request_json_mode(
             role=role,
             model=model,
             schema_name=schema_name,
-            schema=schema,
+            schema=normalized_schema,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             prompt_cache_key=prompt_cache_key,
             stable_prefix=stable_prefix,
-            provider="openrouter",
         )
         return {
             "model": model,
@@ -456,7 +277,6 @@ class OpenRouterClient:
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
         responses_tuning_override: dict[str, Any] | None = None,
-        provider: str = "openai",
     ) -> dict[str, Any]:
         if model.startswith("gpt-5"):
             return self._responses_structured(
@@ -469,7 +289,6 @@ class OpenRouterClient:
                 prompt_cache_key=prompt_cache_key,
                 stable_prefix=stable_prefix,
                 tuning_override=responses_tuning_override,
-                provider=provider,
             )
         return self._chat_structured(
             role=role,
@@ -480,7 +299,6 @@ class OpenRouterClient:
             user_prompt=user_prompt,
             prompt_cache_key=prompt_cache_key,
             stable_prefix=stable_prefix,
-            provider=provider,
         )
 
     def _request_json_mode(
@@ -495,7 +313,6 @@ class OpenRouterClient:
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
         responses_tuning_override: dict[str, Any] | None = None,
-        provider: str = "openai",
     ) -> dict[str, Any]:
         schema_hint = self._schema_hint(schema_name, schema)
         augmented_system_prompt = (
@@ -514,7 +331,6 @@ class OpenRouterClient:
                 prompt_cache_key=prompt_cache_key,
                 stable_prefix=stable_prefix,
                 tuning_override=responses_tuning_override,
-                provider=provider,
             )
         return self._chat_json_object(
             role=role,
@@ -524,25 +340,13 @@ class OpenRouterClient:
             user_prompt=augmented_user_prompt,
             prompt_cache_key=prompt_cache_key,
             stable_prefix=stable_prefix,
-            provider=provider,
         )
 
-    def _headers(self, provider: str) -> dict[str, str]:
-        if provider == "openrouter":
-            headers = {
-                "Authorization": f"Bearer {self.openrouter_api_key}",
-                "Content-Type": "application/json",
-            }
-            if self.openrouter_site_url:
-                headers["HTTP-Referer"] = self.openrouter_site_url
-            if self.openrouter_app_name:
-                headers["X-Title"] = self.openrouter_app_name
-            return headers
-        headers = {
+    def _headers(self) -> dict[str, str]:
+        return {
             "Authorization": f"Bearer {self.openai_api_key}",
             "Content-Type": "application/json",
         }
-        return headers
 
     @staticmethod
     def _dump_for_log(payload: Any) -> str:
@@ -737,12 +541,6 @@ class OpenRouterClient:
         return input_items
 
     @staticmethod
-    def _cache_control(model: str) -> dict[str, str] | None:
-        if model.startswith("anthropic/"):
-            return {"type": "ephemeral"}
-        return None
-
-    @staticmethod
     def _extract_cache_stats(payload: dict[str, Any], prompt_cache_key: str | None = None) -> dict[str, Any]:
         usage = payload.get("usage") if isinstance(payload, dict) else {}
         if not isinstance(usage, dict):
@@ -788,7 +586,6 @@ class OpenRouterClient:
         user_prompt: str,
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
-        provider: str = "openai",
     ) -> dict[str, Any]:
         payload = {
             "model": model,
@@ -807,12 +604,6 @@ class OpenRouterClient:
                 },
             },
         }
-        max_tokens = self._chat_completion_max_tokens(role=role, provider=provider)
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        cache_control = self._cache_control(model)
-        if cache_control is not None:
-            payload["cache_control"] = cache_control
         self._log_prompt_bundle(
             role=role,
             schema_name=schema_name,
@@ -822,7 +613,7 @@ class OpenRouterClient:
             user_prompt=user_prompt,
         )
         self._log_request(endpoint="chat/completions", model=model, payload=payload)
-        data = self._post_json_with_retries(endpoint="chat/completions", model=model, payload=payload, provider=provider)
+        data = self._post_json_with_retries(endpoint="chat/completions", model=model, payload=payload)
         content = self._extract_chat_text(data)
         self._log_parsed_text(endpoint="chat/completions", model=model, text=content)
         return {
@@ -842,7 +633,6 @@ class OpenRouterClient:
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
         tuning_override: dict[str, Any] | None = None,
-        provider: str = "openai",
     ) -> dict[str, Any]:
         tuning = self._responses_tuning(role=role, schema_name=schema_name)
         payload = {
@@ -865,9 +655,6 @@ class OpenRouterClient:
         payload.update(tuning)
         if tuning_override:
             payload.update(tuning_override)
-        cache_control = self._cache_control(model)
-        if cache_control is not None:
-            payload["cache_control"] = cache_control
         self._log_prompt_bundle(
             role=role,
             schema_name=schema_name,
@@ -877,7 +664,7 @@ class OpenRouterClient:
             user_prompt=user_prompt,
         )
         self._log_request(endpoint="responses", model=model, payload=payload)
-        data = self._post_json_with_retries(endpoint="responses", model=model, payload=payload, provider=provider)
+        data = self._post_json_with_retries(endpoint="responses", model=model, payload=payload)
         text = self._extract_response_text(data)
         self._log_parsed_text(endpoint="responses", model=model, text=text)
         return {
@@ -895,7 +682,6 @@ class OpenRouterClient:
         user_prompt: str,
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
-        provider: str = "openai",
     ) -> dict[str, Any]:
         payload = {
             "model": model,
@@ -909,12 +695,6 @@ class OpenRouterClient:
                 "type": "json_object",
             },
         }
-        max_tokens = self._chat_completion_max_tokens(role=role, provider=provider)
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        cache_control = self._cache_control(model)
-        if cache_control is not None:
-            payload["cache_control"] = cache_control
         self._log_prompt_bundle(
             role=role,
             schema_name=schema_name,
@@ -924,7 +704,7 @@ class OpenRouterClient:
             user_prompt=user_prompt,
         )
         self._log_request(endpoint="chat/completions", model=model, payload=payload)
-        data = self._post_json_with_retries(endpoint="chat/completions", model=model, payload=payload, provider=provider)
+        data = self._post_json_with_retries(endpoint="chat/completions", model=model, payload=payload)
         content = self._extract_chat_text(data)
         self._log_parsed_text(endpoint="chat/completions", model=model, text=content)
         return {
@@ -943,7 +723,6 @@ class OpenRouterClient:
         prompt_cache_key: str | None = None,
         stable_prefix: str | None = None,
         tuning_override: dict[str, Any] | None = None,
-        provider: str = "openai",
     ) -> dict[str, Any]:
         tuning = self._responses_tuning(role=role, schema_name=schema_name)
         payload = {
@@ -963,9 +742,6 @@ class OpenRouterClient:
         payload.update(tuning)
         if tuning_override:
             payload.update(tuning_override)
-        cache_control = self._cache_control(model)
-        if cache_control is not None:
-            payload["cache_control"] = cache_control
         self._log_prompt_bundle(
             role=role,
             schema_name=schema_name,
@@ -975,7 +751,7 @@ class OpenRouterClient:
             user_prompt=user_prompt,
         )
         self._log_request(endpoint="responses", model=model, payload=payload)
-        data = self._post_json_with_retries(endpoint="responses", model=model, payload=payload, provider=provider)
+        data = self._post_json_with_retries(endpoint="responses", model=model, payload=payload)
         text = self._extract_response_text(data)
         self._log_parsed_text(endpoint="responses", model=model, text=text)
         return {
@@ -983,10 +759,10 @@ class OpenRouterClient:
             "cache_stats": self._extract_cache_stats(data, prompt_cache_key),
         }
 
-    def _post_json_with_retries(self, *, endpoint: str, model: str, payload: dict[str, Any], provider: str) -> dict[str, Any]:
+    def _post_json_with_retries(self, *, endpoint: str, model: str, payload: dict[str, Any]) -> dict[str, Any]:
         last_error: Exception | None = None
-        provider_label = "OpenRouter" if provider == "openrouter" else "OpenAI"
-        base_url = self.openrouter_base_url.rstrip("/") if provider == "openrouter" else self.openai_base_url.rstrip("/")
+        provider_label = "OpenAI"
+        base_url = self.openai_base_url.rstrip("/")
         for attempt in range(1, self.retry_policy.max_attempts + 1):
             try:
                 started = time.perf_counter()
@@ -998,7 +774,7 @@ class OpenRouterClient:
                         pool=self.pool_timeout_sec,
                     )
                 ) as client:
-                    response = client.post(f"{base_url}/{endpoint}", headers=self._headers(provider), json=payload)
+                    response = client.post(f"{base_url}/{endpoint}", headers=self._headers(), json=payload)
                     duration_ms = int((time.perf_counter() - started) * 1000)
                     self._log_response(endpoint=endpoint, model=model, response=response)
                     self._append_workspace_api_log(
@@ -1007,28 +783,12 @@ class OpenRouterClient:
                         payload={
                             "endpoint": endpoint,
                             "model": model,
-                            "provider": provider,
+                            "provider": "openai",
                             "duration_ms": duration_ms,
                             "target_file_count": self._extract_target_file_count(payload),
                             "usage": self._extract_usage_summary(response),
                         },
                     )
-                    reduced_max_tokens = self._openrouter_reduced_max_tokens(response=response, payload=payload, provider=provider)
-                    if reduced_max_tokens is not None:
-                        payload = dict(payload)
-                        payload["max_tokens"] = reduced_max_tokens
-                        self._append_workspace_api_log(
-                            source="llm.max_tokens_downgrade",
-                            message="OpenRouter request max_tokens was reduced after a provider budget response.",
-                            payload={
-                                "endpoint": endpoint,
-                                "model": model,
-                                "provider": provider,
-                                "attempt": attempt,
-                                "max_tokens": reduced_max_tokens,
-                            },
-                        )
-                        continue
                     self._raise_for_status(response, endpoint, provider_label)
                     return response.json()
             except Exception as exc:
@@ -1043,7 +803,7 @@ class OpenRouterClient:
                     payload={
                         "endpoint": endpoint,
                         "model": model,
-                        "provider": provider,
+                        "provider": "openai",
                         "attempt": attempt,
                         "error": str(exc),
                         "error_type": type(exc).__name__,
@@ -1066,24 +826,6 @@ class OpenRouterClient:
                 time.sleep(delay_seconds)
         assert last_error is not None
         raise last_error
-
-    @staticmethod
-    def _openrouter_reduced_max_tokens(*, response: httpx.Response, payload: dict[str, Any], provider: str) -> int | None:
-        if provider != "openrouter" or response.status_code != 402:
-            return None
-        current = payload.get("max_tokens")
-        if not isinstance(current, int) or current <= 1024:
-            return None
-        text = response.text.lower()
-        if "fewer max_tokens" not in text and "can only afford" not in text:
-            return None
-        afford_match = re.search(r"can only afford\s+(\d+)", text)
-        if afford_match:
-            target = int(afford_match.group(1)) - 1024
-        else:
-            target = current // 2
-        target = max(1024, min(target, current - 1024))
-        return target if target < current else None
 
     @staticmethod
     def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -1146,43 +888,6 @@ class OpenRouterClient:
             return node
 
         return visit(deepcopy(schema))
-
-    @staticmethod
-    def _should_bypass_strict_schema(schema: dict[str, Any]) -> bool:
-        counters = {
-            "defs": 0,
-            "refs": 0,
-            "any_of": 0,
-            "objects": 0,
-        }
-
-        def visit(node: Any) -> None:
-            if isinstance(node, dict):
-                if "$defs" in node:
-                    counters["defs"] += 1
-                if "$ref" in node:
-                    counters["refs"] += 1
-                if "anyOf" in node:
-                    counters["any_of"] += 1
-                if node.get("type") == "object":
-                    counters["objects"] += 1
-                for value in node.values():
-                    visit(value)
-                return
-            if isinstance(node, list):
-                for item in node:
-                    visit(item)
-
-        visit(schema)
-        # Structured outputs are reliable for small hand-authored schemas, but
-        # large Pydantic-derived partial schemas with many refs/nullable branches
-        # frequently trigger invalid_json_schema on the Responses API.
-        return (
-            counters["defs"] > 0
-            or counters["refs"] > 8
-            or counters["any_of"] > 12
-            or counters["objects"] > 40
-        )
 
     @staticmethod
     def _responses_tuning(*, role: str, schema_name: str) -> dict[str, Any]:
@@ -1401,7 +1106,7 @@ class OpenRouterClient:
             return payload["output_text"]
 
         try:
-            return OpenRouterClient._extract_response_text(payload)
+            return OpenAIClient._extract_response_text(payload)
         except RuntimeError:
             snippet = json.dumps(payload)[:1000]
             raise RuntimeError(f"OpenAI chat response did not contain structured text output. Payload: {snippet}")
@@ -1415,38 +1120,3 @@ class OpenRouterClient:
                 if content.get("type") in {"output_text", "text"} and isinstance(content.get("text"), str):
                     return content["text"]
         raise RuntimeError("OpenAI response did not contain structured text output.")
-    @staticmethod
-    def _is_provider_quota_error(error: Exception) -> bool:
-        text = str(error).lower()
-        return "insufficient_quota" in text or "exceeded your current quota" in text
-
-    def _openrouter_rescue_model(self, role: str, *, preferred_model: str | None = None) -> str:
-        normalized_preferred = str(preferred_model or "").strip().lower()
-        if (
-            role in {"cheap_task", "summarize"}
-            or "mini" in normalized_preferred
-            or normalized_preferred in {"gpt-5-mini", "gpt-5.1-codex-mini", "gpt-5.4-mini"}
-        ):
-            return os.getenv("OPENROUTER_FAST_FALLBACK_MODEL", "anthropic/claude-haiku-4.5")
-        return os.getenv("OPENROUTER_CODE_FALLBACK_MODEL", "anthropic/claude-sonnet-4.6")
-
-    @staticmethod
-    def _chat_completion_max_tokens(*, role: str, provider: str) -> int | None:
-        if provider != "openrouter":
-            return None
-        if role in {"cheap_task", "summarize"}:
-            return 4096
-        if role in {"agent_turn", "code_edit", "repair"}:
-            return 32768
-        return 8192
-
-    def _openai_direct_available(self) -> bool:
-        if not self.openai_enabled:
-            return False
-        return time.time() >= self._openai_direct_disabled_until
-
-    def _disable_openai_direct(self) -> None:
-        self._openai_direct_disabled_until = max(
-            self._openai_direct_disabled_until,
-            time.time() + self.openai_quota_disable_sec,
-        )

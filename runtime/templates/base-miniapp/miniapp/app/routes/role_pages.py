@@ -95,7 +95,7 @@ def resolve_role_page(role: str, actual_path: str) -> Path:
     declared_page = resolve_declared_page_file(role, actual_path)
     if declared_page is not None:
         return declared_page
-    fallback_page = resolve_default_role_page(role, actual_path)
-    if fallback_page is not None:
-        return fallback_page
+    default_page = resolve_default_role_page(role, actual_path)
+    if default_page is not None:
+        return default_page
     raise KeyError(actual_path)

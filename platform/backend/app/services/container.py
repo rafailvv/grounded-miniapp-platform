@@ -22,7 +22,7 @@ from app.services.workspace.runtime_manager import PreviewRuntimeManager
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.service import WorkspaceService
 from app.validators.suite import ValidationSuite
-from app.ai.openrouter_client import OpenRouterClient
+from app.ai.openai_client import OpenAIClient
 
 
 class ServiceContainer:
@@ -51,14 +51,14 @@ class ServiceContainer:
         )
         self.validation_suite = ValidationSuite()
         self.check_runner = CheckRunner(self.validation_suite, self.preview_service)
-        self.openrouter_client = OpenRouterClient(self.settings, self.workspace_log_service)
+        self.openai_client = OpenAIClient(self.settings, self.workspace_log_service)
         self.workspace_code_agent_runtime = WorkspaceCodeAgentRuntime(
             store=self.store,
             workspace_service=self.workspace_service,
             check_runner=self.check_runner,
             preview_service=self.preview_service,
             runtime_manager=self.runtime_manager,
-            openrouter_client=self.openrouter_client,
+            openai_client=self.openai_client,
             workspace_log_service=self.workspace_log_service,
             workspace_loop_engine=self.workspace_loop_engine,
         )
@@ -76,7 +76,7 @@ class ServiceContainer:
             self.workspace_code_agent_runtime,
             self.preview_service,
             self.check_runner,
-            self.openrouter_client,
+            self.openai_client,
             self.workspace_log_service,
         )
         self.export_service = ExportService(self.settings, self.store, self.workspace_service)

@@ -60,7 +60,7 @@ class BuildValidator:
         manifest = self._read_json(manifest_path)
         pages = self._manifest_pages(workspace_path, manifest if isinstance(manifest, dict) else {})
         if not pages:
-            pages = self._fallback_static_pages(workspace_path)
+            pages = self._filesystem_static_pages(workspace_path)
         issues: list[ValidationIssue] = []
         seen_routes: set[str] = set()
         for page in pages:
@@ -96,10 +96,10 @@ class BuildValidator:
                     pages.append(dict(page))
         if pages:
             return pages
-        return cls._fallback_static_pages(workspace_path)
+        return cls._filesystem_static_pages(workspace_path)
 
     @staticmethod
-    def _fallback_static_pages(workspace_path: Path) -> list[dict[str, Any]]:
+    def _filesystem_static_pages(workspace_path: Path) -> list[dict[str, Any]]:
         pages: list[dict[str, Any]] = []
         static_root = workspace_path / "miniapp/app/static"
         if not static_root.exists():

@@ -52,9 +52,6 @@ class TimeoutProfile:
     openai_write_sec: float
     openai_pool_sec: float
     preview_start_sec: int
-    structured_llm_sec: int
-    json_object_llm_sec: int
-    tool_command_sec: int
 
     @classmethod
     def from_env(cls) -> "TimeoutProfile":
@@ -64,9 +61,6 @@ class TimeoutProfile:
             openai_write_sec=_env_float("OPENAI_WRITE_TIMEOUT_SEC", 1800.0),
             openai_pool_sec=_env_float("OPENAI_POOL_TIMEOUT_SEC", 600.0),
             preview_start_sec=_env_int("PREVIEW_START_TIMEOUT_SEC", 1200),
-            structured_llm_sec=_env_int("STRUCTURED_LLM_TIMEOUT_SEC", 2700),
-            json_object_llm_sec=_env_int("JSON_OBJECT_LLM_TIMEOUT_SEC", 1800),
-            tool_command_sec=_env_int("TOOL_COMMAND_TIMEOUT_SEC", 180),
         )
 
 
@@ -123,9 +117,9 @@ class RetryPolicy:
     @classmethod
     def from_env(cls) -> "RetryPolicy":
         return cls(
-            max_attempts=max(1, _env_int("LLM_RETRY_MAX_ATTEMPTS", 8)),
-            base_delay_ms=max(100, _env_int("LLM_RETRY_BASE_DELAY_MS", 500)),
-            max_delay_ms=max(500, _env_int("LLM_RETRY_MAX_DELAY_MS", 30000)),
+            max_attempts=max(1, _env_int("LLM_RETRY_MAX_ATTEMPTS", 2)),
+            base_delay_ms=max(100, _env_int("LLM_RETRY_BASE_DELAY_MS", 250)),
+            max_delay_ms=max(500, _env_int("LLM_RETRY_MAX_DELAY_MS", 2000)),
         )
 
     def classify_error(self, error: Exception | str) -> RetryErrorClass:

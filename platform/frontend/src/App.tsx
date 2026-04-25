@@ -902,9 +902,9 @@ export default function App() {
   const [runDetailsOpen, setRunDetailsOpen] = useState(false);
   const [runArtifacts, setRunArtifacts] = useState<RunArtifacts | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
-  const [fallbackDiffText, setFallbackDiffText] = useState("");
-  const [fallbackDiffRunId, setFallbackDiffRunId] = useState("");
-  const [fallbackDiffSource, setFallbackDiffSource] = useState<"" | "run" | "workspace">("");
+  const [secondaryDiffText, setSecondaryDiffText] = useState("");
+  const [secondaryDiffRunId, setSecondaryDiffRunId] = useState("");
+  const [secondaryDiffSource, setSecondaryDiffSource] = useState<"" | "run" | "workspace">("");
   const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
   const [selectedLogSection, setSelectedLogSection] = useState<"mini-app" | "workspace">("mini-app");
   const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "logs">("preview");
@@ -1057,7 +1057,7 @@ export default function App() {
       try {
         await ensurePreview(workspace.workspace_id);
       } catch {
-        // Preview bootstrap is best-effort; polling and rebuild fallback will handle late startup.
+        // Preview bootstrap is best-effort; polling and rebuild path will handle late startup.
       }
       void pollPreviewUntilReady(workspace.workspace_id);
     })();
@@ -1097,25 +1097,25 @@ export default function App() {
   useEffect(() => {
     const activeRunId = selectedRunId || runs[0]?.run_id || "";
     if (!activeRunId) {
-      setFallbackDiffText("");
-      setFallbackDiffRunId("");
-      setFallbackDiffSource("");
+      setSecondaryDiffText("");
+      setSecondaryDiffRunId("");
+      setSecondaryDiffSource("");
       setDiffLoading(false);
       return;
     }
     const primaryDiff = `${runArtifacts?.diff ?? ""}`.trim();
     if (primaryDiff) {
-      setFallbackDiffText("");
-      setFallbackDiffRunId("");
-      setFallbackDiffSource("");
+      setSecondaryDiffText("");
+      setSecondaryDiffRunId("");
+      setSecondaryDiffSource("");
       setDiffLoading(false);
       return;
     }
     const activeIndex = runs.findIndex((item) => item.run_id === activeRunId);
     if (activeIndex === -1) {
-      setFallbackDiffText("");
-      setFallbackDiffRunId("");
-      setFallbackDiffSource("");
+      setSecondaryDiffText("");
+      setSecondaryDiffRunId("");
+      setSecondaryDiffSource("");
       setDiffLoading(false);
       return;
     }
@@ -1134,9 +1134,9 @@ export default function App() {
             continue;
           }
           if (!cancelled) {
-            setFallbackDiffText(previousDiff);
-            setFallbackDiffRunId(previousRun.run_id);
-            setFallbackDiffSource("run");
+            setSecondaryDiffText(previousDiff);
+            setSecondaryDiffRunId(previousRun.run_id);
+            setSecondaryDiffSource("run");
             setDiffLoading(false);
           }
           return;
@@ -1150,9 +1150,9 @@ export default function App() {
           const workspaceDiff = `${workspaceDiffPayload?.diff ?? ""}`.trim();
           if (workspaceDiff) {
             if (!cancelled) {
-              setFallbackDiffText(workspaceDiff);
-              setFallbackDiffRunId("");
-              setFallbackDiffSource("workspace");
+              setSecondaryDiffText(workspaceDiff);
+              setSecondaryDiffRunId("");
+              setSecondaryDiffSource("workspace");
               setDiffLoading(false);
             }
             return;
@@ -1162,9 +1162,9 @@ export default function App() {
         }
       }
       if (!cancelled) {
-        setFallbackDiffText("");
-        setFallbackDiffRunId("");
-        setFallbackDiffSource("");
+        setSecondaryDiffText("");
+        setSecondaryDiffRunId("");
+        setSecondaryDiffSource("");
         setDiffLoading(false);
       }
     })();
@@ -1300,11 +1300,11 @@ export default function App() {
   );
   const draftContextRunId = selectedRun?.draft_ready || selectedRun?.status === "awaiting_approval" ? selectedRun.run_id : "";
   const primaryDiffText = runArtifacts?.diff ?? "";
-  const diffText = primaryDiffText || fallbackDiffText;
+  const diffText = primaryDiffText || secondaryDiffText;
   const diffSourceLabel = !primaryDiffText.trim()
-    ? fallbackDiffSource === "run" && fallbackDiffRunId
-      ? `Patch review • showing previous run ${fallbackDiffRunId.slice(-8)}`
-      : fallbackDiffSource === "workspace"
+    ? secondaryDiffSource === "run" && secondaryDiffRunId
+      ? `Patch review • showing previous run ${secondaryDiffRunId.slice(-8)}`
+      : secondaryDiffSource === "workspace"
         ? "Patch review • showing live workspace diff"
         : undefined
     : undefined;

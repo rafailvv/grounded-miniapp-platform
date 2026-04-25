@@ -91,27 +91,21 @@ TASK_PROFILES = {
 MODEL_REGISTRY = {
     "agent_turn": {
         "primary": TASK_PROFILES["research_balanced"]["routing"]["agent_turn"],
-        "fallback": TASK_PROFILES["openai_code_fast"]["routing"]["agent_turn"],
     },
     "code_edit": {
         "primary": TASK_PROFILES["research_balanced"]["routing"]["code_edit"],
-        "fallback": TASK_PROFILES["openai_code_fast"]["routing"]["code_edit"],
     },
     "repair": {
         "primary": TASK_PROFILES["research_balanced"]["routing"]["repair"],
-        "fallback": TASK_PROFILES["openai_code_fast"]["routing"]["repair"],
     },
     "summarize": {
         "primary": TASK_PROFILES["research_balanced"]["routing"]["summarize"],
-        "fallback": TASK_PROFILES["openai_code_fast"]["routing"]["summarize"],
     },
     "cheap_task": {
         "primary": TASK_PROFILES["research_balanced"]["routing"]["cheap_task"],
-        "fallback": SUMMARY_MODEL,
     },
     "embedding": {
         "primary": "text-embedding-3-large",
-        "fallback": "text-embedding-3-large",
     },
 }
 
@@ -158,30 +152,6 @@ def models_for_role(
     *,
     model_profile: str | None,
     generation_mode: GenerationMode | str | None,
-) -> tuple[str, str]:
+) -> str:
     routing = routing_for_profile(model_profile=model_profile, generation_mode=generation_mode)
-    primary = str(routing.get(role) or MODEL_REGISTRY[role]["primary"])
-    fallback_profile = TASK_PROFILES["openai_code_fast"]["routing"]
-    fallback = str(fallback_profile.get(role) or MODEL_REGISTRY[role]["fallback"] or primary)
-    return primary, fallback
-
-
-def task_model_overrides(
-    *,
-    role: str,
-    generation_mode: GenerationMode | str | None,
-    scope_mode: str | None = None,
-    visual_only_patch: bool = False,
-    target_file_count: int = 0,
-    backend_target_count: int = 0,
-) -> tuple[str | None, str | None]:
-    del visual_only_patch
-    if generation_mode is None:
-        return None, None
-    mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(str(generation_mode))
-    if mode == GenerationMode.FAST:
-        if role in {"agent_turn", "code_edit"} and backend_target_count == 0:
-            return FAST_CODE_MODEL, FAST_CODE_MODEL
-        if role in {"agent_turn", "code_edit"} and scope_mode == "full_build" and 0 < target_file_count <= 2:
-            return FAST_CODE_MODEL, FAST_CODE_MODEL
-    return None, None
+    return str(routing.get(role) or MODEL_REGISTRY[role]["primary"])
