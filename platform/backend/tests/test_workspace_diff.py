@@ -54,7 +54,7 @@ def test_meaningful_paths_fall_back_to_completed_job_apply_result(tmp_path: Path
         workspace_id=run.workspace_id,
         run_id=run.run_id,
         intent="edit",
-        summary="No planner targets were emitted for a fast visual patch.",
+        summary="No agent targets were emitted for this patch.",
     )
     job = JobRecord(
         workspace_id=run.workspace_id,

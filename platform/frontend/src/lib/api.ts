@@ -88,24 +88,16 @@ export type RunArtifacts = {
     summary?: string | null;
     assumptions_report?: Array<{ text?: string; rationale?: string }>;
     validation_snapshot?: {
-      grounded_spec_valid: boolean;
-      app_ir_valid: boolean;
+      platform_valid: boolean;
+      prompt_alignment_valid: boolean;
+      checks_valid: boolean;
       build_valid: boolean;
       blocking: boolean;
       issues: Array<{ code: string; message: string; severity?: string }>;
     } | null;
   };
-  grounded_spec?: Record<string, unknown> | null;
   validation?: Record<string, unknown> | null;
-  assumptions?: Record<string, unknown> | null;
-  traceability?: Record<string, unknown> | null;
   trace?: { entries?: Array<{ stage: string; message: string; created_at?: string }> } | null;
-  code_change_plan?: {
-    summary?: string;
-    targets?: Array<{ file_path: string; operation: "create" | "replace" | "delete"; reason: string; risk: string }>;
-    risks?: string[];
-    acceptance_checks?: string[];
-  } | null;
   iterations?: Array<{
     iteration_id: string;
     assistant_message: string;
@@ -116,7 +108,6 @@ export type RunArtifacts = {
     role_scope: Array<"client" | "specialist" | "manager">;
     created_at: string;
   }>;
-  candidate_diff?: string;
   check_results?: Array<{ name: string; status: string; details?: string | null }>;
   draft_preview?: {
     status: string;
@@ -124,7 +115,6 @@ export type RunArtifacts = {
     url?: string | null;
     role_urls?: Record<string, string>;
   };
-  final_summary?: string | null;
   diff?: string;
   failure_analysis?: {
     mode?: "generate" | "fix";
@@ -197,8 +187,6 @@ export type WorkspaceLogs = {
       }>;
     } | null;
     validation?: Record<string, unknown> | null;
-    assumptions?: Record<string, unknown> | null;
-    traceability?: Record<string, unknown> | null;
     iterations?: Record<string, unknown> | null;
     candidate_diff?: Record<string, unknown> | null;
     check_results?: Record<string, unknown> | null;
@@ -206,7 +194,6 @@ export type WorkspaceLogs = {
     fix_attempts?: Record<string, unknown> | null;
     scope_expansions?: Record<string, unknown> | null;
     fix_runtime?: Record<string, unknown> | null;
-    spec_summary?: Record<string, unknown> | null;
   };
 };
 
@@ -245,7 +232,7 @@ export async function listWorkspaces(): Promise<Workspace[]> {
 }
 
 export async function ensureWorkspace(): Promise<Workspace> {
-  const workspace = await request<Workspace>("/workspaces", {
+  return request<Workspace>("/workspaces", {
     method: "POST",
     body: JSON.stringify({
       name: "Research Workspace",
@@ -254,19 +241,10 @@ export async function ensureWorkspace(): Promise<Workspace> {
       preview_profile: "telegram_mock",
     }),
   });
-  return request<Workspace>(`/workspaces/${workspace.workspace_id}/clone-template`, {
-    method: "POST",
-  });
 }
 
 export async function openWorkspace(workspaceId: string): Promise<Workspace> {
-  const workspace = await request<Workspace>(`/workspaces/${workspaceId}`);
-  if (workspace.template_cloned) {
-    return workspace;
-  }
-  return request<Workspace>(`/workspaces/${workspace.workspace_id}/clone-template`, {
-    method: "POST",
-  });
+  return request<Workspace>(`/workspaces/${workspaceId}`);
 }
 
 export async function deleteWorkspace(workspaceId: string): Promise<void> {

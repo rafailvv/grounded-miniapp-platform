@@ -14,8 +14,8 @@ class ContextBudgetManager:
     ) -> dict[str, int | str | bool]:
         profile = ModeProfiles.resolve(generation_mode)
         narrow_path = target_file_count > 0 and target_file_count <= max(4, profile.targeted_file_limit // 2)
-        retrieval_chunks = profile.planning_code_limit + max(1, target_file_count // 3)
-        file_bodies = min(profile.targeted_file_limit, max(target_file_count, profile.planning_code_limit))
+        retrieval_chunks = profile.context_code_limit + max(1, target_file_count // 3)
+        file_bodies = min(profile.targeted_file_limit, max(target_file_count, profile.context_code_limit))
         failure_packet = 9000 if run_mode == "fix" else 3000
         recent_diff_chars = 8000
         if profile.mode == "fast":

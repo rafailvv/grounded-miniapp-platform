@@ -39,10 +39,7 @@ The current baseline is a tri-role app:
 
 ## Generation references
 
-- `docs/generation-contract.md`: product, shell, workflow, and backend invariants.
+- `docs/generation-contract.md`: prompt authority, shell, and backend invariants.
 - `docs/ownership-contract.md`: file ownership and module responsibilities.
-- `docs/generic-persisted-workflow.md`: canonical CRUD and cross-role lifecycle pattern.
+- `docs/components.md`: reusable static UI conventions.
 - `docs/anti-patterns.md`: generation mistakes that should be avoided.
-- `docs/entity-naming-contract.md`: choose and preserve one internal noun family for the dominant entity.
-- `docs/detail-page-pattern.md`: use dedicated detail pages for real record inspection and actions.
-- `docs/status-lifecycle-pattern.md`: keep status values consistent across schemas, routes, and UI.

@@ -5,7 +5,6 @@ from typing import Iterable
 from typing import Any
 
 from app.models.common import GenerationMode
-from app.models.grounded_spec import GroundedSpecModel
 from app.models.domain import CodeChunkRecord, ContextPack, WorkspaceRecord
 from app.services.code_index_service import CodeIndexService
 from app.services.engine.mode_profiles import ModeProfiles
@@ -34,7 +33,6 @@ class ContextPackBuilder:
         generation_mode: GenerationMode = GenerationMode.BALANCED,
         active_paths: list[str] | None = None,
         target_files: list[str] | None = None,
-        grounded_spec: GroundedSpecModel | None = None,
         execution_class: str | None = None,
         run_id: str | None = None,
         intent: str | None = None,
@@ -55,11 +53,7 @@ class ContextPackBuilder:
         ):
             budget["recent_diff_chars"] = 1500
         code_limit, doc_limit = self._retrieval_limits(generation_mode, budget=budget)
-        preferred_paths = self._preferred_anchor_paths(
-            grounded_spec=grounded_spec,
-            execution_class=execution_class,
-            target_files=target_files or [],
-        )
+        preferred_paths = self._preferred_anchor_paths(target_files=target_files or [])
         retrieval_active_paths = list(dict.fromkeys([*preferred_paths, *(active_paths or []), *(target_files or [])]))
         retrieval = self.code_index_service.retrieve(
             workspace_id=workspace.workspace_id,
@@ -200,8 +194,6 @@ class ContextPackBuilder:
                 )
             )
             filtered_diff = self._filter_diff_to_paths(diff_text, focus_paths) if focus_paths else ""
-            if execution_class == "entity_workflow_app" and not target_files:
-                filtered_diff = ""
         if not filtered_diff.strip():
             return ""
         return filtered_diff[:diff_budget]
@@ -236,44 +228,8 @@ class ContextPackBuilder:
         return "\n".join(section for section in kept_sections if section).strip()
 
     @staticmethod
-    def _preferred_anchor_paths(
-        *,
-        grounded_spec: GroundedSpecModel | None,
-        execution_class: str | None,
-        target_files: list[str],
-    ) -> list[str]:
+    def _preferred_anchor_paths(*, target_files: list[str]) -> list[str]:
         anchors: list[str] = []
-        if execution_class in {"entity_workflow_app", "workflow_dashboard_app", "data_crud_app"}:
-            anchors.extend(
-                [
-                    "miniapp/app/main.py",
-                    "miniapp/app/db.py",
-                    "miniapp/app/schemas.py",
-                ]
-            )
-            anchors.extend(path for path in target_files if path.startswith("miniapp/app/routes/"))
-            anchors.extend(
-                path
-                for path in target_files
-                if path.startswith("miniapp/app/static/") and not path.endswith("/index.html")
-            )
-        else:
-            anchors.extend(path for path in target_files if path.endswith("/index.html") or path.endswith("/profile.html"))
-
-        if grounded_spec is not None:
-            entity_names = {entity.name.strip().lower() for entity in grounded_spec.domain_entities if entity.name.strip()}
-            api_paths = {api.path.strip("/") for api in grounded_spec.api_requirements if api.path.strip("/")}
-            if grounded_spec.persistence_requirements or grounded_spec.api_requirements:
-                anchors.extend(["miniapp/app/db.py", "miniapp/app/schemas.py"])
-            for target in target_files:
-                lowered = target.lower()
-                if any(name and name in lowered for name in entity_names):
-                    anchors.append(target)
-                if any(path and path.split("/")[-1] in lowered for path in api_paths):
-                    anchors.append(target)
-            if execution_class in {"workflow_dashboard_app", "data_crud_app"}:
-                for target in target_files:
-                    lowered = target.lower()
-                    if any(token in lowered for token in ("request", "detail", "list", "workload", "dashboard", "demo", "slot", "comment")):
-                        anchors.append(target)
+        anchors.extend(path for path in target_files if path.endswith("/index.html") or path.endswith("/profile.html"))
+        anchors.extend(path for path in target_files if path.startswith("miniapp/app/routes/"))
         return list(dict.fromkeys(path for path in anchors if path))

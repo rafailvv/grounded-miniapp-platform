@@ -448,13 +448,20 @@ class WorkspaceService:
             target_path = draft_source / self._safe_relative_path(operation.file_path)
             current_content = target_path.read_text(encoding="utf-8") if target_path.exists() and target_path.is_file() else ""
             file_hash = self._file_hash(current_content) if target_path.exists() and target_path.is_file() else None
-            diff = self._unified_diff(current_content, operation.content or "", operation.file_path)
+            if operation.operation == "patch":
+                diff = str(operation.diff or operation.content or "")
+                op_name = "patch"
+                content = None
+            else:
+                diff = self._unified_diff(current_content, operation.content or "", operation.file_path)
+                op_name = "delete" if operation.operation == "delete" else ("create" if not target_path.exists() else "update")
+                content = operation.content
             prepared_ops.append(
                 PatchOperationModel(
                     operation_id=operation.operation_id,
-                    op="delete" if operation.operation == "delete" else ("create" if not target_path.exists() else "update"),
+                    op=op_name,
                     file_path=operation.file_path,
-                    content=operation.content,
+                    content=content,
                     diff=diff,
                     explanation=operation.reason,
                     trace_refs=[],
@@ -597,6 +604,73 @@ class WorkspaceService:
                         target_path.unlink()
                     changed_files.append(operation.file_path)
                 continue
+            if operation.op == "patch":
+                patch_diff = str(operation.diff or "")
+                if not patch_diff.strip():
+                    return ApplyPatchResult(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        base_revision_id=envelope.base_revision_id,
+                        status="failed",
+                        conflict_reason=f"Patch operation {operation.operation_id} is missing a unified diff.",
+                        changed_files=changed_files,
+                    )
+                patch_paths = self._paths_from_unified_diff(patch_diff)
+                if not patch_paths:
+                    return ApplyPatchResult(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        base_revision_id=envelope.base_revision_id,
+                        status="failed",
+                        conflict_reason=f"Patch operation {operation.operation_id} did not contain file paths.",
+                        changed_files=changed_files,
+                    )
+                expected_path = operation.file_path.strip().replace("\\", "/")
+                if any(path != expected_path for path in patch_paths):
+                    return ApplyPatchResult(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        base_revision_id=envelope.base_revision_id,
+                        status="failed",
+                        conflict_reason=f"Patch operation {operation.operation_id} touched paths outside {operation.file_path}.",
+                        changed_files=changed_files,
+                    )
+                for path in patch_paths:
+                    self._safe_relative_path(path)
+                check_result = subprocess.run(
+                    ["git", "apply", "--check", "--whitespace=nowarn", "--"],
+                    cwd=target_root,
+                    input=patch_diff,
+                    capture_output=True,
+                    text=True,
+                )
+                if check_result.returncode != 0:
+                    return ApplyPatchResult(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        base_revision_id=envelope.base_revision_id,
+                        status="conflict",
+                        conflict_reason=check_result.stderr.strip() or check_result.stdout.strip() or f"Patch operation {operation.operation_id} could not be applied.",
+                        changed_files=changed_files,
+                    )
+                apply_result = subprocess.run(
+                    ["git", "apply", "--whitespace=nowarn", "--"],
+                    cwd=target_root,
+                    input=patch_diff,
+                    capture_output=True,
+                    text=True,
+                )
+                if apply_result.returncode != 0:
+                    return ApplyPatchResult(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        base_revision_id=envelope.base_revision_id,
+                        status="failed",
+                        conflict_reason=apply_result.stderr.strip() or apply_result.stdout.strip() or f"Patch operation {operation.operation_id} failed during apply.",
+                        changed_files=changed_files,
+                    )
+                changed_files.extend(path for path in patch_paths if path not in changed_files)
+                continue
             if operation.content is None:
                 return ApplyPatchResult(
                     workspace_id=workspace_id,
@@ -736,6 +810,25 @@ class WorkspaceService:
             if normalized:
                 paths.append(normalized)
         return list(dict.fromkeys(paths))
+
+    @classmethod
+    def _paths_from_unified_diff(cls, diff_text: str) -> list[str]:
+        paths: list[str] = []
+        for line in str(diff_text or "").splitlines():
+            if line.startswith("diff --git "):
+                paths.extend(cls._paths_from_draft_diff_header(line))
+                continue
+            if line.startswith("--- ") or line.startswith("+++ "):
+                candidate = line[4:].strip().split("\t", 1)[0].strip().strip('"')
+                if candidate in {"/dev/null", "dev/null"}:
+                    continue
+                if candidate.startswith("a/") or candidate.startswith("b/"):
+                    candidate = candidate[2:]
+                if candidate.startswith("source/") or candidate.startswith("draft/"):
+                    candidate = candidate.split("/", 1)[1]
+                if candidate:
+                    paths.append(candidate)
+        return list(dict.fromkeys(path for path in paths if path))
 
     @staticmethod
     def _copy_tree(source_dir: Path, destination_dir: Path) -> None:

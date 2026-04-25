@@ -60,7 +60,7 @@ def get_preview_logs(workspace_id: str, container: ServiceContainer = Depends(ge
 
 @router.get("/workspaces/{workspace_id}/logs")
 def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, object]:
-    job = container.generation_service.latest_job_for_workspace(workspace_id)
+    job = container.workspace_code_agent_runtime.latest_job_for_workspace(workspace_id)
     preview = container.preview_service.peek(workspace_id)
     platform_log = container.workspace_log_service.read_lines(workspace_id, kind="platform")
     api_log = container.workspace_log_service.read_lines(workspace_id, kind="api")
@@ -89,18 +89,15 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
         for service, lines in container_logs.items()
         for line in ([f"=== {service} ==="] + lines + [""])
     ]
-    validation = container.generation_service.current_report(workspace_id, "validation")
-    assumptions = container.generation_service.current_report(workspace_id, "assumptions")
-    traceability = container.generation_service.current_report(workspace_id, "traceability")
-    spec = container.generation_service.current_report(workspace_id, "spec")
-    iterations = container.generation_service.current_report(workspace_id, "iterations")
-    candidate_diff = container.generation_service.current_report(workspace_id, "candidate_diff")
-    check_results = container.generation_service.current_report(workspace_id, "check_results")
-    trace = container.generation_service.current_report(workspace_id, "trace")
-    fix_case = container.generation_service.current_report(workspace_id, "fix_case")
-    fix_attempts = container.generation_service.current_report(workspace_id, "fix_attempts")
-    scope_expansions = container.generation_service.current_report(workspace_id, "scope_expansions")
-    fix_runtime = container.generation_service.current_report(workspace_id, "fix_runtime")
+    validation = container.workspace_code_agent_runtime.current_report(workspace_id, "validation")
+    iterations = container.workspace_code_agent_runtime.current_report(workspace_id, "iterations")
+    candidate_diff = container.workspace_code_agent_runtime.current_report(workspace_id, "candidate_diff")
+    check_results = container.workspace_code_agent_runtime.current_report(workspace_id, "check_results")
+    trace = container.workspace_code_agent_runtime.current_report(workspace_id, "trace")
+    fix_case = container.workspace_code_agent_runtime.current_report(workspace_id, "fix_case")
+    fix_attempts = container.workspace_code_agent_runtime.current_report(workspace_id, "fix_attempts")
+    scope_expansions = container.workspace_code_agent_runtime.current_report(workspace_id, "scope_expansions")
+    fix_runtime = container.workspace_code_agent_runtime.current_report(workspace_id, "fix_runtime")
 
     return {
         "workspace_id": workspace_id,
@@ -122,8 +119,6 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
         "reports": {
             "trace": trace,
             "validation": validation,
-            "assumptions": assumptions,
-            "traceability": traceability,
             "iterations": iterations,
             "candidate_diff": candidate_diff,
             "check_results": check_results,
@@ -131,12 +126,6 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
             "fix_attempts": fix_attempts,
             "scope_expansions": scope_expansions,
             "fix_runtime": fix_runtime,
-            "spec_summary": {
-                "product_goal": spec.get("product_goal") if spec else None,
-                "actors": len(spec.get("actors", [])) if spec else 0,
-                "flows": len(spec.get("user_flows", [])) if spec else 0,
-                "api_requirements": len(spec.get("api_requirements", [])) if spec else 0,
-            },
         },
     }
 

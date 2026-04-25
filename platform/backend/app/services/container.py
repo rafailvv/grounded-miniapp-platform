@@ -10,20 +10,11 @@ from app.services.context_pack_builder import ContextPackBuilder
 from app.services.document_intelligence import DocumentIntelligenceService
 from app.services.export_service import ExportService
 from app.services.engine import (
-    ArtifactRecorder,
-    CompactionService,
     ContextBudgetManager,
-    DiminishingReturnsService,
     PromptStateManager,
-    ProjectMemoryService,
-    SessionCostLedger,
-    SessionEngine,
-    TaskRouter,
-    TelemetryLogBridge,
 )
-from app.services.fix_orchestrator import FixOrchestrator
-from app.services.miniapp_generation.service import GenerationService
 from app.modules.miniapp_agent_loop.engine import WorkspaceLoopEngine
+from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.services.patch_service import PatchService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.run_service import RunService
@@ -61,79 +52,32 @@ class ServiceContainer:
         self.validation_suite = ValidationSuite()
         self.check_runner = CheckRunner(self.validation_suite, self.preview_service)
         self.openrouter_client = OpenRouterClient(self.settings, self.workspace_log_service)
+        self.workspace_code_agent_runtime = WorkspaceCodeAgentRuntime(
+            store=self.store,
+            workspace_service=self.workspace_service,
+            check_runner=self.check_runner,
+            preview_service=self.preview_service,
+            runtime_manager=self.runtime_manager,
+            openrouter_client=self.openrouter_client,
+            workspace_log_service=self.workspace_log_service,
+            workspace_loop_engine=self.workspace_loop_engine,
+        )
         self.context_budget_manager = ContextBudgetManager()
         self.prompt_state_manager = PromptStateManager()
-        self.task_router = TaskRouter()
-        self.compaction_service = CompactionService()
-        self.artifact_recorder = ArtifactRecorder(self.store)
-        self.telemetry_log_bridge = TelemetryLogBridge(self.workspace_log_service)
-        self.session_cost_ledger = SessionCostLedger(self.store)
-        self.project_memory_service = ProjectMemoryService(self.store)
-        self.diminishing_returns_service = DiminishingReturnsService(self.store)
-        self.session_engine = SessionEngine(
-            self.artifact_recorder,
-            self.task_router,
-            self.context_budget_manager,
-            self.prompt_state_manager,
-            self.compaction_service,
-            self.telemetry_log_bridge,
-            self.session_cost_ledger,
-            self.project_memory_service,
-            self.diminishing_returns_service,
-        )
         self.context_pack_builder = ContextPackBuilder(
             self.code_index_service,
             self.workspace_service,
             self.context_budget_manager,
             self.prompt_state_manager,
         )
-        self.generation_service = GenerationService(
-            self.store,
-            self.workspace_service,
-            self.document_service,
-            self.code_index_service,
-            self.context_pack_builder,
-            self.patch_service,
-            self.preview_service,
-            self.check_runner,
-            self.validation_suite,
-            self.openrouter_client,
-            self.workspace_log_service,
-            self.session_engine,
-            self.task_router,
-            self.context_budget_manager,
-            self.prompt_state_manager,
-            self.compaction_service,
-            self.artifact_recorder,
-            self.workspace_loop_engine,
-        )
-        self.fix_orchestrator = FixOrchestrator(
-            self.store,
-            self.workspace_service,
-            self.check_runner,
-            self.preview_service,
-            self.runtime_manager,
-            self.openrouter_client,
-            self.workspace_log_service,
-            self.session_engine,
-            self.task_router,
-            self.context_budget_manager,
-            self.prompt_state_manager,
-            self.compaction_service,
-            self.artifact_recorder,
-            self.generation_service,
-            self.workspace_loop_engine,
-        )
         self.run_service = RunService(
             self.store,
             self.workspace_service,
-            self.generation_service,
-            self.fix_orchestrator,
+            self.workspace_code_agent_runtime,
             self.preview_service,
             self.check_runner,
             self.openrouter_client,
             self.workspace_log_service,
-            self.session_engine,
         )
         self.export_service = ExportService(self.settings, self.store, self.workspace_service)
 

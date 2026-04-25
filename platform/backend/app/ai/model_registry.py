@@ -37,18 +37,14 @@ CHIP_ENABLED = _chip_enabled()
 
 
 if CHIP_ENABLED:
-    PLANNING_MODEL = "gpt-5.1-codex-mini"
     FAST_CODE_MODEL = "gpt-5.1-codex-mini"
     STRONG_CODE_MODEL = "gpt-5.1-codex-mini"
     SUMMARY_MODEL = "gpt-5.1-codex-mini"
 else:
-    PLANNING_MODEL = "gpt-5.4-mini"
     FAST_CODE_MODEL = "gpt-5.4-mini"
     STRONG_CODE_MODEL = "gpt-5.4"
     SUMMARY_MODEL = "gpt-5.4-mini"
-VISUAL_PATCH_MODEL = PLANNING_MODEL
 REPAIR_MODEL = STRONG_CODE_MODEL
-FAST_PLAN_MODEL = PLANNING_MODEL
 
 TASK_PROFILES = {
     "openai_code_fast": {
@@ -56,9 +52,7 @@ TASK_PROFILES = {
         "provider": "openai",
         "description": "Default iterative coding profile tuned for lower cost while keeping solid general coding quality.",
         "routing": {
-            "spec_analysis": PLANNING_MODEL,
-            "ir_codegen": FAST_CODE_MODEL,
-            "code_plan": FAST_PLAN_MODEL,
+            "agent_turn": FAST_CODE_MODEL,
             "code_edit": FAST_CODE_MODEL,
             "repair": REPAIR_MODEL,
             "summarize": SUMMARY_MODEL,
@@ -69,11 +63,9 @@ TASK_PROFILES = {
     "research_balanced": {
         "label": "Research Balanced",
         "provider": "openai",
-        "description": "Balanced profile for grounded artifact generation with stronger planning and code editing before entering repair.",
+        "description": "Balanced profile for iterative code-agent generation and repair.",
         "routing": {
-            "spec_analysis": PLANNING_MODEL,
-            "ir_codegen": STRONG_CODE_MODEL,
-            "code_plan": STRONG_CODE_MODEL,
+            "agent_turn": STRONG_CODE_MODEL,
             "code_edit": STRONG_CODE_MODEL,
             "repair": REPAIR_MODEL,
             "summarize": SUMMARY_MODEL,
@@ -84,11 +76,9 @@ TASK_PROFILES = {
     "openai_code_quality": {
         "label": "OpenAI Code Quality",
         "provider": "openai",
-        "description": "Highest-confidence profile for grounded artifact generation and repair.",
+        "description": "Highest-confidence profile for iterative code-agent generation and repair.",
         "routing": {
-            "spec_analysis": PLANNING_MODEL,
-            "ir_codegen": STRONG_CODE_MODEL,
-            "code_plan": STRONG_CODE_MODEL,
+            "agent_turn": STRONG_CODE_MODEL,
             "code_edit": STRONG_CODE_MODEL,
             "repair": REPAIR_MODEL,
             "summarize": SUMMARY_MODEL,
@@ -99,17 +89,9 @@ TASK_PROFILES = {
 }
 
 MODEL_REGISTRY = {
-    "spec_analysis": {
-        "primary": TASK_PROFILES["research_balanced"]["routing"]["spec_analysis"],
-        "fallback": TASK_PROFILES["openai_code_fast"]["routing"]["spec_analysis"],
-    },
-    "ir_codegen": {
-        "primary": TASK_PROFILES["research_balanced"]["routing"]["ir_codegen"],
-        "fallback": TASK_PROFILES["openai_code_fast"]["routing"]["ir_codegen"],
-    },
-    "code_plan": {
-        "primary": TASK_PROFILES["research_balanced"]["routing"]["code_plan"],
-        "fallback": TASK_PROFILES["openai_code_fast"]["routing"]["code_plan"],
+    "agent_turn": {
+        "primary": TASK_PROFILES["research_balanced"]["routing"]["agent_turn"],
+        "fallback": TASK_PROFILES["openai_code_fast"]["routing"]["agent_turn"],
     },
     "code_edit": {
         "primary": TASK_PROFILES["research_balanced"]["routing"]["code_edit"],
@@ -192,23 +174,14 @@ def task_model_overrides(
     visual_only_patch: bool = False,
     target_file_count: int = 0,
     backend_target_count: int = 0,
-    cluster_name: str | None = None,
 ) -> tuple[str | None, str | None]:
     del visual_only_patch
     if generation_mode is None:
         return None, None
     mode = generation_mode if isinstance(generation_mode, GenerationMode) else GenerationMode(str(generation_mode))
-    normalized_cluster = str(cluster_name or "").strip()
     if mode == GenerationMode.FAST:
-        if role == "code_plan":
-            return FAST_PLAN_MODEL, FAST_PLAN_MODEL
-        if role in {"code_edit", "ir_codegen"} and backend_target_count == 0:
+        if role in {"agent_turn", "code_edit"} and backend_target_count == 0:
             return FAST_CODE_MODEL, FAST_CODE_MODEL
-        if (
-            role in {"code_edit", "ir_codegen"}
-            and scope_mode == "whole_file_build"
-            and normalized_cluster == "shared_static"
-            and 0 < target_file_count <= 2
-        ):
+        if role in {"agent_turn", "code_edit"} and scope_mode == "full_build" and 0 < target_file_count <= 2:
             return FAST_CODE_MODEL, FAST_CODE_MODEL
     return None, None

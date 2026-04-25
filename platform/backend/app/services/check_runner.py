@@ -56,7 +56,7 @@ class CheckRunner:
         source_dir: Path,
         changed_files: list[str],
         preview_run_id: str | None = None,
-        scope_mode: str = "whole_file_build",
+        scope_mode: str = "full_build",
         check_profile: str = "full",
     ) -> CheckExecutionRecord:
         started = time.perf_counter()
@@ -96,19 +96,19 @@ class CheckRunner:
         results.append(static_result)
 
         canonical_started = time.perf_counter()
-        workflow_smoke_result = self._workflow_canonical_smoke(
+        platform_smoke_result = self._platform_invariants_smoke(
             source_dir=source_dir,
             changed_files=changed_files,
             scope_mode=scope_mode,
         )
-        workflow_smoke_result.duration_ms = int((time.perf_counter() - canonical_started) * 1000)
-        results.append(workflow_smoke_result)
+        platform_smoke_result.duration_ms = int((time.perf_counter() - canonical_started) * 1000)
+        results.append(platform_smoke_result)
 
         should_skip_preview = (
             bool(filtered_issues)
             or bool(connectivity_issues)
             or static_result.status == "failed"
-            or workflow_smoke_result.status == "failed"
+            or platform_smoke_result.status == "failed"
         )
 
         if check_profile == "fast_gate":
@@ -247,9 +247,9 @@ class CheckRunner:
                 message = next((line for line in result.logs if line.strip()), message)
             if result.name == "changed_files_static":
                 message = next((line for line in result.logs if line.strip()), message)
-            if result.name == "workflow_canonical_smoke":
+            if result.name == "platform_invariants":
                 location = "miniapp/app"
-                code = "workflow.canonical_smoke"
+                code = "platform.invariants"
                 message = next((line for line in result.logs if line.strip()), message)
             if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
                 location = "tests"
@@ -307,7 +307,7 @@ class CheckRunner:
             return "validator/domain_constraint"
         if "changed_files_static" in failed_names:
             return "syntax/build"
-        if "workflow_canonical_smoke" in failed_names:
+        if "platform_invariants" in failed_names or "prompt_alignment_smoke" in failed_names:
             return "validator/domain_constraint"
         if "generated_app_python_tests" in failed_names or "generated_app_js_tests" in failed_names:
             return "app/runtime_test"
@@ -388,7 +388,7 @@ class CheckRunner:
             return RunCheckResult(
                 name="preview_connectivity_smoke",
                 status="skipped",
-                details="Preview connectivity smoke skipped because no generated route graph is available.",
+                details="Preview connectivity smoke skipped because no preview routes are available.",
                 command="preview route smoke (current session)",
                 logs=[],
             )
@@ -432,27 +432,32 @@ class CheckRunner:
 
     @staticmethod
     def _root_preview_routes(source_dir: Path) -> list[str]:
-        graph_path = source_dir / "artifacts" / "generated_app_graph.json"
-        if not graph_path.exists():
-            return []
+        manifest_path = source_dir / "miniapp/app/generated/route_manifest.json"
         try:
-            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except ValueError:
             return []
-        roles = graph.get("roles") or {}
+        except OSError:
+            manifest = {}
+        roles = manifest.get("roles") if isinstance(manifest, dict) else {}
         routes: list[str] = []
         for role in ("client", "specialist", "manager"):
-            role_payload = roles.get(role) or {}
-            pages = role_payload.get("pages") or []
-            role_route = next(
-                (
-                    str(page.get("route_path") or "")
-                    for page in pages
-                    if isinstance(page, dict) and str(page.get("route_path") or "") in {f"/{role}", "/"}
-                ),
-                "",
-            )
-            if not role_route or role_route == "/":
+            role_payload = roles.get(role) if isinstance(roles, dict) else {}
+            pages = role_payload.get("pages") if isinstance(role_payload, dict) else []
+            role_route = ""
+            for page in pages or []:
+                if not isinstance(page, dict):
+                    continue
+                candidate = str(page.get("route_path") or "").strip()
+                if candidate in {f"/{role}", "/"}:
+                    role_route = candidate
+                    break
+            if not role_route:
+                static_index = source_dir / f"miniapp/app/static/{role}/index.html"
+                if static_index.exists():
+                    routes.append(f"/{role}")
+                continue
+            if role_route == "/":
                 routes.append(f"/{role}")
                 continue
             if role_route == f"/{role}":
@@ -462,7 +467,7 @@ class CheckRunner:
             routes.append(f"/{role}{normalized}")
         return list(dict.fromkeys(route for route in routes if route))
 
-    def _workflow_canonical_smoke(
+    def _platform_invariants_smoke(
         self,
         *,
         source_dir: Path,
@@ -477,10 +482,10 @@ class CheckRunner:
         ]
         if not relevant_changed:
             return RunCheckResult(
-                name="workflow_canonical_smoke",
+                name="platform_invariants",
                 status="skipped",
-                details="Workflow canonical smoke skipped because no app files changed.",
-                command="workflow canonical smoke",
+                details="Platform invariant smoke skipped because no app files changed.",
+                command="platform invariant smoke",
                 logs=[],
             )
         issues: list[ValidationIssue] = []
@@ -492,44 +497,18 @@ class CheckRunner:
         ):
             issues.extend(GenerationPreflightValidation.preflight_profile_schema_issues(source_dir))
             issues.extend(GenerationPreflightValidation.preflight_route_schema_issues(source_dir))
-            page_graph = self._load_generated_page_graph(source_dir)
-            role_scope = [
-                str(role)
-                for role in ((page_graph.get("roles") or {}).keys() if isinstance(page_graph, dict) else [])
-                if str(role) in {"client", "specialist", "manager"}
-            ]
-            if role_scope:
-                issues.extend(
-                    GenerationPreflightValidation.preflight_route_manifest_link_issues(
-                        source_dir,
-                        page_graph,
-                        role_scope,
-                        normalize_local_route_ref=GenerationPreflightValidation._normalize_local_route_ref,
-                    )
-                )
-        issues.extend(self._workflow_dom_contract_issues(source_dir=source_dir, changed_files=relevant_changed))
+        issues.extend(self._dom_contract_issues(source_dir=source_dir, changed_files=relevant_changed))
         issues = self._dedupe_validation_issues(issues)
         return RunCheckResult(
-            name="workflow_canonical_smoke",
+            name="platform_invariants",
             status="failed" if issues else "passed",
-            details="Workflow canonical smoke validated lightweight route/schema and DOM invariants for the edited surface.",
-            command="workflow canonical smoke",
-            logs=self._validation_logs(issues) if issues else ["Workflow canonical smoke passed."],
+            details="Platform invariant smoke validated lightweight route/schema and DOM invariants for the edited surface.",
+            command="platform invariant smoke",
+            logs=self._validation_logs(issues) if issues else ["Platform invariant smoke passed."],
         )
 
-    @staticmethod
-    def _load_generated_page_graph(source_dir: Path) -> dict[str, object]:
-        graph_path = source_dir / "artifacts" / "generated_app_graph.json"
-        if not graph_path.exists():
-            return {}
-        try:
-            payload = json.loads(graph_path.read_text(encoding="utf-8"))
-        except ValueError:
-            return {}
-        return payload if isinstance(payload, dict) else {}
-
     @classmethod
-    def _workflow_dom_contract_issues(cls, *, source_dir: Path, changed_files: list[str]) -> list[ValidationIssue]:
+    def _dom_contract_issues(cls, *, source_dir: Path, changed_files: list[str]) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         js_files = [
             str(path)
@@ -564,7 +543,7 @@ class CheckRunner:
                 continue
             issues.append(
                 ValidationIssue(
-                    code="workflow.missing_dom_id",
+                    code="platform.missing_dom_id",
                     message=f"{relative_path} references missing DOM ids in {html_path.relative_to(source_dir).as_posix()}: {', '.join(missing_ids)}.",
                     severity="high",
                     location=relative_path,
@@ -1034,7 +1013,7 @@ class CheckRunner:
 
     @staticmethod
     def _filter_build_issues(issues: list[ValidationIssue], scope_mode: str) -> list[ValidationIssue]:
-        if scope_mode not in {"minimal_patch", "role_partial_build", "workflow_partial_build", "fix_agentic"}:
+        if scope_mode not in {"minimal_patch", "role_partial_build", "fix_agentic", "agentic"}:
             return issues
         ignored_prefixes = ("build.placeholder_",)
         ignored_codes = {"build.missing_entrypoint"}

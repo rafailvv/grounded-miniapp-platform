@@ -5,9 +5,7 @@ from dataclasses import dataclass, field
 import os
 import random
 import re
-from typing import Any, Literal
-
-from app.models.common import GenerationMode
+from typing import Literal
 
 
 def _env_int(name: str, default: int, *, aliases: tuple[str, ...] = ()) -> int:
@@ -54,14 +52,8 @@ class TimeoutProfile:
     openai_write_sec: float
     openai_pool_sec: float
     preview_start_sec: int
-    grounded_spec_section_sec: int
-    grounded_spec_total_sec: int
-    code_plan_section_sec: int
-    code_plan_total_sec: int
     structured_llm_sec: int
     json_object_llm_sec: int
-    whole_file_cluster_sec: int
-    whole_file_ui_cluster_sec: int
     tool_command_sec: int
 
     @classmethod
@@ -72,14 +64,8 @@ class TimeoutProfile:
             openai_write_sec=_env_float("OPENAI_WRITE_TIMEOUT_SEC", 1800.0),
             openai_pool_sec=_env_float("OPENAI_POOL_TIMEOUT_SEC", 600.0),
             preview_start_sec=_env_int("PREVIEW_START_TIMEOUT_SEC", 1200),
-            grounded_spec_section_sec=_env_int("GROUNDED_SPEC_SECTION_TIMEOUT_SEC", 900),
-            grounded_spec_total_sec=_env_int("GROUNDED_SPEC_TOTAL_TIMEOUT_SEC", 2400),
-            code_plan_section_sec=_env_int("CODE_PLAN_SECTION_TIMEOUT_SEC", 900),
-            code_plan_total_sec=_env_int("CODE_PLAN_TOTAL_TIMEOUT_SEC", 2400),
             structured_llm_sec=_env_int("STRUCTURED_LLM_TIMEOUT_SEC", 2700),
             json_object_llm_sec=_env_int("JSON_OBJECT_LLM_TIMEOUT_SEC", 1800),
-            whole_file_cluster_sec=_env_int("WHOLE_FILE_CLUSTER_TIMEOUT_SEC", 2700),
-            whole_file_ui_cluster_sec=_env_int("WHOLE_FILE_UI_CLUSTER_TIMEOUT_SEC", 3600),
             tool_command_sec=_env_int("TOOL_COMMAND_TIMEOUT_SEC", 180),
         )
 
@@ -190,62 +176,12 @@ class RetryPolicy:
         return float(capped_delay_ms + jitter_ms) / 1000.0
 
 
-@dataclass(frozen=True)
-class ToolExecutionBatch:
-    kind: Literal["parallel_read", "serial"]
-    requests: list[dict[str, Any]]
-
-
-@dataclass(frozen=True)
-class GenerationQueryConfig:
-    workspace_id: str
-    run_id: str
-    prompt: str
-    intent: str
-    model_profile: str
-    generation_mode: str
-    target_role_scope: list[str]
-    preview_profile: str
-    timeout_profile: TimeoutProfile
-    retry_policy: RetryPolicy
-    max_tool_concurrency: int
-
-    @classmethod
-    def capture(
-        cls,
-        *,
-        workspace_id: str,
-        run_id: str,
-        prompt: str,
-        intent: str,
-        model_profile: str,
-        generation_mode: GenerationMode | str,
-        target_role_scope: list[str],
-        preview_profile: str,
-    ) -> "GenerationQueryConfig":
-        return cls(
-            workspace_id=workspace_id,
-            run_id=run_id,
-            prompt=prompt,
-            intent=intent,
-            model_profile=model_profile,
-            generation_mode=str(getattr(generation_mode, "value", generation_mode)),
-            target_role_scope=list(target_role_scope),
-            preview_profile=preview_profile,
-            timeout_profile=TimeoutProfile.from_env(),
-            retry_policy=RetryPolicy.from_env(),
-            max_tool_concurrency=max(1, _env_int("GENERATION_MAX_TOOL_CONCURRENCY", 8)),
-        )
-
-
 @dataclass
-class GenerationTurnState:
-    attempt: int = 0
+class AgentTurnState:
     prompt_build_ms: int = 0
     tool_orchestration_ms: int = 0
     llm_retry_ms: int = 0
-    repair_ms: int = 0
-    followup_checks_ms: int = 0
+    checks_ms: int = 0
     last_error_class: str | None = None
 
     def latency_breakdown(self) -> dict[str, int]:
@@ -253,16 +189,11 @@ class GenerationTurnState:
             "prompt_build_ms": int(self.prompt_build_ms),
             "tool_orchestration_ms": int(self.tool_orchestration_ms),
             "llm_retry_ms": int(self.llm_retry_ms),
-            "repair_ms": int(self.repair_ms),
-            "followup_checks_ms": int(self.followup_checks_ms),
+            "checks_ms": int(self.checks_ms),
         }
 
 
-ACTIVE_GENERATION_QUERY_CONFIG: ContextVar[GenerationQueryConfig | None] = ContextVar(
-    "active_generation_query_config",
-    default=None,
-)
-ACTIVE_GENERATION_TURN_STATE: ContextVar[GenerationTurnState | None] = ContextVar(
-    "active_generation_turn_state",
+ACTIVE_AGENT_TURN_STATE: ContextVar[AgentTurnState | None] = ContextVar(
+    "active_agent_turn_state",
     default=None,
 )

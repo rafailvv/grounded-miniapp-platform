@@ -18,6 +18,11 @@ class StateStore:
     _PERSISTED_JOB_EVENT_RENAMES = {
         _historical_runtime_value.__func__("building", "_scaffold"): "building_surface",
         _historical_runtime_value.__func__("scaffold", "_ready"): "surface_ready",
+        _historical_runtime_value.__func__("repair", "_planned"): "agent_turn_started",
+        _historical_runtime_value.__func__("fast", "_visual", "_patch"): "agent_turn_started",
+        _historical_runtime_value.__func__("plan", "ner", "_contract", "_gap", "_detected"): "agent_turn_started",
+        _historical_runtime_value.__func__("tri", "age", "_started"): "agent_turn_started",
+        _historical_runtime_value.__func__("tri", "age", "_completed"): "agent_turn_started",
     }
     _PERSISTED_JOB_FIDELITY_RENAMES = {
         _historical_runtime_value.__func__("basic", "_scaffold"): "basic_app",
@@ -25,6 +30,14 @@ class StateStore:
     _PERSISTED_RUN_STAGE_RENAMES = {
         _historical_runtime_value.__func__("building", "_scaffold"): "building_surface",
         _historical_runtime_value.__func__("scaffold", "_ready"): "surface_ready",
+    }
+    _PERSISTED_EXECUTION_CLASS_RENAMES = {
+        _historical_runtime_value.__func__("entity", "_workflow", "_app"): "shell_app",
+        _historical_runtime_value.__func__("workflow", "_dashboard", "_app"): "shell_app",
+        _historical_runtime_value.__func__("data", "_crud", "_app"): "shell_app",
+    }
+    _PERSISTED_OUTCOME_RENAMES = {
+        _historical_runtime_value.__func__("noop", "_mater", "ialization", "_failure"): "noop_generation_failure",
     }
 
     def __init__(self, path: Path) -> None:
@@ -184,6 +197,19 @@ class StateStore:
                             counters["job_events_migrated"] += 1
                             job_changed = True
 
+                execution_class = str(payload.get("execution_class") or "").strip()
+                migrated_execution_class = self._PERSISTED_EXECUTION_CLASS_RENAMES.get(execution_class)
+                if migrated_execution_class and migrated_execution_class != execution_class:
+                    payload["execution_class"] = migrated_execution_class
+                    job_changed = True
+                outcome_kind = str(payload.get("outcome_kind") or "").strip()
+                migrated_outcome = self._PERSISTED_OUTCOME_RENAMES.get(outcome_kind)
+                if migrated_outcome and migrated_outcome != outcome_kind:
+                    payload["outcome_kind"] = migrated_outcome
+                    job_changed = True
+                if self._normalize_validation_snapshot(payload):
+                    job_changed = True
+
                 if job_changed:
                     jobs[key] = payload
                     counters["jobs_migrated"] += 1
@@ -200,6 +226,18 @@ class StateStore:
                     payload["current_stage"] = migrated_stage
                     counters["run_stages_migrated"] += 1
                     run_changed = True
+                execution_class = str(payload.get("execution_class") or "").strip()
+                migrated_execution_class = self._PERSISTED_EXECUTION_CLASS_RENAMES.get(execution_class)
+                if migrated_execution_class and migrated_execution_class != execution_class:
+                    payload["execution_class"] = migrated_execution_class
+                    run_changed = True
+                outcome_kind = str(payload.get("outcome_kind") or "").strip()
+                migrated_outcome = self._PERSISTED_OUTCOME_RENAMES.get(outcome_kind)
+                if migrated_outcome and migrated_outcome != outcome_kind:
+                    payload["outcome_kind"] = migrated_outcome
+                    run_changed = True
+                if self._normalize_validation_snapshot(payload):
+                    run_changed = True
                 if run_changed:
                     runs[key] = payload
                     counters["runs_migrated"] += 1
@@ -208,3 +246,29 @@ class StateStore:
             if changed:
                 self._write(state)
             return counters
+
+    @staticmethod
+    def _normalize_validation_snapshot(payload: dict[str, Any]) -> bool:
+        snapshot = payload.get("validation_snapshot")
+        if not isinstance(snapshot, dict):
+            return False
+        changed = False
+        legacy_spec = snapshot.pop(StateStore._historical_runtime_value("grounded", "_spec", "_valid"), None)
+        legacy_ir = snapshot.pop(StateStore._historical_runtime_value("app", "_ir", "_valid"), None)
+        if legacy_spec is not None or legacy_ir is not None:
+            inferred_valid = bool(legacy_spec) or bool(legacy_ir)
+            snapshot.setdefault("platform_valid", inferred_valid)
+            snapshot.setdefault("prompt_alignment_valid", inferred_valid)
+            snapshot.setdefault("checks_valid", inferred_valid)
+            changed = True
+        if "checks_valid" not in snapshot:
+            snapshot["checks_valid"] = not bool(snapshot.get("blocking", True))
+            changed = True
+        if "platform_valid" not in snapshot:
+            snapshot["platform_valid"] = bool(snapshot.get("checks_valid"))
+            changed = True
+        if "prompt_alignment_valid" not in snapshot:
+            snapshot["prompt_alignment_valid"] = bool(snapshot.get("checks_valid"))
+            changed = True
+        payload["validation_snapshot"] = snapshot
+        return changed

@@ -340,15 +340,15 @@ class PreviewService:
         preview = self._gate_public_readiness(preview)
         if preview.runtime_mode == "inline":
             preview.runtime_mode = "docker"
-            preview.status = "error"
-            preview.stage = "error"
+            preview.status = "stopped"
+            preview.stage = "idle"
             preview.url = None
             preview.frontend_url = None
             preview.backend_url = None
             preview.proxy_port = None
             preview.project_name = None
-            preview.progress_percent = 100
-            self._append_log(preview, "Legacy inline preview was disabled. Start the docker runtime preview.")
+            preview.progress_percent = 0
+            self._append_log(preview, "Preview runtime mode was normalized to docker.")
         return preview
 
     def peek(self, workspace_id: str) -> PreviewRecord:
@@ -713,33 +713,6 @@ class PreviewService:
                 "phone": "",
             }
 
-        generated_graph_path = source_dir / "artifacts" / "generated_app_graph.json"
-        if generated_graph_path.exists():
-            graph = json.loads(generated_graph_path.read_text(encoding="utf-8"))
-            roles: dict[str, dict[str, object]] = {}
-            for role in ROLE_ORDER:
-                role_payload = (graph.get("roles") or {}).get(role) or {}
-                pages = role_payload.get("pages") or []
-                secondary_label = "Explore"
-                for page in pages:
-                    if isinstance(page, dict) and str(page.get("route_path") or "/") != "/":
-                        secondary_label = str(page.get("navigation_label") or page.get("title") or "Explore")
-                        break
-                roles[role] = {
-                    "title": str(graph.get("app_title") or role.title()),
-                    "description": str(graph.get("summary") or ""),
-                    "feature_text": str(graph.get("summary") or ""),
-                    "primary_action_label": pages[1]["title"] if len(pages) > 1 else "Open role",
-                    "secondary_action_label": secondary_label,
-                    "metrics": [
-                        {"metric_id": "pages", "label": "Pages", "value": str(len(pages))},
-                        {"metric_id": "routes", "label": "Routes", "value": str(len(pages))},
-                    ],
-                    "pages": pages,
-                    "profile": empty_profile(),
-                }
-            return {"roles": roles}
-
         route_manifest_path = source_dir / "miniapp" / "app" / "generated" / "route_manifest.json"
         if route_manifest_path.exists():
             route_manifest = json.loads(route_manifest_path.read_text(encoding="utf-8"))
@@ -757,26 +730,6 @@ class PreviewService:
                         {"metric_id": "pages", "label": "Pages", "value": str(len(pages))},
                     ],
                     "pages": pages,
-                    "profile": empty_profile(),
-                }
-            return {"roles": roles}
-
-        grounded_spec_path = source_dir / "artifacts" / "grounded_spec.json"
-        if grounded_spec_path.exists():
-            spec = json.loads(grounded_spec_path.read_text(encoding="utf-8"))
-            goal = str(spec.get("product_goal") or "Generated mini-app preview")
-            roles = {}
-            for role in ROLE_ORDER:
-                roles[role] = {
-                    "title": f"{role.title()} workspace",
-                    "description": goal,
-                    "feature_text": goal,
-                    "primary_action_label": "Open role",
-                    "secondary_action_label": "Profile",
-                    "metrics": [
-                        {"metric_id": "scope", "label": "Flows", "value": str(len(spec.get("user_flows", [])))},
-                        {"metric_id": "docs", "label": "Sources", "value": str(len(spec.get("doc_refs", [])))},
-                    ],
                     "profile": empty_profile(),
                 }
             return {"roles": roles}

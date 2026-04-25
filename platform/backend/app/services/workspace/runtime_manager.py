@@ -21,8 +21,9 @@ class PreviewRuntimeManager:
         self.settings = settings
 
     def preferred_mode(self) -> str:
-        if os.getenv("PYTEST_CURRENT_TEST"):
-            return "inline"
+        configured = str(self.settings.preview_runtime_mode or "auto").strip().lower()
+        if configured == "docker":
+            return "docker"
         return "docker"
 
     def allocate_port(self, workspace_id: str, reserved_ports: set[int] | None = None) -> int:

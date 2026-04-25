@@ -36,7 +36,7 @@ def generate(
         )
         if not run.linked_job_id:
             raise HTTPException(status_code=500, detail="Run did not produce a linked job.")
-        return container.generation_service.get_job(run.linked_job_id)
+        return container.workspace_code_agent_runtime.get_job(run.linked_job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -44,7 +44,7 @@ def generate(
 @router.get("/jobs/{job_id}", response_model=JobRecord)
 def get_job(job_id: str, container: ServiceContainer = Depends(get_container)) -> JobRecord:
     try:
-        return container.generation_service.get_job(job_id)
+        return container.workspace_code_agent_runtime.get_job(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -52,7 +52,7 @@ def get_job(job_id: str, container: ServiceContainer = Depends(get_container)) -
 @router.get("/jobs/{job_id}/events")
 def get_job_events(job_id: str, container: ServiceContainer = Depends(get_container)):
     try:
-        job = container.generation_service.get_job(job_id)
+        job = container.workspace_code_agent_runtime.get_job(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -66,7 +66,7 @@ def get_job_events(job_id: str, container: ServiceContainer = Depends(get_contai
 @router.post("/jobs/{job_id}/retry", response_model=JobRecord)
 def retry_job(job_id: str, container: ServiceContainer = Depends(get_container)) -> JobRecord:
     try:
-        job = container.generation_service.get_job(job_id)
+        job = container.workspace_code_agent_runtime.get_job(job_id)
         request = GenerateRequest(
             prompt=job.prompt,
             mode=job.mode,
@@ -78,8 +78,6 @@ def retry_job(job_id: str, container: ServiceContainer = Depends(get_container))
             linked_run_id=job.linked_run_id,
             error_context=job.error_context,
         )
-        if job.mode == "fix":
-            return container.fix_orchestrator.generate(job.workspace_id, request)
-        return container.generation_service.retry(job_id)
+        return container.workspace_code_agent_runtime.generate(job.workspace_id, request)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

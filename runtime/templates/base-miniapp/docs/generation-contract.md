@@ -4,10 +4,11 @@ Use this template as an extension target, not as something to replace.
 
 ## Product invariants
 
-- Keep exactly three roles: `client`, `specialist`, `manager`.
-- Keep one shared DB-backed state model for workflow records.
-- Preserve the existing profile flow for all three roles.
+- The user prompt is the only source of product/domain semantics.
+- Keep exactly three role entry points available by default: `client`, `specialist`, `manager`.
+- Preserve the existing profile flow for all three roles unless the user explicitly asks to remove it.
 - Preserve the FastAPI runtime layout under `miniapp/app`.
+- Do not assume a request, status, approval, or workflow lifecycle unless the prompt asks for it.
 
 ## Frontend shell rules
 
@@ -24,31 +25,23 @@ Use this template as an extension target, not as something to replace.
 - For frontend API calls, prefer `window.miniappApiFetch(...)` from the preview bridge over raw `fetch(...)`.
 - A local alias like `const apiFetch = window.miniappApiFetch || fetch;` is valid, but write surfaces must still visibly target `/api/...` with a write method.
 
-## Workflow rules
+## Product behavior rules
 
-- Build one real shared persisted entity lifecycle.
-- `client` creates records.
-- `specialist` reads and updates the same records.
-- `manager` observes the same shared state or an aggregate of it.
-- Do not ship form UI, lists, or role dashboards without real read/write API paths in the same draft.
-- Do not pre-render invented business records just to make a page look populated. Live request cards, approval rows, conflict items, and availability records must come from real API reads, or the page must show an honest empty state instead.
-- Static dropdown options, filter chips, and guidance copy are allowed. Example request cards, seeded bookings, and pre-filled live rows are not allowed.
-- Derive the dominant workflow entity, route names, and page names from the prompt and grounded spec. Do not hard-code domain nouns from previous apps.
-- Prefer one canonical backend route module per dominant workflow entity instead of splitting the same lifecycle across multiple near-duplicate route files.
-- If the prompt implies time-bound reservations, bookings, requests, loans, or appointments, keep the API and UI vocabulary internally consistent instead of mixing several synonyms in parallel.
+- Build the app type implied by the prompt: content site, commerce app, calculator, dashboard, booking flow, CRUD tool, or another domain.
+- Add backend persistence only when the requested behavior needs shared or durable data.
+- Do not pre-render invented live business records just to make a page look populated. Use real API data, static catalog/config data, or an honest empty state according to the app type.
+- Static sample content is acceptable for content, catalog, marketing, portfolio, or tool surfaces when it is the product itself rather than fake live state.
+- Derive route names, page names, schemas, and UI vocabulary from the prompt. Do not hard-code domain nouns from previous apps.
+- If the prompt is an internet shop, use commerce vocabulary such as products, catalog, cart, orders, checkout, inventory, and customers; never generic applications or requests.
 
 ## Backend rules
 
 - Keep routers under `miniapp/app/routes` on FastAPI with top-level `router = APIRouter(...)`.
-- Extend `db.py` and `schemas.py` when new persistent entities are introduced.
-- Keep route wiring, runtime manifests, and generated tests derived from realized code.
-- Keep schema enum/status values consistent across `db.py`, `schemas.py`, route handlers, and frontend UI labels. Do not invent alternate status literals in only one layer.
+- Extend `db.py` and `schemas.py` only when persistent entities are introduced.
+- Keep route wiring and runtime surfaces derived from realized code.
+- Keep enum values and frontend labels consistent when a domain actually uses enums.
 
 ## Related docs
 
 - See `docs/ownership-contract.md` for file and module ownership.
-- See `docs/generic-persisted-workflow.md` for the canonical CRUD and role-lifecycle pattern.
 - See `docs/anti-patterns.md` for generation mistakes that should be avoided.
-- See `docs/entity-naming-contract.md` for choosing one internal noun family per dominant entity.
-- See `docs/detail-page-pattern.md` for dedicated record detail page behavior.
-- See `docs/status-lifecycle-pattern.md` for shared status vocabulary.

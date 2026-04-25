@@ -31,16 +31,12 @@ class GenerationPreflightValidation:
         *,
         draft_root: Path,
         changed_files: list[str],
-        page_graph: dict[str, Any],
-        role_scope: list[str],
-        normalize_local_route_ref: Any,
     ) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         issues.extend(cls.preflight_backend_syntax_issues(draft_root, changed_files))
         issues.extend(cls.preflight_frontend_syntax_issues(draft_root, changed_files))
         issues.extend(cls.preflight_profile_schema_issues(draft_root))
         issues.extend(cls.preflight_route_schema_issues(draft_root))
-        issues.extend(cls.preflight_route_manifest_link_issues(draft_root, page_graph, role_scope, normalize_local_route_ref=normalize_local_route_ref))
         deduped: list[ValidationIssue] = []
         seen: set[tuple[str, str]] = set()
         for issue in issues:
@@ -129,54 +125,6 @@ class GenerationPreflightValidation:
         return issues
 
     _preflight_route_schema_issues = preflight_route_schema_issues
-
-    @classmethod
-    def preflight_route_manifest_link_issues(
-        cls,
-        draft_root: Path,
-        page_graph: dict[str, Any],
-        role_scope: list[str],
-        *,
-        normalize_local_route_ref: Any | None = None,
-    ) -> list[ValidationIssue]:
-        manifest_path = draft_root / "miniapp/app/generated/route_manifest.json"
-        if not manifest_path.exists():
-            return []
-        try:
-            route_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-        normalize_local_route_ref = normalize_local_route_ref or cls._normalize_local_route_ref
-        declared_routes: set[str] = set()
-        for role in role_scope:
-            for page in (((route_manifest.get("roles") or {}).get(role) or {}).get("pages") or []):
-                if isinstance(page, dict):
-                    route_path = str(page.get("route_path") or "").strip()
-                    if route_path:
-                        declared_routes.add(normalize_local_route_ref(route_path))
-        issues: list[ValidationIssue] = []
-        href_pattern = re.compile(r"""href=["']([^"']+)["']""")
-        for role in role_scope:
-            for page in (((page_graph.get("roles") or {}).get(role) or {}).get("pages") or []):
-                if not isinstance(page, dict):
-                    continue
-                file_path = str(page.get("file_path") or "")
-                if not file_path.endswith(".html"):
-                    continue
-                absolute = draft_root / file_path
-                if not absolute.exists():
-                    continue
-                content = absolute.read_text(encoding="utf-8")
-                for route_ref in href_pattern.findall(content):
-                    route_ref = str(route_ref).strip()
-                    if not route_ref.startswith("/") or route_ref.startswith("/api/") or route_ref.startswith("/static/"):
-                        continue
-                    normalized_route_ref = normalize_local_route_ref(route_ref)
-                    if normalized_route_ref not in declared_routes:
-                        issues.append(ValidationIssue(code="preflight.route_manifest_link_mismatch", message=f"{file_path} references {route_ref}, but route_manifest.json does not declare it.", severity="high", location=file_path, blocking=True))
-        return issues
-
-    _preflight_route_manifest_link_issues = preflight_route_manifest_link_issues
 
     @staticmethod
     def preflight_check_results(issues: list[ValidationIssue]) -> list[RunCheckResult]:

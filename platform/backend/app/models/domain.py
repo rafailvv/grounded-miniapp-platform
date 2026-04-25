@@ -99,7 +99,6 @@ class JobEvent(StrictModel):
         "fixing_code",
         "applying",
         "editing_started",
-        "fast_visual_patch",
         "iteration_ready",
         "validation_failed",
         "build_started",
@@ -107,11 +106,8 @@ class JobEvent(StrictModel):
         "preview_skipped_due_to_build_failure",
         "repair_started",
         "repair_iteration",
-        "repair_scope_expanded",
         "repair_repeated_signature_aborted",
-        "triage_started",
-        "triage_completed",
-        "repair_planned",
+        "agent_turn_started",
         "patch_apply_started",
         "patch_apply_completed",
         "frontend_build_started",
@@ -120,7 +116,6 @@ class JobEvent(StrictModel):
         "preview_validation_started",
         "failure_reanalyzed",
         "scope_expanded",
-        "planner_contract_gap_detected",
         "apply_started",
         "apply_completed",
         "preview_rebuild_started",
@@ -136,8 +131,9 @@ class JobEvent(StrictModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 class ValidationSnapshot(StrictModel):
-    grounded_spec_valid: bool = False
-    app_ir_valid: bool = False
+    platform_valid: bool = False
+    prompt_alignment_valid: bool = False
+    checks_valid: bool = False
     build_valid: bool = False
     blocking: bool = True
     issues: list[dict] = Field(default_factory=list)
@@ -168,8 +164,8 @@ class JobRecord(StrictModel):
     llm_provider: str | None = None
     llm_model: str | None = None
     model_profile: str | None = None
-    execution_class: Literal["shell_app", "entity_workflow_app", "workflow_dashboard_app", "data_crud_app"] | None = None
-    outcome_kind: Literal["applied", "warnings", "blocked_generation", "blocked_preview_infra", "noop_materialization_failure"] | None = None
+    execution_class: Literal["shell_app"] | None = None
+    outcome_kind: Literal["applied", "warnings", "blocked_generation", "blocked_preview_infra", "noop_generation_failure"] | None = None
     linked_run_id: str | None = None
     error_context: ErrorContext | None = None
     failure_reason: str | None = None
@@ -288,8 +284,9 @@ class SaveFileRequest(StrictModel):
 class DraftFileOperation(StrictModel):
     operation_id: str = Field(default_factory=lambda: new_id("draft_op"))
     file_path: str
-    operation: Literal["create", "replace", "delete"]
+    operation: Literal["create", "replace", "delete", "patch"]
     content: str | None = None
+    diff: str | None = None
     reason: str
 
 
@@ -369,7 +366,7 @@ class CheckExecutionRecord(StrictModel):
 
 class RunIterationOperation(StrictModel):
     file_path: str
-    operation: Literal["create", "replace", "delete"]
+    operation: Literal["create", "replace", "delete", "patch"]
     reason: str
 
 
@@ -446,7 +443,7 @@ class FixAttemptRecord(StrictModel):
 
 class CodeChangeTarget(StrictModel):
     file_path: str
-    operation: Literal["create", "replace", "delete"]
+    operation: Literal["create", "replace", "delete", "patch"]
     reason: str
     risk: Literal["low", "medium", "high"] = "medium"
 
@@ -487,8 +484,8 @@ class RunRecord(StrictModel):
     generation_mode: GenerationMode = GenerationMode.BALANCED
     llm_provider: str | None = None
     llm_model: str | None = None
-    execution_class: Literal["shell_app", "entity_workflow_app", "workflow_dashboard_app", "data_crud_app"] | None = None
-    outcome_kind: Literal["applied", "warnings", "blocked_generation", "blocked_preview_infra", "noop_materialization_failure"] | None = None
+    execution_class: Literal["shell_app"] | None = None
+    outcome_kind: Literal["applied", "warnings", "blocked_generation", "blocked_preview_infra", "noop_generation_failure"] | None = None
     linked_job_id: str | None = None
     resume_from_run_id: str | None = None
     source_revision_id: str | None = None

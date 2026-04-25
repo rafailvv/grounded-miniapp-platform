@@ -22,13 +22,12 @@ from app.models.domain import (
     JobRecord,
     RunChecksSummary,
     RunRecord,
+    ValidationSnapshot,
     WorkspaceRecord,
 )
-from app.modules.miniapp_generation_runtime.generation_completion import MiniappGenerationCompletion
+from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
-from app.services.fix_orchestrator import FixOrchestrator
-from app.services.miniapp_generation.service import GenerationService
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.service import WorkspaceService
@@ -90,23 +89,19 @@ class RunService:
         self,
         store: StateStore,
         workspace_service: WorkspaceService,
-        generation_service: GenerationService,
-        fix_orchestrator: FixOrchestrator,
+        code_agent_runtime: WorkspaceCodeAgentRuntime,
         preview_service: PreviewService,
         check_runner: CheckRunner,
         openrouter_client: OpenRouterClient,
         workspace_log_service: WorkspaceLogService,
-        session_engine: Any | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
-        self.generation_service = generation_service
-        self.fix_orchestrator = fix_orchestrator
+        self.code_agent_runtime = code_agent_runtime
         self.preview_service = preview_service
         self.check_runner = check_runner
         self.openrouter_client = openrouter_client
         self.workspace_log_service = workspace_log_service
-        self.session_engine = session_engine
         self._active_workers: dict[str, threading.Thread] = {}
         self._startup_started_at = datetime.now(timezone.utc)
         self._recover_orphaned_active_runs()
@@ -367,7 +362,7 @@ class RunService:
         if not payload:
             run = self.get_run(run_id)
             if run.linked_job_id:
-                job = self.generation_service.get_job(run.linked_job_id)
+                job = self.code_agent_runtime.get_job(run.linked_job_id)
                 preview = self.preview_service.get(run.workspace_id)
                 change_plan = self._build_change_plan(
                     workspace_id=run.workspace_id,
@@ -557,20 +552,20 @@ class RunService:
                         },
                     )
                     resumed_generate_request = generate_request.model_copy(update={"mode": "generate"})
-                    job = self.generation_service.generate(
+                    job = self.code_agent_runtime.generate(
                         run.workspace_id,
                         resumed_generate_request,
                         should_stop=lambda: self._is_stop_requested(run.run_id),
                     )
                 else:
                     job = (
-                        self.fix_orchestrator.generate(
+                        self.code_agent_runtime.generate(
                             run.workspace_id,
                             generate_request,
                             should_stop=lambda: self._is_stop_requested(run.run_id),
                         )
                         if request.mode == "fix"
-                        else self.generation_service.generate(
+                        else self.code_agent_runtime.generate(
                             run.workspace_id,
                             generate_request,
                             should_stop=lambda: self._is_stop_requested(run.run_id),
@@ -588,7 +583,7 @@ class RunService:
                     {"run_id": run.run_id},
                 )
                 with self.openrouter_client.workspace_logging(run.workspace_id):
-                    job = self.fix_orchestrator.generate(
+                    job = self.code_agent_runtime.generate(
                         run.workspace_id,
                         self._build_auto_fix_request(run=run, request=request, failed_job=job),
                         should_stop=lambda: self._is_stop_requested(run.run_id),
@@ -628,7 +623,7 @@ class RunService:
                 request=request,
             )
             run.candidate_revision_id = f"draft:{run.run_id}"
-            run.iteration_count = len((self.generation_service.current_report(run.workspace_id, "iterations") or {}).get("items", []))
+            run.iteration_count = len((self.code_agent_runtime.current_report(run.workspace_id, "iterations") or {}).get("items", []))
             run.latency_breakdown = dict(job.latency_breakdown)
             run.repair_iterations = list(job.repair_iterations)
             run.fix_attempts = list(job.fix_attempts)
@@ -637,10 +632,9 @@ class RunService:
             run.retrieval_stats = dict(job.retrieval_stats)
             run.cache_stats = dict(job.cache_stats)
             run.artifacts = {
-                "grounded_spec": f"/workspaces/{run.workspace_id}/spec/current",
                 "run_artifacts": f"/runs/{run.run_id}/artifacts",
                 "preview_url": preview.url or "",
-                "traceability": f"/workspaces/{run.workspace_id}/traceability/current",
+                "trace": f"/workspaces/{run.workspace_id}/logs",
                 "iterations": f"/runs/{run.run_id}/iterations",
                 "checks": f"/runs/{run.run_id}/checks",
                 "patch": f"/runs/{run.run_id}/patch",
@@ -819,7 +813,7 @@ class RunService:
             self._save_run(run)
             if linked_job_id:
                 try:
-                    job = self.generation_service.get_job(linked_job_id)
+                    job = self.code_agent_runtime.get_job(linked_job_id)
                 except KeyError:
                     job = None
                 if job is not None:
@@ -827,7 +821,7 @@ class RunService:
                     job.summary = job.summary or "Run failed with an unexpected exception."
                     job.failure_reason = str(exc)
                     job.current_fix_phase = "failed" if job.current_fix_phase == "completed" else job.current_fix_phase
-                    self.generation_service._append_event(
+                    self.code_agent_runtime.append_event(
                         job,
                         "job_failed",
                         "Run failed with an unexpected exception.",
@@ -1084,10 +1078,10 @@ class RunService:
             source_dir=source_dir,
             changed_files=list(run.touched_files or ["miniapp"]),
             preview_run_id=None,
-            scope_mode="whole_file_build",
+            scope_mode="full_build",
             check_profile="full",
         )
-        validation_snapshot = MiniappGenerationCompletion.validation_snapshot_from_execution(execution)
+        validation_snapshot = self._validation_snapshot_from_execution(execution)
         self.store.upsert(
             "reports",
             f"followup_checks:{run.run_id}",
@@ -1099,12 +1093,45 @@ class RunService:
         return execution, validation_snapshot
 
     def _followup_checks_passed(self, run: RunRecord, execution: CheckExecutionRecord, validation_snapshot: Any) -> bool:
-        completion = MiniappGenerationCompletion.workspace_loop_completion_state(
-            execution.results,
-            self._preview_snapshot(run.workspace_id),
-            validation_snapshot,
+        return bool(self._strict_green_completion_state(execution.results, validation_snapshot).get("strict_green"))
+
+    @staticmethod
+    def _validation_snapshot_from_execution(execution: CheckExecutionRecord) -> ValidationSnapshot:
+        issues = [issue.model_dump(mode="json") for issue in CheckRunner.failing_issues(execution.results)]
+        build_failed = any(item.status == "failed" for item in execution.results if item.name == "changed_files_static")
+        prompt_failed = any(item.status == "failed" for item in execution.results if item.name == "prompt_alignment_smoke")
+        return ValidationSnapshot(
+            platform_valid=not bool(issues),
+            prompt_alignment_valid=not prompt_failed,
+            checks_valid=not bool(issues),
+            build_valid=not build_failed,
+            blocking=bool(issues),
+            issues=issues,
         )
-        return bool(completion.get("strict_green"))
+
+    @staticmethod
+    def _strict_green_completion_state(results: list[Any], validation_snapshot: Any | None) -> dict[str, object]:
+        failed = [result for result in results if getattr(result, "status", None) == "failed"]
+        remaining_issues = [
+            {
+                "kind": "check_failure",
+                "check": getattr(result, "name", "unknown"),
+                "details": getattr(result, "details", None),
+                "logs": list(getattr(result, "logs", []) or [])[-8:],
+                "blocking": True,
+            }
+            for result in failed
+        ]
+        if validation_snapshot is not None:
+            remaining_issues.extend(
+                issue
+                for issue in getattr(validation_snapshot, "issues", [])
+                if isinstance(issue, dict) and issue.get("blocking", False)
+            )
+        return {
+            "strict_green": not failed and not remaining_issues,
+            "remaining_issues": remaining_issues,
+        }
 
     def _should_auto_fix_followup_failure(self, execution: CheckExecutionRecord, validation_snapshot: Any) -> bool:
         if CheckRunner.has_tooling_failure(execution.results):
@@ -1116,7 +1143,7 @@ class RunService:
             "schema_validators",
             "connectivity_validators",
             "changed_files_static",
-            "workflow_canonical_smoke",
+            "platform_invariants",
             "generated_app_python_tests",
             "generated_app_js_tests",
             "preview_boot_smoke",
@@ -1281,8 +1308,8 @@ class RunService:
 
     def _store_run_artifacts(self, run: RunRecord, change_plan: CodeChangePlan, job: Any, preview: Any) -> None:
         workspace_id = run.workspace_id
-        iterations = (self.generation_service.current_report(workspace_id, "iterations") or {}).get("items", [])
-        candidate_diff = (self.generation_service.current_report(workspace_id, "candidate_diff") or {}).get("diff", "")
+        iterations = (self.code_agent_runtime.current_report(workspace_id, "iterations") or {}).get("items", [])
+        candidate_diff = (self.code_agent_runtime.current_report(workspace_id, "candidate_diff") or {}).get("diff", "")
         if candidate_diff:
             effective_diff = candidate_diff
         elif run.draft_ready and self.workspace_service.draft_exists(workspace_id, run.run_id):
@@ -1290,7 +1317,7 @@ class RunService:
         else:
             effective_diff = self.workspace_service.diff(workspace_id)
         preview_payload = self._preview_snapshot(workspace_id, preview)
-        patch_payload = self.generation_service.current_report(workspace_id, "patch")
+        patch_payload = self.code_agent_runtime.current_report(workspace_id, "patch")
         if not patch_payload and effective_diff.strip():
             patch_paths = self._paths_from_diff(effective_diff)
             if not patch_paths:
@@ -1304,28 +1331,11 @@ class RunService:
         payload = {
             "run": run.model_dump(mode="json"),
             "job": job.model_dump(mode="json"),
-            "grounded_spec": self.generation_service.current_report(workspace_id, "spec"),
-            "validation": self.generation_service.current_report(workspace_id, "validation"),
-            "assumptions": self.generation_service.current_report(workspace_id, "assumptions"),
-            "role_contract": self.generation_service.current_report(workspace_id, "role_contract"),
-            "traceability": self.generation_service.current_report(workspace_id, "traceability"),
-            "trace": self.generation_service.current_report(workspace_id, "trace"),
-            "code_change_plan": change_plan.model_dump(mode="json"),
-            "page_graph": self.generation_service.current_report(workspace_id, "page_graph"),
+            "trace": self.code_agent_runtime.current_report(workspace_id, "trace"),
             "iterations": iterations,
-            "candidate_diff": candidate_diff,
-            "check_results": (self.generation_service.current_report(workspace_id, "check_results") or {}).get("items", []),
-            "checks": self.generation_service.current_report(workspace_id, "check_results"),
+            "check_results": (self.code_agent_runtime.current_report(workspace_id, "check_results") or {}).get("items", []),
+            "checks": self.code_agent_runtime.current_report(workspace_id, "check_results"),
             "patch": patch_payload,
-            "materialization_report": self.generation_service.current_report(workspace_id, "materialization_report"),
-            "stage_reports": self.generation_service.current_report(workspace_id, "stage_reports"),
-            "retrieval_anchor_report": self.generation_service.current_report(workspace_id, "retrieval_anchor_report"),
-            "execution_class": self.generation_service.current_report(workspace_id, "execution_class"),
-            "context_budget": self.generation_service.current_report(workspace_id, "context_budget"),
-            "prompt_fingerprint": self.generation_service.current_report(workspace_id, "prompt_fingerprint"),
-            "mode_profile_snapshot": self.generation_service.current_report(workspace_id, "mode_profile_snapshot"),
-            "phase_metrics": self.generation_service.current_report(workspace_id, "phase_metrics"),
-            "engine_trace": self.generation_service.current_report(workspace_id, "engine_trace"),
             "diff": effective_diff,
             "preview": preview_payload,
             "draft_preview": {
@@ -1333,16 +1343,10 @@ class RunService:
                 for key, value in preview_payload.items()
                 if key in {"status", "stage", "progress_percent", "runtime_mode", "url", "role_urls", "draft_run_id"}
             },
-            "final_summary": job.summary,
             "latency_breakdown": job.latency_breakdown,
             "retrieval_stats": job.retrieval_stats,
             "cache_stats": job.cache_stats,
             "apply_result": job.apply_result,
-            "repair_iterations": job.repair_iterations,
-            "fix_case": self.generation_service.current_report(workspace_id, "fix_case"),
-            "fix_attempts": self.generation_service.current_report(workspace_id, "fix_attempts"),
-            "scope_expansions": self.generation_service.current_report(workspace_id, "scope_expansions"),
-            "fix_runtime": self.generation_service.current_report(workspace_id, "fix_runtime"),
             "preview_infra_diagnostics": {
                 "failure_kind": getattr(preview, "preview_failure_kind", None),
                 "retry_count": getattr(preview, "preview_retry_count", 0),
@@ -1379,7 +1383,7 @@ class RunService:
         role_scope = list(resolved_role_scope if resolved_role_scope is not None else self._resolve_target_role_scope(request))
         if self._looks_like_fix_request(prompt):
             return "edit"
-        if GenerationService._looks_like_create_surface_request(prompt, role_scope):
+        if self._looks_like_create_request(prompt):
             return "create"
         if role_scope and len(role_scope) == 1:
             return "role_only_change"
@@ -1401,28 +1405,6 @@ class RunService:
             hints = ROLE_SCOPE_HINTS.get(role) or ()
             if any(hint in prompt for hint in hints):
                 inferred_scope.append(role)
-        workflow_markers = (
-            "status",
-            "cancel",
-            "assign",
-            "approve",
-            "reject",
-            "queue",
-            "workflow",
-            "lifecycle",
-            "order",
-            "orders",
-            "processing",
-            "статус",
-            "отмен",
-            "назнач",
-            "очеред",
-            "заказ",
-            "обработ",
-        )
-        if any(marker in prompt for marker in workflow_markers):
-            if not inferred_scope or len(inferred_scope) == 1:
-                return [role for role in ("client", "specialist", "manager") if role in ROLE_SCOPE]
         return inferred_scope
 
     def _resolve_generation_mode(
@@ -1474,7 +1456,7 @@ class RunService:
         diff_text: str,
         prompt: str,
     ) -> CodeChangePlan:
-        iteration_payload = self.generation_service.current_report(workspace_id, "iterations") or {}
+        iteration_payload = self.code_agent_runtime.current_report(workspace_id, "iterations") or {}
         targets: list[CodeChangeTarget] = []
         seen_paths: set[str] = set()
         file_paths = self._paths_from_diff(diff_text)
@@ -1495,15 +1477,15 @@ class RunService:
 
         summary = f"Prepare draft code changes for prompt: {prompt[:120]}"
         risks = [
-            "Role-specific behavior must remain valid for client, specialist, and manager previews.",
+            "Generated app behavior must remain valid in the preview shell.",
             "Draft changes should not overwrite manual workspace edits outside the reviewed draft.",
         ]
         if diff_text.strip():
             risks.append("Existing workspace edits must be preserved and not overwritten unexpectedly.")
         acceptance_checks = [
-            "GroundedSpec planning diagnostics pass or provide explicit blocking issues.",
-            "Build validation succeeds on the draft workspace.",
-            "Preview runtime starts and exposes role-specific URLs.",
+            "Agent-authored changes satisfy the user prompt.",
+            "Platform checks succeed on the draft workspace.",
+            "Preview runtime starts and serves usable app pages.",
         ]
         return CodeChangePlan(
             workspace_id=workspace_id,
@@ -1543,6 +1525,23 @@ class RunService:
             "сбой",
         )
         return any(marker in prompt for marker in fix_markers)
+
+    @staticmethod
+    def _looks_like_create_request(prompt: str) -> bool:
+        create_markers = (
+            "create",
+            "build",
+            "make",
+            "generate",
+            "new app",
+            "new workspace",
+            "создай",
+            "создать",
+            "сделай",
+            "сгенерируй",
+            "новое приложение",
+        )
+        return any(marker in prompt for marker in create_markers)
 
     def _resolve_touched_files(
         self,
@@ -1632,7 +1631,7 @@ class RunService:
         run.failure_reason = message
         run.status = "failed"
         run.apply_status = "failed"
-        run.outcome_kind = "noop_materialization_failure"
+        run.outcome_kind = "noop_generation_failure"
         run.draft_status = "discarded" if self.workspace_service.draft_exists(run.workspace_id, run.run_id) else "none"
         run.draft_ready = False
         run.current_stage = "failed"
@@ -1644,7 +1643,7 @@ class RunService:
         job.status = "failed"
         job.summary = message
         job.failure_reason = message
-        self.generation_service._append_event(job, "job_failed", message, {"reason": "no_meaningful_diff"})
+        self.code_agent_runtime.append_event(job, "job_failed", message, {"reason": "no_meaningful_diff"})
 
     def _complete_blocked_noop_run_from_green_source(
         self,
@@ -1665,14 +1664,10 @@ class RunService:
             source_dir=source_dir,
             changed_files=[],
             preview_run_id=None,
-            scope_mode="whole_file_build",
+            scope_mode="full_build",
         )
-        validation_snapshot = MiniappGenerationCompletion.validation_snapshot_from_execution(execution)
-        completion_state = MiniappGenerationCompletion.workspace_loop_completion_state(
-            execution.results,
-            self._preview_snapshot(run.workspace_id, self.preview_service.get(run.workspace_id)),
-            validation_snapshot,
-        )
+        validation_snapshot = self._validation_snapshot_from_execution(execution)
+        completion_state = self._strict_green_completion_state(execution.results, validation_snapshot)
         if not bool(completion_state.get("strict_green")):
             return False
 
@@ -1763,9 +1758,9 @@ class RunService:
             source_dir=draft_source,
             changed_files=meaningful_paths,
             preview_run_id=run.run_id,
-            scope_mode="whole_file_build",
+            scope_mode="full_build",
         )
-        validation_snapshot = MiniappGenerationCompletion.validation_snapshot_from_execution(execution)
+        validation_snapshot = self._validation_snapshot_from_execution(execution)
         results = execution.results
         draft_green = all(
             result.status != "failed"
@@ -1911,7 +1906,7 @@ class RunService:
         change_plan: CodeChangePlan,
         job: Any | None = None,
     ) -> list[str]:
-        candidate_diff = (self.generation_service.current_report(workspace_id, "candidate_diff") or {}).get("diff", "")
+        candidate_diff = (self.code_agent_runtime.current_report(workspace_id, "candidate_diff") or {}).get("diff", "")
         diff_text = candidate_diff
         if not diff_text and self.workspace_service.draft_exists(workspace_id, run.run_id):
             diff_text = self.workspace_service.diff(workspace_id, run_id=run.run_id)
@@ -2002,12 +1997,11 @@ class RunService:
             has_generation_block = any(code.startswith("generation.") for code in issue_codes)
             has_build_issue = any(code.startswith("build.") for code in issue_codes)
             has_preview_issue = any(code.startswith("preview.") for code in issue_codes)
-            has_workflow_issue = any(code.startswith("workflow.") for code in issue_codes)
-            if getattr(validation_snapshot, "blocking", False) and (has_generation_block or has_workflow_issue):
+            if getattr(validation_snapshot, "blocking", False) and has_generation_block:
                 validators = "blocked"
             elif has_build_issue or has_preview_issue:
                 validators = "passed"
-            elif getattr(validation_snapshot, "grounded_spec_valid", False) or getattr(validation_snapshot, "app_ir_valid", False):
+            elif getattr(validation_snapshot, "platform_valid", False) or getattr(validation_snapshot, "checks_valid", False):
                 validators = "passed"
             else:
                 validators = "failed"

@@ -21,21 +21,9 @@ class ValidationIssue(StrictModel):
     blocking: bool = True
 
 
-class GroundedSpecValidatorResult(StrictModel):
-    valid: bool
-    blocking: bool
-    issues: list[ValidationIssue] = Field(default_factory=list)
-
-
-class AppIRValidatorResult(StrictModel):
-    valid: bool
-    blocking: bool
-    issues: list[ValidationIssue] = Field(default_factory=list)
-
-
 class PatchOperationModel(StrictModel):
     operation_id: str
-    op: Literal["create", "update", "delete"]
+    op: Literal["create", "update", "delete", "patch"]
     file_path: str
     content: str | None = None
     diff: str | None = None
@@ -89,26 +77,9 @@ class TraceabilityReportModel(StrictModel):
     entries: list[TraceabilityReportEntry]
 
 
-ExecutionClass = Literal["shell_app", "entity_workflow_app", "workflow_dashboard_app", "data_crud_app"]
+ExecutionClass = Literal["shell_app"]
 PreviewFailureKind = Literal["address_pool_exhausted", "container_name_conflict", "network_conflict", "compose_start_failure", "unknown"]
-RunOutcomeKind = Literal["applied", "warnings", "blocked_generation", "blocked_preview_infra", "noop_materialization_failure"]
-
-
-class MaterializationReport(StrictModel):
-    execution_class: ExecutionClass
-    planned_files: list[str] = Field(default_factory=list)
-    created_files: list[str] = Field(default_factory=list)
-    missing_files: list[str] = Field(default_factory=list)
-    expected_backend_files: list[str] = Field(default_factory=list)
-    missing_backend_files: list[str] = Field(default_factory=list)
-    backend_surface_ok: bool = False
-    page_surface_ok: bool = False
-    manifest_surface_ok: bool = False
-    collapsed_surface: bool = False
-    role_page_counts: dict[str, int] = Field(default_factory=dict)
-    role_unique_page_counts: dict[str, int] = Field(default_factory=dict)
-    duplicate_page_file_roles: dict[str, list[str]] = Field(default_factory=dict)
-    stage_reports: list[dict[str, Any]] = Field(default_factory=list)
+RunOutcomeKind = Literal["applied", "warnings", "blocked_generation", "blocked_preview_infra", "noop_generation_failure"]
 
 
 class PreviewInfraDiagnostics(StrictModel):

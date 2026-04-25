@@ -1103,7 +1103,7 @@ export default function App() {
       setDiffLoading(false);
       return;
     }
-    const primaryDiff = `${runArtifacts?.candidate_diff ?? runArtifacts?.diff ?? ""}`.trim();
+    const primaryDiff = `${runArtifacts?.diff ?? ""}`.trim();
     if (primaryDiff) {
       setFallbackDiffText("");
       setFallbackDiffRunId("");
@@ -1129,7 +1129,7 @@ export default function App() {
         }
         try {
           const artifacts = await getRunArtifacts(previousRun.run_id);
-          const previousDiff = `${artifacts?.candidate_diff ?? artifacts?.diff ?? ""}`.trim();
+          const previousDiff = `${artifacts?.diff ?? ""}`.trim();
           if (!previousDiff) {
             continue;
           }
@@ -1172,7 +1172,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [runs, runArtifacts?.candidate_diff, runArtifacts?.diff, selectedRunId, workspace?.workspace_id]);
+  }, [runs, runArtifacts?.diff, selectedRunId, workspace?.workspace_id]);
 
   useEffect(() => {
     if (!workspace) {
@@ -1299,7 +1299,7 @@ export default function App() {
     [runs],
   );
   const draftContextRunId = selectedRun?.draft_ready || selectedRun?.status === "awaiting_approval" ? selectedRun.run_id : "";
-  const primaryDiffText = runArtifacts?.candidate_diff ?? runArtifacts?.diff ?? "";
+  const primaryDiffText = runArtifacts?.diff ?? "";
   const diffText = primaryDiffText || fallbackDiffText;
   const diffSourceLabel = !primaryDiffText.trim()
     ? fallbackDiffSource === "run" && fallbackDiffRunId
@@ -1310,7 +1310,6 @@ export default function App() {
     : undefined;
   const showGlobalLoader = initializing || creatingWorkspace || (workspaceTransitioning && !workspace);
   const runDetailSummary =
-    runArtifacts?.final_summary ??
     runArtifacts?.job?.summary ??
     selectedRun?.summary ??
     selectedRun?.failure_reason ??

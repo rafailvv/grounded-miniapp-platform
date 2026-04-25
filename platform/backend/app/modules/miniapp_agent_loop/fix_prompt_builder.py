@@ -15,7 +15,6 @@ class FixPromptBuilder:
         return [
             "miniapp/tests/",
             "miniapp/app/generated/",
-            "artifacts/generated_app_graph.json",
         ]
 
     @classmethod
@@ -136,11 +135,11 @@ class FixPromptBuilder:
             "You are a focused software repair agent. "
             "Diagnose the current failure packet, patch only the generated app files justified by the evidence, "
             "keep the diff minimal, and aim for strict-green validation: validators, generated tests, and preview runtime all passing. "
-            "Do not redesign the app. Fix the current root-cause cluster only. "
+            "Do not redesign the app. Fix the current root cause only. "
             "Preserve the existing backend architecture, routers, and static mounting unless the evidence explicitly implicates them. "
             "Never replace a functioning FastAPI backend or route module with placeholder HTML handlers, stub pages, or a simplified demo app. "
             "Do not rewrite generated tests or generated manifests to make the app pass; repair the application code and runtime contract instead. "
-            "When generated app tests report a create/update API failure, treat the primary repair cluster as app/routes/<resource>.py plus app/schemas.py and app/db.py before touching broader runtime files. "
+            "When generated app tests report a create/update API failure, start with app/routes/<resource>.py plus app/schemas.py and app/db.py before touching broader runtime files. "
             "When validation reports a missing role profile page or missing profile route, repair the role-local profile page surface and the supporting role_pages/profiles route modules before touching main.py."
         )
 
@@ -173,13 +172,13 @@ class FixPromptBuilder:
                 },
                 "repair_feedback": repair_feedback,
                 "rules": [
-                    "Fix only the current root-cause cluster before moving on.",
+                    "Fix only the current root cause before moving on.",
                     "Return the smallest safe patch.",
                     "Prefer editing the implicated failing files first and expand only when adjacent structural files are genuinely required.",
                     "Treat failing_checks, failing_file_paths, file_contexts, and hard runtime invariants as the source of truth for repair scope.",
                     "Only change generated app code. Generated tests, generated manifests, and platform runtime assets are read-only.",
                     "Do not modify miniapp/tests/*; default to repairing app code instead of test code.",
-                    "Do not modify generated manifests such as route_manifest.json or generated_app_graph.json; repair the application bundle so manifest generation remains correct.",
+                    "Do not modify generated manifests such as route_manifest.json; repair the application bundle so manifest generation remains correct.",
                     "Do not replace route modules with placeholder text/html responses to satisfy navigation tests; repair real route wiring and page surfaces.",
                     "Strict-green is the ideal target, but the immediate goal is to remove blocking runtime, compile, routing, and preview failures first.",
                     "Preserve existing endpoints, router wiring, and static file serving unless the evidence shows they are broken.",

@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.services.generation_runtime_config import TimeoutProfile
+from app.services.agent_runtime_config import TimeoutProfile
 
 
 @dataclass(frozen=True)
@@ -16,7 +16,6 @@ class Settings:
     exports_dir: Path
     runtime_dir: Path
     template_dir: Path
-    contracts_dir: Path
     preview_base_url: str = "http://localhost:8000"
     preview_runtime_mode: str = "auto"
     preview_port_base: int = 16000
@@ -66,7 +65,6 @@ def get_settings(
         exports_dir=resolved_data_dir / "exports",
         runtime_dir=root / "runtime",
         template_dir=root / "runtime" / "templates" / "base-miniapp",
-        contracts_dir=root / "contracts",
         preview_base_url=preview_base_url,
         preview_runtime_mode=os.getenv("PREVIEW_RUNTIME_MODE", "auto"),
         preview_port_base=int(os.getenv("PREVIEW_PORT_BASE", "16000")),

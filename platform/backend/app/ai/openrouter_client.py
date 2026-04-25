@@ -21,7 +21,7 @@ from app.ai.model_registry import (
 )
 from app.core.config import Settings
 from app.models.common import GenerationMode
-from app.services.generation_runtime_config import ACTIVE_GENERATION_TURN_STATE, RetryPolicy, TimeoutProfile
+from app.services.agent_runtime_config import ACTIVE_AGENT_TURN_STATE, RetryPolicy, TimeoutProfile
 from app.services.workspace.log_service import WorkspaceLogService
 
 logger = logging.getLogger(__name__)
@@ -121,6 +121,7 @@ class OpenRouterClient:
         model_override: str | None = None,
         fallback_model_override: str | None = None,
         responses_tuning_override: dict[str, Any] | None = None,
+        allow_fallbacks: bool = True,
     ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("No LLM provider is configured.")
@@ -138,6 +139,8 @@ class OpenRouterClient:
         primary_model = str(model_override or routed_primary_model or model_config["primary"])
         fallback_model = str(fallback_model_override or routed_fallback_model or model_config["fallback"])
         if (not self._openai_direct_available()) and self.openrouter_enabled:
+            if self.openai_enabled and not allow_fallbacks:
+                raise RuntimeError("OpenAI direct provider is unavailable and fallback routing is disabled.")
             return self._openrouter_rescue_structured(
                 role=role,
                 schema_name=schema_name,
@@ -148,7 +151,7 @@ class OpenRouterClient:
                 stable_prefix=stable_prefix,
                 preferred_model=primary_model,
             )
-        if self._should_bypass_strict_schema(normalized_schema):
+        if allow_fallbacks and self._should_bypass_strict_schema(normalized_schema):
             logger.info(
                 "Bypassing strict json_schema upload for %s and using json_object mode due to complex schema shape.",
                 schema_name,
@@ -170,7 +173,7 @@ class OpenRouterClient:
                 "response_mode": "json_object",
                 "cache_stats": payload["cache_stats"],
             }
-        models = [primary_model] if fallback_model == primary_model else [primary_model, fallback_model]
+        models = [primary_model] if (not allow_fallbacks or fallback_model == primary_model) else [primary_model, fallback_model]
         last_error: Exception | None = None
         openrouter_rescue_attempted = False
         for model in models:
@@ -195,7 +198,7 @@ class OpenRouterClient:
                 }
             except Exception as exc:
                 last_error = exc
-                if self._is_invalid_schema_error(exc):
+                if allow_fallbacks and self._is_invalid_schema_error(exc):
                     payload = self._request_json_mode(
                         role=role,
                         model=model,
@@ -214,7 +217,7 @@ class OpenRouterClient:
                         "response_mode": "json_object",
                         "cache_stats": payload["cache_stats"],
                     }
-                if not openrouter_rescue_attempted and self.openrouter_enabled and self._is_provider_quota_error(exc):
+                if allow_fallbacks and not openrouter_rescue_attempted and self.openrouter_enabled and self._is_provider_quota_error(exc):
                     self._disable_openai_direct()
                     openrouter_rescue_attempted = True
                     try:
@@ -245,26 +248,6 @@ class OpenRouterClient:
         assert last_error is not None
         raise last_error
 
-    def generate_code_plan(
-        self,
-        *,
-        schema_name: str,
-        schema: dict[str, Any],
-        system_prompt: str,
-        user_prompt: str,
-        prompt_cache_key: str | None = None,
-        stable_prefix: str | None = None,
-    ) -> dict[str, Any]:
-        return self.generate_structured(
-            role="code_plan",
-            schema_name=schema_name,
-            schema=schema,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            prompt_cache_key=prompt_cache_key,
-            stable_prefix=stable_prefix,
-        )
-
     def generate_code_edit(
         self,
         *,
@@ -285,7 +268,7 @@ class OpenRouterClient:
             stable_prefix=stable_prefix,
         )
 
-    def generate_repair(
+    def generate_agent_turn(
         self,
         *,
         schema_name: str,
@@ -297,9 +280,10 @@ class OpenRouterClient:
         model_override: str | None = None,
         fallback_model_override: str | None = None,
         responses_tuning_override: dict[str, Any] | None = None,
+        allow_fallbacks: bool = True,
     ) -> dict[str, Any]:
         return self.generate_structured(
-            role="repair",
+            role="agent_turn",
             schema_name=schema_name,
             schema=schema,
             system_prompt=system_prompt,
@@ -309,6 +293,7 @@ class OpenRouterClient:
             model_override=model_override,
             fallback_model_override=fallback_model_override,
             responses_tuning_override=responses_tuning_override,
+            allow_fallbacks=allow_fallbacks,
         )
 
     def generate_workspace_edits(
@@ -1049,7 +1034,7 @@ class OpenRouterClient:
             except Exception as exc:
                 last_error = exc
                 error_class = self.retry_policy.classify_error(exc)
-                turn_state = ACTIVE_GENERATION_TURN_STATE.get()
+                turn_state = ACTIVE_AGENT_TURN_STATE.get()
                 if turn_state is not None:
                     turn_state.last_error_class = error_class
                 self._append_workspace_api_log(
@@ -1201,17 +1186,12 @@ class OpenRouterClient:
 
     @staticmethod
     def _responses_tuning(*, role: str, schema_name: str) -> dict[str, Any]:
-        if role == "repair":
-            if schema_name == "fix_patch_v1":
-                return {"reasoning": {"effort": "medium"}}
+        del schema_name
+        if role == "agent_turn":
             return {"reasoning": {"effort": "high"}}
         if role == "code_edit":
             return {"reasoning": {"effort": "medium"}}
-        if role == "code_plan":
-            return {"reasoning": {"effort": "medium"}}
-        if role == "spec_analysis":
-            return {"reasoning": {"effort": "low"}}
-        if role == "ir_codegen":
+        if role == "repair":
             return {"reasoning": {"effort": "medium"}}
         if role == "summarize":
             return {"reasoning": {"effort": "low"}}
@@ -1456,9 +1436,7 @@ class OpenRouterClient:
             return None
         if role in {"cheap_task", "summarize"}:
             return 4096
-        if role in {"code_plan", "spec_analysis"}:
-            return 8192
-        if role in {"code_edit", "ir_codegen", "repair"}:
+        if role in {"agent_turn", "code_edit", "repair"}:
             return 32768
         return 8192
 

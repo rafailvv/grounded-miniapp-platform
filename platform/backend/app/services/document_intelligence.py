@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
 from app.core.config import Settings
+from app.models.common import StrictModel
 from app.models.domain import DocumentChunkRecord, DocumentRecord
-from app.models.grounded_spec import DocRef
 from app.repositories.state_store import StateStore
 from app.services.code_index_service import CodeIndexService
 from app.services.platform_adapters import get_platform_adapter
+
+
+class DocumentReference(StrictModel):
+    doc_ref_id: str
+    source_type: Literal["project_doc", "platform_doc", "user_prompt", "codebase", "openapi", "assumption"]
+    file_path: str
+    chunk_id: str
+    section_title: str
+    snippet: str
+    relevance: float
 
 
 class DocumentIntelligenceService:
@@ -52,9 +62,9 @@ class DocumentIntelligenceService:
         prompt: str,
         target_platform: str,
         limit: int = 8,
-    ) -> list[DocRef]:
+    ) -> list[DocumentReference]:
         query_terms = self._tokenize(prompt)
-        refs: list[DocRef] = []
+        refs: list[DocumentReference] = []
         workspace_documents = self.list_documents(workspace_id)
         if workspace_documents:
             self.code_index_service.index_documents(workspace_id, workspace_documents)
@@ -69,7 +79,7 @@ class DocumentIntelligenceService:
         )
         for item in retrieval["code"][: max(2, limit // 3)]:  # type: ignore[index]
             refs.append(
-                DocRef(
+                DocumentReference(
                     doc_ref_id=f"{item['chunk_id']}",
                     source_type="codebase",
                     file_path=str(item["path"]),
@@ -83,7 +93,7 @@ class DocumentIntelligenceService:
         adapter = get_platform_adapter(target_platform)
         refs.extend(self._refs_from_bundled_dir(self.settings.runtime_dir / "platform-docs" / adapter.doc_dir_name, "platform_doc", query_terms))
         refs.append(
-            DocRef(
+            DocumentReference(
                 doc_ref_id="prompt-source",
                 source_type="user_prompt",
                 file_path="prompt",
@@ -107,15 +117,15 @@ class DocumentIntelligenceService:
             issues.append(f"Bundled platform corpus is missing for {target_platform}.")
         return issues
 
-    def _refs_from_document(self, document: DocumentRecord, query_terms: set[str]) -> list[DocRef]:
-        refs: list[DocRef] = []
+    def _refs_from_document(self, document: DocumentRecord, query_terms: set[str]) -> list[DocumentReference]:
+        refs: list[DocumentReference] = []
         chunks = document.chunks or self._chunk_document(document.content)
         for chunk in chunks:
             score = self._score(chunk.content, query_terms)
             if score <= 0:
                 continue
             refs.append(
-                DocRef(
+                DocumentReference(
                     doc_ref_id=f"{document.document_id}:{chunk.chunk_id}",
                     source_type=document.source_type,
                     file_path=document.file_path,
@@ -132,8 +142,8 @@ class DocumentIntelligenceService:
         directory: Path,
         source_type: str,
         query_terms: set[str],
-    ) -> list[DocRef]:
-        refs: list[DocRef] = []
+    ) -> list[DocumentReference]:
+        refs: list[DocumentReference] = []
         for file_path in sorted(directory.rglob("*")):
             if not file_path.is_file():
                 continue
@@ -143,7 +153,7 @@ class DocumentIntelligenceService:
                 if score <= 0:
                     continue
                 refs.append(
-                    DocRef(
+                    DocumentReference(
                         doc_ref_id=f"{source_type}:{file_path.name}:{chunk.chunk_id}",
                         source_type=source_type,  # type: ignore[arg-type]
                         file_path=str(file_path.relative_to(self.settings.repo_root)),

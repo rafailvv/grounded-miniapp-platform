@@ -48,7 +48,7 @@ def tool_patch_schema() -> dict[str, Any]:
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "tool": {"type": "string", "enum": ["list_files", "read_files", "run_checks", "search_files", "run_command"]},
+                        "tool": {"type": "string", "enum": ["list_files", "read_files", "run_checks", "search_files", "inspect_diff", "run_command"]},
                         "mode": {"type": "string", "enum": ["exact", "final"]},
                         "targets": {"type": "array", "items": {"type": "string"}},
                         "pattern": {"type": "string"},
@@ -67,8 +67,9 @@ def tool_patch_schema() -> dict[str, Any]:
                     "additionalProperties": False,
                     "properties": {
                         "file_path": {"type": "string"},
-                        "operation": {"type": "string", "enum": ["create", "replace", "delete"]},
+                        "operation": {"type": "string", "enum": ["create", "replace", "delete", "patch"]},
                         "content": {"type": ["string", "null"]},
+                        "diff": {"type": ["string", "null"]},
                         "reason": {"type": "string"},
                     },
                     "required": ["file_path", "operation", "reason"],
@@ -87,7 +88,7 @@ def normalize_tool_requests(raw_tool_requests: list[Any]) -> list[dict[str, Any]
         if not isinstance(item, dict):
             continue
         tool = str(item.get("tool") or "").strip().lower()
-        if tool not in {"list_files", "read_files", "run_checks", "search_files", "run_command"}:
+        if tool not in {"list_files", "read_files", "run_checks", "search_files", "inspect_diff", "run_command"}:
             continue
         raw_targets = item.get("targets") or []
         if not isinstance(raw_targets, list):
