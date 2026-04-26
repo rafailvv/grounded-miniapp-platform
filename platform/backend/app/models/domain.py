@@ -512,6 +512,9 @@ class RunRecord(StrictModel):
     error_context: ErrorContext | None = None
     checks_summary: RunChecksSummary = Field(default_factory=RunChecksSummary)
     touched_files: list[str] = Field(default_factory=list)
+    role_coverage: dict[str, Any] = Field(default_factory=dict)
+    generated_tests: dict[str, Any] = Field(default_factory=dict)
+    neutral_template_findings: list[dict[str, Any]] = Field(default_factory=list)
     artifacts: dict[str, str] = Field(default_factory=dict)
     remaining_issues: list[dict[str, Any]] = Field(default_factory=list)
     latency_breakdown: dict[str, float | int] = Field(default_factory=dict)

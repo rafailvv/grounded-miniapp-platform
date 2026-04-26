@@ -13,7 +13,6 @@ class FixPromptBuilder:
     @staticmethod
     def read_only_surfaces() -> list[str]:
         return [
-            "miniapp/tests/",
             "miniapp/app/generated/",
         ]
 
@@ -138,7 +137,8 @@ class FixPromptBuilder:
             "Do not redesign the app. Fix the current root cause only. "
             "Preserve the existing backend architecture, routers, and static mounting unless the evidence explicitly implicates them. "
             "Never replace a functioning FastAPI backend or route module with placeholder HTML handlers, stub pages, or a simplified demo app. "
-            "Do not rewrite generated tests or generated manifests to make the app pass; repair the application code and runtime contract instead. "
+            "Do not rewrite generated tests or generated manifests to hide failures; repair the application code and runtime contract instead. "
+            "Generated app tests may be updated only when they are stale because the requested product behavior changed. "
             "When generated app tests report a create/update API failure, start with app/routes/<resource>.py plus app/schemas.py and app/db.py before touching broader runtime files. "
             "When validation reports a missing role profile page or missing profile route, repair the role-local profile page surface and the supporting role_pages/profiles route modules before touching main.py."
         )
@@ -176,8 +176,8 @@ class FixPromptBuilder:
                     "Return the smallest safe patch.",
                     "Prefer editing the implicated failing files first and expand only when adjacent structural files are genuinely required.",
                     "Treat failing_checks, failing_file_paths, file_contexts, and hard runtime invariants as the source of truth for repair scope.",
-                    "Only change generated app code. Generated tests, generated manifests, and platform runtime assets are read-only.",
-                    "Do not modify miniapp/tests/*; default to repairing app code instead of test code.",
+                    "Only change generated app code and product-specific generated tests. Generated manifests and platform runtime assets are read-only.",
+                    "For fix runs, default to repairing app code instead of changing miniapp/tests/* unless the tests are clearly stale after a requested behavior change.",
                     "Do not modify generated manifests such as route_manifest.json; repair the application bundle so manifest generation remains correct.",
                     "Do not replace route modules with placeholder text/html responses to satisfy navigation tests; repair real route wiring and page surfaces.",
                     "Strict-green is the ideal target, but the immediate goal is to remove blocking runtime, compile, routing, and preview failures first.",

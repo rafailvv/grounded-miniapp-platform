@@ -21,6 +21,52 @@ from app.services.workspace.preview_service import PreviewService
 from app.validators.suite import ValidationSuite
 
 
+ROLE_ORDER = ("client", "specialist", "manager")
+NEUTRAL_TEMPLATE_MARKERS = (
+    "client preview",
+    "specialist preview",
+    "manager preview",
+    "client surface",
+    "specialist surface",
+    "manager surface",
+    "neutral starter",
+    "starter screen",
+    "preview entry",
+    "should be replaced by the generated app",
+    "replace starter screens",
+)
+ROLE_LINK_STOPWORDS = {
+    "client",
+    "specialist",
+    "manager",
+    "preview",
+    "surface",
+    "starter",
+    "screen",
+    "generated",
+    "static",
+    "script",
+    "style",
+    "button",
+    "section",
+    "header",
+    "footer",
+    "main",
+    "role",
+    "page",
+    "app",
+    "miniapp",
+    "telegram",
+    "пользователь",
+    "клиент",
+    "специалист",
+    "менеджер",
+    "страница",
+    "экран",
+    "приложение",
+}
+
+
 class CheckRunner:
     _API_FAILURE_RE = re.compile(
         r"(?P<label>Create|Update|List|Post-update list)\s+API\s+failed:\s*"
@@ -156,15 +202,17 @@ class CheckRunner:
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
 
+        require_generated_tests = scope_mode == "agentic"
+
         def _run_python_tests() -> RunCheckResult:
             python_tests_started = time.perf_counter()
-            python_tests_result = self._run_python_app_tests(backend_dir)
+            python_tests_result = self._run_python_app_tests(backend_dir, require_present=require_generated_tests)
             python_tests_result.duration_ms = int((time.perf_counter() - python_tests_started) * 1000)
             return python_tests_result
 
         def _run_js_tests() -> RunCheckResult:
             js_tests_started = time.perf_counter()
-            js_tests_result = self._run_js_app_tests(backend_dir)
+            js_tests_result = self._run_js_app_tests(backend_dir, require_present=require_generated_tests)
             js_tests_result.duration_ms = int((time.perf_counter() - js_tests_started) * 1000)
             return js_tests_result
 
@@ -258,7 +306,21 @@ class CheckRunner:
                 diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
                 api_failure = diagnostics.get("api_failure") if isinstance(diagnostics, dict) else None
                 shared_state_failure = diagnostics.get("shared_state_update_failure") if isinstance(diagnostics, dict) else None
-                if isinstance(shared_state_failure, dict):
+                js_path_root = diagnostics.get("js_test_path_root") if isinstance(diagnostics, dict) else None
+                js_url_path_api = diagnostics.get("js_test_url_path_api") if isinstance(diagnostics, dict) else None
+                server_html_assertion = diagnostics.get("server_rendered_html_assertion") if isinstance(diagnostics, dict) else None
+                static_html_assertion = diagnostics.get("static_html_assertion") if isinstance(diagnostics, dict) else None
+                if isinstance(js_path_root, dict):
+                    expected_root = str(js_path_root.get("expected_root") or "").strip()
+                    message = expected_root or "Generated JS tests used an invalid miniapp path root."
+                elif isinstance(js_url_path_api, dict):
+                    expected_path_api = str(js_url_path_api.get("expected_path_api") or "").strip()
+                    message = expected_path_api or "Generated JS tests passed a URL object to a path/fs API."
+                elif isinstance(server_html_assertion, dict):
+                    message = str(server_html_assertion.get("expected_scope") or "").strip() or "Generated Python tests asserted JS-rendered text in server HTML."
+                elif isinstance(static_html_assertion, dict):
+                    message = str(static_html_assertion.get("expected_scope") or "").strip() or "Generated JS tests asserted dynamic text only in HTML."
+                elif isinstance(shared_state_failure, dict):
                     actor = str(shared_state_failure.get("actor") or "").strip()
                     resource_slug = str(shared_state_failure.get("resource_slug") or "").strip()
                     resource_label = f"/api/{resource_slug}" if resource_slug else "shared record API"
@@ -442,7 +504,7 @@ class CheckRunner:
             manifest = {}
         roles = manifest.get("roles") if isinstance(manifest, dict) else {}
         routes: list[str] = []
-        for role in ("client", "specialist", "manager"):
+        for role in ROLE_ORDER:
             role_payload = roles.get(role) if isinstance(roles, dict) else {}
             pages = role_payload.get("pages") if isinstance(role_payload, dict) else []
             role_route = ""
@@ -481,7 +543,8 @@ class CheckRunner:
             if isinstance(path, str)
             and path.startswith("miniapp/app/")
         ]
-        if not relevant_changed:
+        agentic_scope = scope_mode == "agentic"
+        if not relevant_changed and not agentic_scope:
             return RunCheckResult(
                 name="platform_invariants",
                 status="skipped",
@@ -490,6 +553,9 @@ class CheckRunner:
                 logs=[],
             )
         issues: list[ValidationIssue] = []
+        role_coverage: dict[str, object] = {}
+        neutral_template_findings: list[dict[str, str]] = []
+        generated_tests: dict[str, object] = {}
         if any(
             path.startswith("miniapp/app/routes/")
             or path in {"miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"}
@@ -498,6 +564,11 @@ class CheckRunner:
         ):
             issues.extend(GenerationPreflightValidation.preflight_profile_schema_issues(source_dir))
             issues.extend(GenerationPreflightValidation.preflight_route_schema_issues(source_dir))
+        if agentic_scope:
+            role_issues, role_coverage, neutral_template_findings = self._role_surface_issues(source_dir)
+            issues.extend(role_issues)
+            tests_issues, generated_tests = self._generated_tests_presence_issues(source_dir)
+            issues.extend(tests_issues)
         issues.extend(self._dom_contract_issues(source_dir=source_dir, changed_files=relevant_changed))
         issues = self._dedupe_validation_issues(issues)
         return RunCheckResult(
@@ -506,7 +577,136 @@ class CheckRunner:
             details="Platform invariant smoke validated lightweight route/schema and DOM invariants for the edited surface.",
             command="platform invariant smoke",
             logs=self._validation_logs(issues) if issues else ["Platform invariant smoke passed."],
+            diagnostics={
+                "role_coverage": role_coverage,
+                "neutral_template_findings": neutral_template_findings,
+                "generated_tests": generated_tests,
+            },
         )
+
+    @classmethod
+    def _role_surface_issues(cls, source_dir: Path) -> tuple[list[ValidationIssue], dict[str, object], list[dict[str, str]]]:
+        issues: list[ValidationIssue] = []
+        coverage: dict[str, object] = {}
+        neutral_findings: list[dict[str, str]] = []
+        role_tokens: dict[str, set[str]] = {}
+
+        for role in ROLE_ORDER:
+            role_dir = source_dir / "miniapp" / "app" / "static" / role
+            expected_files = {
+                "html": role_dir / "index.html",
+                "js": role_dir / "app.js",
+                "css": role_dir / "styles.css",
+            }
+            missing = [path.relative_to(source_dir).as_posix() for path in expected_files.values() if not path.exists()]
+            texts: list[str] = []
+            for path in expected_files.values():
+                if not path.exists():
+                    continue
+                try:
+                    texts.append(path.read_text(encoding="utf-8"))
+                except OSError:
+                    continue
+            combined = "\n".join(texts)
+            normalized = combined.lower()
+            markers = [marker for marker in NEUTRAL_TEMPLATE_MARKERS if marker in normalized]
+            role_tokens[role] = cls._domain_tokens(combined)
+            if missing:
+                coverage[role] = {"status": "missing", "missing_files": missing}
+                issues.append(
+                    ValidationIssue(
+                        code="platform.missing_role_surface",
+                        message=f"{role} role surface is incomplete: missing {', '.join(missing)}.",
+                        severity="high",
+                        location=f"miniapp/app/static/{role}",
+                        blocking=True,
+                    )
+                )
+                continue
+            if markers:
+                finding = {
+                    "role": role,
+                    "file_path": f"miniapp/app/static/{role}",
+                    "markers": ", ".join(markers[:4]),
+                }
+                neutral_findings.append(finding)
+                coverage[role] = {"status": "neutral_template", "markers": markers[:4]}
+                issues.append(
+                    ValidationIssue(
+                        code="platform.neutral_role_template",
+                        message=f"{role} role still contains neutral starter/template text: {', '.join(markers[:4])}.",
+                        severity="high",
+                        location=f"miniapp/app/static/{role}",
+                        blocking=True,
+                    )
+                )
+                continue
+            coverage[role] = {
+                "status": "present",
+                "files": [path.relative_to(source_dir).as_posix() for path in expected_files.values()],
+                "domain_token_count": len(role_tokens[role]),
+            }
+
+        present_roles = [
+            role
+            for role, payload in coverage.items()
+            if isinstance(payload, dict) and payload.get("status") == "present"
+        ]
+        if len(present_roles) == len(ROLE_ORDER):
+            shared_tokens = set.intersection(*(role_tokens[role] for role in ROLE_ORDER))
+            if not shared_tokens:
+                issues.append(
+                    ValidationIssue(
+                        code="platform.disconnected_role_surfaces",
+                        message="Client, specialist, and manager surfaces do not share visible domain content. Use one connected product domain across all roles.",
+                        severity="high",
+                        location="miniapp/app/static",
+                        blocking=True,
+                    )
+                )
+            coverage["shared_domain_tokens"] = sorted(shared_tokens)[:12]
+        return issues, coverage, neutral_findings
+
+    @staticmethod
+    def _domain_tokens(text: str) -> set[str]:
+        cleaned = re.sub(r"<script\b.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r"<style\b.*?</style>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        tokens = {
+            token.lower()
+            for token in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{3,}", cleaned)
+        }
+        return {
+            token
+            for token in tokens
+            if token not in ROLE_LINK_STOPWORDS
+            and not token.startswith(("data-", "aria-", "http", "html", "body", "class", "const", "function"))
+        }
+
+    @staticmethod
+    def _generated_tests_presence_issues(source_dir: Path) -> tuple[list[ValidationIssue], dict[str, object]]:
+        expected = {
+            "python": source_dir / "miniapp" / "tests" / "test_generated_app.py",
+            "js": source_dir / "miniapp" / "tests" / "generated_app.test.mjs",
+        }
+        status: dict[str, object] = {}
+        issues: list[ValidationIssue] = []
+        for kind, path in expected.items():
+            relative_path = path.relative_to(source_dir).as_posix()
+            if path.exists():
+                status[kind] = {"status": "present", "file_path": relative_path}
+                continue
+            status[kind] = {"status": "missing", "file_path": relative_path}
+            issues.append(
+                ValidationIssue(
+                    code="platform.missing_generated_app_tests",
+                    message=f"Generated {kind} app test file is missing: {relative_path}.",
+                    severity="high",
+                    location=relative_path,
+                    blocking=True,
+                )
+            )
+        return issues, status
 
     @classmethod
     def _dom_contract_issues(cls, *, source_dir: Path, changed_files: list[str]) -> list[ValidationIssue]:
@@ -615,15 +815,20 @@ class CheckRunner:
             details="No changed-file static checks were required.",
         )
 
-    def _run_python_app_tests(self, backend_dir: Path) -> RunCheckResult:
+    def _run_python_app_tests(self, backend_dir: Path, *, require_present: bool = False) -> RunCheckResult:
         test_file = backend_dir / "tests" / "test_generated_app.py"
         if not test_file.exists():
             return RunCheckResult(
                 name="generated_app_python_tests",
-                status="skipped",
-                details="Generated Python app tests were not present in the draft workspace.",
+                status="failed" if require_present else "skipped",
+                details=(
+                    "Generated Python app tests are required for agentic create/edit runs but were not present in the draft workspace."
+                    if require_present
+                    else "Generated Python app tests were not present in the draft workspace."
+                ),
                 command=f"{sys.executable} -m unittest discover -s tests -p test_generated_app.py",
                 logs=[],
+                diagnostics={"missing_test_file": "tests/test_generated_app.py"} if require_present else {},
             )
         install_result = self._install_python_requirements(backend_dir)
         if install_result is not None:
@@ -717,15 +922,20 @@ class CheckRunner:
             )
         return None
 
-    def _run_js_app_tests(self, backend_dir: Path) -> RunCheckResult:
+    def _run_js_app_tests(self, backend_dir: Path, *, require_present: bool = False) -> RunCheckResult:
         test_file = backend_dir / "tests" / "generated_app.test.mjs"
         if not test_file.exists():
             return RunCheckResult(
                 name="generated_app_js_tests",
-                status="skipped",
-                details="Generated JS app tests were not present in the draft workspace.",
+                status="failed" if require_present else "skipped",
+                details=(
+                    "Generated JS app tests are required for agentic create/edit runs but were not present in the draft workspace."
+                    if require_present
+                    else "Generated JS app tests were not present in the draft workspace."
+                ),
                 command="node --test tests/generated_app.test.mjs",
                 logs=[],
+                diagnostics={"missing_test_file": "tests/generated_app.test.mjs"} if require_present else {},
             )
         node_binary = shutil.which("node") or shutil.which("nodejs")
         if not node_binary:
@@ -757,13 +967,15 @@ class CheckRunner:
                 logs=self._command_logs("Generated JS app tests timed out.", exc.stdout or "", exc.stderr or ""),
             )
         if result.returncode != 0:
+            logs = self._command_logs("Generated JS app tests failed for the draft miniapp.", result.stdout, result.stderr)
             return RunCheckResult(
                 name="generated_app_js_tests",
                 status="failed",
                 details="Generated JS app tests failed for the draft miniapp.",
                 command=" ".join(command),
                 exit_code=result.returncode,
-                logs=self._command_logs("Generated JS app tests failed for the draft miniapp.", result.stdout, result.stderr),
+                logs=logs,
+                diagnostics=self._extract_generated_app_test_diagnostics(logs),
             )
         return RunCheckResult(
             name="generated_app_js_tests",
@@ -1079,6 +1291,37 @@ class CheckRunner:
         stack_excerpt = [str(line or "") for line in logs[-12:] if str(line or "").strip()]
         if stack_excerpt:
             diagnostics["stack_excerpt"] = stack_excerpt
+        if any("miniapp/miniapp/app/" in str(line or "") for line in logs):
+            diagnostics["js_test_path_root"] = {
+                "problem": "generated_js_test_prefixed_miniapp_twice",
+                "expected_root": "Generated JS tests run from cwd=miniapp; use app/static/<role>/... or resolve ../app/static from import.meta.url.",
+            }
+        if any(
+            "ERR_INVALID_ARG_TYPE" in str(line or "") and "Received an instance of URL" in str(line or "")
+            for line in logs
+        ) or any("path.resolve(new URL" in str(line or "") for line in logs):
+            diagnostics["js_test_url_path_api"] = {
+                "problem": "generated_js_test_passed_url_to_path_api",
+                "expected_path_api": (
+                    "In generated_app.test.mjs, path/fs APIs need strings. Use path.join(process.cwd(), 'app/static/...') "
+                    "or fileURLToPath(new URL('../app/static/...', import.meta.url)); never pass a URL object directly to path.resolve/path.join/fs."
+                ),
+            }
+        if any("not found in '<!doctype html>" in str(line or "").lower() for line in logs):
+            diagnostics["server_rendered_html_assertion"] = {
+                "problem": "test_asserts_js_rendered_text_in_server_html",
+                "expected_scope": (
+                    "FastAPI TestClient sees HTML before browser JavaScript runs. "
+                    "Assert route/static shell in Python tests, or include fallback text in HTML, or move JS-rendered item checks to generated_app.test.mjs."
+                ),
+            }
+        if any("assert(html.includes(" in str(line or "") for line in logs):
+            diagnostics["static_html_assertion"] = {
+                "problem": "js_test_asserts_dynamic_text_only_in_html",
+                "expected_scope": (
+                    "If role data is rendered by JavaScript, generated_app.test.mjs should read the role JS/shared data source as well as HTML."
+                ),
+            }
         missing_role_pages = [
             str(match.group("role") or "").strip().lower()
             for line in logs

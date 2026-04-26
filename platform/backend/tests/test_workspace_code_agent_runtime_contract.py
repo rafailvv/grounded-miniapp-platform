@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.models.common import GenerationMode
+from app.models.domain import GenerateRequest
 from app.modules.workspace_code_agent_runtime.runtime import WorkspaceCodeAgentRuntime
 from app.services.workspace.service import WorkspaceService
 from app.services.workspace.run_service import RunService
@@ -13,7 +14,48 @@ def test_agent_prompt_declares_run_checks_read_only() -> None:
     assert "run_checks is a read-only platform validation snapshot" in prompt
     assert "Tools are diagnostic only" in prompt
     assert "All code changes must be returned in the operations array" in prompt
-    assert schema["properties"]["operations"]["maxItems"] == 8
+    assert "client, specialist, and manager" in prompt
+    assert "miniapp/tests/test_generated_app.py" in prompt
+    assert "miniapp/tests/generated_app.test.mjs" in prompt
+    assert "do not use miniapp/app/..." in prompt
+    assert "fileURLToPath" in prompt
+    assert schema["properties"]["operations"]["maxItems"] == 12
+
+
+def test_create_effective_role_scope_always_includes_all_roles() -> None:
+    request = GenerateRequest(
+        prompt="Create a catalog for buyers",
+        intent="create",
+        target_role_scope=["client"],
+    )
+
+    assert WorkspaceCodeAgentRuntime._effective_role_scope(request) == ["client", "specialist", "manager"]
+
+
+def test_generated_tests_are_writeable_agent_outputs() -> None:
+    runtime = object.__new__(WorkspaceCodeAgentRuntime)
+
+    operations = runtime._coerce_operations(
+        [
+            {
+                "file_path": "miniapp/tests/test_generated_app.py",
+                "operation": "create",
+                "content": "import unittest\n",
+                "reason": "cover generated backend app behavior",
+            },
+            {
+                "file_path": "miniapp/tests/generated_app.test.mjs",
+                "operation": "create",
+                "content": "import test from 'node:test';\n",
+                "reason": "cover generated frontend app behavior",
+            },
+        ]
+    )
+
+    assert [operation.file_path for operation in operations] == [
+        "miniapp/tests/test_generated_app.py",
+        "miniapp/tests/generated_app.test.mjs",
+    ]
 
 
 def test_self_blocked_tool_contract_response_is_retryable() -> None:
@@ -92,6 +134,7 @@ def test_output_cap_correction_for_create_requires_compact_patch() -> None:
 
     assert correction["tool"] == "output_cap_correction"
     assert "no more than 6 file operations" in str(correction["required_next_action"])
+    assert "frontend-only patch" in str(correction["required_next_action"])
     assert "do not request more context" in str(correction["required_next_action"])
 
 
@@ -107,6 +150,34 @@ def test_output_cap_correction_for_edit_prefers_focused_replace() -> None:
 
     assert "1-2 focused operations" in str(correction["required_next_action"])
     assert "full-file replace" in str(correction["required_next_action"])
+
+
+def test_fast_create_budget_prefers_frontend_first_compact_patch() -> None:
+    budget = WorkspaceCodeAgentRuntime._fast_create_budget_result()
+
+    assert budget["tool"] == "fast_create_budget"
+    assert "6-8 operations" in str(budget["required_next_action"])
+    assert "frontend-first" in str(budget["contract"])
+    assert "cwd=miniapp" in str(budget["required_next_action"])
+    assert "path.join(process.cwd()" in str(budget["required_next_action"])
+
+
+def test_product_behavior_phrase_is_not_commerce_prompt() -> None:
+    assert not WorkspaceCodeAgentRuntime._is_commerce_prompt(
+        "fix the javascript syntax error without changing product behavior"
+    )
+    assert WorkspaceCodeAgentRuntime._is_commerce_prompt("create a product catalog with cart")
+
+
+def test_fix_run_preserves_requested_generation_mode() -> None:
+    from app.models.domain import CreateRunRequest, WorkspaceRecord
+
+    service = object.__new__(RunService)
+    workspace = WorkspaceRecord(name="Fix mode", path="/tmp/fix-mode")
+
+    for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY):
+        request = CreateRunRequest(prompt="Fix bug", mode="fix", generation_mode=mode)
+        assert service._resolve_generation_mode(workspace, request, "edit") == mode
 
 
 def test_agent_turn_tuning_caps_all_generation_modes() -> None:

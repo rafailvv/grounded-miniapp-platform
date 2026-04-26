@@ -632,6 +632,15 @@ button:disabled {
   flex: 0 0 auto;
 }
 
+.run-card-quality {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .run-card-actions {
   display: flex;
   justify-content: flex-end;

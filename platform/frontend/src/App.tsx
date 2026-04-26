@@ -552,6 +552,30 @@ function runTimelineMeta(run: Run): string {
   return formatTimestamp(run.created_at);
 }
 
+function qualityStatusFromEntry(entry: unknown): string {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return "";
+  }
+  const status = (entry as Record<string, unknown>).status;
+  return typeof status === "string" ? status : "";
+}
+
+function runQualitySummary(run: Run): string {
+  const coverage = run.role_coverage ?? {};
+  const roleStatuses = ROLE_ORDER.map((role) => qualityStatusFromEntry(coverage[role]));
+  const roleCount = roleStatuses.filter((status) => status === "present").length;
+  const rolePart = roleStatuses.some(Boolean) ? `roles ${roleCount}/${ROLE_ORDER.length}` : formatRoleScope(run.target_role_scope);
+
+  const generatedTests = run.generated_tests ?? {};
+  const testStatuses = [
+    qualityStatusFromEntry(generatedTests.generated_app_python_tests),
+    qualityStatusFromEntry(generatedTests.generated_app_js_tests),
+  ].filter(Boolean);
+  const passedTests = testStatuses.filter((status) => status === "passed").length;
+  const testsPart = testStatuses.length ? `tests ${passedTests}/${testStatuses.length}` : "";
+  return [rolePart, testsPart].filter(Boolean).join(" · ");
+}
+
 function ensureChildrenMap(node: FileTreeNode): Map<string, FileTreeNode> {
   const map = new Map<string, FileTreeNode>();
   node.children.forEach((child) => map.set(child.name, child));
@@ -2710,6 +2734,7 @@ export default function App() {
                           </span>
                           <span className="run-card-meta-time">{runTimelineMeta(run)}</span>
                         </div>
+                        <div className="run-card-quality">{runQualitySummary(run)}</div>
                       </button>
                       {run.status === "completed" || canStopRun || run.status === "failed" || run.status === "blocked" ? (
                         <div className="run-card-actions">

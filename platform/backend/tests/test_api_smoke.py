@@ -49,8 +49,10 @@ def test_generate_endpoint_uses_agent_runtime_and_auto_applies(tmp_path: Path, m
     ).json()
     workspace_id = workspace["workspace_id"]
     runtime = app.state.container.workspace_code_agent_runtime
+    captured_request: dict[str, GenerateRequest] = {}
 
     def fake_generate(workspace_id: str, request: GenerateRequest, **_kwargs) -> JobRecord:
+        captured_request["request"] = request
         draft = app.state.container.workspace_service.prepare_draft(workspace_id, request.linked_run_id or "run_fake")
         readme = draft / "README.md"
         readme.write_text(readme.read_text(encoding="utf-8") + "\nAgent generated product catalog.\n", encoding="utf-8")
@@ -102,6 +104,7 @@ def test_generate_endpoint_uses_agent_runtime_and_auto_applies(tmp_path: Path, m
     runs = client.get(f"/workspaces/{workspace_id}/runs").json()
     assert runs[0]["status"] == "completed"
     assert runs[0]["apply_status"] == "applied"
+    assert captured_request["request"].target_role_scope == ["client", "specialist", "manager"]
     artifacts = client.get(f"/runs/{runs[0]['run_id']}/artifacts").json()
     forbidden_keys = {"role" + "_contract", "page" + "_graph", "entity" + "_contract", "mater" + "ialization" + "_report"}
     assert forbidden_keys.isdisjoint(artifacts.keys())

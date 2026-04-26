@@ -32,7 +32,8 @@ from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.service import WorkspaceService
 
-ROLE_SCOPE = {"client", "specialist", "manager"}
+ROLE_ORDER = ("client", "specialist", "manager")
+ROLE_SCOPE = set(ROLE_ORDER)
 MEANINGFUL_DIFF_IGNORED_PARTS = {
     ".git",
     "node_modules",
@@ -151,6 +152,8 @@ class RunService:
             workspace = self.workspace_service.rename_workspace(workspace_id, suggested_workspace_name)
         resolved_role_scope = self._resolve_target_role_scope(request)
         resolved_intent = self._resolve_intent(workspace, request, resolved_role_scope=resolved_role_scope)
+        if resolved_intent == "create":
+            resolved_role_scope = list(ROLE_ORDER)
         effective_generation_mode = self._resolve_generation_mode(workspace, request, resolved_intent)
         effective_model_profile = self._resolve_model_profile(request.model_profile, effective_generation_mode)
         run = RunRecord(
@@ -648,6 +651,10 @@ class RunService:
             run.remaining_issues = list(getattr(job, "remaining_issues", []) or [])
             run.handoff_from_failed_generate = dict(job.handoff_from_failed_generate or {}) or None
             run.checks_summary = self._build_checks_summary(job.validation_snapshot, preview.status)
+            agent_quality = self._agent_quality_report(run.workspace_id)
+            run.role_coverage = dict(agent_quality.get("role_coverage") or {})
+            run.generated_tests = dict(agent_quality.get("generated_tests") or {})
+            run.neutral_template_findings = list(agent_quality.get("neutral_template_findings") or [])
             run.touched_files = self._resolve_touched_files(
                 workspace_id=run.workspace_id,
                 run=run,
@@ -1405,6 +1412,9 @@ class RunService:
             "checks": self.code_agent_runtime.current_report(workspace_id, "check_results"),
             "patch": patch_payload,
             "diff": effective_diff,
+            "role_coverage": run.role_coverage,
+            "generated_tests": run.generated_tests,
+            "neutral_template_findings": run.neutral_template_findings,
             "preview": preview_payload,
             "draft_preview": {
                 key: value
@@ -1475,6 +1485,10 @@ class RunService:
                 inferred_scope.append(role)
         return inferred_scope
 
+    def _agent_quality_report(self, workspace_id: str) -> dict[str, Any]:
+        payload = self.code_agent_runtime.current_report(workspace_id, "agent_quality")
+        return dict(payload) if isinstance(payload, dict) else {}
+
     def _resolve_generation_mode(
         self,
         workspace: WorkspaceRecord,
@@ -1482,7 +1496,7 @@ class RunService:
         resolved_intent: str,
     ) -> GenerationMode:
         if request.mode == "fix":
-            return request.generation_mode if request.generation_mode == GenerationMode.QUALITY else GenerationMode.BALANCED
+            return request.generation_mode
         if request.generation_mode != GenerationMode.QUALITY:
             return request.generation_mode
         prompt = request.prompt.lower()

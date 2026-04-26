@@ -558,7 +558,7 @@ class PreviewService:
         return False
 
     def _http_preview_ready(self, preview_url: str) -> bool:
-        probe_paths = ("/health", "/client")
+        probe_paths = ("/health", "/client", "/specialist", "/manager")
         candidate_bases = self._probe_base_urls(preview_url)
         for base_url in candidate_bases:
             if all(self._probe_http(f"{base_url}{probe_path}") for probe_path in probe_paths):

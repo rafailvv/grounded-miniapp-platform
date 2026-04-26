@@ -5,6 +5,7 @@ from pathlib import Path
 from app.main import create_app
 from app.models.domain import WorkspaceRecord
 from app.services.check_runner import CheckRunner
+from app.services.workspace.preview_service import PreviewService
 from app.validators.build_validator import BuildValidator
 from app.validators.connectivity_validator import ConnectivityValidator
 
@@ -84,6 +85,84 @@ def test_static_check_rejects_typescript_syntax_inside_plain_js(tmp_path: Path) 
 
     assert result.status == "failed"
     assert "Static JavaScript syntax check failed" in "\n".join(result.logs)
+
+
+def test_agentic_platform_invariants_reject_neutral_role_template(tmp_path: Path) -> None:
+    app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
+    workspace = app.state.container.workspace_service.create_workspace(
+        WorkspaceRecord(name="Neutral Role Workspace", path=str(tmp_path / "workspace"))
+    )
+    app.state.container.workspace_service.clone_template(workspace.workspace_id)
+    source_dir = app.state.container.workspace_service.source_dir(workspace.workspace_id)
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/specialist/index.html"],
+        scope_mode="agentic",
+    )
+
+    assert result.status == "failed"
+    assert "platform.neutral_role_template" in "\n".join(result.logs)
+    assert "specialist" in result.diagnostics["role_coverage"]
+
+
+def test_agentic_generated_app_tests_are_required(tmp_path: Path) -> None:
+    runner = object.__new__(CheckRunner)
+    backend_dir = tmp_path / "miniapp"
+    (backend_dir / "app").mkdir(parents=True)
+
+    python_result = runner._run_python_app_tests(backend_dir, require_present=True)
+    js_result = runner._run_js_app_tests(backend_dir, require_present=True)
+
+    assert python_result.status == "failed"
+    assert js_result.status == "failed"
+    assert python_result.diagnostics["missing_test_file"] == "tests/test_generated_app.py"
+    assert js_result.diagnostics["missing_test_file"] == "tests/generated_app.test.mjs"
+
+
+def test_generated_js_test_double_miniapp_path_is_diagnostic() -> None:
+    logs = [
+        "Error: ENOENT: no such file or directory",
+        "/tmp/workspace/source/miniapp/miniapp/app/static/client/index.html",
+    ]
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(logs)
+
+    assert diagnostics["js_test_path_root"]["problem"] == "generated_js_test_prefixed_miniapp_twice"
+    assert "cwd=miniapp" in diagnostics["js_test_path_root"]["expected_root"]
+
+
+def test_generated_tests_explain_server_html_vs_js_rendered_content() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "AssertionError: 'Waterproof jacket' not found in '<!doctype html>...'",
+            "assert(html.includes(\"Packing cubes\"))",
+            'TypeError [ERR_INVALID_ARG_TYPE]: The "paths[0]" argument must be of type string. Received an instance of URL',
+        ]
+    )
+
+    assert diagnostics["server_rendered_html_assertion"]["problem"] == "test_asserts_js_rendered_text_in_server_html"
+    assert "TestClient sees HTML before browser JavaScript runs" in diagnostics["server_rendered_html_assertion"]["expected_scope"]
+    assert diagnostics["static_html_assertion"]["problem"] == "js_test_asserts_dynamic_text_only_in_html"
+    assert diagnostics["js_test_url_path_api"]["problem"] == "generated_js_test_passed_url_to_path_api"
+    assert "fileURLToPath" in diagnostics["js_test_url_path_api"]["expected_path_api"]
+
+
+def test_preview_ready_probes_all_role_roots(monkeypatch) -> None:
+    probed: list[str] = []
+    service = object.__new__(PreviewService)
+
+    monkeypatch.setattr(PreviewService, "_probe_base_urls", staticmethod(lambda _url: ["http://preview.local"]))
+    monkeypatch.setattr(PreviewService, "_probe_http", staticmethod(lambda url: probed.append(url) or True))
+
+    assert service._http_preview_ready("http://preview.local")
+    assert probed == [
+        "http://preview.local/health",
+        "http://preview.local/client",
+        "http://preview.local/specialist",
+        "http://preview.local/manager",
+    ]
 
 
 def test_connectivity_validator_accepts_api_routes_declared_inside_role_module(tmp_path: Path) -> None:

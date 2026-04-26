@@ -69,6 +69,9 @@ export type Run = {
     issues: Array<{ code?: string; message?: string; severity?: string }>;
   };
   touched_files: string[];
+  role_coverage?: Record<string, unknown>;
+  generated_tests?: Record<string, unknown>;
+  neutral_template_findings?: Array<Record<string, unknown>>;
   artifacts: Record<string, string>;
   repair_iterations?: Array<Record<string, unknown>>;
   fix_attempts?: Array<Record<string, unknown>>;
@@ -109,6 +112,9 @@ export type RunArtifacts = {
     created_at: string;
   }>;
   check_results?: Array<{ name: string; status: string; details?: string | null }>;
+  role_coverage?: Record<string, unknown>;
+  generated_tests?: Record<string, unknown>;
+  neutral_template_findings?: Array<Record<string, unknown>>;
   draft_preview?: {
     status: string;
     runtime_mode: string;

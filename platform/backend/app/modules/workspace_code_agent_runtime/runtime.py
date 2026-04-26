@@ -59,7 +59,6 @@ READ_ONLY_WRITE_PREFIXES = (
     ".ruff_cache/",
     ".next/",
     ".vite/",
-    "miniapp/tests/",
 )
 SEED_CONTEXT_PATHS = (
     "README.md",
@@ -153,7 +152,7 @@ class WorkspaceCodeAgentRuntime:
         workspace = self.workspace_service.get_workspace(workspace_id)
         generation_mode = self._generation_mode(request.generation_mode)
         model_profile = resolve_model_profile(request.model_profile, generation_mode)
-        role_scope = [role for role in request.target_role_scope if role in ROLE_ORDER] or list(ROLE_ORDER)
+        role_scope = self._effective_role_scope(request)
         run_id = request.linked_run_id or f"agent_{int(time.time() * 1000)}"
         job = JobRecord(
             workspace_id=workspace_id,
@@ -210,7 +209,7 @@ class WorkspaceCodeAgentRuntime:
             loop_result = self._run_loop(
                 workspace_id=workspace_id,
                 run_id=run_id,
-                request=request.model_copy(update={"model_profile": model_profile}),
+                request=request.model_copy(update={"model_profile": model_profile, "target_role_scope": role_scope}),
                 job=job,
                 draft_source=draft_source,
                 role_scope=role_scope,
@@ -231,6 +230,13 @@ class WorkspaceCodeAgentRuntime:
             return self.workspace_service.ensure_draft(workspace_id, run_id)
         return self.workspace_service.prepare_draft(workspace_id, run_id)
 
+    @staticmethod
+    def _effective_role_scope(request: GenerateRequest) -> list[str]:
+        explicit_scope = [role for role in request.target_role_scope if role in ROLE_ORDER]
+        if request.intent == "create" or (request.intent == "auto" and request.mode == "generate" and not explicit_scope):
+            return list(ROLE_ORDER)
+        return explicit_scope or list(ROLE_ORDER)
+
     def _run_loop(
         self,
         *,
@@ -245,6 +251,8 @@ class WorkspaceCodeAgentRuntime:
     ) -> WorkspaceLoopResult:
         seed_context = self._seed_file_context(workspace_id, run_id, role_scope=role_scope)
         tool_results: list[dict[str, object]] = []
+        if generation_mode == GenerationMode.FAST and str(request.intent or "").lower() == "create":
+            tool_results.append(self._fast_create_budget_result())
         last_changed_files: list[str] = ["miniapp", "docs", "README.md"]
 
         def _execute_checks(changed_files: list[str]) -> tuple[CheckExecutionRecord, dict[str, Any]]:
@@ -294,6 +302,7 @@ class WorkspaceCodeAgentRuntime:
             )
             execution.results.append(prompt_smoke)
             execution.completed_at = datetime.now(timezone.utc)
+            self._store_agent_quality_report(workspace_id, execution)
             preview = self.preview_service.get(workspace_id)
             preview_details = {
                 "status": "skipped",
@@ -619,7 +628,7 @@ class WorkspaceCodeAgentRuntime:
                 },
                 "operations": {
                     "type": "array",
-                            "maxItems": 8,
+                            "maxItems": 12,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
@@ -657,12 +666,23 @@ class WorkspaceCodeAgentRuntime:
             "The user's prompt is the only source of product semantics. Do not impose any generic queue, ticketing, lifecycle, or CRUD product model unless the prompt explicitly asks for it. "
             "Existing template docs and files are technical shell context only. They must not override the user's domain. "
             "Preserve the FastAPI + static-file shell, preview bridge, and role-root routing unless the user asks otherwise. "
-            "For create tasks, build a complete domain-specific app from the prompt. For e-commerce prompts, prefer products, catalog, cart, orders, and management surfaces, never generic intake or application tracking. "
+            "Every generated role index.html must keep /static/preview_bridge.js and the role app script; do not remove the preview bridge script while replacing starter content. "
+            "For create tasks, build a complete domain-specific app from the prompt across all role roots: client, specialist, and manager. "
+            "The three role surfaces must be different but connected parts of one product: shared app title/domain objects, consistent labels/actions, and role-specific responsibilities. "
+            "Never leave a role as a neutral starter, generic preview, blank page, or placeholder surface. "
+            "For e-commerce prompts, prefer products, catalog, cart, orders, and management surfaces, never generic intake or application tracking. "
+            "In Fast create mode, prefer a frontend-first implementation with role pages, a shared static data file, and compact generated tests. Do not add backend routes, schemas, or database models unless the prompt explicitly requires persistent server data, APIs, authentication, or cross-session mutations. "
+            "For every create task, write generated app tests for both backend and frontend surfaces: miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. "
+            "Generated tests must validate the requested product semantics, all role roots, and shared role content without relying on network calls or non-template dependencies. "
+            "Python generated tests run through FastAPI TestClient and see server-rendered HTML before browser JavaScript executes; do not assert JS-rendered item text there unless the text is also present in HTML fallback/source. Use Python tests for route status, preview bridge/static shell, and backend APIs when present. "
+            "JS generated tests are responsible for frontend source/data assertions; read role HTML/JS/shared data files directly with node:test and fs/path. "
+            "Generated JS tests execute from the miniapp directory, so file paths inside those tests must start with app/static/... or be resolved from import.meta.url to ../app/static; do not use miniapp/app/... in generated tests. "
+            "In generated JS tests, path/fs APIs require string paths: use path.join(process.cwd(), 'app/static/...') or fileURLToPath(new URL('../app/static/...', import.meta.url)); never pass a URL object directly to path.resolve, path.join, or fs. "
             "Tools are diagnostic only. They cannot write files, execute arbitrary scripts, run shell commands, or apply changes. "
             "run_checks is a read-only platform validation snapshot for the current draft; it is not a command runner and must never be used to rewrite files. "
             "All code changes must be returned in the operations array of the same structured JSON response. "
             "Use hunk patches when small edits are enough. Use full-file create/replace only when creating or substantially rewriting a file. "
-            "Do not edit generated app tests or generated manifests to hide failures. Repair app code and platform invariants instead. "
+            "Do not edit generated app tests or generated manifests to hide failures. For edits, update tests only when the requested product behavior changes; for fixes, repair app code unless a test expectation is clearly stale because of the requested change. "
             "Return only the structured JSON payload requested by the schema."
         )
 
@@ -710,15 +730,29 @@ class WorkspaceCodeAgentRuntime:
             "last_turn_summary": last_turn_summary,
             "tool_results": tool_results[-8:],
             "rules": [
-                "Keep each turn applyable: return up to 8 independent file operations together when they are part of the same coherent change.",
-                "For Fast create tasks, keep the first patch compact and complete: usually 4-6 files, no verbose comments, no large fixtures, and no repeated tool reads for files already shown in file_contexts.",
+                "Keep each turn applyable: return up to 12 independent file operations together when they are part of the same coherent change.",
+                "For Fast create tasks, keep the first patch compact and complete: usually 6-8 files total, no verbose comments, no large fixtures, and no repeated tool reads for files already shown in file_contexts.",
+                "For Fast create tasks, prefer frontend-only role surfaces plus one shared static data module; avoid backend routes/models unless the prompt explicitly requires server persistence or APIs.",
+                "For Fast create tasks, keep each generated HTML/JS/CSS/test file under about 140 lines and use at most 3 seed records.",
+                "For Fast create tasks, do not emit separate large CSS files for every role; use shared/base.css or one compact shared stylesheet when possible.",
                 "For broad create tasks, batch independent backend/static/style files in one response when the changes are clear; otherwise patch the most important blocking slice first and continue after checks.",
+                "For create tasks, generate client, specialist, and manager role roots even if the prompt mentions only one audience.",
+                "Each role root must be domain-specific, non-placeholder, and connected to the same product content; specialist is required and cannot remain the starter screen.",
+                "For create tasks, include dependency-free generated tests in miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs.",
+                "Python generated tests should use unittest plus FastAPI TestClient to verify role routes and backend/API behavior when backend state exists.",
+                "JS generated tests should use node:test plus fs/path only to verify role HTML/JS content, shared domain labels, role-specific selectors/actions, and absence of neutral template text.",
+                "Do not make Python TestClient tests assert text that is only rendered by browser JavaScript; either include the text in HTML fallback/source or move that assertion to generated_app.test.mjs.",
+                "When role content is populated from a shared JS data file, JS generated tests should read that data/source file directly and assert the shared item names there.",
+                "Generated JS tests run with cwd=miniapp, so read app/static/<role>/... paths or resolve from import.meta.url to ../app/static; never prefix paths with miniapp/app/ inside the test.",
+                "In generated_app.test.mjs, prefer path.join(process.cwd(), 'app/static/<role>/index.html') for fixture paths. If using import.meta.url, wrap new URL(...) with fileURLToPath(...) before passing it to path/fs APIs.",
+                "For edit/refine tasks, update generated tests when the requested behavior changes so the new behavior is covered.",
                 "For edit/refine tasks, keep the patch focused on one visible slice in the requested role files and usually return 1-2 operations.",
                 "For edit/refine tasks, keep the response under 16000 output tokens; if more is needed, replace the single most important file first and continue after checks.",
                 "For edit/refine tasks, do not rewrite the whole app or unrelated files; make the smallest complete visible change that satisfies the prompt.",
                 "If role_scope contains only client, prioritize miniapp/app/static/client files and do not change backend unless the prompt explicitly asks for API/data changes.",
                 "If role_scope contains only manager, prioritize miniapp/app/static/manager files and do not change backend unless the prompt explicitly asks for API/data changes.",
                 "For existing HTML/CSS/JS files, use replace with the full resulting file when a hunk patch would be large or ambiguous.",
+                "Every role index.html must include /static/preview_bridge.js before the role app script; if a check reports page_missing_preview_bridge, patch only the missing script tag instead of rewriting the whole app.",
                 "Prefer targeted patch operations over full-file replace when the file already exists.",
                 "If the latest turn reports a patch apply conflict, return a full-file replace for that conflicted file unless the exact corrected hunk is obvious.",
                 "If you need more context, request list_files/read_files/search_files/inspect_diff/run_checks.",
@@ -838,7 +872,7 @@ class WorkspaceCodeAgentRuntime:
             next_action = (
                 "The previous answer was too large. Return outcome=patch_ready now with a compact, complete first implementation. "
                 "Use no more than 6 file operations, keep seed/demo data small, avoid long comments, and do not request more context unless a specific required file is absent. "
-                "Prefer replacing the existing role HTML/JS/CSS plus one backend route/model file rather than emitting a huge multi-stage bundle."
+                "Prefer a frontend-only patch: replace the three role HTML files, add/update one shared data/style file, and add both generated test files. Do not add backend routes/models in this recovery turn unless explicitly required."
             )
         else:
             next_action = (
@@ -851,6 +885,23 @@ class WorkspaceCodeAgentRuntime:
             "contract": "The structured JSON response exceeded the model output cap; tools cannot recover this automatically.",
             "required_next_action": next_action,
             "previous_error": str(payload.get("error") or "")[:1200],
+        }
+
+    @staticmethod
+    def _fast_create_budget_result() -> dict[str, object]:
+        return {
+            "tool": "fast_create_budget",
+            "contract": (
+                "Fast create should finish in one compact patch whenever possible. "
+                "Use a frontend-first implementation unless backend persistence/API behavior is explicitly required."
+            ),
+            "required_next_action": (
+                "Return outcome=patch_ready with no more than 6-8 operations and concise files. "
+                "Prefer replacing the three role index.html files, one shared CSS/data file, and the two generated test files. "
+                "Keep /static/preview_bridge.js in every role HTML. Use app/static paths inside JS tests because tests run from cwd=miniapp. "
+                "Use string paths in JS tests, for example path.join(process.cwd(), 'app/static/client/index.html'); do not pass URL objects to path.resolve or fs. "
+                "Do not emit backend routes/models, long fixtures, or large per-role CSS for a simple static/local-data app."
+            ),
         }
 
     @staticmethod
@@ -1074,7 +1125,7 @@ class WorkspaceCodeAgentRuntime:
                 combined.append(f"\n/* {path} */\n{content[:12000]}")
         haystack = "\n".join(combined).lower()
         issues: list[str] = []
-        if commerce_requested:
+        if commerce_requested and not targeted_fix_requested:
             commerce_markers = ("product", "catalog", "cart", "order", "товар", "каталог", "корзин", "заказ", "магазин")
             if not any(marker in haystack for marker in commerce_markers):
                 issues.append("Commerce prompt did not result in visible commerce/product/cart/order language in changed app files.")
@@ -1105,7 +1156,7 @@ class WorkspaceCodeAgentRuntime:
                 and not any(marker in manager_text for marker in ("product", "order", "товар", "заказ"))
             ):
                 issues.append("Commerce prompt requested manager/admin functionality, but changed manager static files do not show product/order management.")
-        if booking_requested:
+        if booking_requested and not targeted_fix_requested:
             booking_markers = ("booking", "reservation", "appointment", "slot", "schedule", "trainer", "брон", "запис", "слот", "расписан", "тренер")
             if not any(marker in haystack for marker in booking_markers):
                 issues.append("Booking prompt did not result in visible booking/schedule/trainer/slot language in changed app files.")
@@ -1135,11 +1186,37 @@ class WorkspaceCodeAgentRuntime:
             logs=issues or ["Prompt alignment smoke passed."],
         )
 
+    def _store_agent_quality_report(self, workspace_id: str, execution: CheckExecutionRecord) -> None:
+        role_coverage: dict[str, Any] = {}
+        generated_tests: dict[str, Any] = {}
+        neutral_template_findings: list[dict[str, Any]] = []
+        for result in execution.results:
+            diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+            if result.name == "platform_invariants":
+                role_coverage = dict(diagnostics.get("role_coverage") or role_coverage)
+                generated_tests = dict(diagnostics.get("generated_tests") or generated_tests)
+                neutral_template_findings = list(diagnostics.get("neutral_template_findings") or neutral_template_findings)
+            if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
+                generated_tests[result.name] = {
+                    "status": result.status,
+                    "details": result.details,
+                    "command": result.command,
+                }
+        self._store_report(
+            f"agent_quality:{workspace_id}",
+            {
+                "workspace_id": workspace_id,
+                "role_coverage": role_coverage,
+                "generated_tests": generated_tests,
+                "neutral_template_findings": neutral_template_findings,
+            },
+        )
+
     @staticmethod
     def _is_commerce_prompt(prompt_lower: str) -> bool:
         return any(
             marker in prompt_lower
-            for marker in ("store", "shop", "ecommerce", "e-commerce", "cart", "product", "магазин", "товар", "корзин")
+            for marker in ("store", "shop", "ecommerce", "e-commerce", "cart", "магазин", "товар", "корзин")
         ) or (
             any(marker in prompt_lower for marker in ("catalog", "каталог"))
             and any(marker in prompt_lower for marker in ("product", "goods", "shop", "store", "товар", "магазин"))
