@@ -21,7 +21,7 @@ def ensure_preview(workspace_id: str, container: ServiceContainer = Depends(get_
 
 @router.post("/workspaces/{workspace_id}/preview/rebuild")
 def rebuild_preview(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict:
-    return container.preview_service.rebuild_async(workspace_id).model_dump(mode="json")
+    return container.preview_service.rebuild_async(workspace_id, force=True).model_dump(mode="json")
 
 
 @router.post("/workspaces/{workspace_id}/preview/reset")

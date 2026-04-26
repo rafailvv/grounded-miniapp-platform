@@ -12,11 +12,7 @@ class ConnectivityValidator:
         issues: list[ValidationIssue] = []
         static_root = workspace_path / "miniapp" / "app" / "static"
         routes_root = workspace_path / "miniapp" / "app" / "routes"
-        route_stems = {
-            self._normalize_route_stem(path.stem)
-            for path in routes_root.glob("*.py")
-            if path.name != "__init__.py"
-        }
+        api_route_paths = self._api_route_paths(routes_root)
 
         if static_root.exists():
             for file_path in static_root.rglob("*"):
@@ -25,14 +21,14 @@ class ConnectivityValidator:
                 relative = str(file_path.relative_to(workspace_path))
                 content = file_path.read_text(encoding="utf-8")
                 for endpoint in self._extract_api_refs(content):
-                    normalized_endpoint = self._normalize_route_stem(endpoint)
-                    if normalized_endpoint not in route_stems:
+                    normalized_endpoint = self._normalize_api_path(endpoint)
+                    if not self._api_path_is_declared(normalized_endpoint, api_route_paths):
                         issues.append(
                             ValidationIssue(
                                 code="connectivity.missing_backend_route",
-                                message=f"{relative} references /api/{endpoint} but the matching route module is missing.",
+                                message=f"{relative} references {normalized_endpoint} but the matching backend route is missing.",
                                 severity="high",
-                                location=f"miniapp/app/routes/{normalized_endpoint}.py",
+                                location="miniapp/app/routes",
                             )
                         )
                 for asset_path in self._extract_static_asset_refs(content, source_path=relative):
@@ -51,9 +47,63 @@ class ConnectivityValidator:
     @staticmethod
     def _extract_api_refs(content: str) -> set[str]:
         refs: set[str] = set()
-        for match in re.finditer(r"['\"]?/api/([a-zA-Z0-9_-]+)(?:[/'\"?)]|$)", content):
-            refs.add(ConnectivityValidator._normalize_route_stem(match.group(1).lower()))
+        for match in re.finditer(r"['\"`](/api/[^'\"`\s)]+)", content):
+            refs.add(ConnectivityValidator._normalize_api_path(match.group(1)))
         return refs
+
+    @classmethod
+    def _api_route_paths(cls, routes_root: Path) -> set[str]:
+        paths: set[str] = set()
+        if not routes_root.exists():
+            return paths
+        for path in routes_root.glob("*.py"):
+            if path.name == "__init__.py":
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            router_prefixes = {
+                match.group("name"): match.group("prefix")
+                for match in re.finditer(
+                    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*APIRouter\(\s*prefix\s*=\s*['\"](?P<prefix>[^'\"]*)['\"]",
+                    content,
+                )
+            }
+            for match in re.finditer(
+                r"@(?P<name>[A-Za-z_][A-Za-z0-9_]*)\.(?:get|post|put|patch|delete)\(\s*['\"](?P<path>[^'\"]*)['\"]",
+                content,
+            ):
+                prefix = router_prefixes.get(match.group("name"), "")
+                full_path = f"{prefix.rstrip('/')}/{match.group('path').lstrip('/')}".strip()
+                if not full_path.startswith("/api/"):
+                    continue
+                paths.add(cls._normalize_api_path(full_path))
+        return paths
+
+    @classmethod
+    def _api_path_is_declared(cls, referenced_path: str, declared_paths: set[str]) -> bool:
+        if any(cls._api_paths_match(referenced_path, declared_path) for declared_path in declared_paths):
+            return True
+        referenced = referenced_path.rstrip("/")
+        if referenced.count("/") < 2:
+            return False
+        return any(declared_path.startswith(f"{referenced}/") for declared_path in declared_paths)
+
+    @staticmethod
+    def _api_paths_match(referenced_path: str, declared_path: str) -> bool:
+        referenced_parts = referenced_path.strip("/").split("/")
+        declared_parts = declared_path.strip("/").split("/")
+        if len(referenced_parts) != len(declared_parts):
+            return False
+        for referenced, declared in zip(referenced_parts, declared_parts):
+            if declared.startswith("{") and declared.endswith("}"):
+                continue
+            if referenced.startswith("{") and referenced.endswith("}"):
+                continue
+            if referenced != declared:
+                return False
+        return True
 
     @staticmethod
     def _extract_static_asset_refs(content: str, *, source_path: str) -> set[str]:
@@ -107,6 +157,16 @@ class ConnectivityValidator:
             if singular not in {"status", "news"}:
                 normalized = singular
         return normalized
+
+    @staticmethod
+    def _normalize_api_path(value: str) -> str:
+        normalized = str(value or "").strip().strip("'\"`").split("?", 1)[0].split("#", 1)[0]
+        normalized = re.sub(r"\$\{[^}]+\}", "{param}", normalized)
+        normalized = normalized.rstrip(".,;")
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        normalized = re.sub(r"/+", "/", normalized)
+        return normalized.rstrip("/") or "/"
 
     @staticmethod
     def _dedupe_issues(issues: list[ValidationIssue]) -> list[ValidationIssue]:

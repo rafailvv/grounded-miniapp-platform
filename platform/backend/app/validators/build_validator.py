@@ -121,7 +121,7 @@ class BuildValidator:
         return pages
 
     def _static_page_issues(self, workspace_path: Path, page: dict[str, Any]) -> list[ValidationIssue]:
-        file_path_raw = str(page.get("file_path") or "").strip().replace("\\", "/")
+        file_path_raw = self._workspace_static_path(str(page.get("file_path") or "").strip().replace("\\", "/"))
         if not file_path_raw:
             return []
         file_path = workspace_path / file_path_raw
@@ -165,7 +165,7 @@ class BuildValidator:
     ) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         for key, label in (("style_path", "CSS"), ("script_path", "JS")):
-            asset_path_raw = str(page.get(key) or "").strip().replace("\\", "/")
+            asset_path_raw = self._workspace_static_path(str(page.get(key) or "").strip().replace("\\", "/"))
             if not asset_path_raw:
                 continue
             href = self._static_asset_href(asset_path_raw)
@@ -178,6 +178,15 @@ class BuildValidator:
             if not asset_path.exists():
                 issues.append(self._issue("build.broken_static_ref", f"Static asset reference is broken: {ref}", file_path_raw))
         return issues
+
+    @staticmethod
+    def _workspace_static_path(path: str) -> str:
+        normalized = str(path or "").strip().replace("\\", "/").lstrip("/")
+        if normalized.startswith("miniapp/app/"):
+            return normalized
+        if normalized.startswith("static/"):
+            return f"miniapp/app/{normalized}"
+        return normalized
 
     def _dom_reference_issues(
         self,

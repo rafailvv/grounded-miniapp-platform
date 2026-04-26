@@ -449,7 +449,7 @@ class WorkspaceService:
             current_content = target_path.read_text(encoding="utf-8") if target_path.exists() and target_path.is_file() else ""
             file_hash = self._file_hash(current_content) if target_path.exists() and target_path.is_file() else None
             if operation.operation == "patch":
-                diff = str(operation.diff or operation.content or "")
+                diff = self._ensure_unified_diff_paths(str(operation.diff or operation.content or ""), operation.file_path)
                 op_name = "patch"
                 content = None
             else:
@@ -583,20 +583,52 @@ class WorkspaceService:
         envelope: PatchEnvelope,
     ) -> ApplyPatchResult:
         changed_files: list[str] = []
+
+        backups: dict[str, tuple[str, str | None]] = {}
+
+        def backup_path(relative_path: str, target_path: Path) -> None:
+            if relative_path in backups:
+                return
+            if target_path.exists() and target_path.is_file():
+                backups[relative_path] = ("file", target_path.read_text(encoding="utf-8"))
+            elif target_path.exists():
+                backups[relative_path] = ("other", None)
+            else:
+                backups[relative_path] = ("missing", None)
+
+        def rollback() -> None:
+            for relative_path, (kind, content) in reversed(list(backups.items())):
+                target_path = target_root / self._safe_relative_path(relative_path)
+                if kind == "file":
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(content or "", encoding="utf-8")
+                    continue
+                if kind == "missing":
+                    if target_path.exists():
+                        if target_path.is_dir():
+                            shutil.rmtree(target_path)
+                        else:
+                            target_path.unlink()
+
+        def failed(status: str, reason: str) -> ApplyPatchResult:
+            rollback()
+            return ApplyPatchResult(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                base_revision_id=envelope.base_revision_id,
+                status=status,
+                conflict_reason=reason,
+                changed_files=[],
+            )
+
         for operation in envelope.ops:
             target_path = target_root / self._safe_relative_path(operation.file_path)
             existing_content = target_path.read_text(encoding="utf-8") if target_path.exists() and target_path.is_file() else ""
             precondition_hash = (operation.precondition or {}).get("file_hash") if operation.precondition else None
             if precondition_hash is not None and self._file_hash(existing_content) != precondition_hash:
-                return ApplyPatchResult(
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                    base_revision_id=envelope.base_revision_id,
-                    status="conflict",
-                    conflict_reason=f"Precondition hash mismatch for {operation.file_path}.",
-                    changed_files=changed_files,
-                )
+                return failed("conflict", f"Precondition hash mismatch for {operation.file_path}.")
             if operation.op == "delete":
+                backup_path(operation.file_path, target_path)
                 if target_path.exists():
                     if target_path.is_dir():
                         shutil.rmtree(target_path)
@@ -607,36 +639,39 @@ class WorkspaceService:
             if operation.op == "patch":
                 patch_diff = str(operation.diff or "")
                 if not patch_diff.strip():
-                    return ApplyPatchResult(
-                        workspace_id=workspace_id,
-                        run_id=run_id,
-                        base_revision_id=envelope.base_revision_id,
-                        status="failed",
-                        conflict_reason=f"Patch operation {operation.operation_id} is missing a unified diff.",
-                        changed_files=changed_files,
+                    return failed("failed", f"Patch operation {operation.operation_id} is missing a unified diff.")
+                backup_path(operation.file_path, target_path)
+                if patch_diff.lstrip().startswith("*** Begin Patch"):
+                    codex_result = self._apply_codex_update_patch(
+                        existing_content,
+                        patch_diff,
+                        expected_path=operation.file_path,
                     )
+                    if codex_result is None:
+                        return failed("conflict", f"Patch operation {operation.operation_id} could not be applied as a Codex update patch.")
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(codex_result, encoding="utf-8")
+                    if operation.file_path not in changed_files:
+                        changed_files.append(operation.file_path)
+                    continue
+                if self._is_line_free_hunk_patch(patch_diff):
+                    hunk_result = self._apply_line_free_hunks(existing_content, patch_diff)
+                    if hunk_result is None:
+                        return failed("conflict", f"Patch operation {operation.operation_id} could not be applied as a line-free hunk patch.")
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(hunk_result, encoding="utf-8")
+                    if operation.file_path not in changed_files:
+                        changed_files.append(operation.file_path)
+                    continue
                 patch_paths = self._paths_from_unified_diff(patch_diff)
                 if not patch_paths:
-                    return ApplyPatchResult(
-                        workspace_id=workspace_id,
-                        run_id=run_id,
-                        base_revision_id=envelope.base_revision_id,
-                        status="failed",
-                        conflict_reason=f"Patch operation {operation.operation_id} did not contain file paths.",
-                        changed_files=changed_files,
-                    )
+                    return failed("failed", f"Patch operation {operation.operation_id} did not contain file paths.")
                 expected_path = operation.file_path.strip().replace("\\", "/")
                 if any(path != expected_path for path in patch_paths):
-                    return ApplyPatchResult(
-                        workspace_id=workspace_id,
-                        run_id=run_id,
-                        base_revision_id=envelope.base_revision_id,
-                        status="failed",
-                        conflict_reason=f"Patch operation {operation.operation_id} touched paths outside {operation.file_path}.",
-                        changed_files=changed_files,
-                    )
+                    return failed("failed", f"Patch operation {operation.operation_id} touched paths outside {operation.file_path}.")
                 for path in patch_paths:
                     self._safe_relative_path(path)
+                    backup_path(path, target_root / self._safe_relative_path(path))
                 check_result = subprocess.run(
                     ["git", "apply", "--check", "--whitespace=nowarn", "--"],
                     cwd=target_root,
@@ -645,14 +680,7 @@ class WorkspaceService:
                     text=True,
                 )
                 if check_result.returncode != 0:
-                    return ApplyPatchResult(
-                        workspace_id=workspace_id,
-                        run_id=run_id,
-                        base_revision_id=envelope.base_revision_id,
-                        status="conflict",
-                        conflict_reason=check_result.stderr.strip() or check_result.stdout.strip() or f"Patch operation {operation.operation_id} could not be applied.",
-                        changed_files=changed_files,
-                    )
+                    return failed("conflict", check_result.stderr.strip() or check_result.stdout.strip() or f"Patch operation {operation.operation_id} could not be applied.")
                 apply_result = subprocess.run(
                     ["git", "apply", "--whitespace=nowarn", "--"],
                     cwd=target_root,
@@ -661,25 +689,12 @@ class WorkspaceService:
                     text=True,
                 )
                 if apply_result.returncode != 0:
-                    return ApplyPatchResult(
-                        workspace_id=workspace_id,
-                        run_id=run_id,
-                        base_revision_id=envelope.base_revision_id,
-                        status="failed",
-                        conflict_reason=apply_result.stderr.strip() or apply_result.stdout.strip() or f"Patch operation {operation.operation_id} failed during apply.",
-                        changed_files=changed_files,
-                    )
+                    return failed("failed", apply_result.stderr.strip() or apply_result.stdout.strip() or f"Patch operation {operation.operation_id} failed during apply.")
                 changed_files.extend(path for path in patch_paths if path not in changed_files)
                 continue
             if operation.content is None:
-                return ApplyPatchResult(
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                    base_revision_id=envelope.base_revision_id,
-                    status="failed",
-                    conflict_reason=f"Patch operation {operation.operation_id} is missing content.",
-                    changed_files=changed_files,
-                )
+                return failed("failed", f"Patch operation {operation.operation_id} is missing content.")
+            backup_path(operation.file_path, target_path)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(operation.content, encoding="utf-8")
             changed_files.append(operation.file_path)
@@ -829,6 +844,259 @@ class WorkspaceService:
                 if candidate:
                     paths.append(candidate)
         return list(dict.fromkeys(path for path in paths if path))
+
+    @classmethod
+    def _ensure_unified_diff_paths(cls, diff_text: str, relative_path: str) -> str:
+        text = str(diff_text or "")
+        if text.lstrip().startswith("*** Begin Patch"):
+            return text
+        if cls._paths_from_unified_diff(text):
+            return text
+        if cls._is_line_free_hunk_patch(text):
+            return text
+        if not re.search(r"^@@\s", text, flags=re.MULTILINE):
+            return text
+        normalized_path = str(relative_path or "").strip().replace("\\", "/").lstrip("./")
+        if not normalized_path:
+            return text
+        body = text if text.endswith("\n") else f"{text}\n"
+        return f"--- a/{normalized_path}\n+++ b/{normalized_path}\n{body}"
+
+    @staticmethod
+    def _is_line_free_hunk_patch(diff_text: str) -> bool:
+        for line in str(diff_text or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(("--- ", "+++ ", "diff --git ")):
+                continue
+            if stripped.startswith("@@"):
+                return re.match(r"^@@\s+-\d", stripped) is None
+            return False
+        return False
+
+    @classmethod
+    def _apply_codex_update_patch(cls, existing_content: str, patch_text: str, *, expected_path: str) -> str | None:
+        lines = str(patch_text or "").splitlines()
+        expected = str(expected_path or "").strip().replace("\\", "/").lstrip("./")
+        active = False
+        hunks: list[list[str]] = []
+        current: list[str] = []
+        for line in lines:
+            if line.startswith("*** Update File: "):
+                path = line.split(":", 1)[1].strip().replace("\\", "/").lstrip("./")
+                active = path == expected
+                continue
+            if line.startswith("*** End Patch") or line.startswith("*** Update File: "):
+                break
+            if not active:
+                continue
+            if line.startswith("@@"):
+                if current:
+                    hunks.append(current)
+                current = []
+                continue
+            if line.startswith("***"):
+                continue
+            if current is not None:
+                current.append(line)
+        if current:
+            hunks.append(current)
+        if not hunks:
+            return None
+
+        updated = existing_content
+        for hunk in hunks:
+            next_content = cls._apply_line_free_hunk(updated, hunk)
+            if next_content is None:
+                return None
+            updated = next_content
+        return updated
+
+    @classmethod
+    def _apply_line_free_hunks(cls, existing_content: str, diff_text: str) -> str | None:
+        hunks: list[list[str]] = []
+        current: list[str] = []
+        for line in str(diff_text or "").splitlines():
+            if line.startswith(("--- ", "+++ ", "diff --git ")):
+                continue
+            if line.startswith("***"):
+                continue
+            if line.startswith("@@"):
+                if current:
+                    hunks.append(current)
+                current = []
+                continue
+            current.append(line)
+        if current:
+            hunks.append(current)
+        if not hunks:
+            return None
+        updated = existing_content
+        for hunk in hunks:
+            next_content = cls._apply_line_free_hunk(updated, hunk)
+            if next_content is None:
+                return None
+            updated = next_content
+        return updated
+
+    @staticmethod
+    def _apply_line_free_hunk(existing_content: str, hunk: list[str]) -> str | None:
+        if WorkspaceService._route_addition_has_indented_after_context(hunk):
+            return None
+        old_lines: list[str] = []
+        new_lines: list[str] = []
+        for line in hunk:
+            if not line:
+                old_lines.append("")
+                new_lines.append("")
+                continue
+            prefix = line[0]
+            body = line[1:] if prefix in {" ", "+", "-"} else line
+            if prefix in {" ", "-"}:
+                old_lines.append(body)
+            if prefix in {" ", "+"}:
+                new_lines.append(body)
+        old_text = "\n".join(old_lines)
+        new_text = "\n".join(new_lines)
+        if not old_text and new_text:
+            addition = new_text if new_text.endswith("\n") else f"{new_text}\n"
+            return f"{existing_content}{addition}"
+        candidates = [old_text]
+        if old_text and not old_text.endswith("\n"):
+            candidates.insert(0, f"{old_text}\n")
+        for candidate in candidates:
+            if candidate and candidate in existing_content:
+                replacement = f"{new_text}\n" if candidate.endswith("\n") and not new_text.endswith("\n") else new_text
+                return existing_content.replace(candidate, replacement, 1)
+        addition_fallback = WorkspaceService._apply_line_free_addition_fallback(existing_content, hunk)
+        if addition_fallback is not None:
+            return addition_fallback
+        return None
+
+    @classmethod
+    def _route_addition_has_indented_after_context(cls, hunk: list[str]) -> bool:
+        entries = cls._line_free_entries(hunk)
+        for index, (prefix, body) in enumerate(entries):
+            if prefix != "+" or not body.startswith("@router."):
+                continue
+            cursor = index
+            while cursor < len(entries) and entries[cursor][0] == "+":
+                cursor += 1
+            while cursor < len(entries):
+                next_prefix, next_body = entries[cursor]
+                if next_prefix == " " and next_body.strip():
+                    return next_body.startswith((" ", "\t"))
+                cursor += 1
+        return False
+
+    @staticmethod
+    def _line_free_entries(hunk: list[str]) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        for line in hunk:
+            if not line:
+                entries.append((" ", ""))
+                continue
+            prefix = line[0] if line[0] in {" ", "+", "-"} else " "
+            body = line[1:] if prefix in {" ", "+", "-"} else line
+            entries.append((prefix, body))
+        return entries
+
+    @classmethod
+    def _apply_line_free_addition_fallback(cls, existing_content: str, hunk: list[str]) -> str | None:
+        entries = cls._line_free_entries(hunk)
+        if not entries or any(prefix == "-" for prefix, _body in entries):
+            return None
+
+        updated = existing_content
+        index = 0
+        while index < len(entries):
+            prefix, _body = entries[index]
+            if prefix != "+":
+                index += 1
+                continue
+            block_start = index
+            while index < len(entries) and entries[index][0] == "+":
+                index += 1
+            block_end = index
+            addition_lines = [body for _prefix, body in entries[block_start:block_end]]
+            if not any(line.strip() for line in addition_lines):
+                continue
+            addition_text = cls._lines_to_text(addition_lines)
+            if addition_text.strip() and addition_text in updated:
+                continue
+
+            before_context = [body for prefix, body in entries[:block_start] if prefix == " "]
+            after_context = [body for prefix, body in entries[block_end:] if prefix == " "]
+            route_decorator_addition = any(line.startswith("@router.") for line in addition_lines)
+            inserted = cls._insert_addition_near_context(
+                updated,
+                addition_text,
+                before_context=before_context,
+                after_context=after_context,
+                require_router_after_anchor=route_decorator_addition,
+            )
+            if inserted is None:
+                return None
+            updated = inserted
+        return updated if updated != existing_content else None
+
+    @classmethod
+    def _insert_addition_near_context(
+        cls,
+        existing_content: str,
+        addition_text: str,
+        *,
+        before_context: list[str],
+        after_context: list[str],
+        require_router_after_anchor: bool = False,
+    ) -> str | None:
+        if not addition_text:
+            return None
+        after_snippets = cls._context_snippets(after_context, from_end=False)
+        if require_router_after_anchor:
+            after_snippets = [snippet for snippet in after_snippets if cls._starts_with_router_decorator(snippet)]
+        for snippet in after_snippets:
+            position = existing_content.find(snippet)
+            if position >= 0:
+                return f"{existing_content[:position]}{addition_text}{existing_content[position:]}"
+        if require_router_after_anchor:
+            return None
+        for snippet in cls._context_snippets(before_context, from_end=True):
+            position = existing_content.rfind(snippet)
+            if position >= 0:
+                insertion_at = position + len(snippet)
+                return f"{existing_content[:insertion_at]}{addition_text}{existing_content[insertion_at:]}"
+        return None
+
+    @staticmethod
+    def _starts_with_router_decorator(snippet: str) -> bool:
+        for line in str(snippet or "").splitlines():
+            if not line.strip():
+                continue
+            return line.startswith("@router.")
+        return False
+
+    @classmethod
+    def _context_snippets(cls, lines: list[str], *, from_end: bool) -> list[str]:
+        meaningful_indexes = [idx for idx, line in enumerate(lines) if line.strip()]
+        if not meaningful_indexes:
+            return []
+        if from_end:
+            end = meaningful_indexes[-1] + 1
+            starts = range(max(0, end - 8), end)
+            candidates = [lines[start:end] for start in starts]
+        else:
+            start = meaningful_indexes[0]
+            ends = range(min(len(lines), start + 8), start, -1)
+            candidates = [lines[start:end] for end in ends]
+        snippets = [cls._lines_to_text(candidate) for candidate in candidates if any(line.strip() for line in candidate)]
+        return [snippet for snippet in snippets if snippet.strip()]
+
+    @staticmethod
+    def _lines_to_text(lines: list[str]) -> str:
+        text = "\n".join(lines)
+        return text if text.endswith("\n") else f"{text}\n"
 
     @staticmethod
     def _copy_tree(source_dir: Path, destination_dir: Path) -> None:

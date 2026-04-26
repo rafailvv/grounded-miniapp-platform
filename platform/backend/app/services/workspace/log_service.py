@@ -46,7 +46,7 @@ class WorkspaceLogService:
             "message": message,
             "payload": payload or {},
         }
-        line = json.dumps(entry, ensure_ascii=True)
+        line = json.dumps(entry, ensure_ascii=False)
         with self._lock:
             with self.log_path(workspace_id).open("a", encoding="utf-8") as handle:
                 handle.write(f"{line}\n")
@@ -67,7 +67,7 @@ class WorkspaceLogService:
             "message": message,
             "payload": payload or {},
         }
-        line = json.dumps(entry, ensure_ascii=True)
+        line = json.dumps(entry, ensure_ascii=False)
         log_path = self.api_log_path(workspace_id)
         with self._lock:
             with log_path.open("a", encoding="utf-8") as handle:

@@ -76,6 +76,19 @@ WORKSPACE_NAME_STOPWORDS = {
     "this",
     "to",
     "with",
+    "создай",
+    "сделай",
+    "сгенерируй",
+    "приложение",
+    "мини",
+    "миниапп",
+    "для",
+    "мне",
+    "нужно",
+    "надо",
+    "простое",
+    "с",
+    "и",
 }
 ROLE_SCOPE_HINTS: dict[str, tuple[str, ...]] = {
     "client": ("client", "customer", "buyer", "shopper", "user", "клиент", "покупатель", "покупательница", "пользователь", "заказчик"),
@@ -176,7 +189,8 @@ class RunService:
 
     @staticmethod
     def _derive_workspace_name_from_prompt(prompt: str) -> str:
-        normalized = " ".join(str(prompt or "").split()).strip()
+        normalized = RunService._strip_prompt_time_prefix(str(prompt or ""))
+        normalized = " ".join(normalized.split()).strip()
         if not normalized:
             return ""
         normalized = re.sub(r"^['\"`]+|['\"`]+$", "", normalized)
@@ -193,7 +207,7 @@ class RunService:
         if not normalized:
             return ""
 
-        tokens = re.findall(r"[A-Za-z0-9]+", normalized)
+        tokens = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", normalized)
         meaningful: list[str] = []
         for token in tokens:
             lowered_token = token.lower()
@@ -209,6 +223,24 @@ class RunService:
         title = " ".join(word.capitalize() if not word.isupper() else word for word in meaningful)
         title = re.sub(r"\s+", " ", title).strip()
         return title[:48].rstrip(" -_,")
+
+    @staticmethod
+    def _strip_prompt_time_prefix(prompt: str) -> str:
+        lines = str(prompt or "").splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        timestamp_pattern = re.compile(
+            r"^\s*(?:"
+            r"(?:[01]?\d|2[0-3])[:.][0-5]\d(?:\s*(?:am|pm))?"
+            r"|(?:1[0-2]|0?[1-9])[:.][0-5]\d\s*(?:am|pm)"
+            r")\s*$",
+            re.IGNORECASE,
+        )
+        while lines and timestamp_pattern.match(lines[0]):
+            lines.pop(0)
+            while lines and not lines[0].strip():
+                lines.pop(0)
+        return "\n".join(lines).strip()
 
     def list_runs(self, workspace_id: str) -> list[RunRecord]:
         runs = [
@@ -761,7 +793,6 @@ class RunService:
                     if run.draft_ready:
                         run.summary = "Strict-green validation did not pass. Draft was retained for inspection."
 
-            self._save_run(run)
             if run.status == "awaiting_approval" and getattr(job, "status", None) != "completed":
                 self._append_job_event(
                     run.linked_job_id,
@@ -776,6 +807,16 @@ class RunService:
             queue_preview_reason: str | None = None
             if run.status == "completed" and run.apply_status == "applied":
                 queue_preview_reason = "run completion"
+                should_queue_followup_verification = self._should_queue_async_followup_verification(request, run)
+                if should_queue_followup_verification:
+                    run.checks_summary = self._build_checks_summary(
+                        job.validation_snapshot,
+                        self.preview_service.get(run.workspace_id).status,
+                        gate_status="passed",
+                        followup_status="pending",
+                        auto_fix_status="skipped",
+                    )
+            self._save_run(run)
             self._store_run_artifacts(run, change_plan, job, preview)
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
             logger.info(
@@ -946,6 +987,8 @@ class RunService:
         source_dir = self.workspace_service.source_dir(run.workspace_id)
 
         def on_complete(preview: Any) -> None:
+            if preview is None:
+                preview = self.preview_service.get(run.workspace_id)
             actual_preview_ms = int(
                 getattr(preview, "latency_breakdown", {}).get("last_rebuild_ms")
                 or getattr(preview, "latency_breakdown", {}).get("last_start_ms")
@@ -999,6 +1042,7 @@ class RunService:
             source_dir=source_dir,
             draft_run_id=None,
             on_complete=on_complete,
+            force=True,
         )
         latency_breakdown = dict((self.store.get("runs", run.run_id) or {}).get("latency_breakdown") or run.latency_breakdown)
         latency_breakdown["preview_enqueue_ms"] = int((time.perf_counter() - queue_started_at) * 1000)
@@ -1046,6 +1090,7 @@ class RunService:
         self._set_followup_status(parent_run_id, followup_status="failed")
         if not self._should_auto_fix_followup_failure(execution, validation_snapshot):
             self._set_followup_status(parent_run_id, auto_fix_status="skipped")
+            self._mark_parent_failed_followup(parent_run_id, execution)
             return
         self._set_followup_status(parent_run_id, auto_fix_status="pending")
         try:
@@ -1055,6 +1100,7 @@ class RunService:
             )
         except Exception:
             self._set_followup_status(parent_run_id, auto_fix_status="failed")
+            self._mark_parent_failed_followup(parent_run_id, execution)
             return
         self._set_followup_status(
             parent_run_id,
@@ -1062,13 +1108,17 @@ class RunService:
             auto_fix_status="passed" if followup_run.status == "completed" and followup_run.apply_status == "applied" else "failed",
         )
         if not (followup_run.status == "completed" and followup_run.apply_status == "applied"):
+            self._mark_parent_failed_followup(parent_run_id, execution)
             return
         refreshed_parent = self.get_run(parent_run_id)
         post_fix_execution, _post_fix_validation = self._run_followup_checks(refreshed_parent)
+        post_fix_passed = self._followup_checks_passed(refreshed_parent, post_fix_execution, _post_fix_validation)
         self._set_followup_status(
             parent_run_id,
-            followup_status="passed" if self._followup_checks_passed(refreshed_parent, post_fix_execution, _post_fix_validation) else "failed",
+            followup_status="passed" if post_fix_passed else "failed",
         )
+        if not post_fix_passed:
+            self._mark_parent_failed_followup(parent_run_id, post_fix_execution)
 
     def _run_followup_checks(self, run: RunRecord) -> tuple[CheckExecutionRecord, Any]:
         source_dir = self.workspace_service.source_dir(run.workspace_id)
@@ -1091,6 +1141,24 @@ class RunService:
             },
         )
         return execution, validation_snapshot
+
+    def _mark_parent_failed_followup(self, run_id: str, execution: CheckExecutionRecord) -> None:
+        run_payload = self.store.get("runs", run_id)
+        if run_payload is None:
+            return
+        failing_result = next((result for result in execution.results if result.status == "failed"), None)
+        failure_reason = None
+        if failing_result is not None:
+            failure_reason = next(
+                (line for line in reversed(failing_result.logs or []) if str(line).strip()),
+                failing_result.details or f"{failing_result.name} failed.",
+            )
+        run_payload["status"] = "blocked"
+        run_payload["current_stage"] = "follow-up failed"
+        run_payload["failure_class"] = CheckRunner.classify_failure(execution.results) or "followup_verification"
+        run_payload["failure_reason"] = failure_reason or "Follow-up verification failed after apply."
+        run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.store.upsert("runs", run_id, run_payload)
 
     def _followup_checks_passed(self, run: RunRecord, execution: CheckExecutionRecord, validation_snapshot: Any) -> bool:
         return bool(self._strict_green_completion_state(execution.results, validation_snapshot).get("strict_green"))
@@ -1746,6 +1814,13 @@ class RunService:
             return False
         if str(getattr(job, "failure_class", "") or "") == "generation.edit.llm_failure":
             return False
+        if any(
+            isinstance(result, dict)
+            and result.get("name") == "prompt_alignment_smoke"
+            and result.get("status") == "failed"
+            for result in getattr(job, "executed_checks", []) or []
+        ):
+            return False
         if not self.workspace_service.draft_exists(run.workspace_id, run.run_id):
             return False
         if run.apply_strategy != "staged_auto_apply":
@@ -1832,7 +1907,7 @@ class RunService:
             return False
         if run.generation_mode == GenerationMode.QUALITY:
             return False
-        return run.intent in {"edit", "refine", "role_only_change"}
+        return run.intent in {"create", "edit", "refine", "role_only_change"}
 
     def _should_apply_best_effort_after_failed_repairs(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
         del run, job, meaningful_paths

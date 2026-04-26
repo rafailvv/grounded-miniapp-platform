@@ -37,6 +37,16 @@ class PreviewService:
         self.workspace_service = workspace_service
         self.runtime_manager = runtime_manager
         self.workspace_log_service = workspace_log_service
+        self._workspace_locks: dict[str, threading.RLock] = {}
+        self._workspace_locks_guard = threading.Lock()
+
+    def _workspace_lock(self, workspace_id: str) -> threading.RLock:
+        with self._workspace_locks_guard:
+            lock = self._workspace_locks.get(workspace_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._workspace_locks[workspace_id] = lock
+            return lock
 
     def _append_log(self, preview: PreviewRecord, message: str) -> None:
         preview.logs.append(message)
@@ -48,20 +58,23 @@ class PreviewService:
         self.store.upsert("previews", preview.workspace_id, preview.model_dump(mode="json"))
 
     def start(self, workspace_id: str, source_dir: Path | None = None, draft_run_id: str | None = None) -> PreviewRecord:
+        lock = self._workspace_lock(workspace_id)
+        lock.acquire()
         preview = self._get_or_create(workspace_id)
-        source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
-        runtime_mode = self.runtime_manager.preferred_mode()
-        preview.runtime_mode = runtime_mode
-        preview.draft_run_id = None
-        preview.status = "starting"
-        preview.stage = "starting"
-        preview.progress_percent = max(preview.progress_percent, 8)
-        preview.last_error = None
-        self._persist(preview)
-        started_at = datetime.now(timezone.utc)
         try:
+            source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
+            runtime_mode = self.runtime_manager.preferred_mode()
+            preview.runtime_mode = runtime_mode
+            preview.draft_run_id = None
+            preview.status = "starting"
+            preview.stage = "starting"
+            preview.progress_percent = max(preview.progress_percent, 8)
+            preview.last_error = None
+            self._persist(preview)
+            started_at = datetime.now(timezone.utc)
             self._append_log(preview, f"Preview start requested. mode={runtime_mode}.")
             proxy_port = self._select_proxy_port(workspace_id, preview, source_dir)
+            preview.proxy_port = proxy_port
             self._append_log(preview, f"Selected preview port {proxy_port}.")
             preview.progress_percent = max(preview.progress_percent, 24)
             self._persist(preview)
@@ -98,8 +111,10 @@ class PreviewService:
                 preview.progress_percent = 100
                 preview.last_error = str(exc)
                 self._append_log(preview, f"Docker preview failed: {exc}")
-        self._persist(preview)
-        return preview
+            self._persist(preview)
+            return preview
+        finally:
+            lock.release()
 
     def ensure_started(self, workspace_id: str, *, force_rebuild: bool = False) -> PreviewRecord:
         preview = self._reconcile_runtime_state(self._get_or_create(workspace_id), workspace_id)
@@ -142,20 +157,23 @@ class PreviewService:
         source_dir: Path | None = None,
         draft_run_id: str | None = None,
     ) -> PreviewRecord:
+        lock = self._workspace_lock(workspace_id)
+        lock.acquire()
         preview = self._get_or_create(workspace_id)
-        source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
-        runtime_mode = self.runtime_manager.preferred_mode()
-        preview.runtime_mode = runtime_mode
-        preview.draft_run_id = None
-        preview.status = "starting"
-        preview.stage = "rebuilding"
-        preview.progress_percent = max(preview.progress_percent, 12)
-        preview.last_error = None
-        self._persist(preview)
-        started_at = datetime.now(timezone.utc)
         try:
+            source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
+            runtime_mode = self.runtime_manager.preferred_mode()
+            preview.runtime_mode = runtime_mode
+            preview.draft_run_id = None
+            preview.status = "starting"
+            preview.stage = "rebuilding"
+            preview.progress_percent = max(preview.progress_percent, 12)
+            preview.last_error = None
+            self._persist(preview)
+            started_at = datetime.now(timezone.utc)
             self._append_log(preview, f"Preview rebuild requested. mode={runtime_mode}.")
             proxy_port = self._select_proxy_port(workspace_id, preview, source_dir)
+            preview.proxy_port = proxy_port
             self._append_log(preview, f"Using preview port {proxy_port} for rebuild.")
             preview.progress_percent = max(preview.progress_percent, 28)
             self._persist(preview)
@@ -192,8 +210,10 @@ class PreviewService:
                 preview.progress_percent = 100
                 preview.last_error = str(exc)
                 self._append_log(preview, f"Docker preview rebuild failed: {exc}")
-        self._persist(preview)
-        return preview
+            self._persist(preview)
+            return preview
+        finally:
+            lock.release()
 
     def rebuild_async(
         self,
@@ -201,8 +221,25 @@ class PreviewService:
         source_dir: Path | None = None,
         draft_run_id: str | None = None,
         on_complete: Callable[[PreviewRecord], None] | None = None,
+        force: bool = False,
     ) -> PreviewRecord:
-        preview = self._get_or_create(workspace_id)
+        preview = self._reconcile_runtime_state(self._get_or_create(workspace_id), workspace_id)
+        if (
+            not force
+            and preview.status == "starting"
+            and preview.stage in {"starting", "rebuilding", "health_check"}
+            and preview.proxy_port is not None
+        ):
+            preview = self._fast_restore_preview_from_http(preview)
+        if (
+            not force
+            and preview.status == "starting"
+            and preview.stage in {"starting", "rebuilding", "health_check"}
+            and not self._is_stale_starting_preview(preview)
+        ):
+            self._append_log(preview, "Asynchronous preview rebuild already in progress for this workspace.")
+            self._persist(preview)
+            return preview
         preview.runtime_mode = self.runtime_manager.preferred_mode()
         preview.draft_run_id = None
         preview.status = "starting"
@@ -487,6 +524,32 @@ class PreviewService:
                 if cleanup_logs:
                     preview.logs.extend(cleanup_logs[-20:])
                     preview.logs = preview.logs[-240:]
+            if cleanup_attempted and preview.proxy_port is not None:
+                try:
+                    project_name, retry_logs = self.runtime_manager.start(workspace_id, source_dir, preview.proxy_port)
+                except Exception as retry_exc:
+                    self._append_log(preview, f"Preview retry after cleanup failed: {retry_exc}")
+                else:
+                    preview.project_name = project_name
+                    preview.url = self.runtime_manager.preview_url(preview.proxy_port)
+                    preview.frontend_url = preview.url
+                    preview.backend_url = self.runtime_manager.backend_url(preview.proxy_port)
+                    preview.logs.extend(retry_logs or [f"Docker preview restarted on port {preview.proxy_port}."])
+                    preview.logs = preview.logs[-240:]
+                    preview.status = "running"
+                    preview.stage = "running"
+                    preview.progress_percent = 100
+                    preview.started_at = preview.started_at or datetime.now(timezone.utc)
+                    preview.last_error = None
+                    preview.preview_failure_kind = None
+                    preview.preview_retry_count = 0
+                    preview.preview_cleanup_attempted = True
+                    preview.preview_reused_existing_runtime = False
+                    preview.preview_cooldown_until = None
+                    preview.last_failure_signature = None
+                    self._append_log(preview, "Preview start recovered after cleanup of stale docker runtime.")
+                    self._persist(preview)
+                    return True
         self._record_preview_failure(preview, error=error, failure_kind=failure_kind, cleanup_attempted=cleanup_attempted)
         self._append_log(
             preview,

@@ -665,6 +665,7 @@ class OpenAIClient:
         )
         self._log_request(endpoint="responses", model=model, payload=payload)
         data = self._post_json_with_retries(endpoint="responses", model=model, payload=payload)
+        self._raise_for_incomplete_response(data, endpoint="responses")
         text = self._extract_response_text(data)
         self._log_parsed_text(endpoint="responses", model=model, text=text)
         return {
@@ -752,6 +753,7 @@ class OpenAIClient:
         )
         self._log_request(endpoint="responses", model=model, payload=payload)
         data = self._post_json_with_retries(endpoint="responses", model=model, payload=payload)
+        self._raise_for_incomplete_response(data, endpoint="responses")
         text = self._extract_response_text(data)
         self._log_parsed_text(endpoint="responses", model=model, text=text)
         return {
@@ -920,6 +922,16 @@ class OpenAIClient:
             "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
             "total_tokens": int(usage.get("total_tokens") or 0),
         }
+
+    @staticmethod
+    def _raise_for_incomplete_response(payload: dict[str, Any], *, endpoint: str) -> None:
+        if str(payload.get("status") or "").lower() != "incomplete":
+            return
+        details = payload.get("incomplete_details")
+        reason = ""
+        if isinstance(details, dict):
+            reason = str(details.get("reason") or "")
+        raise RuntimeError(f"OpenAI {endpoint} returned incomplete response: {reason or 'unknown'}")
 
     @staticmethod
     def _extract_target_file_count(payload: dict[str, Any]) -> int | None:

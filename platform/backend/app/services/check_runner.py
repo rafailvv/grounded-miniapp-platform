@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urljoin
@@ -583,6 +584,14 @@ class CheckRunner:
             logs.extend(backend_result.logs)
             if backend_result.status == "failed":
                 return backend_result
+            js_syntax_result = self._run_static_js_syntax_check(backend_dir)
+            logs.extend(js_syntax_result.logs)
+            if js_syntax_result.status == "failed":
+                return js_syntax_result
+            import_result = self._run_backend_import_smoke(backend_dir)
+            logs.extend(import_result.logs)
+            if import_result.status == "failed":
+                return import_result
 
         if executed:
             return RunCheckResult(
@@ -927,6 +936,121 @@ class CheckRunner:
             command=f"{sys.executable} -m py_compile {' '.join(py_files)}",
             exit_code=result.returncode,
             logs=["Backend py_compile passed for the draft miniapp."],
+        )
+
+    def _run_static_js_syntax_check(self, backend_dir: Path) -> RunCheckResult:
+        static_dir = backend_dir / "app" / "static"
+        js_files = sorted(str(path.relative_to(backend_dir)) for path in static_dir.rglob("*.js")) if static_dir.exists() else []
+        if not js_files:
+            return RunCheckResult(
+                name="changed_files_static",
+                status="passed",
+                details="No static JavaScript files required syntax checking.",
+                command="node --check",
+                logs=["No static JavaScript files required syntax checking."],
+            )
+        node_binary = shutil.which("node") or shutil.which("nodejs")
+        if not node_binary:
+            return RunCheckResult(
+                name="changed_files_static",
+                status="failed",
+                details="Node.js is missing for static JavaScript syntax checks.",
+                command="node --check",
+                logs=[
+                    "Node.js is missing for static JavaScript syntax checks.",
+                    "Install Node.js in the platform runtime so generated browser scripts can be validated before apply.",
+                ],
+            )
+        for js_file in js_files:
+            command = [node_binary, "--check", js_file]
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=backend_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=int(os.getenv("STATIC_JS_CHECK_TIMEOUT_SEC", "45")),
+                )
+            except subprocess.TimeoutExpired as exc:
+                return RunCheckResult(
+                    name="changed_files_static",
+                    status="failed",
+                    details="Static JavaScript syntax check timed out.",
+                    command=" ".join(command),
+                    logs=self._command_logs("Static JavaScript syntax check timed out.", exc.stdout or "", exc.stderr or ""),
+                )
+            if result.returncode != 0:
+                return RunCheckResult(
+                    name="changed_files_static",
+                    status="failed",
+                    details="Static JavaScript syntax check failed for the draft miniapp.",
+                    command=" ".join(command),
+                    exit_code=result.returncode,
+                    logs=self._command_logs("Static JavaScript syntax check failed for the draft miniapp.", result.stdout, result.stderr),
+                )
+        return RunCheckResult(
+            name="changed_files_static",
+            status="passed",
+            details="Static JavaScript syntax checks passed for the draft miniapp.",
+            command=f"{node_binary} --check {' '.join(js_files)}",
+            logs=["Static JavaScript syntax checks passed for the draft miniapp."],
+        )
+
+    def _run_backend_import_smoke(self, backend_dir: Path) -> RunCheckResult:
+        if not (backend_dir / "app" / "main.py").exists():
+            return RunCheckResult(
+                name="changed_files_static",
+                status="skipped",
+                details="Backend import smoke skipped because app/main.py is missing.",
+                command=f"{sys.executable} -c import app.main",
+                logs=[],
+            )
+        env = {**os.environ}
+        python_path_parts = [str(backend_dir)]
+        existing_python_path = env.get("PYTHONPATH")
+        if existing_python_path:
+            python_path_parts.append(existing_python_path)
+        env["PYTHONPATH"] = os.pathsep.join(python_path_parts)
+        with tempfile.TemporaryDirectory(prefix="miniapp-import-smoke-") as tmp_dir:
+            env["DATABASE_URL"] = f"sqlite:///{(Path(tmp_dir) / 'app.db').as_posix()}"
+            command = [
+                sys.executable,
+                "-c",
+                "import importlib; importlib.import_module('app.main')",
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=backend_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=int(os.getenv("BACKEND_IMPORT_SMOKE_TIMEOUT_SEC", "45")),
+                    env=env,
+                )
+            except subprocess.TimeoutExpired as exc:
+                return RunCheckResult(
+                    name="changed_files_static",
+                    status="failed",
+                    details="Backend import smoke timed out.",
+                    command=" ".join(command),
+                    logs=self._command_logs("Backend import smoke timed out.", exc.stdout or "", exc.stderr or ""),
+                )
+        if result.returncode != 0:
+            return RunCheckResult(
+                name="changed_files_static",
+                status="failed",
+                details="Backend import smoke failed for the draft miniapp.",
+                command=" ".join(command),
+                exit_code=result.returncode,
+                logs=self._command_logs("Backend import smoke failed for the draft miniapp.", result.stdout, result.stderr),
+            )
+        return RunCheckResult(
+            name="changed_files_static",
+            status="passed",
+            details="Backend import smoke passed for the draft miniapp.",
+            command=" ".join(command),
+            exit_code=result.returncode,
+            logs=["Backend import smoke passed for the draft miniapp."],
         )
 
     @staticmethod

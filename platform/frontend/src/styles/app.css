@@ -581,13 +581,6 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
-.run-card-copy {
-  display: -webkit-box;
-  -webkit-line-clamp: 4;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
 .run-progress {
   display: grid;
   gap: 6px;
@@ -622,6 +615,21 @@ button:disabled {
   color: var(--muted);
   font-size: 12px;
   row-gap: 6px;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: nowrap;
+}
+
+.run-card-meta-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-card-meta-time {
+  flex: 0 0 auto;
 }
 
 .run-card-actions {

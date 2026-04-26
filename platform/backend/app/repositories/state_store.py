@@ -97,11 +97,11 @@ class StateStore:
     def _write(self, payload: dict[str, Any]) -> None:
         temp_path = self.path.with_suffix(f".{uuid.uuid4().hex}.tmp")
         with temp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=True, indent=2, default=str)
+            json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
         temp_path.replace(self.path)
         backup_path = self.path.with_suffix(f".{uuid.uuid4().hex}.bak.tmp")
         with backup_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=True, indent=2, default=str)
+            json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
         backup_path.replace(self.backup_path)
 
     def list(self, collection: str) -> list[dict[str, Any]]:

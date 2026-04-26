@@ -243,7 +243,7 @@ class WorkspaceCodeAgentRuntime:
         generation_mode: GenerationMode,
         should_stop: Callable[[], bool] | None,
     ) -> WorkspaceLoopResult:
-        seed_context = self._seed_file_context(workspace_id, run_id)
+        seed_context = self._seed_file_context(workspace_id, run_id, role_scope=role_scope)
         tool_results: list[dict[str, object]] = []
         last_changed_files: list[str] = ["miniapp", "docs", "README.md"]
 
@@ -323,7 +323,10 @@ class WorkspaceCodeAgentRuntime:
             extra_file_context: dict[str, str] = {}
             local_tool_results = list(tool_results)
             seen_tool_requests: set[str] = set()
-            for tool_round in range(self._tool_round_limit(generation_mode) + 1):
+            self_blocked_correction_sent = False
+            generic_fatal_correction_sent = False
+            output_cap_correction_sent = False
+            for tool_round in range(self._tool_round_limit(generation_mode) + 2):
                 llm_payload = self._request_agent_turn(
                     job=job,
                     workspace_id=workspace_id,
@@ -342,6 +345,29 @@ class WorkspaceCodeAgentRuntime:
                     latest_diff_summary=latest_diff_summary,
                 )
                 if "error" in llm_payload:
+                    if self._is_output_cap_error(str(llm_payload.get("error") or "")):
+                        if not output_cap_correction_sent:
+                            correction = self._output_cap_correction_result(llm_payload, request=request)
+                            local_tool_results.append(correction)
+                            tool_results.append(correction)
+                            output_cap_correction_sent = True
+                            self._append_event(
+                                job,
+                                "repair_iteration",
+                                "Agent exceeded the structured output cap. Retrying with a smaller patch contract.",
+                                {"attempt": attempt, "tool_round": tool_round, "reason": "output_cap"},
+                            )
+                            continue
+                        return WorkspaceLoopTurnPlan(
+                            outcome="needs_context",
+                            assistant_message="Agent response exceeded the structured output cap.",
+                            diagnosis=(
+                                "The previous response was too large to return as valid JSON. "
+                                "Retry with a smaller operation set, prefer compact replace operations, and keep this turn applyable."
+                            ),
+                            files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                            metadata={"error": str(llm_payload.get("error") or ""), "retry_reason": "max_output_tokens"},
+                        )
                     return WorkspaceLoopTurnPlan(
                         outcome="fatal_invalid_response",
                         assistant_message=str(llm_payload.get("error") or ""),
@@ -384,6 +410,36 @@ class WorkspaceCodeAgentRuntime:
                         metadata={"tool_requests": raw_tool_requests},
                     )
                 if outcome == "fatal_invalid_response":
+                    if (
+                        not self_blocked_correction_sent
+                        and self._is_self_blocked_tool_contract_response(llm_payload)
+                    ):
+                        correction = self._tool_contract_correction_result(llm_payload)
+                        local_tool_results.append(correction)
+                        tool_results.append(correction)
+                        self_blocked_correction_sent = True
+                        self._append_event(
+                            job,
+                            "repair_iteration",
+                            "Agent misunderstood the read-only tool contract. Retrying with corrected tool instructions.",
+                            {"attempt": attempt, "tool_round": tool_round, "reason": "self_blocked_tool_contract"},
+                        )
+                        continue
+                    if (
+                        not generic_fatal_correction_sent
+                        and self._is_empty_fatal_agent_response(llm_payload)
+                    ):
+                        correction = self._empty_fatal_correction_result(llm_payload)
+                        local_tool_results.append(correction)
+                        tool_results.append(correction)
+                        generic_fatal_correction_sent = True
+                        self._append_event(
+                            job,
+                            "repair_iteration",
+                            "Agent returned an empty fatal response. Retrying with corrected task instructions.",
+                            {"attempt": attempt, "tool_round": tool_round, "reason": "empty_fatal_response"},
+                        )
+                        continue
                     return WorkspaceLoopTurnPlan(
                         outcome="fatal_invalid_response",
                         assistant_message=str(llm_payload.get("assistant_message") or ""),
@@ -510,11 +566,25 @@ class WorkspaceCodeAgentRuntime:
                 prompt_cache_key=self._prompt_cache_key(workspace_id, run_id, request.prompt),
                 stable_prefix=self._agent_system_prompt(),
                 model_override=primary_model,
-                responses_tuning_override={"reasoning": {"effort": "medium" if generation_mode == GenerationMode.FAST else "high"}},
+                responses_tuning_override=self._agent_turn_tuning(generation_mode, intent=str(request.intent or "")),
             )
             job.llm_model = str(response.get("model") or "")
-            job.cache_stats = self._merge_cache_stats(job.cache_stats, response.get("cache_stats") or {})
-            self._save_job(job)
+            turn_cache_stats = response.get("cache_stats") or {}
+            job.cache_stats = self._merge_cache_stats(job.cache_stats, turn_cache_stats)
+            self._append_event(
+                job,
+                "iteration_ready",
+                "Workspace code agent returned a structured turn.",
+                {
+                    "attempt": attempt,
+                    "tool_round": tool_round,
+                    "model": job.llm_model,
+                    "input_tokens": int(turn_cache_stats.get("input_tokens") or 0),
+                    "output_tokens": int(turn_cache_stats.get("output_tokens") or 0),
+                    "reasoning_tokens": int(turn_cache_stats.get("reasoning_tokens") or 0),
+                    "total_tokens": int(turn_cache_stats.get("total_tokens") or 0),
+                },
+            )
             payload = response.get("payload")
             if isinstance(payload, str):
                 payload = json.loads(payload)
@@ -549,6 +619,7 @@ class WorkspaceCodeAgentRuntime:
                 },
                 "operations": {
                     "type": "array",
+                            "maxItems": 8,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
@@ -582,11 +653,14 @@ class WorkspaceCodeAgentRuntime:
     def _agent_system_prompt() -> str:
         return (
             "You are a universal workspace code agent for a Telegram mini-app platform. "
-            "Work like a coding agent: inspect files, edit source, run checks, and converge to a working app. "
+            "Work like a coding agent: inspect files, return source edits as operations, request read-only validation checks, and converge to a working app. "
             "The user's prompt is the only source of product semantics. Do not impose any generic queue, ticketing, lifecycle, or CRUD product model unless the prompt explicitly asks for it. "
             "Existing template docs and files are technical shell context only. They must not override the user's domain. "
             "Preserve the FastAPI + static-file shell, preview bridge, and role-root routing unless the user asks otherwise. "
             "For create tasks, build a complete domain-specific app from the prompt. For e-commerce prompts, prefer products, catalog, cart, orders, and management surfaces, never generic intake or application tracking. "
+            "Tools are diagnostic only. They cannot write files, execute arbitrary scripts, run shell commands, or apply changes. "
+            "run_checks is a read-only platform validation snapshot for the current draft; it is not a command runner and must never be used to rewrite files. "
+            "All code changes must be returned in the operations array of the same structured JSON response. "
             "Use hunk patches when small edits are enough. Use full-file create/replace only when creating or substantially rewriting a file. "
             "Do not edit generated app tests or generated manifests to hide failures. Repair app code and platform invariants instead. "
             "Return only the structured JSON payload requested by the schema."
@@ -636,8 +710,22 @@ class WorkspaceCodeAgentRuntime:
             "last_turn_summary": last_turn_summary,
             "tool_results": tool_results[-8:],
             "rules": [
+                "Keep each turn applyable: return up to 8 independent file operations together when they are part of the same coherent change.",
+                "For Fast create tasks, keep the first patch compact and complete: usually 4-6 files, no verbose comments, no large fixtures, and no repeated tool reads for files already shown in file_contexts.",
+                "For broad create tasks, batch independent backend/static/style files in one response when the changes are clear; otherwise patch the most important blocking slice first and continue after checks.",
+                "For edit/refine tasks, keep the patch focused on one visible slice in the requested role files and usually return 1-2 operations.",
+                "For edit/refine tasks, keep the response under 16000 output tokens; if more is needed, replace the single most important file first and continue after checks.",
+                "For edit/refine tasks, do not rewrite the whole app or unrelated files; make the smallest complete visible change that satisfies the prompt.",
+                "If role_scope contains only client, prioritize miniapp/app/static/client files and do not change backend unless the prompt explicitly asks for API/data changes.",
+                "If role_scope contains only manager, prioritize miniapp/app/static/manager files and do not change backend unless the prompt explicitly asks for API/data changes.",
+                "For existing HTML/CSS/JS files, use replace with the full resulting file when a hunk patch would be large or ambiguous.",
+                "Prefer targeted patch operations over full-file replace when the file already exists.",
+                "If the latest turn reports a patch apply conflict, return a full-file replace for that conflicted file unless the exact corrected hunk is obvious.",
                 "If you need more context, request list_files/read_files/search_files/inspect_diff/run_checks.",
+                "Tools are read-only diagnostics. They cannot run arbitrary commands, execute scripts, write files, or apply edits.",
+                "run_checks only returns a platform validation snapshot for the current draft. It is not a shell, Python, or patch execution tool.",
                 "If you have enough context, return outcome=patch_ready with operations.",
+                "All writes must be represented as operations. Never wait for a tool to write code for you.",
                 "Every create or replace operation must include full resulting file content.",
                 "Every patch operation must include a unified diff for exactly file_path.",
                 "Do not create generic queue, ticketing, lifecycle, or CRUD language unless the prompt asks for it.",
@@ -716,6 +804,9 @@ class WorkspaceCodeAgentRuntime:
                 tool_results.append(
                     {
                         "tool": "run_checks",
+                        "contract": "read_only_validation_snapshot",
+                        "writes_files": False,
+                        "executes_arbitrary_commands": False,
                         "mode": mode,
                         "targets": targets or ["miniapp"],
                         "failed_checks": failed_checks,
@@ -724,6 +815,103 @@ class WorkspaceCodeAgentRuntime:
                     }
                 )
         return loaded_context, tool_results
+
+    @staticmethod
+    def _agent_turn_tuning(generation_mode: GenerationMode, *, intent: str = "") -> dict[str, Any]:
+        if str(intent or "").lower() in {"edit", "refine", "role_only_change"}:
+            return {"reasoning": {"effort": "low"}, "max_output_tokens": 16000}
+        if generation_mode == GenerationMode.FAST:
+            return {"reasoning": {"effort": "low"}, "max_output_tokens": 32000}
+        if generation_mode == GenerationMode.QUALITY:
+            return {"reasoning": {"effort": "high"}, "max_output_tokens": 60000}
+        return {"reasoning": {"effort": "medium"}, "max_output_tokens": 45000}
+
+    @staticmethod
+    def _is_output_cap_error(error: str) -> bool:
+        text = str(error or "").lower()
+        return "max_output_tokens" in text or "output cap" in text or "too large to return as valid json" in text
+
+    @staticmethod
+    def _output_cap_correction_result(payload: dict[str, Any], *, request: GenerateRequest) -> dict[str, object]:
+        create_task = str(request.intent or "").lower() == "create"
+        if create_task:
+            next_action = (
+                "The previous answer was too large. Return outcome=patch_ready now with a compact, complete first implementation. "
+                "Use no more than 6 file operations, keep seed/demo data small, avoid long comments, and do not request more context unless a specific required file is absent. "
+                "Prefer replacing the existing role HTML/JS/CSS plus one backend route/model file rather than emitting a huge multi-stage bundle."
+            )
+        else:
+            next_action = (
+                "The previous answer was too large. Return outcome=patch_ready now with 1-2 focused operations for the requested edit. "
+                "Prefer full-file replace for the single visible role file that needs the change instead of fragile multi-file hunks. "
+                "Do not request more context unless a required file is absent."
+            )
+        return {
+            "tool": "output_cap_correction",
+            "contract": "The structured JSON response exceeded the model output cap; tools cannot recover this automatically.",
+            "required_next_action": next_action,
+            "previous_error": str(payload.get("error") or "")[:1200],
+        }
+
+    @staticmethod
+    def _is_self_blocked_tool_contract_response(payload: dict[str, Any]) -> bool:
+        if str(payload.get("outcome") or "").strip().lower() != "fatal_invalid_response":
+            return False
+        if payload.get("operations"):
+            return False
+        text = " ".join(
+            str(payload.get(key) or "")
+            for key in ("assistant_message", "diagnosis", "expected_verification")
+        ).lower()
+        tool_markers = ("run_checks", "tool", "script", "python", "command", "shell", "write", "apply", "edit", "rewrite", "file changes")
+        blocked_markers = ("cannot", "could not", "unable", "never returned", "no response", "did not produce", "without the ability", "no more", "not provided", "not recognized", "unrecognized")
+        return any(marker in text for marker in tool_markers) and any(marker in text for marker in blocked_markers)
+
+    @staticmethod
+    def _tool_contract_correction_result(payload: dict[str, Any]) -> dict[str, object]:
+        return {
+            "tool": "tool_contract_correction",
+            "contract": "Tools are read-only diagnostics and cannot write files, run shell commands, execute Python scripts, or apply edits.",
+            "required_next_action": "Return outcome=patch_ready with operations that create/replace/patch/delete files, or request read-only context only if specific files are still missing.",
+            "previous_outcome": str(payload.get("outcome") or ""),
+            "previous_diagnosis": str(payload.get("diagnosis") or payload.get("assistant_message") or "")[:1200],
+        }
+
+    @staticmethod
+    def _is_empty_fatal_agent_response(payload: dict[str, Any]) -> bool:
+        if str(payload.get("outcome") or "").strip().lower() != "fatal_invalid_response":
+            return False
+        if payload.get("operations") or payload.get("tool_requests"):
+            return False
+        text = " ".join(str(payload.get(key) or "") for key in ("assistant_message", "diagnosis")).strip().lower()
+        return (
+            not text
+            or "no analysis performed" in text
+            or "can't help with that" in text
+            or "can’t help with that" in text
+            or "cannot help with that" in text
+            or "not able to help with that" in text
+            or "unable to help with that" in text
+            or "cannot generate the required response" in text
+            or "can't generate the required response" in text
+            or "can’t generate the required response" in text
+            or "missing or malformed" in text
+            or "please rerun" in text
+            or "please re-run" in text
+            or "could you please rerun" in text
+            or "need to inspect" in text
+            or "i need to inspect" in text
+        )
+
+    @staticmethod
+    def _empty_fatal_correction_result(payload: dict[str, Any]) -> dict[str, object]:
+        return {
+            "tool": "fatal_response_correction",
+            "contract": "The user is asking for ordinary workspace code generation/editing. This is allowed platform work.",
+            "required_next_action": "Do not return fatal_invalid_response without a concrete blocker. Return patch_ready operations or request read-only context.",
+            "previous_outcome": str(payload.get("outcome") or ""),
+            "previous_message": str(payload.get("diagnosis") or payload.get("assistant_message") or "")[:1200],
+        }
 
     @staticmethod
     def _agent_tool_requests(raw_tool_requests: list[Any]) -> list[dict[str, Any]]:
@@ -777,6 +965,10 @@ class WorkspaceCodeAgentRuntime:
                 continue
             operation = DraftFileOperation.model_validate(item)
             file_path = operation.file_path.strip().replace("\\", "/").lstrip("./")
+            raw_patch = str(operation.diff or operation.content or "") if operation.operation == "patch" else ""
+            codex_patch_paths = self._codex_update_patch_paths(raw_patch)
+            if len(codex_patch_paths) == 1:
+                file_path = codex_patch_paths[0]
             if not file_path or file_path.startswith("/") or ".." in Path(file_path).parts:
                 raise ValueError(f"Agent returned an unsafe file path: {operation.file_path}")
             if any(file_path == prefix.rstrip("/") or file_path.startswith(prefix) for prefix in READ_ONLY_WRITE_PREFIXES):
@@ -785,6 +977,32 @@ class WorkspaceCodeAgentRuntime:
                 raise ValueError(f"Agent returned {operation.operation} for {file_path} without content.")
             if operation.operation == "patch" and not str(operation.diff or operation.content or "").strip():
                 raise ValueError(f"Agent returned patch for {file_path} without a unified diff.")
+            if operation.operation == "patch":
+                raw_content = str(operation.content or "")
+                if operation.diff and raw_content.strip() and raw_content != str(operation.diff) and not self._looks_like_unified_diff(raw_content):
+                    operations.append(
+                        DraftFileOperation(
+                            operation_id=operation.operation_id,
+                            file_path=file_path,
+                            operation="replace",
+                            content=raw_content,
+                            diff=None,
+                            reason=operation.reason,
+                        )
+                    )
+                    continue
+                if not self._looks_like_unified_diff(raw_patch):
+                    operations.append(
+                        DraftFileOperation(
+                            operation_id=operation.operation_id,
+                            file_path=file_path,
+                            operation="replace",
+                            content=raw_patch,
+                            diff=None,
+                            reason=operation.reason,
+                        )
+                    )
+                    continue
             operations.append(
                 DraftFileOperation(
                     operation_id=operation.operation_id,
@@ -797,6 +1015,25 @@ class WorkspaceCodeAgentRuntime:
             )
         return operations
 
+    @staticmethod
+    def _looks_like_unified_diff(text: str) -> bool:
+        value = str(text or "")
+        return bool(
+            re.search(r"^@@\s", value, flags=re.MULTILINE)
+            or re.search(r"^(---|\+\+\+)\s+", value, flags=re.MULTILINE)
+            or re.search(r"^diff --git\s+", value, flags=re.MULTILINE)
+            or re.search(r"^\*\*\* Update File:\s+", value, flags=re.MULTILINE)
+        )
+
+    @staticmethod
+    def _codex_update_patch_paths(text: str) -> list[str]:
+        paths: list[str] = []
+        for match in re.finditer(r"^\*\*\* Update File:\s+(.+)$", str(text or ""), flags=re.MULTILINE):
+            path = match.group(1).strip().replace("\\", "/").lstrip("./")
+            if path:
+                paths.append(path)
+        return list(dict.fromkeys(paths))
+
     def _prompt_alignment_smoke(self, *, workspace_id: str, run_id: str, prompt: str) -> RunCheckResult:
         diff_text = self.workspace_service.diff(workspace_id, run_id=run_id)
         if not diff_text.strip():
@@ -808,7 +1045,25 @@ class WorkspaceCodeAgentRuntime:
                 logs=[],
             )
         prompt_lower = prompt.lower()
-        commerce_requested = any(marker in prompt_lower for marker in ("store", "shop", "ecommerce", "e-commerce", "catalog", "cart", "product", "магазин", "каталог", "товар", "корзин"))
+        commerce_requested = self._is_commerce_prompt(prompt_lower)
+        booking_requested = self._is_booking_prompt(prompt_lower)
+        targeted_fix_requested = any(
+            marker in prompt_lower
+            for marker in (
+                "fix",
+                "bug",
+                "error",
+                "404",
+                "crash",
+                "endpoint",
+                "route",
+                "not found",
+                "ошиб",
+                "почин",
+                "фикс",
+                "не работает",
+            )
+        )
         changed_paths = self._paths_from_diff(diff_text)
         combined = []
         for path in changed_paths:
@@ -823,6 +1078,55 @@ class WorkspaceCodeAgentRuntime:
             commerce_markers = ("product", "catalog", "cart", "order", "товар", "каталог", "корзин", "заказ", "магазин")
             if not any(marker in haystack for marker in commerce_markers):
                 issues.append("Commerce prompt did not result in visible commerce/product/cart/order language in changed app files.")
+            client_requested = any(marker in prompt_lower for marker in ("client", "customer", "buyer", "shopper", "клиент", "покупател"))
+            manager_requested = any(marker in prompt_lower for marker in ("manager", "admin", "administrator", "менеджер", "админ", "управлен"))
+            client_text = self._combined_changed_content(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                changed_paths=changed_paths,
+                path_prefix="miniapp/app/static/client/",
+            ).lower()
+            manager_text = self._combined_changed_content(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                changed_paths=changed_paths,
+                path_prefix="miniapp/app/static/manager/",
+            ).lower()
+            if (
+                not targeted_fix_requested
+                and client_requested
+                and not all(marker in client_text for marker in ("product", "cart"))
+                and not all(marker in client_text for marker in ("товар", "корзин"))
+            ):
+                issues.append("Commerce prompt requested a buyer/client experience, but changed client static files do not show product/cart behavior.")
+            if (
+                not targeted_fix_requested
+                and manager_requested
+                and not any(marker in manager_text for marker in ("product", "order", "товар", "заказ"))
+            ):
+                issues.append("Commerce prompt requested manager/admin functionality, but changed manager static files do not show product/order management.")
+        if booking_requested:
+            booking_markers = ("booking", "reservation", "appointment", "slot", "schedule", "trainer", "брон", "запис", "слот", "расписан", "тренер")
+            if not any(marker in haystack for marker in booking_markers):
+                issues.append("Booking prompt did not result in visible booking/schedule/trainer/slot language in changed app files.")
+            client_requested = any(marker in prompt_lower for marker in ("client", "customer", "клиент"))
+            manager_requested = any(marker in prompt_lower for marker in ("manager", "admin", "administrator", "менеджер", "админ", "управлен"))
+            client_text = self._combined_changed_content(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                changed_paths=changed_paths,
+                path_prefix="miniapp/app/static/client/",
+            ).lower()
+            manager_text = self._combined_changed_content(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                changed_paths=changed_paths,
+                path_prefix="miniapp/app/static/manager/",
+            ).lower()
+            if not targeted_fix_requested and client_requested and not any(marker in client_text for marker in booking_markers):
+                issues.append("Booking prompt requested a client experience, but changed client static files do not show booking behavior.")
+            if not targeted_fix_requested and manager_requested and not any(marker in manager_text for marker in booking_markers):
+                issues.append("Booking prompt requested manager functionality, but changed manager static files do not show booking/schedule management.")
         return RunCheckResult(
             name="prompt_alignment_smoke",
             status="failed" if issues else "passed",
@@ -830,6 +1134,33 @@ class WorkspaceCodeAgentRuntime:
             command="prompt alignment static smoke",
             logs=issues or ["Prompt alignment smoke passed."],
         )
+
+    @staticmethod
+    def _is_commerce_prompt(prompt_lower: str) -> bool:
+        return any(
+            marker in prompt_lower
+            for marker in ("store", "shop", "ecommerce", "e-commerce", "cart", "product", "магазин", "товар", "корзин")
+        ) or (
+            any(marker in prompt_lower for marker in ("catalog", "каталог"))
+            and any(marker in prompt_lower for marker in ("product", "goods", "shop", "store", "товар", "магазин"))
+        )
+
+    @staticmethod
+    def _is_booking_prompt(prompt_lower: str) -> bool:
+        return any(
+            marker in prompt_lower
+            for marker in ("booking", "reservation", "appointment", "slot", "schedule", "trainer", "бронир", "запис", "слот", "расписан", "тренер")
+        )
+
+    def _combined_changed_content(self, *, workspace_id: str, run_id: str, changed_paths: list[str], path_prefix: str) -> str:
+        combined: list[str] = []
+        for path in changed_paths:
+            if not path.startswith(path_prefix):
+                continue
+            content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
+            if content:
+                combined.append(content[:12000])
+        return "\n".join(combined)
 
     def _completion_state(
         self,
@@ -952,9 +1283,21 @@ class WorkspaceCodeAgentRuntime:
         self._append_event(job, event_type, job.summary or ("Workspace code agent completed." if job.status == "completed" else "Workspace code agent failed."))
         return job
 
-    def _seed_file_context(self, workspace_id: str, run_id: str) -> dict[str, str]:
+    def _seed_file_context(self, workspace_id: str, run_id: str, *, role_scope: list[str] | None = None) -> dict[str, str]:
         contexts: dict[str, str] = {}
-        for path in SEED_CONTEXT_PATHS:
+        role_paths: list[str] = []
+        for role in role_scope or []:
+            if role in ROLE_ORDER:
+                role_paths.extend(
+                    [
+                        f"miniapp/app/static/{role}/index.html",
+                        f"miniapp/app/static/{role}/app.js",
+                        f"miniapp/app/static/{role}/styles.css",
+                    ]
+                )
+        for path in [*role_paths, *SEED_CONTEXT_PATHS]:
+            if path in contexts:
+                continue
             content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
             if content is not None:
                 contexts[path] = content
@@ -1075,6 +1418,7 @@ class WorkspaceCodeAgentRuntime:
             "backend_compile_started": ("Checking backend imports" if is_after_patch else "Checking backend baseline", 76 if is_after_patch else 14),
             "checks_completed": (cls._checks_stage(details), 82 if is_after_patch else 22),
             "agent_turn_started": (cls._agent_turn_stage(details), 32 if attempt <= 1 else min(64, 32 + attempt * 8)),
+            "iteration_ready": ("Code edit plan ready", 40 if attempt <= 1 else min(70, 40 + attempt * 8)),
             "scope_expanded": ("Reading more workspace context", 38 if attempt <= 1 else min(68, 38 + attempt * 8)),
             "patch_apply_started": (cls._files_stage("Applying patch", details, key="files"), 48 if attempt <= 1 else min(78, 48 + attempt * 8)),
             "patch_apply_completed": (cls._files_stage("Patch applied", details, key="changed_files"), 58 if attempt <= 1 else min(84, 58 + attempt * 6)),
@@ -1151,7 +1495,7 @@ class WorkspaceCodeAgentRuntime:
     @staticmethod
     def _max_attempts(generation_mode: GenerationMode) -> int:
         if generation_mode == GenerationMode.FAST:
-            return 2
+            return 5
         if generation_mode == GenerationMode.QUALITY:
             return 8
         return 6
@@ -1166,6 +1510,12 @@ class WorkspaceCodeAgentRuntime:
 
     @staticmethod
     def _prompt_cache_key(workspace_id: str, run_id: str, prompt: str) -> str:
+        prompt = re.sub(
+            r"^\s*(?:(?:[01]?\d|2[0-3])[:.][0-5]\d(?:\s*(?:am|pm))?|(?:1[0-2]|0?[1-9])[:.][0-5]\d\s*(?:am|pm))\s+",
+            "",
+            str(prompt or "").strip(),
+            flags=re.IGNORECASE,
+        )
         prompt_key = re.sub(r"[^a-zA-Z0-9]+", "_", prompt.strip().lower())[:80].strip("_") or "prompt"
         return f"workspace_code_agent:{workspace_id}:{run_id}:{prompt_key}"
 

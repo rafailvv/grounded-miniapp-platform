@@ -432,6 +432,40 @@ class WorkspaceLoopTurnRunner:
                 },
             )
             if apply_result.status != "applied":
+                if attempt < max_attempts:
+                    latest_operations = list(synced_operations)
+                    latest_files_read = list(plan.files_read)
+                    latest_assistant_message = plan.assistant_message or plan.diagnosis or latest_assistant_message
+                    last_turn_summary = (
+                        f"Previous patch did not apply: {apply_result.conflict_reason or apply_result.status}. "
+                        "Return corrected operations. If a hunk patch was rejected, prefer replace with full resulting file content "
+                        "for the conflicted file instead of repeating another approximate hunk."
+                    )
+                    turn_history[-1]["result"] = "apply_conflict"
+                    turn_history[-1]["apply_error"] = apply_result.conflict_reason or apply_result.status
+                    callbacks.append_event(
+                        job,
+                        "repair_iteration",
+                        "Draft patch did not apply. Retrying with apply error context.",
+                        {
+                            "attempt": attempt + 1,
+                            "status": apply_result.status,
+                            "conflict_reason": apply_result.conflict_reason,
+                            "files": [operation.file_path for operation in synced_operations],
+                        },
+                    )
+                    callbacks.append_trace(
+                        workspace_id,
+                        "workspace_loop",
+                        "Draft patch did not apply; retrying.",
+                        {
+                            "attempt": attempt + 1,
+                            "status": apply_result.status,
+                            "conflict_reason": apply_result.conflict_reason,
+                        },
+                    )
+                    context_mode = "expanded" if context_mode == "minimal" else "full_bundle"
+                    continue
                 return self.results.failed(
                     outcome_kind="blocked_generation",
                     summary="Workspace loop stopped because the draft patch could not be applied safely.",

@@ -529,35 +529,19 @@ function displayProgressForRun(run: Run, progressDisplay: RunProgressDisplayMap)
   return Math.max(actual, Math.min(100, Math.round(visual)));
 }
 
+function runModeTitle(run: Run): string {
+  const generationMode = run.generation_mode && run.generation_mode !== "basic"
+    ? `${run.generation_mode.charAt(0).toUpperCase()}${run.generation_mode.slice(1)}`
+    : "Balanced";
+  return run.mode === "fix" ? `Fixbug · ${generationMode}` : `Generate · ${generationMode}`;
+}
+
 function runTimelineTitle(run: Run): string {
-  const status = displayRunStatus(run);
-  if (status === "running") {
-    return run.current_stage || "Running";
-  }
-  if (status === "completed" && run.apply_status === "applied") {
-    return "Generated and applied";
-  }
-  if (status === "failed" || status === "blocked") {
-    return run.failure_class || run.failure_reason || status;
-  }
-  return run.intent.replaceAll("_", " ");
+  return runModeTitle(run);
 }
 
 function runTimelineDescription(run: Run): string {
-  const status = displayRunStatus(run);
-  if (status === "running") {
-    const parts = [run.generation_mode ? `${run.generation_mode} mode` : "", run.llm_model ? `model ${run.llm_model}` : ""].filter(Boolean);
-    return parts.length ? parts.join(" • ") : "Code agent is editing and checking the draft.";
-  }
-  if (status === "completed") {
-    const count = run.touched_files.length;
-    const filesText = count ? pluralize(count, "file") : "no source files";
-    return run.summary?.trim() || `${filesText} changed and applied to the workspace.`;
-  }
-  if (status === "failed" || status === "blocked") {
-    return run.failure_reason?.trim() || run.root_cause_summary?.trim() || "Run stopped before a valid draft was applied.";
-  }
-  return clampText(displayRunPrompt(run), 140);
+  return displayRunPrompt(run);
 }
 
 function runTimelineMeta(run: Run): string {
@@ -566,17 +550,6 @@ function runTimelineMeta(run: Run): string {
     return run.iteration_count > 0 ? pluralize(run.iteration_count, "turn") : "active";
   }
   return formatTimestamp(run.created_at);
-}
-
-function runTimelineFileMeta(run: Run): string {
-  const changedFileCount = run.touched_files.length;
-  if (changedFileCount > 0) {
-    return pluralize(changedFileCount, "file");
-  }
-  if (displayRunStatus(run) === "running") {
-    return "editing draft";
-  }
-  return "0 files";
 }
 
 function ensureChildrenMap(node: FileTreeNode): Map<string, FileTreeNode> {
@@ -1399,7 +1372,7 @@ export default function App() {
     selectedRunMode === "fix"
       ? "Paste the exact error or log, for example: Docker preview rebuild failed... or a TypeScript traceback."
       : "Describe the change you want to build. Switch to fixbug mode for build failures, preview issues, or stack traces.";
-  const effectiveGenerationMode: UserGenerationMode = selectedRunMode === "fix" ? "balanced" : selectedGenerationMode;
+  const effectiveGenerationMode: UserGenerationMode = selectedGenerationMode;
   const previewErrorMessage = useMemo(
     () => extractPreviewErrorMessage(workspaceLogs?.preview?.logs ?? runArtifacts?.preview?.logs ?? []),
     [runArtifacts?.preview?.logs, workspaceLogs?.preview?.logs],
@@ -1790,7 +1763,7 @@ export default function App() {
         apply_strategy: "staged_auto_apply",
         target_role_scope: run.target_role_scope.length ? run.target_role_scope : activeRoleScope,
         model_profile: run.model_profile || systemConfig?.default_coding_profile || systemConfig?.defaults.model_profile || "openai_code_fast",
-        generation_mode: "balanced",
+        generation_mode: selectedGenerationMode,
         target_platform: "telegram_mini_app",
         preview_profile: "telegram_mock",
         resume_from_run_id: run.run_id,
@@ -2622,7 +2595,6 @@ export default function App() {
                 className={`composer-mode-pill ${selectedRunMode === "fix" ? "is-active" : ""}`}
                 onClick={() => {
                   setSelectedRunMode("fix");
-                  setSelectedGenerationMode("balanced");
                 }}
               >
                 fixbug
@@ -2672,7 +2644,6 @@ export default function App() {
               <span>Generation mode</span>
               <select
                 value={effectiveGenerationMode}
-                disabled={selectedRunMode === "fix"}
                 onChange={(event) => setSelectedGenerationMode(event.target.value as UserGenerationMode)}
               >
                 <option value="fast">Fast</option>
@@ -2724,7 +2695,6 @@ export default function App() {
                             {runStatus}
                           </span>
                         </div>
-                        <p className="run-card-copy">{clampText(runTimelineDescription(run), 140)}</p>
                         <div className="run-progress">
                           <div className="run-progress-bar">
                             <div className="run-progress-fill" style={{ width: `${visualProgress}%` }} />
@@ -2735,8 +2705,10 @@ export default function App() {
                           </div>
                         </div>
                         <div className="run-card-meta">
-                          <span>{runTimelineMeta(run)}</span>
-                          <span>{runTimelineFileMeta(run)}</span>
+                          <span className="run-card-meta-copy" title={runTimelineDescription(run)}>
+                            {clampText(runTimelineDescription(run), 140)}
+                          </span>
+                          <span className="run-card-meta-time">{runTimelineMeta(run)}</span>
                         </div>
                       </button>
                       {run.status === "completed" || canStopRun || run.status === "failed" || run.status === "blocked" ? (

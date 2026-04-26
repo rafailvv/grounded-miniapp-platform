@@ -46,7 +46,7 @@ class PreviewRuntimeManager:
         if compose_cmd is None:
             raise RuntimeError("Docker Compose is not available inside the platform backend container.")
         compose_file = self._render_host_compose_file(source_dir)
-        command = [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"]
+        command = [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build", "--force-recreate"]
         started_at = time.perf_counter()
         try:
             result = subprocess.run(
@@ -77,7 +77,7 @@ class PreviewRuntimeManager:
         if compose_cmd is None:
             raise RuntimeError("Docker Compose is not available inside the platform backend container.")
         compose_file = self._render_host_compose_file(source_dir)
-        command = [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build"]
+        command = [*compose_cmd, "-f", str(compose_file), "-p", project_name, "up", "-d", "--build", "--force-recreate"]
         started_at = time.perf_counter()
         try:
             result = subprocess.run(
