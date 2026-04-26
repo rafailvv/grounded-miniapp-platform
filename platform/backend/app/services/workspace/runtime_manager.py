@@ -110,6 +110,9 @@ class PreviewRuntimeManager:
         try:
             compose_file = self._render_host_compose_file(source_dir)
         except FileNotFoundError as exc:
+            cleanup_logs = self._remove_project_resources(project_name)
+            if cleanup_logs:
+                return [f"[runtime] {exc}; cleaned stale docker resources without compose file.", *cleanup_logs]
             return [f"[runtime] {exc}; nothing to stop."]
         command = [*compose_cmd, "-f", str(compose_file), "-p", project_name, "down", "-v", "--remove-orphans"]
         try:
@@ -122,13 +125,18 @@ class PreviewRuntimeManager:
             )
         finally:
             compose_file.unlink(missing_ok=True)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Docker compose down failed.")
-        return [
+        logs = [
             f"[runtime] stopping docker preview on port {effective_proxy_port}",
             f"[runtime] command: {' '.join(command)}",
             *self._command_output_logs(result.stdout, result.stderr),
         ]
+        direct_cleanup_logs = self._remove_project_resources(project_name)
+        logs.extend(direct_cleanup_logs)
+        if result.returncode != 0 and not direct_cleanup_logs:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Docker compose down failed.")
+        if result.returncode != 0:
+            logs.append("[runtime] compose down failed, but direct stale-resource cleanup completed.")
+        return [item for item in logs if item]
 
     def project_name(self, workspace_id: str) -> str:
         return f"grounded_preview_{workspace_id[:18]}"
@@ -352,6 +360,71 @@ class PreviewRuntimeManager:
             return []
         lines = [line.rstrip() for line in merged.splitlines() if line.strip()]
         return lines[-tail_lines:]
+
+    def _remove_project_resources(self, project_name: str) -> list[str]:
+        logs: list[str] = []
+        container_ids = self._project_container_ids(project_name)
+        if container_ids:
+            result = subprocess.run(
+                ["docker", "rm", "-f", *container_ids],
+                capture_output=True,
+                text=True,
+            )
+            logs.append(f"[runtime] removed {len(container_ids)} stale preview container(s) for project {project_name}.")
+            logs.extend(self._command_output_logs(result.stdout, result.stderr))
+        network_ids = self._labelled_project_resource_ids("network", project_name)
+        if network_ids:
+            result = subprocess.run(
+                ["docker", "network", "rm", *network_ids],
+                capture_output=True,
+                text=True,
+            )
+            logs.append(f"[runtime] removed {len(network_ids)} stale preview network(s) for project {project_name}.")
+            logs.extend(self._command_output_logs(result.stdout, result.stderr))
+        volume_ids = self._labelled_project_resource_ids("volume", project_name)
+        if volume_ids:
+            result = subprocess.run(
+                ["docker", "volume", "rm", "-f", *volume_ids],
+                capture_output=True,
+                text=True,
+            )
+            logs.append(f"[runtime] removed {len(volume_ids)} stale preview volume(s) for project {project_name}.")
+            logs.extend(self._command_output_logs(result.stdout, result.stderr))
+        return logs
+
+    @staticmethod
+    def _project_container_ids(project_name: str) -> list[str]:
+        candidates: list[str] = []
+        commands = (
+            ["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={project_name}"],
+            ["docker", "ps", "-aq", "--filter", f"name=^/{project_name}[-_]"],
+        )
+        for command in commands:
+            try:
+                result = subprocess.run(command, capture_output=True, text=True)
+            except FileNotFoundError:
+                continue
+            if result.returncode != 0:
+                continue
+            for line in result.stdout.splitlines():
+                container_id = line.strip()
+                if container_id and container_id not in candidates:
+                    candidates.append(container_id)
+        return candidates
+
+    @staticmethod
+    def _labelled_project_resource_ids(resource: str, project_name: str) -> list[str]:
+        try:
+            result = subprocess.run(
+                ["docker", resource, "ls", "-q", "--filter", f"label=com.docker.compose.project={project_name}"],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            return []
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     @classmethod
     def _parse_container_rows(cls, payload: str) -> dict[str, dict[str, str | None]]:

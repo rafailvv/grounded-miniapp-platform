@@ -61,6 +61,8 @@ READ_ONLY_WRITE_PREFIXES = (
     ".vite/",
 )
 SEED_CONTEXT_PATHS = (
+    "miniapp/tests/test_generated_app.py",
+    "miniapp/tests/generated_app.test.mjs",
     "README.md",
     "docs/agent-guidelines.md",
     "miniapp/app/main.py",
@@ -263,7 +265,11 @@ class WorkspaceCodeAgentRuntime:
                 job,
                 "frontend_build_started",
                 "Running platform invariant checks.",
-                {"attempt": 1 if has_draft_diff else 0, "changed_files": list(last_changed_files)},
+                {
+                    "attempt": 1 if has_draft_diff else 0,
+                    "has_file_edits": has_draft_diff,
+                    "changed_files": list(last_changed_files),
+                },
             )
             check_profile = "full" if generation_mode == GenerationMode.QUALITY else "fast_gate"
             execution = self.check_runner.run(
@@ -284,7 +290,7 @@ class WorkspaceCodeAgentRuntime:
                     job,
                     "frontend_build_started",
                     "Running final generated app checks.",
-                    {"attempt": 1, "changed_files": list(last_changed_files)},
+                    {"attempt": 1, "has_file_edits": True, "changed_files": list(last_changed_files)},
                 )
                 execution = self.check_runner.run(
                     workspace_id=workspace_id,
@@ -335,6 +341,20 @@ class WorkspaceCodeAgentRuntime:
             self_blocked_correction_sent = False
             generic_fatal_correction_sent = False
             output_cap_correction_sent = False
+            self._add_failed_generated_test_context(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                latest_execution=latest_execution,
+                extra_file_context=extra_file_context,
+                tool_results=local_tool_results,
+            )
+            self._add_build_validator_failure_context(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                latest_execution=latest_execution,
+                extra_file_context=extra_file_context,
+                tool_results=local_tool_results,
+            )
             for tool_round in range(self._tool_round_limit(generation_mode) + 2):
                 llm_payload = self._request_agent_turn(
                     job=job,
@@ -457,6 +477,21 @@ class WorkspaceCodeAgentRuntime:
                     )
                 operations = self._coerce_operations(llm_payload.get("operations") or [])
                 if not operations:
+                    if (
+                        not self_blocked_correction_sent
+                        and self._is_self_blocked_tool_contract_response(llm_payload)
+                    ):
+                        correction = self._tool_contract_correction_result(llm_payload)
+                        local_tool_results.append(correction)
+                        tool_results.append(correction)
+                        self_blocked_correction_sent = True
+                        self._append_event(
+                            job,
+                            "repair_iteration",
+                            "Agent misunderstood how file edits are applied. Retrying with the operations contract.",
+                            {"attempt": attempt, "tool_round": tool_round, "reason": "self_blocked_no_operations"},
+                        )
+                        continue
                     return WorkspaceLoopTurnPlan(
                         outcome="no_op",
                         assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or ""),
@@ -539,6 +574,8 @@ class WorkspaceCodeAgentRuntime:
         last_turn_summary: str | None,
         latest_diff_summary: str | None,
     ) -> dict[str, Any]:
+        turn_started_at = time.perf_counter()
+        turn_started_iso = datetime.now(timezone.utc).isoformat()
         self._append_event(
             job,
             "agent_turn_started",
@@ -580,6 +617,52 @@ class WorkspaceCodeAgentRuntime:
             job.llm_model = str(response.get("model") or "")
             turn_cache_stats = response.get("cache_stats") or {}
             job.cache_stats = self._merge_cache_stats(job.cache_stats, turn_cache_stats)
+            payload = response.get("payload")
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            parsed_payload = payload if isinstance(payload, dict) else {}
+            raw_operations = parsed_payload.get("operations")
+            raw_tool_requests = parsed_payload.get("tool_requests")
+            operation_count = len(raw_operations) if isinstance(raw_operations, list) else 0
+            tool_request_count = len(raw_tool_requests) if isinstance(raw_tool_requests, list) else 0
+            duration_ms = int((time.perf_counter() - turn_started_at) * 1000)
+            self._append_agent_diagnostic(
+                workspace_id,
+                {
+                    "run_id": run_id,
+                    "job_id": job.job_id,
+                    "attempt": attempt,
+                    "tool_round": tool_round,
+                    "context_mode": context_mode,
+                    "started_at": turn_started_iso,
+                    "duration_ms": duration_ms,
+                    "status": "completed",
+                    "model": job.llm_model,
+                    "outcome": str(parsed_payload.get("outcome") or ""),
+                    "operation_count": operation_count,
+                    "operation_files": [
+                        str(item.get("file_path") or "")
+                        for item in raw_operations
+                        if isinstance(item, dict) and str(item.get("file_path") or "").strip()
+                    ] if isinstance(raw_operations, list) else [],
+                    "tool_request_count": tool_request_count,
+                    "tool_requests": [
+                        {
+                            "tool": str(item.get("tool") or ""),
+                            "mode": str(item.get("mode") or ""),
+                            "targets": [str(target) for target in item.get("targets") or []] if isinstance(item, dict) else [],
+                        }
+                        for item in raw_tool_requests
+                        if isinstance(item, dict)
+                    ] if isinstance(raw_tool_requests, list) else [],
+                    "token_usage": {
+                        "input_tokens": int(turn_cache_stats.get("input_tokens") or 0),
+                        "output_tokens": int(turn_cache_stats.get("output_tokens") or 0),
+                        "reasoning_tokens": int(turn_cache_stats.get("reasoning_tokens") or 0),
+                        "total_tokens": int(turn_cache_stats.get("total_tokens") or 0),
+                    },
+                },
+            )
             self._append_event(
                 job,
                 "iteration_ready",
@@ -587,6 +670,9 @@ class WorkspaceCodeAgentRuntime:
                 {
                     "attempt": attempt,
                     "tool_round": tool_round,
+                    "outcome": str(parsed_payload.get("outcome") or ""),
+                    "operation_count": operation_count,
+                    "tool_request_count": tool_request_count,
                     "model": job.llm_model,
                     "input_tokens": int(turn_cache_stats.get("input_tokens") or 0),
                     "output_tokens": int(turn_cache_stats.get("output_tokens") or 0),
@@ -594,13 +680,36 @@ class WorkspaceCodeAgentRuntime:
                     "total_tokens": int(turn_cache_stats.get("total_tokens") or 0),
                 },
             )
-            payload = response.get("payload")
-            if isinstance(payload, str):
-                payload = json.loads(payload)
             return payload if isinstance(payload, dict) else {"error": "Agent returned a non-object payload."}
         except Exception as exc:
-            logger.exception("workspace_code_agent_turn_failed workspace_id=%s run_id=%s", workspace_id, run_id)
-            return {"error": f"Workspace code agent turn failed: {exc}"}
+            error_text = str(exc)
+            self._append_agent_diagnostic(
+                workspace_id,
+                {
+                    "run_id": run_id,
+                    "job_id": job.job_id,
+                    "attempt": attempt,
+                    "tool_round": tool_round,
+                    "context_mode": context_mode,
+                    "started_at": turn_started_iso,
+                    "duration_ms": int((time.perf_counter() - turn_started_at) * 1000),
+                    "status": "error",
+                    "error": error_text,
+                    "error_class": exc.__class__.__name__,
+                },
+            )
+            if self._is_output_cap_error(error_text):
+                logger.warning(
+                    "workspace_code_agent_turn_output_cap workspace_id=%s run_id=%s attempt=%s tool_round=%s error=%s",
+                    workspace_id,
+                    run_id,
+                    attempt,
+                    tool_round,
+                    error_text,
+                )
+            else:
+                logger.exception("workspace_code_agent_turn_failed workspace_id=%s run_id=%s", workspace_id, run_id)
+            return {"error": f"Workspace code agent turn failed: {error_text}"}
 
     @staticmethod
     def _agent_turn_schema() -> dict[str, Any]:
@@ -666,18 +775,25 @@ class WorkspaceCodeAgentRuntime:
             "The user's prompt is the only source of product semantics. Do not impose any generic queue, ticketing, lifecycle, or CRUD product model unless the prompt explicitly asks for it. "
             "Existing template docs and files are technical shell context only. They must not override the user's domain. "
             "Preserve the FastAPI + static-file shell, preview bridge, and role-root routing unless the user asks otherwise. "
-            "Every generated role index.html must keep /static/preview_bridge.js and the role app script; do not remove the preview bridge script while replacing starter content. "
+            "Every generated HTML route page, including role roots and child pages such as static/client/catalog/index.html, must include <script src=\"/static/preview_bridge.js\" defer></script>. Role root pages must also keep the role app script. "
+            "Generate light-mode interfaces by default: light backgrounds, dark readable text, clear contrast, and no dark theme unless the user explicitly asks for dark mode. "
             "For create tasks, build a complete domain-specific app from the prompt across all role roots: client, specialist, and manager. "
+            "Create tasks must be multi-page: each role root is a dashboard/hub and each role must expose at least two domain-specific child pages such as profile/settings plus catalog/orders/tasks/reports depending on the prompt. "
+            "Use miniapp/app/generated/route_manifest.json to declare role routes for generated child pages. Prefer a compact routes map, either top-level \"routes\": {\"/client/catalog\": \"static/client/catalog/index.html\"} or per-role \"routes\" maps. "
+            "Never declare a route_manifest route unless its target file already exists or is created/replaced in the same operations array. "
             "The three role surfaces must be different but connected parts of one product: shared app title/domain objects, consistent labels/actions, and role-specific responsibilities. "
             "Never leave a role as a neutral starter, generic preview, blank page, or placeholder surface. "
             "For e-commerce prompts, prefer products, catalog, cart, orders, and management surfaces, never generic intake or application tracking. "
             "In Fast create mode, prefer a frontend-first implementation with role pages, a shared static data file, and compact generated tests. Do not add backend routes, schemas, or database models unless the prompt explicitly requires persistent server data, APIs, authentication, or cross-session mutations. "
             "For every create task, write generated app tests for both backend and frontend surfaces: miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. "
             "Generated tests must validate the requested product semantics, all role roots, and shared role content without relying on network calls or non-template dependencies. "
+            "For edit tasks, preserve existing selectors, ids, and data-testid attributes that generated tests assert unless the requested behavior intentionally replaces them; when behavior changes test expectations, update the generated test file in the same patch. "
             "Python generated tests run through FastAPI TestClient and see server-rendered HTML before browser JavaScript executes; do not assert JS-rendered item text there unless the text is also present in HTML fallback/source. Use Python tests for route status, preview bridge/static shell, and backend APIs when present. "
             "JS generated tests are responsible for frontend source/data assertions; read role HTML/JS/shared data files directly with node:test and fs/path. "
+            "Before writing generated_app.test.mjs, ensure every exact phrase asserted by includes() or match() is literally present in the file being read; prefer stable headings, route links, app title, and data-testid values over paraphrased expectations. "
             "Generated JS tests execute from the miniapp directory, so file paths inside those tests must start with app/static/... or be resolved from import.meta.url to ../app/static; do not use miniapp/app/... in generated tests. "
             "In generated JS tests, path/fs APIs require string paths: use path.join(process.cwd(), 'app/static/...') or fileURLToPath(new URL('../app/static/...', import.meta.url)); never pass a URL object directly to path.resolve, path.join, or fs. "
+            "In Fast create mode, if the provided file_contexts already include the role HTML shells and tests directory context, return a compact patch_ready response immediately instead of planning an exhaustive product architecture. "
             "Tools are diagnostic only. They cannot write files, execute arbitrary scripts, run shell commands, or apply changes. "
             "run_checks is a read-only platform validation snapshot for the current draft; it is not a command runner and must never be used to rewrite files. "
             "All code changes must be returned in the operations array of the same structured JSON response. "
@@ -731,28 +847,39 @@ class WorkspaceCodeAgentRuntime:
             "tool_results": tool_results[-8:],
             "rules": [
                 "Keep each turn applyable: return up to 12 independent file operations together when they are part of the same coherent change.",
-                "For Fast create tasks, keep the first patch compact and complete: usually 6-8 files total, no verbose comments, no large fixtures, and no repeated tool reads for files already shown in file_contexts.",
-                "For Fast create tasks, prefer frontend-only role surfaces plus one shared static data module; avoid backend routes/models unless the prompt explicitly requires server persistence or APIs.",
-                "For Fast create tasks, keep each generated HTML/JS/CSS/test file under about 140 lines and use at most 3 seed records.",
-                "For Fast create tasks, do not emit separate large CSS files for every role; use shared/base.css or one compact shared stylesheet when possible.",
+                "For Fast create tasks, the first model answer should usually be outcome=patch_ready, not tool_request or no_progress, because the template file_contexts already provide the shell.",
+                "For Fast create tasks, never try to output a whole multi-page app in one giant answer. Keep each turn small: usually no more than 6 full-file operations, no verbose comments, no large fixtures, and no repeated tool reads for files already shown in file_contexts.",
+                "For Fast create tasks, prefer frontend-only role surfaces with compact shared domain content in the HTML/tests or one small shared static data module when the operation budget allows; avoid backend routes/models unless the prompt explicitly requires server persistence or APIs.",
+                "For Fast create tasks, use staged compact patches: first create/update the three role hub pages, route_manifest.json, and generated tests; then use later turns to add child pages needed by platform.single_page_role_surface.",
+                "For create tasks, do not put every feature into one scrolling role page. Each role must have at least three routeable pages: /<role> plus at least two /<role>/<slug> pages.",
+                "Do not declare child/profile/settings routes unless you also create those exact files in the same response or they already exist. If staging the work, wait to add child routes until creating their files.",
+                "Use the old profile pattern only as neutral page architecture: every role may have a profile/settings child page, but the page content must use the user's product domain.",
+                "Each role root should visibly link to its child pages and summarize the role-specific workflow rather than containing all details inline.",
+                "For Fast create tasks, keep each generated HTML/JS/CSS/test file under about 120 lines and use at most 3 seed records.",
+                "For Fast create tasks, do not emit separate large CSS files for every role; reuse existing shell styles or one compact shared stylesheet when needed.",
+                "Use light mode by default for all generated UI: light surfaces, dark text, accessible contrast, and no dark backgrounds unless the user explicitly requested dark mode.",
                 "For broad create tasks, batch independent backend/static/style files in one response when the changes are clear; otherwise patch the most important blocking slice first and continue after checks.",
                 "For create tasks, generate client, specialist, and manager role roots even if the prompt mentions only one audience.",
                 "Each role root must be domain-specific, non-placeholder, and connected to the same product content; specialist is required and cannot remain the starter screen.",
                 "For create tasks, include dependency-free generated tests in miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs.",
                 "Python generated tests should use unittest plus FastAPI TestClient to verify role routes and backend/API behavior when backend state exists.",
                 "JS generated tests should use node:test plus fs/path only to verify role HTML/JS content, shared domain labels, role-specific selectors/actions, and absence of neutral template text.",
+                "In generated_app.test.mjs, only assert exact strings that literally appear in the file being read; do not paraphrase expected UI text.",
                 "Do not make Python TestClient tests assert text that is only rendered by browser JavaScript; either include the text in HTML fallback/source or move that assertion to generated_app.test.mjs.",
                 "When role content is populated from a shared JS data file, JS generated tests should read that data/source file directly and assert the shared item names there.",
                 "Generated JS tests run with cwd=miniapp, so read app/static/<role>/... paths or resolve from import.meta.url to ../app/static; never prefix paths with miniapp/app/ inside the test.",
                 "In generated_app.test.mjs, prefer path.join(process.cwd(), 'app/static/<role>/index.html') for fixture paths. If using import.meta.url, wrap new URL(...) with fileURLToPath(...) before passing it to path/fs APIs.",
                 "For edit/refine tasks, update generated tests when the requested behavior changes so the new behavior is covered.",
-                "For edit/refine tasks, keep the patch focused on one visible slice in the requested role files and usually return 1-2 operations.",
-                "For edit/refine tasks, keep the response under 16000 output tokens; if more is needed, replace the single most important file first and continue after checks.",
+                "For edit/refine tasks, preserve existing ids/selectors/data-testid values that tests or existing scripts rely on, unless you update the affected generated test in the same response.",
+                "For edit/refine tasks, keep the patch focused on one visible slice in the requested role files and usually return 1-2 operations: one small app-code patch plus one generated-test patch when tests need new expectations.",
+                "For edit/refine tasks, keep the response compact; prefer a hunk patch under 200 changed lines over a whole-file rewrite for small feature additions.",
                 "For edit/refine tasks, do not rewrite the whole app or unrelated files; make the smallest complete visible change that satisfies the prompt.",
+                "If generated_app_python_tests or generated_app_js_tests failed, read the failure logs in latest_checks and patch the app or generated tests so that exact failure changes on the next attempt; do not repeat app-only patches that leave the same generated test failure.",
                 "If role_scope contains only client, prioritize miniapp/app/static/client files and do not change backend unless the prompt explicitly asks for API/data changes.",
                 "If role_scope contains only manager, prioritize miniapp/app/static/manager files and do not change backend unless the prompt explicitly asks for API/data changes.",
                 "For existing HTML/CSS/JS files, use replace with the full resulting file when a hunk patch would be large or ambiguous.",
-                "Every role index.html must include /static/preview_bridge.js before the role app script; if a check reports page_missing_preview_bridge, patch only the missing script tag instead of rewriting the whole app.",
+                "Every generated HTML route page must include /static/preview_bridge.js; role root pages should place it before the role app script. If a check reports page_missing_preview_bridge, patch only the missing script tag instead of rewriting the whole app.",
+                "If a check reports build.missing_static_page for route_manifest, either create that exact HTML file or remove the route from route_manifest; do not rewrite unrelated pages.",
                 "Prefer targeted patch operations over full-file replace when the file already exists.",
                 "If the latest turn reports a patch apply conflict, return a full-file replace for that conflicted file unless the exact corrected hunk is obvious.",
                 "If you need more context, request list_files/read_files/search_files/inspect_diff/run_checks.",
@@ -854,8 +981,10 @@ class WorkspaceCodeAgentRuntime:
     def _agent_turn_tuning(generation_mode: GenerationMode, *, intent: str = "") -> dict[str, Any]:
         if str(intent or "").lower() in {"edit", "refine", "role_only_change"}:
             return {"reasoning": {"effort": "low"}, "max_output_tokens": 16000}
+        if str(intent or "").lower() == "create":
+            return {"reasoning": {"effort": "low" if generation_mode == GenerationMode.FAST else "medium"}, "max_output_tokens": 60000}
         if generation_mode == GenerationMode.FAST:
-            return {"reasoning": {"effort": "low"}, "max_output_tokens": 32000}
+            return {"reasoning": {"effort": "low"}, "max_output_tokens": 24000}
         if generation_mode == GenerationMode.QUALITY:
             return {"reasoning": {"effort": "high"}, "max_output_tokens": 60000}
         return {"reasoning": {"effort": "medium"}, "max_output_tokens": 45000}
@@ -863,7 +992,7 @@ class WorkspaceCodeAgentRuntime:
     @staticmethod
     def _is_output_cap_error(error: str) -> bool:
         text = str(error or "").lower()
-        return "max_output_tokens" in text or "output cap" in text or "too large to return as valid json" in text
+        return "max_output_token" in text or "max_output_tokens" in text or "output cap" in text or "too large to return as valid json" in text
 
     @staticmethod
     def _output_cap_correction_result(payload: dict[str, Any], *, request: GenerateRequest) -> dict[str, object]:
@@ -871,8 +1000,8 @@ class WorkspaceCodeAgentRuntime:
         if create_task:
             next_action = (
                 "The previous answer was too large. Return outcome=patch_ready now with a compact, complete first implementation. "
-                "Use no more than 6 file operations, keep seed/demo data small, avoid long comments, and do not request more context unless a specific required file is absent. "
-                "Prefer a frontend-only patch: replace the three role HTML files, add/update one shared data/style file, and add both generated test files. Do not add backend routes/models in this recovery turn unless explicitly required."
+                "Use no more than 6 full-file operations in this turn, keep seed/demo data small, avoid long comments, and do not request more context unless a specific required file is absent. "
+                "Prefer a staged frontend-only patch: create/update the three role hub HTML files, route_manifest.json with only routes whose files exist in this turn, and the generated test files. Do not add backend routes/models in this recovery turn unless explicitly required. Later checks will request the missing child pages."
             )
         else:
             next_action = (
@@ -896,9 +1025,12 @@ class WorkspaceCodeAgentRuntime:
                 "Use a frontend-first implementation unless backend persistence/API behavior is explicitly required."
             ),
             "required_next_action": (
-                "Return outcome=patch_ready with no more than 6-8 operations and concise files. "
-                "Prefer replacing the three role index.html files, one shared CSS/data file, and the two generated test files. "
-                "Keep /static/preview_bridge.js in every role HTML. Use app/static paths inside JS tests because tests run from cwd=miniapp. "
+                "Return outcome=patch_ready in the first answer with no more than 6 full-file operations and concise files. "
+                "Prefer a staged first patch: update route_manifest.json, replace the three role hub index.html files, and add/update the two generated test files. "
+                "Do not output all child pages in the same answer if that makes the JSON large; later checks will request the exact missing child pages. Final success still requires at least three routeable pages per role: /client, /client/<slug>, /client/<slug>; same for specialist and manager. "
+                "Use the profile/settings page pattern as neutral navigation architecture when useful, but keep all visible content domain-specific. "
+                "Put enough domain text in the role HTML itself so backend TestClient can see meaningful product content without browser JavaScript. "
+                "Keep /static/preview_bridge.js in every generated HTML route page, including every child page. Use app/static paths inside JS tests because tests run from cwd=miniapp. "
                 "Use string paths in JS tests, for example path.join(process.cwd(), 'app/static/client/index.html'); do not pass URL objects to path.resolve or fs. "
                 "Do not emit backend routes/models, long fixtures, or large per-role CSS for a simple static/local-data app."
             ),
@@ -906,7 +1038,7 @@ class WorkspaceCodeAgentRuntime:
 
     @staticmethod
     def _is_self_blocked_tool_contract_response(payload: dict[str, Any]) -> bool:
-        if str(payload.get("outcome") or "").strip().lower() != "fatal_invalid_response":
+        if str(payload.get("outcome") or "").strip().lower() not in {"fatal_invalid_response", "no_progress"}:
             return False
         if payload.get("operations"):
             return False
@@ -914,8 +1046,43 @@ class WorkspaceCodeAgentRuntime:
             str(payload.get(key) or "")
             for key in ("assistant_message", "diagnosis", "expected_verification")
         ).lower()
-        tool_markers = ("run_checks", "tool", "script", "python", "command", "shell", "write", "apply", "edit", "rewrite", "file changes")
-        blocked_markers = ("cannot", "could not", "unable", "never returned", "no response", "did not produce", "without the ability", "no more", "not provided", "not recognized", "unrecognized")
+        tool_markers = (
+            "run_checks",
+            "apply_patch",
+            "tool",
+            "script",
+            "python",
+            "command",
+            "shell",
+            "write",
+            "apply",
+            "edit",
+            "rewrite",
+            "file changes",
+            "инструмент",
+            "редакт",
+            "запис",
+            "файл",
+        )
+        blocked_markers = (
+            "cannot",
+            "could not",
+            "unable",
+            "never returned",
+            "no response",
+            "did not produce",
+            "without the ability",
+            "no more",
+            "not provided",
+            "not recognized",
+            "unrecognized",
+            "нельзя",
+            "невозможно",
+            "не могу",
+            "нужен доступ",
+            "требуется",
+            "без возможности",
+        )
         return any(marker in text for marker in tool_markers) and any(marker in text for marker in blocked_markers)
 
     @staticmethod
@@ -1143,17 +1310,18 @@ class WorkspaceCodeAgentRuntime:
                 changed_paths=changed_paths,
                 path_prefix="miniapp/app/static/manager/",
             ).lower()
+            client_product_markers = ("product", "catalog", "item", "assortment", "товар", "каталог", "сорт", "позици", "ассортимент")
+            client_cart_markers = ("cart", "basket", "checkout", "order", "корзин", "оформ", "заказ")
             if (
                 not targeted_fix_requested
                 and client_requested
-                and not all(marker in client_text for marker in ("product", "cart"))
-                and not all(marker in client_text for marker in ("товар", "корзин"))
+                and not (any(marker in client_text for marker in client_product_markers) and any(marker in client_text for marker in client_cart_markers))
             ):
                 issues.append("Commerce prompt requested a buyer/client experience, but changed client static files do not show product/cart behavior.")
             if (
                 not targeted_fix_requested
                 and manager_requested
-                and not any(marker in manager_text for marker in ("product", "order", "товар", "заказ"))
+                and not any(marker in manager_text for marker in ("product", "order", "assortment", "catalog", "товар", "заказ", "ассортимент", "каталог", "позици"))
             ):
                 issues.append("Commerce prompt requested manager/admin functionality, but changed manager static files do not show product/order management.")
         if booking_requested and not targeted_fix_requested:
@@ -1380,6 +1548,114 @@ class WorkspaceCodeAgentRuntime:
                 contexts[path] = content
         return contexts
 
+    def _add_failed_generated_test_context(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        latest_execution: CheckExecutionRecord,
+        extra_file_context: dict[str, str],
+        tool_results: list[dict[str, object]],
+    ) -> None:
+        failed_tests = [
+            result
+            for result in latest_execution.results
+            if result.status == "failed" and result.name in {"generated_app_python_tests", "generated_app_js_tests"}
+        ]
+        if not failed_tests:
+            return
+        for path in ("miniapp/tests/test_generated_app.py", "miniapp/tests/generated_app.test.mjs"):
+            if path in extra_file_context:
+                continue
+            content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
+            if content is not None:
+                extra_file_context[path] = content
+        if any(item.get("tool") == "generated_test_failure_context" for item in tool_results if isinstance(item, dict)):
+            return
+        tool_results.append(
+            {
+                "tool": "generated_test_failure_context",
+                "contract": (
+                    "Generated tests are product acceptance tests. On an edit, either preserve the app selectors/text they still validly assert, "
+                    "or update the generated test file in the same patch when the requested behavior intentionally changes the expectation."
+                ),
+                "required_next_action": (
+                    "Return operations that make the next generated test result different: restore missing selectors/ids in app code, "
+                    "or patch miniapp/tests/test_generated_app.py / miniapp/tests/generated_app.test.mjs together with the app change. "
+                    "Do not keep returning single app-file patches that leave the same generated test failure."
+                ),
+                "failed_tests": [
+                    {
+                        "name": result.name,
+                        "details": result.details,
+                        "command": result.command,
+                        "logs": list(result.logs or [])[-24:],
+                    }
+                    for result in failed_tests
+                ],
+            }
+        )
+
+    def _add_build_validator_failure_context(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        latest_execution: CheckExecutionRecord,
+        extra_file_context: dict[str, str],
+        tool_results: list[dict[str, object]],
+    ) -> None:
+        actionable_codes = {
+            "build.missing_static_page",
+            "build.page_missing_preview_bridge",
+            "build.page_missing_shell_style_link",
+            "build.page_missing_shell_root",
+        }
+        issues: list[dict[str, object]] = []
+        for result in latest_execution.results:
+            if result.status != "failed" or result.name not in {"schema_validators", "platform_invariants"}:
+                continue
+            for line in result.logs or []:
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                code = str(payload.get("code") or "")
+                if code not in actionable_codes:
+                    continue
+                issues.append(
+                    {
+                        "check": result.name,
+                        "code": code,
+                        "location": str(payload.get("location") or ""),
+                        "message": str(payload.get("message") or ""),
+                    }
+                )
+        if not issues:
+            return
+        for path in ["miniapp/app/generated/route_manifest.json", *[str(issue.get("location") or "") for issue in issues]]:
+            if not path or path in extra_file_context:
+                continue
+            content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
+            if content is not None:
+                extra_file_context[path] = content
+        if any(item.get("tool") == "build_validator_failure_context" for item in tool_results if isinstance(item, dict)):
+            return
+        tool_results.append(
+            {
+                "tool": "build_validator_failure_context",
+                "contract": "Build validator failures are platform invariants for routeable generated pages.",
+                "required_next_action": (
+                    "Patch only the exact failing route/page contract. For build.missing_static_page, either create the exact missing HTML file "
+                    "or remove that exact route_manifest entry. For build.page_missing_preview_bridge, add "
+                    "<script src=\"/static/preview_bridge.js\" defer></script> to the exact page. Do not rewrite unrelated role pages."
+                ),
+                "issues": issues[:24],
+            }
+        )
+
     @staticmethod
     def _compact_file_contexts(file_contexts: dict[str, str], *, max_files: int, max_chars: int = 6000) -> dict[str, str]:
         compact: dict[str, str] = {}
@@ -1427,8 +1703,16 @@ class WorkspaceCodeAgentRuntime:
             "scope_expansions",
             "fix_runtime",
             "remaining_issues",
+            "agent_diagnostics",
         ):
             self.store.delete("reports", f"{key}:{workspace_id}")
+
+    def _append_agent_diagnostic(self, workspace_id: str, entry: dict[str, Any]) -> None:
+        report_key = f"agent_diagnostics:{workspace_id}"
+        current = self.store.get("reports", report_key) or {"workspace_id": workspace_id, "items": []}
+        items = list(current.get("items", [])) if isinstance(current, dict) else []
+        items.append({**entry, "recorded_at": datetime.now(timezone.utc).isoformat()})
+        self._store_report(report_key, {"workspace_id": workspace_id, "items": items[-80:]})
 
     def _append_event(self, job: JobRecord, event_type: str, message: str, details: dict[str, Any] | None = None) -> None:
         job.events.append(JobEvent(event_type=event_type, message=message, details=details or {}))
@@ -1465,6 +1749,19 @@ class WorkspaceCodeAgentRuntime:
         payload["linked_job_id"] = job.job_id
         payload["current_stage"] = stage
         payload["progress_percent"] = max(int(payload.get("progress_percent", 0)), progress)
+        iteration_count = self._current_iteration_count(job.workspace_id)
+        if iteration_count:
+            payload["iteration_count"] = iteration_count
+        if event_type == "patch_apply_completed":
+            changed_files = details.get("changed_files")
+            if isinstance(changed_files, list):
+                existing_files = payload.get("touched_files")
+                merged_files = [
+                    str(path)
+                    for path in [*(existing_files if isinstance(existing_files, list) else []), *changed_files]
+                    if str(path).strip()
+                ]
+                payload["touched_files"] = list(dict.fromkeys(merged_files))
         payload["summary"] = job.summary
         payload["failure_reason"] = job.failure_reason
         payload["failure_class"] = job.failure_class
@@ -1476,6 +1773,11 @@ class WorkspaceCodeAgentRuntime:
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.store.upsert("runs", job.linked_run_id, payload)
 
+    def _current_iteration_count(self, workspace_id: str) -> int:
+        payload = self.store.get("reports", f"iterations:{workspace_id}") or {}
+        items = payload.get("items") if isinstance(payload, dict) else None
+        return len(items) if isinstance(items, list) else 0
+
     @classmethod
     def _run_progress_for_event(
         cls,
@@ -1486,21 +1788,22 @@ class WorkspaceCodeAgentRuntime:
     ) -> tuple[str, int]:
         details = details or {}
         attempt = cls._safe_int(details.get("attempt"), default=0)
-        is_after_patch = attempt > 0
+        is_after_patch = bool(details.get("has_file_edits") or details.get("has_draft_diff"))
         progress_map = {
             "job_started": ("Starting code agent", 4),
-            "running_checks": ("Running final checks" if is_after_patch else "Checking workspace shell", 66 if is_after_patch else 8),
-            "build_started": ("Validating generated app" if is_after_patch else "Validating workspace shell", 70 if is_after_patch else 10),
-            "frontend_build_started": ("Building generated frontend" if is_after_patch else "Checking frontend baseline", 74 if is_after_patch else 12),
-            "backend_compile_started": ("Checking backend imports" if is_after_patch else "Checking backend baseline", 76 if is_after_patch else 14),
-            "checks_completed": (cls._checks_stage(details), 82 if is_after_patch else 22),
-            "agent_turn_started": (cls._agent_turn_stage(details), 32 if attempt <= 1 else min(64, 32 + attempt * 8)),
-            "iteration_ready": ("Code edit plan ready", 40 if attempt <= 1 else min(70, 40 + attempt * 8)),
-            "scope_expanded": ("Reading more workspace context", 38 if attempt <= 1 else min(68, 38 + attempt * 8)),
-            "patch_apply_started": (cls._files_stage("Applying patch", details, key="files"), 48 if attempt <= 1 else min(78, 48 + attempt * 8)),
-            "patch_apply_completed": (cls._files_stage("Patch applied", details, key="changed_files"), 58 if attempt <= 1 else min(84, 58 + attempt * 6)),
-            "repair_iteration": ("Refining patch with more context", 44 if attempt <= 1 else min(72, 44 + attempt * 8)),
-            "final_checks_started": ("Running final checks", 86),
+            "running_checks": ("Running final checks" if is_after_patch else "Checking workspace shell", 64 if is_after_patch else 7),
+            "build_started": ("Validating generated app" if is_after_patch else "Validating workspace shell", 67 if is_after_patch else 9),
+            "frontend_build_started": ("Building generated frontend" if is_after_patch else "Checking frontend baseline", 70 if is_after_patch else 11),
+            "backend_compile_started": ("Checking backend imports" if is_after_patch else "Checking backend baseline", 72 if is_after_patch else 12),
+            "checks_completed": (cls._checks_stage(details), 78 if is_after_patch else 15),
+            "agent_turn_started": (cls._agent_turn_stage(details), cls._agent_turn_progress(details)),
+            "iteration_ready": (cls._iteration_ready_stage(details), cls._iteration_ready_progress(details)),
+            "scope_expanded": ("Reading more workspace context", min(34, 20 + max(1, attempt) * 4)),
+            "patch_apply_started": (cls._files_stage("Applying patch", details, key="files"), 44 if attempt <= 1 else min(60, 44 + attempt * 4)),
+            "patch_apply_completed": (cls._files_stage("Patch applied", details, key="changed_files"), 58 if attempt <= 1 else min(72, 58 + attempt * 4)),
+            "repair_iteration": (cls._repair_stage(details), cls._repair_progress(details)),
+            "final_checks_started": ("Running final checks", 84),
+            "apply_started": ("Applying to workspace", 92),
             "apply_completed": ("Applied to workspace", 98),
             "preview_rebuild_completed": ("Preview refreshed", 98),
             "job_completed": ("Complete", 99),
@@ -1532,6 +1835,54 @@ class WorkspaceCodeAgentRuntime:
         if tool_round > 0:
             return f"Reading context for turn {attempt}"
         return f"Planning code edit {attempt}"
+
+    @classmethod
+    def _agent_turn_progress(cls, details: dict[str, Any]) -> int:
+        attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
+        tool_round = cls._safe_int(details.get("tool_round"), default=0)
+        return min(34, 16 + attempt * 4 + tool_round * 2)
+
+    @classmethod
+    def _iteration_ready_stage(cls, details: dict[str, Any]) -> str:
+        operation_count = cls._safe_int(details.get("operation_count"), default=0)
+        tool_request_count = cls._safe_int(details.get("tool_request_count"), default=0)
+        outcome = str(details.get("outcome") or "").strip().lower()
+        if operation_count > 0:
+            return f"Prepared {operation_count} file edit{'s' if operation_count != 1 else ''}"
+        if tool_request_count > 0:
+            return f"Requested {tool_request_count} context read{'s' if tool_request_count != 1 else ''}"
+        if outcome in {"no_progress", "no_op"}:
+            return "No file edits returned"
+        return "Model response received"
+
+    @classmethod
+    def _iteration_ready_progress(cls, details: dict[str, Any]) -> int:
+        attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
+        operation_count = cls._safe_int(details.get("operation_count"), default=0)
+        tool_request_count = cls._safe_int(details.get("tool_request_count"), default=0)
+        if operation_count > 0:
+            return min(48, 34 + attempt * 4)
+        if tool_request_count > 0:
+            return min(34, 22 + attempt * 3)
+        return min(36, 24 + attempt * 3)
+
+    @classmethod
+    def _repair_stage(cls, details: dict[str, Any]) -> str:
+        reason = str(details.get("reason") or "").strip()
+        outcome = str(details.get("outcome") or "").strip()
+        if reason == "self_blocked_no_operations":
+            return "Correcting edit contract"
+        if outcome in {"needs_context", "no_op"}:
+            return "No file edits yet; reading more context"
+        return "Refining patch with more context"
+
+    @classmethod
+    def _repair_progress(cls, details: dict[str, Any]) -> int:
+        attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
+        outcome = str(details.get("outcome") or "").strip()
+        if outcome in {"needs_context", "no_op"}:
+            return min(38, 24 + attempt * 3)
+        return min(46, 28 + attempt * 4)
 
     @staticmethod
     def _files_stage(prefix: str, details: dict[str, Any], *, key: str) -> str:

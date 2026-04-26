@@ -56,7 +56,32 @@ def route_matches(pattern: str, actual: str) -> bool:
 def resolve_declared_page_file(role: str, actual_path: str) -> Path | None:
     actual_path = canonicalize_role_path(role, actual_path)
     route_manifest = load_route_manifest()
-    pages = (((route_manifest.get("roles") or {}).get(role) or {}).get("pages") or [])
+    top_level_routes = route_manifest.get("routes") if isinstance(route_manifest, dict) else {}
+    if isinstance(top_level_routes, dict):
+        for route_path, file_path in top_level_routes.items():
+            route_path = str(route_path or "").strip()
+            file_path = str(file_path or "").strip()
+            if not route_path or not file_path:
+                continue
+            if not route_matches(route_path, actual_path):
+                continue
+            resolved = normalize_declared_page_path(file_path)
+            if resolved.exists():
+                return resolved
+    role_payload = ((route_manifest.get("roles") or {}).get(role) or {})
+    route_map = role_payload.get("routes") if isinstance(role_payload, dict) else {}
+    if isinstance(route_map, dict):
+        for route_path, file_path in route_map.items():
+            route_path = str(route_path or "").strip()
+            file_path = str(file_path or "").strip()
+            if not route_path or not file_path:
+                continue
+            if not route_matches(route_path, actual_path):
+                continue
+            resolved = normalize_declared_page_path(file_path)
+            if resolved.exists():
+                return resolved
+    pages = (role_payload.get("pages") if isinstance(role_payload, dict) else []) or []
     for page in pages:
         if not isinstance(page, dict):
             continue

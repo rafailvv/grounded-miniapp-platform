@@ -608,7 +608,6 @@ button:disabled {
   gap: 10px;
   color: var(--muted);
   font-size: 12px;
-  text-transform: lowercase;
 }
 
 .run-card-meta {
@@ -616,7 +615,7 @@ button:disabled {
   font-size: 12px;
   row-gap: 6px;
   min-width: 0;
-  align-items: center;
+  align-items: flex-start;
   flex-wrap: nowrap;
 }
 
@@ -624,12 +623,18 @@ button:disabled {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
+  display: -webkit-box;
+  line-height: 1.32;
+  min-height: calc(1.32em * 3);
   text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .run-card-meta-time {
   flex: 0 0 auto;
+  padding-top: 1px;
 }
 
 .run-card-quality {

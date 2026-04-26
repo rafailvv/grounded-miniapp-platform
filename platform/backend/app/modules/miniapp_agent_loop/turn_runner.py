@@ -59,9 +59,7 @@ class WorkspaceLoopTurnRunner:
             return "minimal"
         if next_attempt <= 4:
             return "expanded"
-        if made_progress or signature_changed:
-            return "full_bundle"
-        return "expanded"
+        return "full_bundle"
 
     def run(
         self,
@@ -115,8 +113,19 @@ class WorkspaceLoopTurnRunner:
                     turn_history=turn_history,
                 )
 
-            callbacks.append_event(job, "running_checks", "Running validation and generated app checks.", {"attempt": attempt})
-            callbacks.append_event(job, "build_started", "Build validation started.", {"attempt": attempt})
+            has_file_edits = bool(all_operations)
+            callbacks.append_event(
+                job,
+                "running_checks",
+                "Running validation and generated app checks.",
+                {"attempt": attempt, "has_file_edits": has_file_edits},
+            )
+            callbacks.append_event(
+                job,
+                "build_started",
+                "Build validation started.",
+                {"attempt": attempt, "has_file_edits": has_file_edits},
+            )
             latest_execution, latest_preview_details = callbacks.execute_checks(changed_files)
             validation_snapshot = callbacks.build_validation_snapshot(latest_execution)
             completion_state = callbacks.completion_state(

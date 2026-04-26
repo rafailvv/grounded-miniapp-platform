@@ -101,6 +101,7 @@ export type RunArtifacts = {
   };
   validation?: Record<string, unknown> | null;
   trace?: { entries?: Array<{ stage: string; message: string; created_at?: string }> } | null;
+  agent_diagnostics?: { items?: Array<Record<string, unknown>> } | null;
   iterations?: Array<{
     iteration_id: string;
     assistant_message: string;

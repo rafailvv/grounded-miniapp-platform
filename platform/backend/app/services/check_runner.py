@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tempfile
 from pathlib import Path
@@ -65,6 +67,7 @@ ROLE_LINK_STOPWORDS = {
     "экран",
     "приложение",
 }
+MIN_ROLE_ROUTE_PAGES = 3
 
 
 class CheckRunner:
@@ -94,6 +97,8 @@ class CheckRunner:
     def __init__(self, validation_suite: ValidationSuite, preview_service: PreviewService) -> None:
         self.validation_suite = validation_suite
         self.preview_service = preview_service
+        self._python_requirements_cache: set[str] = set()
+        self._python_requirements_cache_lock = threading.Lock()
 
     def run(
         self,
@@ -488,47 +493,23 @@ class CheckRunner:
         return RunCheckResult(
             name="preview_connectivity_smoke",
             status="failed" if failures else "passed",
-            details="Preview route smoke checked generated root routes against the running preview session.",
+            details="Preview route smoke checked generated role routes against the running preview session.",
             command="preview route smoke (current session)",
             logs=failures or logs,
+            diagnostics={"routes_checked": routes},
         )
 
     @staticmethod
     def _root_preview_routes(source_dir: Path) -> list[str]:
-        manifest_path = source_dir / "miniapp/app/generated/route_manifest.json"
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except ValueError:
-            return []
-        except OSError:
-            manifest = {}
-        roles = manifest.get("roles") if isinstance(manifest, dict) else {}
         routes: list[str] = []
+        pages_by_role = CheckRunner._routeable_role_pages(source_dir)
         for role in ROLE_ORDER:
-            role_payload = roles.get(role) if isinstance(roles, dict) else {}
-            pages = role_payload.get("pages") if isinstance(role_payload, dict) else []
-            role_route = ""
-            for page in pages or []:
-                if not isinstance(page, dict):
-                    continue
-                candidate = str(page.get("route_path") or "").strip()
-                if candidate in {f"/{role}", "/"}:
-                    role_route = candidate
-                    break
-            if not role_route:
-                static_index = source_dir / f"miniapp/app/static/{role}/index.html"
-                if static_index.exists():
-                    routes.append(f"/{role}")
-                continue
-            if role_route == "/":
-                routes.append(f"/{role}")
-                continue
-            if role_route == f"/{role}":
-                routes.append(role_route)
-                continue
-            normalized = role_route if role_route.startswith("/") else f"/{role_route}"
-            routes.append(f"/{role}{normalized}")
-        return list(dict.fromkeys(route for route in routes if route))
+            role_routes = CheckRunner._unique_role_routes(pages_by_role.get(role, []))
+            root_route = f"/{role}"
+            if root_route in role_routes:
+                routes.append(root_route)
+            routes.extend(route for route in role_routes if route != root_route)
+        return list(dict.fromkeys(route for route in routes if route))[:18]
 
     def _platform_invariants_smoke(
         self,
@@ -579,6 +560,7 @@ class CheckRunner:
             logs=self._validation_logs(issues) if issues else ["Platform invariant smoke passed."],
             diagnostics={
                 "role_coverage": role_coverage,
+                "multipage_coverage": self._multipage_coverage_from_roles(role_coverage),
                 "neutral_template_findings": neutral_template_findings,
                 "generated_tests": generated_tests,
             },
@@ -590,6 +572,7 @@ class CheckRunner:
         coverage: dict[str, object] = {}
         neutral_findings: list[dict[str, str]] = []
         role_tokens: dict[str, set[str]] = {}
+        route_pages = cls._routeable_role_pages(source_dir)
 
         for role in ROLE_ORDER:
             role_dir = source_dir / "miniapp" / "app" / "static" / role
@@ -607,10 +590,21 @@ class CheckRunner:
                     texts.append(path.read_text(encoding="utf-8"))
                 except OSError:
                     continue
+            for page in route_pages.get(role, []):
+                page_path_raw = str(page.get("file_path") or "")
+                page_path = source_dir / page_path_raw
+                if page_path in expected_files.values() or not page_path.exists():
+                    continue
+                try:
+                    texts.append(page_path.read_text(encoding="utf-8"))
+                except OSError:
+                    continue
             combined = "\n".join(texts)
             normalized = combined.lower()
             markers = [marker for marker in NEUTRAL_TEMPLATE_MARKERS if marker in normalized]
             role_tokens[role] = cls._domain_tokens(combined)
+            role_routes = cls._unique_role_routes(route_pages.get(role, []))
+            secondary_routes = [route for route in role_routes if route != f"/{role}"]
             if missing:
                 coverage[role] = {"status": "missing", "missing_files": missing}
                 issues.append(
@@ -630,7 +624,13 @@ class CheckRunner:
                     "markers": ", ".join(markers[:4]),
                 }
                 neutral_findings.append(finding)
-                coverage[role] = {"status": "neutral_template", "markers": markers[:4]}
+                coverage[role] = {
+                    "status": "neutral_template",
+                    "markers": markers[:4],
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                }
                 issues.append(
                     ValidationIssue(
                         code="platform.neutral_role_template",
@@ -641,9 +641,33 @@ class CheckRunner:
                     )
                 )
                 continue
+            if len(role_routes) < MIN_ROLE_ROUTE_PAGES or len(secondary_routes) < MIN_ROLE_ROUTE_PAGES - 1:
+                coverage[role] = {
+                    "status": "single_page",
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                    "required_route_count": MIN_ROLE_ROUTE_PAGES,
+                }
+                issues.append(
+                    ValidationIssue(
+                        code="platform.single_page_role_surface",
+                        message=(
+                            f"{role} role is too single-page. Generate at least {MIN_ROLE_ROUTE_PAGES} routeable pages "
+                            f"for this role: /{role} plus at least {MIN_ROLE_ROUTE_PAGES - 1} domain-specific child pages."
+                        ),
+                        severity="high",
+                        location=f"miniapp/app/static/{role}",
+                        blocking=True,
+                    )
+                )
+                continue
             coverage[role] = {
                 "status": "present",
                 "files": [path.relative_to(source_dir).as_posix() for path in expected_files.values()],
+                "route_count": len(role_routes),
+                "secondary_route_count": len(secondary_routes),
+                "routes": role_routes,
                 "domain_token_count": len(role_tokens[role]),
             }
 
@@ -666,6 +690,174 @@ class CheckRunner:
                 )
             coverage["shared_domain_tokens"] = sorted(shared_tokens)[:12]
         return issues, coverage, neutral_findings
+
+    @staticmethod
+    def _multipage_coverage_from_roles(role_coverage: dict[str, object]) -> dict[str, object]:
+        coverage: dict[str, object] = {}
+        for role in ROLE_ORDER:
+            payload = role_coverage.get(role)
+            if not isinstance(payload, dict):
+                continue
+            coverage[role] = {
+                "status": payload.get("status"),
+                "route_count": payload.get("route_count"),
+                "secondary_route_count": payload.get("secondary_route_count"),
+                "required_route_count": payload.get("required_route_count") or MIN_ROLE_ROUTE_PAGES,
+                "routes": payload.get("routes") or [],
+            }
+        return coverage
+
+    @classmethod
+    def _routeable_role_pages(cls, source_dir: Path) -> dict[str, list[dict[str, str]]]:
+        pages_by_role: dict[str, list[dict[str, str]]] = {role: [] for role in ROLE_ORDER}
+        manifest_path = source_dir / "miniapp/app/generated/route_manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        except ValueError:
+            manifest = {}
+        top_level_routes = manifest.get("routes") if isinstance(manifest, dict) else {}
+        if isinstance(top_level_routes, dict):
+            for route_path_raw, file_path_raw_value in top_level_routes.items():
+                route_path_text = str(route_path_raw or "").strip()
+                file_path_raw = str(file_path_raw_value or "").strip()
+                if not route_path_text or not file_path_raw:
+                    continue
+                for role in ROLE_ORDER:
+                    route_probe = route_path_text if route_path_text.startswith("/") else f"/{route_path_text}"
+                    route_probe = route_probe.rstrip("/") or f"/{role}"
+                    if route_probe != f"/{role}" and not route_probe.startswith(f"/{role}/"):
+                        continue
+                    normalized_route = cls._normalize_role_route(role, route_probe)
+                    file_path = cls._resolve_manifest_static_page(source_dir, file_path_raw)
+                    if not file_path.exists():
+                        continue
+                    pages_by_role[role].append(
+                        {
+                            "route_path": normalized_route,
+                            "file_path": file_path.relative_to(source_dir).as_posix(),
+                            "source": "manifest_top_routes",
+                        }
+                    )
+                    break
+        roles = manifest.get("roles") if isinstance(manifest, dict) else {}
+        if isinstance(roles, dict):
+            for role in ROLE_ORDER:
+                role_payload = roles.get(role)
+                if not isinstance(role_payload, dict):
+                    continue
+                route_map = role_payload.get("routes")
+                if isinstance(route_map, dict):
+                    for route_path_raw, file_path_raw_value in route_map.items():
+                        file_path_raw = str(file_path_raw_value or "").strip()
+                        if not file_path_raw:
+                            continue
+                        file_path = cls._resolve_manifest_static_page(source_dir, file_path_raw)
+                        if not file_path.exists():
+                            continue
+                        route_path = cls._normalize_role_route(role, str(route_path_raw or "").strip())
+                        pages_by_role[role].append(
+                            {
+                                "route_path": route_path,
+                                "file_path": file_path.relative_to(source_dir).as_posix(),
+                                "source": "manifest_routes",
+                            }
+                        )
+                pages = role_payload.get("pages")
+                if not isinstance(pages, list):
+                    continue
+                for page in pages:
+                    if not isinstance(page, dict):
+                        continue
+                    file_path_raw = str(page.get("file_path") or "").strip()
+                    if not file_path_raw:
+                        continue
+                    file_path = cls._resolve_manifest_static_page(source_dir, file_path_raw)
+                    if not file_path.exists():
+                        continue
+                    route_path = cls._normalize_role_route(role, str(page.get("route_path") or "").strip())
+                    pages_by_role[role].append(
+                        {
+                            "route_path": route_path,
+                            "file_path": file_path.relative_to(source_dir).as_posix(),
+                            "source": "manifest",
+                        }
+                    )
+
+        static_root = source_dir / "miniapp/app/static"
+        for role in ROLE_ORDER:
+            role_root = static_root / role
+            if not role_root.exists():
+                continue
+            for html_path in sorted(role_root.rglob("index.html")):
+                route_path = cls._filesystem_role_route(role, role_root, html_path)
+                pages_by_role[role].append(
+                    {
+                        "route_path": route_path,
+                        "file_path": html_path.relative_to(source_dir).as_posix(),
+                        "source": "filesystem",
+                    }
+                )
+        return {
+            role: cls._dedupe_role_pages(pages)
+            for role, pages in pages_by_role.items()
+        }
+
+    @staticmethod
+    def _resolve_manifest_static_page(source_dir: Path, file_path_raw: str) -> Path:
+        normalized = str(file_path_raw or "").strip().replace("\\", "/").lstrip("/")
+        if normalized.startswith("miniapp/app/"):
+            return source_dir / normalized
+        if normalized.startswith("app/"):
+            return source_dir / "miniapp" / normalized
+        if normalized.startswith("static/"):
+            return source_dir / "miniapp/app" / normalized
+        return source_dir / normalized
+
+    @staticmethod
+    def _normalize_role_route(role: str, route_path: str) -> str:
+        normalized = str(route_path or "").strip()
+        if not normalized or normalized in {"/", f"/{role}/root"}:
+            return f"/{role}"
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        normalized = normalized.rstrip("/") or f"/{role}"
+        if normalized == f"/{role}/root":
+            return f"/{role}"
+        if normalized == f"/{role}" or normalized.startswith(f"/{role}/"):
+            return normalized
+        return f"/{role}{normalized}"
+
+    @staticmethod
+    def _filesystem_role_route(role: str, role_root: Path, html_path: Path) -> str:
+        relative = html_path.relative_to(role_root).as_posix()
+        slug = relative.removesuffix("/index.html").removesuffix("index.html").strip("/")
+        return f"/{role}/{slug}".rstrip("/") if slug else f"/{role}"
+
+    @staticmethod
+    def _dedupe_role_pages(pages: list[dict[str, str]]) -> list[dict[str, str]]:
+        deduped: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for page in pages:
+            route_path = str(page.get("route_path") or "").rstrip("/") or "/"
+            file_path = str(page.get("file_path") or "")
+            key = (route_path, file_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(page)
+        return deduped
+
+    @staticmethod
+    def _unique_role_routes(pages: list[dict[str, str]]) -> list[str]:
+        routes: list[str] = []
+        seen: set[str] = set()
+        for page in pages:
+            route = str(page.get("route_path") or "").rstrip("/") or "/"
+            if route in seen:
+                continue
+            seen.add(route)
+            routes.append(route)
+        return routes
 
     @staticmethod
     def _domain_tokens(text: str) -> set[str]:
@@ -788,6 +980,15 @@ class CheckRunner:
             logs.extend(js_syntax_result.logs)
             if js_syntax_result.status == "failed":
                 return js_syntax_result
+            install_result = self._install_python_requirements(
+                backend_dir,
+                result_name="changed_files_static",
+                purpose="Backend import-smoke dependency",
+            )
+            if install_result is not None:
+                logs.extend(install_result.logs)
+                if install_result.status == "failed":
+                    return install_result
             import_result = self._run_backend_import_smoke(backend_dir)
             logs.extend(import_result.logs)
             if import_result.status == "failed":
@@ -877,10 +1078,24 @@ class CheckRunner:
             logs=["Generated Python app tests passed."],
         )
 
-    def _install_python_requirements(self, backend_dir: Path) -> RunCheckResult | None:
+    def _install_python_requirements(
+        self,
+        backend_dir: Path,
+        *,
+        result_name: str = "generated_app_python_tests",
+        purpose: str = "Generated Python dependency",
+    ) -> RunCheckResult | None:
         requirements_file = backend_dir / "requirements.txt"
         if not requirements_file.exists():
             return None
+        try:
+            digest = hashlib.sha256(requirements_file.read_bytes()).hexdigest()
+        except OSError:
+            digest = str(requirements_file)
+        cache_key = f"{sys.executable}:{digest}"
+        with self._python_requirements_cache_lock:
+            if cache_key in self._python_requirements_cache:
+                return None
         command = [sys.executable, "-m", "pip", "install", "--no-cache-dir", "-r", "requirements.txt"]
         env = {
             **os.environ,
@@ -897,29 +1112,31 @@ class CheckRunner:
             )
         except subprocess.TimeoutExpired as exc:
             return RunCheckResult(
-                name="generated_app_python_tests",
+                name=result_name,
                 status="failed",
-                details="Generated Python dependency install timed out.",
+                details=f"{purpose} install timed out.",
                 command=" ".join(command),
                 logs=self._command_logs(
-                    "Generated Python dependency install timed out.",
+                    f"{purpose} install timed out.",
                     exc.stdout or "",
                     exc.stderr or "",
                 ),
             )
         if result.returncode != 0:
             return RunCheckResult(
-                name="generated_app_python_tests",
+                name=result_name,
                 status="failed",
-                details="Generated Python dependency install failed.",
+                details=f"{purpose} install failed.",
                 command=" ".join(command),
                 exit_code=result.returncode,
                 logs=self._command_logs(
-                    "Generated Python dependency install failed.",
+                    f"{purpose} install failed.",
                     result.stdout,
                     result.stderr,
                 ),
             )
+        with self._python_requirements_cache_lock:
+            self._python_requirements_cache.add(cache_key)
         return None
 
     def _run_js_app_tests(self, backend_dir: Path, *, require_present: bool = False) -> RunCheckResult:

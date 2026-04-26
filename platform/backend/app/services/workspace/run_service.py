@@ -1032,6 +1032,16 @@ class RunService:
                     for key, value in artifacts_payload["preview"].items()
                     if key in {"status", "stage", "progress_percent", "runtime_mode", "url", "role_urls", "draft_run_id"}
                 }
+                artifacts_payload["preview_infra_diagnostics"] = {
+                    "failure_kind": getattr(preview, "preview_failure_kind", None),
+                    "retry_count": getattr(preview, "preview_retry_count", 0),
+                    "cleanup_attempted": getattr(preview, "preview_cleanup_attempted", False),
+                    "reused_existing_runtime": getattr(preview, "preview_reused_existing_runtime", False),
+                    "cooldown_until": getattr(preview, "preview_cooldown_until", None).isoformat()
+                    if getattr(preview, "preview_cooldown_until", None)
+                    else None,
+                    "last_error": getattr(preview, "last_error", None),
+                }
                 self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
             run_payload = self.store.get("runs", run.run_id)
             if run_payload is not None:
@@ -1039,6 +1049,13 @@ class RunService:
                 if actual_preview_ms > 0:
                     latency_breakdown["preview_ms"] = actual_preview_ms
                 run_payload["latency_breakdown"] = latency_breakdown
+                checks_summary = dict(run_payload.get("checks_summary") or {})
+                if preview.status == "running":
+                    checks_summary["preview"] = "passed"
+                elif preview.status == "error":
+                    checks_summary["preview"] = "failed"
+                if checks_summary:
+                    run_payload["checks_summary"] = checks_summary
                 run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
                 self.store.upsert("runs", run.run_id, run_payload)
             if followup_request is not None:
@@ -1407,6 +1424,7 @@ class RunService:
             "run": run.model_dump(mode="json"),
             "job": job.model_dump(mode="json"),
             "trace": self.code_agent_runtime.current_report(workspace_id, "trace"),
+            "agent_diagnostics": self.code_agent_runtime.current_report(workspace_id, "agent_diagnostics"),
             "iterations": iterations,
             "check_results": (self.code_agent_runtime.current_report(workspace_id, "check_results") or {}).get("items", []),
             "checks": self.code_agent_runtime.current_report(workspace_id, "check_results"),
@@ -1956,7 +1974,7 @@ class RunService:
     def _apply_completed_draft(self, run: RunRecord, *, message: str) -> None:
         apply_started_at = time.perf_counter()
         run.current_stage = "finalizing apply"
-        run.progress_percent = 99
+        run.progress_percent = max(run.progress_percent, 94)
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
         self._append_job_event(run.linked_job_id, "apply_started", message)

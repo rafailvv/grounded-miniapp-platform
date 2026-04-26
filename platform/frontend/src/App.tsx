@@ -240,14 +240,6 @@ function formatTimestamp(value?: string): string {
   return date.toLocaleString();
 }
 
-function clampText(value: string, maxLength = 180): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLength) {
-    return normalized;
-  }
-  return `${normalized.slice(0, maxLength - 1).trimEnd()}…`;
-}
-
 function pluralize(count: number, singular: string, plural = `${singular}s`): string {
   return `${count} ${count === 1 ? singular : plural}`;
 }
@@ -448,39 +440,112 @@ function displayFixPhase(run: Run, phase?: string | null): string {
   return phase ?? run.current_fix_phase ?? "n/a";
 }
 
+const RUN_STAGE_LABELS: Record<string, string> = {
+  agent_turn: "Planning code edit",
+  agent_turn_started: "Planning code edit",
+  running_checks: "Running checks",
+  build_started: "Validating app",
+  frontend_build_started: "Checking frontend",
+  backend_compile_started: "Checking backend",
+  checks_completed: "Checks completed",
+  patch_apply_started: "Applying patch",
+  patch_apply_completed: "Patch applied",
+  repair_iteration: "Reading more context",
+  apply_started: "Applying to workspace",
+  apply_completed: "Applied to workspace",
+  job_started: "Starting code agent",
+  job_completed: "Complete",
+  job_failed: "Failed",
+};
+
+function displayRunStage(run: Run): string {
+  const raw = (run.current_stage || "").trim();
+  if (!raw) {
+    return "Starting";
+  }
+  const normalized = raw.toLowerCase();
+  if (RUN_STAGE_LABELS[normalized]) {
+    return RUN_STAGE_LABELS[normalized];
+  }
+  if (/^[a-z_]+$/.test(normalized)) {
+    return normalized
+      .split("_")
+      .filter(Boolean)
+      .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+      .join(" ");
+  }
+  return raw;
+}
+
+function runProgressStage(run: Run): string {
+  const stage = displayRunStage(run);
+  const stageLower = stage.toLowerCase();
+  if (displayRunStatus(run) === "running" && !stageLower.includes("file")) {
+    const fileCount = run.touched_files.length;
+    if (fileCount > 0) {
+      return `${stage} · ${pluralize(fileCount, "file")}`;
+    }
+    if (run.iteration_count > 0) {
+      return `${stage} · ${pluralize(run.iteration_count, "turn")}`;
+    }
+  }
+  return stage;
+}
+
 function progressCeilingForRun(run: Run): number {
-  const stage = (run.current_stage || "").toLowerCase();
+  const stage = displayRunStage(run).toLowerCase();
   if (run.status === "completed" || run.status === "failed" || run.status === "blocked" || run.status === "awaiting_approval") {
     return 100;
   }
   if (stage.includes("starting")) {
-    return 12;
+    return 10;
   }
-  if (stage.includes("checking workspace") || stage.includes("baseline")) {
-    return 24;
+  if (stage.includes("checking workspace") || stage.includes("baseline") || stage.includes("validating workspace")) {
+    return 18;
   }
-  if (stage.includes("planning code edit") || stage.includes("reading context")) {
-    return 44;
+  if (
+    stage.includes("planning code edit") ||
+    stage.includes("reading context") ||
+    stage.includes("requested") ||
+    stage.includes("no file edits") ||
+    stage.includes("correcting edit contract")
+  ) {
+    return 38;
+  }
+  if (stage.includes("prepared")) {
+    return 50;
   }
   if (stage.includes("applying patch")) {
     return 58;
   }
   if (stage.includes("patch applied")) {
-    return 66;
+    return 72;
   }
-  if (stage.includes("running final") || stage.includes("validating generated") || stage.includes("building generated")) {
-    return 90;
+  if (stage.includes("running final") || stage.includes("validating generated") || stage.includes("building generated") || stage.includes("checking frontend") || stage.includes("checking backend")) {
+    return 88;
+  }
+  if (stage.includes("applying to workspace") || stage.includes("finalizing apply")) {
+    return 94;
   }
   if (stage.includes("preview")) {
-    return 98;
+    return 96;
   }
-  return Math.min(96, Math.max(18, (run.progress_percent || 0) + 8));
+  return Math.min(42, Math.max(18, (run.progress_percent || 0) + 4));
+}
+
+function actualProgressForRun(run: Run): number {
+  const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
+  const status = displayRunStatus(run);
+  if (["completed", "failed", "blocked", "rolled_back", "awaiting_approval"].includes(status)) {
+    return actual;
+  }
+  return Math.min(actual, progressCeilingForRun(run));
 }
 
 function nextVisualProgress(current: number, run: Run): number {
-  const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
+  const actual = actualProgressForRun(run);
   const status = displayRunStatus(run);
-  const stage = (run.current_stage || "").toLowerCase();
+  const stage = displayRunStage(run).toLowerCase();
   if (["completed", "failed", "blocked", "rolled_back", "awaiting_approval"].includes(status)) {
     return actual;
   }
@@ -515,7 +580,7 @@ function nextVisualProgress(current: number, run: Run): number {
 }
 
 function displayProgressForRun(run: Run, progressDisplay: RunProgressDisplayMap): number {
-  const actual = Math.max(0, Math.min(100, run.progress_percent || 0));
+  const actual = actualProgressForRun(run);
   const visual = progressDisplay[run.run_id];
   if (visual === undefined) {
     return Math.max(4, actual);
@@ -545,10 +610,6 @@ function runTimelineDescription(run: Run): string {
 }
 
 function runTimelineMeta(run: Run): string {
-  const status = displayRunStatus(run);
-  if (status === "running") {
-    return run.iteration_count > 0 ? pluralize(run.iteration_count, "turn") : "active";
-  }
   return formatTimestamp(run.created_at);
 }
 
@@ -2724,13 +2785,13 @@ export default function App() {
                             <div className="run-progress-fill" style={{ width: `${visualProgress}%` }} />
                           </div>
                           <div className="run-progress-meta">
-                            <span>{run.current_stage}</span>
+                            <span>{runProgressStage(run)}</span>
                             <span>{visualProgress}%</span>
                           </div>
                         </div>
                         <div className="run-card-meta">
                           <span className="run-card-meta-copy" title={runTimelineDescription(run)}>
-                            {clampText(runTimelineDescription(run), 140)}
+                            {runTimelineDescription(run)}
                           </span>
                           <span className="run-card-meta-time">{runTimelineMeta(run)}</span>
                         </div>

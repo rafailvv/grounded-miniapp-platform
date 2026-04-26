@@ -1,13 +1,80 @@
 from __future__ import annotations
 
+import importlib.util
+import json
 from pathlib import Path
 
 from app.main import create_app
-from app.models.domain import WorkspaceRecord
+from app.models.domain import RunCheckResult, WorkspaceRecord
 from app.services.check_runner import CheckRunner
 from app.services.workspace.preview_service import PreviewService
 from app.validators.build_validator import BuildValidator
 from app.validators.connectivity_validator import ConnectivityValidator
+
+
+def _write_role_root(source_dir: Path, role: str, *, app_title: str = "Aurora Shop") -> None:
+    role_dir = source_dir / "miniapp/app/static" / role
+    role_dir.mkdir(parents=True, exist_ok=True)
+    role_dir.joinpath("index.html").write_text(
+        f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>{app_title} {role}</title>
+    <link rel="stylesheet" href="/static/shared/base.css" />
+    <link rel="stylesheet" href="/static/{role}/styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <h1>{app_title}</h1>
+      <nav>
+        <a href="/{role}/profile">Profile</a>
+        <a href="/{role}/catalog">Catalog</a>
+      </nav>
+      <p>{app_title} connected {role} workspace with shared catalog and orders.</p>
+    </main>
+    <script src="/static/preview_bridge.js" defer></script>
+    <script src="/static/{role}/app.js" defer></script>
+  </body>
+</html>
+""",
+        encoding="utf-8",
+    )
+    role_dir.joinpath("app.js").write_text(f"window.setupPreviewBridge?.('{role}');\n", encoding="utf-8")
+    role_dir.joinpath("styles.css").write_text(".page-shell { color: #172033; background: #ffffff; }\n", encoding="utf-8")
+
+
+def _write_role_child(source_dir: Path, role: str, slug: str, *, app_title: str = "Aurora Shop") -> None:
+    page_dir = source_dir / "miniapp/app/static" / role / slug
+    page_dir.mkdir(parents=True, exist_ok=True)
+    page_dir.joinpath("index.html").write_text(
+        f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>{app_title} {role} {slug}</title>
+    <link rel="stylesheet" href="/static/shared/base.css" />
+    <link rel="stylesheet" href="/static/{role}/styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <h1>{app_title}</h1>
+      <p>{app_title} {role} {slug} page for shared products, orders, and role-specific actions.</p>
+    </main>
+    <script src="/static/preview_bridge.js" defer></script>
+    <script src="/static/{role}/app.js" defer></script>
+  </body>
+</html>
+""",
+        encoding="utf-8",
+    )
+
+
+def _write_generated_test_placeholders(source_dir: Path) -> None:
+    tests_dir = source_dir / "miniapp/tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    tests_dir.joinpath("test_generated_app.py").write_text("import unittest\n\nclass GeneratedAppTest(unittest.TestCase):\n    pass\n", encoding="utf-8")
+    tests_dir.joinpath("generated_app.test.mjs").write_text("import test from 'node:test';\n\ntest('placeholder', () => {});\n", encoding="utf-8")
 
 
 def test_template_shell_passes_platform_build_validator(tmp_path: Path) -> None:
@@ -74,6 +141,63 @@ def test_build_validator_accepts_manifest_static_paths_without_workspace_prefix(
     assert not any(issue.code == "build.missing_static_page" for issue in issues)
 
 
+def test_build_validator_accepts_compact_manifest_routes_map_for_child_pages(tmp_path: Path) -> None:
+    app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
+    workspace = app.state.container.workspace_service.create_workspace(
+        WorkspaceRecord(name="Manifest Routes Map Workspace", path=str(tmp_path / "workspace"))
+    )
+    app.state.container.workspace_service.clone_template(workspace.workspace_id)
+    source_dir = app.state.container.workspace_service.source_dir(workspace.workspace_id)
+    _write_role_child(source_dir, "client", "catalog")
+    manifest = source_dir / "miniapp/app/generated/route_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "routes": {
+                    "/client": "static/client/index.html",
+                    "/client/catalog": "static/client/catalog/index.html",
+                },
+                "shared": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    issues = BuildValidator().validate(source_dir)
+
+    assert not any(issue.code == "build.missing_static_asset" for issue in issues)
+    assert not any(issue.location == "miniapp/app/static/client/catalog/styles.css" for issue in issues)
+
+
+def test_template_role_page_resolver_accepts_compact_routes_map(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    source_route_pages = repo_root / "runtime/templates/base-miniapp/miniapp/app/routes/role_pages.py"
+    route_pages_path = tmp_path / "miniapp/app/routes/role_pages.py"
+    route_pages_path.parent.mkdir(parents=True)
+    route_pages_path.write_text(source_route_pages.read_text(encoding="utf-8"), encoding="utf-8")
+    page_path = tmp_path / "miniapp/app/static/client/profile/index.html"
+    page_path.parent.mkdir(parents=True)
+    page_path.write_text("<main class=\"page-shell\">Profile</main>", encoding="utf-8")
+    manifest_path = tmp_path / "miniapp/app/generated/route_manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps({"routes": {"/client/profile": "static/client/profile/index.html"}}),
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("role_pages_under_test", route_pages_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.resolve_role_page("client", "/client/profile") == page_path
+    try:
+        module.resolve_role_page("client", "/client/missing")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("Missing compact route should raise KeyError")
+
+
 def test_static_check_rejects_typescript_syntax_inside_plain_js(tmp_path: Path) -> None:
     backend_dir = tmp_path / "miniapp"
     script = backend_dir / "app/static/client/app.js"
@@ -85,6 +209,45 @@ def test_static_check_rejects_typescript_syntax_inside_plain_js(tmp_path: Path) 
 
     assert result.status == "failed"
     assert "Static JavaScript syntax check failed" in "\n".join(result.logs)
+
+
+def test_static_check_installs_miniapp_requirements_before_import_smoke(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    backend_dir = tmp_path / "source" / "miniapp"
+    (backend_dir / "app").mkdir(parents=True)
+    (backend_dir / "app" / "main.py").write_text("from app.db import Base\n", encoding="utf-8")
+    (backend_dir / "requirements.txt").write_text("sqlalchemy==2.0.43\n", encoding="utf-8")
+    runner = object.__new__(CheckRunner)
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        runner,
+        "_run_backend_compile",
+        lambda _backend_dir: RunCheckResult(name="changed_files_static", status="passed", logs=["compile"]),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_run_static_js_syntax_check",
+        lambda _backend_dir: RunCheckResult(name="changed_files_static", status="passed", logs=["js"]),
+    )
+
+    def fake_install(_backend_dir, *, result_name="generated_app_python_tests", purpose="Generated Python dependency"):
+        calls.append(f"install:{result_name}:{purpose}")
+        return None
+
+    def fake_import(_backend_dir):
+        calls.append("import")
+        return RunCheckResult(name="changed_files_static", status="passed", logs=["import"])
+
+    monkeypatch.setattr(runner, "_install_python_requirements", fake_install)
+    monkeypatch.setattr(runner, "_run_backend_import_smoke", fake_import)
+
+    result = runner._static_check(source_dir=tmp_path / "source", changed_files=["miniapp/app/static/client/index.html"])
+
+    assert result.status == "passed"
+    assert calls == ["install:changed_files_static:Backend import-smoke dependency", "import"]
 
 
 def test_agentic_platform_invariants_reject_neutral_role_template(tmp_path: Path) -> None:
@@ -105,6 +268,55 @@ def test_agentic_platform_invariants_reject_neutral_role_template(tmp_path: Path
     assert result.status == "failed"
     assert "platform.neutral_role_template" in "\n".join(result.logs)
     assert "specialist" in result.diagnostics["role_coverage"]
+
+
+def test_agentic_platform_invariants_reject_single_page_role_surfaces(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    for role in ("client", "specialist", "manager"):
+        _write_role_root(source_dir, role)
+    _write_generated_test_placeholders(source_dir)
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/index.html"],
+        scope_mode="agentic",
+    )
+
+    assert result.status == "failed"
+    assert "platform.single_page_role_surface" in "\n".join(result.logs)
+    assert result.diagnostics["multipage_coverage"]["client"]["route_count"] == 1
+
+
+def test_agentic_platform_invariants_accept_multipage_role_surfaces(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    manifest = {"roles": {}, "shared": {}}
+    for role in ("client", "specialist", "manager"):
+        _write_role_root(source_dir, role)
+        _write_role_child(source_dir, role, "profile")
+        _write_role_child(source_dir, role, "catalog")
+        manifest["roles"][role] = {
+            "routes": {
+                f"/{role}": f"static/{role}/index.html",
+                f"/{role}/profile": f"static/{role}/profile/index.html",
+                f"/{role}/catalog": f"static/{role}/catalog/index.html",
+            }
+        }
+    manifest_path = source_dir / "miniapp/app/generated/route_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _write_generated_test_placeholders(source_dir)
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/index.html", "miniapp/app/generated/route_manifest.json"],
+        scope_mode="agentic",
+    )
+
+    assert result.status == "passed"
+    assert result.diagnostics["multipage_coverage"]["client"]["route_count"] == 3
+    assert "/specialist/profile" in CheckRunner._root_preview_routes(source_dir)
 
 
 def test_agentic_generated_app_tests_are_required(tmp_path: Path) -> None:

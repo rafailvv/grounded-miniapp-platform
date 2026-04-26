@@ -82,10 +82,24 @@ class BuildValidator:
     @classmethod
     def _manifest_pages(cls, workspace_path: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
         pages: list[dict[str, Any]] = []
+        top_level_routes = manifest.get("routes")
+        if isinstance(top_level_routes, dict):
+            for route_path, file_path in top_level_routes.items():
+                route = str(route_path or "").strip()
+                file_ref = str(file_path or "").strip()
+                if route and file_ref:
+                    pages.append({"route_path": route, "file_path": file_ref})
         roles = manifest.get("roles") if isinstance(manifest.get("roles"), dict) else {}
         for role, payload in roles.items():
             if not isinstance(payload, dict):
                 continue
+            route_map = payload.get("routes")
+            if isinstance(route_map, dict):
+                for route_path, file_path in route_map.items():
+                    route = str(route_path or "").strip()
+                    file_ref = str(file_path or "").strip()
+                    if route and file_ref:
+                        pages.append({"role": role, "route_path": route, "file_path": file_ref})
             for page in payload.get("pages") or []:
                 if isinstance(page, dict):
                     pages.append({"role": role, **page})
