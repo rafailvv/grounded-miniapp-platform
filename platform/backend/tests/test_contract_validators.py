@@ -455,6 +455,73 @@ def test_dom_contract_accepts_role_app_js_ids_declared_on_child_pages(tmp_path: 
     assert issues == []
 
 
+def test_dom_contract_rejects_unguarded_shared_role_script_on_child_page(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    role_dir = source_dir / "miniapp/app/static/client"
+    catalog_dir = role_dir / "catalog"
+    orders_dir = role_dir / "orders"
+    catalog_dir.mkdir(parents=True)
+    orders_dir.mkdir(parents=True)
+    catalog_dir.joinpath("index.html").write_text(
+        "<main id='catalog-list'></main><script src='/static/client/app.js'></script>",
+        encoding="utf-8",
+    )
+    orders_dir.joinpath("index.html").write_text(
+        "<main><span id='cart-count'></span></main><script src='/static/client/app.js'></script>",
+        encoding="utf-8",
+    )
+    role_dir.joinpath("app.js").write_text(
+        "const catalogList = document.getElementById('catalog-list');\n"
+        "const cartCount = document.getElementById('cart-count');\n"
+        "function renderCatalog() { catalogList.innerHTML = ''; }\n"
+        "function renderCart() { cartCount.textContent = '0'; }\n"
+        "window.addEventListener('DOMContentLoaded', () => { renderCatalog(); renderCart(); });\n",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._dom_contract_issues(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/app.js"],
+    )
+
+    assert any(issue.code == "platform.unchecked_page_dom_id" for issue in issues)
+    assert any("cart-count" in issue.message or "catalog-list" in issue.message for issue in issues)
+
+
+def test_dom_contract_accepts_guarded_shared_role_script_on_child_pages(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    role_dir = source_dir / "miniapp/app/static/client"
+    catalog_dir = role_dir / "catalog"
+    orders_dir = role_dir / "orders"
+    catalog_dir.mkdir(parents=True)
+    orders_dir.mkdir(parents=True)
+    catalog_dir.joinpath("index.html").write_text(
+        "<main id='catalog-list'></main><script src='/static/client/app.js'></script>",
+        encoding="utf-8",
+    )
+    orders_dir.joinpath("index.html").write_text(
+        "<main><span id='cart-count'></span><span id='status-badge'></span></main><script src='/static/client/app.js'></script>",
+        encoding="utf-8",
+    )
+    role_dir.joinpath("app.js").write_text(
+        "const catalogList = document.getElementById('catalog-list');\n"
+        "const cartCount = document.getElementById('cart-count');\n"
+        "const badges = document.querySelectorAll('#status-badge');\n"
+        "function renderCatalog() { if (catalogList) catalogList.innerHTML = ''; }\n"
+        "function renderCart() { cartCount && (cartCount.textContent = '0'); }\n"
+        "function renderBadges() { badges.forEach((badge) => { badge.textContent = 'ok'; }); }\n"
+        "window.addEventListener('DOMContentLoaded', () => { renderCatalog(); renderCart(); });\n",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._dom_contract_issues(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/app.js"],
+    )
+
+    assert issues == []
+
+
 def test_agentic_platform_invariants_reject_neutral_role_template(tmp_path: Path) -> None:
     app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
     workspace = app.state.container.workspace_service.create_workspace(

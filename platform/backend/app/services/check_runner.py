@@ -5,6 +5,7 @@ import difflib
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ from app.validators.static_analysis import (
     extract_frontend_api_refs,
     extract_html_ids,
     extract_js_dom_ids,
+    extract_script_refs,
     normalize_api_path,
     role_static_root,
 )
@@ -743,7 +745,10 @@ class CheckRunner:
             data_issues, preloaded_data_findings = self._preloaded_business_data_issues(source_dir)
             issues.extend(data_issues)
         if not css_only_focused_edit:
-            issues.extend(self._dom_contract_issues(source_dir=source_dir, changed_files=relevant_changed))
+            dom_contract_files = list(relevant_changed)
+            if agentic_scope and str(intent or "").strip().lower() == "create":
+                dom_contract_files.extend(self._role_script_paths(source_dir))
+            issues.extend(self._dom_contract_issues(source_dir=source_dir, changed_files=dom_contract_files))
         issues = self._dedupe_validation_issues(issues)
         blocking_issues = self._blocking_validation_issues(issues)
         return RunCheckResult(
@@ -1662,30 +1667,165 @@ class CheckRunner:
             except OSError:
                 continue
             html_sources: list[str] = []
+            all_page_sources: list[tuple[str, str, set[str]]] = []
+            page_sources: list[tuple[str, str, set[str]]] = []
             for html_path in existing_html_paths:
                 try:
-                    html_sources.append(html_path.read_text(encoding="utf-8"))
+                    html_source = html_path.read_text(encoding="utf-8")
                 except OSError:
                     continue
+                html_sources.append(html_source)
+                html_relative = html_path.relative_to(source_dir).as_posix()
+                html_ids = extract_html_ids(html_source)
+                all_page_sources.append((html_relative, html_source, html_ids))
+                if cls._html_references_script(html_relative, html_source, relative_path):
+                    page_sources.append((html_relative, html_source, html_ids))
             available_dom_ids = extract_html_ids("\n".join(html_sources))
             required_dom_ids = extract_js_dom_ids(js_source)
             missing_ids = sorted(required_dom_ids - available_dom_ids)
+            if missing_ids:
+                issues.append(
+                    ValidationIssue(
+                        code="platform.missing_dom_id",
+                        message=f"{relative_path} references DOM ids not found in any matching role HTML page: {', '.join(missing_ids)}.",
+                        severity="high",
+                        location=relative_path,
+                        blocking=True,
+                    )
+                )
+            if not page_sources:
+                page_sources = all_page_sources
+            issues.extend(cls._unchecked_page_dom_issues(relative_path, js_source, page_sources))
+        return issues
+
+    @staticmethod
+    def _role_static_root_for_js(source_dir: Path, relative_path: str) -> Path | None:
+        return role_static_root(source_dir, relative_path)
+
+    @staticmethod
+    def _role_script_paths(source_dir: Path) -> list[str]:
+        static_root = source_dir / "miniapp/app/static"
+        if not static_root.exists():
+            return []
+        paths: list[str] = []
+        for role in ROLE_ORDER:
+            role_root = static_root / role
+            if not role_root.exists():
+                continue
+            for script_path in sorted(role_root.rglob("*.js")):
+                paths.append(script_path.relative_to(source_dir).as_posix())
+        return list(dict.fromkeys(paths))
+
+    @classmethod
+    def _unchecked_page_dom_issues(
+        cls,
+        script_relative_path: str,
+        js_source: str,
+        page_sources: list[tuple[str, str, set[str]]],
+    ) -> list[ValidationIssue]:
+        bindings = cls._js_dom_id_bindings(js_source)
+        unsafe_variables = cls._unsafe_js_dom_variables(js_source, set(bindings))
+        unsafe_ids = {bindings[var_name] for var_name in unsafe_variables if var_name in bindings}
+        unsafe_ids.update(cls._unsafe_direct_dom_ids(js_source))
+        if not unsafe_ids:
+            return []
+        issues: list[ValidationIssue] = []
+        for page_relative_path, _html_source, page_ids in page_sources:
+            missing_ids = sorted(dom_id for dom_id in unsafe_ids if dom_id not in page_ids)
             if not missing_ids:
                 continue
             issues.append(
                 ValidationIssue(
-                    code="platform.missing_dom_id",
-                    message=f"{relative_path} references DOM ids not found in any matching role HTML page: {', '.join(missing_ids)}.",
+                    code="platform.unchecked_page_dom_id",
+                    message=(
+                        f"{script_relative_path} is loaded by {page_relative_path} but dereferences DOM ids "
+                        f"not present on that page without an obvious guard: {', '.join(missing_ids[:6])}. "
+                        "Guard page-specific elements before property access/event listeners or split page scripts."
+                    ),
                     severity="high",
-                    location=relative_path,
+                    location=script_relative_path,
                     blocking=True,
                 )
             )
         return issues
 
     @staticmethod
-    def _role_static_root_for_js(source_dir: Path, relative_path: str) -> Path | None:
-        return role_static_root(source_dir, relative_path)
+    def _js_dom_id_bindings(js_source: str) -> dict[str, str]:
+        bindings: dict[str, str] = {}
+        pattern = re.compile(
+            r"""\b(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*document\.(?:getElementById\(\s*["'](?P<id1>[A-Za-z0-9_-]+)["']\s*\)|querySelector\(\s*["']\#(?P<id2>[A-Za-z0-9_-]+)["']\s*\))""",
+            re.DOTALL,
+        )
+        for match in pattern.finditer(str(js_source or "")):
+            dom_id = match.group("id1") or match.group("id2")
+            if dom_id:
+                bindings[match.group("var")] = dom_id
+        return bindings
+
+    @classmethod
+    def _unsafe_js_dom_variables(cls, js_source: str, variables: set[str]) -> set[str]:
+        unsafe: set[str] = set()
+        if not variables:
+            return unsafe
+        lines = str(js_source or "").splitlines()
+        for index, line in enumerate(lines):
+            for var_name in variables:
+                for match in re.finditer(rf"\b{re.escape(var_name)}\s*\.", line):
+                    prefix = line[: match.start()]
+                    if prefix.rstrip().endswith("?"):
+                        continue
+                    context = "\n".join(lines[max(0, index - 3) : index + 1])
+                    if cls._dom_variable_access_is_guarded(context, line, var_name):
+                        continue
+                    unsafe.add(var_name)
+        return unsafe
+
+    @staticmethod
+    def _dom_variable_access_is_guarded(context: str, line: str, var_name: str) -> bool:
+        escaped = re.escape(var_name)
+        if re.search(rf"\b{escaped}\s*&&", line):
+            return True
+        if re.search(rf"\bif\s*\(\s*{escaped}\b", line):
+            return True
+        if re.search(rf"\bif\s*\(\s*!\s*{escaped}\s*\)\s*return\b", context):
+            return True
+        return bool(re.search(rf"\bif\s*\(\s*{escaped}\b[\s\S]{{0,160}}\b{escaped}\s*\.", context))
+
+    @staticmethod
+    def _unsafe_direct_dom_ids(js_source: str) -> set[str]:
+        unsafe: set[str] = set()
+        pattern = re.compile(
+            r"""document\.(?:getElementById\(\s*["'](?P<id1>[A-Za-z0-9_-]+)["']\s*\)|querySelector\(\s*["']\#(?P<id2>[A-Za-z0-9_-]+)["']\s*\))\s*\.""",
+            re.DOTALL,
+        )
+        for match in pattern.finditer(str(js_source or "")):
+            dom_id = match.group("id1") or match.group("id2")
+            if dom_id:
+                unsafe.add(dom_id)
+        return unsafe
+
+    @classmethod
+    def _html_references_script(cls, html_relative_path: str, html_source: str, script_relative_path: str) -> bool:
+        for ref in extract_script_refs(html_source):
+            resolved = cls._resolve_static_ref(ref, source_path=html_relative_path)
+            if resolved == script_relative_path:
+                return True
+        return False
+
+    @staticmethod
+    def _resolve_static_ref(raw_ref: str, *, source_path: str) -> str | None:
+        ref = str(raw_ref or "").strip().split("?", 1)[0].split("#", 1)[0]
+        if not ref or ref.startswith(("http://", "https://", "//", "data:")):
+            return None
+        if ref.startswith("/static/"):
+            return f"miniapp/app{ref}"
+        if ref.startswith("static/"):
+            return f"miniapp/app/{ref}"
+        if ref.startswith("/"):
+            return None
+        source_parent = Path(source_path).parent.as_posix()
+        resolved = posixpath.normpath(posixpath.join(source_parent, ref))
+        return resolved if resolved.startswith("miniapp/app/static/") else None
 
     @staticmethod
     def _dedupe_validation_issues(issues: list[ValidationIssue]) -> list[ValidationIssue]:

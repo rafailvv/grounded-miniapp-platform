@@ -56,6 +56,7 @@ def test_agent_prompt_declares_run_checks_read_only() -> None:
     assert "Do not give roles different color palettes" in prompt
     assert "Balanced design quality must be visibly stronger than Fast" in prompt
     assert "Quality design quality must be top-tier and product-ready" in prompt
+    assert "page-specific DOM selectors must be null-safe" in prompt
     assert "Visible generated UI copy must use the user's language" in prompt
     assert "Do not paste raw prompt excerpts" in prompt
     assert "preserve existing selectors" in prompt
