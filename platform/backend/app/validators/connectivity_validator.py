@@ -5,6 +5,7 @@ import posixpath
 import re
 
 from app.models.artifacts import ValidationIssue
+from app.validators.static_analysis import extract_declared_routes, extract_frontend_api_refs, normalize_api_path
 
 
 class ConnectivityValidator:
@@ -46,70 +47,11 @@ class ConnectivityValidator:
 
     @staticmethod
     def _extract_api_refs(content: str) -> set[tuple[str, str]]:
-        refs: set[tuple[str, str]] = set()
-        fetch_paths: set[str] = set()
-        fetch_pattern = re.compile(
-            r"fetch\(\s*(?P<quote>['\"`])(?P<path>/api/[^'\"`\s)]+)(?P=quote)(?P<options>[^)]*)\)",
-            re.IGNORECASE | re.DOTALL,
-        )
-        for match in fetch_pattern.finditer(str(content or "")):
-            path = ConnectivityValidator._normalize_api_path(match.group("path"))
-            tail = str(content or "")[match.end():match.end() + 500].split(";", 1)[0]
-            options = f"{match.group('options') or ''}{tail}"
-            method_match = re.search(r"method\s*:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"]", options, re.IGNORECASE)
-            method = str(method_match.group("method") if method_match else "GET").upper()
-            refs.add((method, path))
-            fetch_paths.add(path)
-        for match in re.finditer(r"['\"`](/api/[^'\"`\s)]+)", content):
-            path = ConnectivityValidator._normalize_api_path(match.group(1))
-            method = ConnectivityValidator._method_near_api_reference(str(content or ""), match.start(), match.end())
-            if method:
-                refs.add((method, path))
-                fetch_paths.add(path)
-            elif path not in fetch_paths:
-                refs.add(("GET", path))
-        return refs
-
-    @staticmethod
-    def _method_near_api_reference(content: str, start: int, end: int) -> str | None:
-        prefix = str(content or "")[max(0, start - 80):start]
-        if not re.search(r"\bfetch[A-Za-z0-9_$]*\(\s*$", prefix, re.IGNORECASE):
-            return None
-        tail = str(content or "")[end:end + 700].split(";", 1)[0]
-        method_match = re.search(r"method\s*:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"]", tail, re.IGNORECASE)
-        if not method_match:
-            return "GET"
-        return str(method_match.group("method")).upper()
+        return extract_frontend_api_refs(content)
 
     @classmethod
     def _api_route_paths(cls, routes_root: Path) -> set[tuple[str, str]]:
-        paths: set[tuple[str, str]] = set()
-        if not routes_root.exists():
-            return paths
-        for path in routes_root.glob("*.py"):
-            if path.name == "__init__.py":
-                continue
-            try:
-                content = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            router_prefixes = {
-                match.group("name"): match.group("prefix")
-                for match in re.finditer(
-                    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*APIRouter\(\s*prefix\s*=\s*['\"](?P<prefix>[^'\"]*)['\"]",
-                    content,
-                )
-            }
-            for match in re.finditer(
-                r"@(?P<name>[A-Za-z_][A-Za-z0-9_]*)\.(?P<method>get|post|put|patch|delete)\(\s*['\"](?P<path>[^'\"]*)['\"]",
-                content,
-            ):
-                prefix = router_prefixes.get(match.group("name"), "")
-                full_path = f"{prefix.rstrip('/')}/{match.group('path').lstrip('/')}".strip()
-                if not full_path.startswith("/api/"):
-                    continue
-                paths.add((match.group("method").upper(), cls._normalize_api_path(full_path)))
-        return paths
+        return extract_declared_routes(routes_root, api_only=True)
 
     @classmethod
     def _api_path_is_declared(cls, referenced_method: str, referenced_path: str, declared_paths: set[tuple[str, str]]) -> bool:
@@ -194,13 +136,7 @@ class ConnectivityValidator:
 
     @staticmethod
     def _normalize_api_path(value: str) -> str:
-        normalized = str(value or "").strip().strip("'\"`").split("?", 1)[0].split("#", 1)[0]
-        normalized = re.sub(r"\$\{[^}]+\}", "{param}", normalized)
-        normalized = normalized.rstrip(".,;")
-        if not normalized.startswith("/"):
-            normalized = f"/{normalized}"
-        normalized = re.sub(r"/+", "/", normalized)
-        return normalized.rstrip("/") or "/"
+        return normalize_api_path(value)
 
     @staticmethod
     def _dedupe_issues(issues: list[ValidationIssue]) -> list[ValidationIssue]:

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ast
 import json
+import posixpath
 import re
 from pathlib import Path
 from typing import Any
 
 from app.models.artifacts import ValidationIssue
 from app.services.platform_shell import BASE_STYLESHEET_HREF, PAGE_SHELL_CLASS, PREVIEW_BRIDGE_SRC
+from app.validators.static_analysis import extract_html_ids, extract_js_dom_ids, extract_script_refs, role_html_ids
 
 
 class BuildValidator:
@@ -237,28 +239,60 @@ class BuildValidator:
         html_content: str,
         page: dict[str, Any],
     ) -> list[ValidationIssue]:
-        script_path_raw = str(page.get("script_path") or "").strip().replace("\\", "/")
-        if not script_path_raw:
+        script_paths = self._script_paths_for_page(file_path_raw, html_content, page)
+        if not script_paths:
             return []
-        script_path = workspace_path / script_path_raw
-        if not script_path.exists():
-            return []
-        try:
-            script_content = script_path.read_text(encoding="utf-8")
-        except OSError:
-            return []
-        html_ids = self._extract_html_ids(html_content)
-        script_ids = self._extract_js_dom_ids(script_content)
-        missing_ids = sorted(script_ids - html_ids)
-        if not missing_ids:
-            return []
-        return [
-            self._issue(
-                "build.page_script_dom_contract",
-                f"Page is missing DOM ids required by {Path(script_path_raw).name}: {', '.join(missing_ids[:6])}",
-                file_path_raw,
+        issues: list[ValidationIssue] = []
+        page_ids = extract_html_ids(html_content)
+        for script_path_raw in script_paths:
+            script_path = workspace_path / script_path_raw
+            if not script_path.exists():
+                continue
+            try:
+                script_content = script_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            role_ids = role_html_ids(workspace_path, script_path_raw)
+            html_ids = role_ids or page_ids
+            script_ids = extract_js_dom_ids(script_content)
+            missing_ids = sorted(script_ids - html_ids)
+            if not missing_ids:
+                continue
+            issues.append(
+                self._issue(
+                    "build.page_script_dom_contract",
+                    f"Page role surface is missing DOM ids required by {Path(script_path_raw).name}: {', '.join(missing_ids[:6])}",
+                    file_path_raw,
+                )
             )
-        ]
+        return issues
+
+    @classmethod
+    def _script_paths_for_page(cls, file_path_raw: str, html_content: str, page: dict[str, Any]) -> list[str]:
+        paths: list[str] = []
+        script_path_raw = cls._workspace_static_path(str(page.get("script_path") or "").strip().replace("\\", "/"))
+        if script_path_raw:
+            paths.append(script_path_raw)
+        for ref in extract_script_refs(html_content):
+            resolved = cls._resolve_static_ref(ref, source_path=file_path_raw)
+            if resolved and resolved.endswith(".js"):
+                paths.append(resolved)
+        return list(dict.fromkeys(paths))
+
+    @staticmethod
+    def _resolve_static_ref(raw_ref: str, *, source_path: str) -> str | None:
+        ref = str(raw_ref or "").strip().split("?", 1)[0].split("#", 1)[0]
+        if not ref or ref.startswith(("http://", "https://", "//", "data:")):
+            return None
+        if ref.startswith("/static/"):
+            return f"miniapp/app{ref}"
+        if ref.startswith("static/"):
+            return f"miniapp/app/{ref}"
+        if ref.startswith("/"):
+            return None
+        source_parent = Path(source_path).parent.as_posix()
+        resolved = posixpath.normpath(posixpath.join(source_parent, ref))
+        return resolved if resolved.startswith("miniapp/app/static/") else None
 
     @classmethod
     def _route_module_import_issues(cls, workspace_path: Path) -> list[ValidationIssue]:
@@ -337,13 +371,11 @@ class BuildValidator:
 
     @staticmethod
     def _extract_html_ids(content: str) -> set[str]:
-        return set(re.findall(r'id=["\']([A-Za-z0-9_-]+)["\']', content))
+        return extract_html_ids(content)
 
     @staticmethod
     def _extract_js_dom_ids(content: str) -> set[str]:
-        ids = set(re.findall(r'querySelector(?:All)?\(\s*["\']#([A-Za-z0-9_-]+)', content))
-        ids.update(re.findall(r'getElementById\(\s*["\']([A-Za-z0-9_-]+)', content))
-        return ids
+        return extract_js_dom_ids(content)
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any] | list[Any] | None:

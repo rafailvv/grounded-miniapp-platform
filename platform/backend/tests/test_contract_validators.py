@@ -137,6 +137,53 @@ def test_build_validator_flags_missing_dom_id(tmp_path: Path) -> None:
     assert any(issue.code == "build.page_script_dom_contract" for issue in issues)
 
 
+def test_build_validator_accepts_shared_role_script_ids_on_child_pages(tmp_path: Path) -> None:
+    app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
+    workspace = app.state.container.workspace_service.create_workspace(
+        WorkspaceRecord(name="Shared DOM Contract Workspace", path=str(tmp_path / "workspace"))
+    )
+    app.state.container.workspace_service.clone_template(workspace.workspace_id)
+    source_dir = app.state.container.workspace_service.source_dir(workspace.workspace_id)
+    client_dir = source_dir / "miniapp/app/static/client"
+    orders_dir = client_dir / "orders"
+    orders_dir.mkdir(parents=True, exist_ok=True)
+    client_dir.joinpath("index.html").write_text(
+        """<!doctype html><html><head><link rel="stylesheet" href="/static/shared/base.css" /></head>
+<body><main class="page-shell" id="client-root"></main><script src="/static/preview_bridge.js" defer></script><script src="/static/client/app.js" defer></script></body></html>""",
+        encoding="utf-8",
+    )
+    orders_dir.joinpath("index.html").write_text(
+        """<!doctype html><html><head><link rel="stylesheet" href="/static/shared/base.css" /></head>
+<body><main class="page-shell" id="order-form"></main><script src="/static/preview_bridge.js" defer></script><script src="/static/client/app.js" defer></script></body></html>""",
+        encoding="utf-8",
+    )
+    client_dir.joinpath("app.js").write_text(
+        "document.getElementById('client-root');\ndocument.getElementById('order-form');\n",
+        encoding="utf-8",
+    )
+    manifest = source_dir / "miniapp/app/generated/route_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "client": {
+                        "routes": {
+                            "/client": "static/client/index.html",
+                            "/client/orders": "static/client/orders/index.html",
+                        }
+                    }
+                },
+                "shared": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    issues = BuildValidator().validate(source_dir)
+
+    assert not any(issue.code == "build.page_script_dom_contract" for issue in issues)
+
+
 def test_build_validator_flags_duplicate_runtime_route(tmp_path: Path) -> None:
     app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
     workspace = app.state.container.workspace_service.create_workspace(
@@ -689,6 +736,54 @@ def test_agentic_create_invariants_require_persistent_post_api(tmp_path: Path) -
     assert result.diagnostics["api_contract"]["frontend_update_refs"] == ["/api/orders/1"]
 
 
+def test_agentic_create_invariants_do_not_block_on_raw_api_method_evidence(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    routes_dir = source_dir / "miniapp/app/routes"
+    routes_dir.mkdir(parents=True, exist_ok=True)
+    routes_dir.joinpath("orders.py").write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/api/orders')\n\n"
+        "@router.get('')\n"
+        "def list_orders():\n"
+        "    return []\n\n"
+        "@router.post('')\n"
+        "def create_order(payload: dict):\n"
+        "    return payload\n\n"
+        "@router.patch('/{order_id}/status')\n"
+        "def update_order_status(order_id: int, payload: dict):\n"
+        "    return payload\n",
+        encoding="utf-8",
+    )
+    (source_dir / "miniapp/app/static/client/app.js").write_text(
+        "const ordersEndpoint = '/api/orders';\n"
+        "const createOptions = { method: 'POST', body: JSON.stringify({ title: 'Order' }) };\n"
+        "submitToBackend(ordersEndpoint, createOptions);\n",
+        encoding="utf-8",
+    )
+    (source_dir / "miniapp/app/static/specialist/app.js").write_text(
+        "const statusEndpoint = '/api/orders/1/status';\n"
+        "const updateOptions = { method: 'PATCH', body: JSON.stringify({ status: 'ready' }) };\n"
+        "submitToBackend(statusEndpoint, updateOptions);\nconst queue = 'confirm status queue';\n",
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/app.js", "miniapp/app/static/specialist/app.js", "miniapp/app/routes/orders.py"],
+        scope_mode="agentic",
+        intent="create",
+    )
+
+    assert result.status == "passed"
+    logs = "\n".join(result.logs)
+    assert "platform.frontend_missing_post_api" in logs
+    assert "\"blocking\": false" in logs
+    assert result.diagnostics["api_contract"]["frontend_raw_methods"] == ["PATCH", "POST"]
+
+
 def test_agentic_create_invariants_reject_preloaded_business_data(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     _write_multipage_role_surfaces(source_dir)
@@ -934,6 +1029,23 @@ def test_connectivity_validator_flags_post_when_only_get_route_exists(tmp_path: 
         and "POST /api/orders" in issue.message
         for issue in issues
     )
+
+
+def test_connectivity_validator_ignores_unused_api_string_literals(tmp_path: Path) -> None:
+    app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
+    workspace = app.state.container.workspace_service.create_workspace(
+        WorkspaceRecord(name="Unused API Literal Workspace", path=str(tmp_path / "workspace"))
+    )
+    app.state.container.workspace_service.clone_template(workspace.workspace_id)
+    source_dir = app.state.container.workspace_service.source_dir(workspace.workspace_id)
+    (source_dir / "miniapp/app/static/client/app.js").write_text(
+        "const helpText = 'Документация упоминает /api/not-a-real-call только как текст';\n",
+        encoding="utf-8",
+    )
+
+    issues = ConnectivityValidator().validate(source_dir)
+
+    assert not any(issue.code == "connectivity.missing_backend_route" for issue in issues)
 
 
 def test_connectivity_validator_detects_methods_inside_fetch_wrappers(tmp_path: Path) -> None:

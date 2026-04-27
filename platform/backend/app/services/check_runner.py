@@ -23,6 +23,14 @@ from app.models.artifacts import ValidationIssue
 from app.models.domain import CheckExecutionRecord, RunCheckResult, utc_now
 from app.modules.miniapp_validation.generation_preflight_validation import GenerationPreflightValidation
 from app.services.workspace.preview_service import PreviewService
+from app.validators.static_analysis import (
+    extract_declared_routes,
+    extract_frontend_api_refs,
+    extract_html_ids,
+    extract_js_dom_ids,
+    normalize_api_path,
+    role_static_root,
+)
 from app.validators.suite import ValidationSuite
 
 
@@ -169,9 +177,10 @@ class CheckRunner:
         else:
             build_issues = self.validation_suite.validate_build(source_dir)
             filtered_issues = self._filter_build_issues(build_issues, scope_mode)
+        schema_blocking_issues = self._blocking_validation_issues(filtered_issues)
         schema_result = RunCheckResult(
             name="schema_validators",
-            status="skipped" if focused_css_only_profile else "failed" if filtered_issues else "passed",
+            status="skipped" if focused_css_only_profile else "failed" if schema_blocking_issues else "passed",
             details=(
                 "Build validators skipped for focused CSS-only visual edit."
                 if focused_css_only_profile
@@ -187,16 +196,17 @@ class CheckRunner:
             "schema_validators",
             schema_result.status,
             duration_ms=schema_result.duration_ms,
-            issue_count=len(filtered_issues),
+            issue_count=len(schema_blocking_issues),
             check_profile=check_profile,
         )
 
         self._emit_check_progress(progress_callback, "connectivity_validators", "started", check_profile=check_profile)
         connectivity_started = time.perf_counter()
         connectivity_issues = [] if focused_css_only_profile else self.validation_suite.validate_connectivity(source_dir)
+        connectivity_blocking_issues = self._blocking_validation_issues(connectivity_issues)
         connectivity_result = RunCheckResult(
             name="connectivity_validators",
-            status="skipped" if focused_css_only_profile else "failed" if connectivity_issues else "passed",
+            status="skipped" if focused_css_only_profile else "failed" if connectivity_blocking_issues else "passed",
             details=(
                 "Connectivity validators skipped for focused CSS-only visual edit."
                 if focused_css_only_profile
@@ -212,7 +222,7 @@ class CheckRunner:
             "connectivity_validators",
             connectivity_result.status,
             duration_ms=connectivity_result.duration_ms,
-            issue_count=len(connectivity_issues),
+            issue_count=len(connectivity_blocking_issues),
             check_profile=check_profile,
         )
 
@@ -556,6 +566,10 @@ class CheckRunner:
         return [json.dumps(issue.model_dump(mode="json"), ensure_ascii=False) for issue in issues]
 
     @staticmethod
+    def _blocking_validation_issues(issues: list[ValidationIssue]) -> list[ValidationIssue]:
+        return [issue for issue in issues if getattr(issue, "blocking", True)]
+
+    @staticmethod
     def _validation_issues_from_logs(
         logs: list[str],
         *,
@@ -724,9 +738,10 @@ class CheckRunner:
         if not css_only_focused_edit:
             issues.extend(self._dom_contract_issues(source_dir=source_dir, changed_files=relevant_changed))
         issues = self._dedupe_validation_issues(issues)
+        blocking_issues = self._blocking_validation_issues(issues)
         return RunCheckResult(
             name="platform_invariants",
-            status="failed" if issues else "passed",
+            status="failed" if blocking_issues else "passed",
             details="Platform invariant smoke validated lightweight route/schema and DOM invariants for the edited surface.",
             command="platform invariant smoke",
             logs=self._validation_logs(issues) if issues else ["Platform invariant smoke passed."],
@@ -1075,7 +1090,9 @@ class CheckRunner:
     @classmethod
     def _create_api_contract_issues(cls, source_dir: Path) -> tuple[list[ValidationIssue], dict[str, object]]:
         declared_methods = cls._declared_api_methods(source_dir / "miniapp/app/routes")
-        frontend_refs = cls._frontend_api_refs(source_dir / "miniapp/app/static")
+        static_root = source_dir / "miniapp/app/static"
+        frontend_refs = cls._frontend_api_refs(static_root)
+        frontend_raw_methods = cls._frontend_raw_api_methods(static_root)
         has_backend_get = any(method == "GET" for method, _path in declared_methods)
         has_backend_post = any(method == "POST" for method, _path in declared_methods)
         has_backend_update = any(method in {"PATCH", "PUT", "DELETE"} for method, _path in declared_methods)
@@ -1103,13 +1120,18 @@ class CheckRunner:
                 )
             )
         if not frontend_post_refs:
+            raw_post_present = "POST" in frontend_raw_methods
             issues.append(
                 ValidationIssue(
                     code="platform.frontend_missing_post_api",
-                    message="Create runs must include frontend form/fetch code that POSTs user-provided records to /api.",
-                    severity="high",
+                    message=(
+                        "Create runs must include frontend form/fetch code that POSTs user-provided records to /api."
+                        if not raw_post_present
+                        else "Frontend contains POST and /api markers, but the validator could not pair them confidently; generated tests must confirm the flow."
+                    ),
+                    severity="medium" if raw_post_present else "high",
                     location="miniapp/app/static",
-                    blocking=True,
+                    blocking=not raw_post_present,
                 )
             )
         if not has_backend_update:
@@ -1123,13 +1145,18 @@ class CheckRunner:
                 )
             )
         if not frontend_update_refs:
+            raw_update_present = bool(frontend_raw_methods.intersection({"PATCH", "PUT", "DELETE"}))
             issues.append(
                 ValidationIssue(
                     code="platform.frontend_missing_update_api",
-                    message="Create runs must include specialist or manager frontend actions that update saved records through /api.",
-                    severity="high",
+                    message=(
+                        "Create runs must include specialist or manager frontend actions that update saved records through /api."
+                        if not raw_update_present
+                        else "Frontend contains update-method and /api markers, but the validator could not pair them confidently; generated tests must confirm the flow."
+                    ),
+                    severity="medium" if raw_update_present else "high",
                     location="miniapp/app/static",
-                    blocking=True,
+                    blocking=not raw_update_present,
                 )
             )
         return issues, {
@@ -1143,37 +1170,12 @@ class CheckRunner:
             ],
             "frontend_post_refs": frontend_post_refs,
             "frontend_update_refs": frontend_update_refs,
+            "frontend_raw_methods": sorted(frontend_raw_methods),
         }
 
     @staticmethod
     def _declared_api_methods(routes_root: Path) -> set[tuple[str, str]]:
-        methods: set[tuple[str, str]] = set()
-        if not routes_root.exists():
-            return methods
-        for path in routes_root.glob("*.py"):
-            if path.name == "__init__.py":
-                continue
-            try:
-                content = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            router_prefixes = {
-                match.group("name"): match.group("prefix")
-                for match in re.finditer(
-                    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*APIRouter\(\s*prefix\s*=\s*['\"](?P<prefix>[^'\"]*)['\"]",
-                    content,
-                )
-            }
-            for match in re.finditer(
-                r"@(?P<name>[A-Za-z_][A-Za-z0-9_]*)\.(?P<method>get|post|put|patch|delete)\(\s*['\"](?P<path>[^'\"]*)['\"]",
-                content,
-            ):
-                prefix = router_prefixes.get(match.group("name"), "")
-                full_path = f"{prefix.rstrip('/')}/{match.group('path').lstrip('/')}".strip()
-                if not full_path.startswith("/api/"):
-                    continue
-                methods.add((match.group("method").upper(), re.sub(r"/+", "/", full_path).rstrip("/") or "/"))
-        return methods
+        return extract_declared_routes(routes_root, api_only=True)
 
     @classmethod
     def _frontend_api_refs(cls, static_root: Path) -> set[tuple[str, str]]:
@@ -1191,62 +1193,32 @@ class CheckRunner:
         return refs
 
     @staticmethod
-    def _extract_frontend_api_refs(content: str) -> set[tuple[str, str]]:
-        refs: set[tuple[str, str]] = set()
-        fetch_paths: set[str] = set()
-        fetch_pattern = re.compile(
-            r"fetch\(\s*(?P<quote>['\"`])(?P<path>/api/[^'\"`\s)]+)(?P=quote)(?P<options>[^)]*)\)",
-            re.IGNORECASE | re.DOTALL,
-        )
-        for match in fetch_pattern.finditer(str(content or "")):
-            path = CheckRunner._normalize_api_ref_path(match.group("path"))
-            tail = str(content or "")[match.end():match.end() + 500].split(";", 1)[0]
-            options = f"{match.group('options') or ''}{tail}"
-            method_match = re.search(r"method\s*:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"]", options, re.IGNORECASE)
-            method = str(method_match.group("method") if method_match else "GET").upper()
-            refs.add((method, path))
-            fetch_paths.add(path)
-        api_const_paths = {
-            CheckRunner._normalize_api_ref_path(match.group("path"))
-            for match in re.finditer(
-                r"(?:const|let|var)\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*['\"`](?P<path>/api/[^'\"`]+)['\"`]",
-                str(content or ""),
-            )
-        }
-        if api_const_paths:
-            for method_match in re.finditer(r"method\s*:\s*['\"](?P<method>POST|PUT|PATCH|DELETE)['\"]", str(content or ""), re.IGNORECASE):
-                method = str(method_match.group("method")).upper()
-                for path in api_const_paths:
-                    refs.add((method, f"{path}/{{param}}" if method in {"PUT", "PATCH", "DELETE"} else path))
-        for match in re.finditer(r"['\"`](/api/[^'\"`\s)]+)", str(content or "")):
-            path = CheckRunner._normalize_api_ref_path(match.group(1))
-            method = CheckRunner._method_near_api_reference(str(content or ""), match.start(), match.end())
-            if method:
-                refs.add((method, path))
-                fetch_paths.add(path)
-            elif path not in fetch_paths:
-                refs.add(("GET", path))
-        return refs
+    def _frontend_raw_api_methods(static_root: Path) -> set[str]:
+        methods: set[str] = set()
+        if not static_root.exists():
+            return methods
+        for path in static_root.rglob("*"):
+            if path.suffix.lower() not in {".html", ".js"} or path.name == "preview_bridge.js":
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if "/api/" not in content and "/api" not in content:
+                continue
+            for match in re.finditer(r"method\s*:\s*['\"](?P<method>POST|PUT|PATCH|DELETE)['\"]", content, re.IGNORECASE):
+                methods.add(match.group("method").upper())
+            for match in re.finditer(r"\.(?P<method>post|put|patch|delete)\s*\(", content, re.IGNORECASE):
+                methods.add(match.group("method").upper())
+        return methods
 
     @staticmethod
-    def _method_near_api_reference(content: str, start: int, end: int) -> str | None:
-        prefix = str(content or "")[max(0, start - 80):start]
-        if not re.search(r"\bfetch[A-Za-z0-9_$]*\(\s*$", prefix, re.IGNORECASE):
-            return None
-        tail = str(content or "")[end:end + 700].split(";", 1)[0]
-        method_match = re.search(r"method\s*:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"]", tail, re.IGNORECASE)
-        if not method_match:
-            return "GET"
-        return str(method_match.group("method")).upper()
+    def _extract_frontend_api_refs(content: str) -> set[tuple[str, str]]:
+        return extract_frontend_api_refs(content)
 
     @staticmethod
     def _normalize_api_ref_path(value: str) -> str:
-        normalized = str(value or "").strip().strip("'\"`").split("?", 1)[0].split("#", 1)[0]
-        normalized = re.sub(r"\$\{[^}]+\}", "{param}", normalized)
-        normalized = normalized.rstrip(".,;")
-        if not normalized.startswith("/"):
-            normalized = f"/{normalized}"
-        return re.sub(r"/+", "/", normalized).rstrip("/") or "/"
+        return normalize_api_path(value)
 
     @classmethod
     def _preloaded_business_data_issues(cls, source_dir: Path) -> tuple[list[ValidationIssue], list[dict[str, str]]]:
@@ -1587,13 +1559,8 @@ class CheckRunner:
                     html_sources.append(html_path.read_text(encoding="utf-8"))
                 except OSError:
                     continue
-            available_dom_ids = set(re.findall(r'id=["\']([A-Za-z0-9_-]+)["\']', "\n".join(html_sources)))
-            required_dom_ids = set(
-                re.findall(r'querySelector(?:All)?\(\s*["\']#([A-Za-z0-9_-]+)', js_source)
-            )
-            required_dom_ids.update(
-                re.findall(r'getElementById\(\s*["\']([A-Za-z0-9_-]+)', js_source)
-            )
+            available_dom_ids = extract_html_ids("\n".join(html_sources))
+            required_dom_ids = extract_js_dom_ids(js_source)
             missing_ids = sorted(required_dom_ids - available_dom_ids)
             if not missing_ids:
                 continue
@@ -1610,17 +1577,7 @@ class CheckRunner:
 
     @staticmethod
     def _role_static_root_for_js(source_dir: Path, relative_path: str) -> Path | None:
-        parts = str(relative_path or "").replace("\\", "/").split("/")
-        try:
-            static_index = parts.index("static")
-        except ValueError:
-            return None
-        if len(parts) <= static_index + 1:
-            return None
-        role = parts[static_index + 1]
-        if role not in ROLE_ORDER:
-            return None
-        return source_dir / "miniapp/app/static" / role
+        return role_static_root(source_dir, relative_path)
 
     @staticmethod
     def _dedupe_validation_issues(issues: list[ValidationIssue]) -> list[ValidationIssue]:
