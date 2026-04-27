@@ -3028,10 +3028,6 @@ export default function App() {
             <div className="preview-grid">
               {ROLE_ORDER.map((role) => (
                 <div key={role} className="preview-column">
-                  <div className="preview-heading">
-                    <strong>{role}</strong>
-                    <span>{previewRuntimeMode || "runtime"} preview</span>
-                  </div>
                   <div className="phone-shell">
                     <div className="mockup-topbar">
                       <button

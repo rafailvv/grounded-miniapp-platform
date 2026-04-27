@@ -763,6 +763,28 @@ class CheckRunner:
                     )
                 )
                 continue
+            technical_copy = cls._technical_role_copy_markers(combined)
+            if technical_copy:
+                coverage[role] = {
+                    "status": "technical_role_copy",
+                    "markers": technical_copy,
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                }
+                issues.append(
+                    ValidationIssue(
+                        code="platform.technical_role_copy",
+                        message=(
+                            f"{role} role contains technical/generated copy: {', '.join(technical_copy[:4])}. "
+                            "Use polished user-facing text in the user's language."
+                        ),
+                        severity="high",
+                        location=f"miniapp/app/static/{role}",
+                        blocking=True,
+                    )
+                )
+                continue
             if len(role_routes) < min_role_route_pages or len(secondary_routes) < min_role_route_pages - 1:
                 coverage[role] = {
                     "status": "single_page",
@@ -899,6 +921,19 @@ class CheckRunner:
             if any(href == f"/{other}" or href.startswith(f"/{other}/") for other in other_roles):
                 links.append(href)
         return list(dict.fromkeys(links))
+
+    @staticmethod
+    def _technical_role_copy_markers(content: str) -> list[str]:
+        lowered = str(content or "").lower()
+        markers = (
+            "client app",
+            "specialist app",
+            "manager app",
+            "source request",
+            "collect user-provided details",
+            "record records",
+        )
+        return [marker for marker in markers if marker in lowered]
 
     @staticmethod
     def _role_surfaces_too_similar(role_text: dict[str, str]) -> bool:

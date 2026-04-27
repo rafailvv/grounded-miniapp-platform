@@ -466,6 +466,27 @@ def test_agentic_platform_invariants_reject_cross_role_navigation(tmp_path: Path
     assert "platform.cross_role_navigation" in "\n".join(result.logs)
 
 
+def test_agentic_platform_invariants_reject_technical_role_copy(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    client_html = source_dir / "miniapp/app/static/client/index.html"
+    client_html.write_text(
+        client_html.read_text(encoding="utf-8").replace("<h1>Aurora Shop</h1>", "<p>Client app</p><h1>Aurora Shop</h1><p>source request</p>"),
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/index.html"],
+        scope_mode="agentic",
+    )
+
+    assert result.status == "failed"
+    assert "platform.technical_role_copy" in "\n".join(result.logs)
+
+
 def test_agentic_platform_invariants_reject_identical_role_apps(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     manifest = {"roles": {}, "shared": {}}

@@ -84,6 +84,7 @@ PROMPT_SEMANTIC_STOPWORDS = {
     "app",
     "application",
     "build",
+    "business",
     "create",
     "for",
     "from",
@@ -91,7 +92,11 @@ PROMPT_SEMANTIC_STOPWORDS = {
     "make",
     "miniapp",
     "need",
+    "owner",
     "please",
+    "sell",
+    "selling",
+    "small",
     "that",
     "the",
     "this",
@@ -105,23 +110,37 @@ PROMPT_SEMANTIC_STOPWORDS = {
     "для",
     "его",
     "есть",
+    "занимаюсь",
+    "занимается",
+    "заниматься",
     "как",
     "который",
+    "маленький",
+    "малого",
     "мне",
     "мини",
+    "небольшого",
+    "небольшой",
     "нужно",
     "обычно",
     "они",
     "оно",
+    "продаю",
+    "продавать",
+    "продажи",
     "приложение",
     "сделай",
+    "соцсети",
+    "соцсетях",
     "создай",
     "так",
     "там",
+    "через",
     "хочу",
     "чтобы",
     "это",
     "этот",
+    "владелец",
     "я",
 }
 CYRILLIC_TRANSLIT = str.maketrans(
@@ -1005,6 +1024,7 @@ class WorkspaceCodeAgentRuntime:
             "Every generated HTML route page, including role roots and child pages such as static/client/details/index.html, must include <script src=\"/static/preview_bridge.js\" defer></script>. Role root pages must also keep the role app script. "
             "Generate normal light-mode interfaces by default: light backgrounds, dark readable text, clear contrast, restrained neutral colors, and no dark theme unless the user explicitly asks for dark mode. Do not give roles different color palettes; use one consistent light visual system across client, specialist, and manager. "
             "Preserve the top safe spacing from the template shell; generated role CSS must not collapse the top padding of .page-shell. "
+            "Visible generated UI copy must use the user's language. Do not paste raw prompt excerpts into the interface, and do not show technical role labels such as Client app, Specialist app, Manager app, source request, or Workspace suffixes unless the user explicitly asks for them. "
             "For create tasks, build three separate role apps inside one miniapp shell: client, specialist, and manager. They share backend state, but their UI logic, actions, text, CSS, and workflow focus must be visibly different. "
             "Role apps must be isolated inside the UI: do not add in-app links from client to specialist/manager, from specialist to client/manager, or from manager to client/specialist. The platform shell chooses the role entry; each role app may only link to its own child pages. "
             "Create tasks must be multi-page: each role root is a dashboard/hub and each role must expose child pages for the mode budget. Fast requires at least one domain-specific child page per role; Balanced and Quality require at least two. "
@@ -1493,10 +1513,6 @@ class WorkspaceCodeAgentRuntime:
         resource = str(spec["resource"])
         api_path = f"/api/{resource}"
         route_file = f"miniapp/app/routes/{resource}.py"
-        title = str(spec["title"])
-        record_label = str(spec["record_label"])
-        action_label = str(spec["action_label"])
-        child_label = str(spec["child_label"])
 
         route_manifest = {
             "routes": {
@@ -1511,16 +1527,16 @@ class WorkspaceCodeAgentRuntime:
 
         return [
             op("miniapp/app/static/client/index.html", WorkspaceCodeAgentRuntime._fast_client_html(spec, api_path), "Create client role form and saved-record list."),
-            op("miniapp/app/static/client/request/index.html", WorkspaceCodeAgentRuntime._fast_child_html(title, "client", "Client request guide", child_label, "/client"), "Create client child page."),
-            op("miniapp/app/static/client/app.js", WorkspaceCodeAgentRuntime._fast_client_js(api_path), "Create client-only form and saved-record logic."),
+            op("miniapp/app/static/client/request/index.html", WorkspaceCodeAgentRuntime._fast_client_child_html(spec, api_path), "Create client child page."),
+            op("miniapp/app/static/client/app.js", WorkspaceCodeAgentRuntime._fast_client_js(spec, api_path), "Create client-only form and saved-record logic."),
             op("miniapp/app/static/client/styles.css", WorkspaceCodeAgentRuntime._fast_role_css("client"), "Create real client role styles."),
             op("miniapp/app/static/specialist/index.html", WorkspaceCodeAgentRuntime._fast_specialist_html(spec, api_path), "Create specialist role queue and status workflow."),
-            op("miniapp/app/static/specialist/queue/index.html", WorkspaceCodeAgentRuntime._fast_child_html(title, "specialist", "Specialist work queue", f"Review incoming {record_label} records, contact clients, and move work through statuses.", "/specialist"), "Create specialist child page."),
-            op("miniapp/app/static/specialist/app.js", WorkspaceCodeAgentRuntime._fast_specialist_js(api_path), "Create specialist status action logic."),
+            op("miniapp/app/static/specialist/queue/index.html", WorkspaceCodeAgentRuntime._fast_specialist_child_html(spec, api_path), "Create specialist child page."),
+            op("miniapp/app/static/specialist/app.js", WorkspaceCodeAgentRuntime._fast_specialist_js(spec, api_path), "Create specialist status action logic."),
             op("miniapp/app/static/specialist/styles.css", WorkspaceCodeAgentRuntime._fast_role_css("specialist"), "Create real specialist role styles."),
             op("miniapp/app/static/manager/index.html", WorkspaceCodeAgentRuntime._fast_manager_html(spec, api_path), "Create manager role dashboard and workload overview."),
-            op("miniapp/app/static/manager/overview/index.html", WorkspaceCodeAgentRuntime._fast_child_html(title, "manager", "Manager operations overview", f"Track open {record_label} records, confirmed work, completed work, and team load.", "/manager"), "Create manager child page."),
-            op("miniapp/app/static/manager/app.js", WorkspaceCodeAgentRuntime._fast_manager_js(api_path), "Create manager dashboard summary logic."),
+            op("miniapp/app/static/manager/overview/index.html", WorkspaceCodeAgentRuntime._fast_manager_child_html(spec, api_path), "Create manager child page."),
+            op("miniapp/app/static/manager/app.js", WorkspaceCodeAgentRuntime._fast_manager_js(spec, api_path), "Create manager dashboard summary logic."),
             op("miniapp/app/static/manager/styles.css", WorkspaceCodeAgentRuntime._fast_role_css("manager"), "Create real manager role styles."),
             op("miniapp/app/generated/route_manifest.json", json.dumps(route_manifest, indent=2, ensure_ascii=False) + "\n", "Declare Fast child routes."),
             op(route_file, WorkspaceCodeAgentRuntime._fast_api_route_py(spec, api_path), "Create persistent GET/POST API resource."),
@@ -1530,23 +1546,110 @@ class WorkspaceCodeAgentRuntime:
         ]
 
     @staticmethod
-    def _fast_create_domain_spec(prompt: str) -> dict[str, str]:
+    def _fast_create_domain_spec(prompt: str) -> dict[str, Any]:
+        language = WorkspaceCodeAgentRuntime._prompt_language(prompt)
+        copy = WorkspaceCodeAgentRuntime._fast_copy(language)
         tokens = WorkspaceCodeAgentRuntime._prompt_semantic_tokens(prompt, limit=4)
-        title_base = " ".join(tokens[:4]).title() if tokens else "Business"
-        label_base = " ".join(tokens[:3]).lower() if tokens else "business"
+        title_base = WorkspaceCodeAgentRuntime._human_title_from_tokens(tokens, language) if tokens else str(copy["fallback_title"])
         resource = WorkspaceCodeAgentRuntime._resource_slug_from_prompt_tokens(tokens)
-        prompt_excerpt = " ".join(str(prompt or "").split())[:140]
-        child_label = (
-            f"Collect user-provided details for {label_base} from the original request."
-            if not prompt_excerpt
-            else f"Collect user-provided details for {label_base}; source request: {prompt_excerpt}."
-        )
         return {
-            "title": f"{title_base} Workspace",
+            "language": language,
+            "copy": copy,
+            "title": title_base,
             "resource": resource,
-            "record_label": f"{label_base} record",
-            "action_label": f"Create {label_base} record",
-            "child_label": child_label,
+            "record_label": str(copy["entry_label"]),
+            "action_label": str(copy["create_action"]),
+        }
+
+    @staticmethod
+    def _prompt_language(prompt: str) -> str:
+        text = str(prompt or "")
+        cyrillic = len(re.findall(r"[А-Яа-яЁё]", text))
+        latin = len(re.findall(r"[A-Za-z]", text))
+        return "ru" if cyrillic > latin else "en"
+
+    @staticmethod
+    def _human_title_from_tokens(tokens: list[str], language: str) -> str:
+        raw_title = " ".join(tokens[:3]).replace("_", " ").strip()
+        if not raw_title:
+            return "Бизнес" if language == "ru" else "Business"
+        if language == "ru":
+            raw_title = re.sub(r"\bинтернет-магазина\b", "интернет-магазин", raw_title, flags=re.IGNORECASE)
+            return raw_title[:1].upper() + raw_title[1:]
+        return raw_title.title()
+
+    @staticmethod
+    def _fast_copy(language: str) -> dict[str, str]:
+        if language == "ru":
+            return {
+                "lang": "ru",
+                "fallback_title": "Бизнес",
+                "entry_label": "запись",
+                "create_action": "Сохранить",
+                "client_nav": "Оформление",
+                "client_heading": "Новая запись",
+                "client_intro": "Заполните данные. После сохранения они появятся у команды.",
+                "name_label": "Имя",
+                "phone_label": "Телефон",
+                "preferred_time_label": "Удобное время",
+                "details_label": "Детали",
+                "client_records_heading": "Мои записи",
+                "client_empty": "Пока нет сохраненных записей.",
+                "specialist_nav": "Рабочий список",
+                "specialist_heading": "Работа с записями",
+                "specialist_empty": "Пока нет новых записей.",
+                "manager_nav": "Сводка",
+                "manager_heading": "Сводка",
+                "manager_records_heading": "Все записи",
+                "manager_empty": "Пока нет данных для сводки.",
+                "back": "Назад",
+                "client_fallback": "Клиент",
+                "time_pending": "Время не указано",
+                "no_details": "Детали не указаны",
+                "status_label": "Статус",
+                "status_new": "новая",
+                "confirm_action": "В работу",
+                "done_action": "Готово",
+                "review_action": "Проверено",
+                "metric_total": "Всего",
+                "metric_new": "Новые",
+                "metric_confirmed": "В работе",
+                "metric_done": "Готово",
+            }
+        return {
+            "lang": "en",
+            "fallback_title": "Business",
+            "entry_label": "entry",
+            "create_action": "Save",
+            "client_nav": "New entry",
+            "client_heading": "New entry",
+            "client_intro": "Fill in the details. After saving, the team will see them.",
+            "name_label": "Name",
+            "phone_label": "Phone",
+            "preferred_time_label": "Preferred time",
+            "details_label": "Details",
+            "client_records_heading": "My entries",
+            "client_empty": "No saved entries yet.",
+            "specialist_nav": "Work list",
+            "specialist_heading": "Work list",
+            "specialist_empty": "No new entries yet.",
+            "manager_nav": "Summary",
+            "manager_heading": "Summary",
+            "manager_records_heading": "All entries",
+            "manager_empty": "No data for the summary yet.",
+            "back": "Back",
+            "client_fallback": "Client",
+            "time_pending": "Time pending",
+            "no_details": "No details",
+            "status_label": "Status",
+            "status_new": "new",
+            "confirm_action": "Confirm",
+            "done_action": "Done",
+            "review_action": "Reviewed",
+            "metric_total": "Total",
+            "metric_new": "New",
+            "metric_confirmed": "In progress",
+            "metric_done": "Done",
         }
 
     @staticmethod
@@ -1599,40 +1702,49 @@ class WorkspaceCodeAgentRuntime:
         )
 
     @staticmethod
-    def _fast_client_html(spec: dict[str, str], api_path: str) -> str:
+    def _fast_client_html(spec: dict[str, Any], api_path: str) -> str:
         title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        label = WorkspaceCodeAgentRuntime._html_escape(spec["record_label"])
-        action = WorkspaceCodeAgentRuntime._html_escape(spec["action_label"])
+        copy = spec["copy"]
+        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
+        action = WorkspaceCodeAgentRuntime._html_escape(copy["create_action"])
+        nav = WorkspaceCodeAgentRuntime._html_escape(copy["client_nav"])
+        heading = WorkspaceCodeAgentRuntime._html_escape(copy["client_heading"])
+        intro = WorkspaceCodeAgentRuntime._html_escape(copy["client_intro"])
+        name_label = WorkspaceCodeAgentRuntime._html_escape(copy["name_label"])
+        phone_label = WorkspaceCodeAgentRuntime._html_escape(copy["phone_label"])
+        preferred_time_label = WorkspaceCodeAgentRuntime._html_escape(copy["preferred_time_label"])
+        details_label = WorkspaceCodeAgentRuntime._html_escape(copy["details_label"])
+        records_heading = WorkspaceCodeAgentRuntime._html_escape(copy["client_records_heading"])
+        empty = WorkspaceCodeAgentRuntime._html_escape(copy["client_empty"])
         return f"""<!doctype html>
-<html lang="en">
+<html lang="{lang}">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title} Client</title>
+  <title>{title}</title>
   <link rel="stylesheet" href="/static/shared/base.css" />
   <link rel="stylesheet" href="/static/client/styles.css" />
 </head>
 <body>
   <main class="page-shell client-app" data-api-path="{api_path}">
     <header class="role-hero">
-      <p class="eyebrow">Client app</p>
       <h1>{title}</h1>
-      <nav class="role-nav"><a href="/client/request">Request details</a></nav>
+      <nav class="role-nav"><a href="/client/request">{nav}</a></nav>
     </header>
     <section class="action-panel client-request-panel">
-      <h2>{action}</h2>
-      <p>Create a new {label} with your contact details. The team sees it immediately after saving.</p>
+      <h2>{heading}</h2>
+      <p>{intro}</p>
       <form id="record-form" class="request-form">
-        <label>Name <input name="client_name" autocomplete="name" required /></label>
-        <label>Phone <input name="phone" autocomplete="tel" required /></label>
-        <label>Preferred time <input name="preferred_time" required /></label>
-        <label>Details <textarea name="details" required></textarea></label>
+        <label>{name_label}<input name="client_name" autocomplete="name" required /></label>
+        <label>{phone_label}<input name="phone" autocomplete="tel" required /></label>
+        <label>{preferred_time_label}<input name="preferred_time" required /></label>
+        <label>{details_label}<textarea name="details" required></textarea></label>
         <button class="primary-action" type="submit">{action}</button>
       </form>
     </section>
     <section class="records-panel client-records">
-      <h2>My saved {label} records</h2>
-      <p id="empty-state">No {label} records yet. Submit the form to create the first one.</p>
+      <h2>{records_heading}</h2>
+      <p id="empty-state">{empty}</p>
       <ul id="records-list"></ul>
     </section>
   </main>
@@ -1643,28 +1755,31 @@ class WorkspaceCodeAgentRuntime:
 """
 
     @staticmethod
-    def _fast_specialist_html(spec: dict[str, str], api_path: str) -> str:
+    def _fast_specialist_html(spec: dict[str, Any], api_path: str) -> str:
         title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        label = WorkspaceCodeAgentRuntime._html_escape(spec["record_label"])
+        copy = spec["copy"]
+        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
+        nav = WorkspaceCodeAgentRuntime._html_escape(copy["specialist_nav"])
+        heading = WorkspaceCodeAgentRuntime._html_escape(copy["specialist_heading"])
+        empty = WorkspaceCodeAgentRuntime._html_escape(copy["specialist_empty"])
         return f"""<!doctype html>
-<html lang="en">
+<html lang="{lang}">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title} Specialist</title>
+  <title>{title}</title>
   <link rel="stylesheet" href="/static/shared/base.css" />
   <link rel="stylesheet" href="/static/specialist/styles.css" />
 </head>
 <body>
   <main class="page-shell specialist-app" data-api-path="{api_path}">
     <header class="role-hero">
-      <p class="eyebrow">Specialist app</p>
       <h1>{title}</h1>
-      <nav class="role-nav"><a href="/specialist/queue">Work queue</a></nav>
+      <nav class="role-nav"><a href="/specialist/queue">{nav}</a></nav>
     </header>
     <section class="queue-panel">
-      <h2>Process {label} records</h2>
-      <p id="empty-state">No saved {label} records yet. New client requests will appear here for confirmation and completion.</p>
+      <h2>{heading}</h2>
+      <p id="empty-state">{empty}</p>
       <ul id="records-list"></ul>
     </section>
   </main>
@@ -1675,32 +1790,36 @@ class WorkspaceCodeAgentRuntime:
 """
 
     @staticmethod
-    def _fast_manager_html(spec: dict[str, str], api_path: str) -> str:
+    def _fast_manager_html(spec: dict[str, Any], api_path: str) -> str:
         title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        label = WorkspaceCodeAgentRuntime._html_escape(spec["record_label"])
+        copy = spec["copy"]
+        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
+        nav = WorkspaceCodeAgentRuntime._html_escape(copy["manager_nav"])
+        heading = WorkspaceCodeAgentRuntime._html_escape(copy["manager_heading"])
+        records_heading = WorkspaceCodeAgentRuntime._html_escape(copy["manager_records_heading"])
+        empty = WorkspaceCodeAgentRuntime._html_escape(copy["manager_empty"])
         return f"""<!doctype html>
-<html lang="en">
+<html lang="{lang}">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title} Manager</title>
+  <title>{title}</title>
   <link rel="stylesheet" href="/static/shared/base.css" />
   <link rel="stylesheet" href="/static/manager/styles.css" />
 </head>
 <body>
   <main class="page-shell manager-app" data-api-path="{api_path}">
     <header class="role-hero">
-      <p class="eyebrow">Manager app</p>
       <h1>{title}</h1>
-      <nav class="role-nav"><a href="/manager/overview">Operations overview</a></nav>
+      <nav class="role-nav"><a href="/manager/overview">{nav}</a></nav>
     </header>
     <section class="metrics-panel">
-      <h2>{label.title()} dashboard</h2>
+      <h2>{heading}</h2>
       <div id="metrics" class="metric-grid"></div>
     </section>
     <section class="manager-list-panel">
-      <h2>All active {label} records</h2>
-      <p id="empty-state">No {label} records yet. Client requests and specialist updates will appear here.</p>
+      <h2>{records_heading}</h2>
+      <p id="empty-state">{empty}</p>
       <ul id="records-list"></ul>
     </section>
   </main>
@@ -1711,37 +1830,140 @@ class WorkspaceCodeAgentRuntime:
 """
 
     @staticmethod
-    def _fast_child_html(title: str, role: str, heading: str, body: str, back_href: str) -> str:
-        safe_title = WorkspaceCodeAgentRuntime._html_escape(title)
-        safe_role = WorkspaceCodeAgentRuntime._html_escape(role)
-        safe_heading = WorkspaceCodeAgentRuntime._html_escape(heading)
-        safe_body = WorkspaceCodeAgentRuntime._html_escape(body)
+    def _fast_client_child_html(spec: dict[str, Any], api_path: str) -> str:
+        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
+        copy = spec["copy"]
+        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
+        back = WorkspaceCodeAgentRuntime._html_escape(copy["back"])
+        action = WorkspaceCodeAgentRuntime._html_escape(copy["create_action"])
+        heading = WorkspaceCodeAgentRuntime._html_escape(copy["client_heading"])
+        intro = WorkspaceCodeAgentRuntime._html_escape(copy["client_intro"])
+        name_label = WorkspaceCodeAgentRuntime._html_escape(copy["name_label"])
+        phone_label = WorkspaceCodeAgentRuntime._html_escape(copy["phone_label"])
+        preferred_time_label = WorkspaceCodeAgentRuntime._html_escape(copy["preferred_time_label"])
+        details_label = WorkspaceCodeAgentRuntime._html_escape(copy["details_label"])
+        records_heading = WorkspaceCodeAgentRuntime._html_escape(copy["client_records_heading"])
+        empty = WorkspaceCodeAgentRuntime._html_escape(copy["client_empty"])
         return f"""<!doctype html>
-<html lang="en">
+<html lang="{lang}">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{safe_title} {safe_heading}</title>
+  <title>{title}</title>
   <link rel="stylesheet" href="/static/shared/base.css" />
-  <link rel="stylesheet" href="/static/{safe_role}/styles.css" />
+  <link rel="stylesheet" href="/static/client/styles.css" />
 </head>
 <body>
-  <main class="page-shell {safe_role}-app">
+  <main class="page-shell client-app" data-api-path="{api_path}">
     <header class="role-hero">
-      <p class="eyebrow">{safe_role} app</p>
-      <h1>{safe_title}</h1>
-      <nav class="role-nav"><a href="{back_href}">Back</a></nav>
+      <h1>{title}</h1>
+      <nav class="role-nav"><a href="/client">{back}</a></nav>
     </header>
-    <section class="detail-panel"><h2>{safe_heading}</h2><p>{safe_body}</p></section>
+    <section class="action-panel client-request-panel">
+      <h2>{heading}</h2>
+      <p>{intro}</p>
+      <form id="record-form" class="request-form">
+        <label>{name_label}<input name="client_name" autocomplete="name" required /></label>
+        <label>{phone_label}<input name="phone" autocomplete="tel" required /></label>
+        <label>{preferred_time_label}<input name="preferred_time" required /></label>
+        <label>{details_label}<textarea name="details" required></textarea></label>
+        <button class="primary-action" type="submit">{action}</button>
+      </form>
+    </section>
+    <section class="records-panel client-records">
+      <h2>{records_heading}</h2>
+      <p id="empty-state">{empty}</p>
+      <ul id="records-list"></ul>
+    </section>
   </main>
   <script src="/static/preview_bridge.js" defer></script>
-  <script src="/static/{safe_role}/app.js" defer></script>
+  <script src="/static/client/app.js" defer></script>
 </body>
 </html>
 """
 
     @staticmethod
-    def _fast_client_js(api_path: str) -> str:
+    def _fast_specialist_child_html(spec: dict[str, Any], api_path: str) -> str:
+        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
+        copy = spec["copy"]
+        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
+        back = WorkspaceCodeAgentRuntime._html_escape(copy["back"])
+        heading = WorkspaceCodeAgentRuntime._html_escape(copy["specialist_heading"])
+        empty = WorkspaceCodeAgentRuntime._html_escape(copy["specialist_empty"])
+        return f"""<!doctype html>
+<html lang="{lang}">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <link rel="stylesheet" href="/static/shared/base.css" />
+  <link rel="stylesheet" href="/static/specialist/styles.css" />
+</head>
+<body>
+  <main class="page-shell specialist-app" data-api-path="{api_path}">
+    <header class="role-hero">
+      <h1>{title}</h1>
+      <nav class="role-nav"><a href="/specialist">{back}</a></nav>
+    </header>
+    <section class="queue-panel">
+      <h2>{heading}</h2>
+      <p id="empty-state">{empty}</p>
+      <ul id="records-list"></ul>
+    </section>
+  </main>
+  <script src="/static/preview_bridge.js" defer></script>
+  <script src="/static/specialist/app.js" defer></script>
+</body>
+</html>
+"""
+
+    @staticmethod
+    def _fast_manager_child_html(spec: dict[str, Any], api_path: str) -> str:
+        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
+        copy = spec["copy"]
+        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
+        back = WorkspaceCodeAgentRuntime._html_escape(copy["back"])
+        heading = WorkspaceCodeAgentRuntime._html_escape(copy["manager_heading"])
+        records_heading = WorkspaceCodeAgentRuntime._html_escape(copy["manager_records_heading"])
+        empty = WorkspaceCodeAgentRuntime._html_escape(copy["manager_empty"])
+        return f"""<!doctype html>
+<html lang="{lang}">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <link rel="stylesheet" href="/static/shared/base.css" />
+  <link rel="stylesheet" href="/static/manager/styles.css" />
+</head>
+<body>
+  <main class="page-shell manager-app" data-api-path="{api_path}">
+    <header class="role-hero">
+      <h1>{title}</h1>
+      <nav class="role-nav"><a href="/manager">{back}</a></nav>
+    </header>
+    <section class="metrics-panel">
+      <h2>{heading}</h2>
+      <div id="metrics" class="metric-grid"></div>
+    </section>
+    <section class="manager-list-panel">
+      <h2>{records_heading}</h2>
+      <p id="empty-state">{empty}</p>
+      <ul id="records-list"></ul>
+    </section>
+  </main>
+  <script src="/static/preview_bridge.js" defer></script>
+  <script src="/static/manager/app.js" defer></script>
+</body>
+</html>
+"""
+
+    @staticmethod
+    def _fast_client_js(spec: dict[str, Any], api_path: str) -> str:
+        copy = spec["copy"]
+        client_fallback = json.dumps(copy["client_fallback"], ensure_ascii=False)
+        time_pending = json.dumps(copy["time_pending"], ensure_ascii=False)
+        status_label = json.dumps(copy["status_label"], ensure_ascii=False)
+        status_new = json.dumps(copy["status_new"], ensure_ascii=False)
         return f'''const role = "client";
 window.setupPreviewBridge?.(role);
 
@@ -1753,12 +1975,13 @@ const recordsList = document.getElementById("records-list");
 async function loadClientRecords() {{
   const response = await fetch(apiPath);
   const records = await response.json();
-  emptyState.hidden = records.length > 0;
+  if (emptyState) emptyState.hidden = records.length > 0;
+  if (!recordsList) return;
   recordsList.innerHTML = records.map((item) => `
     <li class="record-card client-record">
-      <strong>${{item.client_name || "Client"}}</strong>
-      <span>${{item.preferred_time || "time pending"}}</span>
-      <small>Status: ${{item.status || "new"}}</small>
+      <strong>${{item.client_name || {client_fallback}}}</strong>
+      <span>${{item.preferred_time || {time_pending}}}</span>
+      <small>${{ {status_label} }}: ${{item.status || {status_new}}}</small>
     </li>
   `).join("");
 }}
@@ -1779,7 +2002,13 @@ loadClientRecords();
 '''
 
     @staticmethod
-    def _fast_specialist_js(api_path: str) -> str:
+    def _fast_specialist_js(spec: dict[str, Any], api_path: str) -> str:
+        copy = spec["copy"]
+        client_fallback = json.dumps(copy["client_fallback"], ensure_ascii=False)
+        no_details = json.dumps(copy["no_details"], ensure_ascii=False)
+        status_new = json.dumps(copy["status_new"], ensure_ascii=False)
+        confirm_action = json.dumps(copy["confirm_action"], ensure_ascii=False)
+        done_action = json.dumps(copy["done_action"], ensure_ascii=False)
         return f'''const role = "specialist";
 window.setupPreviewBridge?.(role);
 
@@ -1799,13 +2028,14 @@ async function updateStatus(id, status) {{
 async function loadSpecialistQueue() {{
   const response = await fetch(apiPath);
   const records = await response.json();
-  emptyState.hidden = records.length > 0;
+  if (emptyState) emptyState.hidden = records.length > 0;
+  if (!recordsList) return;
   recordsList.innerHTML = records.map((item) => `
     <li class="record-card specialist-task">
-      <div><strong>${{item.client_name || "Client"}}</strong><span>${{item.details || "No details"}}</span></div>
-      <span class="status-pill">${{item.status || "new"}}</span>
-      <button data-status-action data-id="${{item.id}}" data-next="confirmed">Confirm</button>
-      <button data-status-action data-id="${{item.id}}" data-next="done">Done</button>
+      <div><strong>${{item.client_name || {client_fallback}}}</strong><span>${{item.details || {no_details}}}</span></div>
+      <span class="status-pill">${{item.status || {status_new}}}</span>
+      <button data-status-action data-id="${{item.id}}" data-next="confirmed">${{ {confirm_action} }}</button>
+      <button data-status-action data-id="${{item.id}}" data-next="done">${{ {done_action} }}</button>
     </li>
   `).join("");
 }}
@@ -1820,7 +2050,16 @@ loadSpecialistQueue();
 '''
 
     @staticmethod
-    def _fast_manager_js(api_path: str) -> str:
+    def _fast_manager_js(spec: dict[str, Any], api_path: str) -> str:
+        copy = spec["copy"]
+        client_fallback = json.dumps(copy["client_fallback"], ensure_ascii=False)
+        time_pending = json.dumps(copy["time_pending"], ensure_ascii=False)
+        status_new = json.dumps(copy["status_new"], ensure_ascii=False)
+        review_action = json.dumps(copy["review_action"], ensure_ascii=False)
+        metric_total = json.dumps(copy["metric_total"], ensure_ascii=False)
+        metric_new = json.dumps(copy["metric_new"], ensure_ascii=False)
+        metric_confirmed = json.dumps(copy["metric_confirmed"], ensure_ascii=False)
+        metric_done = json.dumps(copy["metric_done"], ensure_ascii=False)
         return f'''const role = "manager";
 window.setupPreviewBridge?.(role);
 
@@ -1844,18 +2083,19 @@ async function loadManagerDashboard() {{
   const open = records.filter((item) => (item.status || "new") === "new").length;
   const confirmed = records.filter((item) => item.status === "confirmed").length;
   const done = records.filter((item) => item.status === "done").length;
-  metrics.innerHTML = [
-    ["Total", records.length],
-    ["New", open],
-    ["Confirmed", confirmed],
-    ["Done", done],
+  if (metrics) metrics.innerHTML = [
+    [{metric_total}, records.length],
+    [{metric_new}, open],
+    [{metric_confirmed}, confirmed],
+    [{metric_done}, done],
   ].map(([label, value]) => `<article class="metric-card"><strong>${{value}}</strong><span>${{label}}</span></article>`).join("");
-  emptyState.hidden = records.length > 0;
+  if (emptyState) emptyState.hidden = records.length > 0;
+  if (!recordsList) return;
   recordsList.innerHTML = records.map((item) => `
     <li class="record-card manager-record">
-      <div><strong>${{item.client_name || "Client"}}</strong><span>${{item.preferred_time || "time pending"}}</span></div>
-      <span class="status-pill">${{item.status || "new"}}</span>
-      <button data-manager-action data-id="${{item.id}}">Mark reviewed</button>
+      <div><strong>${{item.client_name || {client_fallback}}}</strong><span>${{item.preferred_time || {time_pending}}}</span></div>
+      <span class="status-pill">${{item.status || {status_new}}}</span>
+      <button data-manager-action data-id="${{item.id}}">${{ {review_action} }}</button>
     </li>
   `).join("");
 }}

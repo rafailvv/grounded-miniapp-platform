@@ -40,6 +40,8 @@ def test_agent_prompt_declares_run_checks_read_only() -> None:
     assert 'node:test does not export expect' in prompt
     assert "Generate normal light-mode interfaces by default" in prompt
     assert "Do not give roles different color palettes" in prompt
+    assert "Visible generated UI copy must use the user's language" in prompt
+    assert "Do not paste raw prompt excerpts" in prompt
     assert "preserve existing selectors" in prompt
     assert "miniapp/tests/test_generated_app.py" in prompt
     assert "miniapp/tests/generated_app.test.mjs" in prompt
@@ -179,6 +181,15 @@ def test_fast_create_fallback_generates_separate_role_apps_and_css() -> None:
     assert route_paths[0] != "miniapp/app/routes/bookings.py"
     assert '@router.patch("/api/' in by_path[route_paths[0]]
     assert "тренер" in "\n".join(by_path.values()).lower()
+    joined = "\n".join(by_path.values())
+    assert 'html lang="ru"' in by_path["miniapp/app/static/client/index.html"]
+    assert "Client app" not in joined
+    assert "Specialist app" not in joined
+    assert "Manager app" not in joined
+    assert "Workspace" not in joined
+    assert "source request" not in joined
+    assert "Collect user-provided" not in joined
+    assert "Работа с записями" in by_path["miniapp/app/static/specialist/queue/index.html"]
 
 
 def test_create_patch_coverage_rejects_static_only_app_without_api() -> None:
