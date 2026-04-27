@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import difflib
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ from urllib.error import URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
+from app.models.common import GenerationMode
 from app.models.artifacts import ValidationIssue
 from app.models.domain import CheckExecutionRecord, RunCheckResult, utc_now
 from app.modules.miniapp_validation.generation_preflight_validation import GenerationPreflightValidation
@@ -92,6 +94,12 @@ PRELOADED_BUSINESS_DATA_MARKERS = (
     "демо-данн",
     "тестовые данные",
 )
+CSS_PLACEHOLDER_MARKERS = (
+    "generated client page styles can replace this file",
+    "generated specialist page styles can replace this file",
+    "generated manager page styles can replace this file",
+    "styles can replace this file",
+)
 
 
 class CheckRunner:
@@ -143,6 +151,7 @@ class CheckRunner:
         scope_mode: str = "full_build",
         check_profile: str = "full",
         intent: str | None = None,
+        generation_mode: GenerationMode | str | None = None,
     ) -> CheckExecutionRecord:
         started = time.perf_counter()
         results: list[RunCheckResult] = []
@@ -186,6 +195,7 @@ class CheckRunner:
             changed_files=changed_files,
             scope_mode=scope_mode,
             intent=intent,
+            generation_mode=generation_mode,
         )
         platform_smoke_result.duration_ms = int((time.perf_counter() - canonical_started) * 1000)
         results.append(platform_smoke_result)
@@ -563,6 +573,7 @@ class CheckRunner:
         changed_files: list[str],
         scope_mode: str,
         intent: str | None = None,
+        generation_mode: GenerationMode | str | None = None,
     ) -> RunCheckResult:
         relevant_changed = [
             str(path)
@@ -594,7 +605,10 @@ class CheckRunner:
             issues.extend(GenerationPreflightValidation.preflight_profile_schema_issues(source_dir))
             issues.extend(GenerationPreflightValidation.preflight_route_schema_issues(source_dir))
         if agentic_scope:
-            role_issues, role_coverage, neutral_template_findings = self._role_surface_issues(source_dir)
+            role_issues, role_coverage, neutral_template_findings = self._role_surface_issues(
+                source_dir,
+                generation_mode=generation_mode,
+            )
             issues.extend(role_issues)
             tests_issues, generated_tests = self._generated_tests_presence_issues(source_dir)
             issues.extend(tests_issues)
@@ -622,12 +636,19 @@ class CheckRunner:
         )
 
     @classmethod
-    def _role_surface_issues(cls, source_dir: Path) -> tuple[list[ValidationIssue], dict[str, object], list[dict[str, str]]]:
+    def _role_surface_issues(
+        cls,
+        source_dir: Path,
+        *,
+        generation_mode: GenerationMode | str | None = None,
+    ) -> tuple[list[ValidationIssue], dict[str, object], list[dict[str, str]]]:
         issues: list[ValidationIssue] = []
         coverage: dict[str, object] = {}
         neutral_findings: list[dict[str, str]] = []
         role_tokens: dict[str, set[str]] = {}
+        role_surface_text: dict[str, str] = {}
         route_pages = cls._routeable_role_pages(source_dir)
+        min_role_route_pages = cls._min_role_route_pages(generation_mode)
 
         for role in ROLE_ORDER:
             role_dir = source_dir / "miniapp" / "app" / "static" / role
@@ -696,20 +717,45 @@ class CheckRunner:
                     )
                 )
                 continue
-            if len(role_routes) < MIN_ROLE_ROUTE_PAGES or len(secondary_routes) < MIN_ROLE_ROUTE_PAGES - 1:
+            css_text = ""
+            try:
+                css_text = expected_files["css"].read_text(encoding="utf-8")
+            except OSError:
+                css_text = ""
+            css_marker = cls._css_placeholder_marker(css_text)
+            if css_marker:
                 coverage[role] = {
-                    "status": "single_page",
+                    "status": "placeholder_css",
+                    "marker": css_marker,
                     "route_count": len(role_routes),
                     "secondary_route_count": len(secondary_routes),
                     "routes": role_routes,
-                    "required_route_count": MIN_ROLE_ROUTE_PAGES,
                 }
                 issues.append(
                     ValidationIssue(
-                        code="platform.single_page_role_surface",
+                        code="platform.placeholder_role_css",
+                        message=f"{role} role CSS is still a placeholder. Generate a real static/{role}/styles.css file.",
+                        severity="high",
+                        location=f"miniapp/app/static/{role}/styles.css",
+                        blocking=True,
+                    )
+                )
+                continue
+            cross_role_links = cls._cross_role_links(role, combined)
+            if cross_role_links:
+                coverage[role] = {
+                    "status": "cross_role_navigation",
+                    "links": cross_role_links,
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                }
+                issues.append(
+                    ValidationIssue(
+                        code="platform.cross_role_navigation",
                         message=(
-                            f"{role} role is too single-page. Generate at least {MIN_ROLE_ROUTE_PAGES} routeable pages "
-                            f"for this role: /{role} plus at least {MIN_ROLE_ROUTE_PAGES - 1} domain-specific child pages."
+                            f"{role} role links to other role apps: {', '.join(cross_role_links[:4])}. "
+                            "Role apps must be isolated; only the platform shell should switch roles."
                         ),
                         severity="high",
                         location=f"miniapp/app/static/{role}",
@@ -717,13 +763,59 @@ class CheckRunner:
                     )
                 )
                 continue
+            if len(role_routes) < min_role_route_pages or len(secondary_routes) < min_role_route_pages - 1:
+                coverage[role] = {
+                    "status": "single_page",
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                    "required_route_count": min_role_route_pages,
+                }
+                issues.append(
+                    ValidationIssue(
+                        code="platform.single_page_role_surface",
+                        message=(
+                            f"{role} role is too single-page. Generate at least {min_role_route_pages} routeable pages "
+                            f"for this role: /{role} plus at least {min_role_route_pages - 1} domain-specific child pages."
+                        ),
+                        severity="high",
+                        location=f"miniapp/app/static/{role}",
+                        blocking=True,
+                    )
+                )
+                continue
+            action_signals = cls._role_action_signals(role, combined)
+            if not action_signals:
+                coverage[role] = {
+                    "status": "missing_role_actions",
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "required_route_count": min_role_route_pages,
+                    "routes": role_routes,
+                }
+                issues.append(
+                    ValidationIssue(
+                        code="platform.missing_role_workflow_actions",
+                        message=(
+                            f"{role} role lacks its own workflow actions. Client must create records, "
+                            "specialist must process/update work, and manager must expose dashboard/oversight actions."
+                        ),
+                        severity="high",
+                        location=f"miniapp/app/static/{role}",
+                        blocking=True,
+                    )
+                )
+                continue
+            role_surface_text[role] = combined
             coverage[role] = {
                 "status": "present",
                 "files": [path.relative_to(source_dir).as_posix() for path in expected_files.values()],
                 "route_count": len(role_routes),
                 "secondary_route_count": len(secondary_routes),
+                "required_route_count": min_role_route_pages,
                 "routes": role_routes,
                 "domain_token_count": len(role_tokens[role]),
+                "action_signals": action_signals,
             }
 
         present_roles = [
@@ -737,7 +829,17 @@ class CheckRunner:
                 issues.append(
                     ValidationIssue(
                         code="platform.disconnected_role_surfaces",
-                        message="Client, specialist, and manager surfaces do not share visible domain content. Use one connected product domain across all roles.",
+                        message="Client, specialist, and manager surfaces do not share visible prompt-derived content. Use one connected business context across all roles.",
+                        severity="high",
+                        location="miniapp/app/static",
+                        blocking=True,
+                    )
+                )
+            if cls._role_surfaces_too_similar(role_surface_text):
+                issues.append(
+                    ValidationIssue(
+                        code="platform.identical_role_surfaces",
+                        message="Client, specialist, and manager surfaces are too similar. Generate three separate role apps with different workflows, actions, and styling.",
                         severity="high",
                         location="miniapp/app/static",
                         blocking=True,
@@ -746,13 +848,99 @@ class CheckRunner:
             coverage["shared_domain_tokens"] = sorted(shared_tokens)[:12]
         return issues, coverage, neutral_findings
 
+    @staticmethod
+    def _min_role_route_pages(generation_mode: GenerationMode | str | None) -> int:
+        value = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
+        return 2 if value == GenerationMode.FAST.value else MIN_ROLE_ROUTE_PAGES
+
+    @staticmethod
+    def _css_placeholder_marker(content: str) -> str | None:
+        lowered = str(content or "").lower()
+        stripped = re.sub(r"/\*|\*/|\s+", " ", lowered).strip()
+        if not stripped:
+            return "empty css"
+        for marker in CSS_PLACEHOLDER_MARKERS:
+            if marker in lowered:
+                return marker
+        meaningful_tokens = re.findall(r"[.#]?[A-Za-z][A-Za-z0-9_-]*\s*\{", content or "")
+        return None if len(meaningful_tokens) >= 3 else "insufficient css rules"
+
+    @staticmethod
+    def _role_action_signals(role: str, content: str) -> list[str]:
+        text = str(content or "")
+        lowered = text.lower()
+        signals: list[str] = []
+        if role == "client":
+            if "<form" in lowered:
+                signals.append("form")
+            if re.search(r"method\s*:\s*['\"]post['\"]", text, flags=re.IGNORECASE) or ".post(" in lowered:
+                signals.append("post")
+            return signals if {"form", "post"}.issubset(set(signals)) else []
+        if role == "specialist":
+            if re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE):
+                signals.append("status_update")
+            if re.search(r"\b(confirm|done|complete|assign|process|status|queue)\b", lowered):
+                signals.append("operations")
+            return signals if len(signals) >= 2 else []
+        if role == "manager":
+            if re.search(r"\b(metric|dashboard|summary|total|workload|overview|count)\b", lowered):
+                signals.append("dashboard")
+            if re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE) or re.search(r"\b(review|approve|escalate|assign)\b", lowered):
+                signals.append("oversight_action")
+            return signals if len(signals) >= 2 else []
+        return signals
+
+    @staticmethod
+    def _cross_role_links(role: str, content: str) -> list[str]:
+        other_roles = [candidate for candidate in ROLE_ORDER if candidate != role]
+        links: list[str] = []
+        for match in re.finditer(r"\bhref\s*=\s*['\"](?P<href>/[^'\"]*)['\"]", str(content or ""), flags=re.IGNORECASE):
+            href = str(match.group("href") or "").strip()
+            if any(href == f"/{other}" or href.startswith(f"/{other}/") for other in other_roles):
+                links.append(href)
+        return list(dict.fromkeys(links))
+
+    @staticmethod
+    def _role_surfaces_too_similar(role_text: dict[str, str]) -> bool:
+        if any(role not in role_text for role in ROLE_ORDER):
+            return False
+        normalized = {
+            role: CheckRunner._normalize_role_surface_text(text)
+            for role, text in role_text.items()
+        }
+        pairs = [
+            ("client", "specialist"),
+            ("client", "manager"),
+            ("specialist", "manager"),
+        ]
+        high_similarity = 0
+        for left, right in pairs:
+            if not normalized[left] or not normalized[right]:
+                continue
+            ratio = difflib.SequenceMatcher(None, normalized[left], normalized[right]).ratio()
+            if ratio >= 0.92:
+                high_similarity += 1
+        return high_similarity >= 2
+
+    @staticmethod
+    def _normalize_role_surface_text(content: str) -> str:
+        text = re.sub(r"<script[\s\S]*?</script>", " ", str(content or ""), flags=re.IGNORECASE)
+        text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = text.lower()
+        text = re.sub(r"\b(client|specialist|manager|клиент|специалист|менеджер)\b", "role", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:5000]
+
     @classmethod
     def _create_api_contract_issues(cls, source_dir: Path) -> tuple[list[ValidationIssue], dict[str, object]]:
         declared_methods = cls._declared_api_methods(source_dir / "miniapp/app/routes")
         frontend_refs = cls._frontend_api_refs(source_dir / "miniapp/app/static")
         has_backend_get = any(method == "GET" for method, _path in declared_methods)
         has_backend_post = any(method == "POST" for method, _path in declared_methods)
+        has_backend_update = any(method in {"PATCH", "PUT", "DELETE"} for method, _path in declared_methods)
         frontend_post_refs = sorted(path for method, path in frontend_refs if method == "POST")
+        frontend_update_refs = sorted(path for method, path in frontend_refs if method in {"PATCH", "PUT", "DELETE"})
         issues: list[ValidationIssue] = []
         if not has_backend_get:
             issues.append(
@@ -784,6 +972,26 @@ class CheckRunner:
                     blocking=True,
                 )
             )
+        if not has_backend_update:
+            issues.append(
+                ValidationIssue(
+                    code="platform.missing_create_update_api",
+                    message="Create runs must expose at least one PATCH/PUT/DELETE /api endpoint so specialist or manager roles can update saved work.",
+                    severity="high",
+                    location="miniapp/app/routes",
+                    blocking=True,
+                )
+            )
+        if not frontend_update_refs:
+            issues.append(
+                ValidationIssue(
+                    code="platform.frontend_missing_update_api",
+                    message="Create runs must include specialist or manager frontend actions that update saved records through /api.",
+                    severity="high",
+                    location="miniapp/app/static",
+                    blocking=True,
+                )
+            )
         return issues, {
             "declared_methods": [
                 {"method": method, "path": path}
@@ -794,6 +1002,7 @@ class CheckRunner:
                 for method, path in sorted(frontend_refs)
             ],
             "frontend_post_refs": frontend_post_refs,
+            "frontend_update_refs": frontend_update_refs,
         }
 
     @staticmethod
@@ -857,6 +1066,18 @@ class CheckRunner:
             method = str(method_match.group("method") if method_match else "GET").upper()
             refs.add((method, path))
             fetch_paths.add(path)
+        api_const_paths = {
+            CheckRunner._normalize_api_ref_path(match.group("path"))
+            for match in re.finditer(
+                r"(?:const|let|var)\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*['\"`](?P<path>/api/[^'\"`]+)['\"`]",
+                str(content or ""),
+            )
+        }
+        if api_const_paths:
+            for method_match in re.finditer(r"method\s*:\s*['\"](?P<method>POST|PUT|PATCH|DELETE)['\"]", str(content or ""), re.IGNORECASE):
+                method = str(method_match.group("method")).upper()
+                for path in api_const_paths:
+                    refs.add((method, f"{path}/{{param}}" if method in {"PUT", "PATCH", "DELETE"} else path))
         for match in re.finditer(r"['\"`](/api/[^'\"`\s)]+)", str(content or "")):
             path = CheckRunner._normalize_api_ref_path(match.group(1))
             if path not in fetch_paths:

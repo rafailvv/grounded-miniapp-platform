@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from app.main import create_app
+from app.models.common import GenerationMode
 from app.models.domain import RunCheckResult, WorkspaceRecord
 from app.services.check_runner import CheckRunner
 from app.services.workspace.preview_service import PreviewService
@@ -31,7 +32,10 @@ def _write_role_root(source_dir: Path, role: str, *, app_title: str = "Aurora Sh
         <a href="/{role}/profile">Profile</a>
         <a href="/{role}/catalog">Catalog</a>
       </nav>
-      <p>{app_title} connected {role} workspace with shared catalog and orders.</p>
+      <p>{app_title} connected {role} workspace with shared catalog, orders, and role-specific actions.</p>
+      {"<form id='record-form'><button type='submit'>Create order</button></form>" if role == "client" else ""}
+      {"<button data-status-action>Confirm order</button><button data-status-action>Done</button>" if role == "specialist" else ""}
+      {"<section class='metric-card'>Dashboard total count</section><button data-manager-action>Review order</button>" if role == "manager" else ""}
     </main>
     <script src="/static/preview_bridge.js" defer></script>
     <script src="/static/{role}/app.js" defer></script>
@@ -40,8 +44,18 @@ def _write_role_root(source_dir: Path, role: str, *, app_title: str = "Aurora Sh
 """,
         encoding="utf-8",
     )
-    role_dir.joinpath("app.js").write_text(f"window.setupPreviewBridge?.('{role}');\n", encoding="utf-8")
-    role_dir.joinpath("styles.css").write_text(".page-shell { color: #172033; background: #ffffff; }\n", encoding="utf-8")
+    role_js = {
+        "client": "window.setupPreviewBridge?.('client');\nfetch('/api/orders', { method: 'POST', body: JSON.stringify({ title: 'User order' }) });\n",
+        "specialist": "window.setupPreviewBridge?.('specialist');\nfetch('/api/orders/1', { method: 'PATCH', body: JSON.stringify({ status: 'confirmed' }) });\nconst queue = 'confirm status queue';\n",
+        "manager": "window.setupPreviewBridge?.('manager');\nfetch('/api/orders/1', { method: 'PATCH', body: JSON.stringify({ status: 'reviewed' }) });\nconst dashboard = 'metric dashboard review';\n",
+    }[role]
+    role_dir.joinpath("app.js").write_text(role_js, encoding="utf-8")
+    role_dir.joinpath("styles.css").write_text(
+        f".page-shell.{role}-app {{ color: #172033; background: #ffffff; }}\n"
+        ".record-card { border: 1px solid #d8dee8; }\n"
+        ".metric-card { padding: 12px; }\n",
+        encoding="utf-8",
+    )
 
 
 def _write_role_child(source_dir: Path, role: str, slug: str, *, app_title: str = "Aurora Shop") -> None:
@@ -411,6 +425,136 @@ def test_agentic_platform_invariants_reject_single_page_role_surfaces(tmp_path: 
     assert result.diagnostics["multipage_coverage"]["client"]["route_count"] == 1
 
 
+def test_agentic_platform_invariants_reject_placeholder_role_css(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    (source_dir / "miniapp/app/static/specialist/styles.css").write_text(
+        "/* Generated specialist page styles can replace this file. */\n",
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/specialist/styles.css"],
+        scope_mode="agentic",
+    )
+
+    assert result.status == "failed"
+    assert "platform.placeholder_role_css" in "\n".join(result.logs)
+
+
+def test_agentic_platform_invariants_reject_cross_role_navigation(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    client_html = source_dir / "miniapp/app/static/client/index.html"
+    client_html.write_text(
+        client_html.read_text(encoding="utf-8").replace("</nav>", '<a href="/specialist">Specialist app</a></nav>'),
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/index.html"],
+        scope_mode="agentic",
+    )
+
+    assert result.status == "failed"
+    assert "platform.cross_role_navigation" in "\n".join(result.logs)
+
+
+def test_agentic_platform_invariants_reject_identical_role_apps(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    manifest = {"roles": {}, "shared": {}}
+    identical_html = """<!doctype html>
+<html><head><link rel="stylesheet" href="/static/client/styles.css" /></head>
+<body><main class="page-shell role-app"><h1>Aurora Shop</h1><form id="record-form"></form><button data-status-action>Confirm status</button><section class="metric-card">Dashboard total count</section><button data-manager-action>Review</button></main><script src="/static/preview_bridge.js" defer></script><script src="app.js" defer></script></body></html>
+"""
+    identical_js = "fetch('/api/orders', { method: 'POST' });\nfetch('/api/orders/1', { method: 'PATCH' });\nconst dashboard = 'metric dashboard review status queue';\n"
+    identical_css = ".page-shell { color: #172033; }\n.record-card { border: 1px solid #ddd; }\n.metric-card { padding: 12px; }\n"
+    for role in ("client", "specialist", "manager"):
+        role_dir = source_dir / "miniapp/app/static" / role
+        role_dir.mkdir(parents=True, exist_ok=True)
+        role_dir.joinpath("index.html").write_text(identical_html.replace("/static/client/", f"/static/{role}/"), encoding="utf-8")
+        role_dir.joinpath("app.js").write_text(identical_js, encoding="utf-8")
+        role_dir.joinpath("styles.css").write_text(identical_css, encoding="utf-8")
+        _write_role_child(source_dir, role, "profile")
+        _write_role_child(source_dir, role, "catalog")
+        manifest["roles"][role] = {
+            "routes": {
+                f"/{role}": f"static/{role}/index.html",
+                f"/{role}/profile": f"static/{role}/profile/index.html",
+                f"/{role}/catalog": f"static/{role}/catalog/index.html",
+            }
+        }
+    manifest_path = source_dir / "miniapp/app/generated/route_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _write_generated_test_placeholders(source_dir)
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/index.html"],
+        scope_mode="agentic",
+    )
+
+    assert result.status == "failed"
+    assert "platform.identical_role_surfaces" in "\n".join(result.logs)
+
+
+def test_agentic_platform_invariants_reject_roles_without_actions(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    (source_dir / "miniapp/app/static/specialist/app.js").write_text(
+        "window.setupPreviewBridge?.('specialist');\nconst queue = 'read only queue';\n",
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/specialist/app.js"],
+        scope_mode="agentic",
+    )
+
+    assert result.status == "failed"
+    assert "platform.missing_role_workflow_actions" in "\n".join(result.logs)
+
+
+def test_fast_agentic_platform_invariants_accept_one_child_page_per_role(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    manifest = {"roles": {}, "shared": {}}
+    for role in ("client", "specialist", "manager"):
+        _write_role_root(source_dir, role)
+        _write_role_child(source_dir, role, "work")
+        manifest["roles"][role] = {
+            "routes": {
+                f"/{role}": f"static/{role}/index.html",
+                f"/{role}/work": f"static/{role}/work/index.html",
+            }
+        }
+    manifest_path = source_dir / "miniapp/app/generated/route_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _write_generated_test_placeholders(source_dir)
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/index.html"],
+        scope_mode="agentic",
+        generation_mode=GenerationMode.FAST,
+    )
+
+    assert result.status == "passed"
+    assert result.diagnostics["multipage_coverage"]["client"]["route_count"] == 2
+
+
 def test_agentic_platform_invariants_accept_multipage_role_surfaces(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     manifest = {"roles": {}, "shared": {}}
@@ -459,8 +603,9 @@ def test_agentic_create_invariants_require_persistent_post_api(tmp_path: Path) -
     joined_logs = "\n".join(result.logs)
     assert "platform.missing_create_get_api" in joined_logs
     assert "platform.missing_create_post_api" in joined_logs
-    assert "platform.frontend_missing_post_api" in joined_logs
-    assert result.diagnostics["api_contract"]["frontend_post_refs"] == []
+    assert "platform.missing_create_update_api" in joined_logs
+    assert result.diagnostics["api_contract"]["frontend_post_refs"] == ["/api/orders"]
+    assert result.diagnostics["api_contract"]["frontend_update_refs"] == ["/api/orders/1"]
 
 
 def test_agentic_create_invariants_reject_preloaded_business_data(tmp_path: Path) -> None:

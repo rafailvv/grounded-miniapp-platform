@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -214,7 +215,43 @@ def validate_workspace_command(command: str) -> str | None:
     for pattern, message in _BLOCKED_COMMAND_PATTERNS:
         if re.search(pattern, lowered):
             return message
-    return None
+    if re.search(r"[`$<>|;]", stripped):
+        return "Shell metacharacters other than a single safe 'cd miniapp && ...' prefix are blocked."
+    normalized = re.sub(r"\s+", " ", stripped)
+    normalized_lower = normalized.lower()
+    if "&&" in normalized_lower:
+        if not normalized_lower.startswith("cd miniapp && "):
+            return "Command chaining is blocked except for 'cd miniapp && ...'."
+        normalized = normalized.split("&&", 1)[1].strip()
+        normalized_lower = normalized.lower()
+        if "&&" in normalized_lower:
+            return "Command chaining is blocked except for 'cd miniapp && ...'."
+    try:
+        args = shlex.split(normalized)
+    except ValueError as exc:
+        return f"Command could not be parsed safely: {exc}."
+    if not args:
+        return "Empty command."
+    if any(arg == ".." or arg.startswith("../") or "/../" in arg for arg in args):
+        return "Parent-directory paths are blocked."
+    program = Path(args[0]).name.lower()
+    if program in {"python", "python3"} or re.fullmatch(r"python3?\.\d+", program):
+        if len(args) >= 4 and args[1] == "-m" and args[2] in {"unittest", "py_compile"}:
+            return None
+        return "Only 'python -m unittest' and 'python -m py_compile' diagnostics are allowed."
+    if program == "node":
+        if len(args) >= 2 and args[1] in {"--test", "--check"}:
+            return None
+        return "Only 'node --test' and 'node --check' diagnostics are allowed."
+    if program == "rg":
+        return None
+    if program == "sed":
+        if any(arg == "-i" or arg.startswith("-i") for arg in args[1:]):
+            return "In-place sed edits are blocked."
+        return None
+    if program == "ls":
+        return None
+    return "Only diagnostic commands are allowed: python -m unittest, python -m py_compile, node --test, node --check, rg, sed, and ls."
 
 
 def run_workspace_command(

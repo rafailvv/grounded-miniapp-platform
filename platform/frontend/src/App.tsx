@@ -514,16 +514,34 @@ function runFilesSummary(run: Run): string {
   return pluralize(run.touched_files.length, "file");
 }
 
-function runTokenUsageValue(run: Run, key: "input_tokens" | "output_tokens" | "reasoning_tokens" | "total_tokens" | "turn_count"): string {
+type TokenUsageKey = "input_tokens" | "output_tokens" | "reasoning_tokens" | "total_tokens" | "turn_count";
+
+function tokenUsageInteger(usage: NonNullable<Run["token_usage"]>, key: TokenUsageKey): number | null {
+  const raw: unknown = usage[key];
+  if (raw === undefined || raw === null || raw === "") {
+    return null;
+  }
+  const parsed = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+  return Math.round(parsed);
+}
+
+function runTokenUsageValue(run: Run, key: TokenUsageKey): string {
   const usage = run.token_usage;
   if (!usage) {
     return "n/a";
   }
-  let value = toPositiveInteger(usage[key]);
-  if (key === "total_tokens" && !value) {
-    value = toPositiveInteger(usage.input_tokens) + toPositiveInteger(usage.output_tokens);
+  const value = tokenUsageInteger(usage, key);
+  if (key === "total_tokens" && (value === null || value === 0)) {
+    const inputTokens = tokenUsageInteger(usage, "input_tokens");
+    const outputTokens = tokenUsageInteger(usage, "output_tokens");
+    if (inputTokens !== null || outputTokens !== null) {
+      return formatCompactTokenCount((inputTokens ?? 0) + (outputTokens ?? 0));
+    }
   }
-  return value ? formatCompactTokenCount(value) : "n/a";
+  return value !== null ? formatCompactTokenCount(value) : "n/a";
 }
 
 function roleCoverageStatus(run: Run, role: RoleKey): string {

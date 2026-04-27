@@ -247,7 +247,7 @@ class RunService:
 
     def list_runs(self, workspace_id: str) -> list[RunRecord]:
         runs = [
-            RunRecord.model_validate(item)
+            self._hydrate_run_observability(RunRecord.model_validate(item), persist=True)
             for item in self.store.list("runs")
             if item["workspace_id"] == workspace_id
         ]
@@ -258,7 +258,7 @@ class RunService:
         payload = self.store.get("runs", run_id)
         if not payload:
             raise KeyError(f"Run not found: {run_id}")
-        return RunRecord.model_validate(payload)
+        return self._hydrate_run_observability(RunRecord.model_validate(payload), persist=True)
 
     def _recover_orphaned_active_runs(self) -> None:
         now = datetime.now(timezone.utc)
@@ -285,7 +285,7 @@ class RunService:
                 run.summary = run.summary or "Run was interrupted before reaching a terminal state."
                 run.failure_reason = run.failure_reason or "Run was recovered as stale after backend restart because no active worker existed."
                 run.outcome_kind = run.outcome_kind or "blocked_generation"
-            run.progress_percent = 100
+            run.progress_percent = self._terminal_failure_progress(run.progress_percent)
             run.updated_at = now
             self._save_run(run)
             self._sync_linked_job_to_terminal_run_state(run, reason="stale_run_recovery")
@@ -523,7 +523,152 @@ class RunService:
         return run
 
     def _save_run(self, run: RunRecord) -> None:
+        existing = self.store.get("runs", run.run_id)
+        if isinstance(existing, dict):
+            existing_usage = existing.get("token_usage") if isinstance(existing.get("token_usage"), dict) else {}
+            run.token_usage = self._richer_token_usage(run.token_usage, existing_usage)
+            if not run.linked_job_id and existing.get("linked_job_id"):
+                run.linked_job_id = str(existing.get("linked_job_id") or "")
+            try:
+                run.iteration_count = max(int(run.iteration_count or 0), int(existing.get("iteration_count") or 0))
+            except (TypeError, ValueError):
+                pass
+        if run.status in {"failed", "blocked"}:
+            run.progress_percent = self._terminal_failure_progress(run.progress_percent)
         self.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+
+    @staticmethod
+    def _token_usage_weight(usage: dict[str, Any] | None) -> int:
+        if not isinstance(usage, dict):
+            return 0
+        try:
+            return int(usage.get("turn_count") or 0) * 1_000_000 + int(usage.get("total_tokens") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _richer_token_usage(cls, candidate: dict[str, Any] | None, existing: dict[str, Any] | None) -> dict[str, Any]:
+        candidate = dict(candidate or {}) if isinstance(candidate, dict) else {}
+        existing = dict(existing or {}) if isinstance(existing, dict) else {}
+        candidate_weight = cls._token_usage_weight(candidate)
+        existing_weight = cls._token_usage_weight(existing)
+        if candidate_weight > existing_weight:
+            return candidate
+        if existing_weight > candidate_weight:
+            return existing
+        candidate_explicit = cls._token_usage_has_explicit_values(candidate)
+        existing_explicit = cls._token_usage_has_explicit_values(existing)
+        if candidate_explicit and not existing_explicit:
+            return candidate
+        if existing_explicit and not candidate_explicit:
+            return existing
+        return candidate if len(candidate) >= len(existing) else existing
+
+    @staticmethod
+    def _token_usage_has_explicit_values(usage: dict[str, Any] | None) -> bool:
+        if not isinstance(usage, dict) or not usage:
+            return False
+        usage_keys = {"input_tokens", "output_tokens", "reasoning_tokens", "total_tokens", "turn_count", "last_turn"}
+        return any(key in usage for key in usage_keys)
+
+    @staticmethod
+    def _terminal_failure_progress(progress: int | float | None) -> int:
+        try:
+            current = int(progress or 0)
+        except (TypeError, ValueError):
+            current = 0
+        return min(98, max(current, 98))
+
+    @staticmethod
+    def _preview_refresh_progress(progress: int | float | None) -> int:
+        try:
+            current = int(progress or 0)
+        except (TypeError, ValueError):
+            current = 0
+        return max(98, min(current, 99))
+
+    def _hydrate_run_observability(self, run: RunRecord, *, persist: bool = False) -> RunRecord:
+        changed = False
+        job_id = str(run.linked_job_id or "").strip() or self._resolve_linked_job_id(run)
+        job_payload = self.store.get("jobs", job_id) if job_id else None
+        job: JobRecord | None = JobRecord.model_validate(job_payload) if isinstance(job_payload, dict) else None
+        if job is not None:
+            usage = self._richer_token_usage(run.token_usage, job.token_usage)
+            usage = self._richer_token_usage(usage, self._token_usage_from_job_events(job))
+            if usage and usage != run.token_usage:
+                run.token_usage = usage
+                changed = True
+            if not run.linked_job_id:
+                run.linked_job_id = job.job_id
+                changed = True
+            if run.status in {"failed", "blocked"} and self._is_generic_failure_reason(run.failure_reason):
+                specific = self._specific_failure_reason_from_job(job)
+                if specific and specific != run.failure_reason:
+                    run.failure_reason = specific
+                    changed = True
+        if run.status in {"failed", "blocked"} and int(run.progress_percent or 0) >= 100:
+            run.progress_percent = self._terminal_failure_progress(run.progress_percent)
+            changed = True
+        if persist and changed:
+            run.updated_at = datetime.now(timezone.utc)
+            self._save_run(run)
+        return run
+
+    @staticmethod
+    def _token_usage_from_job_events(job: JobRecord) -> dict[str, Any]:
+        usage: dict[str, Any] = {}
+        for event in job.events:
+            if event.event_type != "iteration_ready":
+                continue
+            details = event.details if isinstance(event.details, dict) else {}
+            usage = WorkspaceCodeAgentRuntime._merge_run_token_usage(usage, details)
+        return usage
+
+    @staticmethod
+    def _is_generic_failure_reason(reason: str | None) -> bool:
+        text = str(reason or "").strip().lower()
+        return not text or text in {
+            "workspace loop exhausted its retry budget without reaching a usable state.",
+            "workspace code agent failed.",
+        }
+
+    @staticmethod
+    def _specific_failure_reason_from_job(job: JobRecord) -> str | None:
+        def important_line(logs: list[Any]) -> str:
+            specific_markers = ("operationalerror", "assertionerror", "syntaxerror", "no such table")
+            generic_markers = ("failed", "error:", "traceback")
+            clean = [" ".join(str(line or "").split()).strip() for line in logs if str(line or "").strip()]
+            for line in reversed(clean):
+                lowered = line.lower()
+                if any(marker in lowered for marker in specific_markers):
+                    return line[:320]
+            for line in reversed(clean):
+                lowered = line.lower()
+                if any(marker in lowered for marker in generic_markers):
+                    return line[:320]
+            return clean[-1][:320] if clean else ""
+
+        for issue in job.remaining_issues:
+            check = str(issue.get("check") or issue.get("code") or "validation").strip()
+            logs = issue.get("logs")
+            if isinstance(logs, list):
+                line = important_line(logs)
+                if line:
+                    return f"{check}: {line}"
+            message = str(issue.get("message") or "").strip()
+            if message:
+                return f"{check}: {message[:320]}"
+        for check in job.executed_checks:
+            if check.get("status") != "failed":
+                continue
+            line = important_line(list(check.get("logs") or []))
+            name = str(check.get("name") or "validation")
+            if line:
+                return f"{name}: {line}"
+            details = str(check.get("details") or "").strip()
+            if details:
+                return f"{name}: {details[:320]}"
+        return None
 
     def _execute_run(self, run_id: str, request_payload: dict[str, Any]) -> None:
         request = CreateRunRequest.model_validate(request_payload)
@@ -664,6 +809,10 @@ class RunService:
             run.candidate_revision_id = f"draft:{run.run_id}"
             run.iteration_count = len((self.code_agent_runtime.current_report(run.workspace_id, "iterations") or {}).get("items", []))
             run.latency_breakdown = dict(job.latency_breakdown)
+            run.token_usage = self._richer_token_usage(
+                self._richer_token_usage(run.token_usage, job.token_usage),
+                self._token_usage_from_job_events(job),
+            )
             run.repair_iterations = list(job.repair_iterations)
             run.fix_attempts = list(job.fix_attempts)
             run.scope_expansions = list(job.scope_expansions)
@@ -751,7 +900,7 @@ class RunService:
                     if run.status == "completed" and run.apply_status == "applied":
                         run.status = "running"
                         run.current_stage = "refreshing preview"
-                        run.progress_percent = max(run.progress_percent, 98)
+                        run.progress_percent = self._preview_refresh_progress(run.progress_percent)
                         self._save_run(run)
                         preview = self._queue_preview_refresh(
                             run,
@@ -788,7 +937,7 @@ class RunService:
                     if run.current_fix_phase == "completed":
                         run.current_fix_phase = "failed"
                     run.current_stage = "stopped" if self._is_stop_requested(run.run_id) else "blocked"
-                    run.progress_percent = max(run.progress_percent, 100)
+                    run.progress_percent = self._terminal_failure_progress(run.progress_percent)
                     if run.draft_ready:
                         run.summary = "Strict-green validation did not pass. Draft was retained for inspection."
                 else:
@@ -802,7 +951,7 @@ class RunService:
                     if run.current_fix_phase == "completed":
                         run.current_fix_phase = "failed"
                     run.current_stage = "failed"
-                    run.progress_percent = max(run.progress_percent, 100)
+                    run.progress_percent = self._terminal_failure_progress(run.progress_percent)
                     if run.draft_ready:
                         run.summary = "Strict-green validation did not pass. Draft was retained for inspection."
 
@@ -832,7 +981,7 @@ class RunService:
             if queue_preview_reason is not None:
                 run.status = "running"
                 run.current_stage = "refreshing preview"
-                run.progress_percent = max(run.progress_percent, 98)
+                run.progress_percent = self._preview_refresh_progress(run.progress_percent)
                 self._save_run(run)
                 preview = self._queue_preview_refresh(
                     run,
@@ -866,7 +1015,7 @@ class RunService:
             if run.current_fix_phase == "completed":
                 run.current_fix_phase = "failed"
             run.current_stage = "failed"
-            run.progress_percent = max(run.progress_percent, 100)
+            run.progress_percent = self._terminal_failure_progress(run.progress_percent)
             run.updated_at = datetime.now(timezone.utc)
             linked_job_id = self._resolve_linked_job_id(run)
             self._save_run(run)
@@ -1103,7 +1252,7 @@ class RunService:
             run.outcome_kind = "blocked_preview_infra"
             run.failure_reason = getattr(preview, "last_error", None) or "Preview rebuild failed after applying the draft."
             run.current_stage = "preview failed"
-            run.progress_percent = 100
+            run.progress_percent = self._terminal_failure_progress(run.progress_percent)
             run.checks_summary = self._copy_checks_summary(run.checks_summary, preview="failed")
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
@@ -1189,6 +1338,7 @@ class RunService:
             scope_mode="full_build",
             check_profile="full",
             intent=str(getattr(run, "intent", "") or ""),
+            generation_mode=run.generation_mode,
         )
         validation_snapshot = self._validation_snapshot_from_execution(execution)
         self.store.upsert(
@@ -1822,7 +1972,7 @@ class RunService:
         run.draft_status = "discarded" if self.workspace_service.draft_exists(run.workspace_id, run.run_id) else "none"
         run.draft_ready = False
         run.current_stage = "failed"
-        run.progress_percent = max(run.progress_percent, 100)
+        run.progress_percent = self._terminal_failure_progress(run.progress_percent)
         run.current_fix_phase = job.current_fix_phase
 
         if self.workspace_service.draft_exists(run.workspace_id, run.run_id):
@@ -1853,6 +2003,7 @@ class RunService:
             preview_run_id=None,
             scope_mode=self._validation_scope_for_run(run),
             intent=str(getattr(run, "intent", "") or ""),
+            generation_mode=run.generation_mode,
         )
         validation_snapshot = self._validation_snapshot_from_execution(execution)
         completion_state = self._strict_green_completion_state(execution.results, validation_snapshot)
@@ -1956,6 +2107,7 @@ class RunService:
             preview_run_id=run.run_id,
             scope_mode=self._validation_scope_for_run(run),
             intent=str(getattr(run, "intent", "") or ""),
+            generation_mode=run.generation_mode,
         )
         validation_snapshot = self._validation_snapshot_from_execution(execution)
         results = execution.results

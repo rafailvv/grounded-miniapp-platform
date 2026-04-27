@@ -17,7 +17,7 @@ def _new_workspace(app, tmp_path: Path) -> str:
     return created.workspace_id
 
 
-def test_commerce_prompt_requires_commerce_surface_not_generic_queue(tmp_path: Path) -> None:
+def test_prompt_alignment_requires_prompt_specific_terms_not_generic_queue(tmp_path: Path) -> None:
     app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
     runtime = app.state.container.workspace_code_agent_runtime
     workspace_id = _new_workspace(app, tmp_path)
@@ -29,26 +29,26 @@ def test_commerce_prompt_requires_commerce_surface_not_generic_queue(tmp_path: P
     result = runtime._prompt_alignment_smoke(
         workspace_id=workspace_id,
         run_id=run_id,
-        prompt="Создай интернет магазин с каталогом товаров и корзиной",
+        prompt="Создай приложение для доставки букетов клиентам",
     )
 
     assert result.status == "failed"
-    assert any("Commerce prompt" in line for line in result.logs)
+    assert any("prompt-specific language" in line for line in result.logs)
 
 
-def test_commerce_prompt_accepts_catalog_cart_order_surface(tmp_path: Path) -> None:
+def test_prompt_alignment_accepts_arbitrary_prompt_terms(tmp_path: Path) -> None:
     app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
     runtime = app.state.container.workspace_code_agent_runtime
     workspace_id = _new_workspace(app, tmp_path)
     run_id = "run_alignment_good"
     draft = app.state.container.workspace_service.prepare_draft(workspace_id, run_id)
     target = draft / "miniapp/app/static/client/app.js"
-    target.write_text("const commerce = ['product', 'catalog', 'cart', 'order'];\n", encoding="utf-8")
+    target.write_text("const flow = ['букеты', 'доставка', 'клиенты'];\n", encoding="utf-8")
 
     result = runtime._prompt_alignment_smoke(
         workspace_id=workspace_id,
         run_id=run_id,
-        prompt="Create an online store with catalog, products, cart, and orders",
+        prompt="Создай приложение для доставки букетов клиентам",
     )
 
     assert result.status == "passed"

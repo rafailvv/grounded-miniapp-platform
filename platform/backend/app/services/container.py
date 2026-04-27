@@ -52,6 +52,14 @@ class ServiceContainer:
         self.validation_suite = ValidationSuite()
         self.check_runner = CheckRunner(self.validation_suite, self.preview_service)
         self.openai_client = OpenAIClient(self.settings, self.workspace_log_service)
+        self.context_budget_manager = ContextBudgetManager()
+        self.prompt_state_manager = PromptStateManager()
+        self.context_pack_builder = ContextPackBuilder(
+            self.code_index_service,
+            self.workspace_service,
+            self.context_budget_manager,
+            self.prompt_state_manager,
+        )
         self.workspace_code_agent_runtime = WorkspaceCodeAgentRuntime(
             store=self.store,
             workspace_service=self.workspace_service,
@@ -61,14 +69,7 @@ class ServiceContainer:
             openai_client=self.openai_client,
             workspace_log_service=self.workspace_log_service,
             workspace_loop_engine=self.workspace_loop_engine,
-        )
-        self.context_budget_manager = ContextBudgetManager()
-        self.prompt_state_manager = PromptStateManager()
-        self.context_pack_builder = ContextPackBuilder(
-            self.code_index_service,
-            self.workspace_service,
-            self.context_budget_manager,
-            self.prompt_state_manager,
+            context_pack_builder=self.context_pack_builder,
         )
         self.run_service = RunService(
             self.store,

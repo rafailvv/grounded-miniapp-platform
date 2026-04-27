@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from app.models.common import GenerationMode
-from app.models.domain import CheckExecutionRecord, DraftFileOperation, GenerateRequest, RunCheckResult
+from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
+from app.models.domain import CheckExecutionRecord, DraftFileOperation, GenerateRequest, JobEvent, JobRecord, RunCheckResult, RunRecord
+from app.modules.miniapp_agent_loop.tool_agent_runtime import validate_workspace_command
 from app.modules.miniapp_agent_loop.turn_runner import WorkspaceLoopTurnRunner
 from app.modules.workspace_code_agent_runtime.runtime import SEED_CONTEXT_PATHS, WorkspaceCodeAgentRuntime
+from app.repositories.state_store import StateStore
 from app.services.workspace.service import WorkspaceService
 from app.services.workspace.run_service import RunService
 
@@ -16,34 +18,56 @@ def test_agent_prompt_declares_run_checks_read_only() -> None:
     schema = WorkspaceCodeAgentRuntime._agent_turn_schema()
 
     assert "run_checks is a read-only platform validation snapshot" in prompt
+    assert "run_command is diagnostic-only" in prompt
     assert "Tools are diagnostic only" in prompt
     assert "All code changes must be returned in the operations array" in prompt
     assert "client, specialist, and manager" in prompt
+    assert "three separate role apps" in prompt
     assert "Create tasks must be multi-page" in prompt
-    assert "at least two domain-specific child pages" in prompt
+    assert "Fast requires at least one domain-specific child page per role" in prompt
+    assert "static/client/styles.css" in prompt
+    assert "placeholder CSS" in prompt
     assert "route_manifest.json" in prompt
     assert "compact routes map" in prompt
     assert "never ship static-only mockups" in prompt
     assert "Do not add mock data, seed data, demo data, sample data" in prompt
     assert "GET and POST APIs" in prompt
+    assert "status/update endpoint" in prompt
     assert "GET starts empty, POST creates" in prompt
     assert "Never declare a route_manifest route unless" in prompt
     assert "Every generated HTML route page" in prompt
     assert "literally present in the file being read" in prompt
     assert 'node:test does not export expect' in prompt
-    assert "Generate light-mode interfaces by default" in prompt
+    assert "Generate normal light-mode interfaces by default" in prompt
+    assert "Do not give roles different color palettes" in prompt
     assert "preserve existing selectors" in prompt
     assert "miniapp/tests/test_generated_app.py" in prompt
     assert "miniapp/tests/generated_app.test.mjs" in prompt
     assert "do not use miniapp/app/..." in prompt
     assert "fileURLToPath" in prompt
     assert schema["properties"]["operations"]["maxItems"] == 20
+    assert "run_command" in schema["properties"]["tool_requests"]["items"]["properties"]["tool"]["enum"]
     assert "miniapp/tests/test_generated_app.py" in SEED_CONTEXT_PATHS
     assert "miniapp/tests/generated_app.test.mjs" in SEED_CONTEXT_PATHS
 
 
+def test_fast_first_create_schema_can_force_patch_only_turn() -> None:
+    schema = WorkspaceCodeAgentRuntime._agent_turn_schema(
+        operation_limit=12,
+        content_max_length=7000,
+        allow_tool_requests=False,
+        allowed_outcomes=["patch_ready"],
+    )
+
+    assert schema["properties"]["operations"]["maxItems"] == 12
+    assert schema["properties"]["tool_requests"]["maxItems"] == 0
+    assert "tool_request" not in schema["properties"]["outcome"]["enum"]
+    assert schema["properties"]["outcome"]["enum"] == ["patch_ready"]
+    assert schema["properties"]["operations"]["items"]["properties"]["content"]["maxLength"] == 7000
+
+
 def test_create_patch_coverage_rejects_partial_role_slice() -> None:
-    request = GenerateRequest(prompt="Create a store", intent="create")
+    request = GenerateRequest(prompt="Create a store", intent="create", generation_mode=GenerationMode.FAST)
 
     def op(path: str) -> DraftFileOperation:
         return DraftFileOperation(file_path=path, operation="replace", content="<html></html>", reason="test")
@@ -62,14 +86,14 @@ def test_create_patch_coverage_rejects_partial_role_slice() -> None:
     assert "miniapp/app/static/manager/index.html" in missing
     assert "miniapp/tests/test_generated_app.py" in missing
     assert "miniapp/tests/generated_app.test.mjs" in missing
-    assert "miniapp/app/static/specialist/<two-child-pages>/index.html" in missing
-    assert "miniapp/app/static/manager/<two-child-pages>/index.html" in missing
+    assert "miniapp/app/static/specialist/<one-child-page>/index.html" in missing
+    assert "miniapp/app/static/manager/<one-child-page>/index.html" in missing
     correction = WorkspaceCodeAgentRuntime._create_patch_coverage_correction_result(missing)
     assert "client-only first patch" in str(correction["required_next_action"])
 
 
-def test_create_patch_coverage_accepts_balanced_role_and_test_patch() -> None:
-    request = GenerateRequest(prompt="Create a store", intent="create")
+def test_fast_create_patch_coverage_accepts_one_child_page_per_role_and_test_patch() -> None:
+    request = GenerateRequest(prompt="Create a store", intent="create", generation_mode=GenerationMode.FAST)
 
     def op(path: str) -> DraftFileOperation:
         return DraftFileOperation(file_path=path, operation="replace", content="<html></html>", reason="test")
@@ -78,13 +102,16 @@ def test_create_patch_coverage_accepts_balanced_role_and_test_patch() -> None:
         "miniapp/app/generated/route_manifest.json",
         "miniapp/app/static/client/index.html",
         "miniapp/app/static/client/catalog/index.html",
-        "miniapp/app/static/client/orders/index.html",
+        "miniapp/app/static/client/app.js",
+        "miniapp/app/static/client/styles.css",
         "miniapp/app/static/specialist/index.html",
         "miniapp/app/static/specialist/queue/index.html",
-        "miniapp/app/static/specialist/stock/index.html",
+        "miniapp/app/static/specialist/app.js",
+        "miniapp/app/static/specialist/styles.css",
         "miniapp/app/static/manager/index.html",
         "miniapp/app/static/manager/analytics/index.html",
-        "miniapp/app/static/manager/products/index.html",
+        "miniapp/app/static/manager/app.js",
+        "miniapp/app/static/manager/styles.css",
         "miniapp/app/main.py",
         "miniapp/app/routes/store_api.py",
         "miniapp/tests/test_generated_app.py",
@@ -107,16 +134,55 @@ def test_create_patch_coverage_accepts_balanced_role_and_test_patch() -> None:
                 "def update_order(order_id: str, payload: dict):\n"
                 "    return payload\n"
             )
-        if operation.file_path == "miniapp/app/static/client/index.html":
+        if operation.file_path.endswith(".html"):
+            role = operation.file_path.split("/")[3]
+            operation.content = f'<link rel="stylesheet" href="/static/{role}/styles.css"><script src="/static/preview_bridge.js"></script>'
+        if operation.file_path == "miniapp/app/static/client/app.js":
             operation.content = "fetch('/api/orders', { method: 'POST', body: JSON.stringify({ title: value }) });"
+        if operation.file_path == "miniapp/app/static/specialist/app.js":
+            operation.content = "fetch('/api/orders/1', { method: 'PATCH', body: JSON.stringify({ status: 'confirmed' }) });"
+        if operation.file_path.endswith("styles.css"):
+            operation.content = ".page-shell { color: #172033; }\n.record-card { border: 1px solid #ddd; }\n.metric-card { padding: 12px; }\n"
         if operation.file_path == "miniapp/tests/test_generated_app.py":
-            operation.content = "client.get('/api/orders')\nclient.post('/api/orders', json={'title': 'User order'})\nclient.get('/api/orders')\n"
+            operation.content = "client.get('/api/orders')\nclient.post('/api/orders', json={'title': 'User order'})\nclient.get('/api/orders')\nclient.patch('/api/orders/1', json={'status':'confirmed'})\n"
 
     assert WorkspaceCodeAgentRuntime._create_patch_coverage_gap(operations, request=request) == []
 
 
+def test_fast_create_fallback_generates_separate_role_apps_and_css() -> None:
+    request = GenerateRequest(prompt="Я тренер, хочу записи на тренировки", intent="create", generation_mode=GenerationMode.FAST)
+
+    operations = WorkspaceCodeAgentRuntime._fast_create_fallback_operations(request)
+    by_path = {operation.file_path: operation.content or "" for operation in operations}
+    route_paths = [path for path in by_path if path.startswith("miniapp/app/routes/") and path != "miniapp/app/routes/role_pages.py"]
+
+    for role in ("client", "specialist", "manager"):
+        assert f"miniapp/app/static/{role}/index.html" in by_path
+        assert f"miniapp/app/static/{role}/app.js" in by_path
+        assert f"miniapp/app/static/{role}/styles.css" in by_path
+        assert f"/static/{role}/styles.css" in by_path[f"miniapp/app/static/{role}/index.html"]
+        assert f".{role}-app" in by_path[f"miniapp/app/static/{role}/styles.css"]
+        assert "padding: max(76px" in by_path[f"miniapp/app/static/{role}/styles.css"]
+        assert "/static/client/styles.css" not in by_path[f"miniapp/app/static/{role}/index.html"] or role == "client"
+        assert "/static/specialist/styles.css" not in by_path[f"miniapp/app/static/{role}/index.html"] or role == "specialist"
+        assert "/static/manager/styles.css" not in by_path[f"miniapp/app/static/{role}/index.html"] or role == "manager"
+    assert 'href="/specialist"' not in by_path["miniapp/app/static/client/index.html"]
+    assert 'href="/manager"' not in by_path["miniapp/app/static/client/index.html"]
+    assert 'href="/client"' not in by_path["miniapp/app/static/specialist/index.html"]
+    assert 'href="/manager"' not in by_path["miniapp/app/static/specialist/index.html"]
+    assert 'href="/client"' not in by_path["miniapp/app/static/manager/index.html"]
+    assert 'href="/specialist"' not in by_path["miniapp/app/static/manager/index.html"]
+    assert 'method: "POST"' in by_path["miniapp/app/static/client/app.js"]
+    assert 'method: "PATCH"' in by_path["miniapp/app/static/specialist/app.js"]
+    assert "metric-card" in by_path["miniapp/app/static/manager/app.js"]
+    assert len(route_paths) == 1
+    assert route_paths[0] != "miniapp/app/routes/bookings.py"
+    assert '@router.patch("/api/' in by_path[route_paths[0]]
+    assert "тренер" in "\n".join(by_path.values()).lower()
+
+
 def test_create_patch_coverage_rejects_static_only_app_without_api() -> None:
-    request = GenerateRequest(prompt="Create a store", intent="create")
+    request = GenerateRequest(prompt="Create a store", intent="create", generation_mode=GenerationMode.FAST)
 
     def op(path: str) -> DraftFileOperation:
         return DraftFileOperation(file_path=path, operation="replace", content="<html></html>", reason="test")
@@ -126,13 +192,10 @@ def test_create_patch_coverage_rejects_static_only_app_without_api() -> None:
         "miniapp/app/main.py",
         "miniapp/app/static/client/index.html",
         "miniapp/app/static/client/catalog/index.html",
-        "miniapp/app/static/client/orders/index.html",
         "miniapp/app/static/specialist/index.html",
         "miniapp/app/static/specialist/queue/index.html",
-        "miniapp/app/static/specialist/stock/index.html",
         "miniapp/app/static/manager/index.html",
         "miniapp/app/static/manager/analytics/index.html",
-        "miniapp/app/static/manager/products/index.html",
         "miniapp/tests/test_generated_app.py",
         "miniapp/tests/generated_app.test.mjs",
     ]
@@ -144,6 +207,45 @@ def test_create_patch_coverage_rejects_static_only_app_without_api() -> None:
     assert "backend POST /api/<resource>" in missing
     assert "frontend form/fetch POST /api/<resource>" in missing
     assert "miniapp/tests/test_generated_app.py API persistence coverage" in missing
+
+
+def test_balanced_create_patch_coverage_requires_two_child_pages_per_role() -> None:
+    request = GenerateRequest(prompt="Create a store", intent="create", generation_mode=GenerationMode.BALANCED)
+
+    def op(path: str) -> DraftFileOperation:
+        return DraftFileOperation(file_path=path, operation="replace", content="<html></html>", reason="test")
+
+    operations = [
+        op("miniapp/app/generated/route_manifest.json"),
+        op("miniapp/app/static/client/index.html"),
+        op("miniapp/app/static/client/catalog/index.html"),
+        op("miniapp/app/static/specialist/index.html"),
+        op("miniapp/app/static/specialist/queue/index.html"),
+        op("miniapp/app/static/manager/index.html"),
+        op("miniapp/app/static/manager/analytics/index.html"),
+        op("miniapp/app/main.py"),
+        op("miniapp/app/routes/store_api.py"),
+        op("miniapp/tests/test_generated_app.py"),
+        op("miniapp/tests/generated_app.test.mjs"),
+    ]
+    for operation in operations:
+        if operation.file_path == "miniapp/app/routes/store_api.py":
+            operation.content = (
+                "from fastapi import APIRouter\nrouter = APIRouter()\n"
+                "@router.get('/api/orders')\ndef list_orders(): return []\n"
+                "@router.post('/api/orders')\ndef create_order(payload: dict): return payload\n"
+                "@router.patch('/api/orders/{order_id}')\ndef update_order(order_id: str, payload: dict): return payload\n"
+            )
+        if operation.file_path == "miniapp/app/static/client/index.html":
+            operation.content = "fetch('/api/orders', { method: 'POST', body: JSON.stringify({ title: value }) });"
+        if operation.file_path == "miniapp/tests/test_generated_app.py":
+            operation.content = "client.get('/api/orders')\nclient.post('/api/orders', json={'title': 'User order'})\nclient.get('/api/orders')\n"
+
+    missing = WorkspaceCodeAgentRuntime._create_patch_coverage_gap(operations, request=request)
+
+    assert "miniapp/app/static/client/<two-child-pages>/index.html" in missing
+    assert "miniapp/app/static/specialist/<two-child-pages>/index.html" in missing
+    assert "miniapp/app/static/manager/<two-child-pages>/index.html" in missing
 
 
 def test_fix_completion_requires_meaningful_diff_even_when_checks_are_green() -> None:
@@ -189,6 +291,158 @@ def test_run_token_usage_accumulates_iteration_ready_details() -> None:
         "reasoning_tokens": 25,
         "total_tokens": 1000,
     }
+
+
+def test_run_save_preserves_live_token_usage_and_caps_failed_progress(tmp_path) -> None:
+    service = object.__new__(RunService)
+    service.store = StateStore(tmp_path / "state.json")
+    run = RunRecord(
+        workspace_id="ws",
+        prompt="Create app",
+        intent="create",
+        status="running",
+        token_usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15, "turn_count": 1},
+        linked_job_id="job_live",
+    )
+    service._save_run(run)
+
+    stale_terminal = run.model_copy(
+        update={
+            "status": "failed",
+            "apply_status": "failed",
+            "current_stage": "failed",
+            "progress_percent": 100,
+            "token_usage": {},
+            "linked_job_id": None,
+        }
+    )
+    service._save_run(stale_terminal)
+    saved = RunRecord.model_validate(service.store.get("runs", run.run_id))
+
+    assert saved.progress_percent == 98
+    assert saved.linked_job_id == "job_live"
+    assert saved.token_usage["total_tokens"] == 15
+    assert saved.token_usage["turn_count"] == 1
+
+
+def test_preview_refresh_progress_does_not_step_back_from_99() -> None:
+    assert RunService._preview_refresh_progress(94) == 98
+    assert RunService._preview_refresh_progress(98) == 98
+    assert RunService._preview_refresh_progress(99) == 99
+    assert RunService._preview_refresh_progress(100) == 99
+
+
+def test_get_run_backfills_token_usage_and_specific_failure_from_job_events(tmp_path) -> None:
+    service = object.__new__(RunService)
+    service.store = StateStore(tmp_path / "state.json")
+    run = RunRecord(
+        workspace_id="ws",
+        prompt="Create app",
+        intent="create",
+        status="failed",
+        apply_status="failed",
+        current_stage="failed",
+        progress_percent=100,
+        failure_reason="Workspace loop exhausted its retry budget without reaching a usable state.",
+    )
+    job = JobRecord(
+        workspace_id="ws",
+        prompt="Create app",
+        status="failed",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        linked_run_id=run.run_id,
+        events=[
+            JobEvent(
+                event_type="iteration_ready",
+                message="turn",
+                details={"input_tokens": 1000, "output_tokens": 200, "reasoning_tokens": 50, "total_tokens": 1200},
+            )
+        ],
+        remaining_issues=[
+            {
+                "check": "generated_app_python_tests",
+                "logs": [
+                    "sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) no such table: bookings",
+                    "FAILED (errors=1)",
+                ],
+            }
+        ],
+    )
+    service.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    service.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
+
+    hydrated = service.get_run(run.run_id)
+
+    assert hydrated.progress_percent == 98
+    assert hydrated.linked_job_id == job.job_id
+    assert hydrated.token_usage["total_tokens"] == 1200
+    assert hydrated.token_usage["turn_count"] == 1
+    assert "no such table: bookings" in hydrated.failure_reason
+
+
+def test_get_run_keeps_explicit_zero_token_usage_from_fallback_job(tmp_path) -> None:
+    service = object.__new__(RunService)
+    service.store = StateStore(tmp_path / "state.json")
+    run = RunRecord(
+        workspace_id="ws",
+        prompt="Create app",
+        intent="create",
+        status="completed",
+        apply_status="applied",
+        current_stage="completed",
+        progress_percent=100,
+        token_usage={},
+    )
+    zero_usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 0,
+        "turn_count": 0,
+        "last_turn": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+    job = JobRecord(
+        workspace_id="ws",
+        prompt="Create app",
+        status="completed",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        linked_run_id=run.run_id,
+        token_usage=zero_usage,
+    )
+    service.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    service.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
+
+    hydrated = service.get_run(run.run_id)
+
+    assert hydrated.linked_job_id == job.job_id
+    assert hydrated.token_usage["total_tokens"] == 0
+    assert hydrated.token_usage["input_tokens"] == 0
+    assert hydrated.token_usage["output_tokens"] == 0
+    assert hydrated.token_usage["reasoning_tokens"] == 0
+    assert hydrated.token_usage["turn_count"] == 0
+
+
+def test_scoped_run_command_policy_allows_diagnostics_and_blocks_mutation() -> None:
+    assert validate_workspace_command("cd miniapp && python -m unittest discover -s tests -p test_generated_app.py") is None
+    assert validate_workspace_command("python3 -m py_compile app/main.py") is None
+    assert validate_workspace_command("node --test tests/generated_app.test.mjs") is None
+    assert validate_workspace_command("node --check app/static/client/app.js") is None
+    assert validate_workspace_command("rg \"fetch\" app/static") is None
+    assert validate_workspace_command("sed -n '1,80p' app/main.py") is None
+    assert validate_workspace_command("ls app/static/client") is None
+
+    assert "Package installation" in str(validate_workspace_command("npm install"))
+    assert "Destructive" in str(validate_workspace_command("rm -rf miniapp"))
+    assert "Only 'python -m unittest'" in str(validate_workspace_command("python -c 'print(1)'"))
+    assert "Network" in str(validate_workspace_command("curl https://example.com"))
+    assert "Command chaining" in str(validate_workspace_command("cd miniapp && node --test tests/a.mjs && ls"))
 
 
 def test_failed_generated_tests_add_test_context_and_repair_contract() -> None:
@@ -521,7 +775,7 @@ def test_output_cap_correction_for_create_requires_compact_patch() -> None:
     )
 
     assert correction["tool"] == "output_cap_correction"
-    assert "no more than 20 concise file operations" in str(correction["required_next_action"])
+    assert "no more than 12 concise file operations" in str(correction["required_next_action"])
     assert "backend API route module with GET/POST persistence" in str(correction["required_next_action"])
     assert "Do not add mock data" in str(correction["required_next_action"])
     assert "do not request more context" in str(correction["required_next_action"])
@@ -548,13 +802,16 @@ def test_fast_create_budget_prefers_frontend_first_compact_patch() -> None:
     assert "up to 20 concise operations" in str(budget["required_next_action"])
     assert "first answer" in str(budget["required_next_action"])
     assert "backend persistence" in str(budget["contract"])
-    assert "three role root pages" in str(budget["required_next_action"])
+    assert "three separate role root apps" in str(budget["required_next_action"])
+    assert "role styles.css files" in str(budget["required_next_action"])
     assert "POST-capable /api resource" in str(budget["required_next_action"])
+    assert "status/update endpoint" in str(budget["required_next_action"])
     assert "GET starts empty" in str(budget["required_next_action"])
-    assert "profile/settings page pattern" in str(budget["required_next_action"])
+    assert "Choose child-page names and flows from the user's request" in str(budget["required_next_action"])
     assert "cwd=miniapp" in str(budget["required_next_action"])
     assert "path.join(process.cwd()" in str(budget["required_next_action"])
-    assert "large inline <style> blocks" in str(budget["required_next_action"])
+    assert "Per-role CSS files are required" in str(budget["required_next_action"])
+    assert "consistent neutral light palette" in str(budget["required_next_action"])
 
 
 def test_tool_budget_correction_forces_patch_ready_after_reads() -> None:
@@ -571,11 +828,13 @@ def test_tool_budget_correction_forces_patch_ready_after_reads() -> None:
     assert correction["ignored_tool_requests"][0]["targets"] == ["miniapp/app/routes/role_pages.py"]
 
 
-def test_product_behavior_phrase_is_not_commerce_prompt() -> None:
-    assert not WorkspaceCodeAgentRuntime._is_commerce_prompt(
+def test_prompt_semantic_tokens_are_not_domain_classifier() -> None:
+    assert WorkspaceCodeAgentRuntime._prompt_semantic_tokens(
         "fix the javascript syntax error without changing product behavior"
-    )
-    assert WorkspaceCodeAgentRuntime._is_commerce_prompt("create a product catalog with cart")
+    ) == ["fix", "javascript", "syntax", "error", "without", "changing", "product", "behavior"]
+    assert WorkspaceCodeAgentRuntime._prompt_semantic_tokens(
+        "создай приложение для бронирования тренировок"
+    ) == ["бронирования", "тренировок"]
 
 
 def test_running_progress_stays_early_until_file_edits_exist() -> None:
@@ -633,7 +892,7 @@ def test_agent_turn_tuning_caps_all_generation_modes() -> None:
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.FAST, intent="create") == {
         "reasoning": {"effort": "low"},
-        "max_output_tokens": 22000,
+        "max_output_tokens": 28000,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED, intent="create") == {
         "reasoning": {"effort": "medium"},
@@ -722,14 +981,7 @@ def test_fast_loop_reaches_full_context_before_repeated_signature_failure() -> N
     ) == "full_bundle"
 
 
-def test_prompt_alignment_domain_detection_does_not_treat_booking_catalog_as_commerce() -> None:
-    prompt = "создай приложение для бронирования тренировок: каталог направлений, расписание, тренеры и запись на слот"
-
-    assert not WorkspaceCodeAgentRuntime._is_commerce_prompt(prompt)
-    assert WorkspaceCodeAgentRuntime._is_booking_prompt(prompt)
-
-
-def test_prompt_alignment_accepts_domain_specific_shop_language_without_literal_product_word() -> None:
+def test_prompt_alignment_uses_prompt_terms_without_domain_branches() -> None:
     class FakeWorkspaceService:
         def diff(self, workspace_id: str, run_id: str | None = None) -> str:
             del workspace_id, run_id
@@ -741,8 +993,8 @@ def test_prompt_alignment_accepts_domain_specific_shop_language_without_literal_
         def try_read_text_file(self, workspace_id: str, path: str, run_id: str | None = None) -> str | None:
             del workspace_id, run_id
             return {
-                "miniapp/app/static/client/index.html": "Каталог сортов чая, карточки, корзина и оформление заказа",
-                "miniapp/app/static/manager/index.html": "Панель менеджера: ассортимент, позиции каталога и заказы",
+                "miniapp/app/static/client/index.html": "Кабинет клиента для букетов, доставки и адреса",
+                "miniapp/app/static/manager/index.html": "Панель менеджера: букеты, доставка, адреса",
             }.get(path)
 
     runtime = object.__new__(WorkspaceCodeAgentRuntime)
@@ -751,7 +1003,7 @@ def test_prompt_alignment_accepts_domain_specific_shop_language_without_literal_
     result = runtime._prompt_alignment_smoke(
         workspace_id="ws",
         run_id="run",
-        prompt="Создай светлый интернет-магазин чая для клиента и менеджера",
+        prompt="Создай приложение для доставки букетов клиентам",
     )
 
     assert result.status == "passed"

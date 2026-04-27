@@ -191,6 +191,7 @@ class JobRecord(StrictModel):
     artifacts: dict[str, str] = Field(default_factory=dict)
     remaining_issues: list[dict[str, Any]] = Field(default_factory=list)
     latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
+    token_usage: dict[str, Any] = Field(default_factory=dict)
     retrieval_stats: dict[str, Any] = Field(default_factory=dict)
     cache_stats: dict[str, Any] = Field(default_factory=dict)
     repair_iterations: list[dict[str, Any]] = Field(default_factory=list)
