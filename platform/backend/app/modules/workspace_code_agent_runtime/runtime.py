@@ -50,6 +50,91 @@ QUALITY_FIDELITY = {
     GenerationMode.BASIC: "basic_app",
 }
 AGENT_TURN_OPERATION_LIMIT = 20
+FOCUSED_VISUAL_OPERATION_LIMIT = 4
+FOCUSED_VISUAL_CONTENT_MAX_LENGTH = 8000
+FOCUSED_VISUAL_MAX_ATTEMPTS = 2
+FOCUSED_VISUAL_STYLE_MARKERS = (
+    "background",
+    "border",
+    "color",
+    "colors",
+    "css",
+    "font",
+    "palette",
+    "padding",
+    "spacing",
+    "style",
+    "theme",
+    "typography",
+    "visual",
+    "акцент",
+    "визуал",
+    "внешний вид",
+    "отступ",
+    "палитр",
+    "размер",
+    "стил",
+    "тем",
+    "фон",
+    "цвет",
+    "шрифт",
+    "фиолет",
+    "синий",
+    "синю",
+    "синее",
+    "сини",
+    "красн",
+    "зелен",
+    "зелён",
+    "желт",
+    "жёлт",
+    "черн",
+    "чёрн",
+    "бел",
+    "серый",
+    "серую",
+    "серое",
+    "серые",
+)
+FOCUSED_COPY_EDIT_MARKERS = (
+    "copy",
+    "heading",
+    "label",
+    "rename",
+    "text",
+    "title",
+    "заголов",
+    "лейбл",
+    "назван",
+    "надпис",
+    "переимен",
+    "слово",
+    "текст",
+)
+BEHAVIOR_EDIT_MARKERS = (
+    "/api",
+    "api",
+    "app.js",
+    "backend",
+    "database",
+    "endpoint",
+    "fetch",
+    "javascript",
+    "method:",
+    "patch",
+    "post",
+    "put",
+    "route",
+    "server",
+    "status",
+    "бекенд",
+    "бэк",
+    "логик",
+    "маршрут",
+    "сервер",
+    "статус",
+    "эндпоинт",
+)
 READ_ONLY_WRITE_PREFIXES = (
     ".git/",
     "node_modules/",
@@ -346,6 +431,42 @@ class WorkspaceCodeAgentRuntime:
             return list(ROLE_ORDER)
         return explicit_scope or list(ROLE_ORDER)
 
+    @classmethod
+    def _focused_edit_kind(cls, request: GenerateRequest) -> str:
+        intent = str(request.intent or "").strip().lower()
+        if intent not in {"edit", "refine", "role_only_change"}:
+            return "standard"
+        prompt = str(request.prompt or "").strip().lower()
+        if not prompt:
+            return "behavior_edit"
+        if cls._contains_any_marker(prompt, BEHAVIOR_EDIT_MARKERS):
+            return "behavior_edit"
+        if cls._contains_any_marker(prompt, FOCUSED_VISUAL_STYLE_MARKERS):
+            return "visual_style_edit"
+        if cls._contains_any_marker(prompt, FOCUSED_COPY_EDIT_MARKERS):
+            return "small_copy_edit"
+        return "behavior_edit"
+
+    @staticmethod
+    def _contains_any_marker(text: str, markers: tuple[str, ...]) -> bool:
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _focused_visual_css_paths(role_scope: list[str] | tuple[str, ...] | None = None) -> list[str]:
+        paths: list[str] = ["miniapp/app/static/shared/base.css"]
+        for role in role_scope or ROLE_ORDER:
+            if role in ROLE_ORDER:
+                paths.append(f"miniapp/app/static/{role}/styles.css")
+        return list(dict.fromkeys(paths))
+
+    def _focused_visual_seed_context(self, workspace_id: str, run_id: str, *, role_scope: list[str]) -> dict[str, str]:
+        contexts: dict[str, str] = {}
+        for path in self._focused_visual_css_paths(role_scope):
+            content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
+            if content is not None:
+                contexts[path] = content
+        return contexts
+
     def _run_loop(
         self,
         *,
@@ -358,11 +479,21 @@ class WorkspaceCodeAgentRuntime:
         generation_mode: GenerationMode,
         should_stop: Callable[[], bool] | None,
     ) -> WorkspaceLoopResult:
-        seed_context = self._seed_file_context(workspace_id, run_id, role_scope=role_scope)
+        focused_edit_kind = self._focused_edit_kind(request)
+        focused_visual_edit = focused_edit_kind == "visual_style_edit"
+        seed_context = (
+            self._focused_visual_seed_context(workspace_id, run_id, role_scope=role_scope)
+            if focused_visual_edit
+            else self._seed_file_context(workspace_id, run_id, role_scope=role_scope)
+        )
         tool_results: list[dict[str, object]] = []
         if generation_mode == GenerationMode.FAST and str(request.intent or "").lower() == "create":
             tool_results.append(self._fast_create_budget_result())
-        last_changed_files: list[str] = ["miniapp", "docs", "README.md"]
+        if focused_visual_edit:
+            tool_results.append(self._focused_visual_edit_budget_result(role_scope=role_scope))
+        last_changed_files: list[str] = (
+            self._focused_visual_css_paths(role_scope) if focused_visual_edit else ["miniapp", "docs", "README.md"]
+        )
         cached_no_diff_checks: tuple[CheckExecutionRecord, dict[str, Any]] | None = None
 
         def _execute_checks(changed_files: list[str]) -> tuple[CheckExecutionRecord, dict[str, Any]]:
@@ -381,14 +512,19 @@ class WorkspaceCodeAgentRuntime:
             )
             if not has_draft_diff and cached_no_diff_checks is not None:
                 return cached_no_diff_checks
-            check_profile = "full" if generation_mode == GenerationMode.QUALITY else "fast_gate"
+            check_profile = (
+                "focused_edit"
+                if focused_visual_edit
+                else "full" if generation_mode == GenerationMode.QUALITY else "fast_gate"
+            )
+            scope_mode = "focused_edit" if focused_visual_edit else "agentic"
             execution = self.check_runner.run(
                 workspace_id=workspace_id,
                 run_id=run_id,
                 source_dir=draft_source,
                 changed_files=list(last_changed_files),
                 preview_run_id=run_id,
-                scope_mode="agentic",
+                scope_mode=scope_mode,
                 check_profile=check_profile,
                 intent=str(request.intent or ""),
                 generation_mode=generation_mode,
@@ -419,6 +555,8 @@ class WorkspaceCodeAgentRuntime:
                 workspace_id=workspace_id,
                 run_id=run_id,
                 prompt=request.prompt,
+                intent=str(request.intent or ""),
+                focused_edit_kind=focused_edit_kind,
             )
             execution.results.append(prompt_smoke)
             execution.completed_at = datetime.now(timezone.utc)
@@ -433,7 +571,7 @@ class WorkspaceCodeAgentRuntime:
                 "containers": [],
                 "container_logs": {},
             }
-            if any(item.status == "failed" for item in execution.results):
+            if any(item.status == "failed" for item in execution.results) and not focused_visual_edit:
                 self._collect_preview_diagnostics(workspace_id, preview_details)
             if not has_draft_diff:
                 cached_no_diff_checks = (execution, preview_details)
@@ -777,7 +915,7 @@ class WorkspaceCodeAgentRuntime:
             draft_source=draft_source,
             role_scope=role_scope,
             generation_mode=generation_mode,
-            max_attempts=self._max_attempts(generation_mode),
+            max_attempts=FOCUSED_VISUAL_MAX_ATTEMPTS if focused_visual_edit else self._max_attempts(generation_mode),
             initial_operations=[],
             initial_assistant_message="Workspace code agent initialized.",
             initial_files_read=list(seed_context.keys()),
@@ -816,6 +954,8 @@ class WorkspaceCodeAgentRuntime:
             generation_mode = self._generation_mode(request.generation_mode)
             fast_create_turn = generation_mode == GenerationMode.FAST and str(request.intent or "").strip().lower() == "create"
             fast_first_create_patch = fast_create_turn and not self.workspace_service.diff(workspace_id, run_id=run_id).strip()
+            focused_edit_kind = self._focused_edit_kind(request)
+            focused_visual_edit = focused_edit_kind == "visual_style_edit"
             primary_model = models_for_role(
                 "agent_turn",
                 model_profile=request.model_profile,
@@ -824,10 +964,22 @@ class WorkspaceCodeAgentRuntime:
             response = self.openai_client.generate_agent_turn(
                 schema_name="workspace_code_agent_turn_v1",
                 schema=self._agent_turn_schema(
-                    operation_limit=20 if fast_create_turn else AGENT_TURN_OPERATION_LIMIT,
-                    content_max_length=9000 if fast_create_turn else 18000,
-                    allow_tool_requests=not fast_first_create_patch,
-                    allowed_outcomes=["patch_ready"] if fast_first_create_patch else None,
+                    operation_limit=(
+                        FOCUSED_VISUAL_OPERATION_LIMIT
+                        if focused_visual_edit
+                        else 20 if fast_create_turn else AGENT_TURN_OPERATION_LIMIT
+                    ),
+                    content_max_length=(
+                        FOCUSED_VISUAL_CONTENT_MAX_LENGTH
+                        if focused_visual_edit
+                        else 9000 if fast_create_turn else 18000
+                    ),
+                    allow_tool_requests=False if focused_visual_edit else not fast_first_create_patch,
+                    allowed_outcomes=(
+                        ["patch_ready", "fatal_invalid_response"]
+                        if focused_visual_edit
+                        else ["patch_ready"] if fast_first_create_patch else None
+                    ),
                 ),
                 system_prompt=self._agent_system_prompt(),
                 user_prompt=self._agent_user_prompt(
@@ -849,7 +1001,11 @@ class WorkspaceCodeAgentRuntime:
                 prompt_cache_key=self._prompt_cache_key(workspace_id, run_id, request.prompt),
                 stable_prefix="workspace_code_agent_runtime_v2",
                 model_override=primary_model,
-                responses_tuning_override=self._agent_turn_tuning(generation_mode, intent=str(request.intent or "")),
+                responses_tuning_override=self._agent_turn_tuning(
+                    generation_mode,
+                    intent=str(request.intent or ""),
+                    focused_edit_kind=focused_edit_kind,
+                ),
             )
             job.llm_model = str(response.get("model") or "")
             turn_cache_stats = response.get("cache_stats") or {}
@@ -1076,6 +1232,20 @@ class WorkspaceCodeAgentRuntime:
         latest_diff_summary: str | None,
     ) -> str:
         file_tree = self.workspace_service.file_tree(workspace_id, run_id=run_id)
+        focused_edit_kind = self._focused_edit_kind(request)
+        focused_visual_edit = focused_edit_kind == "visual_style_edit"
+        focused_edit_files = self._focused_visual_css_paths(request.target_role_scope or ROLE_ORDER) if focused_visual_edit else []
+        focused_rules: list[str] = []
+        if focused_visual_edit:
+            focused_rules.extend(
+                [
+                    "Focused visual_style_edit lane: change only CSS/style files listed in focused_edit_files. Do not edit HTML, JavaScript, backend routes, route_manifest.json, generated tests, docs, or unrelated files.",
+                    f"Return one compact patch_ready response with at most {FOCUSED_VISUAL_OPERATION_LIMIT} operations and no tool requests. Prefer full-file replace for CSS if a hunk patch would be ambiguous or has already conflicted.",
+                    "Do not add product behavior, data, tests, API calls, navigation, or role copy for a pure style/color/spacing prompt.",
+                    "CSS may use hex/rgb/hsl values for requested colors; the literal user color word does not need to appear in generated CSS.",
+                    "Keep the existing top safe spacing and existing selectors/data-testid hooks intact while changing the visual styling.",
+                ]
+            )
         payload = {
             "task": "Edit the draft workspace to satisfy the user prompt and pass platform invariant checks.",
             "workspace_id": workspace_id,
@@ -1083,6 +1253,8 @@ class WorkspaceCodeAgentRuntime:
             "mode": request.mode,
             "intent": request.intent,
             "generation_mode": str(getattr(request.generation_mode, "value", request.generation_mode) or ""),
+            "focused_edit_kind": focused_edit_kind,
+            "focused_edit_files": focused_edit_files,
             "attempt": attempt,
             "tool_round": tool_round,
             "context_mode": context_mode,
@@ -1114,19 +1286,27 @@ class WorkspaceCodeAgentRuntime:
                 and str(request.intent or "").strip().lower() == "create"
                 else []
             ),
-            "file_tree": file_tree[:240],
+            "file_tree": file_tree[:120] if focused_visual_edit else file_tree[:240],
             "file_contexts": {
-                **self._compact_file_contexts(seed_context, max_files=22 if context_mode == "full_bundle" else 14),
-                **self._compact_file_contexts(extra_file_context, max_files=12),
+                **self._compact_file_contexts(
+                    seed_context,
+                    max_files=8 if focused_visual_edit else 22 if context_mode == "full_bundle" else 14,
+                    max_chars=9000 if focused_visual_edit else 6000,
+                ),
+                **self._compact_file_contexts(extra_file_context, max_files=4 if focused_visual_edit else 12),
             },
-            "context_pack": self._context_pack_payload(
-                workspace_id=workspace_id,
-                run_id=run_id,
-                request=request,
-                latest_execution=latest_execution,
-                latest_diff_summary=latest_diff_summary,
-                context_mode=context_mode,
-                attempt=attempt,
+            "context_pack": (
+                {}
+                if focused_visual_edit
+                else self._context_pack_payload(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    request=request,
+                    latest_execution=latest_execution,
+                    latest_diff_summary=latest_diff_summary,
+                    context_mode=context_mode,
+                    attempt=attempt,
+                )
             ),
             "latest_checks": self._compact_checks(latest_execution),
             "preview": latest_preview_details,
@@ -1134,7 +1314,8 @@ class WorkspaceCodeAgentRuntime:
             "last_turn_summary": last_turn_summary,
             "tool_results": tool_results[-8:],
             "rules": [
-                f"Keep each turn applyable: return up to {AGENT_TURN_OPERATION_LIMIT} independent file operations together when they are part of the same coherent change.",
+                *focused_rules,
+                f"Outside focused edit lanes, keep each turn applyable: return up to {AGENT_TURN_OPERATION_LIMIT} independent file operations together when they are part of the same coherent change.",
                 "For Fast create tasks, the first model answer should usually be outcome=patch_ready, not tool_request or no_progress, because the template file_contexts already provide the shell.",
                 "For Fast create tasks, output one compact working MVP pass instead of a giant app: up to 20 concise operations covering route_manifest.json, three role roots, one key child page per role, role app.js files, role styles.css files, one backend API route module, main.py router registration, generated tests, and form/fetch/status code. Avoid verbose comments, inline styles, large fixtures, and repeated tool reads for files already shown in file_contexts.",
                 "Fast size contract: no extra pages beyond one child per role, no extra API resources, compact but real per-role CSS, no long narrative copy. Keep each HTML file roughly under 160 lines and keep CSS focused on layout, forms, lists, cards, buttons, and status badges. Use one consistent neutral light palette across roles.",
@@ -1151,7 +1332,7 @@ class WorkspaceCodeAgentRuntime:
                 "For create tasks, do not include mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded business records in generated app source.",
                 "For create tasks, app state starts empty. Use domain-specific empty-state copy plus forms/buttons so users can add their own records.",
                 "For Fast create tasks, keep each generated HTML/JS/CSS/test file compact and use zero preloaded business records.",
-                "For Fast create tasks, do not emit separate large CSS files for every role; reuse existing shell styles or one compact shared stylesheet when needed.",
+                "For Fast create tasks, create the required role CSS files for client, specialist, and manager, but keep them compact and consistent instead of building a large visual system.",
                 "Use light mode by default for all generated UI: light surfaces, dark text, accessible contrast, and no dark backgrounds unless the user explicitly requested dark mode.",
                 "For broad create tasks, batch independent backend/static/style files in one response when the changes are clear; otherwise patch the most important working slice first and continue after checks.",
                 "For create tasks, generate client, specialist, and manager role roots even if the prompt mentions only one audience.",
@@ -1380,7 +1561,14 @@ class WorkspaceCodeAgentRuntime:
         return loaded_context, tool_results
 
     @staticmethod
-    def _agent_turn_tuning(generation_mode: GenerationMode, *, intent: str = "") -> dict[str, Any]:
+    def _agent_turn_tuning(
+        generation_mode: GenerationMode,
+        *,
+        intent: str = "",
+        focused_edit_kind: str = "",
+    ) -> dict[str, Any]:
+        if focused_edit_kind == "visual_style_edit":
+            return {"reasoning": {"effort": "low"}, "max_output_tokens": FOCUSED_VISUAL_CONTENT_MAX_LENGTH}
         if str(intent or "").lower() in {"edit", "refine", "role_only_change"}:
             return {"reasoning": {"effort": "low"}, "max_output_tokens": 16000}
         if str(intent or "").lower() == "create":
@@ -2646,6 +2834,22 @@ test('role apps have separate frontend actions and styles', () => {{
         }
 
     @staticmethod
+    def _focused_visual_edit_budget_result(*, role_scope: list[str]) -> dict[str, object]:
+        return {
+            "tool": "focused_visual_edit_budget",
+            "contract": (
+                "This is a small visual/style edit. It must use the focused CSS lane instead of the full create/product "
+                "generation loop."
+            ),
+            "focused_edit_files": WorkspaceCodeAgentRuntime._focused_visual_css_paths(role_scope),
+            "required_next_action": (
+                "Return outcome=patch_ready with 1-4 CSS-only operations. Prefer replace with the full resulting CSS file "
+                "when a hunk patch is ambiguous. Do not edit backend, JavaScript, HTML, route manifests, generated tests, "
+                "or docs. Do not request tools when the listed CSS files are already provided in file_contexts."
+            ),
+        }
+
+    @staticmethod
     def _is_self_blocked_tool_contract_response(payload: dict[str, Any]) -> bool:
         if str(payload.get("outcome") or "").strip().lower() not in {"fatal_invalid_response", "no_progress"}:
             return False
@@ -2861,7 +3065,15 @@ test('role apps have separate frontend actions and styles', () => {{
                 paths.append(path)
         return list(dict.fromkeys(paths))
 
-    def _prompt_alignment_smoke(self, *, workspace_id: str, run_id: str, prompt: str) -> RunCheckResult:
+    def _prompt_alignment_smoke(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        prompt: str,
+        intent: str = "",
+        focused_edit_kind: str = "",
+    ) -> RunCheckResult:
         diff_text = self.workspace_service.diff(workspace_id, run_id=run_id)
         if not diff_text.strip():
             return RunCheckResult(
@@ -2871,6 +3083,24 @@ test('role apps have separate frontend actions and styles', () => {{
                 command="prompt alignment static smoke",
                 logs=[],
             )
+        if focused_edit_kind == "visual_style_edit":
+            return RunCheckResult(
+                name="prompt_alignment_smoke",
+                status="skipped",
+                details="Prompt alignment smoke skipped for focused visual/style edits; CSS can encode requested colors as design values rather than literal prompt words.",
+                command="prompt alignment static smoke",
+                logs=[],
+            )
+        if str(intent or "").strip().lower() in {"edit", "refine", "role_only_change"}:
+            changed_paths = self._paths_from_diff(diff_text)
+            if changed_paths and all(path.startswith("miniapp/app/static/") and path.endswith(".css") for path in changed_paths):
+                return RunCheckResult(
+                    name="prompt_alignment_smoke",
+                    status="skipped",
+                    details="Prompt alignment smoke skipped for CSS-only edits.",
+                    command="prompt alignment static smoke",
+                    logs=[],
+                )
         prompt_lower = prompt.lower()
         targeted_fix_requested = any(
             marker in prompt_lower

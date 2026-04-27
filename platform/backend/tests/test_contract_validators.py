@@ -407,6 +407,45 @@ def test_agentic_platform_invariants_reject_neutral_role_template(tmp_path: Path
     assert "specialist" in result.diagnostics["role_coverage"]
 
 
+def test_focused_css_edit_check_profile_skips_generated_tests_and_preview(tmp_path: Path) -> None:
+    class FakeValidationSuite:
+        def validate_build(self, workspace_path: Path):
+            del workspace_path
+            return []
+
+        def validate_connectivity(self, workspace_path: Path):
+            del workspace_path
+            return []
+
+    css_path = tmp_path / "miniapp/app/static/client/styles.css"
+    css_path.parent.mkdir(parents=True, exist_ok=True)
+    css_path.write_text(".page-shell { color: #1f2937; background: #ffffff; }\n", encoding="utf-8")
+    runner = CheckRunner(FakeValidationSuite(), object())  # type: ignore[arg-type]
+
+    execution = runner.run(
+        workspace_id="ws",
+        run_id="run",
+        source_dir=tmp_path,
+        changed_files=["miniapp/app/static/client/styles.css"],
+        scope_mode="agentic",
+        check_profile="focused_edit",
+        intent="edit",
+        generation_mode=GenerationMode.FAST,
+    )
+
+    results = {result.name: result for result in execution.results}
+    assert results["schema_validators"].status == "skipped"
+    assert results["connectivity_validators"].status == "skipped"
+    assert results["changed_files_static"].status == "passed"
+    assert results["platform_invariants"].status == "passed"
+    assert results["platform_invariants"].diagnostics["generated_tests"]["status"] == "skipped"
+    assert results["generated_app_python_tests"].status == "skipped"
+    assert "focused CSS-only visual edit" in results["generated_app_python_tests"].details
+    assert results["generated_app_js_tests"].status == "skipped"
+    assert results["preview_boot_smoke"].status == "skipped"
+    assert results["preview_connectivity_smoke"].status == "skipped"
+
+
 def test_agentic_platform_invariants_reject_single_page_role_surfaces(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     for role in ("client", "specialist", "manager"):

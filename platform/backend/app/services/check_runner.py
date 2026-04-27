@@ -156,15 +156,25 @@ class CheckRunner:
         started = time.perf_counter()
         results: list[RunCheckResult] = []
         backend_dir = source_dir / "miniapp"
+        focused_edit_profile = check_profile == "focused_edit"
+        focused_css_only_profile = focused_edit_profile and self._css_only_app_change(changed_files)
 
         validator_started = time.perf_counter()
-        build_issues = self.validation_suite.validate_build(source_dir)
-        filtered_issues = self._filter_build_issues(build_issues, scope_mode)
+        if focused_css_only_profile:
+            build_issues = []
+            filtered_issues = []
+        else:
+            build_issues = self.validation_suite.validate_build(source_dir)
+            filtered_issues = self._filter_build_issues(build_issues, scope_mode)
         results.append(
             RunCheckResult(
                 name="schema_validators",
-                status="failed" if filtered_issues else "passed",
-                details="Build validators executed against the draft workspace.",
+                status="skipped" if focused_css_only_profile else "failed" if filtered_issues else "passed",
+                details=(
+                    "Build validators skipped for focused CSS-only visual edit."
+                    if focused_css_only_profile
+                    else "Build validators executed against the draft workspace."
+                ),
                 duration_ms=int((time.perf_counter() - validator_started) * 1000),
                 command="validation_suite.validate_build",
                 logs=self._validation_logs(filtered_issues),
@@ -172,12 +182,16 @@ class CheckRunner:
         )
 
         connectivity_started = time.perf_counter()
-        connectivity_issues = self.validation_suite.validate_connectivity(source_dir)
+        connectivity_issues = [] if focused_css_only_profile else self.validation_suite.validate_connectivity(source_dir)
         results.append(
             RunCheckResult(
                 name="connectivity_validators",
-                status="failed" if connectivity_issues else "passed",
-                details="Connectivity validators executed against the draft workspace.",
+                status="skipped" if focused_css_only_profile else "failed" if connectivity_issues else "passed",
+                details=(
+                    "Connectivity validators skipped for focused CSS-only visual edit."
+                    if focused_css_only_profile
+                    else "Connectivity validators executed against the draft workspace."
+                ),
                 duration_ms=int((time.perf_counter() - connectivity_started) * 1000),
                 command="validation_suite.validate_connectivity",
                 logs=self._validation_logs(connectivity_issues),
@@ -185,7 +199,11 @@ class CheckRunner:
         )
 
         static_started = time.perf_counter()
-        static_result = self._static_check(source_dir=source_dir, changed_files=changed_files)
+        static_result = (
+            self._focused_css_static_check(source_dir=source_dir, changed_files=changed_files)
+            if focused_edit_profile and self._css_only_app_change(changed_files)
+            else self._static_check(source_dir=source_dir, changed_files=changed_files)
+        )
         static_result.duration_ms = int((time.perf_counter() - static_started) * 1000)
         results.append(static_result)
 
@@ -193,7 +211,7 @@ class CheckRunner:
         platform_smoke_result = self._platform_invariants_smoke(
             source_dir=source_dir,
             changed_files=changed_files,
-            scope_mode=scope_mode,
+            scope_mode="focused_edit" if focused_edit_profile else scope_mode,
             intent=intent,
             generation_mode=generation_mode,
         )
@@ -207,35 +225,55 @@ class CheckRunner:
             or platform_smoke_result.status == "failed"
         )
 
-        if check_profile == "fast_gate":
+        if check_profile in {"fast_gate", "focused_edit"}:
+            focused_details = check_profile == "focused_edit"
+            python_details = (
+                "Generated Python app tests were skipped for a focused CSS-only visual edit."
+                if focused_details
+                else "Generated Python app tests were deferred until follow-up verification."
+            )
+            js_details = (
+                "Generated JS app tests were skipped for a focused CSS-only visual edit."
+                if focused_details
+                else "Generated JS app tests were deferred until follow-up verification."
+            )
+            preview_details = (
+                "Preview rebuild was skipped for a focused CSS-only visual edit until successful apply/final viewing."
+                if focused_details
+                else "Preview rebuild was deferred until follow-up verification."
+            )
             results.extend(
                 [
                     RunCheckResult(
                         name="generated_app_python_tests",
                         status="skipped",
-                        details="Generated Python app tests were deferred until follow-up verification.",
+                        details=python_details,
                         command=f"{sys.executable} -m unittest discover -s tests -p test_generated_app.py",
                         logs=[],
                     ),
                     RunCheckResult(
                         name="generated_app_js_tests",
                         status="skipped",
-                        details="Generated JS app tests were deferred until follow-up verification.",
+                        details=js_details,
                         command="node --test tests/generated_app.test.mjs",
                         logs=[],
                     ),
                     RunCheckResult(
                         name="preview_boot_smoke",
                         status="skipped",
-                        details="Preview rebuild was deferred until follow-up verification.",
-                        command="preview deferred during fast gate",
+                        details=preview_details,
+                        command="preview deferred during focused edit" if focused_details else "preview deferred during fast gate",
                         logs=[],
                     ),
                     RunCheckResult(
                         name="preview_connectivity_smoke",
                         status="skipped",
-                        details="Preview connectivity smoke was deferred until follow-up verification.",
-                        command="preview deferred during fast gate",
+                        details=(
+                            "Preview connectivity smoke was skipped for a focused CSS-only visual edit."
+                            if focused_details
+                            else "Preview connectivity smoke was deferred until follow-up verification."
+                        ),
+                        command="preview deferred during focused edit" if focused_details else "preview deferred during fast gate",
                         logs=[],
                     ),
                 ]
@@ -582,7 +620,9 @@ class CheckRunner:
             and path.startswith("miniapp/app/")
         ]
         agentic_scope = scope_mode == "agentic"
-        if not relevant_changed and not agentic_scope:
+        focused_scope = scope_mode == "focused_edit"
+        css_only_focused_edit = focused_scope and self._css_only_app_change(relevant_changed)
+        if not relevant_changed and not agentic_scope and not focused_scope:
             return RunCheckResult(
                 name="platform_invariants",
                 status="skipped",
@@ -612,12 +652,16 @@ class CheckRunner:
             issues.extend(role_issues)
             tests_issues, generated_tests = self._generated_tests_presence_issues(source_dir)
             issues.extend(tests_issues)
+        elif css_only_focused_edit:
+            role_coverage = {"status": "skipped", "reason": "focused_css_only_edit"}
+            generated_tests = {"status": "skipped", "reason": "focused_css_only_edit"}
         if agentic_scope and str(intent or "").strip().lower() == "create":
             api_issues, api_contract = self._create_api_contract_issues(source_dir)
             issues.extend(api_issues)
             data_issues, preloaded_data_findings = self._preloaded_business_data_issues(source_dir)
             issues.extend(data_issues)
-        issues.extend(self._dom_contract_issues(source_dir=source_dir, changed_files=relevant_changed))
+        if not css_only_focused_edit:
+            issues.extend(self._dom_contract_issues(source_dir=source_dir, changed_files=relevant_changed))
         issues = self._dedupe_validation_issues(issues)
         return RunCheckResult(
             name="platform_invariants",
@@ -1491,6 +1535,57 @@ class CheckRunner:
             seen.add(key)
             deduped.append(issue)
         return deduped
+
+    @staticmethod
+    def _css_only_app_change(changed_files: list[str]) -> bool:
+        relevant = [
+            str(path).replace("\\", "/").lstrip("./")
+            for path in changed_files
+            if isinstance(path, str) and str(path).replace("\\", "/").lstrip("./").startswith("miniapp/app/")
+        ]
+        return bool(relevant) and all(path.startswith("miniapp/app/static/") and path.endswith(".css") for path in relevant)
+
+    def _focused_css_static_check(self, *, source_dir: Path, changed_files: list[str]) -> RunCheckResult:
+        issues: list[str] = []
+        checked_paths: list[str] = []
+        for raw_path in changed_files:
+            path = str(raw_path or "").replace("\\", "/").lstrip("./")
+            if not path.startswith("miniapp/app/static/") or not path.endswith(".css"):
+                continue
+            full_path = source_dir / path
+            if not full_path.exists():
+                if path == "miniapp/app/static/shared/base.css":
+                    continue
+                issues.append(f"{path}: CSS file is missing.")
+                continue
+            try:
+                content = full_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                issues.append(f"{path}: could not read CSS file: {exc}.")
+                continue
+            checked_paths.append(path)
+            stripped = content.strip()
+            if not stripped:
+                issues.append(f"{path}: CSS file is empty.")
+            if any(marker in content for marker in ("<<<<<<<", "=======", ">>>>>>>")):
+                issues.append(f"{path}: unresolved merge/apply conflict marker.")
+            if stripped.count("{") != stripped.count("}"):
+                issues.append(f"{path}: unbalanced CSS braces.")
+        if issues:
+            return RunCheckResult(
+                name="changed_files_static",
+                status="failed",
+                details="Focused CSS static check failed.",
+                command="focused CSS static check",
+                logs=issues,
+            )
+        return RunCheckResult(
+            name="changed_files_static",
+            status="passed",
+            details="Focused CSS static check passed.",
+            command="focused CSS static check",
+            logs=[f"Checked CSS files: {', '.join(checked_paths) or 'none'}."],
+        )
 
     def _static_check(self, *, source_dir: Path, changed_files: list[str]) -> RunCheckResult:
         frontend_dir = source_dir / "frontend"

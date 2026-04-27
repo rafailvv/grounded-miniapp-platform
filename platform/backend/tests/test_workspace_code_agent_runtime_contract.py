@@ -7,7 +7,12 @@ from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
 from app.models.domain import CheckExecutionRecord, DraftFileOperation, GenerateRequest, JobEvent, JobRecord, RunCheckResult, RunRecord
 from app.modules.miniapp_agent_loop.tool_agent_runtime import validate_workspace_command
 from app.modules.miniapp_agent_loop.turn_runner import WorkspaceLoopTurnRunner
-from app.modules.workspace_code_agent_runtime.runtime import SEED_CONTEXT_PATHS, WorkspaceCodeAgentRuntime
+from app.modules.workspace_code_agent_runtime.runtime import (
+    FOCUSED_VISUAL_CONTENT_MAX_LENGTH,
+    FOCUSED_VISUAL_OPERATION_LIMIT,
+    SEED_CONTEXT_PATHS,
+    WorkspaceCodeAgentRuntime,
+)
 from app.repositories.state_store import StateStore
 from app.services.workspace.service import WorkspaceService
 from app.services.workspace.run_service import RunService
@@ -66,6 +71,37 @@ def test_fast_first_create_schema_can_force_patch_only_turn() -> None:
     assert "tool_request" not in schema["properties"]["outcome"]["enum"]
     assert schema["properties"]["outcome"]["enum"] == ["patch_ready"]
     assert schema["properties"]["operations"]["items"]["properties"]["content"]["maxLength"] == 7000
+
+
+def test_visual_style_edit_uses_focused_css_contract() -> None:
+    request = GenerateRequest(prompt="Поменяй стиль и цвета на фиолетовый", intent="edit", generation_mode=GenerationMode.FAST)
+
+    assert WorkspaceCodeAgentRuntime._focused_edit_kind(request) == "visual_style_edit"
+    assert WorkspaceCodeAgentRuntime._focused_visual_css_paths(["client", "manager"]) == [
+        "miniapp/app/static/shared/base.css",
+        "miniapp/app/static/client/styles.css",
+        "miniapp/app/static/manager/styles.css",
+    ]
+
+    schema = WorkspaceCodeAgentRuntime._agent_turn_schema(
+        operation_limit=FOCUSED_VISUAL_OPERATION_LIMIT,
+        content_max_length=FOCUSED_VISUAL_CONTENT_MAX_LENGTH,
+        allow_tool_requests=False,
+        allowed_outcomes=["patch_ready", "fatal_invalid_response"],
+    )
+
+    assert schema["properties"]["operations"]["maxItems"] == 4
+    assert schema["properties"]["tool_requests"]["maxItems"] == 0
+    assert schema["properties"]["outcome"]["enum"] == ["patch_ready", "fatal_invalid_response"]
+    assert schema["properties"]["operations"]["items"]["properties"]["content"]["maxLength"] == 8000
+
+
+def test_copy_and_behavior_edits_are_classified_separately() -> None:
+    copy_request = GenerateRequest(prompt="Переименуй заголовок в карточке заказа", intent="edit")
+    behavior_request = GenerateRequest(prompt="Сделай POST endpoint и fetch для сохранения заказа", intent="edit")
+
+    assert WorkspaceCodeAgentRuntime._focused_edit_kind(copy_request) == "small_copy_edit"
+    assert WorkspaceCodeAgentRuntime._focused_edit_kind(behavior_request) == "behavior_edit"
 
 
 def test_create_patch_coverage_rejects_partial_role_slice() -> None:
@@ -893,6 +929,14 @@ def test_fix_run_preserves_requested_generation_mode() -> None:
 
 
 def test_agent_turn_tuning_caps_all_generation_modes() -> None:
+    assert WorkspaceCodeAgentRuntime._agent_turn_tuning(
+        GenerationMode.FAST,
+        intent="edit",
+        focused_edit_kind="visual_style_edit",
+    ) == {
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": 8000,
+    }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.FAST, intent="edit") == {
         "reasoning": {"effort": "low"},
         "max_output_tokens": 16000,
@@ -1018,6 +1062,34 @@ def test_prompt_alignment_uses_prompt_terms_without_domain_branches() -> None:
     )
 
     assert result.status == "passed"
+
+
+def test_prompt_alignment_does_not_block_css_only_visual_edits() -> None:
+    class FakeWorkspaceService:
+        def diff(self, workspace_id: str, run_id: str | None = None) -> str:
+            del workspace_id, run_id
+            return (
+                "diff --git a/miniapp/app/static/client/styles.css b/miniapp/app/static/client/styles.css\n"
+                "diff --git a/miniapp/app/static/manager/styles.css b/miniapp/app/static/manager/styles.css\n"
+            )
+
+        def try_read_text_file(self, workspace_id: str, path: str, run_id: str | None = None) -> str | None:
+            del workspace_id, path, run_id
+            return ".page-shell { color: #1f2937; background: #ffffff; }\n.primary-action { background: #6d28d9; }"
+
+    runtime = object.__new__(WorkspaceCodeAgentRuntime)
+    runtime.workspace_service = FakeWorkspaceService()
+
+    result = runtime._prompt_alignment_smoke(
+        workspace_id="ws",
+        run_id="run",
+        prompt="Поменяй стиль и цвета на фиолетовый",
+        intent="edit",
+        focused_edit_kind="visual_style_edit",
+    )
+
+    assert result.status == "skipped"
+    assert "visual/style edits" in result.details
 
 
 def test_workspace_name_ignores_leading_timestamp() -> None:
