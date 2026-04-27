@@ -341,6 +341,8 @@ class WorkspaceCodeAgentRuntime:
             self_blocked_correction_sent = False
             generic_fatal_correction_sent = False
             output_cap_correction_sent = False
+            tool_budget_correction_sent = False
+            create_patch_coverage_correction_sent = False
             self._add_failed_generated_test_context(
                 workspace_id=workspace_id,
                 run_id=run_id,
@@ -355,7 +357,14 @@ class WorkspaceCodeAgentRuntime:
                 extra_file_context=extra_file_context,
                 tool_results=local_tool_results,
             )
-            for tool_round in range(self._tool_round_limit(generation_mode) + 2):
+            self._add_static_js_failure_context(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                latest_execution=latest_execution,
+                extra_file_context=extra_file_context,
+                tool_results=local_tool_results,
+            )
+            for tool_round in range(self._tool_round_limit(generation_mode) + 4):
                 llm_payload = self._request_agent_turn(
                     job=job,
                     workspace_id=workspace_id,
@@ -431,6 +440,18 @@ class WorkspaceCodeAgentRuntime:
                     tool_results.extend(executed_results)
                     if tool_round < self._tool_round_limit(generation_mode):
                         continue
+                    if not tool_budget_correction_sent:
+                        correction = self._tool_budget_correction_result(raw_tool_requests, request=request)
+                        local_tool_results.append(correction)
+                        tool_results.append(correction)
+                        tool_budget_correction_sent = True
+                        self._append_event(
+                            job,
+                            "repair_iteration",
+                            "Agent requested more diagnostic tools than Fast mode allows. Retrying with patch-only instructions.",
+                            {"attempt": attempt, "tool_round": tool_round, "reason": "tool_budget_exhausted"},
+                        )
+                        continue
                     return WorkspaceLoopTurnPlan(
                         outcome="needs_context",
                         assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or ""),
@@ -499,6 +520,19 @@ class WorkspaceCodeAgentRuntime:
                         files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
                         metadata={"raw_response": llm_payload},
                     )
+                create_coverage_gap = self._create_patch_coverage_gap(operations, request=request)
+                if create_coverage_gap and not create_patch_coverage_correction_sent:
+                    correction = self._create_patch_coverage_correction_result(create_coverage_gap)
+                    local_tool_results.append(correction)
+                    tool_results.append(correction)
+                    create_patch_coverage_correction_sent = True
+                    self._append_event(
+                        job,
+                        "repair_iteration",
+                        "Agent create patch missed required role/test coverage. Retrying before applying a partial app.",
+                        {"attempt": attempt, "tool_round": tool_round, "missing": create_coverage_gap},
+                    )
+                    continue
                 return WorkspaceLoopTurnPlan(
                     outcome="patch_ready",
                     assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or "Agent prepared code edits."),
@@ -789,7 +823,8 @@ class WorkspaceCodeAgentRuntime:
             "Generated tests must validate the requested product semantics, all role roots, and shared role content without relying on network calls or non-template dependencies. "
             "For edit tasks, preserve existing selectors, ids, and data-testid attributes that generated tests assert unless the requested behavior intentionally replaces them; when behavior changes test expectations, update the generated test file in the same patch. "
             "Python generated tests run through FastAPI TestClient and see server-rendered HTML before browser JavaScript executes; do not assert JS-rendered item text there unless the text is also present in HTML fallback/source. Use Python tests for route status, preview bridge/static shell, and backend APIs when present. "
-            "JS generated tests are responsible for frontend source/data assertions; read role HTML/JS/shared data files directly with node:test and fs/path. "
+            "JS generated tests are responsible for frontend source/data assertions; read role HTML/JS/shared data files directly with node:test, node:assert, and fs/path. "
+            "node:test does not export expect; generated_app.test.mjs must use import test from \"node:test\" and import assert from \"node:assert\" with assert.ok/assert.equal/assert.match. "
             "Before writing generated_app.test.mjs, ensure every exact phrase asserted by includes() or match() is literally present in the file being read; prefer stable headings, route links, app title, and data-testid values over paraphrased expectations. "
             "Generated JS tests execute from the miniapp directory, so file paths inside those tests must start with app/static/... or be resolved from import.meta.url to ../app/static; do not use miniapp/app/... in generated tests. "
             "In generated JS tests, path/fs APIs require string paths: use path.join(process.cwd(), 'app/static/...') or fileURLToPath(new URL('../app/static/...', import.meta.url)); never pass a URL object directly to path.resolve, path.join, or fs. "
@@ -848,9 +883,10 @@ class WorkspaceCodeAgentRuntime:
             "rules": [
                 "Keep each turn applyable: return up to 12 independent file operations together when they are part of the same coherent change.",
                 "For Fast create tasks, the first model answer should usually be outcome=patch_ready, not tool_request or no_progress, because the template file_contexts already provide the shell.",
-                "For Fast create tasks, never try to output a whole multi-page app in one giant answer. Keep each turn small: usually no more than 6 full-file operations, no verbose comments, no large fixtures, and no repeated tool reads for files already shown in file_contexts.",
+                "For Fast create tasks, output one compact complete HTML pass instead of a giant app: usually 10-12 concise operations covering route_manifest.json, three role roots, six child pages, and generated tests. Avoid verbose comments, inline styles, large fixtures, and repeated tool reads for files already shown in file_contexts.",
                 "For Fast create tasks, prefer frontend-only role surfaces with compact shared domain content in the HTML/tests or one small shared static data module when the operation budget allows; avoid backend routes/models unless the prompt explicitly requires server persistence or APIs.",
-                "For Fast create tasks, use staged compact patches: first create/update the three role hub pages, route_manifest.json, and generated tests; then use later turns to add child pages needed by platform.single_page_role_surface.",
+                "For Fast create tasks, do not stop after only three role hub pages. Include the two required child pages per role in the same first product patch whenever possible.",
+                "For every create task, distribute the first product patch evenly: replace all three role roots, create exactly two child pages per role before adding extra pages to any one role, create route_manifest.json, and create both generated test files. A client-only first patch will be rejected.",
                 "For create tasks, do not put every feature into one scrolling role page. Each role must have at least three routeable pages: /<role> plus at least two /<role>/<slug> pages.",
                 "Do not declare child/profile/settings routes unless you also create those exact files in the same response or they already exist. If staging the work, wait to add child routes until creating their files.",
                 "Use the old profile pattern only as neutral page architecture: every role may have a profile/settings child page, but the page content must use the user's product domain.",
@@ -863,7 +899,7 @@ class WorkspaceCodeAgentRuntime:
                 "Each role root must be domain-specific, non-placeholder, and connected to the same product content; specialist is required and cannot remain the starter screen.",
                 "For create tasks, include dependency-free generated tests in miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs.",
                 "Python generated tests should use unittest plus FastAPI TestClient to verify role routes and backend/API behavior when backend state exists.",
-                "JS generated tests should use node:test plus fs/path only to verify role HTML/JS content, shared domain labels, role-specific selectors/actions, and absence of neutral template text.",
+                "JS generated tests should use node:test plus node:assert plus fs/path only to verify role HTML/JS content, shared domain labels, role-specific selectors/actions, and absence of neutral template text; do not import or call expect.",
                 "In generated_app.test.mjs, only assert exact strings that literally appear in the file being read; do not paraphrase expected UI text.",
                 "Do not make Python TestClient tests assert text that is only rendered by browser JavaScript; either include the text in HTML fallback/source or move that assertion to generated_app.test.mjs.",
                 "When role content is populated from a shared JS data file, JS generated tests should read that data/source file directly and assert the shared item names there.",
@@ -982,12 +1018,15 @@ class WorkspaceCodeAgentRuntime:
         if str(intent or "").lower() in {"edit", "refine", "role_only_change"}:
             return {"reasoning": {"effort": "low"}, "max_output_tokens": 16000}
         if str(intent or "").lower() == "create":
-            return {"reasoning": {"effort": "low" if generation_mode == GenerationMode.FAST else "medium"}, "max_output_tokens": 60000}
+            return {
+                "reasoning": {"effort": "low" if generation_mode == GenerationMode.FAST else "medium"},
+                "max_output_tokens": 14000 if generation_mode == GenerationMode.FAST else 42000,
+            }
         if generation_mode == GenerationMode.FAST:
             return {"reasoning": {"effort": "low"}, "max_output_tokens": 24000}
         if generation_mode == GenerationMode.QUALITY:
-            return {"reasoning": {"effort": "high"}, "max_output_tokens": 60000}
-        return {"reasoning": {"effort": "medium"}, "max_output_tokens": 45000}
+            return {"reasoning": {"effort": "high"}, "max_output_tokens": 42000}
+        return {"reasoning": {"effort": "medium"}, "max_output_tokens": 32000}
 
     @staticmethod
     def _is_output_cap_error(error: str) -> bool:
@@ -1000,8 +1039,8 @@ class WorkspaceCodeAgentRuntime:
         if create_task:
             next_action = (
                 "The previous answer was too large. Return outcome=patch_ready now with a compact, complete first implementation. "
-                "Use no more than 6 full-file operations in this turn, keep seed/demo data small, avoid long comments, and do not request more context unless a specific required file is absent. "
-                "Prefer a staged frontend-only patch: create/update the three role hub HTML files, route_manifest.json with only routes whose files exist in this turn, and the generated test files. Do not add backend routes/models in this recovery turn unless explicitly required. Later checks will request the missing child pages."
+                "Use no more than 12 concise full-file operations in this recovery turn, keep seed/demo data small, avoid inline styles and long comments, and do not request more context unless a specific required file is absent. "
+                "Prefer a staged frontend-only patch: create/update the exact missing route pages or the exact failing JS/test files. Do not add backend routes/models in this recovery turn unless explicitly required."
             )
         else:
             next_action = (
@@ -1017,6 +1056,75 @@ class WorkspaceCodeAgentRuntime:
         }
 
     @staticmethod
+    def _tool_budget_correction_result(tool_requests: list[dict[str, Any]], *, request: GenerateRequest) -> dict[str, object]:
+        create_task = str(request.intent or "").strip().lower() == "create"
+        return {
+            "tool": "tool_budget_correction",
+            "contract": "Fast mode has enough template and validation context to start editing without additional diagnostic reads.",
+            "required_next_action": (
+                "Return outcome=patch_ready now. Do not request more tools in the next answer. "
+                "Use the file_contexts and latest_checks already provided. "
+                + (
+                    "For create, produce compact file operations now. If this is the first product patch, create all required role routes as concise static HTML: /client plus two child pages, /specialist plus two child pages, /manager plus two child pages, route_manifest.json, and generated tests. Keep HTML concise and do not include large inline style blocks."
+                    if create_task
+                    else "For edit/fix, patch the smallest complete set of files needed for the requested behavior."
+                )
+            ),
+            "ignored_tool_requests": [
+                {
+                    "tool": str(item.get("tool") or ""),
+                    "targets": [str(target) for target in item.get("targets") or []] if isinstance(item, dict) else [],
+                    "reason": str(item.get("reason") or "")[:400] if isinstance(item, dict) else "",
+                }
+                for item in tool_requests
+                if isinstance(item, dict)
+            ],
+        }
+
+    @staticmethod
+    def _create_patch_coverage_gap(operations: list[DraftFileOperation], *, request: GenerateRequest) -> list[str]:
+        if str(request.intent or "").strip().lower() != "create":
+            return []
+        touched = {str(operation.file_path or "").strip().replace("\\", "/").lstrip("./") for operation in operations}
+        missing: list[str] = []
+        required_files = [
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/manager/index.html",
+            "miniapp/app/generated/route_manifest.json",
+            "miniapp/tests/test_generated_app.py",
+            "miniapp/tests/generated_app.test.mjs",
+        ]
+        for path in required_files:
+            if path not in touched:
+                missing.append(path)
+        for role in ("client", "specialist", "manager"):
+            child_pages = {
+                path
+                for path in touched
+                if re.fullmatch(rf"miniapp/app/static/{role}/[^/]+/index\.html", path)
+            }
+            if len(child_pages) < 2:
+                missing.append(f"miniapp/app/static/{role}/<two-child-pages>/index.html")
+        return missing
+
+    @staticmethod
+    def _create_patch_coverage_correction_result(missing: list[str]) -> dict[str, object]:
+        return {
+            "tool": "create_patch_coverage_correction",
+            "contract": (
+                "Create runs must not apply a partial product slice that leaves another role as the starter template "
+                "or omits generated tests. The first patch must cover the required app surface evenly."
+            ),
+            "required_next_action": (
+                "Return outcome=patch_ready now with one compact operations array that covers all required create surfaces. "
+                "Do not request more tools. Replace all three role roots, create exactly two child pages per role before adding extra pages to any one role, "
+                "create/update route_manifest.json, and create both generated test files. A client-only first patch is invalid. Keep pages concise and light-mode."
+            ),
+            "missing_required_coverage": list(missing),
+        }
+
+    @staticmethod
     def _fast_create_budget_result() -> dict[str, object]:
         return {
             "tool": "fast_create_budget",
@@ -1025,14 +1133,15 @@ class WorkspaceCodeAgentRuntime:
                 "Use a frontend-first implementation unless backend persistence/API behavior is explicitly required."
             ),
             "required_next_action": (
-                "Return outcome=patch_ready in the first answer with no more than 6 full-file operations and concise files. "
-                "Prefer a staged first patch: update route_manifest.json, replace the three role hub index.html files, and add/update the two generated test files. "
-                "Do not output all child pages in the same answer if that makes the JSON large; later checks will request the exact missing child pages. Final success still requires at least three routeable pages per role: /client, /client/<slug>, /client/<slug>; same for specialist and manager. "
+                "Return outcome=patch_ready in the first answer with a compact complete HTML pass, usually 10-12 concise operations: route_manifest.json, three role root pages, six child pages, and generated tests. "
+                "Final success requires at least three routeable pages per role: /client, /client/<slug>, /client/<slug>; same for specialist and manager. "
                 "Use the profile/settings page pattern as neutral navigation architecture when useful, but keep all visible content domain-specific. "
                 "Put enough domain text in the role HTML itself so backend TestClient can see meaningful product content without browser JavaScript. "
                 "Keep /static/preview_bridge.js in every generated HTML route page, including every child page. Use app/static paths inside JS tests because tests run from cwd=miniapp. "
                 "Use string paths in JS tests, for example path.join(process.cwd(), 'app/static/client/index.html'); do not pass URL objects to path.resolve or fs. "
-                "Do not emit backend routes/models, long fixtures, or large per-role CSS for a simple static/local-data app."
+                "Use node:assert in JS tests; node:test does not export expect. "
+                "Do not emit backend routes/models, long fixtures, large inline <style> blocks, or large per-role CSS for a simple static/local-data app. "
+                "If route_manifest.json is absent or empty, create it; do not request it via tools just to inspect it."
             ),
         }
 
@@ -1420,7 +1529,7 @@ class WorkspaceCodeAgentRuntime:
         del preview_details
         failed = [result for result in results if result.status == "failed"]
         has_diff = bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
-        no_product_diff = request.mode == "generate" and not has_diff
+        no_product_diff = request.mode in {"generate", "fix"} and not has_diff
         remaining_issues = [
             {
                 "kind": "check_failure",
@@ -1570,6 +1679,18 @@ class WorkspaceCodeAgentRuntime:
             content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
             if content is not None:
                 extra_file_context[path] = content
+        related_fixture_paths: list[str] = []
+        js_test_content = extra_file_context.get("miniapp/tests/generated_app.test.mjs") or ""
+        for path in self._generated_js_test_fixture_paths(js_test_content):
+            if path in extra_file_context:
+                continue
+            content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
+            if content is None:
+                continue
+            extra_file_context[path] = content
+            related_fixture_paths.append(path)
+            if len(related_fixture_paths) >= 16:
+                break
         if any(item.get("tool") == "generated_test_failure_context" for item in tool_results if isinstance(item, dict)):
             return
         tool_results.append(
@@ -1589,10 +1710,69 @@ class WorkspaceCodeAgentRuntime:
                         "name": result.name,
                         "details": result.details,
                         "command": result.command,
-                        "logs": list(result.logs or [])[-24:],
+                        "logs": list(result.logs or [])[-40:],
+                        "diagnostics": result.diagnostics if isinstance(result.diagnostics, dict) else {},
                     }
                     for result in failed_tests
                 ],
+                "related_fixture_files_loaded": related_fixture_paths,
+            }
+        )
+
+    @staticmethod
+    def _generated_js_test_fixture_paths(source: str) -> list[str]:
+        paths: list[str] = []
+        for match in re.finditer(r"['\"]app/((?:static|generated)/[^'\"]+)['\"]", str(source or "")):
+            path = f"miniapp/app/{match.group(1).strip().lstrip('/')}"
+            if path not in paths:
+                paths.append(path)
+        return paths
+
+    def _add_static_js_failure_context(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        latest_execution: CheckExecutionRecord,
+        extra_file_context: dict[str, str],
+        tool_results: list[dict[str, object]],
+    ) -> None:
+        failures: list[dict[str, object]] = []
+        for result in latest_execution.results:
+            if result.status != "failed" or result.name != "changed_files_static":
+                continue
+            diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+            syntax_error = diagnostics.get("static_js_syntax_error")
+            if not isinstance(syntax_error, dict):
+                continue
+            file_path = str(syntax_error.get("file_path") or "").strip().lstrip("./")
+            if file_path:
+                content = self.workspace_service.try_read_text_file(workspace_id, file_path, run_id=run_id)
+                if content is not None:
+                    extra_file_context[file_path] = content
+            failures.append(
+                {
+                    "name": result.name,
+                    "details": result.details,
+                    "command": result.command,
+                    "logs": list(result.logs or [])[-20:],
+                    "diagnostics": syntax_error,
+                }
+            )
+        if not failures:
+            return
+        if any(item.get("tool") == "static_js_failure_context" for item in tool_results if isinstance(item, dict)):
+            return
+        tool_results.append(
+            {
+                "tool": "static_js_failure_context",
+                "contract": "changed_files_static is a blocking platform syntax check for generated JavaScript.",
+                "required_next_action": (
+                    "Patch the exact file_path from diagnostics so node --check passes. "
+                    "Use a targeted hunk patch or full-file replace for that JavaScript file. "
+                    "Do not spend the next turn rewriting unrelated pages or tests while this syntax error remains."
+                ),
+                "failures": failures,
             }
         )
 
@@ -1606,14 +1786,18 @@ class WorkspaceCodeAgentRuntime:
         tool_results: list[dict[str, object]],
     ) -> None:
         actionable_codes = {
+            "build.broken_static_ref",
+            "build.missing_static_asset",
             "build.missing_static_page",
             "build.page_missing_preview_bridge",
             "build.page_missing_shell_style_link",
             "build.page_missing_shell_root",
+            "platform.missing_generated_app_tests",
+            "platform.single_page_role_surface",
         }
         issues: list[dict[str, object]] = []
         for result in latest_execution.results:
-            if result.status != "failed" or result.name not in {"schema_validators", "platform_invariants"}:
+            if result.status != "failed" or result.name not in {"schema_validators", "connectivity_validators", "platform_invariants"}:
                 continue
             for line in result.logs or []:
                 try:
@@ -1650,7 +1834,11 @@ class WorkspaceCodeAgentRuntime:
                 "required_next_action": (
                     "Patch only the exact failing route/page contract. For build.missing_static_page, either create the exact missing HTML file "
                     "or remove that exact route_manifest entry. For build.page_missing_preview_bridge, add "
-                    "<script src=\"/static/preview_bridge.js\" defer></script> to the exact page. Do not rewrite unrelated role pages."
+                    "<script src=\"/static/preview_bridge.js\" defer></script> to the exact page. "
+                    "For build.broken_static_ref or build.missing_static_asset, either create the referenced asset or remove the script/link tag from the exact page. "
+                    "For platform.missing_generated_app_tests, create miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. "
+                    "For platform.single_page_role_surface, create the missing child pages for that exact role and add them to route_manifest.json. "
+                    "Do not rewrite unrelated role pages."
                 ),
                 "issues": issues[:24],
             }

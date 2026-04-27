@@ -169,6 +169,62 @@ def test_build_validator_accepts_compact_manifest_routes_map_for_child_pages(tmp
     assert not any(issue.location == "miniapp/app/static/client/catalog/styles.css" for issue in issues)
 
 
+def test_build_validator_accepts_slash_role_shorthand_manifest(tmp_path: Path) -> None:
+    app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
+    workspace = app.state.container.workspace_service.create_workspace(
+        WorkspaceRecord(name="Manifest Role Shorthand Workspace", path=str(tmp_path / "workspace"))
+    )
+    app.state.container.workspace_service.clone_template(workspace.workspace_id)
+    source_dir = app.state.container.workspace_service.source_dir(workspace.workspace_id)
+    _write_role_child(source_dir, "client", "catalog")
+    manifest = source_dir / "miniapp/app/generated/route_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "/client": {
+                        "catalog": "static/client/catalog/index.html",
+                    }
+                },
+                "shared": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    issues = BuildValidator().validate(source_dir)
+
+    assert not any(issue.code == "build.missing_static_asset" for issue in issues)
+    assert not any(issue.location == "miniapp/app/static/client/catalog/styles.css" for issue in issues)
+
+
+def test_build_validator_accepts_roles_as_direct_route_map(tmp_path: Path) -> None:
+    app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
+    workspace = app.state.container.workspace_service.create_workspace(
+        WorkspaceRecord(name="Manifest Direct Roles Map Workspace", path=str(tmp_path / "workspace"))
+    )
+    app.state.container.workspace_service.clone_template(workspace.workspace_id)
+    source_dir = app.state.container.workspace_service.source_dir(workspace.workspace_id)
+    _write_role_child(source_dir, "client", "menu")
+    manifest = source_dir / "miniapp/app/generated/route_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "/client/menu": "static/client/menu/index.html",
+                },
+                "shared": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    issues = BuildValidator().validate(source_dir)
+
+    assert not any(issue.code == "build.missing_static_asset" for issue in issues)
+    assert not any(issue.location == "miniapp/app/static/client/menu/styles.css" for issue in issues)
+
+
 def test_template_role_page_resolver_accepts_compact_routes_map(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     source_route_pages = repo_root / "runtime/templates/base-miniapp/miniapp/app/routes/role_pages.py"
@@ -198,6 +254,52 @@ def test_template_role_page_resolver_accepts_compact_routes_map(tmp_path: Path) 
         raise AssertionError("Missing compact route should raise KeyError")
 
 
+def test_template_role_page_resolver_accepts_slash_role_shorthand_manifest(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    source_route_pages = repo_root / "runtime/templates/base-miniapp/miniapp/app/routes/role_pages.py"
+    route_pages_path = tmp_path / "miniapp/app/routes/role_pages.py"
+    route_pages_path.parent.mkdir(parents=True)
+    route_pages_path.write_text(source_route_pages.read_text(encoding="utf-8"), encoding="utf-8")
+    page_path = tmp_path / "miniapp/app/static/client/catalog/index.html"
+    page_path.parent.mkdir(parents=True)
+    page_path.write_text("<main class=\"page-shell\">Catalog</main>", encoding="utf-8")
+    manifest_path = tmp_path / "miniapp/app/generated/route_manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps({"roles": {"/client": {"catalog": "static/client/catalog/index.html"}}}),
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("role_pages_under_test", route_pages_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.resolve_role_page("client", "/client/catalog") == page_path
+
+
+def test_template_role_page_resolver_accepts_roles_as_direct_route_map(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    source_route_pages = repo_root / "runtime/templates/base-miniapp/miniapp/app/routes/role_pages.py"
+    route_pages_path = tmp_path / "miniapp/app/routes/role_pages.py"
+    route_pages_path.parent.mkdir(parents=True)
+    route_pages_path.write_text(source_route_pages.read_text(encoding="utf-8"), encoding="utf-8")
+    page_path = tmp_path / "miniapp/app/static/client/menu/index.html"
+    page_path.parent.mkdir(parents=True)
+    page_path.write_text("<main class=\"page-shell\">Menu</main>", encoding="utf-8")
+    manifest_path = tmp_path / "miniapp/app/generated/route_manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps({"roles": {"/client/menu": "static/client/menu/index.html"}}),
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("role_pages_under_test", route_pages_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.resolve_role_page("client", "/client/menu") == page_path
+
+
 def test_static_check_rejects_typescript_syntax_inside_plain_js(tmp_path: Path) -> None:
     backend_dir = tmp_path / "miniapp"
     script = backend_dir / "app/static/client/app.js"
@@ -209,6 +311,9 @@ def test_static_check_rejects_typescript_syntax_inside_plain_js(tmp_path: Path) 
 
     assert result.status == "failed"
     assert "Static JavaScript syntax check failed" in "\n".join(result.logs)
+    assert result.diagnostics["static_js_syntax_error"]["file_path"] == "miniapp/app/static/client/app.js"
+    assert result.diagnostics["static_js_syntax_error"]["line"] == 1
+    assert "node --check passes" in result.diagnostics["static_js_syntax_error"]["required_action"]
 
 
 def test_static_check_installs_miniapp_requirements_before_import_smoke(
@@ -359,6 +464,34 @@ def test_generated_tests_explain_server_html_vs_js_rendered_content() -> None:
     assert diagnostics["static_html_assertion"]["problem"] == "js_test_asserts_dynamic_text_only_in_html"
     assert diagnostics["js_test_url_path_api"]["problem"] == "generated_js_test_passed_url_to_path_api"
     assert "fileURLToPath" in diagnostics["js_test_url_path_api"]["expected_path_api"]
+
+
+def test_generated_js_test_failure_reports_assertion_source(tmp_path: Path) -> None:
+    test_file = tmp_path / "generated_app.test.mjs"
+    test_file.write_text(
+        "\n".join(
+            [
+                'import { test } from "node:test";',
+                'import assert from "node:assert";',
+                'test("insights page mentions smart adoption trends", () => {',
+                '  assert(insightsHtml.includes("voice-first devices"));',
+                "});",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "✖ insights page mentions smart adoption trends",
+            "at TestContext.<anonymous> (file:///workspace/miniapp/tests/generated_app.test.mjs:4:3)",
+        ],
+        test_file=test_file,
+    )
+
+    assert diagnostics["failing_test_location"]["line"] == 4
+    assert diagnostics["assertion_source"]["source"] == 'assert(insightsHtml.includes("voice-first devices"));'
+    assert diagnostics["expected_literal"] == "voice-first devices"
 
 
 def test_preview_ready_probes_all_role_roots(monkeypatch) -> None:

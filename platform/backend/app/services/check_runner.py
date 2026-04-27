@@ -93,6 +93,10 @@ class CheckRunner:
         r"Updated record\s+(?P<record_id>[A-Za-z0-9_-]+)\s+did not reflect\s+(?P<actor>[A-Za-z0-9_-]+)\s+changes in shared state\.\s+Payload:\s*(?P<payload>.*)$",
         re.IGNORECASE,
     )
+    _GENERATED_JS_TEST_LOCATION_RE = re.compile(r"generated_app\.test\.mjs:(?P<line>\d+):(?P<column>\d+)")
+    _STATIC_JS_SYNTAX_LOCATION_RE = re.compile(
+        r"(?P<path>.*?/miniapp/(?P<relative>app/static/[^:\s]+\.js)):(?P<line>\d+)"
+    )
 
     def __init__(self, validation_suite: ValidationSuite, preview_service: PreviewService) -> None:
         self.validation_suite = validation_suite
@@ -315,6 +319,7 @@ class CheckRunner:
                 js_url_path_api = diagnostics.get("js_test_url_path_api") if isinstance(diagnostics, dict) else None
                 server_html_assertion = diagnostics.get("server_rendered_html_assertion") if isinstance(diagnostics, dict) else None
                 static_html_assertion = diagnostics.get("static_html_assertion") if isinstance(diagnostics, dict) else None
+                assertion_source = diagnostics.get("assertion_source") if isinstance(diagnostics, dict) else None
                 if isinstance(js_path_root, dict):
                     expected_root = str(js_path_root.get("expected_root") or "").strip()
                     message = expected_root or "Generated JS tests used an invalid miniapp path root."
@@ -325,6 +330,10 @@ class CheckRunner:
                     message = str(server_html_assertion.get("expected_scope") or "").strip() or "Generated Python tests asserted JS-rendered text in server HTML."
                 elif isinstance(static_html_assertion, dict):
                     message = str(static_html_assertion.get("expected_scope") or "").strip() or "Generated JS tests asserted dynamic text only in HTML."
+                elif isinstance(assertion_source, dict):
+                    line_no = assertion_source.get("line")
+                    source_text = str(assertion_source.get("source") or "").strip()
+                    message = f"Generated JS test failed at generated_app.test.mjs:{line_no}: {source_text}".strip()
                 elif isinstance(shared_state_failure, dict):
                     actor = str(shared_state_failure.get("actor") or "").strip()
                     resource_slug = str(shared_state_failure.get("resource_slug") or "").strip()
@@ -741,11 +750,40 @@ class CheckRunner:
                     break
         roles = manifest.get("roles") if isinstance(manifest, dict) else {}
         if isinstance(roles, dict):
+            for route_path_raw, file_path_raw_value in roles.items():
+                if not isinstance(file_path_raw_value, str):
+                    continue
+                route_path_text = str(route_path_raw or "").strip()
+                file_path_raw = str(file_path_raw_value or "").strip()
+                if not route_path_text or not file_path_raw:
+                    continue
+                route_probe = route_path_text if route_path_text.startswith("/") else f"/{route_path_text}"
+                route_probe = route_probe.rstrip("/") or "/"
+                for role in ROLE_ORDER:
+                    if route_probe != f"/{role}" and not route_probe.startswith(f"/{role}/"):
+                        continue
+                    file_path = cls._resolve_manifest_static_page(source_dir, file_path_raw)
+                    if not file_path.exists():
+                        continue
+                    pages_by_role[role].append(
+                        {
+                            "route_path": cls._normalize_role_route(role, route_probe),
+                            "file_path": file_path.relative_to(source_dir).as_posix(),
+                            "source": "manifest_roles_route_map",
+                        }
+                    )
+                    break
             for role in ROLE_ORDER:
-                role_payload = roles.get(role)
+                role_payload = roles.get(role) or roles.get(f"/{role}")
                 if not isinstance(role_payload, dict):
                     continue
                 route_map = role_payload.get("routes")
+                if not isinstance(route_map, dict):
+                    route_map = {
+                        str(route_path): str(file_path)
+                        for route_path, file_path in role_payload.items()
+                        if isinstance(file_path, str) and str(route_path) not in {"pages", "routes"}
+                    }
                 if isinstance(route_map, dict):
                     for route_path_raw, file_path_raw_value in route_map.items():
                         file_path_raw = str(file_path_raw_value or "").strip()
@@ -754,7 +792,7 @@ class CheckRunner:
                         file_path = cls._resolve_manifest_static_page(source_dir, file_path_raw)
                         if not file_path.exists():
                             continue
-                        route_path = cls._normalize_role_route(role, str(route_path_raw or "").strip())
+                        route_path = cls._normalize_manifest_role_route(role, str(route_path_raw or "").strip())
                         pages_by_role[role].append(
                             {
                                 "route_path": route_path,
@@ -812,6 +850,15 @@ class CheckRunner:
         if normalized.startswith("static/"):
             return source_dir / "miniapp/app" / normalized
         return source_dir / normalized
+
+    @staticmethod
+    def _normalize_manifest_role_route(role: str, route_path: str) -> str:
+        route = str(route_path or "").strip()
+        if not route or route in {"root", "index", "/"}:
+            return f"/{role}"
+        if route.startswith("/"):
+            return CheckRunner._normalize_role_route(role, route)
+        return f"/{role}/{route}".rstrip("/")
 
     @staticmethod
     def _normalize_role_route(role: str, route_path: str) -> str:
@@ -1192,7 +1239,7 @@ class CheckRunner:
                 command=" ".join(command),
                 exit_code=result.returncode,
                 logs=logs,
-                diagnostics=self._extract_generated_app_test_diagnostics(logs),
+                diagnostics=self._extract_generated_app_test_diagnostics(logs, test_file=test_file),
             )
         return RunCheckResult(
             name="generated_app_js_tests",
@@ -1409,13 +1456,15 @@ class CheckRunner:
                     logs=self._command_logs("Static JavaScript syntax check timed out.", exc.stdout or "", exc.stderr or ""),
                 )
             if result.returncode != 0:
+                logs = self._command_logs("Static JavaScript syntax check failed for the draft miniapp.", result.stdout, result.stderr)
                 return RunCheckResult(
                     name="changed_files_static",
                     status="failed",
                     details="Static JavaScript syntax check failed for the draft miniapp.",
                     command=" ".join(command),
                     exit_code=result.returncode,
-                    logs=self._command_logs("Static JavaScript syntax check failed for the draft miniapp.", result.stdout, result.stderr),
+                    logs=logs,
+                    diagnostics=self._extract_static_js_syntax_diagnostics(logs, backend_dir=backend_dir, command_path=js_file),
                 )
         return RunCheckResult(
             name="changed_files_static",
@@ -1492,7 +1541,52 @@ class CheckRunner:
         return [summary, *tail]
 
     @classmethod
-    def _extract_generated_app_test_diagnostics(cls, logs: list[str]) -> dict[str, object]:
+    def _extract_static_js_syntax_diagnostics(
+        cls,
+        logs: list[str],
+        *,
+        backend_dir: Path | None = None,
+        command_path: str | None = None,
+    ) -> dict[str, object]:
+        diagnostics: dict[str, object] = {}
+        file_path = ""
+        line_number: int | None = None
+        for line in logs:
+            match = cls._STATIC_JS_SYNTAX_LOCATION_RE.search(str(line or ""))
+            if not match:
+                continue
+            file_path = f"miniapp/{match.group('relative')}"
+            line_number = int(match.group("line"))
+            break
+        if not file_path and command_path:
+            file_path = f"miniapp/{str(command_path).strip().lstrip('./')}"
+        syntax_line = next((str(line) for line in logs if line.strip().startswith("SyntaxError:")), "")
+        snippet_lines: list[str] = []
+        if line_number is not None and backend_dir is not None and file_path:
+            target = backend_dir.parent / file_path
+            try:
+                source_lines = target.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                source_lines = []
+            if source_lines:
+                start = max(line_number - 3, 1)
+                end = min(line_number + 3, len(source_lines))
+                snippet_lines = [
+                    f"{number}: {source_lines[number - 1]}"
+                    for number in range(start, end + 1)
+                ]
+        if file_path:
+            diagnostics["static_js_syntax_error"] = {
+                "file_path": file_path,
+                "line": line_number,
+                "syntax_error": syntax_line,
+                "snippet": snippet_lines,
+                "required_action": "Patch this exact JavaScript file so node --check passes; do not spend the next turn rewriting unrelated pages.",
+            }
+        return diagnostics
+
+    @classmethod
+    def _extract_generated_app_test_diagnostics(cls, logs: list[str], test_file: Path | None = None) -> dict[str, object]:
         diagnostics: dict[str, object] = {}
         failing_test = next(
             (
@@ -1505,6 +1599,45 @@ class CheckRunner:
         )
         if failing_test:
             diagnostics["failing_test_name"] = failing_test
+        generated_js_locations = [
+            {
+                "line": int(match.group("line")),
+                "column": int(match.group("column")),
+            }
+            for line in logs
+            if (match := cls._GENERATED_JS_TEST_LOCATION_RE.search(str(line or "")))
+        ]
+        if generated_js_locations:
+            first_location = generated_js_locations[0]
+            diagnostics["failing_test_location"] = {
+                "file_path": "miniapp/tests/generated_app.test.mjs",
+                **first_location,
+            }
+            if test_file is not None and test_file.exists():
+                try:
+                    source_lines = test_file.read_text(encoding="utf-8").splitlines()
+                except OSError:
+                    source_lines = []
+                line_no = int(first_location["line"])
+                if 1 <= line_no <= len(source_lines):
+                    assertion_line = source_lines[line_no - 1].strip()
+                    diagnostics["assertion_source"] = {
+                        "file_path": "miniapp/tests/generated_app.test.mjs",
+                        "line": line_no,
+                        "source": assertion_line,
+                    }
+                    literal_match = re.search(r"\.includes\(\s*([\"'`])(?P<literal>.+?)\1\s*\)", assertion_line)
+                    if literal_match:
+                        diagnostics["expected_literal"] = literal_match.group("literal")
+                    start = max(0, line_no - 4)
+                    end = min(len(source_lines), line_no + 3)
+                    diagnostics["assertion_context"] = [
+                        {
+                            "line": index + 1,
+                            "source": source_lines[index],
+                        }
+                        for index in range(start, end)
+                    ]
         stack_excerpt = [str(line or "") for line in logs[-12:] if str(line or "").strip()]
         if stack_excerpt:
             diagnostics["stack_excerpt"] = stack_excerpt

@@ -53,6 +53,15 @@ def route_matches(pattern: str, actual: str) -> bool:
     return re.fullmatch(normalized_pattern, actual) is not None
 
 
+def normalize_manifest_role_route(role: str, route_path: str) -> str:
+    route_path = str(route_path or "").strip()
+    if not route_path or route_path in {"root", "index", "/"}:
+        return f"/{role}"
+    if route_path.startswith("/"):
+        return route_path.rstrip("/") or f"/{role}"
+    return f"/{role}/{route_path}".rstrip("/")
+
+
 def resolve_declared_page_file(role: str, actual_path: str) -> Path | None:
     actual_path = canonicalize_role_path(role, actual_path)
     route_manifest = load_route_manifest()
@@ -68,11 +77,35 @@ def resolve_declared_page_file(role: str, actual_path: str) -> Path | None:
             resolved = normalize_declared_page_path(file_path)
             if resolved.exists():
                 return resolved
-    role_payload = ((route_manifest.get("roles") or {}).get(role) or {})
+    roles_manifest = route_manifest.get("roles") or {}
+    if isinstance(roles_manifest, dict):
+        for route_path, file_path in roles_manifest.items():
+            if not isinstance(file_path, str):
+                continue
+            route_path = str(route_path or "").strip()
+            file_path = str(file_path or "").strip()
+            if not route_path or not file_path:
+                continue
+            if not route_matches(route_path, actual_path):
+                continue
+            resolved = normalize_declared_page_path(file_path)
+            if resolved.exists():
+                return resolved
+    role_payload = (
+        roles_manifest.get(role)
+        or roles_manifest.get(f"/{role}")
+        or {}
+    )
     route_map = role_payload.get("routes") if isinstance(role_payload, dict) else {}
+    if not isinstance(route_map, dict) and isinstance(role_payload, dict):
+        route_map = {
+            str(route_path): str(file_path)
+            for route_path, file_path in role_payload.items()
+            if isinstance(file_path, str) and str(route_path) not in {"pages", "routes"}
+        }
     if isinstance(route_map, dict):
         for route_path, file_path in route_map.items():
-            route_path = str(route_path or "").strip()
+            route_path = normalize_manifest_role_route(role, str(route_path or "").strip())
             file_path = str(file_path or "").strip()
             if not route_path or not file_path:
                 continue

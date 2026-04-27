@@ -99,6 +99,8 @@ class PreviewService:
             preview.last_failure_signature = None
             preview.latency_breakdown["last_start_ms"] = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
             self._append_log(preview, f"Preview runtime is healthy at {preview.url}.")
+            self._persist(preview)
+            return preview
         except Exception as exc:
             if not self._handle_preview_start_failure(preview, workspace_id, source_dir, exc):
                 preview.url = None
@@ -198,6 +200,8 @@ class PreviewService:
             preview.last_failure_signature = None
             preview.latency_breakdown["last_rebuild_ms"] = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
             self._append_log(preview, f"Preview rebuild completed and runtime is healthy at {preview.url}.")
+            self._persist(preview)
+            return preview
         except Exception as exc:
             if not self._handle_preview_start_failure(preview, workspace_id, source_dir, exc):
                 preview.url = None

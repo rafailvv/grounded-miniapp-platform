@@ -90,13 +90,27 @@ class BuildValidator:
                 if route and file_ref:
                     pages.append({"route_path": route, "file_path": file_ref})
         roles = manifest.get("roles") if isinstance(manifest.get("roles"), dict) else {}
-        for role, payload in roles.items():
+        for route_path, file_path in roles.items():
+            if not isinstance(file_path, str):
+                continue
+            route = str(route_path or "").strip()
+            file_ref = str(file_path or "").strip()
+            if route and file_ref:
+                pages.append({"route_path": route, "file_path": file_ref})
+        for role_raw, payload in roles.items():
             if not isinstance(payload, dict):
                 continue
+            role = cls._normalize_manifest_role_key(str(role_raw or ""))
             route_map = payload.get("routes")
+            if not isinstance(route_map, dict):
+                route_map = {
+                    str(route_path): str(file_path)
+                    for route_path, file_path in payload.items()
+                    if isinstance(file_path, str) and str(route_path) not in {"pages", "routes"}
+                }
             if isinstance(route_map, dict):
                 for route_path, file_path in route_map.items():
-                    route = str(route_path or "").strip()
+                    route = cls._normalize_manifest_role_route(role, str(route_path or "").strip())
                     file_ref = str(file_path or "").strip()
                     if route and file_ref:
                         pages.append({"role": role, "route_path": route, "file_path": file_ref})
@@ -111,6 +125,20 @@ class BuildValidator:
         if pages:
             return pages
         return cls._filesystem_static_pages(workspace_path)
+
+    @staticmethod
+    def _normalize_manifest_role_key(role_raw: str) -> str:
+        role = str(role_raw or "").strip().strip("/")
+        return role or role_raw
+
+    @staticmethod
+    def _normalize_manifest_role_route(role: str, route_path: str) -> str:
+        route = str(route_path or "").strip()
+        if not route or route in {"root", "index", "/"}:
+            return f"/{role}" if role else route
+        if route.startswith("/"):
+            return route.rstrip("/") or f"/{role}"
+        return f"/{role}/{route}".rstrip("/") if role else f"/{route}".rstrip("/")
 
     @staticmethod
     def _filesystem_static_pages(workspace_path: Path) -> list[dict[str, Any]]:

@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
 
 
@@ -61,3 +62,53 @@ def test_reset_keeps_recovery_going_when_compose_down_fails_but_direct_cleanup_s
 
     assert "[runtime] direct cleanup succeeded." in logs
     assert "[runtime] compose down failed, but direct stale-resource cleanup completed." in logs
+
+
+def test_preview_rebuild_returns_persisted_running_record(monkeypatch, tmp_path: Path) -> None:
+    class FakeStore:
+        def __init__(self) -> None:
+            self.rows: dict[tuple[str, str], dict] = {}
+
+        def get(self, collection: str, key: str):
+            return self.rows.get((collection, key))
+
+        def upsert(self, collection: str, key: str, payload: dict) -> None:
+            self.rows[(collection, key)] = payload
+
+        def list(self, collection: str):
+            return [payload for (stored_collection, _key), payload in self.rows.items() if stored_collection == collection]
+
+    class FakeRuntimeManager:
+        def preferred_mode(self) -> str:
+            return "docker"
+
+        def rebuild(self, workspace_id: str, source_dir: Path, proxy_port: int) -> list[str]:
+            del workspace_id, source_dir, proxy_port
+            return ["rebuilt"]
+
+        def project_name(self, workspace_id: str) -> str:
+            return f"preview_{workspace_id}"
+
+        def preview_url(self, proxy_port: int) -> str:
+            return f"http://localhost:{proxy_port}"
+
+        def backend_url(self, proxy_port: int) -> str:
+            return f"http://localhost:{proxy_port}/api"
+
+    store = FakeStore()
+    service = PreviewService(
+        SimpleNamespace(),
+        store,  # type: ignore[arg-type]
+        SimpleNamespace(source_dir=lambda _workspace_id: tmp_path),
+        FakeRuntimeManager(),  # type: ignore[arg-type]
+        SimpleNamespace(append=lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(service, "_select_proxy_port", lambda _workspace_id, _preview, _source_dir: 16789)
+
+    preview = service.rebuild("ws_return", source_dir=tmp_path)
+
+    assert preview.status == "running"
+    assert preview.url == "http://localhost:16789"
+    persisted = store.get("previews", "ws_return")
+    assert persisted["status"] == "running"
+    assert persisted["url"] == "http://localhost:16789"

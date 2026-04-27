@@ -747,8 +747,21 @@ class RunService:
                             followup_status="pending",
                             auto_fix_status="skipped",
                         )
+                    preview = self.preview_service.get(run.workspace_id)
+                    if run.status == "completed" and run.apply_status == "applied":
+                        run.status = "running"
+                        run.current_stage = "refreshing preview"
+                        run.progress_percent = max(run.progress_percent, 98)
+                        self._save_run(run)
+                        preview = self._queue_preview_refresh(
+                            run,
+                            reason="run completion",
+                            draft_run_id=None,
+                            followup_request=request if should_queue_followup_verification else None,
+                            wait=True,
+                        )
                     self._save_run(run)
-                    self._store_run_artifacts(run, change_plan, job, self.preview_service.get(run.workspace_id))
+                    self._store_run_artifacts(run, change_plan, job, preview)
                     self.store.delete("reports", f"run_stop_request:{run.run_id}")
                     logger.info(
                         "run_finished run_id=%s workspace_id=%s status=%s progress=%s",
@@ -763,13 +776,6 @@ class RunService:
                         message="Run finished.",
                         payload={"run_id": run.run_id, "status": run.status, "apply_status": run.apply_status},
                     )
-                    if run.status == "completed" and run.apply_status == "applied":
-                        self._queue_preview_refresh(
-                            run,
-                            reason="run completion",
-                            draft_run_id=None,
-                            followup_request=request if should_queue_followup_verification else None,
-                        )
                     return
                 if job.status == "blocked":
                     run.status = "blocked"
@@ -823,6 +829,18 @@ class RunService:
                         followup_status="pending",
                         auto_fix_status="skipped",
                     )
+            if queue_preview_reason is not None:
+                run.status = "running"
+                run.current_stage = "refreshing preview"
+                run.progress_percent = max(run.progress_percent, 98)
+                self._save_run(run)
+                preview = self._queue_preview_refresh(
+                    run,
+                    reason=queue_preview_reason,
+                    draft_run_id=None,
+                    followup_request=request if should_queue_followup_verification else None,
+                    wait=True,
+                )
             self._save_run(run)
             self._store_run_artifacts(run, change_plan, job, preview)
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
@@ -841,13 +859,6 @@ class RunService:
             )
             if run.status == "completed" and run.apply_status == "applied":
                 self._queue_resume_generation_from_checkpoint_if_needed(run, request)
-            if queue_preview_reason is not None:
-                self._queue_preview_refresh(
-                    run,
-                    reason=queue_preview_reason,
-                    draft_run_id=None,
-                    followup_request=request if should_queue_followup_verification else None,
-                )
         except Exception as exc:
             run.status = "failed"
             run.apply_status = "failed"
@@ -982,12 +993,13 @@ class RunService:
         reason: str,
         draft_run_id: str | None = None,
         followup_request: CreateRunRequest | None = None,
-    ) -> None:
+        wait: bool = False,
+    ) -> Any:
         queue_started_at = time.perf_counter()
         self._append_job_event(
             run.linked_job_id,
             "preview_rebuild_started",
-            f"Queued preview rebuild after {reason}.",
+            f"{'Running' if wait else 'Queued'} preview rebuild after {reason}.",
             {"reason": reason, "run_id": run.run_id, "draft_run_id": None},
         )
 
@@ -1058,20 +1070,41 @@ class RunService:
                     run_payload["checks_summary"] = checks_summary
                 run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
                 self.store.upsert("runs", run.run_id, run_payload)
-            if followup_request is not None:
+            if followup_request is not None and preview.status == "running":
                 self._launch_async_followup_verification(parent_run_id=run.run_id, request=followup_request)
 
-        preview = self.preview_service.rebuild_async(
-            run.workspace_id,
-            source_dir=source_dir,
-            draft_run_id=None,
-            on_complete=on_complete,
-            force=True,
-        )
+        if wait:
+            preview = self.preview_service.rebuild(
+                run.workspace_id,
+                source_dir=source_dir,
+                draft_run_id=None,
+            )
+            on_complete(preview)
+        else:
+            preview = self.preview_service.rebuild_async(
+                run.workspace_id,
+                source_dir=source_dir,
+                draft_run_id=None,
+                on_complete=on_complete,
+                force=True,
+            )
         latency_breakdown = dict((self.store.get("runs", run.run_id) or {}).get("latency_breakdown") or run.latency_breakdown)
         latency_breakdown["preview_enqueue_ms"] = int((time.perf_counter() - queue_started_at) * 1000)
         latency_breakdown.setdefault("preview_ms", latency_breakdown["preview_enqueue_ms"])
         run.latency_breakdown = latency_breakdown
+        if preview.status == "running":
+            run.status = "completed"
+            run.apply_status = "applied"
+            run.checks_summary = self._copy_checks_summary(run.checks_summary, preview="passed")
+            run.current_stage = "completed"
+            run.progress_percent = 100
+        elif wait:
+            run.status = "blocked"
+            run.outcome_kind = "blocked_preview_infra"
+            run.failure_reason = getattr(preview, "last_error", None) or "Preview rebuild failed after applying the draft."
+            run.current_stage = "preview failed"
+            run.progress_percent = 100
+            run.checks_summary = self._copy_checks_summary(run.checks_summary, preview="failed")
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
         artifacts_payload = self.store.get("reports", f"run_artifacts:{run.run_id}")
@@ -1083,6 +1116,7 @@ class RunService:
                 if key in {"status", "stage", "progress_percent", "runtime_mode", "url", "role_urls", "draft_run_id"}
             }
             self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
+        return preview
 
     def _launch_async_followup_verification(self, *, parent_run_id: str, request: CreateRunRequest) -> None:
         marker_key = f"followup_started:{parent_run_id}"
@@ -1507,6 +1541,58 @@ class RunService:
         payload = self.code_agent_runtime.current_report(workspace_id, "agent_quality")
         return dict(payload) if isinstance(payload, dict) else {}
 
+    @staticmethod
+    def _validation_scope_for_run(run: RunRecord) -> str:
+        if run.intent in {"create", "edit", "refine", "role_only_change"}:
+            return "agentic"
+        if run.mode in {"generate", "fix"}:
+            return "agentic"
+        return "full_build"
+
+    @staticmethod
+    def _agent_quality_from_execution(execution: CheckExecutionRecord) -> dict[str, Any]:
+        role_coverage: dict[str, Any] = {}
+        generated_tests: dict[str, Any] = {}
+        neutral_template_findings: list[dict[str, Any]] = []
+        for result in execution.results:
+            diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+            if result.name == "platform_invariants":
+                diagnostics_role_coverage = diagnostics.get("role_coverage")
+                diagnostics_generated_tests = diagnostics.get("generated_tests")
+                diagnostics_neutral_findings = diagnostics.get("neutral_template_findings")
+                if isinstance(diagnostics_role_coverage, dict) and diagnostics_role_coverage:
+                    role_coverage = dict(diagnostics_role_coverage)
+                if isinstance(diagnostics_generated_tests, dict) and diagnostics_generated_tests:
+                    generated_tests.update(diagnostics_generated_tests)
+                if isinstance(diagnostics_neutral_findings, list):
+                    neutral_template_findings = [
+                        dict(item)
+                        for item in diagnostics_neutral_findings
+                        if isinstance(item, dict)
+                    ]
+            if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
+                generated_tests[result.name] = {
+                    "status": result.status,
+                    "details": result.details,
+                    "command": result.command,
+                }
+        return {
+            "workspace_id": execution.workspace_id,
+            "role_coverage": role_coverage,
+            "generated_tests": generated_tests,
+            "neutral_template_findings": neutral_template_findings,
+        }
+
+    def _store_agent_quality_from_execution(
+        self,
+        workspace_id: str,
+        execution: CheckExecutionRecord,
+    ) -> dict[str, Any]:
+        payload = self._agent_quality_from_execution(execution)
+        payload["workspace_id"] = workspace_id
+        self.store.upsert("reports", f"agent_quality:{workspace_id}", payload)
+        return payload
+
     def _resolve_generation_mode(
         self,
         workspace: WorkspaceRecord,
@@ -1764,7 +1850,7 @@ class RunService:
             source_dir=source_dir,
             changed_files=[],
             preview_run_id=None,
-            scope_mode="full_build",
+            scope_mode=self._validation_scope_for_run(run),
         )
         validation_snapshot = self._validation_snapshot_from_execution(execution)
         completion_state = self._strict_green_completion_state(execution.results, validation_snapshot)
@@ -1784,6 +1870,7 @@ class RunService:
             f"validation:{run.workspace_id}",
             validation_snapshot.model_dump(mode="json"),
         )
+        self._store_agent_quality_from_execution(run.workspace_id, execution)
 
         if self.workspace_service.draft_exists(run.workspace_id, run.run_id):
             self.workspace_service.discard_draft(run.workspace_id, run.run_id)
@@ -1865,7 +1952,7 @@ class RunService:
             source_dir=draft_source,
             changed_files=meaningful_paths,
             preview_run_id=run.run_id,
-            scope_mode="full_build",
+            scope_mode=self._validation_scope_for_run(run),
         )
         validation_snapshot = self._validation_snapshot_from_execution(execution)
         results = execution.results
@@ -1890,10 +1977,14 @@ class RunService:
             f"validation:{run.workspace_id}",
             validation_snapshot.model_dump(mode="json"),
         )
+        agent_quality = self._store_agent_quality_from_execution(run.workspace_id, execution)
 
         message = "Retained draft passed validators/build/tests and was applied automatically."
         run.checks_summary = self._build_checks_summary(validation_snapshot, self.preview_service.get(run.workspace_id).status)
         run.remaining_issues = []
+        run.role_coverage = dict(agent_quality.get("role_coverage") or {})
+        run.generated_tests = dict(agent_quality.get("generated_tests") or {})
+        run.neutral_template_findings = list(agent_quality.get("neutral_template_findings") or [])
         run.summary = message
         run.failure_reason = None
         run.failure_class = None
@@ -1914,6 +2005,7 @@ class RunService:
         job.failure_signature = None
         job.root_cause_summary = None
         job.validation_snapshot = validation_snapshot
+        job.executed_checks = [result.model_dump(mode="json") for result in execution.results]
         self.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
         self._append_job_event(
             run.linked_job_id,
@@ -1933,13 +2025,8 @@ class RunService:
 
     @staticmethod
     def _should_queue_async_followup_verification(request: CreateRunRequest, run: RunRecord) -> bool:
-        if request.mode == "fix":
-            return False
-        if run.status != "completed" or run.apply_status != "applied":
-            return False
-        if run.generation_mode == GenerationMode.QUALITY:
-            return False
-        return run.intent in {"create", "edit", "refine", "role_only_change"}
+        del request, run
+        return False
 
     def _should_apply_best_effort_after_failed_repairs(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
         del run, job, meaningful_paths
@@ -2153,3 +2240,9 @@ class RunService:
             auto_fix_status=auto_fix_status or "skipped",
             issues=issues,
         )
+
+    @staticmethod
+    def _copy_checks_summary(summary: RunChecksSummary | dict[str, Any], **updates: Any) -> RunChecksSummary:
+        payload = summary.model_dump(mode="python") if hasattr(summary, "model_dump") else dict(summary or {})
+        payload.update(updates)
+        return RunChecksSummary.model_validate(payload)
