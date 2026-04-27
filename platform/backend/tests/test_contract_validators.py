@@ -77,6 +77,24 @@ def _write_generated_test_placeholders(source_dir: Path) -> None:
     tests_dir.joinpath("generated_app.test.mjs").write_text("import test from 'node:test';\n\ntest('placeholder', () => {});\n", encoding="utf-8")
 
 
+def _write_multipage_role_surfaces(source_dir: Path) -> None:
+    manifest = {"roles": {}, "shared": {}}
+    for role in ("client", "specialist", "manager"):
+        _write_role_root(source_dir, role)
+        _write_role_child(source_dir, role, "profile")
+        _write_role_child(source_dir, role, "catalog")
+        manifest["roles"][role] = {
+            "routes": {
+                f"/{role}": f"static/{role}/index.html",
+                f"/{role}/profile": f"static/{role}/profile/index.html",
+                f"/{role}/catalog": f"static/{role}/catalog/index.html",
+            }
+        }
+    manifest_path = source_dir / "miniapp/app/generated/route_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
 def test_template_shell_passes_platform_build_validator(tmp_path: Path) -> None:
     app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
     workspace = app.state.container.workspace_service.create_workspace(
@@ -424,6 +442,64 @@ def test_agentic_platform_invariants_accept_multipage_role_surfaces(tmp_path: Pa
     assert "/specialist/profile" in CheckRunner._root_preview_routes(source_dir)
 
 
+def test_agentic_create_invariants_require_persistent_post_api(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/index.html", "miniapp/app/generated/route_manifest.json"],
+        scope_mode="agentic",
+        intent="create",
+    )
+
+    assert result.status == "failed"
+    joined_logs = "\n".join(result.logs)
+    assert "platform.missing_create_get_api" in joined_logs
+    assert "platform.missing_create_post_api" in joined_logs
+    assert "platform.frontend_missing_post_api" in joined_logs
+    assert result.diagnostics["api_contract"]["frontend_post_refs"] == []
+
+
+def test_agentic_create_invariants_reject_preloaded_business_data(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    routes_dir = source_dir / "miniapp/app/routes"
+    routes_dir.mkdir(parents=True, exist_ok=True)
+    routes_dir.joinpath("orders.py").write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/api/orders')\n\n"
+        "@router.get('')\n"
+        "def list_orders():\n"
+        "    return []\n\n"
+        "@router.post('')\n"
+        "def create_order(payload: dict):\n"
+        "    return payload\n",
+        encoding="utf-8",
+    )
+    client_app = source_dir / "miniapp/app/static/client/app.js"
+    client_app.write_text(
+        "const seedRecords = [{ id: 1, title: 'Preloaded order' }];\n"
+        "fetch('/api/orders', { method: 'POST', body: JSON.stringify({ title: 'User order' }) });\n",
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/app.js", "miniapp/app/routes/orders.py"],
+        scope_mode="agentic",
+        intent="create",
+    )
+
+    assert result.status == "failed"
+    assert "platform.preloaded_business_data" in "\n".join(result.logs)
+    assert result.diagnostics["preloaded_data_findings"][0]["file_path"] == "miniapp/app/static/client/app.js"
+
+
 def test_agentic_generated_app_tests_are_required(tmp_path: Path) -> None:
     runner = object.__new__(CheckRunner)
     backend_dir = tmp_path / "miniapp"
@@ -494,6 +570,18 @@ def test_generated_js_test_failure_reports_assertion_source(tmp_path: Path) -> N
     assert diagnostics["expected_literal"] == "voice-first devices"
 
 
+def test_generated_post_persistence_failure_is_diagnostic() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "FAIL: test_create_order_persists (test_generated_app.GeneratedAppTest.test_create_order_persists)",
+            "POST /api/orders record did not persist. Payload: {'order_id': 'ord-1'}",
+        ]
+    )
+
+    assert diagnostics["post_persistence_failure"]["path"] == "/api/orders"
+    assert diagnostics["post_persistence_failure"]["resource_slug"] == "orders"
+
+
 def test_preview_ready_probes_all_role_roots(monkeypatch) -> None:
     probed: list[str] = []
     service = object.__new__(PreviewService)
@@ -518,7 +606,7 @@ def test_connectivity_validator_accepts_api_routes_declared_inside_role_module(t
     app.state.container.workspace_service.clone_template(workspace.workspace_id)
     source_dir = app.state.container.workspace_service.source_dir(workspace.workspace_id)
     (source_dir / "miniapp/app/static/client/app.js").write_text(
-        "fetch('/api/products');\nfetch('/api/orders');\n",
+        "fetch('/api/products');\nfetch('/api/orders', { method: 'POST' });\n",
         encoding="utf-8",
     )
     (source_dir / "miniapp/app/routes/client.py").write_text(
@@ -589,5 +677,34 @@ def test_connectivity_validator_flags_missing_nested_api_route(tmp_path: Path) -
     assert any(
         issue.code == "connectivity.missing_backend_route"
         and "/api/client/bookings/{param}" in issue.message
+        for issue in issues
+    )
+
+
+def test_connectivity_validator_flags_post_when_only_get_route_exists(tmp_path: Path) -> None:
+    app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
+    workspace = app.state.container.workspace_service.create_workspace(
+        WorkspaceRecord(name="POST Connectivity Workspace", path=str(tmp_path / "workspace"))
+    )
+    app.state.container.workspace_service.clone_template(workspace.workspace_id)
+    source_dir = app.state.container.workspace_service.source_dir(workspace.workspace_id)
+    (source_dir / "miniapp/app/static/client/app.js").write_text(
+        "fetch('/api/orders', { method: 'POST', body: JSON.stringify({ title: 'Order' }) });\n",
+        encoding="utf-8",
+    )
+    (source_dir / "miniapp/app/routes/orders.py").write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "@router.get('/api/orders')\n"
+        "def orders():\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+
+    issues = ConnectivityValidator().validate(source_dir)
+
+    assert any(
+        issue.code == "connectivity.missing_backend_route"
+        and "POST /api/orders" in issue.message
         for issue in issues
     )

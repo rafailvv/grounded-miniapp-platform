@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import os
+
 from app.models.common import GenerationMode
 
 
-CODEX_MINI_MODEL = "gpt-5.1-codex-mini"
-FAST_CODE_MODEL = CODEX_MINI_MODEL
-STRONG_CODE_MODEL = CODEX_MINI_MODEL
-SUMMARY_MODEL = CODEX_MINI_MODEL
-REPAIR_MODEL = STRONG_CODE_MODEL
+CODEX_MINI_MODEL = os.getenv("OPENAI_CODE_MINI_MODEL", "gpt-5.1-codex-mini")
+FAST_CODE_MODEL = os.getenv("OPENAI_CODE_FAST_MODEL", CODEX_MINI_MODEL)
+BALANCED_CODE_MODEL = os.getenv("OPENAI_CODE_BALANCED_MODEL", "gpt-5.3-codex")
+QUALITY_CODE_MODEL = os.getenv("OPENAI_CODE_QUALITY_MODEL", "gpt-5.4")
+SUMMARY_MODEL = os.getenv("OPENAI_CODE_SUMMARY_MODEL", FAST_CODE_MODEL)
+REPAIR_MODEL = os.getenv("OPENAI_CODE_REPAIR_MODEL", BALANCED_CODE_MODEL)
 
 TASK_PROFILES = {
     "openai_code_fast": {
@@ -28,8 +31,8 @@ TASK_PROFILES = {
         "provider": "openai",
         "description": "Balanced profile for iterative code-agent generation and repair.",
         "routing": {
-            "agent_turn": STRONG_CODE_MODEL,
-            "code_edit": STRONG_CODE_MODEL,
+            "agent_turn": BALANCED_CODE_MODEL,
+            "code_edit": BALANCED_CODE_MODEL,
             "repair": REPAIR_MODEL,
             "summarize": SUMMARY_MODEL,
             "cheap_task": SUMMARY_MODEL,
@@ -41,8 +44,8 @@ TASK_PROFILES = {
         "provider": "openai",
         "description": "Highest-confidence profile for iterative code-agent generation and repair.",
         "routing": {
-            "agent_turn": STRONG_CODE_MODEL,
-            "code_edit": STRONG_CODE_MODEL,
+            "agent_turn": QUALITY_CODE_MODEL,
+            "code_edit": QUALITY_CODE_MODEL,
             "repair": REPAIR_MODEL,
             "summarize": SUMMARY_MODEL,
             "cheap_task": SUMMARY_MODEL,

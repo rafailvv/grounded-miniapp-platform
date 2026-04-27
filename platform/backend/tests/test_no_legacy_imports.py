@@ -81,8 +81,8 @@ def test_visual_changes_are_handled_by_agent_runtime(tmp_path: Path) -> None:
     app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
     runtime = app.state.container.workspace_code_agent_runtime
 
-    assert runtime._run_progress_for_event("agent_turn_started", details={"attempt": 1}) == ("Planning code edit 1", 20)
+    assert runtime._run_progress_for_event("agent_turn_started", details={"attempt": 1}) == ("Planning code edit 1", 18)
     assert runtime._run_progress_for_event(
         "patch_apply_started",
         details={"attempt": 1, "files": ["miniapp/app/main.py", "miniapp/app/static/client/app.js"]},
-    ) == ("Applying patch • 2 files", 44)
+    ) == ("Applying patch • 2 files", 48)

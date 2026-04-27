@@ -1188,6 +1188,7 @@ class RunService:
             preview_run_id=None,
             scope_mode="full_build",
             check_profile="full",
+            intent=str(getattr(run, "intent", "") or ""),
         )
         validation_snapshot = self._validation_snapshot_from_execution(execution)
         self.store.upsert(
@@ -1851,6 +1852,7 @@ class RunService:
             changed_files=[],
             preview_run_id=None,
             scope_mode=self._validation_scope_for_run(run),
+            intent=str(getattr(run, "intent", "") or ""),
         )
         validation_snapshot = self._validation_snapshot_from_execution(execution)
         completion_state = self._strict_green_completion_state(execution.results, validation_snapshot)
@@ -1953,6 +1955,7 @@ class RunService:
             changed_files=meaningful_paths,
             preview_run_id=run.run_id,
             scope_mode=self._validation_scope_for_run(run),
+            intent=str(getattr(run, "intent", "") or ""),
         )
         validation_snapshot = self._validation_snapshot_from_execution(execution)
         results = execution.results

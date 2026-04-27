@@ -23,6 +23,10 @@ def test_agent_prompt_declares_run_checks_read_only() -> None:
     assert "at least two domain-specific child pages" in prompt
     assert "route_manifest.json" in prompt
     assert "compact routes map" in prompt
+    assert "never ship static-only mockups" in prompt
+    assert "Do not add mock data, seed data, demo data, sample data" in prompt
+    assert "GET and POST APIs" in prompt
+    assert "GET starts empty, POST creates" in prompt
     assert "Never declare a route_manifest route unless" in prompt
     assert "Every generated HTML route page" in prompt
     assert "literally present in the file being read" in prompt
@@ -33,7 +37,7 @@ def test_agent_prompt_declares_run_checks_read_only() -> None:
     assert "miniapp/tests/generated_app.test.mjs" in prompt
     assert "do not use miniapp/app/..." in prompt
     assert "fileURLToPath" in prompt
-    assert schema["properties"]["operations"]["maxItems"] == 12
+    assert schema["properties"]["operations"]["maxItems"] == 20
     assert "miniapp/tests/test_generated_app.py" in SEED_CONTEXT_PATHS
     assert "miniapp/tests/generated_app.test.mjs" in SEED_CONTEXT_PATHS
 
@@ -81,11 +85,65 @@ def test_create_patch_coverage_accepts_balanced_role_and_test_patch() -> None:
         "miniapp/app/static/manager/index.html",
         "miniapp/app/static/manager/analytics/index.html",
         "miniapp/app/static/manager/products/index.html",
+        "miniapp/app/main.py",
+        "miniapp/app/routes/store_api.py",
         "miniapp/tests/test_generated_app.py",
         "miniapp/tests/generated_app.test.mjs",
     ]
 
-    assert WorkspaceCodeAgentRuntime._create_patch_coverage_gap([op(path) for path in paths], request=request) == []
+    operations = [op(path) for path in paths]
+    for operation in operations:
+        if operation.file_path == "miniapp/app/routes/store_api.py":
+            operation.content = (
+                "from fastapi import APIRouter\n\n"
+                "router = APIRouter()\n"
+                "@router.get('/api/orders')\n"
+                "def list_orders():\n"
+                "    return []\n"
+                "@router.post('/api/orders')\n"
+                "def create_order(payload: dict):\n"
+                "    return payload\n"
+                "@router.patch('/api/orders/{order_id}')\n"
+                "def update_order(order_id: str, payload: dict):\n"
+                "    return payload\n"
+            )
+        if operation.file_path == "miniapp/app/static/client/index.html":
+            operation.content = "fetch('/api/orders', { method: 'POST', body: JSON.stringify({ title: value }) });"
+        if operation.file_path == "miniapp/tests/test_generated_app.py":
+            operation.content = "client.get('/api/orders')\nclient.post('/api/orders', json={'title': 'User order'})\nclient.get('/api/orders')\n"
+
+    assert WorkspaceCodeAgentRuntime._create_patch_coverage_gap(operations, request=request) == []
+
+
+def test_create_patch_coverage_rejects_static_only_app_without_api() -> None:
+    request = GenerateRequest(prompt="Create a store", intent="create")
+
+    def op(path: str) -> DraftFileOperation:
+        return DraftFileOperation(file_path=path, operation="replace", content="<html></html>", reason="test")
+
+    paths = [
+        "miniapp/app/generated/route_manifest.json",
+        "miniapp/app/main.py",
+        "miniapp/app/static/client/index.html",
+        "miniapp/app/static/client/catalog/index.html",
+        "miniapp/app/static/client/orders/index.html",
+        "miniapp/app/static/specialist/index.html",
+        "miniapp/app/static/specialist/queue/index.html",
+        "miniapp/app/static/specialist/stock/index.html",
+        "miniapp/app/static/manager/index.html",
+        "miniapp/app/static/manager/analytics/index.html",
+        "miniapp/app/static/manager/products/index.html",
+        "miniapp/tests/test_generated_app.py",
+        "miniapp/tests/generated_app.test.mjs",
+    ]
+
+    missing = WorkspaceCodeAgentRuntime._create_patch_coverage_gap([op(path) for path in paths], request=request)
+
+    assert "miniapp/app/routes/<domain_resource>.py" in missing
+    assert "backend GET /api/<resource>" in missing
+    assert "backend POST /api/<resource>" in missing
+    assert "frontend form/fetch POST /api/<resource>" in missing
+    assert "miniapp/tests/test_generated_app.py API persistence coverage" in missing
 
 
 def test_fix_completion_requires_meaningful_diff_even_when_checks_are_green() -> None:
@@ -463,9 +521,9 @@ def test_output_cap_correction_for_create_requires_compact_patch() -> None:
     )
 
     assert correction["tool"] == "output_cap_correction"
-    assert "no more than 12 concise full-file operations" in str(correction["required_next_action"])
-    assert "staged frontend-only patch" in str(correction["required_next_action"])
-    assert "exact missing route pages" in str(correction["required_next_action"])
+    assert "no more than 20 concise file operations" in str(correction["required_next_action"])
+    assert "backend API route module with GET/POST persistence" in str(correction["required_next_action"])
+    assert "Do not add mock data" in str(correction["required_next_action"])
     assert "do not request more context" in str(correction["required_next_action"])
 
 
@@ -487,10 +545,12 @@ def test_fast_create_budget_prefers_frontend_first_compact_patch() -> None:
     budget = WorkspaceCodeAgentRuntime._fast_create_budget_result()
 
     assert budget["tool"] == "fast_create_budget"
-    assert "10-12 concise operations" in str(budget["required_next_action"])
+    assert "up to 20 concise operations" in str(budget["required_next_action"])
     assert "first answer" in str(budget["required_next_action"])
-    assert "frontend-first" in str(budget["contract"])
+    assert "backend persistence" in str(budget["contract"])
     assert "three role root pages" in str(budget["required_next_action"])
+    assert "POST-capable /api resource" in str(budget["required_next_action"])
+    assert "GET starts empty" in str(budget["required_next_action"])
     assert "profile/settings page pattern" in str(budget["required_next_action"])
     assert "cwd=miniapp" in str(budget["required_next_action"])
     assert "path.join(process.cwd()" in str(budget["required_next_action"])
@@ -522,7 +582,7 @@ def test_running_progress_stays_early_until_file_edits_exist() -> None:
     assert WorkspaceCodeAgentRuntime._run_progress_for_event(
         "running_checks",
         details={"attempt": 2, "has_file_edits": False},
-    ) == ("Checking workspace shell", 7)
+    ) == ("Checking workspace shell", 19)
     assert WorkspaceCodeAgentRuntime._run_progress_for_event(
         "running_checks",
         details={"attempt": 1, "has_file_edits": True},
@@ -530,15 +590,25 @@ def test_running_progress_stays_early_until_file_edits_exist() -> None:
     assert WorkspaceCodeAgentRuntime._run_progress_for_event(
         "iteration_ready",
         details={"attempt": 2, "outcome": "no_progress", "operation_count": 0, "tool_request_count": 0},
-    ) == ("No file edits returned", 30)
+    ) == ("No file edits returned", 37)
     assert WorkspaceCodeAgentRuntime._run_progress_for_event(
         "iteration_ready",
         details={"attempt": 1, "outcome": "tool_request", "operation_count": 0, "tool_request_count": 2},
-    ) == ("Requested 2 context reads", 25)
+    ) == ("Requested 2 context reads", 29)
     assert WorkspaceCodeAgentRuntime._run_progress_for_event(
         "iteration_ready",
         details={"attempt": 1, "outcome": "patch_ready", "operation_count": 8, "tool_request_count": 0},
-    ) == ("Prepared 8 file edits", 38)
+    ) == ("Prepared 8 file edits", 43)
+    assert not WorkspaceCodeAgentRuntime._should_update_run_stage(
+        "running_checks",
+        progress=19,
+        existing_progress=37,
+    )
+    assert WorkspaceCodeAgentRuntime._should_update_run_stage(
+        "agent_turn_started",
+        progress=42,
+        existing_progress=37,
+    )
 
 
 def test_fix_run_preserves_requested_generation_mode() -> None:
@@ -563,7 +633,15 @@ def test_agent_turn_tuning_caps_all_generation_modes() -> None:
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.FAST, intent="create") == {
         "reasoning": {"effort": "low"},
-        "max_output_tokens": 14000,
+        "max_output_tokens": 22000,
+    }
+    assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED, intent="create") == {
+        "reasoning": {"effort": "medium"},
+        "max_output_tokens": 36000,
+    }
+    assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.QUALITY, intent="create") == {
+        "reasoning": {"effort": "high"},
+        "max_output_tokens": 52000,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED) == {
         "reasoning": {"effort": "medium"},

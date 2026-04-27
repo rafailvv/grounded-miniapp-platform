@@ -14,14 +14,15 @@ The user's prompt is the only source of product meaning. Template files provide 
 - Root pages should link to child pages and summarize the role workflow; detailed catalog/order/task/report/profile content belongs on child pages.
 - Name models, routes, pages, and UI with the user's domain language.
 - Generate light-mode UI by default: light backgrounds, dark readable text, and accessible contrast. Use a dark theme only when the user explicitly asks for it.
-- Add backend persistence only when shared or durable state is needed.
-- Keep browser-only tools browser-only when server data is not needed.
+- Every generated create app must be usable, not static-only: include forms/buttons, frontend `fetch` calls, and backend APIs that save user-provided records.
+- Do not include mock data, seed data, demo data, sample data, fixtures, preloaded records, or hard-coded business records in generated app source. Start with empty persistent state and domain-specific empty states.
+- Fast create needs at least one persistent resource with `GET` and `POST`. Balanced should connect two or three resources or add status/update behavior. Quality should provide detailed multi-role workflows with several endpoints.
 - Add generated app tests in `miniapp/tests/test_generated_app.py` and `miniapp/tests/generated_app.test.mjs`.
 - Keep generated tests dependency-free beyond the template runtime: Python `unittest` + FastAPI `TestClient`, and Node `node:test` + `fs/path`.
 - Generated JS tests run from the `miniapp/` directory; read `app/static/<role>/...`, not `miniapp/app/static/<role>/...`.
 - Generated JS tests should assert only exact strings that literally appear in the file being read. Do not paraphrase expected UI text in `includes()` or regex assertions.
 - In generated JS tests, pass string paths to `path`/`fs`: prefer `path.join(process.cwd(), "app/static/client/index.html")`, or wrap URL fixtures with `fileURLToPath(new URL(..., import.meta.url))`.
-- Python `TestClient` tests see HTML before browser JavaScript runs; use them for route/static shell/API checks, and put JS-rendered content/data assertions in `generated_app.test.mjs`.
+- Python `TestClient` tests see HTML before browser JavaScript runs; use them for route/static shell/API checks, including empty `GET`, `POST`, and post-create `GET` persistence. Put JS-rendered content/data assertions in `generated_app.test.mjs`.
 - During edits, preserve existing selectors, ids, and data-testid attributes that generated tests assert, unless the requested behavior intentionally changes them and the test is updated in the same patch.
 
 ## Layout

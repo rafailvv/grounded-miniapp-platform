@@ -68,11 +68,35 @@ ROLE_LINK_STOPWORDS = {
     "приложение",
 }
 MIN_ROLE_ROUTE_PAGES = 3
+PRELOADED_BUSINESS_DATA_MARKERS = (
+    "mock data",
+    "mock-data",
+    "demo data",
+    "demo-data",
+    "sample data",
+    "sample-data",
+    "seed data",
+    "seed-data",
+    "fixture records",
+    "fixture data",
+    "preloaded records",
+    "preloaded data",
+    "hard-coded business records",
+    "hardcoded business records",
+    "initialrecords",
+    "samplerecords",
+    "demorecords",
+    "seedrecords",
+    "mockrecords",
+    "мок-данн",
+    "демо-данн",
+    "тестовые данные",
+)
 
 
 class CheckRunner:
     _API_FAILURE_RE = re.compile(
-        r"(?P<label>Create|Update|List|Post-update list)\s+API\s+failed:\s*"
+        r"(?P<label>Create|Update|List|Post-update list|Post-create list)\s+API\s+failed:\s*"
         r"(?:(?P<method>POST|PUT|PATCH|GET|DELETE)\s+)?"
         r"(?P<path>/api/[A-Za-z0-9_/{}/-]+)\s*->\s*(?P<status>\d+)"
         r"(?:;\s*payload=(?P<payload>.*?))?"
@@ -91,6 +115,10 @@ class CheckRunner:
     )
     _SHARED_STATE_UPDATE_RE = re.compile(
         r"Updated record\s+(?P<record_id>[A-Za-z0-9_-]+)\s+did not reflect\s+(?P<actor>[A-Za-z0-9_-]+)\s+changes in shared state\.\s+Payload:\s*(?P<payload>.*)$",
+        re.IGNORECASE,
+    )
+    _POST_PERSISTENCE_RE = re.compile(
+        r"POST(?:ed)?\s+(?P<path>/api/[A-Za-z0-9_/{}/-]+)?\s*(?:record|payload)?\s*(?:did not|does not|was not)\s+persist(?:ed)?(?:\.\s*Payload:\s*(?P<payload>.*))?$",
         re.IGNORECASE,
     )
     _GENERATED_JS_TEST_LOCATION_RE = re.compile(r"generated_app\.test\.mjs:(?P<line>\d+):(?P<column>\d+)")
@@ -114,6 +142,7 @@ class CheckRunner:
         preview_run_id: str | None = None,
         scope_mode: str = "full_build",
         check_profile: str = "full",
+        intent: str | None = None,
     ) -> CheckExecutionRecord:
         started = time.perf_counter()
         results: list[RunCheckResult] = []
@@ -156,6 +185,7 @@ class CheckRunner:
             source_dir=source_dir,
             changed_files=changed_files,
             scope_mode=scope_mode,
+            intent=intent,
         )
         platform_smoke_result.duration_ms = int((time.perf_counter() - canonical_started) * 1000)
         results.append(platform_smoke_result)
@@ -315,6 +345,7 @@ class CheckRunner:
                 diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
                 api_failure = diagnostics.get("api_failure") if isinstance(diagnostics, dict) else None
                 shared_state_failure = diagnostics.get("shared_state_update_failure") if isinstance(diagnostics, dict) else None
+                post_persistence_failure = diagnostics.get("post_persistence_failure") if isinstance(diagnostics, dict) else None
                 js_path_root = diagnostics.get("js_test_path_root") if isinstance(diagnostics, dict) else None
                 js_url_path_api = diagnostics.get("js_test_url_path_api") if isinstance(diagnostics, dict) else None
                 server_html_assertion = diagnostics.get("server_rendered_html_assertion") if isinstance(diagnostics, dict) else None
@@ -343,6 +374,11 @@ class CheckRunner:
                         f"Generated app shared-state update failure: {resource_label} did not persist "
                         f"{actor or 'role'} changes. Payload: {payload_excerpt}"
                     ).strip()
+                elif isinstance(post_persistence_failure, dict):
+                    path = str(post_persistence_failure.get("path") or "").strip()
+                    resource_slug = str(post_persistence_failure.get("resource_slug") or "").strip()
+                    resource_label = path or (f"/api/{resource_slug}" if resource_slug else "created record API")
+                    message = f"Generated app POST persistence failure: {resource_label} did not persist the created record."
                 elif isinstance(api_failure, dict):
                     method = str(api_failure.get("method") or "").strip().upper()
                     path = str(api_failure.get("path") or "").strip()
@@ -526,6 +562,7 @@ class CheckRunner:
         source_dir: Path,
         changed_files: list[str],
         scope_mode: str,
+        intent: str | None = None,
     ) -> RunCheckResult:
         relevant_changed = [
             str(path)
@@ -546,6 +583,8 @@ class CheckRunner:
         role_coverage: dict[str, object] = {}
         neutral_template_findings: list[dict[str, str]] = []
         generated_tests: dict[str, object] = {}
+        api_contract: dict[str, object] = {}
+        preloaded_data_findings: list[dict[str, str]] = []
         if any(
             path.startswith("miniapp/app/routes/")
             or path in {"miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"}
@@ -559,6 +598,11 @@ class CheckRunner:
             issues.extend(role_issues)
             tests_issues, generated_tests = self._generated_tests_presence_issues(source_dir)
             issues.extend(tests_issues)
+        if agentic_scope and str(intent or "").strip().lower() == "create":
+            api_issues, api_contract = self._create_api_contract_issues(source_dir)
+            issues.extend(api_issues)
+            data_issues, preloaded_data_findings = self._preloaded_business_data_issues(source_dir)
+            issues.extend(data_issues)
         issues.extend(self._dom_contract_issues(source_dir=source_dir, changed_files=relevant_changed))
         issues = self._dedupe_validation_issues(issues)
         return RunCheckResult(
@@ -572,6 +616,8 @@ class CheckRunner:
                 "multipage_coverage": self._multipage_coverage_from_roles(role_coverage),
                 "neutral_template_findings": neutral_template_findings,
                 "generated_tests": generated_tests,
+                "api_contract": api_contract,
+                "preloaded_data_findings": preloaded_data_findings,
             },
         )
 
@@ -699,6 +745,192 @@ class CheckRunner:
                 )
             coverage["shared_domain_tokens"] = sorted(shared_tokens)[:12]
         return issues, coverage, neutral_findings
+
+    @classmethod
+    def _create_api_contract_issues(cls, source_dir: Path) -> tuple[list[ValidationIssue], dict[str, object]]:
+        declared_methods = cls._declared_api_methods(source_dir / "miniapp/app/routes")
+        frontend_refs = cls._frontend_api_refs(source_dir / "miniapp/app/static")
+        has_backend_get = any(method == "GET" for method, _path in declared_methods)
+        has_backend_post = any(method == "POST" for method, _path in declared_methods)
+        frontend_post_refs = sorted(path for method, path in frontend_refs if method == "POST")
+        issues: list[ValidationIssue] = []
+        if not has_backend_get:
+            issues.append(
+                ValidationIssue(
+                    code="platform.missing_create_get_api",
+                    message="Create runs must expose at least one GET /api resource so saved user records can be listed.",
+                    severity="high",
+                    location="miniapp/app/routes",
+                    blocking=True,
+                )
+            )
+        if not has_backend_post:
+            issues.append(
+                ValidationIssue(
+                    code="platform.missing_create_post_api",
+                    message="Create runs must expose at least one POST /api resource so users can save new records.",
+                    severity="high",
+                    location="miniapp/app/routes",
+                    blocking=True,
+                )
+            )
+        if not frontend_post_refs:
+            issues.append(
+                ValidationIssue(
+                    code="platform.frontend_missing_post_api",
+                    message="Create runs must include frontend form/fetch code that POSTs user-provided records to /api.",
+                    severity="high",
+                    location="miniapp/app/static",
+                    blocking=True,
+                )
+            )
+        return issues, {
+            "declared_methods": [
+                {"method": method, "path": path}
+                for method, path in sorted(declared_methods)
+            ],
+            "frontend_refs": [
+                {"method": method, "path": path}
+                for method, path in sorted(frontend_refs)
+            ],
+            "frontend_post_refs": frontend_post_refs,
+        }
+
+    @staticmethod
+    def _declared_api_methods(routes_root: Path) -> set[tuple[str, str]]:
+        methods: set[tuple[str, str]] = set()
+        if not routes_root.exists():
+            return methods
+        for path in routes_root.glob("*.py"):
+            if path.name == "__init__.py":
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            router_prefixes = {
+                match.group("name"): match.group("prefix")
+                for match in re.finditer(
+                    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*APIRouter\(\s*prefix\s*=\s*['\"](?P<prefix>[^'\"]*)['\"]",
+                    content,
+                )
+            }
+            for match in re.finditer(
+                r"@(?P<name>[A-Za-z_][A-Za-z0-9_]*)\.(?P<method>get|post|put|patch|delete)\(\s*['\"](?P<path>[^'\"]*)['\"]",
+                content,
+            ):
+                prefix = router_prefixes.get(match.group("name"), "")
+                full_path = f"{prefix.rstrip('/')}/{match.group('path').lstrip('/')}".strip()
+                if not full_path.startswith("/api/"):
+                    continue
+                methods.add((match.group("method").upper(), re.sub(r"/+", "/", full_path).rstrip("/") or "/"))
+        return methods
+
+    @classmethod
+    def _frontend_api_refs(cls, static_root: Path) -> set[tuple[str, str]]:
+        refs: set[tuple[str, str]] = set()
+        if not static_root.exists():
+            return refs
+        for path in static_root.rglob("*"):
+            if path.suffix.lower() not in {".html", ".js"} or path.name == "preview_bridge.js":
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            refs.update(cls._extract_frontend_api_refs(content))
+        return refs
+
+    @staticmethod
+    def _extract_frontend_api_refs(content: str) -> set[tuple[str, str]]:
+        refs: set[tuple[str, str]] = set()
+        fetch_paths: set[str] = set()
+        fetch_pattern = re.compile(
+            r"fetch\(\s*(?P<quote>['\"`])(?P<path>/api/[^'\"`\s)]+)(?P=quote)(?P<options>[^)]*)\)",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in fetch_pattern.finditer(str(content or "")):
+            path = CheckRunner._normalize_api_ref_path(match.group("path"))
+            tail = str(content or "")[match.end():match.end() + 500].split(";", 1)[0]
+            options = f"{match.group('options') or ''}{tail}"
+            method_match = re.search(r"method\s*:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"]", options, re.IGNORECASE)
+            method = str(method_match.group("method") if method_match else "GET").upper()
+            refs.add((method, path))
+            fetch_paths.add(path)
+        for match in re.finditer(r"['\"`](/api/[^'\"`\s)]+)", str(content or "")):
+            path = CheckRunner._normalize_api_ref_path(match.group(1))
+            if path not in fetch_paths:
+                refs.add(("GET", path))
+        return refs
+
+    @staticmethod
+    def _normalize_api_ref_path(value: str) -> str:
+        normalized = str(value or "").strip().strip("'\"`").split("?", 1)[0].split("#", 1)[0]
+        normalized = re.sub(r"\$\{[^}]+\}", "{param}", normalized)
+        normalized = normalized.rstrip(".,;")
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        return re.sub(r"/+", "/", normalized).rstrip("/") or "/"
+
+    @classmethod
+    def _preloaded_business_data_issues(cls, source_dir: Path) -> tuple[list[ValidationIssue], list[dict[str, str]]]:
+        app_root = source_dir / "miniapp/app"
+        findings: list[dict[str, str]] = []
+        issues: list[ValidationIssue] = []
+        if not app_root.exists():
+            return issues, findings
+        scan_suffixes = {".py", ".js", ".html", ".json"}
+        for path in app_root.rglob("*"):
+            if path.suffix.lower() not in scan_suffixes:
+                continue
+            relative_path = path.relative_to(source_dir).as_posix()
+            if relative_path in {"miniapp/app/static/preview_bridge.js", "miniapp/app/generated/route_manifest.json"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            marker = cls._preloaded_business_data_marker(content)
+            if not marker:
+                continue
+            findings.append({"file_path": relative_path, "marker": marker})
+            issues.append(
+                ValidationIssue(
+                    code="platform.preloaded_business_data",
+                    message=(
+                        f"{relative_path} appears to include preloaded business data ({marker}). "
+                        "Create apps must start with empty persistent state and let users add records."
+                    ),
+                    severity="high",
+                    location=relative_path,
+                    blocking=True,
+                )
+            )
+        return issues, findings
+
+    @staticmethod
+    def _preloaded_business_data_marker(content: str) -> str | None:
+        text = str(content or "")
+        lowered = text.lower()
+        compact = re.sub(r"[\s_\-]+", "", lowered)
+        for marker in PRELOADED_BUSINESS_DATA_MARKERS:
+            normalized_marker = marker.lower()
+            compact_marker = re.sub(r"[\s_\-]+", "", normalized_marker)
+            if normalized_marker in lowered or compact_marker in compact:
+                return marker
+        marker_match = re.search(
+            r"\b(?:const|let|var)\s+[A-Za-z_$][\w$]*(?:Mock|Demo|Sample|Seed|Fixture|Preloaded)[A-Za-z_$\d]*\s*=",
+            text,
+        )
+        if marker_match:
+            return marker_match.group(0).strip()
+        python_marker = re.search(
+            r"\b(?:MOCK|DEMO|SAMPLE|SEED|FIXTURE|PRELOADED)_[A-Z0-9_]*\s*=",
+            text,
+        )
+        if python_marker:
+            return python_marker.group(0).strip()
+        return None
 
     @staticmethod
     def _multipage_coverage_from_roles(role_coverage: dict[str, object]) -> dict[str, object]:
@@ -1701,6 +1933,19 @@ class CheckRunner:
             }
             break
         for line in reversed(logs):
+            persistence_match = cls._POST_PERSISTENCE_RE.search(str(line or ""))
+            if not persistence_match:
+                continue
+            path = str(persistence_match.group("path") or "").strip()
+            payload = str(persistence_match.group("payload") or "").strip()
+            diagnostics["post_persistence_failure"] = {
+                "path": path or None,
+                "resource_slug": cls._resource_slug_from_api_path(path) or cls._resource_slug_from_payload_keys(payload) or None,
+                "payload_excerpt": payload[:700] or None,
+                "expected_behavior": "A generated create API must persist the POSTed record so a later GET returns it.",
+            }
+            break
+        for line in reversed(logs):
             match = cls._API_FAILURE_RE.search(str(line or ""))
             if not match:
                 continue
@@ -1718,6 +1963,13 @@ class CheckRunner:
             }
             break
         return diagnostics
+
+    @staticmethod
+    def _resource_slug_from_api_path(path: str) -> str:
+        segments = [segment for segment in str(path or "").strip("/").split("/") if segment]
+        if len(segments) >= 2 and segments[0] == "api":
+            return segments[1]
+        return ""
 
     @staticmethod
     def _resource_slug_from_payload_keys(payload: str) -> str:

@@ -20,13 +20,13 @@ class ConnectivityValidator:
                     continue
                 relative = str(file_path.relative_to(workspace_path))
                 content = file_path.read_text(encoding="utf-8")
-                for endpoint in self._extract_api_refs(content):
+                for method, endpoint in self._extract_api_refs(content):
                     normalized_endpoint = self._normalize_api_path(endpoint)
-                    if not self._api_path_is_declared(normalized_endpoint, api_route_paths):
+                    if not self._api_path_is_declared(method, normalized_endpoint, api_route_paths):
                         issues.append(
                             ValidationIssue(
                                 code="connectivity.missing_backend_route",
-                                message=f"{relative} references {normalized_endpoint} but the matching backend route is missing.",
+                                message=f"{relative} references {method} {normalized_endpoint} but the matching backend route is missing.",
                                 severity="high",
                                 location="miniapp/app/routes",
                             )
@@ -45,15 +45,30 @@ class ConnectivityValidator:
         return self._dedupe_issues(issues)
 
     @staticmethod
-    def _extract_api_refs(content: str) -> set[str]:
-        refs: set[str] = set()
+    def _extract_api_refs(content: str) -> set[tuple[str, str]]:
+        refs: set[tuple[str, str]] = set()
+        fetch_paths: set[str] = set()
+        fetch_pattern = re.compile(
+            r"fetch\(\s*(?P<quote>['\"`])(?P<path>/api/[^'\"`\s)]+)(?P=quote)(?P<options>[^)]*)\)",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in fetch_pattern.finditer(str(content or "")):
+            path = ConnectivityValidator._normalize_api_path(match.group("path"))
+            tail = str(content or "")[match.end():match.end() + 500].split(";", 1)[0]
+            options = f"{match.group('options') or ''}{tail}"
+            method_match = re.search(r"method\s*:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"]", options, re.IGNORECASE)
+            method = str(method_match.group("method") if method_match else "GET").upper()
+            refs.add((method, path))
+            fetch_paths.add(path)
         for match in re.finditer(r"['\"`](/api/[^'\"`\s)]+)", content):
-            refs.add(ConnectivityValidator._normalize_api_path(match.group(1)))
+            path = ConnectivityValidator._normalize_api_path(match.group(1))
+            if path not in fetch_paths:
+                refs.add(("GET", path))
         return refs
 
     @classmethod
-    def _api_route_paths(cls, routes_root: Path) -> set[str]:
-        paths: set[str] = set()
+    def _api_route_paths(cls, routes_root: Path) -> set[tuple[str, str]]:
+        paths: set[tuple[str, str]] = set()
         if not routes_root.exists():
             return paths
         for path in routes_root.glob("*.py"):
@@ -71,24 +86,28 @@ class ConnectivityValidator:
                 )
             }
             for match in re.finditer(
-                r"@(?P<name>[A-Za-z_][A-Za-z0-9_]*)\.(?:get|post|put|patch|delete)\(\s*['\"](?P<path>[^'\"]*)['\"]",
+                r"@(?P<name>[A-Za-z_][A-Za-z0-9_]*)\.(?P<method>get|post|put|patch|delete)\(\s*['\"](?P<path>[^'\"]*)['\"]",
                 content,
             ):
                 prefix = router_prefixes.get(match.group("name"), "")
                 full_path = f"{prefix.rstrip('/')}/{match.group('path').lstrip('/')}".strip()
                 if not full_path.startswith("/api/"):
                     continue
-                paths.add(cls._normalize_api_path(full_path))
+                paths.add((match.group("method").upper(), cls._normalize_api_path(full_path)))
         return paths
 
     @classmethod
-    def _api_path_is_declared(cls, referenced_path: str, declared_paths: set[str]) -> bool:
-        if any(cls._api_paths_match(referenced_path, declared_path) for declared_path in declared_paths):
+    def _api_path_is_declared(cls, referenced_method: str, referenced_path: str, declared_paths: set[tuple[str, str]]) -> bool:
+        method = str(referenced_method or "GET").upper()
+        same_method_paths = {path for declared_method, path in declared_paths if declared_method == method}
+        if method == "HEAD":
+            same_method_paths.update(path for declared_method, path in declared_paths if declared_method == "GET")
+        if any(cls._api_paths_match(referenced_path, declared_path) for declared_path in same_method_paths):
             return True
         referenced = referenced_path.rstrip("/")
         if referenced.count("/") < 2:
             return False
-        return any(declared_path.startswith(f"{referenced}/") for declared_path in declared_paths)
+        return any(declared_path.startswith(f"{referenced}/") for declared_path in same_method_paths)
 
     @staticmethod
     def _api_paths_match(referenced_path: str, declared_path: str) -> bool:
