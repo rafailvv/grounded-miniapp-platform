@@ -278,6 +278,8 @@ class RunService:
                 run.summary = run.summary or "Run was stopped during stale-run recovery."
                 run.failure_reason = run.failure_reason or "Run was interrupted after a stop request and recovered during backend restart cleanup."
                 run.outcome_kind = run.outcome_kind or "blocked_generation"
+            elif self._recover_stale_run_with_retained_draft(run):
+                pass
             else:
                 run.status = "failed"
                 run.apply_status = "failed"
@@ -297,6 +299,45 @@ class RunService:
                 run.status,
                 run.current_stage,
             )
+
+    def _recover_stale_run_with_retained_draft(self, run: RunRecord) -> bool:
+        if not self.workspace_service.draft_exists(run.workspace_id, run.run_id):
+            return False
+        try:
+            draft_diff = self.workspace_service.diff(run.workspace_id, run_id=run.run_id)
+        except Exception:
+            draft_diff = ""
+        if not draft_diff.strip():
+            return False
+        run.status = "blocked"
+        run.apply_status = "blocked"
+        run.draft_status = "ready"
+        run.draft_ready = True
+        run.current_stage = "interrupted; draft retained"
+        run.summary = "Run was interrupted after generating a draft. The draft was retained and can be resumed."
+        run.failure_reason = (
+            "Backend restarted or the worker disappeared while the agent was repairing the generated draft. "
+            "The draft changes were kept instead of being discarded."
+        )
+        run.failure_class = run.failure_class or "generation.interrupted_stale_worker"
+        run.outcome_kind = run.outcome_kind or "blocked_generation"
+        target_platform = getattr(run, "target_platform", None)
+        preview_profile = getattr(run, "preview_profile", None)
+        checkpoint = {
+            "status": "pending",
+            "source_run_id": run.run_id,
+            "prompt": run.prompt,
+            "intent": run.intent,
+            "target_role_scope": list(run.target_role_scope),
+            "model_profile": run.model_profile,
+            "target_platform": str(getattr(target_platform, "value", target_platform) or "telegram_mini_app"),
+            "preview_profile": str(getattr(preview_profile, "value", preview_profile) or "telegram_mock"),
+            "generation_mode": str(getattr(run.generation_mode, "value", run.generation_mode) or "balanced"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "reason": "stale_run_recovery_retained_draft",
+        }
+        self.store.upsert("reports", f"resume_checkpoint:{run.workspace_id}", checkpoint)
+        return True
 
     def _recover_orphaned_terminal_jobs(self) -> None:
         for item in self.store.list("jobs"):
@@ -609,10 +650,24 @@ class RunService:
         if run.status in {"failed", "blocked"} and int(run.progress_percent or 0) >= 100:
             run.progress_percent = self._terminal_failure_progress(run.progress_percent)
             changed = True
+        if self._failed_run_has_retained_draft(run):
+            run.status = "blocked"
+            run.apply_status = "blocked"
+            run.current_stage = "blocked"
+            run.summary = run.summary or "Strict-green validation did not pass. Draft was retained for inspection."
+            changed = True
         if persist and changed:
             run.updated_at = datetime.now(timezone.utc)
             self._save_run(run)
         return run
+
+    @staticmethod
+    def _failed_run_has_retained_draft(run: RunRecord) -> bool:
+        if run.status != "failed":
+            return False
+        if str(run.outcome_kind or "") not in {"", "blocked_generation", "blocked_preview_infra"}:
+            return False
+        return bool(run.draft_ready or str(run.draft_status or "") == "ready")
 
     @staticmethod
     def _token_usage_from_job_events(job: JobRecord) -> dict[str, Any]:
@@ -941,16 +996,16 @@ class RunService:
                     if run.draft_ready:
                         run.summary = "Strict-green validation did not pass. Draft was retained for inspection."
                 else:
-                    run.status = "failed"
-                    run.apply_status = "failed"
                     run.outcome_kind = "blocked_preview_infra" if str(job.outcome_kind or "") == "blocked_preview_infra" else "blocked_generation"
                     has_draft = self.workspace_service.draft_exists(run.workspace_id, run.run_id)
                     draft_diff = self.workspace_service.diff(run.workspace_id, run_id=run.run_id) if has_draft else ""
                     run.draft_status = "ready" if has_draft and (meaningful_paths or draft_diff.strip()) else "failed"
                     run.draft_ready = run.draft_status == "ready"
+                    run.status = "blocked" if run.draft_ready else "failed"
+                    run.apply_status = "blocked" if run.draft_ready else "failed"
                     if run.current_fix_phase == "completed":
                         run.current_fix_phase = "failed"
-                    run.current_stage = "failed"
+                    run.current_stage = "blocked" if run.draft_ready else "failed"
                     run.progress_percent = self._terminal_failure_progress(run.progress_percent)
                     if run.draft_ready:
                         run.summary = "Strict-green validation did not pass. Draft was retained for inspection."

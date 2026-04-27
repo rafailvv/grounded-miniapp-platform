@@ -502,8 +502,8 @@ class WorkspaceCodeAgentRuntime:
             has_draft_diff = bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
             self._append_event(
                 job,
-                "frontend_build_started",
-                "Running platform invariant checks.",
+                "running_checks",
+                "Starting validation checks.",
                 {
                     "attempt": 1 if has_draft_diff else 0,
                     "has_file_edits": has_draft_diff,
@@ -518,6 +518,19 @@ class WorkspaceCodeAgentRuntime:
                 else "full" if generation_mode == GenerationMode.QUALITY else "fast_gate"
             )
             scope_mode = "focused_edit" if focused_visual_edit else "agentic"
+            check_attempt = 1 if has_draft_diff else 0
+
+            def _check_progress_callback(check_step: str, payload: dict[str, Any]) -> None:
+                event_type = self._check_progress_event_type(check_step)
+                details = {
+                    **payload,
+                    "attempt": check_attempt,
+                    "has_file_edits": has_draft_diff,
+                    "has_draft_diff": has_draft_diff,
+                    "changed_files": list(last_changed_files),
+                }
+                self._append_event(job, event_type, self._check_progress_message(check_step, payload), details)
+
             execution = self.check_runner.run(
                 workspace_id=workspace_id,
                 run_id=run_id,
@@ -528,6 +541,7 @@ class WorkspaceCodeAgentRuntime:
                 check_profile=check_profile,
                 intent=str(request.intent or ""),
                 generation_mode=generation_mode,
+                progress_callback=_check_progress_callback,
             )
             if (
                 check_profile == "fast_gate"
@@ -536,7 +550,7 @@ class WorkspaceCodeAgentRuntime:
             ):
                 self._append_event(
                     job,
-                    "frontend_build_started",
+                    "final_checks_started",
                     "Running final generated app checks.",
                     {"attempt": 1, "has_file_edits": True, "changed_files": list(last_changed_files)},
                 )
@@ -550,6 +564,7 @@ class WorkspaceCodeAgentRuntime:
                     check_profile="full",
                     intent=str(request.intent or ""),
                     generation_mode=generation_mode,
+                    progress_callback=_check_progress_callback,
                 )
             prompt_smoke = self._prompt_alignment_smoke(
                 workspace_id=workspace_id,
@@ -948,7 +963,12 @@ class WorkspaceCodeAgentRuntime:
             job,
             "agent_turn_started",
             "Workspace code agent is planning the next code edit.",
-            {"attempt": attempt, "tool_round": tool_round, "context_mode": context_mode},
+            {
+                "attempt": attempt,
+                "tool_round": tool_round,
+                "context_mode": context_mode,
+                "has_draft_diff": bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip()),
+            },
         )
         try:
             generation_mode = self._generation_mode(request.generation_mode)
@@ -1071,6 +1091,7 @@ class WorkspaceCodeAgentRuntime:
                     "output_tokens": int(turn_cache_stats.get("output_tokens") or 0),
                     "reasoning_tokens": int(turn_cache_stats.get("reasoning_tokens") or 0),
                     "total_tokens": int(turn_cache_stats.get("total_tokens") or 0),
+                    "has_draft_diff": bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip()),
                 },
             )
             return payload if isinstance(payload, dict) else {"error": "Agent returned a non-object payload."}
@@ -3644,7 +3665,7 @@ test('role apps have separate frontend actions and styles', () => {{
         self._store_report(report_key, {"workspace_id": workspace_id, "items": items[-80:]})
 
     def _append_event(self, job: JobRecord, event_type: str, message: str, details: dict[str, Any] | None = None) -> None:
-        details = details or {}
+        details = self._enriched_event_details(details or {})
         job.events.append(JobEvent(event_type=event_type, message=message, details=details))
         if event_type == "iteration_ready":
             job.token_usage = self._merge_run_token_usage(
@@ -3655,6 +3676,103 @@ test('role apps have separate frontend actions and styles', () => {{
         self._sync_run_progress(job, event_type, message, details)
         self._save_job(job)
         self.workspace_log_service.append(job.workspace_id, source=f"agent.{event_type}", message=message, payload=details)
+
+    @staticmethod
+    def _enriched_event_details(details: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(details)
+        for key in ("files", "changed_files", "operation_files"):
+            raw_files = enriched.get(key)
+            if isinstance(raw_files, list) and raw_files:
+                files = [str(path) for path in raw_files if str(path).strip()]
+                enriched.setdefault("file_count", len(set(files)))
+                enriched.setdefault("file_summary", WorkspaceCodeAgentRuntime._compact_file_list(files))
+                enriched.setdefault("file_groups", WorkspaceCodeAgentRuntime._file_group_counts(files))
+                break
+        return enriched
+
+    @staticmethod
+    def _compact_file_list(files: list[str], *, limit: int = 4) -> str:
+        compact: list[str] = []
+        for path in files:
+            value = str(path or "").replace("\\", "/").lstrip("./")
+            for prefix in ("miniapp/app/", "miniapp/", "app/"):
+                if value.startswith(prefix):
+                    value = value[len(prefix):]
+                    break
+            if value and value not in compact:
+                compact.append(value)
+        if not compact:
+            return ""
+        shown = compact[:limit]
+        suffix = f" +{len(compact) - limit}" if len(compact) > limit else ""
+        return ", ".join(shown) + suffix
+
+    @staticmethod
+    def _file_group_counts(files: list[str]) -> dict[str, int]:
+        groups = {"backend": 0, "client": 0, "specialist": 0, "manager": 0, "tests": 0, "styles": 0, "other": 0}
+        seen = set()
+        for raw_path in files:
+            path = str(raw_path or "").replace("\\", "/").lstrip("./")
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            if path.endswith(".css"):
+                groups["styles"] += 1
+            if path.startswith("miniapp/tests/"):
+                groups["tests"] += 1
+            elif path.startswith("miniapp/app/static/client/"):
+                groups["client"] += 1
+            elif path.startswith("miniapp/app/static/specialist/"):
+                groups["specialist"] += 1
+            elif path.startswith("miniapp/app/static/manager/"):
+                groups["manager"] += 1
+            elif path.startswith("miniapp/app/routes/") or path in {
+                "miniapp/app/main.py",
+                "miniapp/app/db.py",
+                "miniapp/app/schemas.py",
+            }:
+                groups["backend"] += 1
+            else:
+                groups["other"] += 1
+        return {key: value for key, value in groups.items() if value}
+
+    @staticmethod
+    def _check_progress_event_type(check_step: str) -> str:
+        step = str(check_step or "").strip()
+        if step == "schema_validators":
+            return "build_started"
+        if step in {"connectivity_validators", "platform_invariants"}:
+            return "frontend_build_started"
+        if step == "changed_files_static":
+            return "backend_compile_started"
+        if step in {"generated_app_python_tests", "generated_app_js_tests"}:
+            return "final_checks_started"
+        if step in {"preview_boot_smoke", "preview_connectivity_smoke"}:
+            return "preview_validation_started"
+        return "running_checks"
+
+    @staticmethod
+    def _check_progress_message(check_step: str, payload: dict[str, Any]) -> str:
+        step_label = {
+            "schema_validators": "schema and route manifest",
+            "connectivity_validators": "frontend API connectivity",
+            "changed_files_static": "static files and backend imports",
+            "platform_invariants": "role workflow invariants",
+            "generated_app_python_tests": "generated Python persistence tests",
+            "generated_app_js_tests": "generated JS frontend tests",
+            "preview_boot_smoke": "preview boot smoke",
+            "preview_connectivity_smoke": "preview route smoke",
+        }.get(str(check_step or ""), str(check_step or "validation step").replace("_", " "))
+        status = str(payload.get("check_status") or "").strip().lower()
+        if status == "started":
+            return f"Checking {step_label}."
+        if status == "skipped":
+            return f"Skipped {step_label}."
+        if status == "passed":
+            return f"{step_label.capitalize()} passed."
+        if status == "failed":
+            return f"{step_label.capitalize()} failed."
+        return f"{step_label.capitalize()} {status or 'completed'}."
 
     def _save_job(self, job: JobRecord) -> None:
         self.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
@@ -3722,6 +3840,21 @@ test('role apps have separate frontend actions and styles', () => {{
     def _should_update_run_stage(event_type: str, *, progress: int, existing_progress: int) -> bool:
         if event_type in {"job_completed", "job_failed"}:
             return True
+        if event_type in {
+            "agent_turn_started",
+            "iteration_ready",
+            "repair_iteration",
+            "scope_expanded",
+            "patch_apply_started",
+            "patch_apply_completed",
+            "build_started",
+            "frontend_build_started",
+            "backend_compile_started",
+            "final_checks_started",
+            "preview_validation_started",
+            "checks_completed",
+        }:
+            return True
         return progress >= existing_progress
 
     def _current_iteration_count(self, workspace_id: str) -> int:
@@ -3766,18 +3899,20 @@ test('role apps have separate frontend actions and styles', () => {{
         details = details or {}
         attempt = cls._safe_int(details.get("attempt"), default=0)
         is_after_patch = bool(details.get("has_file_edits") or details.get("has_draft_diff"))
+        if details.get("check_step"):
+            return cls._check_step_stage(details), cls._check_step_progress(details)
         progress_map = {
             "job_started": ("Starting code agent", 4),
-            "running_checks": ("Running final checks" if is_after_patch else "Checking workspace shell", 64 if is_after_patch else cls._pre_patch_progress(attempt, 7)),
-            "build_started": ("Validating generated app" if is_after_patch else "Validating workspace shell", 67 if is_after_patch else cls._pre_patch_progress(attempt, 9)),
-            "frontend_build_started": ("Building generated frontend" if is_after_patch else "Checking frontend baseline", 70 if is_after_patch else cls._pre_patch_progress(attempt, 11)),
-            "backend_compile_started": ("Checking backend imports" if is_after_patch else "Checking backend baseline", 72 if is_after_patch else cls._pre_patch_progress(attempt, 13)),
-            "checks_completed": (cls._checks_stage(details), 78 if is_after_patch else cls._pre_patch_progress(attempt, 16)),
+            "running_checks": ("Running validation checks" if is_after_patch else "Checking workspace shell", 59 if is_after_patch else cls._pre_patch_progress(attempt, 7)),
+            "build_started": ("Checking schema and route manifest" if is_after_patch else "Validating workspace shell", 61 if is_after_patch else cls._pre_patch_progress(attempt, 9)),
+            "frontend_build_started": ("Checking generated routes and API links" if is_after_patch else "Checking frontend baseline", 64 if is_after_patch else cls._pre_patch_progress(attempt, 11)),
+            "backend_compile_started": ("Checking static files and backend imports" if is_after_patch else "Checking backend baseline", 67 if is_after_patch else cls._pre_patch_progress(attempt, 13)),
+            "checks_completed": (cls._checks_stage(details), cls._checks_completed_progress(details) if is_after_patch else cls._pre_patch_progress(attempt, 16)),
             "agent_turn_started": (cls._agent_turn_stage(details), cls._agent_turn_progress(details)),
             "iteration_ready": (cls._iteration_ready_stage(details), cls._iteration_ready_progress(details)),
             "scope_expanded": ("Reading more workspace context", cls._pre_patch_progress(attempt, 27)),
-            "patch_apply_started": (cls._files_stage("Applying patch", details, key="files"), min(62, 48 + max(0, attempt - 1) * 3)),
-            "patch_apply_completed": (cls._files_stage("Patch applied", details, key="changed_files"), min(72, 58 + max(0, attempt - 1) * 3)),
+            "patch_apply_started": (cls._files_stage("Applying patch", details, key="files"), cls._patch_apply_progress(details, completed=False)),
+            "patch_apply_completed": (cls._files_stage("Patch applied", details, key="changed_files"), cls._patch_apply_progress(details, completed=True)),
             "repair_iteration": (cls._repair_stage(details), cls._repair_progress(details)),
             "final_checks_started": ("Running final checks", 84),
             "apply_started": ("Applying to workspace", 92),
@@ -3806,8 +3941,79 @@ test('role apps have separate frontend actions and styles', () => {{
     def _checks_stage(cls, details: dict[str, Any]) -> str:
         failed_checks = details.get("failed_checks")
         if isinstance(failed_checks, list) and failed_checks:
-            return f"Checks found {len(failed_checks)} issue{'s' if len(failed_checks) != 1 else ''}"
+            return f"Checks found {len(failed_checks)} issue{'s' if len(failed_checks) != 1 else ''}: {', '.join(str(item) for item in failed_checks[:3])}"
         return "Checks passed"
+
+    @classmethod
+    def _checks_completed_progress(cls, details: dict[str, Any]) -> int:
+        attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
+        return min(94, 82 + max(0, attempt - 1) * 4)
+
+    @classmethod
+    def _check_step_stage(cls, details: dict[str, Any]) -> str:
+        step = str(details.get("check_step") or "").strip()
+        status = str(details.get("check_status") or "").strip().lower()
+        labels = {
+            "schema_validators": "schema and route manifest",
+            "connectivity_validators": "frontend API connectivity",
+            "changed_files_static": "static files and backend imports",
+            "platform_invariants": "role workflow invariants",
+            "generated_app_python_tests": "Python persistence tests",
+            "generated_app_js_tests": "JS frontend tests",
+            "preview_boot_smoke": "preview boot smoke",
+            "preview_connectivity_smoke": "preview route smoke",
+        }
+        label = labels.get(step, step.replace("_", " ") or "validation step")
+        prefix = {
+            "started": "Checking",
+            "passed": "Passed",
+            "failed": "Failed",
+            "skipped": "Skipped",
+        }.get(status, "Finished")
+        suffix = cls._duration_suffix(details)
+        return f"{prefix} {label}{suffix}"
+
+    @classmethod
+    def _check_step_progress(cls, details: dict[str, Any]) -> int:
+        attempt = cls._safe_int(details.get("attempt"), default=0)
+        is_after_patch = bool(details.get("has_file_edits") or details.get("has_draft_diff"))
+        step = str(details.get("check_step") or "").strip()
+        status = str(details.get("check_status") or "").strip().lower()
+        if not is_after_patch:
+            order = {
+                "schema_validators": 9,
+                "connectivity_validators": 11,
+                "changed_files_static": 13,
+                "platform_invariants": 15,
+                "generated_app_python_tests": 17,
+                "generated_app_js_tests": 18,
+                "preview_boot_smoke": 19,
+                "preview_connectivity_smoke": 20,
+            }
+            return cls._pre_patch_progress(attempt, order.get(step, 12))
+        order = {
+            "schema_validators": 61,
+            "connectivity_validators": 64,
+            "changed_files_static": 67,
+            "platform_invariants": 70,
+            "generated_app_python_tests": 74,
+            "generated_app_js_tests": 76,
+            "preview_boot_smoke": 78,
+            "preview_connectivity_smoke": 80,
+        }
+        progress = order.get(step, 66) + (1 if status in {"passed", "failed", "skipped"} else 0)
+        if attempt > 1:
+            progress += min(10, (attempt - 1) * 4)
+        return min(94, progress)
+
+    @staticmethod
+    def _duration_suffix(details: dict[str, Any]) -> str:
+        duration_ms = WorkspaceCodeAgentRuntime._safe_int(details.get("duration_ms"), default=0)
+        if duration_ms <= 0:
+            return ""
+        if duration_ms < 1000:
+            return f" ({duration_ms} ms)"
+        return f" ({duration_ms / 1000:.1f}s)"
 
     @classmethod
     def _agent_turn_stage(cls, details: dict[str, Any]) -> str:
@@ -3821,6 +4027,8 @@ test('role apps have separate frontend actions and styles', () => {{
     def _agent_turn_progress(cls, details: dict[str, Any]) -> int:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
         tool_round = cls._safe_int(details.get("tool_round"), default=0)
+        if bool(details.get("has_draft_diff")):
+            return min(93, 84 + max(0, attempt - 2) * 3 + tool_round)
         return min(45, 18 + (attempt - 1) * 8 + tool_round * 3)
 
     @classmethod
@@ -3841,6 +4049,12 @@ test('role apps have separate frontend actions and styles', () => {{
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
         operation_count = cls._safe_int(details.get("operation_count"), default=0)
         tool_request_count = cls._safe_int(details.get("tool_request_count"), default=0)
+        if bool(details.get("has_draft_diff")):
+            if operation_count > 0:
+                return min(94, 87 + max(0, attempt - 2) * 3)
+            if tool_request_count > 0:
+                return min(93, 85 + max(0, attempt - 2) * 3)
+            return min(92, 84 + max(0, attempt - 2) * 3)
         if operation_count > 0:
             return min(47, 40 + attempt * 3)
         if tool_request_count > 0:
@@ -3861,9 +4075,18 @@ test('role apps have separate frontend actions and styles', () => {{
     def _repair_progress(cls, details: dict[str, Any]) -> int:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
         outcome = str(details.get("outcome") or "").strip()
+        if bool(details.get("has_draft_diff")):
+            return min(93, 85 + max(0, attempt - 2) * 3)
         if outcome in {"needs_context", "no_op"}:
             return min(43, 27 + attempt * 6)
         return min(43, 29 + attempt * 6)
+
+    @classmethod
+    def _patch_apply_progress(cls, details: dict[str, Any], *, completed: bool) -> int:
+        attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
+        if attempt <= 1:
+            return 58 if completed else 52
+        return min(94, (89 if completed else 87) + max(0, attempt - 2) * 3)
 
     @staticmethod
     def _files_stage(prefix: str, details: dict[str, Any], *, key: str) -> str:
@@ -3871,7 +4094,11 @@ test('role apps have separate frontend actions and styles', () => {{
         files = [str(item) for item in raw_files if str(item).strip()] if isinstance(raw_files, list) else []
         if not files:
             return prefix
-        return f"{prefix} • {len(set(files))} file{'s' if len(set(files)) != 1 else ''}"
+        unique_count = len(set(files))
+        summary = str(details.get("file_summary") or WorkspaceCodeAgentRuntime._compact_file_list(files)).strip()
+        if summary:
+            return f"{prefix} • {unique_count} file{'s' if unique_count != 1 else ''}: {summary}"
+        return f"{prefix} • {unique_count} file{'s' if unique_count != 1 else ''}"
 
     @staticmethod
     def _paths_from_diff(diff_text: str) -> list[str]:

@@ -85,4 +85,4 @@ def test_visual_changes_are_handled_by_agent_runtime(tmp_path: Path) -> None:
     assert runtime._run_progress_for_event(
         "patch_apply_started",
         details={"attempt": 1, "files": ["miniapp/app/main.py", "miniapp/app/static/client/app.js"]},
-    ) == ("Applying patch • 2 files", 48)
+    ) == ("Applying patch • 2 files: main.py, static/client/app.js", 52)

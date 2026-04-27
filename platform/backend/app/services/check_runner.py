@@ -13,6 +13,7 @@ import threading
 import time
 import tempfile
 from pathlib import Path
+from typing import Any, Callable
 from urllib.error import URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -152,6 +153,7 @@ class CheckRunner:
         check_profile: str = "full",
         intent: str | None = None,
         generation_mode: GenerationMode | str | None = None,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> CheckExecutionRecord:
         started = time.perf_counter()
         results: list[RunCheckResult] = []
@@ -159,6 +161,7 @@ class CheckRunner:
         focused_edit_profile = check_profile == "focused_edit"
         focused_css_only_profile = focused_edit_profile and self._css_only_app_change(changed_files)
 
+        self._emit_check_progress(progress_callback, "schema_validators", "started", check_profile=check_profile)
         validator_started = time.perf_counter()
         if focused_css_only_profile:
             build_issues = []
@@ -166,38 +169,54 @@ class CheckRunner:
         else:
             build_issues = self.validation_suite.validate_build(source_dir)
             filtered_issues = self._filter_build_issues(build_issues, scope_mode)
-        results.append(
-            RunCheckResult(
-                name="schema_validators",
-                status="skipped" if focused_css_only_profile else "failed" if filtered_issues else "passed",
-                details=(
-                    "Build validators skipped for focused CSS-only visual edit."
-                    if focused_css_only_profile
-                    else "Build validators executed against the draft workspace."
-                ),
-                duration_ms=int((time.perf_counter() - validator_started) * 1000),
-                command="validation_suite.validate_build",
-                logs=self._validation_logs(filtered_issues),
-            )
+        schema_result = RunCheckResult(
+            name="schema_validators",
+            status="skipped" if focused_css_only_profile else "failed" if filtered_issues else "passed",
+            details=(
+                "Build validators skipped for focused CSS-only visual edit."
+                if focused_css_only_profile
+                else "Build validators executed against the draft workspace."
+            ),
+            duration_ms=int((time.perf_counter() - validator_started) * 1000),
+            command="validation_suite.validate_build",
+            logs=self._validation_logs(filtered_issues),
+        )
+        results.append(schema_result)
+        self._emit_check_progress(
+            progress_callback,
+            "schema_validators",
+            schema_result.status,
+            duration_ms=schema_result.duration_ms,
+            issue_count=len(filtered_issues),
+            check_profile=check_profile,
         )
 
+        self._emit_check_progress(progress_callback, "connectivity_validators", "started", check_profile=check_profile)
         connectivity_started = time.perf_counter()
         connectivity_issues = [] if focused_css_only_profile else self.validation_suite.validate_connectivity(source_dir)
-        results.append(
-            RunCheckResult(
-                name="connectivity_validators",
-                status="skipped" if focused_css_only_profile else "failed" if connectivity_issues else "passed",
-                details=(
-                    "Connectivity validators skipped for focused CSS-only visual edit."
-                    if focused_css_only_profile
-                    else "Connectivity validators executed against the draft workspace."
-                ),
-                duration_ms=int((time.perf_counter() - connectivity_started) * 1000),
-                command="validation_suite.validate_connectivity",
-                logs=self._validation_logs(connectivity_issues),
-            )
+        connectivity_result = RunCheckResult(
+            name="connectivity_validators",
+            status="skipped" if focused_css_only_profile else "failed" if connectivity_issues else "passed",
+            details=(
+                "Connectivity validators skipped for focused CSS-only visual edit."
+                if focused_css_only_profile
+                else "Connectivity validators executed against the draft workspace."
+            ),
+            duration_ms=int((time.perf_counter() - connectivity_started) * 1000),
+            command="validation_suite.validate_connectivity",
+            logs=self._validation_logs(connectivity_issues),
+        )
+        results.append(connectivity_result)
+        self._emit_check_progress(
+            progress_callback,
+            "connectivity_validators",
+            connectivity_result.status,
+            duration_ms=connectivity_result.duration_ms,
+            issue_count=len(connectivity_issues),
+            check_profile=check_profile,
         )
 
+        self._emit_check_progress(progress_callback, "changed_files_static", "started", changed_files=changed_files, check_profile=check_profile)
         static_started = time.perf_counter()
         static_result = (
             self._focused_css_static_check(source_dir=source_dir, changed_files=changed_files)
@@ -206,7 +225,16 @@ class CheckRunner:
         )
         static_result.duration_ms = int((time.perf_counter() - static_started) * 1000)
         results.append(static_result)
+        self._emit_check_progress(
+            progress_callback,
+            "changed_files_static",
+            static_result.status,
+            duration_ms=static_result.duration_ms,
+            changed_files=changed_files,
+            check_profile=check_profile,
+        )
 
+        self._emit_check_progress(progress_callback, "platform_invariants", "started", changed_files=changed_files, check_profile=check_profile)
         canonical_started = time.perf_counter()
         platform_smoke_result = self._platform_invariants_smoke(
             source_dir=source_dir,
@@ -217,6 +245,15 @@ class CheckRunner:
         )
         platform_smoke_result.duration_ms = int((time.perf_counter() - canonical_started) * 1000)
         results.append(platform_smoke_result)
+        self._emit_check_progress(
+            progress_callback,
+            "platform_invariants",
+            platform_smoke_result.status,
+            duration_ms=platform_smoke_result.duration_ms,
+            changed_files=changed_files,
+            issue_count=len(platform_smoke_result.logs or []) if platform_smoke_result.status == "failed" else 0,
+            check_profile=check_profile,
+        )
 
         should_skip_preview = (
             bool(filtered_issues)
@@ -278,6 +315,8 @@ class CheckRunner:
                     ),
                 ]
             )
+            for skipped_name in ("generated_app_python_tests", "generated_app_js_tests", "preview_boot_smoke", "preview_connectivity_smoke"):
+                self._emit_check_progress(progress_callback, skipped_name, "skipped", check_profile=check_profile)
             completed_at = utc_now()
             return CheckExecutionRecord(
                 workspace_id=workspace_id,
@@ -342,6 +381,9 @@ class CheckRunner:
             connectivity_result.duration_ms = duration_ms
             return preview_boot_result, connectivity_result
 
+        for started_name in ("generated_app_python_tests", "generated_app_js_tests", "preview_boot_smoke", "preview_connectivity_smoke"):
+            self._emit_check_progress(progress_callback, started_name, "started", check_profile=check_profile)
+
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="check-runner") as executor:
             python_future = executor.submit(_run_python_tests)
             js_future = executor.submit(_run_js_tests)
@@ -354,6 +396,14 @@ class CheckRunner:
         results.append(js_tests_result)
         results.append(preview_boot_result)
         results.append(connectivity_result)
+        for result in (python_tests_result, js_tests_result, preview_boot_result, connectivity_result):
+            self._emit_check_progress(
+                progress_callback,
+                result.name,
+                result.status,
+                duration_ms=result.duration_ms,
+                check_profile=check_profile,
+            )
 
         completed_at = utc_now()
         return CheckExecutionRecord(
@@ -365,6 +415,17 @@ class CheckRunner:
             completed_at=completed_at,
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
+
+    @staticmethod
+    def _emit_check_progress(
+        callback: Callable[[str, dict[str, Any]], None] | None,
+        check_step: str,
+        status: str,
+        **details: Any,
+    ) -> None:
+        if callback is None:
+            return
+        callback(check_step, {"check_step": check_step, "check_status": status, **details})
 
     @staticmethod
     def failing_issues(results: list[RunCheckResult]) -> list[ValidationIssue]:
@@ -1159,9 +1220,24 @@ class CheckRunner:
                     refs.add((method, f"{path}/{{param}}" if method in {"PUT", "PATCH", "DELETE"} else path))
         for match in re.finditer(r"['\"`](/api/[^'\"`\s)]+)", str(content or "")):
             path = CheckRunner._normalize_api_ref_path(match.group(1))
-            if path not in fetch_paths:
+            method = CheckRunner._method_near_api_reference(str(content or ""), match.start(), match.end())
+            if method:
+                refs.add((method, path))
+                fetch_paths.add(path)
+            elif path not in fetch_paths:
                 refs.add(("GET", path))
         return refs
+
+    @staticmethod
+    def _method_near_api_reference(content: str, start: int, end: int) -> str | None:
+        prefix = str(content or "")[max(0, start - 80):start]
+        if not re.search(r"\bfetch[A-Za-z0-9_$]*\(\s*$", prefix, re.IGNORECASE):
+            return None
+        tail = str(content or "")[end:end + 700].split(";", 1)[0]
+        method_match = re.search(r"method\s*:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"]", tail, re.IGNORECASE)
+        if not method_match:
+            return "GET"
+        return str(method_match.group("method")).upper()
 
     @staticmethod
     def _normalize_api_ref_path(value: str) -> str:
@@ -1495,15 +1571,23 @@ class CheckRunner:
                 js_path.with_name("index.html"),
                 js_path.with_suffix(".html"),
             ]
-            html_path = next((candidate for candidate in html_candidates if candidate.exists()), None)
-            if html_path is None:
+            role_root = cls._role_static_root_for_js(source_dir, relative_path)
+            if role_root is not None and role_root.exists():
+                html_candidates.extend(sorted(role_root.rglob("index.html")))
+            existing_html_paths = list(dict.fromkeys(candidate for candidate in html_candidates if candidate.exists()))
+            if not existing_html_paths:
                 continue
             try:
                 js_source = js_path.read_text(encoding="utf-8")
-                html_source = html_path.read_text(encoding="utf-8")
             except OSError:
                 continue
-            available_dom_ids = set(re.findall(r'id=["\']([A-Za-z0-9_-]+)["\']', html_source))
+            html_sources: list[str] = []
+            for html_path in existing_html_paths:
+                try:
+                    html_sources.append(html_path.read_text(encoding="utf-8"))
+                except OSError:
+                    continue
+            available_dom_ids = set(re.findall(r'id=["\']([A-Za-z0-9_-]+)["\']', "\n".join(html_sources)))
             required_dom_ids = set(
                 re.findall(r'querySelector(?:All)?\(\s*["\']#([A-Za-z0-9_-]+)', js_source)
             )
@@ -1516,13 +1600,27 @@ class CheckRunner:
             issues.append(
                 ValidationIssue(
                     code="platform.missing_dom_id",
-                    message=f"{relative_path} references missing DOM ids in {html_path.relative_to(source_dir).as_posix()}: {', '.join(missing_ids)}.",
+                    message=f"{relative_path} references DOM ids not found in any matching role HTML page: {', '.join(missing_ids)}.",
                     severity="high",
                     location=relative_path,
                     blocking=True,
                 )
             )
         return issues
+
+    @staticmethod
+    def _role_static_root_for_js(source_dir: Path, relative_path: str) -> Path | None:
+        parts = str(relative_path or "").replace("\\", "/").split("/")
+        try:
+            static_index = parts.index("static")
+        except ValueError:
+            return None
+        if len(parts) <= static_index + 1:
+            return None
+        role = parts[static_index + 1]
+        if role not in ROLE_ORDER:
+            return None
+        return source_dir / "miniapp/app/static" / role
 
     @staticmethod
     def _dedupe_validation_issues(issues: list[ValidationIssue]) -> list[ValidationIssue]:

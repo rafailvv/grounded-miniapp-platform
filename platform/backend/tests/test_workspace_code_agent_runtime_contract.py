@@ -372,6 +372,45 @@ def test_run_save_preserves_live_token_usage_and_caps_failed_progress(tmp_path) 
     assert saved.token_usage["turn_count"] == 1
 
 
+def test_stale_run_recovery_retains_nonempty_draft_for_resume(tmp_path) -> None:
+    class FakeWorkspaceService:
+        def draft_exists(self, workspace_id: str, run_id: str) -> bool:
+            return workspace_id == "ws" and run_id == "run_stale"
+
+        def diff(self, workspace_id: str, *, run_id: str | None = None) -> str:
+            del workspace_id, run_id
+            return "diff --git a/miniapp/app/static/client/index.html b/miniapp/app/static/client/index.html\n"
+
+    service = object.__new__(RunService)
+    service.store = StateStore(tmp_path / "state.json")
+    service.workspace_service = FakeWorkspaceService()
+    run = RunRecord(
+        run_id="run_stale",
+        workspace_id="ws",
+        prompt="Create shop",
+        intent="create",
+        status="running",
+        apply_status="pending",
+        current_stage="repairing generated app",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="fast",
+        generation_mode=GenerationMode.FAST,
+    )
+
+    recovered = service._recover_stale_run_with_retained_draft(run)
+
+    assert recovered
+    assert run.status == "blocked"
+    assert run.apply_status == "blocked"
+    assert run.draft_status == "ready"
+    assert run.draft_ready is True
+    assert run.failure_class == "generation.interrupted_stale_worker"
+    checkpoint = service.store.get("reports", "resume_checkpoint:ws")
+    assert checkpoint["status"] == "pending"
+    assert checkpoint["source_run_id"] == "run_stale"
+    assert checkpoint["generation_mode"] == "fast"
+
+
 def test_preview_refresh_progress_does_not_step_back_from_99() -> None:
     assert RunService._preview_refresh_progress(94) == 98
     assert RunService._preview_refresh_progress(98) == 98
@@ -426,6 +465,32 @@ def test_get_run_backfills_token_usage_and_specific_failure_from_job_events(tmp_
     assert hydrated.token_usage["total_tokens"] == 1200
     assert hydrated.token_usage["turn_count"] == 1
     assert "no such table: bookings" in hydrated.failure_reason
+
+
+def test_get_run_surfaces_failed_retained_draft_as_blocked(tmp_path) -> None:
+    service = object.__new__(RunService)
+    service.store = StateStore(tmp_path / "state.json")
+    run = RunRecord(
+        workspace_id="ws",
+        prompt="Create app",
+        intent="create",
+        status="failed",
+        apply_status="failed",
+        current_stage="failed",
+        progress_percent=98,
+        outcome_kind="blocked_generation",
+        draft_status="ready",
+        draft_ready=True,
+        failure_reason="platform_invariants: frontend_missing_update_api",
+    )
+    service.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+
+    hydrated = service.get_run(run.run_id)
+
+    assert hydrated.status == "blocked"
+    assert hydrated.apply_status == "blocked"
+    assert hydrated.current_stage == "blocked"
+    assert hydrated.draft_ready is True
 
 
 def test_get_run_keeps_explicit_zero_token_usage_from_fallback_job(tmp_path) -> None:
@@ -892,7 +957,26 @@ def test_running_progress_stays_early_until_file_edits_exist() -> None:
     assert WorkspaceCodeAgentRuntime._run_progress_for_event(
         "running_checks",
         details={"attempt": 1, "has_file_edits": True},
-    ) == ("Running final checks", 64)
+    ) == ("Running validation checks", 59)
+    assert WorkspaceCodeAgentRuntime._run_progress_for_event(
+        "frontend_build_started",
+        details={
+            "attempt": 1,
+            "has_file_edits": True,
+            "check_step": "connectivity_validators",
+            "check_status": "started",
+        },
+    ) == ("Checking frontend API connectivity", 64)
+    assert WorkspaceCodeAgentRuntime._run_progress_for_event(
+        "frontend_build_started",
+        details={
+            "attempt": 1,
+            "has_file_edits": True,
+            "check_step": "platform_invariants",
+            "check_status": "passed",
+            "duration_ms": 1530,
+        },
+    ) == ("Passed role workflow invariants (1.5s)", 71)
     assert WorkspaceCodeAgentRuntime._run_progress_for_event(
         "iteration_ready",
         details={"attempt": 2, "outcome": "no_progress", "operation_count": 0, "tool_request_count": 0},
@@ -909,6 +993,11 @@ def test_running_progress_stays_early_until_file_edits_exist() -> None:
         "running_checks",
         progress=19,
         existing_progress=37,
+    )
+    assert WorkspaceCodeAgentRuntime._should_update_run_stage(
+        "frontend_build_started",
+        progress=64,
+        existing_progress=82,
     )
     assert WorkspaceCodeAgentRuntime._should_update_run_stage(
         "agent_turn_started",

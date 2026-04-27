@@ -62,9 +62,24 @@ class ConnectivityValidator:
             fetch_paths.add(path)
         for match in re.finditer(r"['\"`](/api/[^'\"`\s)]+)", content):
             path = ConnectivityValidator._normalize_api_path(match.group(1))
-            if path not in fetch_paths:
+            method = ConnectivityValidator._method_near_api_reference(str(content or ""), match.start(), match.end())
+            if method:
+                refs.add((method, path))
+                fetch_paths.add(path)
+            elif path not in fetch_paths:
                 refs.add(("GET", path))
         return refs
+
+    @staticmethod
+    def _method_near_api_reference(content: str, start: int, end: int) -> str | None:
+        prefix = str(content or "")[max(0, start - 80):start]
+        if not re.search(r"\bfetch[A-Za-z0-9_$]*\(\s*$", prefix, re.IGNORECASE):
+            return None
+        tail = str(content or "")[end:end + 700].split(";", 1)[0]
+        method_match = re.search(r"method\s*:\s*['\"](?P<method>GET|POST|PUT|PATCH|DELETE)['\"]", tail, re.IGNORECASE)
+        if not method_match:
+            return "GET"
+        return str(method_match.group("method")).upper()
 
     @classmethod
     def _api_route_paths(cls, routes_root: Path) -> set[tuple[str, str]]:

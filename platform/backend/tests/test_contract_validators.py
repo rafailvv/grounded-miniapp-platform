@@ -387,6 +387,27 @@ def test_static_check_installs_miniapp_requirements_before_import_smoke(
     assert calls == ["install:changed_files_static:Backend import-smoke dependency", "import"]
 
 
+def test_dom_contract_accepts_role_app_js_ids_declared_on_child_pages(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    role_dir = source_dir / "miniapp/app/static/client"
+    child_dir = role_dir / "orders"
+    child_dir.mkdir(parents=True)
+    role_dir.joinpath("index.html").write_text("<main id='client-root'></main>", encoding="utf-8")
+    child_dir.joinpath("index.html").write_text("<main id='order-form'></main>", encoding="utf-8")
+    role_dir.joinpath("app.js").write_text(
+        "document.getElementById('order-form');\n"
+        "document.querySelector('#client-root');\n",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._dom_contract_issues(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/app.js"],
+    )
+
+    assert issues == []
+
+
 def test_agentic_platform_invariants_reject_neutral_role_template(tmp_path: Path) -> None:
     app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
     workspace = app.state.container.workspace_service.create_workspace(
@@ -913,3 +934,37 @@ def test_connectivity_validator_flags_post_when_only_get_route_exists(tmp_path: 
         and "POST /api/orders" in issue.message
         for issue in issues
     )
+
+
+def test_connectivity_validator_detects_methods_inside_fetch_wrappers(tmp_path: Path) -> None:
+    app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
+    workspace = app.state.container.workspace_service.create_workspace(
+        WorkspaceRecord(name="Fetch Wrapper Connectivity Workspace", path=str(tmp_path / "workspace"))
+    )
+    app.state.container.workspace_service.clone_template(workspace.workspace_id)
+    source_dir = app.state.container.workspace_service.source_dir(workspace.workspace_id)
+    script = (
+        "await fetchJSON('/api/orders', { method: 'POST', body: JSON.stringify({ title: 'Order' }) });\n"
+        "await fetchJSON(`/api/orders/${orderId}/status`, { method: 'PATCH', body: JSON.stringify({ status }) });\n"
+    )
+    (source_dir / "miniapp/app/static/specialist/app.js").write_text(script, encoding="utf-8")
+    (source_dir / "miniapp/app/routes/orders.py").write_text(
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/api/orders')\n\n"
+        "@router.post('')\n"
+        "def create_order(payload: dict):\n"
+        "    return payload\n\n"
+        "@router.patch('/{order_id}/status')\n"
+        "def update_order_status(order_id: int, payload: dict):\n"
+        "    return payload\n",
+        encoding="utf-8",
+    )
+
+    refs = ConnectivityValidator._extract_api_refs(script)
+    runner_refs = CheckRunner._extract_frontend_api_refs(script)
+    issues = ConnectivityValidator().validate(source_dir)
+
+    assert ("POST", "/api/orders") in refs
+    assert ("PATCH", "/api/orders/{param}/status") in refs
+    assert ("PATCH", "/api/orders/{param}/status") in runner_refs
+    assert not any(issue.code == "connectivity.missing_backend_route" for issue in issues)
