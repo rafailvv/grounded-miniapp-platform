@@ -109,6 +109,12 @@ CSS_PLACEHOLDER_MARKERS = (
     "generated manager page styles can replace this file",
     "styles can replace this file",
 )
+PAGE_SHELL_SAFE_TOP_MARKERS = (
+    "var(--telegram-top-safe-offset)",
+    "telegram-top-safe-offset",
+    "safe-area-inset-top",
+    "max(76px",
+)
 
 
 class CheckRunner:
@@ -730,6 +736,7 @@ class CheckRunner:
         elif css_only_focused_edit:
             role_coverage = {"status": "skipped", "reason": "focused_css_only_edit"}
             generated_tests = {"status": "skipped", "reason": "focused_css_only_edit"}
+        issues.extend(self._shell_safe_spacing_issues(source_dir))
         if agentic_scope and str(intent or "").strip().lower() == "create":
             api_issues, api_contract = self._create_api_contract_issues(source_dir)
             issues.extend(api_issues)
@@ -860,6 +867,16 @@ class CheckRunner:
                         blocking=True,
                     )
                 )
+                continue
+            shell_spacing_issue = cls._role_css_shell_spacing_issue(role, css_text)
+            if shell_spacing_issue is not None:
+                coverage[role] = {
+                    "status": "unsafe_shell_spacing",
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                }
+                issues.append(shell_spacing_issue)
                 continue
             cross_role_links = cls._cross_role_links(role, combined)
             if cross_role_links:
@@ -1006,6 +1023,97 @@ class CheckRunner:
                 return marker
         meaningful_tokens = re.findall(r"[.#]?[A-Za-z][A-Za-z0-9_-]*\s*\{", content or "")
         return None if len(meaningful_tokens) >= 3 else "insufficient css rules"
+
+    @classmethod
+    def _shell_safe_spacing_issues(cls, source_dir: Path) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        base_path = source_dir / "miniapp/app/static/shared/base.css"
+        if base_path.exists():
+            try:
+                base_css = base_path.read_text(encoding="utf-8")
+            except OSError:
+                base_css = ""
+            normalized_base = re.sub(r"\s+", "", base_css.lower())
+            expected_safe_top = "padding-top:max(76px,calc(var(--telegram-top-safe-offset)+12px))"
+            if (
+                ".page-shell" not in base_css
+                or "padding-top" not in normalized_base
+                or not any(marker.lower().replace(" ", "") in normalized_base for marker in PAGE_SHELL_SAFE_TOP_MARKERS)
+                or expected_safe_top not in normalized_base
+                or "!important" not in normalized_base
+            ):
+                issues.append(
+                    ValidationIssue(
+                        code="platform.shell_safe_top_spacing_missing",
+                        message=(
+                            "Shared shell CSS must keep the Telegram top safe spacing on .page-shell. "
+                            "Use padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px)) !important."
+                        ),
+                        severity="high",
+                        location="miniapp/app/static/shared/base.css",
+                        blocking=True,
+                    )
+                )
+        for role in ROLE_ORDER:
+            css_path = source_dir / "miniapp/app/static" / role / "styles.css"
+            if not css_path.exists():
+                continue
+            try:
+                css_text = css_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            issue = cls._role_css_shell_spacing_issue(role, css_text)
+            if issue is not None:
+                issues.append(issue)
+        return issues
+
+    @classmethod
+    def _role_css_shell_spacing_issue(cls, role: str, content: str) -> ValidationIssue | None:
+        for match in re.finditer(r"(?P<selectors>[^{}]+)\{(?P<body>[^{}]*)\}", str(content or ""), flags=re.MULTILINE):
+            selectors = match.group("selectors")
+            if not cls._css_selectors_target_page_shell(selectors):
+                continue
+            declarations = re.findall(r"(?P<prop>padding(?:-top)?)\s*:\s*(?P<value>[^;{}]+)", match.group("body"), flags=re.IGNORECASE)
+            if not declarations:
+                continue
+            has_safe_top = False
+            has_unsafe_top = False
+            for prop, value in declarations:
+                prop_name = prop.strip().lower()
+                css_value = value.strip().lower()
+                safe_value = any(marker.lower() in css_value for marker in PAGE_SHELL_SAFE_TOP_MARKERS)
+                if prop_name in {"padding", "padding-top"} and safe_value:
+                    has_safe_top = True
+                elif prop_name in {"padding", "padding-top"}:
+                    has_unsafe_top = True
+            if has_unsafe_top and not has_safe_top:
+                return ValidationIssue(
+                    code="platform.role_css_collapses_shell_safe_top_spacing",
+                    message=(
+                        f"{role} role CSS overrides .page-shell padding without preserving the Telegram top safe spacing. "
+                        "Move layout spacing to inner elements or use the shared safe top expression."
+                    ),
+                    severity="high",
+                    location=f"miniapp/app/static/{role}/styles.css",
+                    blocking=True,
+                )
+        return None
+
+    @staticmethod
+    def _css_selectors_target_page_shell(selectors: str) -> bool:
+        for selector in str(selectors or "").split(","):
+            selector_text = selector.strip()
+            if ".page-shell" not in selector_text:
+                continue
+            match = re.search(r"\.page-shell\b", selector_text)
+            if not match:
+                continue
+            tail = selector_text[match.end():]
+            if not tail.strip():
+                return True
+            if tail[0] in {".", "#", "[", ":"} and not re.search(r"[\s>+~]", tail):
+                return True
+        return False
 
     @staticmethod
     def _role_action_signals(role: str, content: str) -> list[str]:

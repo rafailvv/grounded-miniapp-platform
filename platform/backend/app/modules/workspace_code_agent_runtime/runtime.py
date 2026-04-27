@@ -35,6 +35,7 @@ from app.modules.miniapp_agent_loop.tool_agent_runtime import (
 from app.modules.miniapp_agent_loop.types import WorkspaceLoopCallbacks, WorkspaceLoopResult, WorkspaceLoopTurnPlan
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
+from app.services.platform_shell import BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
@@ -466,6 +467,87 @@ class WorkspaceCodeAgentRuntime:
             if content is not None:
                 contexts[path] = content
         return contexts
+
+    def _stabilize_platform_shell(
+        self,
+        workspace_id: str,
+        run_id: str,
+        draft_source: Any,
+        changed_files: list[str],
+    ) -> list[str]:
+        del workspace_id, run_id, changed_files
+        source_dir = Path(draft_source)
+        stabilized: list[str] = []
+        base_path = source_dir / BASE_STYLESHEET_PATH
+        if base_path.exists():
+            try:
+                original = base_path.read_text(encoding="utf-8")
+            except OSError:
+                original = ""
+            updated = self._ensure_base_shell_safe_spacing(original)
+            if updated != original:
+                base_path.write_text(updated, encoding="utf-8")
+                stabilized.append(BASE_STYLESHEET_PATH)
+
+        static_root = source_dir / "miniapp/app/static"
+        if static_root.exists():
+            for html_path in sorted(static_root.rglob("index.html")):
+                try:
+                    original = html_path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if "page-shell" not in original:
+                    continue
+                updated = self._ensure_page_shell_inline_safe_spacing(original)
+                if updated != original:
+                    html_path.write_text(updated, encoding="utf-8")
+                    stabilized.append(html_path.relative_to(source_dir).as_posix())
+        return list(dict.fromkeys(stabilized))
+
+    @staticmethod
+    def _ensure_base_shell_safe_spacing(content: str) -> str:
+        text = str(content or "")
+        normalized = re.sub(r"\s+", "", text.lower())
+        expected_safe_top = "padding-top:max(76px,calc(var(--telegram-top-safe-offset)+12px))"
+        if ".page-shell" in text and expected_safe_top in normalized and "!important" in normalized:
+            return text
+        guard = (
+            "\n\n/* Platform invariant: generated role CSS must not remove Telegram header clearance. */\n"
+            ".page-shell {\n"
+            "  padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px)) !important;\n"
+            "}\n"
+        )
+        return text.rstrip() + guard
+
+    @staticmethod
+    def _ensure_page_shell_inline_safe_spacing(content: str) -> str:
+        def update_tag(match: re.Match[str]) -> str:
+            tag = match.group(1)
+            close = match.group("close")
+            style_match = re.search(r"""\sstyle=(?P<quote>["'])(?P<value>.*?)(?P=quote)""", tag, flags=re.IGNORECASE | re.DOTALL)
+            if not style_match:
+                return f'{tag} style="{PAGE_SHELL_INLINE_STYLE}"{close}'
+            style_value = style_match.group("value")
+            if re.search(r"padding-top\s*:", style_value, flags=re.IGNORECASE):
+                updated_style = re.sub(
+                    r"padding-top\s*:[^;]+;?",
+                    PAGE_SHELL_INLINE_STYLE,
+                    style_value,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+            else:
+                separator = "" if not style_value.strip() or style_value.rstrip().endswith(";") else "; "
+                updated_style = f"{style_value.rstrip()}{separator}{PAGE_SHELL_INLINE_STYLE}"
+            start, end = style_match.span("value")
+            return f"{tag[:start]}{updated_style}{tag[end:]}{close}"
+
+        return re.sub(
+            r"""(<main\b(?=[^>]*\bclass=(["'])[^"']*\bpage-shell\b[^"']*\2)[^>]*)(?P<close>>)""",
+            update_tag,
+            str(content or ""),
+            flags=re.IGNORECASE,
+        )
 
     def _run_loop(
         self,
@@ -916,7 +998,7 @@ class WorkspaceCodeAgentRuntime:
             has_tooling_failure=CheckRunner.has_tooling_failure,
             plan_turn=_plan_turn,
             apply_contract_sync=lambda operations: list(operations),
-            post_apply_stabilize=None,
+            post_apply_stabilize=self._stabilize_platform_shell,
             append_event=self._append_event,
             append_trace=self._append_trace,
             store_report=self._store_report,
@@ -981,43 +1063,73 @@ class WorkspaceCodeAgentRuntime:
                 model_profile=request.model_profile,
                 generation_mode=generation_mode,
             )
+            operation_limit = (
+                FOCUSED_VISUAL_OPERATION_LIMIT
+                if focused_visual_edit
+                else 20 if fast_create_turn else AGENT_TURN_OPERATION_LIMIT
+            )
+            content_max_length = (
+                FOCUSED_VISUAL_CONTENT_MAX_LENGTH
+                if focused_visual_edit
+                else 9000 if fast_create_turn else 18000
+            )
+            allow_tool_requests = False if focused_visual_edit else not fast_first_create_patch
+            allowed_outcomes = (
+                ["patch_ready", "fatal_invalid_response"]
+                if focused_visual_edit
+                else ["patch_ready"] if fast_first_create_patch else None
+            )
+            agent_schema = self._agent_turn_schema(
+                operation_limit=operation_limit,
+                content_max_length=content_max_length,
+                allow_tool_requests=allow_tool_requests,
+                allowed_outcomes=allowed_outcomes,
+            )
+            user_prompt = self._agent_user_prompt(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                request=request,
+                attempt=attempt,
+                tool_round=tool_round,
+                context_mode=context_mode,
+                repeated_no_progress=repeated_no_progress,
+                latest_execution=latest_execution,
+                latest_preview_details=latest_preview_details,
+                seed_context=seed_context,
+                extra_file_context=extra_file_context,
+                tool_results=tool_results,
+                last_turn_summary=last_turn_summary,
+                latest_diff_summary=latest_diff_summary,
+            )
+            self._append_event(
+                job,
+                "agent_turn_started",
+                "Workspace code agent prepared the model context.",
+                {
+                    "attempt": attempt,
+                    "tool_round": tool_round,
+                    "context_mode": context_mode,
+                    "phase": "context_ready",
+                    "has_draft_diff": bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip()),
+                },
+            )
+            self._append_event(
+                job,
+                "agent_turn_started",
+                "Workspace code agent is generating the structured edit.",
+                {
+                    "attempt": attempt,
+                    "tool_round": tool_round,
+                    "context_mode": context_mode,
+                    "phase": "model_request",
+                    "has_draft_diff": bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip()),
+                },
+            )
             response = self.openai_client.generate_agent_turn(
                 schema_name="workspace_code_agent_turn_v1",
-                schema=self._agent_turn_schema(
-                    operation_limit=(
-                        FOCUSED_VISUAL_OPERATION_LIMIT
-                        if focused_visual_edit
-                        else 20 if fast_create_turn else AGENT_TURN_OPERATION_LIMIT
-                    ),
-                    content_max_length=(
-                        FOCUSED_VISUAL_CONTENT_MAX_LENGTH
-                        if focused_visual_edit
-                        else 9000 if fast_create_turn else 18000
-                    ),
-                    allow_tool_requests=False if focused_visual_edit else not fast_first_create_patch,
-                    allowed_outcomes=(
-                        ["patch_ready", "fatal_invalid_response"]
-                        if focused_visual_edit
-                        else ["patch_ready"] if fast_first_create_patch else None
-                    ),
-                ),
+                schema=agent_schema,
                 system_prompt=self._agent_system_prompt(),
-                user_prompt=self._agent_user_prompt(
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                    request=request,
-                    attempt=attempt,
-                    tool_round=tool_round,
-                    context_mode=context_mode,
-                    repeated_no_progress=repeated_no_progress,
-                    latest_execution=latest_execution,
-                    latest_preview_details=latest_preview_details,
-                    seed_context=seed_context,
-                    extra_file_context=extra_file_context,
-                    tool_results=tool_results,
-                    last_turn_summary=last_turn_summary,
-                    latest_diff_summary=latest_diff_summary,
-                ),
+                user_prompt=user_prompt,
                 prompt_cache_key=self._prompt_cache_key(workspace_id, run_id, request.prompt),
                 stable_prefix="workspace_code_agent_runtime_v2",
                 model_override=primary_model,
@@ -1200,7 +1312,7 @@ class WorkspaceCodeAgentRuntime:
             "Preserve the FastAPI + static-file shell, preview bridge, and role-root routing unless the user asks otherwise. "
             "Every generated HTML route page, including role roots and child pages such as static/client/details/index.html, must include <script src=\"/static/preview_bridge.js\" defer></script>. Role root pages must also keep the role app script. "
             "Generate normal light-mode interfaces by default: light backgrounds, dark readable text, clear contrast, restrained neutral colors, and no dark theme unless the user explicitly asks for dark mode. Do not give roles different color palettes; use one consistent light visual system across client, specialist, and manager. "
-            "Preserve the top safe spacing from the template shell; generated role CSS must not collapse the top padding of .page-shell. "
+            "Preserve the top safe spacing from the template shell; generated role CSS must not collapse the top padding of .page-shell. Do not put plain .page-shell padding or padding-top in role CSS unless it keeps max(76px, calc(var(--telegram-top-safe-offset) + 12px)). Put role layout spacing on inner wrappers when possible. "
             "Visible generated UI copy must use the user's language. Do not paste raw prompt excerpts into the interface, and do not show technical role labels such as Client app, Specialist app, Manager app, source request, or Workspace suffixes unless the user explicitly asks for them. "
             "For create tasks, build three separate role apps inside one miniapp shell: client, specialist, and manager. They share backend state, but their UI logic, actions, text, CSS, and workflow focus must be visibly different. "
             "Role apps must be isolated inside the UI: do not add in-app links from client to specialist/manager, from specialist to client/manager, or from manager to client/specialist. The platform shell chooses the role entry; each role app may only link to its own child pages. "
@@ -1213,8 +1325,8 @@ class WorkspaceCodeAgentRuntime:
             "Do not add mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded business records to generated app source. Start with empty persistent state and domain-specific empty states; generated tests may create their own test payloads. "
             "Every create task must create or replace real per-role CSS files at static/client/styles.css, static/specialist/styles.css, and static/manager/styles.css; placeholder CSS or missing role CSS is invalid. Child pages must link the matching role CSS. "
             "In Fast create mode, build a compact working MVP with three distinct role apps, one key child page per role, one persistent backend resource exposed through GET and POST APIs, a minimal status/update endpoint, frontend fetch/form/status code, compact role CSS, and generated tests that prove POST then GET persistence and status update. Do not add extra child pages, extra resources, or large visual systems in Fast. Do not spend Fast first-patch operations on role_routes.py, generated/models.py, or shared/base.css. "
-            "In Balanced create mode, build deeper separate client/specialist/manager role apps with two or three connected persistent resources, or one resource plus meaningful status/update workflows, so roles share real state instead of copied static content. "
-            "In Quality create mode, build detailed separate client/specialist/manager role apps with several API endpoints, create/list/update behavior where useful, robust empty/error states, richer role-specific CSS, and broader generated acceptance tests. "
+            "In Balanced create mode, build deeper separate client/specialist/manager role apps with two or three connected persistent resources, or one resource plus meaningful status/update workflows, so roles share real state instead of copied static content. Balanced design quality must be visibly stronger than Fast: polished light-mode product UI, clear hierarchy, responsive role dashboards, refined forms/lists/status badges, and real CSS classes for spacing, typography, buttons, cards, and states without decorative bloat. "
+            "In Quality create mode, build detailed separate client/specialist/manager role apps with several API endpoints, create/list/update behavior where useful, robust empty/error states, richer role-specific CSS, and broader generated acceptance tests. Quality design quality must be top-tier and product-ready: highly refined layout, typography, spacing, accessible form states, empty/loading/error/success states, responsive data presentation, role-specific dashboards, and cohesive light visual design implemented in CSS, not just described in text. "
             "For every create task, write generated app tests for both backend and frontend surfaces: miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. "
             "Create-task Python tests must verify backend API behavior: GET starts empty, POST creates a user-provided record, and a later GET returns that record. "
             "Generated tests must validate the requested behavior, all role roots, and shared role content without relying on network calls or non-template dependencies. "
@@ -1343,7 +1455,9 @@ class WorkspaceCodeAgentRuntime:
                 "For Fast create tasks, use the fast_create_required_file_set as the patch skeleton. Do not spend operations on miniapp/app/routes/role_routes.py, miniapp/app/generated/models.py, or miniapp/app/static/shared/base.css in the first create patch.",
                 "For Fast create tasks, include exactly the backend needed for one persistent resource with GET, POST, and minimal PATCH/status update; do not fall back to frontend-only/static-only pages.",
                 "For Balanced create tasks, include deeper separate client/specialist/manager apps with two or three connected persistent resources, or one resource plus meaningful status/update endpoints, so roles share real saved state.",
+                "Balanced design quality: make the UI materially more polished than Fast with clean light-mode hierarchy, responsive dashboards, refined forms/lists/status badges, and meaningful CSS classes for spacing, typography, buttons, cards, and states.",
                 "For Quality create tasks, include detailed separate role workflows, several backend endpoints, create/list/update behavior where useful, richer role-specific CSS, and broader generated Python/JS acceptance tests.",
+                "Quality design quality: make the app look production-ready with highly refined layout, typography, spacing, responsive data presentation, accessible interaction states, empty/loading/error/success states, and cohesive light visual design implemented in CSS.",
                 "For Fast create tasks, do not stop after only three role hub pages. Include one key child page per role in the same first create patch whenever possible.",
                 "For every create task, distribute the first create patch evenly: replace all three role roots, create required child pages for each role before adding extra pages to any one role, create route_manifest.json, and create both generated test files. A client-only first patch will be rejected.",
                 "For Fast create tasks, each role must have at least two routeable pages: /<role> plus at least one /<role>/<slug> page. Balanced and Quality should have at least three routeable pages per role.",
@@ -3910,7 +4024,7 @@ test('role apps have separate frontend actions and styles', () => {{
             "checks_completed": (cls._checks_stage(details), cls._checks_completed_progress(details) if is_after_patch else cls._pre_patch_progress(attempt, 16)),
             "agent_turn_started": (cls._agent_turn_stage(details), cls._agent_turn_progress(details)),
             "iteration_ready": (cls._iteration_ready_stage(details), cls._iteration_ready_progress(details)),
-            "scope_expanded": ("Reading more workspace context", cls._pre_patch_progress(attempt, 27)),
+            "scope_expanded": ("Reading more workspace context", cls._context_expanded_progress(details)),
             "patch_apply_started": (cls._files_stage("Applying patch", details, key="files"), cls._patch_apply_progress(details, completed=False)),
             "patch_apply_completed": (cls._files_stage("Patch applied", details, key="changed_files"), cls._patch_apply_progress(details, completed=True)),
             "repair_iteration": (cls._repair_stage(details), cls._repair_progress(details)),
@@ -4019,6 +4133,11 @@ test('role apps have separate frontend actions and styles', () => {{
     def _agent_turn_stage(cls, details: dict[str, Any]) -> str:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
         tool_round = cls._safe_int(details.get("tool_round"), default=0)
+        phase = str(details.get("phase") or "").strip().lower()
+        if phase == "context_ready":
+            return f"Prepared edit context {attempt}"
+        if phase == "model_request":
+            return f"Generating code edit {attempt}"
         if tool_round > 0:
             return f"Reading context for turn {attempt}"
         return f"Planning code edit {attempt}"
@@ -4027,9 +4146,19 @@ test('role apps have separate frontend actions and styles', () => {{
     def _agent_turn_progress(cls, details: dict[str, Any]) -> int:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
         tool_round = cls._safe_int(details.get("tool_round"), default=0)
+        phase = str(details.get("phase") or "").strip().lower()
         if bool(details.get("has_draft_diff")):
+            if phase == "context_ready":
+                return min(93, 86 + max(0, attempt - 2) * 3 + tool_round)
+            if phase == "model_request":
+                return min(93, 88 + max(0, attempt - 2) * 3 + tool_round)
             return min(93, 84 + max(0, attempt - 2) * 3 + tool_round)
-        return min(45, 18 + (attempt - 1) * 8 + tool_round * 3)
+        base = 24 + (attempt - 1) * 6 + tool_round * 3
+        if phase == "context_ready":
+            return min(48, base + 6)
+        if phase == "model_request":
+            return min(49, base + 12)
+        return min(45, base)
 
     @classmethod
     def _iteration_ready_stage(cls, details: dict[str, Any]) -> str:
@@ -4047,6 +4176,7 @@ test('role apps have separate frontend actions and styles', () => {{
     @classmethod
     def _iteration_ready_progress(cls, details: dict[str, Any]) -> int:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
+        tool_round = cls._safe_int(details.get("tool_round"), default=0)
         operation_count = cls._safe_int(details.get("operation_count"), default=0)
         tool_request_count = cls._safe_int(details.get("tool_request_count"), default=0)
         if bool(details.get("has_draft_diff")):
@@ -4055,11 +4185,12 @@ test('role apps have separate frontend actions and styles', () => {{
             if tool_request_count > 0:
                 return min(93, 85 + max(0, attempt - 2) * 3)
             return min(92, 84 + max(0, attempt - 2) * 3)
+        base = 38 + max(0, attempt - 1) * 5 + tool_round * 2
         if operation_count > 0:
-            return min(47, 40 + attempt * 3)
+            return min(51, base + 7)
         if tool_request_count > 0:
-            return min(43, 23 + attempt * 6)
-        return min(43, 25 + attempt * 6)
+            return min(50, base + 3)
+        return min(50, base + 2)
 
     @classmethod
     def _repair_stage(cls, details: dict[str, Any]) -> str:
@@ -4078,15 +4209,23 @@ test('role apps have separate frontend actions and styles', () => {{
         if bool(details.get("has_draft_diff")):
             return min(93, 85 + max(0, attempt - 2) * 3)
         if outcome in {"needs_context", "no_op"}:
-            return min(43, 27 + attempt * 6)
-        return min(43, 29 + attempt * 6)
+            return min(50, 42 + max(0, attempt - 1) * 4)
+        return min(50, 44 + max(0, attempt - 1) * 4)
 
     @classmethod
     def _patch_apply_progress(cls, details: dict[str, Any], *, completed: bool) -> int:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
-        if attempt <= 1:
+        if attempt <= 1 or bool(details.get("first_patch")) or not bool(details.get("has_draft_diff")):
             return 58 if completed else 52
         return min(94, (89 if completed else 87) + max(0, attempt - 2) * 3)
+
+    @classmethod
+    def _context_expanded_progress(cls, details: dict[str, Any]) -> int:
+        attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
+        tool_round = cls._safe_int(details.get("tool_round"), default=0)
+        if bool(details.get("has_draft_diff")):
+            return min(93, 86 + max(0, attempt - 2) * 3 + tool_round)
+        return min(50, 44 + max(0, attempt - 1) * 4 + tool_round)
 
     @staticmethod
     def _files_stage(prefix: str, details: dict[str, Any], *, key: str) -> str:
@@ -4095,9 +4234,6 @@ test('role apps have separate frontend actions and styles', () => {{
         if not files:
             return prefix
         unique_count = len(set(files))
-        summary = str(details.get("file_summary") or WorkspaceCodeAgentRuntime._compact_file_list(files)).strip()
-        if summary:
-            return f"{prefix} • {unique_count} file{'s' if unique_count != 1 else ''}: {summary}"
         return f"{prefix} • {unique_count} file{'s' if unique_count != 1 else ''}"
 
     @staticmethod

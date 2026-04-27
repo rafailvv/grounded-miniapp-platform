@@ -1562,7 +1562,15 @@ class RunService:
         if request.apply_strategy != "staged_auto_apply" or run.apply_status != "applied":
             return
         source_run_id = str(checkpoint.get("source_run_id") or "")
-        if request.mode != "fix" and source_run_id != run.run_id:
+        if request.mode != "fix":
+            if source_run_id == run.run_id:
+                checkpoint["status"] = "completed"
+                checkpoint["completed_by_run_id"] = run.run_id
+                checkpoint["completed_at"] = datetime.now(timezone.utc).isoformat()
+                checkpoint["completion_reason"] = "source_run_completed_applied"
+                self.store.upsert("reports", f"resume_checkpoint:{run.workspace_id}", checkpoint)
+            return
+        if source_run_id and source_run_id != str(request.resume_from_run_id or ""):
             return
 
         resume_request = CreateRunRequest(
@@ -2046,7 +2054,7 @@ class RunService:
     ) -> bool:
         if meaningful_paths:
             return False
-        if str(getattr(job, "failure_class", "") or "") != "generation.edit.llm_failure":
+        if not self._is_noop_loop_failure(job):
             return False
 
         source_dir = self.workspace_service.source_dir(run.workspace_id)
@@ -2129,6 +2137,34 @@ class RunService:
             payload={"run_id": run.run_id, "mode": "noop_completion"},
         )
         return True
+
+    @staticmethod
+    def _is_noop_loop_failure(job: Any) -> bool:
+        failure_class = str(getattr(job, "failure_class", "") or "").strip()
+        if failure_class == "generation.edit.llm_failure":
+            return True
+        failure_signature = str(getattr(job, "failure_signature", "") or "").strip()
+        summary = " ".join(
+            str(value or "")
+            for value in (
+                getattr(job, "summary", ""),
+                getattr(job, "failure_reason", ""),
+                getattr(job, "root_cause_summary", ""),
+            )
+        ).lower()
+        if failure_signature == "workspace_loop_failure" and (
+            "repeated failure signatures" in summary
+            or "no executable edits" in summary
+            or "without meaningful progress" in summary
+        ):
+            return True
+        remaining_issues = getattr(job, "remaining_issues", []) or []
+        return bool(remaining_issues) and all(
+            isinstance(issue, dict)
+            and issue.get("kind") == "prompt_alignment"
+            and issue.get("check") == "meaningful_diff"
+            for issue in remaining_issues
+        )
 
     def _complete_failed_run_from_green_draft(
         self,

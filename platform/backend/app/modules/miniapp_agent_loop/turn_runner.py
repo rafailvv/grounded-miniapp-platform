@@ -423,11 +423,17 @@ class WorkspaceLoopTurnRunner:
                 synced_operations = list(plan.operations)
             else:
                 synced_operations = callbacks.apply_contract_sync(list(plan.operations))
+            draft_diff_before_apply = bool(self.context_builder.workspace_service.diff(workspace_id, run_id=run_id).strip())
             callbacks.append_event(
                 job,
                 "patch_apply_started",
                 "Applying workspace loop edits to the draft.",
-                {"attempt": attempt + 1, "files": [operation.file_path for operation in synced_operations]},
+                {
+                    "attempt": attempt + 1,
+                    "files": [operation.file_path for operation in synced_operations],
+                    "has_draft_diff": draft_diff_before_apply,
+                    "first_patch": not draft_diff_before_apply,
+                },
             )
             envelope = self.context_builder.workspace_service.build_patch_envelope_for_draft(workspace_id, run_id, synced_operations)
             apply_result = self.context_builder.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
@@ -513,7 +519,12 @@ class WorkspaceLoopTurnRunner:
                 job,
                 "patch_apply_completed",
                 "Workspace loop edits were applied to the draft.",
-                {"attempt": attempt + 1, "changed_files": list(changed_files)},
+                {
+                    "attempt": attempt + 1,
+                    "changed_files": list(changed_files),
+                    "has_draft_diff": True,
+                    "first_patch": not draft_diff_before_apply,
+                },
             )
             callbacks.append_trace(
                 workspace_id,

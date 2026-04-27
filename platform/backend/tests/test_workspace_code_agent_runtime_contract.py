@@ -4,7 +4,16 @@ import json
 from types import SimpleNamespace
 
 from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
-from app.models.domain import CheckExecutionRecord, DraftFileOperation, GenerateRequest, JobEvent, JobRecord, RunCheckResult, RunRecord
+from app.models.domain import (
+    CheckExecutionRecord,
+    CreateRunRequest,
+    DraftFileOperation,
+    GenerateRequest,
+    JobEvent,
+    JobRecord,
+    RunCheckResult,
+    RunRecord,
+)
 from app.modules.miniapp_agent_loop.tool_agent_runtime import validate_workspace_command
 from app.modules.miniapp_agent_loop.turn_runner import WorkspaceLoopTurnRunner
 from app.modules.workspace_code_agent_runtime.runtime import (
@@ -45,6 +54,8 @@ def test_agent_prompt_declares_run_checks_read_only() -> None:
     assert 'node:test does not export expect' in prompt
     assert "Generate normal light-mode interfaces by default" in prompt
     assert "Do not give roles different color palettes" in prompt
+    assert "Balanced design quality must be visibly stronger than Fast" in prompt
+    assert "Quality design quality must be top-tier and product-ready" in prompt
     assert "Visible generated UI copy must use the user's language" in prompt
     assert "Do not paste raw prompt excerpts" in prompt
     assert "preserve existing selectors" in prompt
@@ -94,6 +105,30 @@ def test_visual_style_edit_uses_focused_css_contract() -> None:
     assert schema["properties"]["tool_requests"]["maxItems"] == 0
     assert schema["properties"]["outcome"]["enum"] == ["patch_ready", "fatal_invalid_response"]
     assert schema["properties"]["operations"]["items"]["properties"]["content"]["maxLength"] == 8000
+
+
+def test_platform_shell_stabilizer_restores_safe_top_spacing(tmp_path) -> None:
+    source_dir = tmp_path / "source"
+    base_path = source_dir / "miniapp/app/static/shared/base.css"
+    page_path = source_dir / "miniapp/app/static/client/index.html"
+    base_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    base_path.write_text(
+        ".page-shell { max-width: 620px; padding: 32px 16px 48px; }\n",
+        encoding="utf-8",
+    )
+    page_path.write_text(
+        '<main class="page-shell"><h1>Client</h1></main>',
+        encoding="utf-8",
+    )
+    runtime = object.__new__(WorkspaceCodeAgentRuntime)
+
+    changed = runtime._stabilize_platform_shell("ws", "run", source_dir, ["miniapp/app/static/client/index.html"])
+
+    assert "miniapp/app/static/shared/base.css" in changed
+    assert "miniapp/app/static/client/index.html" in changed
+    assert "padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px)) !important" in base_path.read_text(encoding="utf-8")
+    assert 'style="padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px));"' in page_path.read_text(encoding="utf-8")
 
 
 def test_copy_and_behavior_edits_are_classified_separately() -> None:
@@ -409,6 +444,143 @@ def test_stale_run_recovery_retains_nonempty_draft_for_resume(tmp_path) -> None:
     assert checkpoint["status"] == "pending"
     assert checkpoint["source_run_id"] == "run_stale"
     assert checkpoint["generation_mode"] == "fast"
+
+
+def test_completed_source_run_closes_stale_resume_checkpoint_without_duplicate_run(tmp_path) -> None:
+    service = object.__new__(RunService)
+    service.store = StateStore(tmp_path / "state.json")
+    service.workspace_log_service = SimpleNamespace(
+        append=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("resume log should not be written"))
+    )
+    service.create_run = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("duplicate resume run queued"))
+    service._append_job_event = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("resume job event should not be written"))
+
+    run = RunRecord(
+        run_id="run_source",
+        workspace_id="ws",
+        prompt="Create shop",
+        intent="create",
+        status="completed",
+        apply_status="applied",
+        linked_job_id="job_source",
+        target_role_scope=["client", "specialist", "manager"],
+    )
+    service.store.upsert(
+        "reports",
+        "resume_checkpoint:ws",
+        {
+            "status": "pending",
+            "source_run_id": "run_source",
+            "prompt": "Create shop",
+            "intent": "create",
+            "generation_mode": "balanced",
+        },
+    )
+
+    service._queue_resume_generation_from_checkpoint_if_needed(
+        run,
+        CreateRunRequest(prompt="Create shop", mode="generate", apply_strategy="staged_auto_apply"),
+    )
+
+    checkpoint = service.store.get("reports", "resume_checkpoint:ws")
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["completed_by_run_id"] == "run_source"
+    assert checkpoint["completion_reason"] == "source_run_completed_applied"
+
+
+def test_noop_loop_failure_can_finish_from_green_source() -> None:
+    job = SimpleNamespace(
+        failure_class=None,
+        failure_signature="workspace_loop_failure",
+        summary="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
+        failure_reason="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
+        root_cause_summary=None,
+        remaining_issues=[],
+    )
+
+    assert RunService._is_noop_loop_failure(job)
+
+
+def test_repeated_noop_failure_completes_when_current_source_is_green(tmp_path) -> None:
+    class FakeWorkspaceService:
+        discarded = False
+
+        def source_dir(self, workspace_id: str):
+            assert workspace_id == "ws"
+            return tmp_path
+
+        def draft_exists(self, workspace_id: str, run_id: str) -> bool:
+            assert workspace_id == "ws"
+            assert run_id == "run_noop"
+            return True
+
+        def discard_draft(self, workspace_id: str, run_id: str) -> None:
+            assert workspace_id == "ws"
+            assert run_id == "run_noop"
+            self.discarded = True
+
+    class FakeCheckRunner:
+        def run(self, **kwargs) -> CheckExecutionRecord:
+            assert kwargs["workspace_id"] == "ws"
+            assert kwargs["run_id"] == "run_noop"
+            assert kwargs["changed_files"] == []
+            return CheckExecutionRecord(
+                workspace_id="ws",
+                run_id="run_noop",
+                results=[
+                    RunCheckResult(name="schema_validators", status="passed"),
+                    RunCheckResult(name="connectivity_validators", status="passed"),
+                    RunCheckResult(name="changed_files_static", status="passed"),
+                    RunCheckResult(
+                        name="platform_invariants",
+                        status="passed",
+                        diagnostics={
+                            "role_coverage": {"client": {"status": "present"}},
+                            "generated_tests": {"python": {"status": "present"}},
+                            "neutral_template_findings": [],
+                        },
+                    ),
+                ],
+            )
+
+    service = object.__new__(RunService)
+    service.store = StateStore(tmp_path / "state.json")
+    service.workspace_service = FakeWorkspaceService()
+    service.check_runner = FakeCheckRunner()
+    service.preview_service = SimpleNamespace(get=lambda workspace_id: SimpleNamespace(status="healthy"))
+    service.workspace_log_service = SimpleNamespace(append=lambda *args, **kwargs: None)
+    job = JobRecord(
+        job_id="job_noop",
+        workspace_id="ws",
+        prompt="Create shop",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        status="failed",
+        failure_signature="workspace_loop_failure",
+        summary="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
+        failure_reason="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
+    )
+    service.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
+    run = RunRecord(
+        run_id="run_noop",
+        workspace_id="ws",
+        prompt="Create shop",
+        intent="create",
+        status="failed",
+        apply_status="failed",
+        linked_job_id=job.job_id,
+        target_role_scope=["client", "specialist", "manager"],
+    )
+
+    completed = service._complete_blocked_noop_run_from_green_source(run=run, job=job, meaningful_paths=[])
+
+    assert completed
+    assert run.status == "completed"
+    assert run.apply_status == "noop"
+    assert run.failure_reason is None
+    assert service.workspace_service.discarded
+    saved_job = service.store.get("jobs", job.job_id)
+    assert saved_job["events"][-1]["details"]["reason"] == "green_source_noop"
 
 
 def test_preview_refresh_progress_does_not_step_back_from_99() -> None:
@@ -980,15 +1152,31 @@ def test_running_progress_stays_early_until_file_edits_exist() -> None:
     assert WorkspaceCodeAgentRuntime._run_progress_for_event(
         "iteration_ready",
         details={"attempt": 2, "outcome": "no_progress", "operation_count": 0, "tool_request_count": 0},
-    ) == ("No file edits returned", 37)
+    ) == ("No file edits returned", 45)
     assert WorkspaceCodeAgentRuntime._run_progress_for_event(
         "iteration_ready",
         details={"attempt": 1, "outcome": "tool_request", "operation_count": 0, "tool_request_count": 2},
-    ) == ("Requested 2 context reads", 29)
+    ) == ("Requested 2 context reads", 41)
     assert WorkspaceCodeAgentRuntime._run_progress_for_event(
         "iteration_ready",
         details={"attempt": 1, "outcome": "patch_ready", "operation_count": 8, "tool_request_count": 0},
-    ) == ("Prepared 8 file edits", 43)
+    ) == ("Prepared 8 file edits", 45)
+    assert WorkspaceCodeAgentRuntime._run_progress_for_event(
+        "agent_turn_started",
+        details={"attempt": 1, "phase": "context_ready"},
+    ) == ("Prepared edit context 1", 30)
+    assert WorkspaceCodeAgentRuntime._run_progress_for_event(
+        "agent_turn_started",
+        details={"attempt": 1, "phase": "model_request"},
+    ) == ("Generating code edit 1", 36)
+    assert WorkspaceCodeAgentRuntime._run_progress_for_event(
+        "patch_apply_started",
+        details={"attempt": 2, "files": ["miniapp/app/main.py"], "first_patch": True, "has_draft_diff": False},
+    ) == ("Applying patch • 1 file", 52)
+    assert WorkspaceCodeAgentRuntime._run_progress_for_event(
+        "patch_apply_started",
+        details={"attempt": 2, "files": ["miniapp/app/main.py"], "has_draft_diff": True},
+    ) == ("Applying patch • 1 file", 87)
     assert not WorkspaceCodeAgentRuntime._should_update_run_stage(
         "running_checks",
         progress=19,

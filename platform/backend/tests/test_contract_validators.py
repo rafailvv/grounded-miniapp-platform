@@ -552,6 +552,49 @@ def test_agentic_platform_invariants_reject_placeholder_role_css(tmp_path: Path)
     assert "platform.placeholder_role_css" in "\n".join(result.logs)
 
 
+def test_agentic_platform_invariants_reject_role_css_that_collapses_shell_spacing(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    (source_dir / "miniapp/app/static/client/styles.css").write_text(
+        ".page-shell { padding-top: 32px; color: #172033; }\n"
+        ".record-card { border: 1px solid #d8dee8; }\n"
+        ".metric-card { padding: 12px; }\n",
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/styles.css"],
+        scope_mode="agentic",
+    )
+
+    assert result.status == "failed"
+    assert "platform.role_css_collapses_shell_safe_top_spacing" in "\n".join(result.logs)
+
+
+def test_agentic_platform_invariants_allow_inner_spacing_inside_shell(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    (source_dir / "miniapp/app/static/client/styles.css").write_text(
+        ".page-shell .hero-panel { padding: 32px; color: #172033; }\n"
+        ".record-card { border: 1px solid #d8dee8; }\n"
+        ".metric-card { padding: 12px; }\n",
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/styles.css"],
+        scope_mode="agentic",
+    )
+
+    assert "platform.role_css_collapses_shell_safe_top_spacing" not in "\n".join(result.logs)
+
+
 def test_agentic_platform_invariants_reject_cross_role_navigation(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     _write_multipage_role_surfaces(source_dir)
