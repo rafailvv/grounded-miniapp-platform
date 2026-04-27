@@ -1774,11 +1774,16 @@ class CheckRunner:
                     prefix = line[: match.start()]
                     if prefix.rstrip().endswith("?"):
                         continue
-                    context = "\n".join(lines[max(0, index - 3) : index + 1])
+                    context = cls._dom_access_context(lines, index)
                     if cls._dom_variable_access_is_guarded(context, line, var_name):
                         continue
                     unsafe.add(var_name)
         return unsafe
+
+    @staticmethod
+    def _dom_access_context(lines: list[str], index: int) -> str:
+        start = max(0, index - 80)
+        return "\n".join(lines[start : index + 1])
 
     @staticmethod
     def _dom_variable_access_is_guarded(context: str, line: str, var_name: str) -> bool:
@@ -1786,6 +1791,8 @@ class CheckRunner:
         if re.search(rf"\b{escaped}\s*&&", line):
             return True
         if re.search(rf"\bif\s*\(\s*{escaped}\b", line):
+            return True
+        if re.search(rf"\bif\s*\([^)]*!\s*{escaped}\b[^)]*\)\s*return\b", context):
             return True
         if re.search(rf"\bif\s*\(\s*!\s*{escaped}\s*\)\s*return\b", context):
             return True

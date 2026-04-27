@@ -463,7 +463,7 @@ def test_dom_contract_rejects_unguarded_shared_role_script_on_child_page(tmp_pat
     catalog_dir.mkdir(parents=True)
     orders_dir.mkdir(parents=True)
     catalog_dir.joinpath("index.html").write_text(
-        "<main id='catalog-list'></main><script src='/static/client/app.js'></script>",
+        "<main><section id='catalog-list'></section><p id='catalog-empty'></p></main><script src='/static/client/app.js'></script>",
         encoding="utf-8",
     )
     orders_dir.joinpath("index.html").write_text(
@@ -496,7 +496,7 @@ def test_dom_contract_accepts_guarded_shared_role_script_on_child_pages(tmp_path
     catalog_dir.mkdir(parents=True)
     orders_dir.mkdir(parents=True)
     catalog_dir.joinpath("index.html").write_text(
-        "<main id='catalog-list'></main><script src='/static/client/app.js'></script>",
+        "<main><section id='catalog-list'></section><p id='catalog-empty'></p></main><script src='/static/client/app.js'></script>",
         encoding="utf-8",
     )
     orders_dir.joinpath("index.html").write_text(
@@ -505,9 +505,14 @@ def test_dom_contract_accepts_guarded_shared_role_script_on_child_pages(tmp_path
     )
     role_dir.joinpath("app.js").write_text(
         "const catalogList = document.getElementById('catalog-list');\n"
+        "const catalogEmpty = document.getElementById('catalog-empty');\n"
         "const cartCount = document.getElementById('cart-count');\n"
         "const badges = document.querySelectorAll('#status-badge');\n"
-        "function renderCatalog() { if (catalogList) catalogList.innerHTML = ''; }\n"
+        "function renderCatalog() {\n"
+        "  if (!catalogList || !catalogEmpty) return;\n"
+        "  catalogEmpty.hidden = false;\n"
+        "  catalogList.innerHTML = '';\n"
+        "}\n"
         "function renderCart() { cartCount && (cartCount.textContent = '0'); }\n"
         "function renderBadges() { badges.forEach((badge) => { badge.textContent = 'ok'; }); }\n"
         "window.addEventListener('DOMContentLoaded', () => { renderCatalog(); renderCart(); });\n",
