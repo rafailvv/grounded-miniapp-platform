@@ -24,7 +24,7 @@ body {
   max-width: var(--app-max-width);
   min-height: 100vh;
   margin: 0 auto;
-  padding: 28px 16px 48px;
+  padding: max(76px, calc(var(--telegram-top-safe-offset) + 12px)) 16px 48px;
 }
 
 .page {

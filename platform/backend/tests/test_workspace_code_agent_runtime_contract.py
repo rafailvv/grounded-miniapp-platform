@@ -110,6 +110,29 @@ def test_fix_completion_requires_meaningful_diff_even_when_checks_are_green() ->
     assert any(issue["check"] == "meaningful_diff" for issue in state["remaining_issues"])
 
 
+def test_run_token_usage_accumulates_iteration_ready_details() -> None:
+    first = WorkspaceCodeAgentRuntime._merge_run_token_usage(
+        {},
+        {"input_tokens": 1200, "output_tokens": 300, "reasoning_tokens": 50, "total_tokens": 1550},
+    )
+    merged = WorkspaceCodeAgentRuntime._merge_run_token_usage(
+        first,
+        {"input_tokens": 800, "output_tokens": 200, "reasoning_tokens": 25},
+    )
+
+    assert merged["input_tokens"] == 2000
+    assert merged["output_tokens"] == 500
+    assert merged["reasoning_tokens"] == 75
+    assert merged["total_tokens"] == 2550
+    assert merged["turn_count"] == 2
+    assert merged["last_turn"] == {
+        "input_tokens": 800,
+        "output_tokens": 200,
+        "reasoning_tokens": 25,
+        "total_tokens": 1000,
+    }
+
+
 def test_failed_generated_tests_add_test_context_and_repair_contract() -> None:
     class FakeWorkspaceService:
         def try_read_text_file(self, workspace_id: str, path: str, run_id: str | None = None) -> str | None:

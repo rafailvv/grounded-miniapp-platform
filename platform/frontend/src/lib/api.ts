@@ -76,6 +76,14 @@ export type Run = {
   repair_iterations?: Array<Record<string, unknown>>;
   fix_attempts?: Array<Record<string, unknown>>;
   scope_expansions?: Array<Record<string, unknown>>;
+  token_usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    reasoning_tokens?: number;
+    total_tokens?: number;
+    turn_count?: number;
+    last_turn?: Record<string, unknown>;
+  };
   rolled_back: boolean;
   rolled_back_at?: string | null;
   created_at: string;

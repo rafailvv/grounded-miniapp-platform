@@ -610,6 +610,17 @@ button:disabled {
   font-size: 12px;
 }
 
+.run-progress-meta span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-progress-meta span:last-child {
+  flex: 0 0 auto;
+}
+
 .run-card-meta {
   color: var(--muted);
   font-size: 12px;
@@ -625,19 +636,23 @@ button:disabled {
   overflow: hidden;
   display: -webkit-box;
   line-height: 1.32;
-  min-height: calc(1.32em * 3);
+  min-height: calc(1.32em * 2);
   text-overflow: ellipsis;
   white-space: normal;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 2;
 }
 
-.run-card-meta-time {
+.run-card-meta-side {
   flex: 0 0 auto;
+  display: grid;
+  gap: 3px;
   padding-top: 1px;
+  text-align: right;
 }
 
-.run-card-quality {
+.run-card-meta-time,
+.run-card-meta-files {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.25;

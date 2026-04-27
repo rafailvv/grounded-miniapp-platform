@@ -244,6 +244,24 @@ function pluralize(count: number, singular: string, plural = `${singular}s`): st
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
+function toPositiveInteger(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+  return Math.round(parsed);
+}
+
+function formatCompactTokenCount(value: number): string {
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
+  }
+  if (value >= 1_000) {
+    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  }
+  return String(value);
+}
+
 function asRecordArray(value: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) {
     return [];
@@ -479,17 +497,41 @@ function displayRunStage(run: Run): string {
 
 function runProgressStage(run: Run): string {
   const stage = displayRunStage(run);
+  const parts = [stage];
   const stageLower = stage.toLowerCase();
   if (displayRunStatus(run) === "running" && !stageLower.includes("file")) {
     const fileCount = run.touched_files.length;
     if (fileCount > 0) {
-      return `${stage} · ${pluralize(fileCount, "file")}`;
-    }
-    if (run.iteration_count > 0) {
-      return `${stage} · ${pluralize(run.iteration_count, "turn")}`;
+      parts.push(pluralize(fileCount, "file"));
+    } else if (run.iteration_count > 0) {
+      parts.push(pluralize(run.iteration_count, "turn"));
     }
   }
-  return stage;
+  return parts.join(" · ");
+}
+
+function runFilesSummary(run: Run): string {
+  return pluralize(run.touched_files.length, "file");
+}
+
+function runTokenUsageValue(run: Run, key: "input_tokens" | "output_tokens" | "reasoning_tokens" | "total_tokens" | "turn_count"): string {
+  const usage = run.token_usage;
+  if (!usage) {
+    return "n/a";
+  }
+  let value = toPositiveInteger(usage[key]);
+  if (key === "total_tokens" && !value) {
+    value = toPositiveInteger(usage.input_tokens) + toPositiveInteger(usage.output_tokens);
+  }
+  return value ? formatCompactTokenCount(value) : "n/a";
+}
+
+function roleCoverageStatus(run: Run, role: RoleKey): string {
+  return qualityStatusFromEntry(run.role_coverage?.[role]) || "n/a";
+}
+
+function generatedTestStatus(run: Run, key: string): string {
+  return qualityStatusFromEntry(run.generated_tests?.[key]) || "n/a";
 }
 
 function progressCeilingForRun(run: Run): number {
@@ -619,22 +661,6 @@ function qualityStatusFromEntry(entry: unknown): string {
   }
   const status = (entry as Record<string, unknown>).status;
   return typeof status === "string" ? status : "";
-}
-
-function runQualitySummary(run: Run): string {
-  const coverage = run.role_coverage ?? {};
-  const roleStatuses = ROLE_ORDER.map((role) => qualityStatusFromEntry(coverage[role]));
-  const roleCount = roleStatuses.filter((status) => status === "present").length;
-  const rolePart = roleStatuses.some(Boolean) ? `roles ${roleCount}/${ROLE_ORDER.length}` : formatRoleScope(run.target_role_scope);
-
-  const generatedTests = run.generated_tests ?? {};
-  const testStatuses = [
-    qualityStatusFromEntry(generatedTests.generated_app_python_tests),
-    qualityStatusFromEntry(generatedTests.generated_app_js_tests),
-  ].filter(Boolean);
-  const passedTests = testStatuses.filter((status) => status === "passed").length;
-  const testsPart = testStatuses.length ? `tests ${passedTests}/${testStatuses.length}` : "";
-  return [rolePart, testsPart].filter(Boolean).join(" · ");
 }
 
 function ensureChildrenMap(node: FileTreeNode): Map<string, FileTreeNode> {
@@ -2432,6 +2458,58 @@ export default function App() {
             </div>
 
             <section className="run-detail-section">
+              <h4>Token usage</h4>
+              <div className="run-details-grid">
+                <div className="run-detail-card">
+                  <span>Total</span>
+                  <strong>{runTokenUsageValue(selectedRun, "total_tokens")}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>Input</span>
+                  <strong>{runTokenUsageValue(selectedRun, "input_tokens")}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>Output</span>
+                  <strong>{runTokenUsageValue(selectedRun, "output_tokens")}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>Reasoning</span>
+                  <strong>{runTokenUsageValue(selectedRun, "reasoning_tokens")}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>Turns</span>
+                  <strong>{runTokenUsageValue(selectedRun, "turn_count")}</strong>
+                </div>
+              </div>
+            </section>
+
+            <section className="run-detail-section">
+              <h4>Role coverage</h4>
+              <div className="run-details-grid">
+                {ROLE_ORDER.map((role) => (
+                  <div key={role} className="run-detail-card">
+                    <span>{ROLE_LABELS[role]}</span>
+                    <strong>{roleCoverageStatus(selectedRun, role)}</strong>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            <section className="run-detail-section">
+              <h4>Generated tests</h4>
+              <div className="run-details-grid">
+                <div className="run-detail-card">
+                  <span>Python tests</span>
+                  <strong>{generatedTestStatus(selectedRun, "generated_app_python_tests")}</strong>
+                </div>
+                <div className="run-detail-card">
+                  <span>JS tests</span>
+                  <strong>{generatedTestStatus(selectedRun, "generated_app_js_tests")}</strong>
+                </div>
+              </div>
+            </section>
+
+            <section className="run-detail-section">
               <h4>Prompt</h4>
               <pre className="json-block">{displayRunPrompt(selectedRun)}</pre>
             </section>
@@ -2793,9 +2871,11 @@ export default function App() {
                           <span className="run-card-meta-copy" title={runTimelineDescription(run)}>
                             {runTimelineDescription(run)}
                           </span>
-                          <span className="run-card-meta-time">{runTimelineMeta(run)}</span>
+                          <span className="run-card-meta-side">
+                            <span className="run-card-meta-time">{runTimelineMeta(run)}</span>
+                            <span className="run-card-meta-files">{runFilesSummary(run)}</span>
+                          </span>
                         </div>
-                        <div className="run-card-quality">{runQualitySummary(run)}</div>
                       </button>
                       {run.status === "completed" || canStopRun || run.status === "failed" || run.status === "blocked" ? (
                         <div className="run-card-actions">

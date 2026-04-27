@@ -1950,6 +1950,11 @@ class WorkspaceCodeAgentRuntime:
                     if str(path).strip()
                 ]
                 payload["touched_files"] = list(dict.fromkeys(merged_files))
+        if event_type == "iteration_ready":
+            payload["token_usage"] = self._merge_run_token_usage(
+                payload.get("token_usage") if isinstance(payload.get("token_usage"), dict) else {},
+                details,
+            )
         payload["summary"] = job.summary
         payload["failure_reason"] = job.failure_reason
         payload["failure_class"] = job.failure_class
@@ -1965,6 +1970,32 @@ class WorkspaceCodeAgentRuntime:
         payload = self.store.get("reports", f"iterations:{workspace_id}") or {}
         items = payload.get("items") if isinstance(payload, dict) else None
         return len(items) if isinstance(items, list) else 0
+
+    @staticmethod
+    def _merge_run_token_usage(existing: dict[str, Any], turn: dict[str, Any]) -> dict[str, Any]:
+        def _int(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        last_turn = {
+            "input_tokens": _int(turn.get("input_tokens")),
+            "output_tokens": _int(turn.get("output_tokens")),
+            "reasoning_tokens": _int(turn.get("reasoning_tokens")),
+            "total_tokens": _int(turn.get("total_tokens")),
+        }
+        if not last_turn["total_tokens"]:
+            last_turn["total_tokens"] = last_turn["input_tokens"] + last_turn["output_tokens"]
+        merged = {
+            "input_tokens": _int(existing.get("input_tokens")) + last_turn["input_tokens"],
+            "output_tokens": _int(existing.get("output_tokens")) + last_turn["output_tokens"],
+            "reasoning_tokens": _int(existing.get("reasoning_tokens")) + last_turn["reasoning_tokens"],
+            "total_tokens": _int(existing.get("total_tokens")) + last_turn["total_tokens"],
+            "turn_count": _int(existing.get("turn_count")) + 1,
+            "last_turn": last_turn,
+        }
+        return merged
 
     @classmethod
     def _run_progress_for_event(

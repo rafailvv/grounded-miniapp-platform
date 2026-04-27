@@ -518,6 +518,7 @@ class RunRecord(StrictModel):
     artifacts: dict[str, str] = Field(default_factory=dict)
     remaining_issues: list[dict[str, Any]] = Field(default_factory=list)
     latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
+    token_usage: dict[str, Any] = Field(default_factory=dict)
     repair_iterations: list[dict[str, Any]] = Field(default_factory=list)
     fix_attempts: list[dict[str, Any]] = Field(default_factory=list)
     scope_expansions: list[dict[str, Any]] = Field(default_factory=list)
