@@ -994,6 +994,59 @@ def test_agentic_platform_invariants_accept_multipage_role_surfaces(tmp_path: Pa
     assert "/specialist/profile" in CheckRunner._root_preview_routes(source_dir)
 
 
+def test_balanced_agentic_platform_invariants_reject_shallow_design_depth(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/index.html", "miniapp/app/generated/route_manifest.json"],
+        scope_mode="agentic",
+        generation_mode=GenerationMode.BALANCED,
+    )
+
+    assert result.status == "failed"
+    assert "platform.insufficient_mode_design_depth" in "\n".join(result.logs)
+
+
+def test_quality_agentic_platform_invariants_require_three_child_pages_per_role(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    quality_css = (
+        ".page-shell.quality-app { color: #172033; }\n"
+        ".dashboard-grid { display: grid; }\n"
+        ".metric-card { padding: 12px; }\n"
+        ".status-badge { border: 1px solid #ccd3df; }\n"
+        ".empty-state { color: #607086; }\n"
+        ".loading-state { opacity: .72; }\n"
+        ".success-state { color: #147a44; }\n"
+        ".error-state { color: #a33131; }\n"
+        ".workflow-form { display: grid; }\n"
+        ".input-field { min-height: 40px; }\n"
+        ".action-button { min-height: 40px; }\n"
+        ".list-panel { display: grid; }\n"
+        ".action-button:focus-visible { outline: 2px solid #2459d6; }\n"
+        "@media (max-width: 640px) { .dashboard-grid { grid-template-columns: 1fr; } }\n"
+    )
+    for role in ("client", "specialist", "manager"):
+        (source_dir / "miniapp/app/static" / role / "styles.css").write_text(quality_css, encoding="utf-8")
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/index.html", "miniapp/app/generated/route_manifest.json"],
+        scope_mode="agentic",
+        generation_mode=GenerationMode.QUALITY,
+    )
+
+    assert result.status == "failed"
+    assert "platform.single_page_role_surface" in "\n".join(result.logs)
+    assert result.diagnostics["multipage_coverage"]["client"]["required_route_count"] == 4
+
+
 def test_agentic_create_invariants_require_persistent_post_api(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     _write_multipage_role_surfaces(source_dir)

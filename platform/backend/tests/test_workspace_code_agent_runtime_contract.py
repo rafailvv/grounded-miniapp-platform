@@ -546,26 +546,38 @@ def test_fast_parallel_blueprint_uses_commerce_role_pages() -> None:
     }
 
 
-def test_fast_commerce_fallback_covers_products_orders_cart_workflow() -> None:
-    request = GenerateRequest(
-        prompt="Создай интернет-магазин: сотрудник добавляет товар, клиент кладет товар в корзину и оформляет заказ",
-        intent="create",
-        generation_mode=GenerationMode.FAST,
-    )
+def test_no_platform_create_fallback_entrypoints_remain() -> None:
+    removed_entrypoints = {
+        "_fast_create_fallback_operations",
+        "_fast_create_fallback_operations_with_cleanup",
+        "_fast_commerce_fallback_operations",
+        "_fast_create_should_use_fallback_repair",
+        "_mark_fast_create_fallback_job",
+    }
 
-    operations = WorkspaceCodeAgentRuntime._fast_create_fallback_operations(request)
-    paths = {operation.file_path for operation in operations}
-    text = "\n".join(str(operation.content or "") for operation in operations)
+    for name in removed_entrypoints:
+        assert not hasattr(WorkspaceCodeAgentRuntime, name)
 
-    assert "miniapp/app/routes/commerce.py" in paths
-    assert "miniapp/app/static/client/catalog/index.html" in paths
-    assert "miniapp/app/static/specialist/inventory/index.html" in paths
-    assert "/api/products" in text
-    assert "/api/orders" in text
-    assert "add-to-cart" in text
-    assert 'method: "POST"' in text
-    assert 'method: "PATCH"' in text
-    assert all(term in text.lower() for term in ("products", "orders", "cart"))
+
+def test_parallel_failures_target_owned_repair_workers() -> None:
+    worker_ids = {"backend_api", "client_ui", "specialist_ui", "manager_ui", "generated_tests"}
+
+    assert WorkspaceCodeAgentRuntime._parallel_repair_targets_from_merge_error(
+        "client_ui returned no operations.",
+        worker_ids,
+    ) == {"client_ui"}
+    assert WorkspaceCodeAgentRuntime._parallel_repair_targets_from_merge_error(
+        "miniapp/app/routes/store.py was edited by both backend_api and client_ui.",
+        worker_ids,
+    ) == {"backend_api", "client_ui"}
+    assert WorkspaceCodeAgentRuntime._parallel_repair_targets_from_coverage_gap(
+        [
+            "frontend form/fetch POST /api/<resource>",
+            "backend status/update endpoint",
+            "miniapp/tests/test_generated_app.py API status/update coverage",
+        ],
+        {},
+    ) == {"backend_api", "client_ui", "specialist_ui", "manager_ui", "generated_tests"}
 
 
 def test_create_patch_coverage_rejects_partial_role_slice() -> None:
@@ -651,45 +663,31 @@ def test_fast_create_patch_coverage_accepts_one_child_page_per_role_and_test_pat
     assert WorkspaceCodeAgentRuntime._create_patch_coverage_gap(operations, request=request) == []
 
 
-def test_fast_create_fallback_generates_separate_role_apps_and_css() -> None:
-    request = GenerateRequest(prompt="Я тренер, хочу записи на тренировки", intent="create", generation_mode=GenerationMode.FAST)
+def test_parallel_mode_contracts_make_fast_balanced_quality_different() -> None:
+    prompt = "Я владелец интернет-магазина одежды, хочу каталог, остатки, корзину и заказы"
+    contracts = {
+        mode: build_acceptance_contract(
+            prompt=prompt,
+            intent="create",
+            generation_mode=mode,
+            focused_edit_kind="standard",
+        )
+        for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY)
+    }
+    blueprints = {
+        mode: WorkspaceCodeAgentRuntime._fast_parallel_blueprint(contracts[mode], generation_mode=mode)
+        for mode in contracts
+    }
 
-    operations = WorkspaceCodeAgentRuntime._fast_create_fallback_operations(request)
-    by_path = {operation.file_path: operation.content or "" for operation in operations}
-    route_paths = [path for path in by_path if path.startswith("miniapp/app/routes/") and path != "miniapp/app/routes/role_pages.py"]
-
-    for role in ("client", "specialist", "manager"):
-        assert f"miniapp/app/static/{role}/index.html" in by_path
-        assert f"miniapp/app/static/{role}/app.js" in by_path
-        assert f"miniapp/app/static/{role}/styles.css" in by_path
-        assert f"/static/{role}/styles.css" in by_path[f"miniapp/app/static/{role}/index.html"]
-        assert f".{role}-app" in by_path[f"miniapp/app/static/{role}/styles.css"]
-        assert "padding: max(76px" in by_path[f"miniapp/app/static/{role}/styles.css"]
-        assert "/static/client/styles.css" not in by_path[f"miniapp/app/static/{role}/index.html"] or role == "client"
-        assert "/static/specialist/styles.css" not in by_path[f"miniapp/app/static/{role}/index.html"] or role == "specialist"
-        assert "/static/manager/styles.css" not in by_path[f"miniapp/app/static/{role}/index.html"] or role == "manager"
-    assert 'href="/specialist"' not in by_path["miniapp/app/static/client/index.html"]
-    assert 'href="/manager"' not in by_path["miniapp/app/static/client/index.html"]
-    assert 'href="/client"' not in by_path["miniapp/app/static/specialist/index.html"]
-    assert 'href="/manager"' not in by_path["miniapp/app/static/specialist/index.html"]
-    assert 'href="/client"' not in by_path["miniapp/app/static/manager/index.html"]
-    assert 'href="/specialist"' not in by_path["miniapp/app/static/manager/index.html"]
-    assert 'method: "POST"' in by_path["miniapp/app/static/client/app.js"]
-    assert 'method: "PATCH"' in by_path["miniapp/app/static/specialist/app.js"]
-    assert "metric-card" in by_path["miniapp/app/static/manager/app.js"]
-    assert len(route_paths) == 1
-    assert route_paths[0] != "miniapp/app/routes/bookings.py"
-    assert '@router.patch("/api/' in by_path[route_paths[0]]
-    assert "тренер" in "\n".join(by_path.values()).lower()
-    joined = "\n".join(by_path.values())
-    assert 'html lang="ru"' in by_path["miniapp/app/static/client/index.html"]
-    assert "Client app" not in joined
-    assert "Specialist app" not in joined
-    assert "Manager app" not in joined
-    assert "Workspace" not in joined
-    assert "source request" not in joined
-    assert "Collect user-provided" not in joined
-    assert "Работа с записями" in by_path["miniapp/app/static/specialist/queue/index.html"]
+    assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.FAST) == 3
+    assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.BALANCED) == 5
+    assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.QUALITY) == 7
+    assert blueprints[GenerationMode.FAST]["required_child_pages_per_role"] == 1
+    assert blueprints[GenerationMode.BALANCED]["required_child_pages_per_role"] == 2
+    assert blueprints[GenerationMode.QUALITY]["required_child_pages_per_role"] == 3
+    assert blueprints[GenerationMode.FAST]["mode_contract"]["design_level"] != blueprints[GenerationMode.BALANCED]["mode_contract"]["design_level"]
+    assert blueprints[GenerationMode.BALANCED]["mode_contract"]["design_level"] != blueprints[GenerationMode.QUALITY]["mode_contract"]["design_level"]
+    assert len(blueprints[GenerationMode.QUALITY]["resources"]) >= len(blueprints[GenerationMode.BALANCED]["resources"])
 
 
 def test_create_patch_coverage_rejects_static_only_app_without_api() -> None:
@@ -1094,7 +1092,7 @@ def test_get_run_surfaces_failed_retained_draft_as_blocked(tmp_path) -> None:
     assert hydrated.draft_ready is True
 
 
-def test_get_run_keeps_explicit_zero_token_usage_from_fallback_job(tmp_path) -> None:
+def test_get_run_keeps_explicit_zero_token_usage_from_linked_job(tmp_path) -> None:
     service = object.__new__(RunService)
     service.store = StateStore(tmp_path / "state.json")
     run = RunRecord(
@@ -1915,7 +1913,7 @@ def test_patch_with_separate_full_content_is_coerced_to_replace() -> None:
                 "operation": "patch",
                 "content": 'const role = "client";\nwindow.setupPreviewBridge?.(role);\n',
                 "diff": "*** Begin Patch\n*** Update File: miniapp/app/static/client/app.js\n@@\n-old\n+new\n*** End Patch\n",
-                "reason": "Use full content fallback when a separate patch is also provided.",
+                "reason": "Use full content when a separate patch is also provided.",
             }
         ]
     )

@@ -969,9 +969,9 @@ class WorkspaceService:
             if candidate and candidate in existing_content:
                 replacement = f"{new_text}\n" if candidate.endswith("\n") and not new_text.endswith("\n") else new_text
                 return existing_content.replace(candidate, replacement, 1)
-        addition_fallback = WorkspaceService._apply_line_free_addition_fallback(existing_content, hunk)
-        if addition_fallback is not None:
-            return addition_fallback
+        addition_recovery = WorkspaceService._apply_line_free_addition_recovery(existing_content, hunk)
+        if addition_recovery is not None:
+            return addition_recovery
         return None
 
     @classmethod
@@ -1003,7 +1003,7 @@ class WorkspaceService:
         return entries
 
     @classmethod
-    def _apply_line_free_addition_fallback(cls, existing_content: str, hunk: list[str]) -> str | None:
+    def _apply_line_free_addition_recovery(cls, existing_content: str, hunk: list[str]) -> str | None:
         entries = cls._line_free_entries(hunk)
         if not entries or any(prefix == "-" for prefix, _body in entries):
             return None

@@ -121,7 +121,7 @@ class WorkspaceLoopTurnRunner:
                 callbacks.append_event(
                     job,
                     "running_checks",
-                    "Skipping initial checks for a focused edit; validating after the first patch.",
+                    "Skipping pre-patch baseline checks; validating after the first generated patch.",
                     {"attempt": attempt, "has_file_edits": False, "skipped_initial_checks": True},
                 )
                 latest_execution = CheckExecutionRecord(
@@ -130,10 +130,10 @@ class WorkspaceLoopTurnRunner:
                     changed_files=list(changed_files),
                     results=[
                         RunCheckResult(
-                            name="initial_focused_edit_pending",
+                            name="initial_patch_pending",
                             status="failed",
-                            details="Initial focused edit checks were skipped until after the first CSS patch.",
-                            command="focused edit precheck shortcut",
+                            details="Initial checks were skipped until after the first generated patch.",
+                            command="pre-patch check shortcut",
                             logs=[],
                         )
                     ],
@@ -148,9 +148,9 @@ class WorkspaceLoopTurnRunner:
                     "optimistic_complete": False,
                     "remaining_issues": [
                         {
-                            "kind": "focused_edit_pending",
-                            "check": "initial_focused_edit_pending",
-                            "details": "Focused edit must produce a patch before validation can pass.",
+                            "kind": "initial_patch_pending",
+                            "check": "initial_patch_pending",
+                            "details": "The run must produce a patch before validation can pass.",
                             "blocking": True,
                         }
                     ],
@@ -185,6 +185,7 @@ class WorkspaceLoopTurnRunner:
                     latest_preview_details,
                     validation_snapshot,
                 )
+            skipped_prepatch_baseline = skip_initial_checks
             previous_signature = self.feedback.progress_signature(previous_snapshot) if previous_snapshot is not None else None
             current_signature = self.feedback.progress_signature(progress_snapshot)
             signature_changed = previous_signature is not None and current_signature != previous_signature
@@ -195,28 +196,29 @@ class WorkspaceLoopTurnRunner:
             )
             repeated_no_progress = 0 if made_progress else repeated_no_progress + 1
 
-            iteration_message = latest_assistant_message or f"workspace loop attempt {attempt}"
-            iterations.append(
-                RunIterationRecord(
-                    run_id=run_id,
-                    assistant_message=iteration_message,
-                    files_read=list(latest_files_read),
-                    operations=[
-                        RunIterationOperation(
-                            file_path=operation.file_path,
-                            operation=operation.operation,
-                            reason=operation.reason,
-                        )
-                        for operation in latest_operations
-                    ],
-                    check_results=latest_execution.results,
-                    diff_summary=self.context_builder.current_diff_summary(workspace_id, run_id),
-                    role_scope=role_scope,
-                    latency_breakdown={"checks_ms": latest_execution.duration_ms or 0},
-                    failure_class=progress_snapshot.get("failure_class"),
+            if not skipped_prepatch_baseline:
+                iteration_message = latest_assistant_message or f"workspace loop attempt {attempt}"
+                iterations.append(
+                    RunIterationRecord(
+                        run_id=run_id,
+                        assistant_message=iteration_message,
+                        files_read=list(latest_files_read),
+                        operations=[
+                            RunIterationOperation(
+                                file_path=operation.file_path,
+                                operation=operation.operation,
+                                reason=operation.reason,
+                            )
+                            for operation in latest_operations
+                        ],
+                        check_results=latest_execution.results,
+                        diff_summary=self.context_builder.current_diff_summary(workspace_id, run_id),
+                        role_scope=role_scope,
+                        latency_breakdown={"checks_ms": latest_execution.duration_ms or 0},
+                        failure_class=progress_snapshot.get("failure_class"),
+                    )
                 )
-            )
-            if attempt > 0:
+            if attempt > 0 and not skipped_prepatch_baseline:
                 repair_iterations.append(
                     RepairIterationRecord(
                         run_id=run_id,
@@ -229,23 +231,24 @@ class WorkspaceLoopTurnRunner:
                         token_usage={},
                     )
                 )
-            self.context_builder.store_loop_reports(
-                callbacks=callbacks,
-                workspace_id=workspace_id,
-                run_id=run_id,
-                iterations=iterations,
-                latest_execution=latest_execution,
-            )
-            callbacks.append_event(
-                job,
-                "checks_completed",
-                "Checks completed." if not progress_snapshot["failed_checks"] else f"Checks completed with failures: {', '.join(progress_snapshot['failed_checks'])}.",
-                {
-                    "attempt": attempt,
-                    "failed_checks": progress_snapshot["failed_checks"],
-                    "remaining_issue_count": len(completion_state.get("remaining_issues") or []),
-                },
-            )
+            if not skipped_prepatch_baseline:
+                self.context_builder.store_loop_reports(
+                    callbacks=callbacks,
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    iterations=iterations,
+                    latest_execution=latest_execution,
+                )
+                callbacks.append_event(
+                    job,
+                    "checks_completed",
+                    "Checks completed." if not progress_snapshot["failed_checks"] else f"Checks completed with failures: {', '.join(progress_snapshot['failed_checks'])}.",
+                    {
+                        "attempt": attempt,
+                        "failed_checks": progress_snapshot["failed_checks"],
+                        "remaining_issue_count": len(completion_state.get("remaining_issues") or []),
+                    },
+                )
 
             if completion_state.get("strict_green") or (
                 callbacks.allow_optimistic_completion and completion_state.get("optimistic_complete")

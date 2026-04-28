@@ -1311,6 +1311,16 @@ class CheckRunner:
                 }
                 issues.append(shell_spacing_issue)
                 continue
+            design_depth_issue = cls._role_design_depth_issue(role, css_text, combined, generation_mode)
+            if design_depth_issue is not None:
+                coverage[role] = {
+                    "status": "insufficient_mode_design",
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                }
+                issues.append(design_depth_issue)
+                continue
             cross_role_links = cls._cross_role_links(role, combined)
             if cross_role_links:
                 coverage[role] = {
@@ -1443,7 +1453,51 @@ class CheckRunner:
     @staticmethod
     def _min_role_route_pages(generation_mode: GenerationMode | str | None) -> int:
         value = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
+        if value == GenerationMode.QUALITY.value:
+            return 4
         return 2 if value == GenerationMode.FAST.value else MIN_ROLE_ROUTE_PAGES
+
+    @staticmethod
+    def _role_design_depth_issue(role: str, css_text: str, combined: str, generation_mode: GenerationMode | str | None) -> ValidationIssue | None:
+        value = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
+        if value not in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
+            return None
+        css = str(css_text or "").lower()
+        surface = f"{css}\n{str(combined or '').lower()}"
+        css_rule_count = len(re.findall(r"[.#]?[a-z][a-z0-9_-]*\s*\{", css))
+        state_tokens = {
+            "badge",
+            "button",
+            "card",
+            "dashboard",
+            "empty",
+            "error",
+            "form",
+            "grid",
+            "input",
+            "list",
+            "loading",
+            "metric",
+            "success",
+            "status",
+        }
+        token_hits = {token for token in state_tokens if token in surface}
+        min_rules = 12 if value == GenerationMode.QUALITY.value else 8
+        min_hits = 7 if value == GenerationMode.QUALITY.value else 5
+        quality_structure_ok = value != GenerationMode.QUALITY.value or ("@media" in css and ("focus-visible" in css or ":focus" in css))
+        if css_rule_count >= min_rules and len(token_hits) >= min_hits and quality_structure_ok:
+            return None
+        return ValidationIssue(
+            code="platform.insufficient_mode_design_depth",
+            message=(
+                f"{role} role design is too shallow for {value} mode. "
+                f"Expected at least {min_rules} real CSS rules, richer role state classes, "
+                "and for quality mode responsive/focus styling."
+            ),
+            severity="high",
+            location=f"miniapp/app/static/{role}/styles.css",
+            blocking=True,
+        )
 
     @staticmethod
     def _css_placeholder_marker(content: str) -> str | None:
@@ -2983,7 +3037,7 @@ class CheckRunner:
                 "problem": "test_asserts_js_rendered_text_in_server_html",
                 "expected_scope": (
                     "FastAPI TestClient sees HTML before browser JavaScript runs. "
-                    "Assert route/static shell in Python tests, or include fallback text in HTML, or move JS-rendered item checks to generated_app.test.mjs."
+                    "Assert route/static shell in Python tests, include source text in HTML, or move JS-rendered item checks to generated_app.test.mjs."
                 ),
             }
         if any("assert(html.includes(" in str(line or "") for line in logs):

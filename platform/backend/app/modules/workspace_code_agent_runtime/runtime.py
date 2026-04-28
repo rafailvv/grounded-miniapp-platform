@@ -659,6 +659,7 @@ class WorkspaceCodeAgentRuntime:
     ) -> WorkspaceLoopResult:
         focused_edit_kind = self._focused_edit_kind(request)
         focused_visual_edit = focused_edit_kind == "visual_style_edit"
+        create_intent = str(request.intent or "").strip().lower() == "create"
         acceptance_contract = build_acceptance_contract(
             prompt=request.prompt,
             intent=str(request.intent or ""),
@@ -760,6 +761,7 @@ class WorkspaceCodeAgentRuntime:
                 check_profile == "fast_gate"
                 and self._fast_gate_passed(execution.results)
                 and self.workspace_service.diff(workspace_id, run_id=run_id).strip()
+                and not (str(request.intent or "").strip().lower() == "create" or bool(acceptance_contract.get("required")))
             ):
                 self._append_event(
                     job,
@@ -848,37 +850,6 @@ class WorkspaceCodeAgentRuntime:
                 extra_file_context=extra_file_context,
                 tool_results=local_tool_results,
             )
-            if (
-                generation_mode == GenerationMode.FAST
-                and str(request.intent or "").strip().lower() == "create"
-                and self.workspace_service.diff(workspace_id, run_id=run_id).strip()
-                and self._fast_create_should_use_fallback_repair(latest_execution)
-            ):
-                fallback_operations = self._fast_create_fallback_operations_with_cleanup(
-                    request,
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                )
-                fallback_result = self._fast_create_fallback_result(request)
-                self._mark_fast_create_fallback_job(job)
-                local_tool_results.append(fallback_result)
-                tool_results.append(fallback_result)
-                self._append_event(
-                    job,
-                    "repair_iteration",
-                    "Fast create used the compact platform fallback to repair generated-test API persistence failures.",
-                    {"attempt": attempt, "reason": "fast_create_generated_test_fallback"},
-                )
-                return WorkspaceLoopTurnPlan(
-                    outcome="patch_ready",
-                    assistant_message="Fast create fallback repaired the generated API persistence path.",
-                    diagnosis="Generated app tests exposed a persistence/schema failure; Fast mode replaced the app with a compact file-backed GET/POST implementation.",
-                    operations=fallback_operations,
-                    files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
-                    expected_verification="Run generated Python/JS tests and preview checks.",
-                    rationale_by_file={operation.file_path: operation.reason for operation in fallback_operations},
-                    metadata={"tool_results": list(local_tool_results), "fallback": "fast_create_generated_test_repair"},
-                )
             for tool_round in range(self._tool_round_limit(generation_mode) + 4):
                 if (
                     not fast_parallel_attempted
@@ -931,37 +902,6 @@ class WorkspaceCodeAgentRuntime:
                 )
                 if "error" in llm_payload:
                     if self._is_output_cap_error(str(llm_payload.get("error") or "")):
-                        fast_first_create_patch = (
-                            generation_mode == GenerationMode.FAST
-                            and str(request.intent or "").strip().lower() == "create"
-                            and not self.workspace_service.diff(workspace_id, run_id=run_id).strip()
-                        )
-                        if fast_first_create_patch:
-                            fallback_operations = self._fast_create_fallback_operations_with_cleanup(
-                                request,
-                                workspace_id=workspace_id,
-                                run_id=run_id,
-                            )
-                            fallback_result = self._fast_create_fallback_result(request)
-                            self._mark_fast_create_fallback_job(job)
-                            local_tool_results.append(fallback_result)
-                            tool_results.append(fallback_result)
-                            self._append_event(
-                                job,
-                                "repair_iteration",
-                                "Fast create used the compact platform fallback after the first model response exceeded the output cap.",
-                                {"attempt": attempt, "tool_round": tool_round, "reason": "fast_create_output_cap_fallback"},
-                            )
-                            return WorkspaceLoopTurnPlan(
-                                outcome="patch_ready",
-                                assistant_message="Fast create fallback prepared a compact working app after the model output cap.",
-                                diagnosis="The first Fast create model response exceeded max_output_tokens, so the platform emitted a compact persisted app scaffold using the prompt domain.",
-                                operations=fallback_operations,
-                                files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
-                                expected_verification="Run validators plus generated Python/JS tests; verify GET starts empty, POST saves, and GET returns the created record.",
-                                rationale_by_file={operation.file_path: operation.reason for operation in fallback_operations},
-                                metadata={"tool_results": list(local_tool_results), "fallback": "fast_create_output_cap"},
-                            )
                         if not output_cap_correction_sent:
                             correction = self._output_cap_correction_result(llm_payload, request=request)
                             local_tool_results.append(correction)
@@ -1006,11 +946,10 @@ class WorkspaceCodeAgentRuntime:
                             metadata={"tool_requests": raw_tool_requests},
                         )
                     seen_tool_requests.add(signature)
-                    is_fast_first_create_patch = (
-                        generation_mode == GenerationMode.FAST
-                        and str(request.intent or "").strip().lower() == "create"
-                        and not self.workspace_service.diff(workspace_id, run_id=run_id).strip()
-                    )
+                    is_fast_first_create_patch = str(request.intent or "").strip().lower() == "create" and not self.workspace_service.diff(
+                        workspace_id,
+                        run_id=run_id,
+                    ).strip()
                     if is_fast_first_create_patch and not tool_budget_correction_sent:
                         correction = self._tool_budget_correction_result(raw_tool_requests, request=request)
                         local_tool_results.append(correction)
@@ -1182,7 +1121,7 @@ class WorkspaceCodeAgentRuntime:
             append_trace=self._append_trace,
             store_report=self._store_report,
             allow_optimistic_completion=True,
-            skip_initial_checks=focused_visual_edit,
+            skip_initial_checks=focused_visual_edit or create_intent,
             stop_if_requested=should_stop,
         )
         return self.workspace_loop_engine.run(
@@ -1211,17 +1150,176 @@ class WorkspaceCodeAgentRuntime:
         run_id: str,
         acceptance_contract: dict[str, Any],
     ) -> bool:
-        if generation_mode != GenerationMode.FAST:
-            return False
+        del generation_mode
         if int(attempt or 0) > 1:
             return False
         if not acceptance_contract.get("required"):
             return False
-        if str(request.intent or "").strip().lower() not in {"create", "edit", "refine", "role_only_change"}:
+        intent = str(request.intent or "").strip().lower()
+        if intent not in {"create", "edit", "refine", "role_only_change"}:
             return False
-        if focused_edit_kind not in {"standard", "behavior_workflow_edit"} and str(request.intent or "").strip().lower() != "create":
+        if focused_edit_kind not in {"standard", "behavior_workflow_edit"} and intent != "create":
             return False
         return not bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
+
+    @staticmethod
+    def _parallel_create_round_budget(generation_mode: GenerationMode | str | None) -> int:
+        mode = WorkspaceCodeAgentRuntime._generation_mode(generation_mode)
+        if mode == GenerationMode.QUALITY:
+            return 7
+        if mode == GenerationMode.BALANCED:
+            return 5
+        return 3
+
+    @staticmethod
+    def _parallel_worker_reasoning_effort(generation_mode: GenerationMode | str | None) -> str:
+        mode = WorkspaceCodeAgentRuntime._generation_mode(generation_mode)
+        if mode == GenerationMode.QUALITY:
+            return "high"
+        if mode == GenerationMode.BALANCED:
+            return "medium"
+        return "low"
+
+    @staticmethod
+    def _parallel_create_mode_contract(generation_mode: GenerationMode | str | None) -> dict[str, object]:
+        mode = WorkspaceCodeAgentRuntime._generation_mode(generation_mode)
+        if mode == GenerationMode.QUALITY:
+            return {
+                "mode": "quality",
+                "reasoning_effort": "high",
+                "round_budget": 7,
+                "target_resource_count": 3,
+                "required_child_pages_per_role": 3,
+                "workflow_depth": "planning, design pass, 3+ connected role workflows, richer validation, broad generated acceptance tests",
+                "design_level": "product-ready, highly refined, responsive, with empty/loading/error/success states",
+            }
+        if mode == GenerationMode.BALANCED:
+            return {
+                "mode": "balanced",
+                "reasoning_effort": "medium",
+                "round_budget": 5,
+                "target_resource_count": 2,
+                "required_child_pages_per_role": 2,
+                "workflow_depth": "2-3 connected workflows/resources, shared cross-role state, status/update flows, stronger acceptance tests",
+                "design_level": "polished product UI with clearer hierarchy, dashboards, responsive lists, forms, badges, and state styling",
+            }
+        return {
+            "mode": "fast",
+            "reasoning_effort": "low",
+            "round_budget": 3,
+            "target_resource_count": 1,
+            "required_child_pages_per_role": 1,
+            "workflow_depth": "compact MVP with one persistent resource, GET/POST, one status/update flow, forms, fetch, and generated tests",
+            "design_level": "compact real CSS, consistent light palette, no placeholder styling",
+        }
+
+    @staticmethod
+    def _parallel_create_design_brief(generation_mode: GenerationMode | str | None) -> dict[str, object]:
+        mode = WorkspaceCodeAgentRuntime._generation_mode(generation_mode)
+        common = {
+            "palette": "neutral light product UI with restrained accents; no random digital/neon palettes",
+            "role_isolation": "client, specialist, and manager are separate apps; role pages must not link to other role apps",
+            "shell_spacing": "preserve Telegram top safe spacing; do not override .page-shell padding unless using the shared safe expression",
+            "css": "real per-role styles.css files with classes used by HTML; no placeholder CSS",
+        }
+        if mode == GenerationMode.QUALITY:
+            return {
+                **common,
+                "layout": "product-ready dashboards with dense but readable sections, responsive grids, accessible forms, and refined state surfaces",
+                "states": "include visible empty, loading, success, validation, and error states where the role workflow needs them",
+                "role_depth": "each role should feel like its own purpose-built app, not a copied page with changed labels",
+            }
+        if mode == GenerationMode.BALANCED:
+            return {
+                **common,
+                "layout": "polished role dashboards, clear form/list hierarchy, status badges, metrics, and responsive card/table patterns",
+                "states": "include empty, success, and error states for the main workflow",
+                "role_depth": "each role needs distinct actions and layout emphasis",
+            }
+        return {
+            **common,
+            "layout": "compact, practical, readable role screens with forms, lists, buttons, and status badges",
+            "states": "include empty state text before user data exists",
+            "role_depth": "keep small, but client creates, specialist processes, manager oversees",
+        }
+
+    @staticmethod
+    def _parallel_initial_failure_context(latest_execution: CheckExecutionRecord) -> dict[str, object]:
+        failures: list[dict[str, object]] = []
+        for result in latest_execution.results:
+            if result.status != "failed":
+                continue
+            failures.append(
+                {
+                    "check": result.name,
+                    "details": str(result.details or "")[:800],
+                    "logs": [str(line or "")[:600] for line in list(result.logs or [])[:4]],
+                }
+            )
+        if not failures:
+            return {}
+        return {
+            "round": 0,
+            "source": "latest_checks",
+            "failed_checks": failures[:4],
+        }
+
+    @staticmethod
+    def _parallel_repair_targets_from_merge_error(error: str, worker_ids: object) -> set[str]:
+        worker_set = {str(worker_id) for worker_id in worker_ids}
+        text = str(error or "")
+        lowered = text.lower()
+        targets = {worker_id for worker_id in worker_set if worker_id.lower() in lowered}
+        for file_match in re.findall(r"miniapp/[A-Za-z0-9_./-]+", text):
+            mapped = WorkspaceCodeAgentRuntime._parallel_worker_for_path(file_match)
+            if mapped:
+                targets.add(mapped)
+        if "route_manifest" in lowered or "main.py" in lowered or "/routes/" in lowered or "backend" in lowered or "api" in lowered:
+            targets.add("backend_api")
+        if "test" in lowered:
+            targets.add("generated_tests")
+        return {target for target in targets if target in worker_set}
+
+    @staticmethod
+    def _parallel_repair_targets_from_coverage_gap(gap: list[str], blueprint: dict[str, Any]) -> set[str]:
+        del blueprint
+        targets: set[str] = set()
+        for item in gap:
+            text = str(item or "").lower()
+            mapped = WorkspaceCodeAgentRuntime._parallel_worker_for_path(text)
+            if mapped:
+                targets.add(mapped)
+            if "backend" in text or "/api/" in text or "/routes/" in text or "main.py" in text or "route_manifest" in text:
+                targets.add("backend_api")
+            if "test" in text:
+                targets.add("generated_tests")
+            if "frontend form" in text or "fetch post" in text:
+                targets.add("client_ui")
+            if "status/update" in text or "update action" in text:
+                targets.update({"backend_api", "specialist_ui", "manager_ui", "generated_tests"})
+            if "balanced create" in text or "quality create" in text:
+                targets.update({"backend_api", "client_ui", "specialist_ui", "manager_ui", "generated_tests"})
+        return targets
+
+    @staticmethod
+    def _parallel_worker_for_path(path: str) -> str | None:
+        normalized = str(path or "").replace("\\", "/").lstrip("./").lower()
+        if normalized.startswith("miniapp/app/static/client/") or "client" in normalized:
+            return "client_ui"
+        if normalized.startswith("miniapp/app/static/specialist/") or "specialist" in normalized:
+            return "specialist_ui"
+        if normalized.startswith("miniapp/app/static/manager/") or "manager" in normalized:
+            return "manager_ui"
+        if normalized.startswith("miniapp/tests/") or "test_generated_app" in normalized or "generated_app.test" in normalized:
+            return "generated_tests"
+        if (
+            normalized.startswith("miniapp/app/routes/")
+            or normalized in {"miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py", "miniapp/app/generated/route_manifest.json"}
+            or "backend" in normalized
+            or "/api/" in normalized
+        ):
+            return "backend_api"
+        return None
 
     def _request_fast_parallel_plan(
         self,
@@ -1241,18 +1339,33 @@ class WorkspaceCodeAgentRuntime:
         latest_diff_summary: str | None,
         acceptance_contract: dict[str, Any],
     ) -> WorkspaceLoopTurnPlan | None:
-        del latest_execution, latest_preview_details, last_turn_summary, latest_diff_summary
+        del latest_preview_details, last_turn_summary, latest_diff_summary
         started = time.perf_counter()
-        blueprint = self._fast_parallel_blueprint(acceptance_contract)
+        generation_mode = self._generation_mode(request.generation_mode)
+        blueprint = self._fast_parallel_blueprint(acceptance_contract, generation_mode=generation_mode)
+        mode_contract = self._parallel_create_mode_contract(generation_mode)
+        blueprint["mode_contract"] = mode_contract
+        blueprint["design_brief"] = self._parallel_create_design_brief(generation_mode)
         workers = self._fast_parallel_workers(blueprint)
+        workers_by_id = {str(worker["worker"]): worker for worker in workers}
+        round_budget = self._parallel_create_round_budget(generation_mode)
+        retry_worker_ids = list(workers_by_id.keys())
+        successful_results: dict[str, dict[str, Any]] = {}
+        failed_rounds: list[dict[str, Any]] = []
+        repair_context: list[dict[str, Any]] = []
+        initial_failure_context = self._parallel_initial_failure_context(latest_execution)
+        if initial_failure_context:
+            repair_context.append(initial_failure_context)
         self._append_event(
             job,
             "parallel_build_started",
-            "Fast parallel build started.",
+            "Parallel role build started.",
             {
                 "attempt": attempt,
                 "worker_count": len(workers),
-                "execution_style": "fast_parallel_workers",
+                "execution_style": "parallel_role_workers",
+                "generation_mode": generation_mode.value,
+                "round_budget": round_budget,
                 "has_draft_diff": False,
             },
         )
@@ -1261,8 +1374,9 @@ class WorkspaceCodeAgentRuntime:
             {
                 "workspace_id": workspace_id,
                 "run_id": run_id,
-                "mode": "fast",
+                "mode": generation_mode.value,
                 "blueprint": blueprint,
+                "mode_contract": mode_contract,
                 "workers": [
                     {
                         "worker": worker["worker"],
@@ -1273,217 +1387,281 @@ class WorkspaceCodeAgentRuntime:
                 ],
             },
         )
-        results: list[dict[str, Any]] = []
-        try:
-            with ThreadPoolExecutor(max_workers=min(FAST_PARALLEL_WORKER_COUNT, len(workers)), thread_name_prefix="fast-agent-worker") as executor:
-                future_to_worker = {}
-                for worker in workers:
-                    ctx = copy_context()
-                    future = executor.submit(
-                        ctx.run,
-                        self._request_fast_parallel_worker,
-                        job,
-                        workspace_id,
-                        run_id,
-                        request,
-                        attempt,
-                        context_mode,
-                        seed_context,
-                        extra_file_context,
-                        tool_results,
-                        acceptance_contract,
-                        blueprint,
-                        worker,
-                    )
-                    future_to_worker[future] = worker
-                for future in as_completed(future_to_worker):
-                    worker = future_to_worker[future]
-                    try:
-                        result = future.result()
-                    except Exception as exc:
-                        result = {
-                            "worker": worker["worker"],
-                            "status": "error",
-                            "error": str(exc),
-                            "error_class": exc.__class__.__name__,
-                            "payload": {},
-                            "operations": [],
-                            "cache_stats": {},
-                            "duration_ms": 0,
-                        }
-                    results.append(result)
-        except Exception as exc:
+        merged_operations: list[DraftFileOperation] = []
+        merge_error: str | None = None
+        create_gap: list[str] = []
+        round_results: list[dict[str, Any]] = []
+        for build_round in range(1, round_budget + 1):
+            round_started = time.perf_counter()
+            selected_workers = [workers_by_id[worker_id] for worker_id in retry_worker_ids if worker_id in workers_by_id]
+            if not selected_workers:
+                selected_workers = workers
             self._append_event(
                 job,
-                "parallel_build_failed",
-                "Fast parallel build failed before worker merge; falling back to single agent turn.",
-                {"attempt": attempt, "error": str(exc), "error_class": exc.__class__.__name__},
-            )
-            return None
-
-        for result in sorted(results, key=lambda item: str(item.get("worker") or "")):
-            cache_stats = result.get("cache_stats") if isinstance(result.get("cache_stats"), dict) else {}
-            if cache_stats:
-                job.cache_stats = self._merge_cache_stats(job.cache_stats, cache_stats)
-            if result.get("model") and not job.llm_model:
-                job.llm_model = str(result.get("model") or "")
-            self._append_agent_diagnostic(
-                workspace_id,
+                "parallel_build_started" if build_round == 1 else "repair_iteration",
+                "Parallel role build round started." if build_round == 1 else "Targeted parallel repair round started.",
                 {
-                    "run_id": run_id,
-                    "job_id": job.job_id,
                     "attempt": attempt,
-                    "worker": result.get("worker"),
-                    "context_mode": context_mode,
-                    "duration_ms": int(result.get("duration_ms") or 0),
-                    "status": result.get("status"),
-                    "model": result.get("model"),
-                    "outcome": result.get("outcome"),
-                    "operation_count": len(result.get("operations") or []),
-                    "operation_files": [operation.file_path for operation in result.get("operations") or []],
-                    "error": result.get("error"),
-                    "token_usage": {
+                    "round": build_round,
+                    "round_budget": round_budget,
+                    "workers": [str(worker["worker"]) for worker in selected_workers],
+                    "generation_mode": generation_mode.value,
+                },
+            )
+            results: list[dict[str, Any]] = []
+            try:
+                with ThreadPoolExecutor(max_workers=min(len(selected_workers), max(1, FAST_PARALLEL_WORKER_COUNT)), thread_name_prefix="role-agent-worker") as executor:
+                    future_to_worker = {}
+                    for worker in selected_workers:
+                        ctx = copy_context()
+                        future = executor.submit(
+                            ctx.run,
+                            self._request_fast_parallel_worker,
+                            job,
+                            workspace_id,
+                            run_id,
+                            request,
+                            attempt,
+                            context_mode,
+                            seed_context,
+                            extra_file_context,
+                            tool_results,
+                            acceptance_contract,
+                            blueprint,
+                            worker,
+                            build_round,
+                            repair_context,
+                        )
+                        future_to_worker[future] = worker
+                    for future in as_completed(future_to_worker):
+                        worker = future_to_worker[future]
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            result = {
+                                "worker": worker["worker"],
+                                "status": "error",
+                                "error": str(exc),
+                                "error_class": exc.__class__.__name__,
+                                "payload": {},
+                                "operations": [],
+                                "cache_stats": {},
+                                "duration_ms": 0,
+                            }
+                        result["round"] = build_round
+                        results.append(result)
+            except Exception as exc:
+                results = [
+                    {
+                        "worker": str(worker["worker"]),
+                        "status": "error",
+                        "error": str(exc),
+                        "error_class": exc.__class__.__name__,
+                        "payload": {},
+                        "operations": [],
+                        "cache_stats": {},
+                        "duration_ms": 0,
+                        "round": build_round,
+                    }
+                    for worker in selected_workers
+                ]
+            round_results.extend(results)
+            for result in sorted(results, key=lambda item: str(item.get("worker") or "")):
+                worker_id = str(result.get("worker") or "")
+                cache_stats = result.get("cache_stats") if isinstance(result.get("cache_stats"), dict) else {}
+                if cache_stats:
+                    job.cache_stats = self._merge_cache_stats(job.cache_stats, cache_stats)
+                if result.get("model") and not job.llm_model:
+                    job.llm_model = str(result.get("model") or "")
+                operation_files = [operation.file_path for operation in result.get("operations") or []]
+                self._append_agent_diagnostic(
+                    workspace_id,
+                    {
+                        "run_id": run_id,
+                        "job_id": job.job_id,
+                        "attempt": attempt,
+                        "round": build_round,
+                        "worker": worker_id,
+                        "context_mode": context_mode,
+                        "duration_ms": int(result.get("duration_ms") or 0),
+                        "status": result.get("status"),
+                        "model": result.get("model"),
+                        "outcome": result.get("outcome"),
+                        "operation_count": len(operation_files),
+                        "operation_files": operation_files,
+                        "error": result.get("error"),
+                        "token_usage": {
+                            "input_tokens": int(cache_stats.get("input_tokens") or 0),
+                            "output_tokens": int(cache_stats.get("output_tokens") or 0),
+                            "reasoning_tokens": int(cache_stats.get("reasoning_tokens") or 0),
+                            "total_tokens": int(cache_stats.get("total_tokens") or 0),
+                        },
+                    },
+                )
+                self._append_event(
+                    job,
+                    "iteration_ready",
+                    f"Parallel role worker {worker_id} returned.",
+                    {
+                        "attempt": attempt,
+                        "round": build_round,
+                        "worker": worker_id,
+                        "outcome": str(result.get("outcome") or result.get("status") or ""),
+                        "operation_count": len(operation_files),
+                        "model": result.get("model") or "",
                         "input_tokens": int(cache_stats.get("input_tokens") or 0),
                         "output_tokens": int(cache_stats.get("output_tokens") or 0),
                         "reasoning_tokens": int(cache_stats.get("reasoning_tokens") or 0),
                         "total_tokens": int(cache_stats.get("total_tokens") or 0),
+                        "has_draft_diff": False,
                     },
-                },
-            )
-            self._append_event(
-                job,
-                "iteration_ready",
-                f"Fast parallel worker {result.get('worker')} returned.",
-                {
-                    "attempt": attempt,
-                    "worker": result.get("worker"),
-                    "outcome": str(result.get("outcome") or result.get("status") or ""),
-                    "operation_count": len(result.get("operations") or []),
-                    "model": result.get("model") or "",
-                    "input_tokens": int(cache_stats.get("input_tokens") or 0),
-                    "output_tokens": int(cache_stats.get("output_tokens") or 0),
-                    "reasoning_tokens": int(cache_stats.get("reasoning_tokens") or 0),
-                    "total_tokens": int(cache_stats.get("total_tokens") or 0),
-                    "has_draft_diff": False,
-                },
-            )
-
-        merged_operations, merge_error = self._merge_fast_parallel_worker_operations(results)
-        if merge_error:
-            self._append_event(
-                job,
-                "parallel_build_failed",
-                "Fast parallel worker merge failed; selecting the fastest safe fallback.",
-                {"attempt": attempt, "reason": merge_error},
-            )
-            if str(request.intent or "").strip().lower() == "create":
-                fallback_operations = self._fast_create_fallback_operations_with_cleanup(
-                    request,
-                    workspace_id=workspace_id,
-                    run_id=run_id,
                 )
-                fallback_result = self._fast_create_fallback_result(request)
-                self._mark_fast_create_fallback_job(job)
-                tool_results.append(fallback_result)
+                if result.get("status") == "completed" and str(result.get("outcome") or "").strip().lower() == "patch_ready" and result.get("operations"):
+                    successful_results[worker_id] = result
+
+            missing_workers = [worker_id for worker_id in workers_by_id if worker_id not in successful_results]
+            if missing_workers:
+                merged_operations = []
+                merge_error = f"Workers missing patch_ready result: {', '.join(missing_workers)}."
+                create_gap = []
+            else:
+                current_results = [successful_results[worker_id] for worker_id in workers_by_id]
+                merged_operations, merge_error = self._merge_fast_parallel_worker_operations(current_results)
+                create_gap = self._create_patch_coverage_gap(merged_operations, request=request) if merge_error is None else []
+
+            if merge_error is None and not create_gap:
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                job.flow_coverage = {
+                    **dict(job.flow_coverage or {}),
+                    "status": "parallel_patch_ready",
+                    "parallel_worker_count": len(workers),
+                    "merged_file_count": len({operation.file_path for operation in merged_operations}),
+                    "build_rounds": build_round,
+                    "repair_rounds": max(0, build_round - 1),
+                    "mode_contract": mode_contract,
+                    "failed_rounds": failed_rounds,
+                }
                 self._append_event(
                     job,
-                    "repair_iteration",
-                    "Fast create used the compact platform fallback after parallel worker merge failed.",
-                    {"attempt": attempt, "reason": "fast_parallel_merge_failed", "merge_error": merge_error},
+                    "parallel_build_completed",
+                    "Parallel role build produced a merged patch.",
+                    {
+                        "attempt": attempt,
+                        "rounds": build_round,
+                        "duration_ms": duration_ms,
+                        "worker_count": len(workers),
+                        "operation_count": len(merged_operations),
+                    },
                 )
                 return WorkspaceLoopTurnPlan(
                     outcome="patch_ready",
-                    assistant_message="Fast parallel workers partially generated the app, then platform fallback completed the create contract.",
-                    diagnosis="At least one Fast parallel worker failed or conflicted, so Fast mode applied a compact persisted fallback instead of spending another full LLM turn.",
-                    operations=fallback_operations,
+                    assistant_message="Parallel role workers produced a merged product patch.",
+                    diagnosis="The platform built backend, client, specialist, manager, and generated tests in parallel ownership lanes, then merged non-conflicting LLM-generated operations.",
+                    operations=merged_operations,
                     files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
-                    expected_verification="Run validators plus generated Python/JS tests for persistence and role workflow coverage.",
-                    rationale_by_file={operation.file_path: operation.reason for operation in fallback_operations},
-                    metadata={"tool_results": list(tool_results), "fallback": "fast_parallel_merge_failed"},
+                    expected_verification="Run static validators, frontend interaction smoke, generated Python/JS tests, and preview checks.",
+                    rationale_by_file={operation.file_path: operation.reason for operation in merged_operations},
+                    metadata={
+                        "parallel_build": True,
+                        "generation_mode": generation_mode.value,
+                        "worker_count": len(workers),
+                        "build_rounds": build_round,
+                        "repair_rounds": max(0, build_round - 1),
+                        "mode_contract": mode_contract,
+                        "worker_summaries": [
+                            {
+                                "worker": result.get("worker"),
+                                "status": result.get("status"),
+                                "round": result.get("round"),
+                                "operation_count": len(result.get("operations") or []),
+                            }
+                            for result in sorted(round_results, key=lambda item: (int(item.get("round") or 0), str(item.get("worker") or "")))
+                        ],
+                    },
                 )
+
+            retry_targets = (
+                self._parallel_repair_targets_from_merge_error(merge_error or "", workers_by_id.keys())
+                if merge_error
+                else self._parallel_repair_targets_from_coverage_gap(create_gap, blueprint)
+            )
+            if not retry_targets:
+                retry_targets = set(workers_by_id.keys())
+            failed_round = {
+                "round": build_round,
+                "duration_ms": int((time.perf_counter() - round_started) * 1000),
+                "merge_error": merge_error,
+                "coverage_gap": create_gap,
+                "retry_workers": sorted(retry_targets),
+            }
+            failed_rounds.append(failed_round)
+            repair_context = [*repair_context[-2:], failed_round]
             tool_results.append(
                 {
-                    "tool": "fast_parallel_build",
-                    "status": "failed",
-                    "reason": merge_error,
-                    "required_next_action": "Return a single coherent patch_ready response that satisfies the same acceptance_contract.",
+                    "tool": "parallel_role_repair",
+                    "status": "needs_repair",
+                    "round": build_round,
+                    "merge_error": merge_error,
+                    "coverage_gap": create_gap,
+                    "retry_workers": sorted(retry_targets),
+                    "required_next_action": "Retry only the listed ownership workers and return complete patch_ready operations for their owned files.",
                 }
             )
-            return None
-        create_gap = self._create_patch_coverage_gap(merged_operations, request=request)
-        if create_gap:
             self._append_event(
                 job,
-                "parallel_build_failed",
-                "Fast parallel worker merge missed create coverage; applying compact fallback.",
-                {"attempt": attempt, "missing": create_gap},
+                "repair_iteration",
+                "Parallel role build needs targeted repair.",
+                {
+                    "attempt": attempt,
+                    "round": build_round,
+                    "round_budget": round_budget,
+                    "merge_error": merge_error,
+                    "coverage_gap_count": len(create_gap),
+                    "retry_workers": sorted(retry_targets),
+                    "generation_mode": generation_mode.value,
+                },
             )
-            if str(request.intent or "").strip().lower() == "create":
-                fallback_operations = self._fast_create_fallback_operations_with_cleanup(
-                    request,
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                )
-                fallback_result = self._fast_create_fallback_result(request)
-                self._mark_fast_create_fallback_job(job)
-                tool_results.append(self._create_patch_coverage_correction_result(create_gap))
-                tool_results.append(fallback_result)
-                self._append_event(
-                    job,
-                    "repair_iteration",
-                    "Fast create used the compact platform fallback after parallel coverage was incomplete.",
-                    {"attempt": attempt, "reason": "fast_parallel_coverage_gap", "missing": create_gap},
-                )
-                return WorkspaceLoopTurnPlan(
-                    outcome="patch_ready",
-                    assistant_message="Fast parallel workers missed required create coverage, then platform fallback completed the app contract.",
-                    diagnosis="Parallel workers returned a partial app; Fast mode applied a compact persisted fallback instead of spending another full LLM turn.",
-                    operations=fallback_operations,
-                    files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
-                    expected_verification="Run validators plus generated Python/JS tests for persistence and role workflow coverage.",
-                    rationale_by_file={operation.file_path: operation.reason for operation in fallback_operations},
-                    metadata={"tool_results": list(tool_results), "fallback": "fast_parallel_coverage_gap"},
-                )
-            tool_results.append(self._create_patch_coverage_correction_result(create_gap))
-            return None
+            retry_worker_ids = [worker_id for worker_id in workers_by_id if worker_id in retry_targets]
+
         duration_ms = int((time.perf_counter() - started) * 1000)
+        final_reason = merge_error or (f"Missing create coverage: {', '.join(create_gap[:8])}" if create_gap else "Parallel build did not produce a complete patch.")
         job.flow_coverage = {
             **dict(job.flow_coverage or {}),
-            "status": "parallel_patch_ready",
+            "status": "parallel_build_exhausted",
             "parallel_worker_count": len(workers),
-            "merged_file_count": len({operation.file_path for operation in merged_operations}),
+            "build_rounds": round_budget,
+            "repair_rounds": max(0, round_budget - 1),
+            "failed_rounds": failed_rounds,
+            "mode_contract": mode_contract,
         }
         self._append_event(
             job,
-            "parallel_build_completed",
-            "Fast parallel build produced a merged patch.",
+            "parallel_build_failed",
+            "Parallel role build exhausted targeted repair rounds.",
             {
                 "attempt": attempt,
                 "duration_ms": duration_ms,
-                "worker_count": len(workers),
-                "operation_count": len(merged_operations),
-                "operation_files": [operation.file_path for operation in merged_operations],
+                "round_budget": round_budget,
+                "reason": final_reason,
+                "generation_mode": generation_mode.value,
             },
         )
+        duration_ms = int((time.perf_counter() - started) * 1000)
         return WorkspaceLoopTurnPlan(
-            outcome="patch_ready",
-            assistant_message="Fast parallel workers produced a merged product patch.",
-            diagnosis="Fast built backend, client, specialist, manager, and generated tests in parallel ownership lanes, then merged non-conflicting operations.",
-            operations=merged_operations,
+            outcome="fatal_invalid_response",
+            assistant_message="Parallel role build could not produce a complete patch inside the mode repair budget.",
+            diagnosis=final_reason,
             files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
-            expected_verification="Run static validators, frontend interaction smoke, generated Python/JS tests, and preview checks.",
-            rationale_by_file={operation.file_path: operation.reason for operation in merged_operations},
+            failure_class="generation.parallel_build_exhausted",
+            failure_signature=f"generation.parallel_build_exhausted:{generation_mode.value}",
+            root_cause_summary=final_reason,
             metadata={
                 "parallel_build": True,
+                "generation_mode": generation_mode.value,
                 "worker_count": len(workers),
-                "worker_summaries": [
-                    {
-                        "worker": result.get("worker"),
-                        "status": result.get("status"),
-                        "operation_count": len(result.get("operations") or []),
-                    }
-                    for result in sorted(results, key=lambda item: str(item.get("worker") or ""))
-                ],
+                "build_rounds": round_budget,
+                "repair_rounds": max(0, round_budget - 1),
+                "failed_rounds": failed_rounds,
             },
         )
 
@@ -1501,6 +1679,8 @@ class WorkspaceCodeAgentRuntime:
         acceptance_contract: dict[str, Any],
         blueprint: dict[str, Any],
         worker: dict[str, Any],
+        build_round: int = 1,
+        repair_context: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         started = time.perf_counter()
         generation_mode = self._generation_mode(request.generation_mode)
@@ -1512,7 +1692,7 @@ class WorkspaceCodeAgentRuntime:
         )
         model = models_for_role("agent_turn", model_profile=request.model_profile, generation_mode=generation_mode)
         response = self.openai_client.generate_agent_turn(
-            schema_name=f"fast_parallel_{worker['worker']}_v1",
+            schema_name=f"parallel_{generation_mode.value}_{worker['worker']}_v1",
             schema=schema,
             system_prompt=self._agent_system_prompt(),
             user_prompt=self._fast_parallel_worker_prompt(
@@ -1527,12 +1707,30 @@ class WorkspaceCodeAgentRuntime:
                 acceptance_contract=acceptance_contract,
                 blueprint=blueprint,
                 worker=worker,
+                build_round=build_round,
+                repair_context=repair_context or [],
             ),
-            prompt_cache_key=self._prompt_cache_key(workspace_id, run_id, f"{request.prompt}:{worker['worker']}"),
-            stable_prefix="workspace_code_agent_fast_parallel_v1",
+            prompt_cache_key=self._prompt_cache_key(workspace_id, run_id, f"{request.prompt}:{generation_mode.value}:{worker['worker']}:round:{build_round}"),
+            stable_prefix="workspace_code_agent_parallel_role_workers_v1",
             model_override=model,
-            responses_tuning_override={"reasoning": {"effort": "low"}, "max_output_tokens": int(worker.get("max_output_tokens") or 14000)},
+            responses_tuning_override={
+                "reasoning": {"effort": self._parallel_worker_reasoning_effort(generation_mode)},
+                "max_output_tokens": int(worker.get("max_output_tokens") or 14000),
+            },
         )
+        if response.get("error"):
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            return {
+                "worker": worker["worker"],
+                "status": "error",
+                "outcome": "fatal_invalid_response",
+                "model": str(response.get("model") or ""),
+                "payload": {},
+                "operations": [],
+                "cache_stats": response.get("cache_stats") if isinstance(response.get("cache_stats"), dict) else {},
+                "duration_ms": duration_ms,
+                "error": str(response.get("error") or ""),
+            }
         payload = response.get("payload")
         if isinstance(payload, str):
             payload = json.loads(payload)
@@ -1564,15 +1762,26 @@ class WorkspaceCodeAgentRuntime:
         acceptance_contract: dict[str, Any],
         blueprint: dict[str, Any],
         worker: dict[str, Any],
+        build_round: int = 1,
+        repair_context: list[dict[str, Any]] | None = None,
     ) -> str:
+        generation_mode = self._generation_mode(request.generation_mode)
+        depth_rule = (
+            "Keep Fast compact but complete."
+            if generation_mode == GenerationMode.FAST
+            else "Keep this worker compact, but add Balanced-level workflow detail within your ownership zone."
+            if generation_mode == GenerationMode.BALANCED
+            else "Keep this worker compact, but make the owned UI/API/test slice polished and product-ready within the output cap."
+        )
         payload = {
-            "task": "Fast parallel worker: return only operations for your ownership zone. Other workers are running in parallel.",
+            "task": "Parallel role worker: return only operations for your ownership zone. Other workers are running in parallel.",
             "workspace_id": workspace_id,
             "run_id": run_id,
             "mode": request.mode,
             "intent": request.intent,
-            "generation_mode": "fast",
+            "generation_mode": generation_mode.value,
             "attempt": attempt,
+            "build_round": build_round,
             "context_mode": context_mode,
             "worker": {
                 "id": worker["worker"],
@@ -1582,7 +1791,10 @@ class WorkspaceCodeAgentRuntime:
             },
             "user_prompt": request.prompt,
             "acceptance_contract": acceptance_contract,
-            "fast_parallel_blueprint": blueprint,
+            "parallel_blueprint": blueprint,
+            "mode_contract": blueprint.get("mode_contract"),
+            "design_brief": blueprint.get("design_brief"),
+            "repair_context": list(repair_context or [])[-3:],
             "file_contexts": self._compact_file_contexts(
                 {**seed_context, **extra_file_context},
                 max_files=16,
@@ -1593,7 +1805,8 @@ class WorkspaceCodeAgentRuntime:
                 "Return outcome=patch_ready with create/replace/patch operations only inside your ownership list.",
                 "Do not edit files owned by another worker. The merge layer rejects overlapping file paths.",
                 "Use the exact required_files paths for this worker unless the prompt and blueprint require an additional file inside your ownership zone.",
-                "Keep Fast compact but complete. Do not add mock/seed/demo/sample/preloaded business records.",
+                "On repair rounds, replace your whole owned slice only when needed; otherwise return the smallest complete owned-file operations that close the listed gap.",
+                f"{depth_rule} Do not add mock/seed/demo/sample/preloaded business records.",
                 "Generated UI must be usable with forms/buttons/fetch and must start from an empty state.",
                 "Use one consistent light visual system and preserve preview_bridge/page-shell safe spacing.",
                 "If you cannot satisfy your ownership zone, return fatal_invalid_response with a concrete diagnosis.",
@@ -1602,39 +1815,71 @@ class WorkspaceCodeAgentRuntime:
         return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
-    def _fast_parallel_blueprint(acceptance_contract: dict[str, Any]) -> dict[str, Any]:
+    def _fast_parallel_blueprint(
+        acceptance_contract: dict[str, Any],
+        *,
+        generation_mode: GenerationMode = GenerationMode.FAST,
+    ) -> dict[str, Any]:
         features = acceptance_contract.get("features") if isinstance(acceptance_contract.get("features"), dict) else {}
         commerce = bool(features.get("commerce_catalog_cart_order"))
-        client_child = "catalog" if commerce else "request"
-        specialist_child = "inventory" if commerce else "queue"
-        manager_child = "overview"
+        mode_contract = WorkspaceCodeAgentRuntime._parallel_create_mode_contract(generation_mode)
+        child_count = int(mode_contract.get("required_child_pages_per_role") or 1)
+        role_child_slugs = {
+            "client": ["catalog", "cart", "orders"] if commerce else ["request", "visits", "history"],
+            "specialist": ["inventory", "orders", "fulfillment"] if commerce else ["queue", "attendance", "calendar"],
+            "manager": ["overview", "reports", "control"],
+        }
+        role_children = {
+            role: [
+                {
+                    "slug": slug,
+                    "path": f"miniapp/app/static/{role}/{slug}/index.html",
+                    "route": f"/{role}/{slug}",
+                }
+                for slug in slugs[:child_count]
+            ]
+            for role, slugs in role_child_slugs.items()
+        }
+        target_resource_count = int(mode_contract.get("target_resource_count") or 1)
+        if commerce:
+            resource_candidates = ["products", "orders", "inventory", "fulfillment"]
+            resources = resource_candidates[: max(2, target_resource_count)]
+        else:
+            resource_candidates = ["records", "statuses", "schedule", "notes"]
+            resources = resource_candidates[: max(1, target_resource_count)]
         return {
             "roles": list(ROLE_ORDER),
+            "generation_mode": generation_mode.value,
+            "required_child_pages_per_role": child_count,
+            "mode_contract": mode_contract,
             "commerce_flow": commerce,
             "backend_route_file": "miniapp/app/routes/app_api.py",
             "route_manifest": "miniapp/app/generated/route_manifest.json",
             "main_file": "miniapp/app/main.py",
-            "resources": ["products", "orders"] if commerce else ["records"],
-            "api_paths": ["/api/products", "/api/orders"] if commerce else ["/api/records"],
+            "resources": resources,
+            "api_paths": [f"/api/{resource}" for resource in resources],
             "role_files": {
                 "client": {
                     "root": "miniapp/app/static/client/index.html",
-                    "child": f"miniapp/app/static/client/{client_child}/index.html",
-                    "child_route": f"/client/{client_child}",
+                    "child": role_children["client"][0]["path"],
+                    "child_route": role_children["client"][0]["route"],
+                    "children": role_children["client"],
                     "app_js": "miniapp/app/static/client/app.js",
                     "css": "miniapp/app/static/client/styles.css",
                 },
                 "specialist": {
                     "root": "miniapp/app/static/specialist/index.html",
-                    "child": f"miniapp/app/static/specialist/{specialist_child}/index.html",
-                    "child_route": f"/specialist/{specialist_child}",
+                    "child": role_children["specialist"][0]["path"],
+                    "child_route": role_children["specialist"][0]["route"],
+                    "children": role_children["specialist"],
                     "app_js": "miniapp/app/static/specialist/app.js",
                     "css": "miniapp/app/static/specialist/styles.css",
                 },
                 "manager": {
                     "root": "miniapp/app/static/manager/index.html",
-                    "child": f"miniapp/app/static/manager/{manager_child}/index.html",
-                    "child_route": f"/manager/{manager_child}",
+                    "child": role_children["manager"][0]["path"],
+                    "child_route": role_children["manager"][0]["route"],
+                    "children": role_children["manager"],
                     "app_js": "miniapp/app/static/manager/app.js",
                     "css": "miniapp/app/static/manager/styles.css",
                 },
@@ -1648,6 +1893,17 @@ class WorkspaceCodeAgentRuntime:
     @staticmethod
     def _fast_parallel_workers(blueprint: dict[str, Any]) -> list[dict[str, Any]]:
         role_files = blueprint.get("role_files") if isinstance(blueprint.get("role_files"), dict) else {}
+        mode_contract = blueprint.get("mode_contract") if isinstance(blueprint.get("mode_contract"), dict) else {}
+        child_pages = int(blueprint.get("required_child_pages_per_role") or mode_contract.get("required_child_pages_per_role") or 1)
+        target_resources = int(mode_contract.get("target_resource_count") or len(blueprint.get("resources") or []) or 1)
+        quality_depth = child_pages >= 3 or str(mode_contract.get("mode") or "") == "quality"
+        balanced_depth = quality_depth or child_pages >= 2 or target_resources >= 2
+        backend_operation_limit = 6 if quality_depth else 5 if balanced_depth else 4
+        role_operation_limit = 6 if quality_depth else 5 if balanced_depth else 4
+        test_operation_limit = 3 if balanced_depth else 2
+        role_content_limit = 22000 if quality_depth else 18000 if balanced_depth else 14000
+        backend_content_limit = 21000 if quality_depth else 18000 if balanced_depth else 15000
+        test_content_limit = 22000 if quality_depth else 18000 if balanced_depth else 16000
         return [
             {
                 "worker": "backend_api",
@@ -1664,24 +1920,28 @@ class WorkspaceCodeAgentRuntime:
                     blueprint.get("main_file"),
                     blueprint.get("route_manifest"),
                 ],
-                "operation_limit": 4,
-                "content_max_length": 15000,
-                "max_output_tokens": 15000,
+                "operation_limit": backend_operation_limit,
+                "content_max_length": backend_content_limit,
+                "max_output_tokens": backend_content_limit,
             },
             *[
                 {
                     "worker": f"{role}_ui",
-                    "responsibility": f"Create the {role} role app root, one child page, role JavaScript, and role CSS with role-specific workflow actions.",
+                    "responsibility": f"Create the {role} role app root, required child pages, role JavaScript, and role CSS with role-specific workflow actions.",
                     "ownership": [f"miniapp/app/static/{role}/**"],
                     "required_files": [
                         role_payload.get("root"),
-                        role_payload.get("child"),
+                        *[
+                            child.get("path")
+                            for child in role_payload.get("children", [])
+                            if isinstance(child, dict)
+                        ],
                         role_payload.get("app_js"),
                         role_payload.get("css"),
                     ],
-                    "operation_limit": 4,
-                    "content_max_length": 14000,
-                    "max_output_tokens": 14000,
+                    "operation_limit": role_operation_limit,
+                    "content_max_length": role_content_limit,
+                    "max_output_tokens": role_content_limit,
                 }
                 for role, role_payload in role_files.items()
                 if role in ROLE_ORDER and isinstance(role_payload, dict)
@@ -1691,9 +1951,9 @@ class WorkspaceCodeAgentRuntime:
                 "responsibility": "Create generated Python and JS tests that cover the complete acceptance contract and cross-role flow.",
                 "ownership": ["miniapp/tests/**"],
                 "required_files": list(blueprint.get("test_files") or []),
-                "operation_limit": 2,
-                "content_max_length": 16000,
-                "max_output_tokens": 16000,
+                "operation_limit": test_operation_limit,
+                "content_max_length": test_content_limit,
+                "max_output_tokens": test_content_limit,
             },
         ]
 
@@ -2100,7 +2360,7 @@ class WorkspaceCodeAgentRuntime:
             "Create-task Python tests must verify backend API behavior: GET starts empty, POST creates a user-provided record, and a later GET returns that record. "
             "Generated tests must validate the requested behavior, all role roots, and shared role content without relying on network calls or non-template dependencies. "
             "For edit tasks, preserve existing selectors, ids, and data-testid attributes that generated tests assert unless the requested behavior intentionally replaces them; when behavior changes test expectations, update the generated test file in the same patch. "
-            "Python generated tests run through FastAPI TestClient and see server-rendered HTML before browser JavaScript executes; do not assert JS-rendered item text there unless the text is also present in HTML fallback/source. Use Python tests for route status, preview bridge/static shell, and backend APIs when present. "
+            "Python generated tests run through FastAPI TestClient and see server-rendered HTML before browser JavaScript executes; do not assert JS-rendered item text there unless the text is also present in HTML source. Use Python tests for route status, preview bridge/static shell, and backend APIs when present. "
             "JS generated tests are responsible for frontend source/data assertions; read role HTML/JS/shared data files directly with node:test, node:assert, and fs/path. "
             "node:test does not export expect; generated_app.test.mjs must use import test from \"node:test\" and import assert from \"node:assert\" with assert.ok/assert.equal/assert.match. "
             "Before writing generated_app.test.mjs, ensure every exact phrase asserted by includes() or match() is literally present in the file being read; prefer stable headings, route links, app title, and data-testid values over paraphrased expectations. "
@@ -2264,7 +2524,7 @@ class WorkspaceCodeAgentRuntime:
                 "Python generated tests should use unittest plus FastAPI TestClient to verify role routes and backend/API behavior when backend state exists.",
                 "JS generated tests should use node:test plus node:assert plus fs/path only to verify role HTML/JS content, shared domain labels, role-specific selectors/actions, and absence of neutral template text; do not import or call expect.",
                 "In generated_app.test.mjs, only assert exact strings that literally appear in the file being read; do not paraphrase expected UI text.",
-                "Do not make Python TestClient tests assert text that is only rendered by browser JavaScript; either include the text in HTML fallback/source or move that assertion to generated_app.test.mjs.",
+                "Do not make Python TestClient tests assert text that is only rendered by browser JavaScript; either include the text in HTML source or move that assertion to generated_app.test.mjs.",
                 "When role content is populated from a shared JS data file, JS generated tests should read that data/source file directly and assert the shared item names there.",
                 "Generated JS tests run with cwd=miniapp, so read app/static/<role>/... paths or resolve from import.meta.url to ../app/static; never prefix paths with miniapp/app/ inside the test.",
                 "In generated_app.test.mjs, prefer path.join(process.cwd(), 'app/static/<role>/index.html') for fixture paths. If using import.meta.url, wrap new URL(...) with fileURLToPath(...) before passing it to path/fs APIs.",
@@ -2565,1673 +2825,6 @@ class WorkspaceCodeAgentRuntime:
             ],
         }
 
-    @staticmethod
-    def _fast_create_fallback_result(request: GenerateRequest) -> dict[str, object]:
-        spec = WorkspaceCodeAgentRuntime._fast_create_domain_spec(request.prompt)
-        return {
-            "tool": "fast_create_platform_fallback",
-            "contract": "Fast create must return a working persisted app even when the model exceeds the output cap.",
-            "domain": spec["title"],
-            "required_next_action": "Apply the compact platform fallback operations, then run validators and generated app tests.",
-        }
-
-    @staticmethod
-    def _mark_fast_create_fallback_job(job: JobRecord) -> None:
-        job.llm_model = job.llm_model or "platform_fast_fallback"
-        if not isinstance(job.token_usage, dict) or not job.token_usage:
-            job.token_usage = {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "reasoning_tokens": 0,
-                "total_tokens": 0,
-                "turn_count": 0,
-                "last_turn": {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "reasoning_tokens": 0,
-                    "total_tokens": 0,
-                },
-            }
-
-    @staticmethod
-    def _fast_create_should_use_fallback_repair(latest_execution: CheckExecutionRecord) -> bool:
-        markers = (
-            "no such table",
-            "operationalerror",
-            "post exists but",
-            "was not persisted",
-            "did not persist",
-            "missing_create_post_api",
-            "missing_create_get_api",
-            "missing_create_update_api",
-            "frontend_missing_post_api",
-            "frontend_missing_update_api",
-            "placeholder_role_css",
-            "identical_role_surfaces",
-            "missing_role_workflow_actions",
-        )
-        for result in latest_execution.results:
-            if result.status != "failed":
-                continue
-            if result.name not in {"generated_app_python_tests", "platform_invariants", "connectivity_validators"}:
-                continue
-            text = "\n".join([str(result.details or ""), *[str(line or "") for line in result.logs]]).lower()
-            if any(marker in text for marker in markers):
-                return True
-        return False
-
-    def _fast_create_fallback_operations_with_cleanup(
-        self,
-        request: GenerateRequest,
-        *,
-        workspace_id: str,
-        run_id: str,
-    ) -> list[DraftFileOperation]:
-        operations = list(self._fast_create_fallback_operations(request))
-        keep_paths = {operation.file_path for operation in operations if operation.file_path.startswith("miniapp/app/routes/")}
-        protected_paths = {
-            "miniapp/app/routes/__init__.py",
-            "miniapp/app/routes/health.py",
-            "miniapp/app/routes/role_pages.py",
-            "miniapp/app/routes/role_routes.py",
-        }
-        try:
-            existing_files = self.workspace_service.file_tree(workspace_id, run_id=run_id)
-        except Exception:
-            existing_files = []
-        for item in existing_files:
-            path = str(item.get("path") or "").strip().replace("\\", "/").lstrip("./")
-            if item.get("type") != "file":
-                continue
-            if not re.fullmatch(r"miniapp/app/routes/[^/]+\.py", path):
-                continue
-            if path in keep_paths or path in protected_paths:
-                continue
-            operations.append(
-                DraftFileOperation(
-                    file_path=path,
-                    operation="delete",
-                    reason="Remove stale generated route module before applying the compact Fast fallback.",
-                )
-            )
-        return operations
-
-    @staticmethod
-    def _fast_create_fallback_operations(request: GenerateRequest) -> list[DraftFileOperation]:
-        if WorkspaceCodeAgentRuntime._fast_create_uses_commerce_flow(request.prompt):
-            return WorkspaceCodeAgentRuntime._fast_commerce_fallback_operations(request)
-        spec = WorkspaceCodeAgentRuntime._fast_create_domain_spec(request.prompt)
-        resource = str(spec["resource"])
-        api_path = f"/api/{resource}"
-        route_file = f"miniapp/app/routes/{resource}.py"
-
-        route_manifest = {
-            "routes": {
-                "/client/request": "static/client/request/index.html",
-                "/specialist/queue": "static/specialist/queue/index.html",
-                "/manager/overview": "static/manager/overview/index.html",
-            }
-        }
-
-        def op(path: str, content: str, reason: str) -> DraftFileOperation:
-            return DraftFileOperation(file_path=path, operation="replace", content=content, reason=reason)
-
-        return [
-            op("miniapp/app/static/client/index.html", WorkspaceCodeAgentRuntime._fast_client_html(spec, api_path), "Create client role form and saved-record list."),
-            op("miniapp/app/static/client/request/index.html", WorkspaceCodeAgentRuntime._fast_client_child_html(spec, api_path), "Create client child page."),
-            op("miniapp/app/static/client/app.js", WorkspaceCodeAgentRuntime._fast_client_js(spec, api_path), "Create client-only form and saved-record logic."),
-            op("miniapp/app/static/client/styles.css", WorkspaceCodeAgentRuntime._fast_role_css("client"), "Create real client role styles."),
-            op("miniapp/app/static/specialist/index.html", WorkspaceCodeAgentRuntime._fast_specialist_html(spec, api_path), "Create specialist role queue and status workflow."),
-            op("miniapp/app/static/specialist/queue/index.html", WorkspaceCodeAgentRuntime._fast_specialist_child_html(spec, api_path), "Create specialist child page."),
-            op("miniapp/app/static/specialist/app.js", WorkspaceCodeAgentRuntime._fast_specialist_js(spec, api_path), "Create specialist status action logic."),
-            op("miniapp/app/static/specialist/styles.css", WorkspaceCodeAgentRuntime._fast_role_css("specialist"), "Create real specialist role styles."),
-            op("miniapp/app/static/manager/index.html", WorkspaceCodeAgentRuntime._fast_manager_html(spec, api_path), "Create manager role dashboard and workload overview."),
-            op("miniapp/app/static/manager/overview/index.html", WorkspaceCodeAgentRuntime._fast_manager_child_html(spec, api_path), "Create manager child page."),
-            op("miniapp/app/static/manager/app.js", WorkspaceCodeAgentRuntime._fast_manager_js(spec, api_path), "Create manager dashboard summary logic."),
-            op("miniapp/app/static/manager/styles.css", WorkspaceCodeAgentRuntime._fast_role_css("manager"), "Create real manager role styles."),
-            op("miniapp/app/generated/route_manifest.json", json.dumps(route_manifest, indent=2, ensure_ascii=False) + "\n", "Declare Fast child routes."),
-            op(route_file, WorkspaceCodeAgentRuntime._fast_api_route_py(spec, api_path), "Create persistent GET/POST API resource."),
-            op("miniapp/app/main.py", WorkspaceCodeAgentRuntime._fast_main_py(resource), "Register the generated API route."),
-            op("miniapp/tests/test_generated_app.py", WorkspaceCodeAgentRuntime._fast_python_test_py(spec, api_path, resource), "Test API persistence and role routes."),
-            op("miniapp/tests/generated_app.test.mjs", WorkspaceCodeAgentRuntime._fast_js_test_mjs(spec, api_path), "Test frontend source and role pages."),
-        ]
-
-    @staticmethod
-    def _fast_create_uses_commerce_flow(prompt: str) -> bool:
-        contract = build_acceptance_contract(
-            prompt=prompt,
-            intent="create",
-            generation_mode=GenerationMode.FAST,
-            focused_edit_kind="standard",
-        )
-        return bool((contract.get("features") or {}).get("commerce_catalog_cart_order"))
-
-    @staticmethod
-    def _fast_commerce_fallback_operations(request: GenerateRequest) -> list[DraftFileOperation]:
-        spec = WorkspaceCodeAgentRuntime._fast_create_domain_spec(request.prompt)
-        route_manifest = {
-            "routes": {
-                "/client/catalog": "static/client/catalog/index.html",
-                "/specialist/inventory": "static/specialist/inventory/index.html",
-                "/manager/overview": "static/manager/overview/index.html",
-            }
-        }
-
-        def op(path: str, content: str, reason: str) -> DraftFileOperation:
-            return DraftFileOperation(file_path=path, operation="replace", content=content, reason=reason)
-
-        return [
-            op("miniapp/app/static/client/index.html", WorkspaceCodeAgentRuntime._fast_commerce_client_html(spec, child=False), "Create client catalog, cart, and checkout surface."),
-            op("miniapp/app/static/client/catalog/index.html", WorkspaceCodeAgentRuntime._fast_commerce_client_html(spec, child=True), "Create client catalog child page."),
-            op("miniapp/app/static/client/app.js", WorkspaceCodeAgentRuntime._fast_commerce_client_js(spec), "Create catalog loading, add-to-cart, and checkout persistence."),
-            op("miniapp/app/static/client/styles.css", WorkspaceCodeAgentRuntime._fast_role_css("client"), "Create real client role styles."),
-            op("miniapp/app/static/specialist/index.html", WorkspaceCodeAgentRuntime._fast_commerce_specialist_html(spec, child=False), "Create specialist inventory and order queue surface."),
-            op("miniapp/app/static/specialist/inventory/index.html", WorkspaceCodeAgentRuntime._fast_commerce_specialist_html(spec, child=True), "Create specialist inventory child page."),
-            op("miniapp/app/static/specialist/app.js", WorkspaceCodeAgentRuntime._fast_commerce_specialist_js(), "Create product POST flow and order status workflow."),
-            op("miniapp/app/static/specialist/styles.css", WorkspaceCodeAgentRuntime._fast_role_css("specialist"), "Create real specialist role styles."),
-            op("miniapp/app/static/manager/index.html", WorkspaceCodeAgentRuntime._fast_commerce_manager_html(spec, child=False), "Create manager dashboard surface."),
-            op("miniapp/app/static/manager/overview/index.html", WorkspaceCodeAgentRuntime._fast_commerce_manager_html(spec, child=True), "Create manager dashboard child page."),
-            op("miniapp/app/static/manager/app.js", WorkspaceCodeAgentRuntime._fast_commerce_manager_js(), "Create management metrics and order review workflow."),
-            op("miniapp/app/static/manager/styles.css", WorkspaceCodeAgentRuntime._fast_role_css("manager"), "Create real manager role styles."),
-            op("miniapp/app/generated/route_manifest.json", json.dumps(route_manifest, indent=2, ensure_ascii=False) + "\n", "Declare commerce child routes."),
-            op("miniapp/app/routes/commerce.py", WorkspaceCodeAgentRuntime._fast_commerce_route_py(), "Create persistent products and orders APIs."),
-            op("miniapp/app/main.py", WorkspaceCodeAgentRuntime._fast_commerce_main_py(), "Register the commerce API route."),
-            op("miniapp/tests/test_generated_app.py", WorkspaceCodeAgentRuntime._fast_commerce_python_test_py(spec), "Test product/order persistence and status updates."),
-            op("miniapp/tests/generated_app.test.mjs", WorkspaceCodeAgentRuntime._fast_commerce_js_test_mjs(spec), "Test commerce frontend source and role pages."),
-        ]
-
-    @staticmethod
-    def _fast_commerce_client_html(spec: dict[str, Any], *, child: bool) -> str:
-        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        lang = WorkspaceCodeAgentRuntime._html_escape(spec["copy"]["lang"])
-        back_href = "/client" if child else "/client/catalog"
-        nav_text = "Назад" if child and lang == "ru" else "Каталог" if lang == "ru" else "Back" if child else "Catalog"
-        return f"""<!doctype html>
-<html lang="{lang}">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <link rel="stylesheet" href="/static/shared/base.css" />
-  <link rel="stylesheet" href="/static/client/styles.css" />
-</head>
-<body>
-  <main class="page-shell client-app">
-    <header class="role-hero">
-      <h1>{title}</h1>
-      <nav class="role-nav"><a href="{back_href}">{nav_text}</a></nav>
-    </header>
-    <section class="records-panel">
-      <h2>{'Каталог товаров' if lang == 'ru' else 'Product catalog'}</h2>
-      <p id="catalog-empty">{'Пока нет товаров. Они появятся после добавления сотрудником.' if lang == 'ru' else 'No products yet. They will appear after staff adds them.'}</p>
-      <ul id="catalog-list"></ul>
-    </section>
-    <section class="action-panel">
-      <h2>{'Корзина и оформление' if lang == 'ru' else 'Cart and checkout'}</h2>
-      <ul id="cart-list"></ul>
-      <p id="cart-empty">{'Корзина пуста.' if lang == 'ru' else 'Cart is empty.'}</p>
-      <form id="checkout-form" class="request-form">
-        <label>{'Имя' if lang == 'ru' else 'Name'}<input name="customer_name" autocomplete="name" required /></label>
-        <label>{'Телефон' if lang == 'ru' else 'Phone'}<input name="phone" autocomplete="tel" required /></label>
-        <label>{'Адрес или комментарий' if lang == 'ru' else 'Address or note'}<textarea name="delivery_note" required></textarea></label>
-        <button class="primary-action" type="submit">{'Оформить заказ' if lang == 'ru' else 'Place order'}</button>
-      </form>
-    </section>
-  </main>
-  <script src="/static/preview_bridge.js" defer></script>
-  <script src="/static/client/app.js" defer></script>
-</body>
-</html>
-"""
-
-    @staticmethod
-    def _fast_commerce_specialist_html(spec: dict[str, Any], *, child: bool) -> str:
-        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        lang = WorkspaceCodeAgentRuntime._html_escape(spec["copy"]["lang"])
-        back_href = "/specialist" if child else "/specialist/inventory"
-        nav_text = "Назад" if child and lang == "ru" else "Склад" if lang == "ru" else "Back" if child else "Inventory"
-        return f"""<!doctype html>
-<html lang="{lang}">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <link rel="stylesheet" href="/static/shared/base.css" />
-  <link rel="stylesheet" href="/static/specialist/styles.css" />
-</head>
-<body>
-  <main class="page-shell specialist-app">
-    <header class="role-hero">
-      <h1>{title}</h1>
-      <nav class="role-nav"><a href="{back_href}">{nav_text}</a></nav>
-    </header>
-    <section class="action-panel">
-      <h2>{'Добавить товар' if lang == 'ru' else 'Add product'}</h2>
-      <form id="product-form" class="request-form">
-        <label>{'Название' if lang == 'ru' else 'Name'}<input name="name" required /></label>
-        <label>{'Цена' if lang == 'ru' else 'Price'}<input name="price" type="number" min="0" step="1" required /></label>
-        <label>{'Остаток' if lang == 'ru' else 'Stock'}<input name="stock" type="number" min="0" step="1" required /></label>
-        <label>{'Описание' if lang == 'ru' else 'Description'}<textarea name="description" required></textarea></label>
-        <button class="primary-action" type="submit">{'Сохранить товар' if lang == 'ru' else 'Save product'}</button>
-      </form>
-    </section>
-    <section class="records-panel">
-      <h2>{'Товары на складе' if lang == 'ru' else 'Inventory'}</h2>
-      <p id="products-empty">{'Пока нет товаров.' if lang == 'ru' else 'No products yet.'}</p>
-      <ul id="products-list"></ul>
-    </section>
-    <section class="queue-panel">
-      <h2>{'Новые заказы' if lang == 'ru' else 'Orders'}</h2>
-      <p id="orders-empty">{'Пока нет заказов.' if lang == 'ru' else 'No orders yet.'}</p>
-      <ul id="orders-list"></ul>
-    </section>
-  </main>
-  <script src="/static/preview_bridge.js" defer></script>
-  <script src="/static/specialist/app.js" defer></script>
-</body>
-</html>
-"""
-
-    @staticmethod
-    def _fast_commerce_manager_html(spec: dict[str, Any], *, child: bool) -> str:
-        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        lang = WorkspaceCodeAgentRuntime._html_escape(spec["copy"]["lang"])
-        back_href = "/manager" if child else "/manager/overview"
-        nav_text = "Назад" if child and lang == "ru" else "Сводка" if lang == "ru" else "Back" if child else "Summary"
-        return f"""<!doctype html>
-<html lang="{lang}">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <link rel="stylesheet" href="/static/shared/base.css" />
-  <link rel="stylesheet" href="/static/manager/styles.css" />
-</head>
-<body>
-  <main class="page-shell manager-app">
-    <header class="role-hero">
-      <h1>{title}</h1>
-      <nav class="role-nav"><a href="{back_href}">{nav_text}</a></nav>
-    </header>
-    <section class="metrics-panel">
-      <h2>{'Сводка продаж' if lang == 'ru' else 'Sales summary'}</h2>
-      <div id="metrics" class="metric-grid"></div>
-    </section>
-    <section class="manager-list-panel">
-      <h2>{'Заказы' if lang == 'ru' else 'Orders'}</h2>
-      <p id="orders-empty">{'Пока нет заказов.' if lang == 'ru' else 'No orders yet.'}</p>
-      <ul id="orders-list"></ul>
-    </section>
-  </main>
-  <script src="/static/preview_bridge.js" defer></script>
-  <script src="/static/manager/app.js" defer></script>
-</body>
-</html>
-"""
-
-    @staticmethod
-    def _fast_commerce_client_js(spec: dict[str, Any]) -> str:
-        lang = spec["copy"]["lang"]
-        return f'''const role = "client";
-window.setupPreviewBridge?.(role);
-
-const productsApi = "/api/products";
-const ordersApi = "/api/orders";
-let products = [];
-let cart = [];
-
-const catalogList = document.getElementById("catalog-list");
-const catalogEmpty = document.getElementById("catalog-empty");
-const cartList = document.getElementById("cart-list");
-const cartEmpty = document.getElementById("cart-empty");
-const checkoutForm = document.getElementById("checkout-form");
-
-async function loadProducts() {{
-  const response = await fetch(productsApi);
-  products = await response.json();
-  if (catalogEmpty) catalogEmpty.hidden = products.length > 0;
-  if (!catalogList) return;
-  catalogList.innerHTML = products.map((product) => `
-    <li class="record-card product-card">
-      <div><strong>${{product.name}}</strong><span>${{product.description || ""}}</span><small>${{product.price}} · ${{product.stock}}</small></div>
-      <button type="button" class="add-to-cart" data-add-to-cart data-id="${{product.id}}">{'В корзину' if lang == 'ru' else 'Add to cart'}</button>
-    </li>
-  `).join("");
-}}
-
-function renderCart() {{
-  if (cartEmpty) cartEmpty.hidden = cart.length > 0;
-  if (!cartList) return;
-  cartList.innerHTML = cart.map((item) => `
-    <li class="record-card cart-item">
-      <strong>${{item.name}}</strong>
-      <button type="button" data-decrease data-id="${{item.id}}">-</button>
-      <span>${{item.quantity}}</span>
-      <button type="button" data-increase data-id="${{item.id}}">+</button>
-    </li>
-  `).join("");
-}}
-
-function addToCart(productId) {{
-  const product = products.find((item) => item.id === productId);
-  if (!product) return;
-  const existing = cart.find((item) => item.id === productId);
-  if (existing) existing.quantity += 1;
-  else cart.push({{ id: product.id, name: product.name, price: Number(product.price || 0), quantity: 1 }});
-  renderCart();
-}}
-
-catalogList?.addEventListener("click", (event) => {{
-  const button = event.target.closest("[data-add-to-cart]");
-  if (!button) return;
-  addToCart(button.dataset.id);
-}});
-
-cartList?.addEventListener("click", (event) => {{
-  const up = event.target.closest("[data-increase]");
-  const down = event.target.closest("[data-decrease]");
-  const control = up || down;
-  if (!control) return;
-  const item = cart.find((entry) => entry.id === control.dataset.id);
-  if (!item) return;
-  item.quantity += up ? 1 : -1;
-  cart = cart.filter((entry) => entry.quantity > 0);
-  renderCart();
-}});
-
-checkoutForm?.addEventListener("submit", async (event) => {{
-  event.preventDefault();
-  if (cart.length === 0) return;
-  const customer = Object.fromEntries(new FormData(event.currentTarget).entries());
-  await fetch(ordersApi, {{
-    method: "POST",
-    headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ ...customer, items: cart, status: "new" }}),
-  }});
-  cart = [];
-  event.currentTarget.reset();
-  renderCart();
-}});
-
-loadProducts();
-renderCart();
-'''
-
-    @staticmethod
-    def _fast_commerce_specialist_js() -> str:
-        return '''const role = "specialist";
-window.setupPreviewBridge?.(role);
-
-const productsApi = "/api/products";
-const ordersApi = "/api/orders";
-const productForm = document.getElementById("product-form");
-const productsList = document.getElementById("products-list");
-const productsEmpty = document.getElementById("products-empty");
-const ordersList = document.getElementById("orders-list");
-const ordersEmpty = document.getElementById("orders-empty");
-
-async function loadProducts() {
-  const response = await fetch(productsApi);
-  const products = await response.json();
-  if (productsEmpty) productsEmpty.hidden = products.length > 0;
-  if (!productsList) return;
-  productsList.innerHTML = products.map((product) => `
-    <li class="record-card product-card">
-      <div><strong>${product.name}</strong><span>${product.description || ""}</span></div>
-      <span class="status-pill">${product.stock} шт.</span>
-    </li>
-  `).join("");
-}
-
-async function loadOrders() {
-  const response = await fetch(ordersApi);
-  const orders = await response.json();
-  if (ordersEmpty) ordersEmpty.hidden = orders.length > 0;
-  if (!ordersList) return;
-  ordersList.innerHTML = orders.map((order) => `
-    <li class="record-card specialist-task">
-      <div><strong>${order.customer_name || "Покупатель"}</strong><span>${(order.items || []).map((item) => `${item.name} x${item.quantity}`).join(", ")}</span></div>
-      <span class="status-pill">${order.status || "new"}</span>
-      <button type="button" data-status-action data-id="${order.id}" data-next="assembling">Собирается</button>
-      <button type="button" data-status-action data-id="${order.id}" data-next="done">Готово</button>
-    </li>
-  `).join("");
-}
-
-productForm?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const payload = Object.fromEntries(new FormData(event.currentTarget).entries());
-  await fetch(productsApi, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  event.currentTarget.reset();
-  await loadProducts();
-});
-
-ordersList?.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-status-action]");
-  if (!button) return;
-  await fetch(`${ordersApi}/${button.dataset.id}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status: button.dataset.next }),
-  });
-  await loadOrders();
-});
-
-loadProducts();
-loadOrders();
-'''
-
-    @staticmethod
-    def _fast_commerce_manager_js() -> str:
-        return '''const role = "manager";
-window.setupPreviewBridge?.(role);
-
-const productsApi = "/api/products";
-const ordersApi = "/api/orders";
-const metrics = document.getElementById("metrics");
-const ordersList = document.getElementById("orders-list");
-const ordersEmpty = document.getElementById("orders-empty");
-
-async function loadDashboard() {
-  const [productsResponse, ordersResponse] = await Promise.all([
-    fetch(productsApi),
-    fetch(ordersApi),
-  ]);
-  const products = await productsResponse.json();
-  const orders = await ordersResponse.json();
-  const total = orders.reduce((sum, order) => sum + (order.items || []).reduce((itemSum, item) => itemSum + Number(item.price || 0) * Number(item.quantity || 0), 0), 0);
-  const active = orders.filter((order) => !["done", "reviewed"].includes(order.status || "new")).length;
-  if (metrics) metrics.innerHTML = [
-    ["total", orders.length],
-    ["products", products.length],
-    ["active", active],
-    ["summary", total],
-  ].map(([label, value]) => `<article class="metric-card"><strong>${value}</strong><span>${label}</span></article>`).join("");
-  if (ordersEmpty) ordersEmpty.hidden = orders.length > 0;
-  if (!ordersList) return;
-  ordersList.innerHTML = orders.map((order) => `
-    <li class="record-card manager-record">
-      <div><strong>${order.customer_name || "Покупатель"}</strong><span>${order.phone || ""}</span></div>
-      <span class="status-pill">${order.status || "new"}</span>
-      <button type="button" data-manager-action data-id="${order.id}">Проверено</button>
-    </li>
-  `).join("");
-}
-
-ordersList?.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-manager-action]");
-  if (!button) return;
-  await fetch(`${ordersApi}/${button.dataset.id}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status: "reviewed" }),
-  });
-  await loadDashboard();
-});
-
-loadDashboard();
-'''
-
-    @staticmethod
-    def _fast_commerce_route_py() -> str:
-        return '''from __future__ import annotations
-
-import json
-from pathlib import Path
-from uuid import uuid4
-
-from fastapi import APIRouter, HTTPException
-
-
-router = APIRouter(tags=["commerce"])
-GENERATED_DIR = Path(__file__).resolve().parent.parent / "generated"
-PRODUCTS_FILE = GENERATED_DIR / "products.json"
-ORDERS_FILE = GENERATED_DIR / "orders.json"
-
-
-def _read_list(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    return data if isinstance(data, list) else []
-
-
-def _write_list(path: Path, records: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-@router.get("/api/products")
-def list_products() -> list[dict]:
-    return _read_list(PRODUCTS_FILE)
-
-
-@router.post("/api/products")
-def create_product(payload: dict) -> dict:
-    products = _read_list(PRODUCTS_FILE)
-    product = {
-        "id": uuid4().hex,
-        "name": str(payload.get("name") or "").strip(),
-        "description": str(payload.get("description") or "").strip(),
-        "price": float(payload.get("price") or 0),
-        "stock": int(payload.get("stock") or 0),
-        "status": "active",
-    }
-    if not product["name"]:
-        raise HTTPException(status_code=422, detail="name is required")
-    products.append(product)
-    _write_list(PRODUCTS_FILE, products)
-    return product
-
-
-@router.patch("/api/products/{product_id}")
-def update_product(product_id: str, payload: dict) -> dict:
-    products = _read_list(PRODUCTS_FILE)
-    for product in products:
-        if str(product.get("id")) == product_id:
-            for key in ("name", "description", "price", "stock", "status"):
-                if key in payload:
-                    product[key] = payload[key]
-            _write_list(PRODUCTS_FILE, products)
-            return product
-    raise HTTPException(status_code=404, detail="product not found")
-
-
-@router.get("/api/orders")
-def list_orders() -> list[dict]:
-    return _read_list(ORDERS_FILE)
-
-
-@router.post("/api/orders")
-def create_order(payload: dict) -> dict:
-    orders = _read_list(ORDERS_FILE)
-    order = {"id": uuid4().hex, "status": payload.get("status") or "new", **payload}
-    orders.append(order)
-    _write_list(ORDERS_FILE, orders)
-    return order
-
-
-@router.patch("/api/orders/{order_id}")
-def update_order(order_id: str, payload: dict) -> dict:
-    orders = _read_list(ORDERS_FILE)
-    for order in orders:
-        if str(order.get("id")) == order_id:
-            order["status"] = str(payload.get("status") or order.get("status") or "new")
-            _write_list(ORDERS_FILE, orders)
-            return order
-    raise HTTPException(status_code=404, detail="order not found")
-'''
-
-    @staticmethod
-    def _fast_commerce_main_py() -> str:
-        return '''from __future__ import annotations
-
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
-
-from app.db import Base, engine
-from app.routes.commerce import router as commerce_router
-from app.routes.health import router as health_router
-from app.routes.role_routes import router as role_router
-
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
-app.include_router(health_router)
-app.include_router(role_router)
-app.include_router(commerce_router)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
-@app.middleware("http")
-async def disable_preview_caching(request: Request, call_next):
-    response = await call_next(request)
-    if request.method in {"GET", "HEAD"} and (request.url.path.startswith("/static/") or not request.url.path.startswith("/api/")):
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
-    return response
-
-
-@app.get("/", include_in_schema=False)
-def index() -> RedirectResponse:
-    return RedirectResponse(url="/client", status_code=307)
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
-@app.exception_handler(HTTPException)
-def http_exception_handler(_, exc: HTTPException) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"detail": _json_safe(exc.detail)}, headers=exc.headers)
-
-
-@app.exception_handler(KeyError)
-def key_error_handler(_, exc: KeyError) -> JSONResponse:
-    return JSONResponse(status_code=404, content={"detail": str(exc)})
-
-
-@app.exception_handler(ValueError)
-def value_error_handler(_, exc: ValueError) -> JSONResponse:
-    return JSONResponse(status_code=422, content={"detail": str(exc)})
-'''
-
-    @staticmethod
-    def _fast_commerce_python_test_py(spec: dict[str, Any]) -> str:
-        title = spec["title"]
-        return f'''import unittest
-
-from fastapi.testclient import TestClient
-
-from app.main import app
-from app.routes.commerce import ORDERS_FILE, PRODUCTS_FILE
-
-
-class GeneratedCommerceAppTest(unittest.TestCase):
-    def setUp(self):
-        PRODUCTS_FILE.unlink(missing_ok=True)
-        ORDERS_FILE.unlink(missing_ok=True)
-        self.client = TestClient(app)
-
-    def test_products_cart_orders_persist_across_roles(self):
-        self.assertEqual(self.client.get("/api/products").json(), [])
-        self.assertEqual(self.client.get("/api/orders").json(), [])
-        product = self.client.post("/api/products", json={{"name": "{title} product", "price": 2500, "stock": 7, "description": "Catalog item"}})
-        self.assertEqual(product.status_code, 200)
-        product_payload = product.json()
-        self.assertEqual(self.client.get("/api/products").json()[0]["name"], product_payload["name"])
-        order = self.client.post("/api/orders", json={{"customer_name": "Buyer", "phone": "+79990000000", "items": [{{"id": product_payload["id"], "name": product_payload["name"], "quantity": 2, "price": 2500}}]}})
-        self.assertEqual(order.status_code, 200)
-        order_payload = order.json()
-        self.assertEqual(len(self.client.get("/api/orders").json()), 1)
-        updated = self.client.patch(f"/api/orders/{{order_payload['id']}}", json={{"status": "done"}})
-        self.assertEqual(updated.status_code, 200)
-        self.assertEqual(self.client.get("/api/orders").json()[0]["status"], "done")
-
-    def test_role_routes(self):
-        for path in ["/client", "/client/catalog", "/specialist", "/specialist/inventory", "/manager", "/manager/overview"]:
-            response = self.client.get(path)
-            self.assertEqual(response.status_code, 200, path)
-            self.assertIn("{title}", response.text)
-
-
-if __name__ == "__main__":
-    unittest.main()
-'''
-
-    @staticmethod
-    def _fast_commerce_js_test_mjs(spec: dict[str, Any]) -> str:
-        title_literal = json.dumps(spec["title"])
-        return f'''import test from 'node:test';
-import assert from 'node:assert';
-import fs from 'node:fs';
-import path from 'node:path';
-
-const root = process.cwd();
-const read = (filePath) => fs.readFileSync(path.join(root, filePath), 'utf8');
-
-test('commerce role pages are separate and styled', () => {{
-  for (const filePath of [
-    'app/static/client/index.html',
-    'app/static/client/catalog/index.html',
-    'app/static/specialist/index.html',
-    'app/static/specialist/inventory/index.html',
-    'app/static/manager/index.html',
-    'app/static/manager/overview/index.html'
-  ]) {{
-    const html = read(filePath);
-    assert.ok(html.includes({title_literal}));
-    assert.match(html, /\\/static\\/preview_bridge\\.js/);
-    assert.match(html, /\\/static\\/(client|specialist|manager)\\/styles\\.css/);
-  }}
-}});
-
-test('products orders cart workflow is wired in frontend source', () => {{
-  const clientJs = read('app/static/client/app.js');
-  assert.ok(clientJs.includes('/api/products'));
-  assert.ok(clientJs.includes('/api/orders'));
-  assert.match(clientJs, /add-to-cart|addToCart|корзин/i);
-  assert.match(clientJs, /method:\\s*"POST"/);
-  const specialistJs = read('app/static/specialist/app.js');
-  assert.ok(specialistJs.includes('/api/products'));
-  assert.ok(specialistJs.includes('/api/orders'));
-  assert.match(specialistJs, /method:\\s*"POST"/);
-  assert.match(specialistJs, /method:\\s*"PATCH"/);
-  const managerJs = read('app/static/manager/app.js');
-  assert.ok(managerJs.includes('/api/orders'));
-  assert.match(managerJs, /metric|summary|dashboard|total/i);
-}});
-'''
-
-    @staticmethod
-    def _fast_create_domain_spec(prompt: str) -> dict[str, Any]:
-        language = WorkspaceCodeAgentRuntime._prompt_language(prompt)
-        copy = WorkspaceCodeAgentRuntime._fast_copy(language)
-        tokens = WorkspaceCodeAgentRuntime._prompt_semantic_tokens(prompt, limit=4)
-        title_base = WorkspaceCodeAgentRuntime._human_title_from_tokens(tokens, language) if tokens else str(copy["fallback_title"])
-        resource = WorkspaceCodeAgentRuntime._resource_slug_from_prompt_tokens(tokens)
-        return {
-            "language": language,
-            "copy": copy,
-            "title": title_base,
-            "resource": resource,
-            "record_label": str(copy["entry_label"]),
-            "action_label": str(copy["create_action"]),
-        }
-
-    @staticmethod
-    def _prompt_language(prompt: str) -> str:
-        text = str(prompt or "")
-        cyrillic = len(re.findall(r"[А-Яа-яЁё]", text))
-        latin = len(re.findall(r"[A-Za-z]", text))
-        return "ru" if cyrillic > latin else "en"
-
-    @staticmethod
-    def _human_title_from_tokens(tokens: list[str], language: str) -> str:
-        raw_title = " ".join(tokens[:3]).replace("_", " ").strip()
-        if not raw_title:
-            return "Бизнес" if language == "ru" else "Business"
-        if language == "ru":
-            raw_title = re.sub(r"\bинтернет-магазина\b", "интернет-магазин", raw_title, flags=re.IGNORECASE)
-            return raw_title[:1].upper() + raw_title[1:]
-        return raw_title.title()
-
-    @staticmethod
-    def _fast_copy(language: str) -> dict[str, str]:
-        if language == "ru":
-            return {
-                "lang": "ru",
-                "fallback_title": "Бизнес",
-                "entry_label": "запись",
-                "create_action": "Сохранить",
-                "client_nav": "Оформление",
-                "client_heading": "Новая запись",
-                "client_intro": "Заполните данные. После сохранения они появятся у команды.",
-                "name_label": "Имя",
-                "phone_label": "Телефон",
-                "preferred_time_label": "Удобное время",
-                "details_label": "Детали",
-                "client_records_heading": "Мои записи",
-                "client_empty": "Пока нет сохраненных записей.",
-                "specialist_nav": "Рабочий список",
-                "specialist_heading": "Работа с записями",
-                "specialist_empty": "Пока нет новых записей.",
-                "manager_nav": "Сводка",
-                "manager_heading": "Сводка",
-                "manager_records_heading": "Все записи",
-                "manager_empty": "Пока нет данных для сводки.",
-                "back": "Назад",
-                "client_fallback": "Клиент",
-                "time_pending": "Время не указано",
-                "no_details": "Детали не указаны",
-                "status_label": "Статус",
-                "status_new": "новая",
-                "confirm_action": "В работу",
-                "done_action": "Готово",
-                "review_action": "Проверено",
-                "metric_total": "Всего",
-                "metric_new": "Новые",
-                "metric_confirmed": "В работе",
-                "metric_done": "Готово",
-            }
-        return {
-            "lang": "en",
-            "fallback_title": "Business",
-            "entry_label": "entry",
-            "create_action": "Save",
-            "client_nav": "New entry",
-            "client_heading": "New entry",
-            "client_intro": "Fill in the details. After saving, the team will see them.",
-            "name_label": "Name",
-            "phone_label": "Phone",
-            "preferred_time_label": "Preferred time",
-            "details_label": "Details",
-            "client_records_heading": "My entries",
-            "client_empty": "No saved entries yet.",
-            "specialist_nav": "Work list",
-            "specialist_heading": "Work list",
-            "specialist_empty": "No new entries yet.",
-            "manager_nav": "Summary",
-            "manager_heading": "Summary",
-            "manager_records_heading": "All entries",
-            "manager_empty": "No data for the summary yet.",
-            "back": "Back",
-            "client_fallback": "Client",
-            "time_pending": "Time pending",
-            "no_details": "No details",
-            "status_label": "Status",
-            "status_new": "new",
-            "confirm_action": "Confirm",
-            "done_action": "Done",
-            "review_action": "Reviewed",
-            "metric_total": "Total",
-            "metric_new": "New",
-            "metric_confirmed": "In progress",
-            "metric_done": "Done",
-        }
-
-    @staticmethod
-    def _prompt_semantic_tokens(prompt: str, *, limit: int = 8) -> list[str]:
-        tokens: list[str] = []
-        seen: set[str] = set()
-        for raw_token in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{2,}", str(prompt or "")):
-            token = raw_token.strip("-_").lower()
-            if not token or token in PROMPT_SEMANTIC_STOPWORDS or token in seen:
-                continue
-            seen.add(token)
-            tokens.append(token)
-            if len(tokens) >= limit:
-                break
-        return tokens
-
-    @staticmethod
-    def _resource_slug_from_prompt_tokens(tokens: list[str]) -> str:
-        slug_parts: list[str] = []
-        for token in tokens[:3]:
-            ascii_token = token.lower().translate(CYRILLIC_TRANSLIT)
-            ascii_token = re.sub(r"[^a-z0-9]+", "_", ascii_token).strip("_")
-            if ascii_token:
-                slug_parts.append(ascii_token)
-        slug = "_".join(slug_parts)[:60].strip("_") or "records"
-        if not re.match(r"^[a-z_]", slug):
-            slug = f"records_{slug}"
-        if slug in {"class", "def", "from", "import", "return", "for", "while", "if", "else", "try"}:
-            slug = f"{slug}_records"
-        return slug
-
-    @staticmethod
-    def _prompt_token_matches_text(token: str, text: str) -> bool:
-        normalized = str(token or "").lower()
-        haystack = str(text or "").lower()
-        if not normalized:
-            return False
-        if normalized in haystack:
-            return True
-        return len(normalized) >= 6 and normalized[:5] in haystack
-
-    @staticmethod
-    def _html_escape(value: str) -> str:
-        return (
-            str(value or "")
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-        )
-
-    @staticmethod
-    def _fast_client_html(spec: dict[str, Any], api_path: str) -> str:
-        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        copy = spec["copy"]
-        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
-        action = WorkspaceCodeAgentRuntime._html_escape(copy["create_action"])
-        nav = WorkspaceCodeAgentRuntime._html_escape(copy["client_nav"])
-        heading = WorkspaceCodeAgentRuntime._html_escape(copy["client_heading"])
-        intro = WorkspaceCodeAgentRuntime._html_escape(copy["client_intro"])
-        name_label = WorkspaceCodeAgentRuntime._html_escape(copy["name_label"])
-        phone_label = WorkspaceCodeAgentRuntime._html_escape(copy["phone_label"])
-        preferred_time_label = WorkspaceCodeAgentRuntime._html_escape(copy["preferred_time_label"])
-        details_label = WorkspaceCodeAgentRuntime._html_escape(copy["details_label"])
-        records_heading = WorkspaceCodeAgentRuntime._html_escape(copy["client_records_heading"])
-        empty = WorkspaceCodeAgentRuntime._html_escape(copy["client_empty"])
-        return f"""<!doctype html>
-<html lang="{lang}">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <link rel="stylesheet" href="/static/shared/base.css" />
-  <link rel="stylesheet" href="/static/client/styles.css" />
-</head>
-<body>
-  <main class="page-shell client-app" data-api-path="{api_path}">
-    <header class="role-hero">
-      <h1>{title}</h1>
-      <nav class="role-nav"><a href="/client/request">{nav}</a></nav>
-    </header>
-    <section class="action-panel client-request-panel">
-      <h2>{heading}</h2>
-      <p>{intro}</p>
-      <form id="record-form" class="request-form">
-        <label>{name_label}<input name="client_name" autocomplete="name" required /></label>
-        <label>{phone_label}<input name="phone" autocomplete="tel" required /></label>
-        <label>{preferred_time_label}<input name="preferred_time" required /></label>
-        <label>{details_label}<textarea name="details" required></textarea></label>
-        <button class="primary-action" type="submit">{action}</button>
-      </form>
-    </section>
-    <section class="records-panel client-records">
-      <h2>{records_heading}</h2>
-      <p id="empty-state">{empty}</p>
-      <ul id="records-list"></ul>
-    </section>
-  </main>
-  <script src="/static/preview_bridge.js" defer></script>
-  <script src="/static/client/app.js" defer></script>
-</body>
-</html>
-"""
-
-    @staticmethod
-    def _fast_specialist_html(spec: dict[str, Any], api_path: str) -> str:
-        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        copy = spec["copy"]
-        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
-        nav = WorkspaceCodeAgentRuntime._html_escape(copy["specialist_nav"])
-        heading = WorkspaceCodeAgentRuntime._html_escape(copy["specialist_heading"])
-        empty = WorkspaceCodeAgentRuntime._html_escape(copy["specialist_empty"])
-        return f"""<!doctype html>
-<html lang="{lang}">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <link rel="stylesheet" href="/static/shared/base.css" />
-  <link rel="stylesheet" href="/static/specialist/styles.css" />
-</head>
-<body>
-  <main class="page-shell specialist-app" data-api-path="{api_path}">
-    <header class="role-hero">
-      <h1>{title}</h1>
-      <nav class="role-nav"><a href="/specialist/queue">{nav}</a></nav>
-    </header>
-    <section class="queue-panel">
-      <h2>{heading}</h2>
-      <p id="empty-state">{empty}</p>
-      <ul id="records-list"></ul>
-    </section>
-  </main>
-  <script src="/static/preview_bridge.js" defer></script>
-  <script src="/static/specialist/app.js" defer></script>
-</body>
-</html>
-"""
-
-    @staticmethod
-    def _fast_manager_html(spec: dict[str, Any], api_path: str) -> str:
-        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        copy = spec["copy"]
-        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
-        nav = WorkspaceCodeAgentRuntime._html_escape(copy["manager_nav"])
-        heading = WorkspaceCodeAgentRuntime._html_escape(copy["manager_heading"])
-        records_heading = WorkspaceCodeAgentRuntime._html_escape(copy["manager_records_heading"])
-        empty = WorkspaceCodeAgentRuntime._html_escape(copy["manager_empty"])
-        return f"""<!doctype html>
-<html lang="{lang}">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <link rel="stylesheet" href="/static/shared/base.css" />
-  <link rel="stylesheet" href="/static/manager/styles.css" />
-</head>
-<body>
-  <main class="page-shell manager-app" data-api-path="{api_path}">
-    <header class="role-hero">
-      <h1>{title}</h1>
-      <nav class="role-nav"><a href="/manager/overview">{nav}</a></nav>
-    </header>
-    <section class="metrics-panel">
-      <h2>{heading}</h2>
-      <div id="metrics" class="metric-grid"></div>
-    </section>
-    <section class="manager-list-panel">
-      <h2>{records_heading}</h2>
-      <p id="empty-state">{empty}</p>
-      <ul id="records-list"></ul>
-    </section>
-  </main>
-  <script src="/static/preview_bridge.js" defer></script>
-  <script src="/static/manager/app.js" defer></script>
-</body>
-</html>
-"""
-
-    @staticmethod
-    def _fast_client_child_html(spec: dict[str, Any], api_path: str) -> str:
-        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        copy = spec["copy"]
-        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
-        back = WorkspaceCodeAgentRuntime._html_escape(copy["back"])
-        action = WorkspaceCodeAgentRuntime._html_escape(copy["create_action"])
-        heading = WorkspaceCodeAgentRuntime._html_escape(copy["client_heading"])
-        intro = WorkspaceCodeAgentRuntime._html_escape(copy["client_intro"])
-        name_label = WorkspaceCodeAgentRuntime._html_escape(copy["name_label"])
-        phone_label = WorkspaceCodeAgentRuntime._html_escape(copy["phone_label"])
-        preferred_time_label = WorkspaceCodeAgentRuntime._html_escape(copy["preferred_time_label"])
-        details_label = WorkspaceCodeAgentRuntime._html_escape(copy["details_label"])
-        records_heading = WorkspaceCodeAgentRuntime._html_escape(copy["client_records_heading"])
-        empty = WorkspaceCodeAgentRuntime._html_escape(copy["client_empty"])
-        return f"""<!doctype html>
-<html lang="{lang}">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <link rel="stylesheet" href="/static/shared/base.css" />
-  <link rel="stylesheet" href="/static/client/styles.css" />
-</head>
-<body>
-  <main class="page-shell client-app" data-api-path="{api_path}">
-    <header class="role-hero">
-      <h1>{title}</h1>
-      <nav class="role-nav"><a href="/client">{back}</a></nav>
-    </header>
-    <section class="action-panel client-request-panel">
-      <h2>{heading}</h2>
-      <p>{intro}</p>
-      <form id="record-form" class="request-form">
-        <label>{name_label}<input name="client_name" autocomplete="name" required /></label>
-        <label>{phone_label}<input name="phone" autocomplete="tel" required /></label>
-        <label>{preferred_time_label}<input name="preferred_time" required /></label>
-        <label>{details_label}<textarea name="details" required></textarea></label>
-        <button class="primary-action" type="submit">{action}</button>
-      </form>
-    </section>
-    <section class="records-panel client-records">
-      <h2>{records_heading}</h2>
-      <p id="empty-state">{empty}</p>
-      <ul id="records-list"></ul>
-    </section>
-  </main>
-  <script src="/static/preview_bridge.js" defer></script>
-  <script src="/static/client/app.js" defer></script>
-</body>
-</html>
-"""
-
-    @staticmethod
-    def _fast_specialist_child_html(spec: dict[str, Any], api_path: str) -> str:
-        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        copy = spec["copy"]
-        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
-        back = WorkspaceCodeAgentRuntime._html_escape(copy["back"])
-        heading = WorkspaceCodeAgentRuntime._html_escape(copy["specialist_heading"])
-        empty = WorkspaceCodeAgentRuntime._html_escape(copy["specialist_empty"])
-        return f"""<!doctype html>
-<html lang="{lang}">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <link rel="stylesheet" href="/static/shared/base.css" />
-  <link rel="stylesheet" href="/static/specialist/styles.css" />
-</head>
-<body>
-  <main class="page-shell specialist-app" data-api-path="{api_path}">
-    <header class="role-hero">
-      <h1>{title}</h1>
-      <nav class="role-nav"><a href="/specialist">{back}</a></nav>
-    </header>
-    <section class="queue-panel">
-      <h2>{heading}</h2>
-      <p id="empty-state">{empty}</p>
-      <ul id="records-list"></ul>
-    </section>
-  </main>
-  <script src="/static/preview_bridge.js" defer></script>
-  <script src="/static/specialist/app.js" defer></script>
-</body>
-</html>
-"""
-
-    @staticmethod
-    def _fast_manager_child_html(spec: dict[str, Any], api_path: str) -> str:
-        title = WorkspaceCodeAgentRuntime._html_escape(spec["title"])
-        copy = spec["copy"]
-        lang = WorkspaceCodeAgentRuntime._html_escape(copy["lang"])
-        back = WorkspaceCodeAgentRuntime._html_escape(copy["back"])
-        heading = WorkspaceCodeAgentRuntime._html_escape(copy["manager_heading"])
-        records_heading = WorkspaceCodeAgentRuntime._html_escape(copy["manager_records_heading"])
-        empty = WorkspaceCodeAgentRuntime._html_escape(copy["manager_empty"])
-        return f"""<!doctype html>
-<html lang="{lang}">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <link rel="stylesheet" href="/static/shared/base.css" />
-  <link rel="stylesheet" href="/static/manager/styles.css" />
-</head>
-<body>
-  <main class="page-shell manager-app" data-api-path="{api_path}">
-    <header class="role-hero">
-      <h1>{title}</h1>
-      <nav class="role-nav"><a href="/manager">{back}</a></nav>
-    </header>
-    <section class="metrics-panel">
-      <h2>{heading}</h2>
-      <div id="metrics" class="metric-grid"></div>
-    </section>
-    <section class="manager-list-panel">
-      <h2>{records_heading}</h2>
-      <p id="empty-state">{empty}</p>
-      <ul id="records-list"></ul>
-    </section>
-  </main>
-  <script src="/static/preview_bridge.js" defer></script>
-  <script src="/static/manager/app.js" defer></script>
-</body>
-</html>
-"""
-
-    @staticmethod
-    def _fast_client_js(spec: dict[str, Any], api_path: str) -> str:
-        copy = spec["copy"]
-        client_fallback = json.dumps(copy["client_fallback"], ensure_ascii=False)
-        time_pending = json.dumps(copy["time_pending"], ensure_ascii=False)
-        status_label = json.dumps(copy["status_label"], ensure_ascii=False)
-        status_new = json.dumps(copy["status_new"], ensure_ascii=False)
-        return f'''const role = "client";
-window.setupPreviewBridge?.(role);
-
-const apiPath = "{api_path}";
-const form = document.getElementById("record-form");
-const emptyState = document.getElementById("empty-state");
-const recordsList = document.getElementById("records-list");
-
-async function loadClientRecords() {{
-  const response = await fetch(apiPath);
-  const records = await response.json();
-  if (emptyState) emptyState.hidden = records.length > 0;
-  if (!recordsList) return;
-  recordsList.innerHTML = records.map((item) => `
-    <li class="record-card client-record">
-      <strong>${{item.client_name || {client_fallback}}}</strong>
-      <span>${{item.preferred_time || {time_pending}}}</span>
-      <small>${{ {status_label} }}: ${{item.status || {status_new}}}</small>
-    </li>
-  `).join("");
-}}
-
-form?.addEventListener("submit", async (event) => {{
-  event.preventDefault();
-  const payload = Object.fromEntries(new FormData(event.currentTarget).entries());
-  await fetch(apiPath, {{
-    method: "POST",
-    headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify(payload),
-  }});
-  event.currentTarget.reset();
-  await loadClientRecords();
-}});
-
-loadClientRecords();
-'''
-
-    @staticmethod
-    def _fast_specialist_js(spec: dict[str, Any], api_path: str) -> str:
-        copy = spec["copy"]
-        client_fallback = json.dumps(copy["client_fallback"], ensure_ascii=False)
-        no_details = json.dumps(copy["no_details"], ensure_ascii=False)
-        status_new = json.dumps(copy["status_new"], ensure_ascii=False)
-        confirm_action = json.dumps(copy["confirm_action"], ensure_ascii=False)
-        done_action = json.dumps(copy["done_action"], ensure_ascii=False)
-        return f'''const role = "specialist";
-window.setupPreviewBridge?.(role);
-
-const apiPath = "{api_path}";
-const emptyState = document.getElementById("empty-state");
-const recordsList = document.getElementById("records-list");
-
-async function updateStatus(id, status) {{
-  await fetch(`${{apiPath}}/${{id}}`, {{
-    method: "PATCH",
-    headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ status }}),
-  }});
-  await loadSpecialistQueue();
-}}
-
-async function loadSpecialistQueue() {{
-  const response = await fetch(apiPath);
-  const records = await response.json();
-  if (emptyState) emptyState.hidden = records.length > 0;
-  if (!recordsList) return;
-  recordsList.innerHTML = records.map((item) => `
-    <li class="record-card specialist-task">
-      <div><strong>${{item.client_name || {client_fallback}}}</strong><span>${{item.details || {no_details}}}</span></div>
-      <span class="status-pill">${{item.status || {status_new}}}</span>
-      <button data-status-action data-id="${{item.id}}" data-next="confirmed">${{ {confirm_action} }}</button>
-      <button data-status-action data-id="${{item.id}}" data-next="done">${{ {done_action} }}</button>
-    </li>
-  `).join("");
-}}
-
-recordsList?.addEventListener("click", (event) => {{
-  const button = event.target.closest("[data-status-action]");
-  if (!button) return;
-  updateStatus(button.dataset.id, button.dataset.next);
-}});
-
-loadSpecialistQueue();
-'''
-
-    @staticmethod
-    def _fast_manager_js(spec: dict[str, Any], api_path: str) -> str:
-        copy = spec["copy"]
-        client_fallback = json.dumps(copy["client_fallback"], ensure_ascii=False)
-        time_pending = json.dumps(copy["time_pending"], ensure_ascii=False)
-        status_new = json.dumps(copy["status_new"], ensure_ascii=False)
-        review_action = json.dumps(copy["review_action"], ensure_ascii=False)
-        metric_total = json.dumps(copy["metric_total"], ensure_ascii=False)
-        metric_new = json.dumps(copy["metric_new"], ensure_ascii=False)
-        metric_confirmed = json.dumps(copy["metric_confirmed"], ensure_ascii=False)
-        metric_done = json.dumps(copy["metric_done"], ensure_ascii=False)
-        return f'''const role = "manager";
-window.setupPreviewBridge?.(role);
-
-const apiPath = "{api_path}";
-const metrics = document.getElementById("metrics");
-const emptyState = document.getElementById("empty-state");
-const recordsList = document.getElementById("records-list");
-
-async function markReviewed(id) {{
-  await fetch(`${{apiPath}}/${{id}}`, {{
-    method: "PATCH",
-    headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ status: "reviewed" }}),
-  }});
-  await loadManagerDashboard();
-}}
-
-async function loadManagerDashboard() {{
-  const response = await fetch(apiPath);
-  const records = await response.json();
-  const open = records.filter((item) => (item.status || "new") === "new").length;
-  const confirmed = records.filter((item) => item.status === "confirmed").length;
-  const done = records.filter((item) => item.status === "done").length;
-  if (metrics) metrics.innerHTML = [
-    [{metric_total}, records.length],
-    [{metric_new}, open],
-    [{metric_confirmed}, confirmed],
-    [{metric_done}, done],
-  ].map(([label, value]) => `<article class="metric-card"><strong>${{value}}</strong><span>${{label}}</span></article>`).join("");
-  if (emptyState) emptyState.hidden = records.length > 0;
-  if (!recordsList) return;
-  recordsList.innerHTML = records.map((item) => `
-    <li class="record-card manager-record">
-      <div><strong>${{item.client_name || {client_fallback}}}</strong><span>${{item.preferred_time || {time_pending}}}</span></div>
-      <span class="status-pill">${{item.status || {status_new}}}</span>
-      <button data-manager-action data-id="${{item.id}}">${{ {review_action} }}</button>
-    </li>
-  `).join("");
-}}
-
-recordsList?.addEventListener("click", (event) => {{
-  const button = event.target.closest("[data-manager-action]");
-  if (!button) return;
-  markReviewed(button.dataset.id);
-}});
-
-loadManagerDashboard();
-'''
-
-    @staticmethod
-    def _fast_role_css(role: str) -> str:
-        accent = "#2563eb"
-        surface = "#f8fafc"
-        ink = "#172033"
-        return f'''.page-shell.{role}-app {{
-  max-width: 1040px;
-  margin: 0 auto;
-  padding: max(76px, calc(var(--telegram-top-safe-offset) + 24px)) 24px 48px;
-  color: {ink};
-  background: #ffffff;
-}}
-.role-hero {{
-  display: grid;
-  gap: 12px;
-  padding: 20px;
-  border: 1px solid #d8dee8;
-  border-radius: 8px;
-  background: {surface};
-}}
-.eyebrow {{
-  margin: 0;
-  color: {accent};
-  font-weight: 700;
-  text-transform: uppercase;
-  font-size: 12px;
-}}
-.role-nav {{
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-}}
-.role-nav a, button, .primary-action {{
-  border: 1px solid {accent};
-  border-radius: 6px;
-  padding: 10px 12px;
-  color: {accent};
-  background: #ffffff;
-  text-decoration: none;
-  font-weight: 700;
-}}
-.primary-action, button:hover {{
-  color: #ffffff;
-  background: {accent};
-}}
-.action-panel, .records-panel, .queue-panel, .metrics-panel, .manager-list-panel, .detail-panel {{
-  margin-top: 18px;
-  padding: 18px;
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
-  background: #ffffff;
-}}
-.request-form {{
-  display: grid;
-  gap: 12px;
-}}
-label {{
-  display: grid;
-  gap: 6px;
-  font-weight: 700;
-}}
-input, textarea {{
-  width: 100%;
-  box-sizing: border-box;
-  border: 1px solid #cbd5e1;
-  border-radius: 6px;
-  padding: 10px;
-  font: inherit;
-}}
-#records-list {{
-  display: grid;
-  gap: 10px;
-  padding: 0;
-  list-style: none;
-}}
-.record-card {{
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px;
-  border: 1px solid #d8dee8;
-  border-radius: 8px;
-  background: #f8fafc;
-}}
-.metric-grid {{
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 10px;
-}}
-.metric-card {{
-  padding: 14px;
-  border-radius: 8px;
-  background: {surface};
-}}
-.metric-card strong {{
-  display: block;
-  font-size: 24px;
-  color: {accent};
-}}
-.status-pill {{
-  border-radius: 999px;
-  padding: 5px 9px;
-  background: {surface};
-  color: {accent};
-  font-weight: 700;
-}}
-@media (max-width: 720px) {{
-  .page-shell.{role}-app {{ padding: max(76px, calc(var(--telegram-top-safe-offset) + 18px)) 14px 36px; }}
-  .record-card {{ align-items: stretch; flex-direction: column; }}
-}}
-'''
-
-    @staticmethod
-    def _fast_api_route_py(spec: dict[str, str], api_path: str) -> str:
-        resource = spec["resource"]
-        return f'''from __future__ import annotations
-
-import json
-from pathlib import Path
-from uuid import uuid4
-
-from fastapi import APIRouter, HTTPException
-
-
-router = APIRouter(tags=["{resource}"])
-DATA_FILE = Path(__file__).resolve().parent.parent / "generated" / "{resource}.json"
-
-
-def _read_records() -> list[dict]:
-    if not DATA_FILE.exists():
-        return []
-    try:
-        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    return data if isinstance(data, list) else []
-
-
-def _write_records(records: list[dict]) -> None:
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DATA_FILE.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-@router.get("{api_path}")
-def list_records() -> list[dict]:
-    return _read_records()
-
-
-@router.post("{api_path}")
-def create_record(payload: dict) -> dict:
-    records = _read_records()
-    record = {{"id": uuid4().hex, "status": "new", **payload}}
-    records.append(record)
-    _write_records(records)
-    return record
-
-
-@router.patch("{api_path}/{{record_id}}")
-def update_record_status(record_id: str, payload: dict) -> dict:
-    records = _read_records()
-    status = str(payload.get("status") or "").strip()
-    if not status:
-        raise HTTPException(status_code=422, detail="status is required")
-    for record in records:
-        if str(record.get("id")) == record_id:
-            record["status"] = status
-            _write_records(records)
-            return record
-    raise HTTPException(status_code=404, detail="record not found")
-'''
-
-    @staticmethod
-    def _fast_main_py(resource: str) -> str:
-        return f'''from __future__ import annotations
-
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
-
-from app.db import Base, engine
-from app.routes.health import router as health_router
-from app.routes.role_routes import router as role_router
-from app.routes.{resource} import router as generated_router
-
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
-app.include_router(health_router)
-app.include_router(role_router)
-app.include_router(generated_router)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
-@app.middleware("http")
-async def disable_preview_caching(request: Request, call_next):
-    response = await call_next(request)
-    if request.method in {{"GET", "HEAD"}} and (request.url.path.startswith("/static/") or not request.url.path.startswith("/api/")):
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
-    return response
-
-
-@app.get("/", include_in_schema=False)
-def index() -> RedirectResponse:
-    return RedirectResponse(url="/client", status_code=307)
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {{str(key): _json_safe(item) for key, item in value.items()}}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
-@app.exception_handler(HTTPException)
-def http_exception_handler(_, exc: HTTPException) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={{"detail": _json_safe(exc.detail)}}, headers=exc.headers)
-
-
-@app.exception_handler(KeyError)
-def key_error_handler(_, exc: KeyError) -> JSONResponse:
-    return JSONResponse(status_code=404, content={{"detail": str(exc)}})
-
-
-@app.exception_handler(ValueError)
-def value_error_handler(_, exc: ValueError) -> JSONResponse:
-    return JSONResponse(status_code=422, content={{"detail": str(exc)}})
-'''
-
-    @staticmethod
-    def _fast_python_test_py(spec: dict[str, str], api_path: str, resource: str) -> str:
-        title = spec["title"]
-        return f'''import unittest
-
-from fastapi.testclient import TestClient
-
-from app.main import app
-from app.routes.{resource} import DATA_FILE
-
-
-class GeneratedAppTest(unittest.TestCase):
-    def setUp(self):
-        DATA_FILE.unlink(missing_ok=True)
-        self.client = TestClient(app)
-
-    def test_api_persistence(self):
-        self.assertEqual(self.client.get("{api_path}").json(), [])
-        payload = {{"client_name": "Benchmark Client", "phone": "+79990000000", "preferred_time": "2026-05-05 10:00", "details": "{title} request"}}
-        created = self.client.post("{api_path}", json=payload)
-        self.assertEqual(created.status_code, 200)
-        created_payload = created.json()
-        records = self.client.get("{api_path}").json()
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["client_name"], payload["client_name"])
-        self.assertEqual(records[0]["status"], "new")
-        updated = self.client.patch(f"{api_path}/{{created_payload['id']}}", json={{"status": "confirmed"}})
-        self.assertEqual(updated.status_code, 200)
-        self.assertEqual(updated.json()["status"], "confirmed")
-        self.assertEqual(self.client.get("{api_path}").json()[0]["status"], "confirmed")
-
-    def test_role_routes(self):
-        for path in ["/client", "/client/request", "/specialist", "/specialist/queue", "/manager", "/manager/overview"]:
-            response = self.client.get(path)
-            self.assertEqual(response.status_code, 200, path)
-            self.assertIn("{title}", response.text)
-
-
-if __name__ == "__main__":
-    unittest.main()
-'''
-
-    @staticmethod
-    def _fast_js_test_mjs(spec: dict[str, str], api_path: str) -> str:
-        title = spec["title"]
-        title_literal = json.dumps(title)
-        api_literal = json.dumps(api_path)
-        return f'''import test from 'node:test';
-import assert from 'node:assert';
-import fs from 'node:fs';
-import path from 'node:path';
-
-const root = process.cwd();
-const apiPath = {api_literal};
-const read = (filePath) => fs.readFileSync(path.join(root, filePath), 'utf8');
-
-test('role pages contain domain content and preview bridge', () => {{
-  for (const filePath of [
-    'app/static/client/index.html',
-    'app/static/client/request/index.html',
-    'app/static/specialist/index.html',
-    'app/static/specialist/queue/index.html',
-    'app/static/manager/index.html',
-    'app/static/manager/overview/index.html'
-  ]) {{
-    const html = read(filePath);
-    assert.ok(html.includes({title_literal}));
-    assert.match(html, /\\/static\\/preview_bridge\\.js/);
-    assert.match(html, /\\/static\\/(client|specialist|manager)\\/styles\\.css/);
-  }}
-}});
-
-test('role apps have separate frontend actions and styles', () => {{
-  const html = read('app/static/client/index.html');
-  assert.match(html, /record-form/);
-  const clientJs = read('app/static/client/app.js');
-  assert.ok(clientJs.includes('fetch(apiPath'));
-  assert.match(clientJs, /method:\\s*"POST"/);
-  const specialistJs = read('app/static/specialist/app.js');
-  assert.match(specialistJs, /method:\\s*"PATCH"/);
-  assert.match(specialistJs, /data-status-action/);
-  const managerJs = read('app/static/manager/app.js');
-  assert.match(managerJs, /metric-card/);
-  assert.match(managerJs, /data-manager-action/);
-  for (const role of ['client', 'specialist', 'manager']) {{
-    const css = read(`app/static/${{role}}/styles.css`);
-    assert.match(css, new RegExp(`\\\\.${{role}}-app`));
-    assert.match(css, /record-card|metric-card|request-form/);
-  }}
-}});
-'''
-
     def _create_coverage_existing_state(self, *, workspace_id: str, run_id: str) -> tuple[set[str], dict[str, str]]:
         paths: set[str] = set()
         text_by_path: dict[str, str] = {}
@@ -4305,7 +2898,7 @@ test('role apps have separate frontend actions and styles', () => {{
             if path not in touched:
                 missing.append(path)
         generation_mode = WorkspaceCodeAgentRuntime._generation_mode(request.generation_mode)
-        required_child_pages = 1 if generation_mode == GenerationMode.FAST else 2
+        required_child_pages = 3 if generation_mode == GenerationMode.QUALITY else 1 if generation_mode == GenerationMode.FAST else 2
         for role in ("client", "specialist", "manager"):
             child_pages = {
                 path
@@ -4661,6 +3254,83 @@ test('role apps have separate frontend actions and styles', () => {{
             if path:
                 paths.append(path)
         return list(dict.fromkeys(paths))
+
+    @staticmethod
+    def _prompt_semantic_tokens(prompt: str, *, limit: int = 10) -> list[str]:
+        stopwords = {
+            "a",
+            "an",
+            "and",
+            "app",
+            "application",
+            "build",
+            "create",
+            "for",
+            "make",
+            "mini",
+            "please",
+            "the",
+            "with",
+            "для",
+            "мини",
+            "миниприложение",
+            "приложение",
+            "сделай",
+            "создай",
+            "хочу",
+            "чтобы",
+        }
+        tokens = re.findall(r"[0-9A-Za-zА-Яа-яЁё_-]+", str(prompt or "").lower())
+        semantic = [token.strip("_-") for token in tokens if len(token.strip("_-")) >= 3 and token.strip("_-") not in stopwords]
+        return list(dict.fromkeys(token for token in semantic if token))[: max(1, int(limit or 10))]
+
+    @staticmethod
+    def _prompt_token_matches_text(token: str, text: str) -> bool:
+        value = str(token or "").strip().lower()
+        haystack = str(text or "").lower()
+        if not value:
+            return False
+        if value in haystack:
+            return True
+        stems = {value}
+        for suffix in (
+            "иями",
+            "ями",
+            "ами",
+            "ого",
+            "ему",
+            "ыми",
+            "ими",
+            "иях",
+            "ах",
+            "ях",
+            "ов",
+            "ев",
+            "ам",
+            "ям",
+            "ом",
+            "ем",
+            "ой",
+            "ый",
+            "ий",
+            "ая",
+            "ое",
+            "ые",
+            "ие",
+            "ки",
+            "а",
+            "у",
+            "е",
+            "ы",
+            "и",
+            "s",
+            "es",
+            "ing",
+            "ed",
+        ):
+            if value.endswith(suffix) and len(value) - len(suffix) >= 4:
+                stems.add(value[: -len(suffix)])
+        return any(stem and stem in haystack for stem in stems if len(stem) >= 4)
 
     def _prompt_alignment_smoke(
         self,
@@ -5535,9 +4205,10 @@ test('role apps have separate frontend actions and styles', () => {{
         progress_map = {
             "job_started": ("Starting code agent", 4),
             "spec_extract_started": ("Extracting workflow contract", 6),
-            "parallel_build_started": ("Running Fast parallel workers", 24),
-            "parallel_build_completed": ("Merged Fast parallel workers", 52),
-            "parallel_build_failed": ("Fast parallel build fallback", 38),
+            "parallel_build_started": ("Running parallel role workers", 24),
+            "parallel_build_completed": ("Merged parallel role workers", 52),
+            "parallel_build_failed": ("Parallel role build repair", 38),
+            "draft_prepared": ("Prepared first create patch", 52),
             "running_checks": ("Running validation checks" if is_after_patch else "Checking workspace shell", 59 if is_after_patch else cls._pre_patch_progress(attempt, 7)),
             "build_started": ("Checking schema and route manifest" if is_after_patch else "Validating workspace shell", 61 if is_after_patch else cls._pre_patch_progress(attempt, 9)),
             "frontend_build_started": ("Checking generated routes and API links" if is_after_patch else "Checking frontend baseline", 64 if is_after_patch else cls._pre_patch_progress(attempt, 11)),
