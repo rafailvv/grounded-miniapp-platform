@@ -89,6 +89,7 @@ class JobEvent(StrictModel):
         "building_surface",
         "surface_ready",
         "spec_started",
+        "spec_extract_started",
         "spec_ready",
         "spec_blocked",
         "draft_prepared",
@@ -108,6 +109,9 @@ class JobEvent(StrictModel):
         "repair_iteration",
         "repair_repeated_signature_aborted",
         "agent_turn_started",
+        "parallel_build_started",
+        "parallel_build_completed",
+        "parallel_build_failed",
         "patch_apply_started",
         "patch_apply_completed",
         "frontend_build_started",
@@ -192,6 +196,10 @@ class JobRecord(StrictModel):
     remaining_issues: list[dict[str, Any]] = Field(default_factory=list)
     latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
     token_usage: dict[str, Any] = Field(default_factory=dict)
+    orchestration_phases: list[dict[str, Any]] = Field(default_factory=list)
+    acceptance_contract: dict[str, Any] = Field(default_factory=dict)
+    worker_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    flow_coverage: dict[str, Any] = Field(default_factory=dict)
     retrieval_stats: dict[str, Any] = Field(default_factory=dict)
     cache_stats: dict[str, Any] = Field(default_factory=dict)
     repair_iterations: list[dict[str, Any]] = Field(default_factory=list)
@@ -520,6 +528,10 @@ class RunRecord(StrictModel):
     remaining_issues: list[dict[str, Any]] = Field(default_factory=list)
     latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
     token_usage: dict[str, Any] = Field(default_factory=dict)
+    orchestration_phases: list[dict[str, Any]] = Field(default_factory=list)
+    acceptance_contract: dict[str, Any] = Field(default_factory=dict)
+    worker_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    flow_coverage: dict[str, Any] = Field(default_factory=dict)
     repair_iterations: list[dict[str, Any]] = Field(default_factory=list)
     fix_attempts: list[dict[str, Any]] = Field(default_factory=list)
     scope_expansions: list[dict[str, Any]] = Field(default_factory=list)

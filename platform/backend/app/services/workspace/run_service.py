@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import PurePosixPath
+import os
 import re
 import threading
 import logging
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.ai.model_registry import resolve_model_profile
@@ -28,12 +29,14 @@ from app.models.domain import (
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
+from app.services.workflow_acceptance import build_acceptance_contract, orchestration_metadata_for_contract
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.service import WorkspaceService
 
 ROLE_ORDER = ("client", "specialist", "manager")
 ROLE_SCOPE = set(ROLE_ORDER)
+ACTIVE_RUN_RECOVERY_STALE_SECONDS = int(os.getenv("ACTIVE_RUN_RECOVERY_STALE_SECONDS", "3600"))
 MEANINGFUL_DIFF_IGNORED_PARTS = {
     ".git",
     "node_modules",
@@ -156,6 +159,31 @@ class RunService:
             resolved_role_scope = list(ROLE_ORDER)
         effective_generation_mode = self._resolve_generation_mode(workspace, request, resolved_intent)
         effective_model_profile = self._resolve_model_profile(request.model_profile, effective_generation_mode)
+        contract_probe = GenerateRequest(
+            prompt=request.prompt,
+            mode=request.mode,
+            target_platform=request.target_platform,
+            preview_profile=request.preview_profile,
+            generation_mode=effective_generation_mode,
+            intent=resolved_intent,
+            target_role_scope=resolved_role_scope,
+            model_profile=effective_model_profile,
+            linked_run_id=None,
+            resume_from_run_id=request.resume_from_run_id,
+            error_context=request.error_context,
+        )
+        focused_edit_kind = WorkspaceCodeAgentRuntime._focused_edit_kind(contract_probe)
+        acceptance_contract = build_acceptance_contract(
+            prompt=request.prompt,
+            intent=resolved_intent,
+            generation_mode=effective_generation_mode,
+            focused_edit_kind=focused_edit_kind,
+        )
+        orchestration = orchestration_metadata_for_contract(
+            contract=acceptance_contract,
+            generation_mode=effective_generation_mode,
+            focused_edit_kind=focused_edit_kind,
+        )
         run = RunRecord(
             workspace_id=workspace_id,
             prompt=request.prompt,
@@ -170,6 +198,13 @@ class RunService:
             resume_from_run_id=request.resume_from_run_id,
             source_revision_id=workspace.current_revision_id,
             error_context=request.error_context,
+            acceptance_contract=acceptance_contract,
+            orchestration_phases=list(orchestration.get("phases") or []),
+            worker_summaries=list(orchestration.get("worker_summaries") or []),
+            flow_coverage={
+                "status": "planned" if acceptance_contract.get("required") else "not_required",
+                "required_flows": [flow.get("id") for flow in acceptance_contract.get("flows", []) if isinstance(flow, dict)],
+            },
             status="pending",
             apply_status="pending",
             current_stage="queued",
@@ -262,11 +297,14 @@ class RunService:
 
     def _recover_orphaned_active_runs(self) -> None:
         now = datetime.now(timezone.utc)
+        stale_cutoff = now - timedelta(seconds=ACTIVE_RUN_RECOVERY_STALE_SECONDS)
         for item in self.store.list("runs"):
             run = RunRecord.model_validate(item)
             if run.status not in {"pending", "running"} and run.current_stage != "stopping":
                 continue
             if run.run_id in self._active_workers:
+                continue
+            if run.updated_at > stale_cutoff:
                 continue
             if run.updated_at >= self._startup_started_at:
                 continue
@@ -570,6 +608,12 @@ class RunService:
             run.token_usage = self._richer_token_usage(run.token_usage, existing_usage)
             if not run.linked_job_id and existing.get("linked_job_id"):
                 run.linked_job_id = str(existing.get("linked_job_id") or "")
+            for attr in ("orchestration_phases", "worker_summaries"):
+                if not getattr(run, attr, None) and isinstance(existing.get(attr), list):
+                    setattr(run, attr, list(existing.get(attr) or []))
+            for attr in ("acceptance_contract", "flow_coverage"):
+                if not getattr(run, attr, None) and isinstance(existing.get(attr), dict):
+                    setattr(run, attr, dict(existing.get(attr) or {}))
             try:
                 run.iteration_count = max(int(run.iteration_count or 0), int(existing.get("iteration_count") or 0))
             except (TypeError, ValueError):
@@ -646,6 +690,14 @@ class RunService:
                 specific = self._specific_failure_reason_from_job(job)
                 if specific and specific != run.failure_reason:
                     run.failure_reason = specific
+                    changed = True
+            for attr in ("orchestration_phases", "worker_summaries"):
+                if not getattr(run, attr, None) and getattr(job, attr, None):
+                    setattr(run, attr, list(getattr(job, attr) or []))
+                    changed = True
+            for attr in ("acceptance_contract", "flow_coverage"):
+                if not getattr(run, attr, None) and getattr(job, attr, None):
+                    setattr(run, attr, dict(getattr(job, attr) or {}))
                     changed = True
         if run.status in {"failed", "blocked"} and int(run.progress_percent or 0) >= 100:
             run.progress_percent = self._terminal_failure_progress(run.progress_percent)
@@ -854,6 +906,8 @@ class RunService:
             agent_quality = self._agent_quality_report(run.workspace_id)
             run.role_coverage = dict(agent_quality.get("role_coverage") or {})
             run.generated_tests = dict(agent_quality.get("generated_tests") or {})
+            if agent_quality.get("flow_coverage"):
+                run.flow_coverage = dict(agent_quality.get("flow_coverage") or {})
             run.neutral_template_findings = list(agent_quality.get("neutral_template_findings") or [])
             run.touched_files = self._resolve_touched_files(
                 workspace_id=run.workspace_id,
@@ -868,6 +922,10 @@ class RunService:
                 self._richer_token_usage(run.token_usage, job.token_usage),
                 self._token_usage_from_job_events(job),
             )
+            run.orchestration_phases = list(getattr(job, "orchestration_phases", []) or run.orchestration_phases)
+            run.acceptance_contract = dict(getattr(job, "acceptance_contract", {}) or run.acceptance_contract)
+            run.worker_summaries = list(getattr(job, "worker_summaries", []) or run.worker_summaries)
+            run.flow_coverage = dict(getattr(job, "flow_coverage", {}) or run.flow_coverage)
             run.repair_iterations = list(job.repair_iterations)
             run.fix_attempts = list(job.fix_attempts)
             run.scope_expansions = list(job.scope_expansions)
@@ -1394,6 +1452,7 @@ class RunService:
             check_profile="full",
             intent=str(getattr(run, "intent", "") or ""),
             generation_mode=run.generation_mode,
+            acceptance_contract=dict(getattr(run, "acceptance_contract", {}) or {}),
         )
         validation_snapshot = self._validation_snapshot_from_execution(execution)
         self.store.upsert(
@@ -1681,6 +1740,10 @@ class RunService:
             "role_coverage": run.role_coverage,
             "generated_tests": run.generated_tests,
             "neutral_template_findings": run.neutral_template_findings,
+            "orchestration_phases": run.orchestration_phases,
+            "acceptance_contract": run.acceptance_contract,
+            "worker_summaries": run.worker_summaries,
+            "flow_coverage": run.flow_coverage,
             "preview": preview_payload,
             "draft_preview": {
                 key: value
@@ -1767,6 +1830,7 @@ class RunService:
     def _agent_quality_from_execution(execution: CheckExecutionRecord) -> dict[str, Any]:
         role_coverage: dict[str, Any] = {}
         generated_tests: dict[str, Any] = {}
+        flow_coverage: dict[str, Any] = {}
         neutral_template_findings: list[dict[str, Any]] = []
         for result in execution.results:
             diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
@@ -1790,10 +1854,18 @@ class RunService:
                     "details": result.details,
                     "command": result.command,
                 }
+            if result.name == "frontend_interaction_static_smoke":
+                flow_coverage = {
+                    "status": result.status,
+                    "details": result.details,
+                    "diagnostics": dict(diagnostics),
+                    "logs": list(result.logs or []),
+                }
         return {
             "workspace_id": execution.workspace_id,
             "role_coverage": role_coverage,
             "generated_tests": generated_tests,
+            "flow_coverage": flow_coverage,
             "neutral_template_findings": neutral_template_findings,
         }
 
@@ -2067,6 +2139,7 @@ class RunService:
             scope_mode=self._validation_scope_for_run(run),
             intent=str(getattr(run, "intent", "") or ""),
             generation_mode=run.generation_mode,
+            acceptance_contract=dict(getattr(run, "acceptance_contract", {}) or {}),
         )
         validation_snapshot = self._validation_snapshot_from_execution(execution)
         completion_state = self._strict_green_completion_state(execution.results, validation_snapshot)
@@ -2199,6 +2272,7 @@ class RunService:
             scope_mode=self._validation_scope_for_run(run),
             intent=str(getattr(run, "intent", "") or ""),
             generation_mode=run.generation_mode,
+            acceptance_contract=dict(getattr(run, "acceptance_contract", {}) or {}),
         )
         validation_snapshot = self._validation_snapshot_from_execution(execution)
         results = execution.results

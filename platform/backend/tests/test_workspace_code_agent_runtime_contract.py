@@ -23,6 +23,7 @@ from app.modules.workspace_code_agent_runtime.runtime import (
     WorkspaceCodeAgentRuntime,
 )
 from app.repositories.state_store import StateStore
+from app.services.workflow_acceptance import build_acceptance_contract, orchestration_metadata_for_contract
 from app.services.workspace.service import WorkspaceService
 from app.services.workspace.run_service import RunService
 
@@ -87,8 +88,14 @@ def test_fast_first_create_schema_can_force_patch_only_turn() -> None:
 
 def test_visual_style_edit_uses_focused_css_contract() -> None:
     request = GenerateRequest(prompt="Поменяй стиль и цвета на фиолетовый", intent="edit", generation_mode=GenerationMode.FAST)
+    visual_no_logic_request = GenerateRequest(
+        prompt="Сделай интерфейс аккуратнее, увеличь отступы и не меняй логику приложения.",
+        intent="edit",
+        generation_mode=GenerationMode.FAST,
+    )
 
     assert WorkspaceCodeAgentRuntime._focused_edit_kind(request) == "visual_style_edit"
+    assert WorkspaceCodeAgentRuntime._focused_edit_kind(visual_no_logic_request) == "visual_style_edit"
     assert WorkspaceCodeAgentRuntime._focused_visual_css_paths(["client", "manager"]) == [
         "miniapp/app/static/shared/base.css",
         "miniapp/app/static/client/styles.css",
@@ -105,7 +112,7 @@ def test_visual_style_edit_uses_focused_css_contract() -> None:
     assert schema["properties"]["operations"]["maxItems"] == 4
     assert schema["properties"]["tool_requests"]["maxItems"] == 0
     assert schema["properties"]["outcome"]["enum"] == ["patch_ready", "fatal_invalid_response"]
-    assert schema["properties"]["operations"]["items"]["properties"]["content"]["maxLength"] == 8000
+    assert schema["properties"]["operations"]["items"]["properties"]["content"]["maxLength"] == FOCUSED_VISUAL_CONTENT_MAX_LENGTH
 
 
 def test_platform_shell_stabilizer_restores_safe_top_spacing(tmp_path) -> None:
@@ -135,9 +142,299 @@ def test_platform_shell_stabilizer_restores_safe_top_spacing(tmp_path) -> None:
 def test_copy_and_behavior_edits_are_classified_separately() -> None:
     copy_request = GenerateRequest(prompt="Переименуй заголовок в карточке заказа", intent="edit")
     behavior_request = GenerateRequest(prompt="Сделай POST endpoint и fetch для сохранения заказа", intent="edit")
+    workflow_request = GenerateRequest(prompt="Не работает кнопка в корзину, заказ должен появляться у специалиста", intent="edit")
 
     assert WorkspaceCodeAgentRuntime._focused_edit_kind(copy_request) == "small_copy_edit"
     assert WorkspaceCodeAgentRuntime._focused_edit_kind(behavior_request) == "behavior_edit"
+    assert WorkspaceCodeAgentRuntime._focused_edit_kind(workflow_request) == "behavior_workflow_edit"
+
+
+def test_acceptance_contract_captures_commerce_workflow_and_orchestration() -> None:
+    contract = build_acceptance_contract(
+        prompt="Интернет-магазин: специалист добавляет товар, клиент кладет в корзину и оформляет заказ, менеджер видит заказы",
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+        focused_edit_kind="standard",
+    )
+    orchestration = orchestration_metadata_for_contract(
+        contract=contract,
+        generation_mode=GenerationMode.BALANCED,
+        focused_edit_kind="standard",
+    )
+
+    assert contract["required"] is True
+    assert contract["features"]["commerce_catalog_cart_order"] is True
+    assert any(flow["id"] == "commerce_catalog_cart_order" for flow in contract["flows"])
+    assert {item["resource"] for item in contract["required_endpoints"]} == {"products", "orders"}
+    assert orchestration["enabled"] is True
+    assert [phase["id"] for phase in orchestration["phases"]] == [
+        "spec_extract",
+        "parallel_build",
+        "merge",
+        "verify_repair",
+    ]
+    assert {worker["worker"] for worker in orchestration["worker_summaries"]} >= {
+        "backend_api",
+        "client_ui",
+        "specialist_ui",
+        "manager_ui",
+        "generated_tests",
+    }
+
+
+def test_cross_role_behavior_addition_gets_workflow_contract() -> None:
+    prompt = (
+        "Добавь срочность заявки: клиент выбирает обычная или срочная, "
+        "исполнитель видит срочность в очереди, менеджер видит количество срочных. "
+        "Срочность должна сохраняться после обновления и быть видна во всех трех частях приложения."
+    )
+    request = GenerateRequest(prompt=prompt, intent="edit", generation_mode=GenerationMode.FAST)
+
+    focused_kind = WorkspaceCodeAgentRuntime._focused_edit_kind(request)
+    contract = build_acceptance_contract(
+        prompt=prompt,
+        intent="edit",
+        generation_mode=GenerationMode.FAST,
+        focused_edit_kind=focused_kind,
+    )
+    orchestration = orchestration_metadata_for_contract(
+        contract=contract,
+        generation_mode=GenerationMode.FAST,
+        focused_edit_kind=focused_kind,
+    )
+
+    assert focused_kind == "behavior_workflow_edit"
+    assert contract["required"] is True
+    assert orchestration["execution_style"] == "fast_parallel_workers"
+
+
+def test_orchestration_job_events_are_valid_domain_events() -> None:
+    for event_type in [
+        "spec_extract_started",
+        "parallel_build_started",
+        "parallel_build_completed",
+        "parallel_build_failed",
+    ]:
+        event = JobEvent(event_type=event_type, message="ok", details={})
+        assert event.event_type == event_type
+
+
+def test_fast_acceptance_contract_enables_parallel_workers() -> None:
+    contract = build_acceptance_contract(
+        prompt="Создай интернет-магазин: специалист добавляет товар, клиент оформляет заказ из корзины",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        focused_edit_kind="standard",
+    )
+    orchestration = orchestration_metadata_for_contract(
+        contract=contract,
+        generation_mode=GenerationMode.FAST,
+        focused_edit_kind="standard",
+    )
+
+    assert orchestration["enabled"] is True
+    assert orchestration["execution_style"] == "fast_parallel_workers"
+    assert orchestration["parallel_worker_count"] == 5
+
+
+def test_fast_parallel_worker_merge_rejects_conflicting_ownership() -> None:
+    client_op = DraftFileOperation(
+        file_path="miniapp/app/static/client/app.js",
+        operation="replace",
+        content="console.log('client')",
+        reason="client",
+    )
+    bad_backend_op = DraftFileOperation(
+        file_path="miniapp/app/static/client/app.js",
+        operation="replace",
+        content="console.log('bad')",
+        reason="bad",
+    )
+    results = [
+        {"worker": "backend_api", "status": "completed", "outcome": "patch_ready", "operations": [bad_backend_op]},
+        {"worker": "client_ui", "status": "completed", "outcome": "patch_ready", "operations": [client_op]},
+        {
+            "worker": "specialist_ui",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/app/static/specialist/app.js",
+                    operation="replace",
+                    content="",
+                    reason="specialist",
+                )
+            ],
+        },
+        {
+            "worker": "manager_ui",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/app/static/manager/app.js",
+                    operation="replace",
+                    content="",
+                    reason="manager",
+                )
+            ],
+        },
+        {
+            "worker": "generated_tests",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/tests/test_generated_app.py",
+                    operation="replace",
+                    content="",
+                    reason="tests",
+                )
+            ],
+        },
+    ]
+
+    merged, error = WorkspaceCodeAgentRuntime._merge_fast_parallel_worker_operations(results)
+
+    assert merged == []
+    assert error is not None
+    assert "outside ownership" in error
+
+
+def test_fast_parallel_worker_merge_deduplicates_same_worker_path() -> None:
+    first_manifest = DraftFileOperation(
+        file_path="miniapp/app/generated/route_manifest.json",
+        operation="replace",
+        content='{"version": 1}',
+        reason="first manifest",
+    )
+    final_manifest = DraftFileOperation(
+        file_path="miniapp/app/generated/route_manifest.json",
+        operation="replace",
+        content='{"version": 2}',
+        reason="final manifest",
+    )
+    results = [
+        {
+            "worker": "backend_api",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/app/routes/app_api.py",
+                    operation="replace",
+                    content="router = object()",
+                    reason="api",
+                ),
+                first_manifest,
+                final_manifest,
+            ],
+        },
+        {
+            "worker": "client_ui",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/app/static/client/app.js",
+                    operation="replace",
+                    content="",
+                    reason="client",
+                )
+            ],
+        },
+        {
+            "worker": "specialist_ui",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/app/static/specialist/app.js",
+                    operation="replace",
+                    content="",
+                    reason="specialist",
+                )
+            ],
+        },
+        {
+            "worker": "manager_ui",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/app/static/manager/app.js",
+                    operation="replace",
+                    content="",
+                    reason="manager",
+                )
+            ],
+        },
+        {
+            "worker": "generated_tests",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/tests/test_generated_app.py",
+                    operation="replace",
+                    content="",
+                    reason="tests",
+                )
+            ],
+        },
+    ]
+
+    merged, error = WorkspaceCodeAgentRuntime._merge_fast_parallel_worker_operations(results)
+
+    assert error is None
+    manifests = [operation for operation in merged if operation.file_path == "miniapp/app/generated/route_manifest.json"]
+    assert len(manifests) == 1
+    assert manifests[0].content == '{"version": 2}'
+
+
+def test_fast_parallel_blueprint_uses_commerce_role_pages() -> None:
+    contract = build_acceptance_contract(
+        prompt="Интернет-магазин с каталогом, корзиной и заказами",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        focused_edit_kind="standard",
+    )
+
+    blueprint = WorkspaceCodeAgentRuntime._fast_parallel_blueprint(contract)
+    workers = WorkspaceCodeAgentRuntime._fast_parallel_workers(blueprint)
+
+    assert blueprint["commerce_flow"] is True
+    assert blueprint["role_files"]["client"]["child"] == "miniapp/app/static/client/catalog/index.html"
+    assert blueprint["role_files"]["specialist"]["child"] == "miniapp/app/static/specialist/inventory/index.html"
+    assert {worker["worker"] for worker in workers} == {
+        "backend_api",
+        "client_ui",
+        "specialist_ui",
+        "manager_ui",
+        "generated_tests",
+    }
+
+
+def test_fast_commerce_fallback_covers_products_orders_cart_workflow() -> None:
+    request = GenerateRequest(
+        prompt="Создай интернет-магазин: сотрудник добавляет товар, клиент кладет товар в корзину и оформляет заказ",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+    )
+
+    operations = WorkspaceCodeAgentRuntime._fast_create_fallback_operations(request)
+    paths = {operation.file_path for operation in operations}
+    text = "\n".join(str(operation.content or "") for operation in operations)
+
+    assert "miniapp/app/routes/commerce.py" in paths
+    assert "miniapp/app/static/client/catalog/index.html" in paths
+    assert "miniapp/app/static/specialist/inventory/index.html" in paths
+    assert "/api/products" in text
+    assert "/api/orders" in text
+    assert "add-to-cart" in text
+    assert 'method: "POST"' in text
+    assert 'method: "PATCH"' in text
+    assert all(term in text.lower() for term in ("products", "orders", "cart"))
 
 
 def test_create_patch_coverage_rejects_partial_role_slice() -> None:
@@ -1213,7 +1510,7 @@ def test_agent_turn_tuning_caps_all_generation_modes() -> None:
         focused_edit_kind="visual_style_edit",
     ) == {
         "reasoning": {"effort": "low"},
-        "max_output_tokens": 8000,
+        "max_output_tokens": FOCUSED_VISUAL_CONTENT_MAX_LENGTH,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.FAST, intent="edit") == {
         "reasoning": {"effort": "low"},

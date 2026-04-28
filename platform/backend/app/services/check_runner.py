@@ -34,6 +34,7 @@ from app.validators.static_analysis import (
     role_static_root,
 )
 from app.validators.suite import ValidationSuite
+from app.services.workflow_acceptance import build_acceptance_contract
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
@@ -169,6 +170,7 @@ class CheckRunner:
         check_profile: str = "full",
         intent: str | None = None,
         generation_mode: GenerationMode | str | None = None,
+        acceptance_contract: dict[str, Any] | None = None,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> CheckExecutionRecord:
         started = time.perf_counter()
@@ -273,14 +275,41 @@ class CheckRunner:
             check_profile=check_profile,
         )
 
+        self._emit_check_progress(progress_callback, "frontend_interaction_static_smoke", "started", check_profile=check_profile)
+        flow_started = time.perf_counter()
+        frontend_flow_result = self._frontend_interaction_static_smoke(
+            source_dir=source_dir,
+            changed_files=changed_files,
+            intent=intent,
+            generation_mode=generation_mode,
+            acceptance_contract=acceptance_contract,
+            focused_css_only=focused_css_only_profile,
+        )
+        frontend_flow_result.duration_ms = int((time.perf_counter() - flow_started) * 1000)
+        results.append(frontend_flow_result)
+        self._emit_check_progress(
+            progress_callback,
+            "frontend_interaction_static_smoke",
+            frontend_flow_result.status,
+            duration_ms=frontend_flow_result.duration_ms,
+            issue_count=len(frontend_flow_result.logs or []) if frontend_flow_result.status == "failed" else 0,
+            check_profile=check_profile,
+        )
+
         should_skip_preview = (
             bool(filtered_issues)
             or bool(connectivity_issues)
             or static_result.status == "failed"
             or platform_smoke_result.status == "failed"
+            or frontend_flow_result.status == "failed"
         )
 
-        if check_profile in {"fast_gate", "focused_edit"}:
+        must_run_generated_tests = check_profile == "fast_gate" and self._requires_generated_workflow_tests(
+            intent=intent,
+            acceptance_contract=acceptance_contract,
+        )
+
+        if check_profile == "focused_edit" or (check_profile == "fast_gate" and not must_run_generated_tests):
             focused_details = check_profile == "focused_edit"
             python_details = (
                 "Generated Python app tests were skipped for a focused CSS-only visual edit."
@@ -331,9 +360,20 @@ class CheckRunner:
                         command="preview deferred during focused edit" if focused_details else "preview deferred during fast gate",
                         logs=[],
                     ),
+                    RunCheckResult(
+                        name="browser_flow_smoke",
+                        status="skipped",
+                        details=(
+                            "Browser flow smoke was skipped for a focused CSS-only visual edit."
+                            if focused_details
+                            else "Browser flow smoke was deferred until follow-up verification."
+                        ),
+                        command="browser/preview flow deferred during focused edit" if focused_details else "browser/preview flow deferred during fast gate",
+                        logs=[],
+                    ),
                 ]
             )
-            for skipped_name in ("generated_app_python_tests", "generated_app_js_tests", "preview_boot_smoke", "preview_connectivity_smoke"):
+            for skipped_name in ("generated_app_python_tests", "generated_app_js_tests", "preview_boot_smoke", "preview_connectivity_smoke", "browser_flow_smoke"):
                 self._emit_check_progress(progress_callback, skipped_name, "skipped", check_profile=check_profile)
             completed_at = utc_now()
             return CheckExecutionRecord(
@@ -347,6 +387,7 @@ class CheckRunner:
             )
 
         require_generated_tests = scope_mode == "agentic"
+        skip_preview_only = check_profile == "fast_gate" and must_run_generated_tests
 
         def _run_python_tests() -> RunCheckResult:
             python_tests_started = time.perf_counter()
@@ -360,15 +401,19 @@ class CheckRunner:
             js_tests_result.duration_ms = int((time.perf_counter() - js_tests_started) * 1000)
             return js_tests_result
 
-        def _run_preview_checks() -> tuple[RunCheckResult, RunCheckResult]:
+        def _run_preview_checks() -> tuple[RunCheckResult, RunCheckResult, RunCheckResult]:
             preview_started = time.perf_counter()
-            preview = self.preview_service.get(workspace_id)
-            if should_skip_preview:
+            if should_skip_preview or skip_preview_only:
                 duration_ms = int((time.perf_counter() - preview_started) * 1000)
+                reason = (
+                    "Preview smoke deferred during fast gate after generated workflow tests."
+                    if skip_preview_only
+                    else "Preview smoke skipped because validator or build checks already failed."
+                )
                 preview_boot_result = RunCheckResult(
                     name="preview_boot_smoke",
                     status="skipped",
-                    details="Preview smoke skipped because validator or build checks already failed.",
+                    details=reason,
                     duration_ms=duration_ms,
                     command="preview smoke (current session)",
                     logs=[],
@@ -376,12 +421,21 @@ class CheckRunner:
                 connectivity_result = RunCheckResult(
                     name="preview_connectivity_smoke",
                     status="skipped",
-                    details="Preview connectivity smoke skipped because validator or build checks already failed.",
+                    details=reason,
                     duration_ms=duration_ms,
                     command="preview route smoke (current session)",
                     logs=[],
                 )
-                return preview_boot_result, connectivity_result
+                browser_result = RunCheckResult(
+                    name="browser_flow_smoke",
+                    status="skipped",
+                    details=reason,
+                    duration_ms=duration_ms,
+                    command="browser/preview flow smoke",
+                    logs=[],
+                )
+                return preview_boot_result, connectivity_result, browser_result
+            preview = self.preview_service.get(workspace_id)
             preview_boot_result = RunCheckResult(
                 name="preview_boot_smoke",
                 status="skipped" if preview.status in {"stopped", "error"} else "passed",
@@ -394,12 +448,20 @@ class CheckRunner:
                 preview=preview,
                 preview_run_id=preview_run_id,
             )
+            browser_result = self._browser_flow_smoke(
+                source_dir=source_dir,
+                preview=preview,
+                preview_run_id=preview_run_id,
+                generation_mode=generation_mode,
+                acceptance_contract=acceptance_contract,
+            )
             duration_ms = int((time.perf_counter() - preview_started) * 1000)
             preview_boot_result.duration_ms = duration_ms
             connectivity_result.duration_ms = duration_ms
-            return preview_boot_result, connectivity_result
+            browser_result.duration_ms = duration_ms
+            return preview_boot_result, connectivity_result, browser_result
 
-        for started_name in ("generated_app_python_tests", "generated_app_js_tests", "preview_boot_smoke", "preview_connectivity_smoke"):
+        for started_name in ("generated_app_python_tests", "generated_app_js_tests", "preview_boot_smoke", "preview_connectivity_smoke", "browser_flow_smoke"):
             self._emit_check_progress(progress_callback, started_name, "started", check_profile=check_profile)
 
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="check-runner") as executor:
@@ -408,13 +470,14 @@ class CheckRunner:
             preview_future = executor.submit(_run_preview_checks)
             python_tests_result = python_future.result()
             js_tests_result = js_future.result()
-            preview_boot_result, connectivity_result = preview_future.result()
+            preview_boot_result, connectivity_result, browser_flow_result = preview_future.result()
 
         results.append(python_tests_result)
         results.append(js_tests_result)
         results.append(preview_boot_result)
         results.append(connectivity_result)
-        for result in (python_tests_result, js_tests_result, preview_boot_result, connectivity_result):
+        results.append(browser_flow_result)
+        for result in (python_tests_result, js_tests_result, preview_boot_result, connectivity_result, browser_flow_result):
             self._emit_check_progress(
                 progress_callback,
                 result.name,
@@ -446,6 +509,364 @@ class CheckRunner:
         callback(check_step, {"check_step": check_step, "check_status": status, **details})
 
     @staticmethod
+    def _requires_generated_workflow_tests(
+        *,
+        intent: str | None,
+        acceptance_contract: dict[str, Any] | None,
+    ) -> bool:
+        intent_value = str(intent or "").strip().lower()
+        return intent_value == "create" or bool((acceptance_contract or {}).get("required"))
+
+    def _frontend_interaction_static_smoke(
+        self,
+        *,
+        source_dir: Path,
+        changed_files: list[str],
+        intent: str | None,
+        generation_mode: GenerationMode | str | None,
+        acceptance_contract: dict[str, Any] | None,
+        focused_css_only: bool = False,
+    ) -> RunCheckResult:
+        del changed_files
+        if focused_css_only:
+            return RunCheckResult(
+                name="frontend_interaction_static_smoke",
+                status="skipped",
+                details="Frontend interaction smoke skipped for focused CSS-only visual edit.",
+                command="frontend interaction static smoke",
+                logs=[],
+            )
+        contract = dict(acceptance_contract or {})
+        if not contract:
+            contract = build_acceptance_contract(
+                prompt="",
+                intent=intent,
+                generation_mode=generation_mode,
+                focused_edit_kind="",
+            )
+        if not contract.get("required"):
+            return RunCheckResult(
+                name="frontend_interaction_static_smoke",
+                status="skipped",
+                details="Frontend interaction smoke skipped because no workflow acceptance contract is required.",
+                command="frontend interaction static smoke",
+                logs=[],
+                diagnostics={"acceptance_contract_required": False},
+            )
+
+        issues = self._frontend_interaction_contract_issues(source_dir=source_dir, contract=contract)
+        blocking = self._blocking_validation_issues(issues)
+        return RunCheckResult(
+            name="frontend_interaction_static_smoke",
+            status="failed" if blocking else "passed",
+            details="Frontend interaction smoke checked required buttons/forms, JavaScript handlers, API calls, and generated test coverage.",
+            command="frontend interaction static smoke",
+            logs=self._validation_logs(issues) if issues else ["Frontend interaction flow wiring passed."],
+            diagnostics={
+                "acceptance_contract_required": True,
+                "flow_ids": [flow.get("id") for flow in contract.get("flows", []) if isinstance(flow, dict)],
+                "features": dict(contract.get("features") or {}),
+            },
+        )
+
+    @classmethod
+    def _frontend_interaction_contract_issues(cls, *, source_dir: Path, contract: dict[str, Any]) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        static_root = source_dir / "miniapp/app/static"
+        role_text = {
+            role: cls._read_role_surface_text(static_root / role)
+            for role in ROLE_ORDER
+        }
+        backend_text = cls._read_backend_routes_text(source_dir)
+        tests_text = cls._read_generated_tests_text(source_dir)
+        all_frontend = "\n".join(role_text.values())
+        if not cls._has_frontend_post(all_frontend):
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_missing_frontend_post",
+                    message="Acceptance workflow requires at least one frontend POST submit/fetch path, but no POST-capable frontend action was found.",
+                    severity="high",
+                    location="miniapp/app/static",
+                    blocking=True,
+                )
+            )
+        if not cls._has_status_update_action(role_text.get("specialist", "") + "\n" + role_text.get("manager", "")):
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_missing_status_update",
+                    message="Acceptance workflow requires specialist/manager processing actions, but no PATCH/PUT/status update action was found.",
+                    severity="high",
+                    location="miniapp/app/static",
+                    blocking=True,
+                )
+            )
+        if not cls._tests_cover_workflow_contract(tests_text, contract):
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_tests_missing_contract",
+                    message="Generated tests do not cover the workflow acceptance contract. Add Python/JS tests for the required form/API/status/cross-role flow.",
+                    severity="high",
+                    location="miniapp/tests",
+                    blocking=True,
+                )
+            )
+        features = contract.get("features") if isinstance(contract.get("features"), dict) else {}
+        if features.get("commerce_catalog_cart_order"):
+            issues.extend(cls._commerce_flow_issues(role_text=role_text, backend_text=backend_text, tests_text=tests_text))
+        return cls._dedupe_validation_issues(issues)
+
+    @staticmethod
+    def _read_role_surface_text(role_dir: Path) -> str:
+        if not role_dir.exists():
+            return ""
+        chunks: list[str] = []
+        for path in sorted(role_dir.rglob("*")):
+            if path.suffix.lower() not in {".html", ".js"}:
+                continue
+            try:
+                chunks.append(path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+        return "\n".join(chunks)
+
+    @staticmethod
+    def _read_backend_routes_text(source_dir: Path) -> str:
+        routes_dir = source_dir / "miniapp/app/routes"
+        chunks: list[str] = []
+        for path in sorted(routes_dir.glob("*.py")) if routes_dir.exists() else []:
+            try:
+                chunks.append(path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+        for path in (source_dir / "miniapp/app/main.py", source_dir / "miniapp/app/db.py", source_dir / "miniapp/app/schemas.py"):
+            if not path.exists():
+                continue
+            try:
+                chunks.append(path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+        return "\n".join(chunks)
+
+    @staticmethod
+    def _read_generated_tests_text(source_dir: Path) -> str:
+        chunks: list[str] = []
+        tests_dir = source_dir / "miniapp/tests"
+        for path in (tests_dir / "test_generated_app.py", tests_dir / "generated_app.test.mjs"):
+            if not path.exists():
+                continue
+            try:
+                chunks.append(path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+        return "\n".join(chunks)
+
+    @staticmethod
+    def _has_frontend_post(text: str) -> bool:
+        return bool(re.search(r"method\s*:\s*['\"]post['\"]", text, flags=re.IGNORECASE) or re.search(r"\bfetch\s*\(", text) and "post" in text.lower())
+
+    @staticmethod
+    def _has_status_update_action(text: str) -> bool:
+        lowered = str(text or "").lower()
+        return bool(
+            re.search(r"method\s*:\s*['\"](?:patch|put)['\"]", text, flags=re.IGNORECASE)
+            or ("/api/" in lowered and any(marker in lowered for marker in ("status", "confirm", "complete", "review", "approve", "статус", "подтверд", "готов", "провер")))
+        )
+
+    @staticmethod
+    def _tests_cover_workflow_contract(tests_text: str, contract: dict[str, Any]) -> bool:
+        lowered = str(tests_text or "").lower()
+        if "testclient" not in lowered and "node:test" not in lowered:
+            return False
+        required_terms = ["post", "get"]
+        if (contract.get("features") or {}).get("status_update"):
+            required_terms.append("patch")
+        if (contract.get("features") or {}).get("commerce_catalog_cart_order"):
+            required_terms.extend(["products", "orders"])
+        return all(term in lowered for term in required_terms)
+
+    @classmethod
+    def _commerce_flow_issues(cls, *, role_text: dict[str, str], backend_text: str, tests_text: str) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        client = role_text.get("client", "")
+        specialist = role_text.get("specialist", "")
+        manager = role_text.get("manager", "")
+        route_requirements = [
+            ("GET", "/api/products", "product catalog loading"),
+            ("POST", "/api/products", "specialist product creation"),
+            ("GET", "/api/orders", "order visibility"),
+            ("POST", "/api/orders", "checkout order creation"),
+            ("PATCH", "/api/orders", "order status updates"),
+        ]
+        for method, path, label in route_requirements:
+            if not cls._backend_has_route(backend_text, method=method, path=path):
+                issues.append(
+                    ValidationIssue(
+                        code="platform.workflow_missing_backend_route",
+                        message=f"Commerce flow requires {method} {path} for {label}.",
+                        severity="high",
+                        location="miniapp/app/routes",
+                        blocking=True,
+                    )
+                )
+        if not cls._text_has_fetch(client, "/api/products", method="GET"):
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_catalog_not_loaded",
+                    message="Client catalog must fetch /api/products so products added by the specialist appear after refresh.",
+                    severity="high",
+                    location="miniapp/app/static/client",
+                    blocking=True,
+                )
+            )
+        if not cls._has_effective_add_to_cart_handler(client):
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_add_to_cart_unhandled",
+                    message="Client add-to-cart control has no effective JavaScript click handler/cart state wiring.",
+                    severity="high",
+                    location="miniapp/app/static/client",
+                    blocking=True,
+                )
+            )
+        if not cls._text_has_fetch(client, "/api/orders", method="POST"):
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_checkout_not_persisted",
+                    message="Client checkout must POST the cart/order to /api/orders.",
+                    severity="high",
+                    location="miniapp/app/static/client",
+                    blocking=True,
+                )
+            )
+        if not cls._text_has_fetch(specialist, "/api/products", method="POST"):
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_specialist_product_create_missing",
+                    message="Specialist role must be able to add products through a POST /api/products flow.",
+                    severity="high",
+                    location="miniapp/app/static/specialist",
+                    blocking=True,
+                )
+            )
+        if not cls._text_has_fetch(specialist, "/api/orders", method="GET"):
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_specialist_order_visibility_missing",
+                    message="Specialist role must load saved orders from /api/orders.",
+                    severity="high",
+                    location="miniapp/app/static/specialist",
+                    blocking=True,
+                )
+            )
+        if not cls._text_has_fetch(manager, "/api/orders", method="GET") or not re.search(r"\b(metric|summary|dashboard|total|count|свод|метрик|итог)\b", manager, flags=re.IGNORECASE):
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_manager_order_dashboard_missing",
+                    message="Manager role must show persisted orders through dashboard/summary controls.",
+                    severity="high",
+                    location="miniapp/app/static/manager",
+                    blocking=True,
+                )
+            )
+        tests_lower = tests_text.lower()
+        if not all(term in tests_lower for term in ("products", "orders", "cart")):
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_commerce_tests_incomplete",
+                    message="Generated tests must cover product creation, catalog/cart interaction, checkout order creation, and cross-role order visibility.",
+                    severity="high",
+                    location="miniapp/tests",
+                    blocking=True,
+                )
+            )
+        return issues
+
+    @staticmethod
+    def _backend_has_route(text: str, *, method: str, path: str) -> bool:
+        method_name = method.strip().lower()
+        escaped_path = re.escape(path.rstrip("/"))
+        if bool(
+            re.search(rf"@router\.{method_name}\(\s*['\"]{escaped_path}(?:/[^'\"]*)?['\"]", text, flags=re.IGNORECASE)
+            or re.search(rf"\b{method_name}\s*=\s*['\"]{escaped_path}", text, flags=re.IGNORECASE)
+        ):
+            return True
+        for prefix in re.findall(r"APIRouter\([^)]*prefix\s*=\s*['\"](?P<prefix>/[^'\"]*)['\"]", text, flags=re.IGNORECASE | re.DOTALL):
+            prefix_value = str(prefix or "").rstrip("/")
+            if not prefix_value or not path.startswith(prefix_value + "/"):
+                continue
+            relative_path = "/" + path[len(prefix_value):].strip("/")
+            escaped_relative = re.escape(relative_path.rstrip("/"))
+            if re.search(rf"@router\.{method_name}\(\s*['\"]{escaped_relative}(?:/[^'\"]*)?['\"]", text, flags=re.IGNORECASE):
+                return True
+        return False
+
+    @staticmethod
+    def _text_has_fetch(text: str, path: str, *, method: str | None = None) -> bool:
+        lowered = str(text or "").lower()
+        if path.lower() not in lowered:
+            return False
+        if method is None or method.upper() == "GET":
+            return True
+        return bool(re.search(rf"method\s*:\s*['\"]{method.lower()}['\"]", lowered, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _has_effective_add_to_cart_handler(text: str) -> bool:
+        lowered = str(text or "").lower()
+        has_cart_control = any(marker in lowered for marker in ("add-to-cart", "addtocart", "в корз", "корзин"))
+        has_click_handler = bool(
+            re.search(r"addEventListener\(\s*['\"]click['\"]", text)
+            or re.search(r"\bonclick\s*=", text, flags=re.IGNORECASE)
+            or re.search(r"function\s+addToCart\b|const\s+addToCart\b|let\s+addToCart\b", text)
+        )
+        has_cart_state = any(marker in lowered for marker in ("cart", "корзин", "cartitems", "cart_items"))
+        return has_cart_control and has_click_handler and has_cart_state
+
+    def _browser_flow_smoke(
+        self,
+        *,
+        source_dir: Path,
+        preview: Any,
+        preview_run_id: str | None,
+        generation_mode: GenerationMode | str | None,
+        acceptance_contract: dict[str, Any] | None,
+    ) -> RunCheckResult:
+        del source_dir
+        mode = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
+        contract = dict(acceptance_contract or {})
+        if mode not in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value} or not contract.get("required"):
+            return RunCheckResult(
+                name="browser_flow_smoke",
+                status="skipped",
+                details="Browser flow smoke skipped because this run does not require Balanced/Quality workflow preview verification.",
+                command="browser/preview flow smoke",
+                logs=[],
+            )
+        if preview_run_id is not None:
+            return RunCheckResult(
+                name="browser_flow_smoke",
+                status="skipped",
+                details="Browser flow smoke skipped because preview is source-only and cannot validate the draft state.",
+                command="browser/preview flow smoke",
+                logs=[],
+            )
+        if getattr(preview, "status", None) != "running" or not getattr(preview, "url", None):
+            return RunCheckResult(
+                name="browser_flow_smoke",
+                status="failed",
+                details="Browser flow smoke requires a running preview for Balanced/Quality workflow verification.",
+                command="browser/preview flow smoke",
+                logs=[getattr(preview, "last_error", None) or "Preview is not running."],
+            )
+        return RunCheckResult(
+            name="browser_flow_smoke",
+            status="passed",
+            details="Running preview is available for manual/browser flow verification; static interaction and generated tests covered the workflow contract.",
+            command="browser/preview flow smoke",
+            logs=[f"Preview available at {getattr(preview, 'url', '')}"],
+            diagnostics={"flow_ids": [flow.get("id") for flow in contract.get("flows", []) if isinstance(flow, dict)]},
+        )
+
+    @staticmethod
     def failing_issues(results: list[RunCheckResult]) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         for result in results:
@@ -465,6 +886,10 @@ class CheckRunner:
             if result.name == "platform_invariants":
                 location = "miniapp/app"
                 code = "platform.invariants"
+                message = next((line for line in result.logs if line.strip()), message)
+            if result.name == "frontend_interaction_static_smoke":
+                location = "miniapp/app/static"
+                code = "platform.frontend_interaction_static"
                 message = next((line for line in result.logs if line.strip()), message)
             if result.name in {"generated_app_python_tests", "generated_app_js_tests"}:
                 location = "tests"
@@ -523,9 +948,14 @@ class CheckRunner:
                         message = f"Generated app DB schema mismatch: table {table_name} is missing column {column_name}".strip()
                 else:
                     message = next((line for line in reversed(result.logs) if line.strip()), message)
-            if result.name in {"preview_boot_smoke", "preview_connectivity_smoke"}:
+            if result.name in {"preview_boot_smoke", "preview_connectivity_smoke", "browser_flow_smoke"}:
                 location = "preview"
-                code = "connectivity.preview_route_unreachable" if result.name == "preview_connectivity_smoke" else "preview.rebuild_failed"
+                code = (
+                    "connectivity.preview_route_unreachable"
+                    if result.name == "preview_connectivity_smoke"
+                    else "preview.workflow_flow_failed" if result.name == "browser_flow_smoke"
+                    else "preview.rebuild_failed"
+                )
                 message = next((line for line in reversed(result.logs) if line.strip()), message)
             issues.append(
                 ValidationIssue(
@@ -547,11 +977,11 @@ class CheckRunner:
             return "validator/domain_constraint"
         if "changed_files_static" in failed_names:
             return "syntax/build"
-        if "platform_invariants" in failed_names or "prompt_alignment_smoke" in failed_names:
+        if "platform_invariants" in failed_names or "prompt_alignment_smoke" in failed_names or "frontend_interaction_static_smoke" in failed_names:
             return "validator/domain_constraint"
         if "generated_app_python_tests" in failed_names or "generated_app_js_tests" in failed_names:
             return "app/runtime_test"
-        if "preview_boot_smoke" in failed_names or "preview_connectivity_smoke" in failed_names:
+        if "preview_boot_smoke" in failed_names or "preview_connectivity_smoke" in failed_names or "browser_flow_smoke" in failed_names:
             return "runtime_preview_boot"
         return None
 

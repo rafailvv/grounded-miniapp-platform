@@ -4,8 +4,10 @@ from pathlib import Path
 
 from app.models.common import GenerationMode
 from app.models.domain import (
+    CheckExecutionRecord,
     JobRecord,
     RepairIterationRecord,
+    RunCheckResult,
     RunIterationOperation,
     RunIterationRecord,
     utc_now,
@@ -114,30 +116,75 @@ class WorkspaceLoopTurnRunner:
                 )
 
             has_file_edits = bool(all_operations)
-            callbacks.append_event(
-                job,
-                "running_checks",
-                "Running validation and generated app checks.",
-                {"attempt": attempt, "has_file_edits": has_file_edits},
-            )
-            callbacks.append_event(
-                job,
-                "build_started",
-                "Build validation started.",
-                {"attempt": attempt, "has_file_edits": has_file_edits},
-            )
-            latest_execution, latest_preview_details = callbacks.execute_checks(changed_files)
-            validation_snapshot = callbacks.build_validation_snapshot(latest_execution)
-            completion_state = callbacks.completion_state(
-                latest_execution.results,
-                latest_preview_details,
-                validation_snapshot=validation_snapshot,
-            )
-            progress_snapshot = self.feedback.progress_snapshot(
-                latest_execution.results,
-                latest_preview_details,
-                validation_snapshot,
-            )
+            skip_initial_checks = bool(callbacks.skip_initial_checks and attempt == 0 and not has_file_edits)
+            if skip_initial_checks:
+                callbacks.append_event(
+                    job,
+                    "running_checks",
+                    "Skipping initial checks for a focused edit; validating after the first patch.",
+                    {"attempt": attempt, "has_file_edits": False, "skipped_initial_checks": True},
+                )
+                latest_execution = CheckExecutionRecord(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    changed_files=list(changed_files),
+                    results=[
+                        RunCheckResult(
+                            name="initial_focused_edit_pending",
+                            status="failed",
+                            details="Initial focused edit checks were skipped until after the first CSS patch.",
+                            command="focused edit precheck shortcut",
+                            logs=[],
+                        )
+                    ],
+                    started_at=utc_now(),
+                    completed_at=utc_now(),
+                    duration_ms=0,
+                )
+                latest_preview_details = {}
+                validation_snapshot = callbacks.build_validation_snapshot(latest_execution)
+                completion_state = {
+                    "strict_green": False,
+                    "optimistic_complete": False,
+                    "remaining_issues": [
+                        {
+                            "kind": "focused_edit_pending",
+                            "check": "initial_focused_edit_pending",
+                            "details": "Focused edit must produce a patch before validation can pass.",
+                            "blocking": True,
+                        }
+                    ],
+                }
+                progress_snapshot = self.feedback.progress_snapshot(
+                    latest_execution.results,
+                    latest_preview_details,
+                    validation_snapshot,
+                )
+            else:
+                callbacks.append_event(
+                    job,
+                    "running_checks",
+                    "Running validation and generated app checks.",
+                    {"attempt": attempt, "has_file_edits": has_file_edits},
+                )
+                callbacks.append_event(
+                    job,
+                    "build_started",
+                    "Build validation started.",
+                    {"attempt": attempt, "has_file_edits": has_file_edits},
+                )
+                latest_execution, latest_preview_details = callbacks.execute_checks(changed_files)
+                validation_snapshot = callbacks.build_validation_snapshot(latest_execution)
+                completion_state = callbacks.completion_state(
+                    latest_execution.results,
+                    latest_preview_details,
+                    validation_snapshot=validation_snapshot,
+                )
+                progress_snapshot = self.feedback.progress_snapshot(
+                    latest_execution.results,
+                    latest_preview_details,
+                    validation_snapshot,
+                )
             previous_signature = self.feedback.progress_signature(previous_snapshot) if previous_snapshot is not None else None
             current_signature = self.feedback.progress_signature(progress_snapshot)
             signature_changed = previous_signature is not None and current_signature != previous_signature

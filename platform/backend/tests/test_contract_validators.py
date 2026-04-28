@@ -8,6 +8,7 @@ from app.main import create_app
 from app.models.common import GenerationMode
 from app.models.domain import RunCheckResult, WorkspaceRecord
 from app.services.check_runner import CheckRunner
+from app.services.workflow_acceptance import build_acceptance_contract
 from app.services.workspace.preview_service import PreviewService
 from app.validators.build_validator import BuildValidator
 from app.validators.connectivity_validator import ConnectivityValidator
@@ -584,6 +585,170 @@ def test_focused_css_edit_check_profile_skips_generated_tests_and_preview(tmp_pa
     assert results["generated_app_js_tests"].status == "skipped"
     assert results["preview_boot_smoke"].status == "skipped"
     assert results["preview_connectivity_smoke"].status == "skipped"
+    assert results["browser_flow_smoke"].status == "skipped"
+
+
+def _write_commerce_flow_source(source_dir: Path, *, handled_cart: bool) -> None:
+    client_dir = source_dir / "miniapp/app/static/client"
+    specialist_dir = source_dir / "miniapp/app/static/specialist"
+    manager_dir = source_dir / "miniapp/app/static/manager"
+    for directory in (client_dir, specialist_dir, manager_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    client_dir.joinpath("index.html").write_text(
+        "<button data-action='add-to-cart'>В корзину</button><button id='checkout'>Оформить заказ</button>",
+        encoding="utf-8",
+    )
+    client_js = (
+        "const cart = [];\n"
+        "fetch('/api/products');\n"
+        "document.addEventListener('click', (event) => { if (event.target.matches('[data-action=\"add-to-cart\"]')) { cart.push('product'); } });\n"
+        "fetch('/api/orders', { method: 'POST', body: JSON.stringify({ items: cart }) });\n"
+        if handled_cart
+        else "const cart = [];\nfetch('/api/products');\nfetch('/api/orders', { method: 'POST', body: JSON.stringify({ items: cart }) });\n"
+    )
+    client_dir.joinpath("app.js").write_text(client_js, encoding="utf-8")
+    specialist_dir.joinpath("index.html").write_text("<form id='product-form'></form><section id='orders'></section>", encoding="utf-8")
+    specialist_dir.joinpath("app.js").write_text(
+        "fetch('/api/products', { method: 'POST', body: JSON.stringify({ name: 'test' }) });\n"
+        "fetch('/api/orders');\n"
+        "fetch('/api/orders/1', { method: 'PATCH', body: JSON.stringify({ status: 'packed' }) });\n",
+        encoding="utf-8",
+    )
+    manager_dir.joinpath("index.html").write_text("<section>Dashboard summary total count</section>", encoding="utf-8")
+    manager_dir.joinpath("app.js").write_text(
+        "fetch('/api/orders');\nfetch('/api/orders/1', { method: 'PATCH', body: JSON.stringify({ status: 'reviewed' }) });\n",
+        encoding="utf-8",
+    )
+    routes_dir = source_dir / "miniapp/app/routes"
+    routes_dir.mkdir(parents=True, exist_ok=True)
+    routes_dir.joinpath("store.py").write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        "@router.get('/api/products')\n"
+        "def products(): return []\n"
+        "@router.post('/api/products')\n"
+        "def create_product(payload: dict): return payload\n"
+        "@router.patch('/api/products/{product_id}')\n"
+        "def patch_product(product_id: str, payload: dict): return payload\n"
+        "@router.get('/api/orders')\n"
+        "def orders(): return []\n"
+        "@router.post('/api/orders')\n"
+        "def create_order(payload: dict): return payload\n"
+        "@router.patch('/api/orders/{order_id}')\n"
+        "def patch_order(order_id: str, payload: dict): return payload\n",
+        encoding="utf-8",
+    )
+    tests_dir = source_dir / "miniapp/tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    tests_dir.joinpath("test_generated_app.py").write_text(
+        "from fastapi.testclient import TestClient\n# GET POST PATCH products orders cart\n",
+        encoding="utf-8",
+    )
+    tests_dir.joinpath("generated_app.test.mjs").write_text(
+        "import test from 'node:test';\n// products orders cart GET POST PATCH\n",
+        encoding="utf-8",
+    )
+
+
+def test_frontend_interaction_static_smoke_rejects_unhandled_cart_button(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_commerce_flow_source(source_dir, handled_cart=False)
+    contract = build_acceptance_contract(
+        prompt="Интернет-магазин: специалист добавляет товар, клиент кладет в корзину и оформляет заказ",
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._frontend_interaction_static_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/app.js"],
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+        acceptance_contract=contract,
+    )
+
+    assert result.status == "failed"
+    assert "platform.workflow_add_to_cart_unhandled" in "\n".join(result.logs)
+
+
+def test_frontend_interaction_static_smoke_accepts_complete_commerce_flow(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_commerce_flow_source(source_dir, handled_cart=True)
+    contract = build_acceptance_contract(
+        prompt="Интернет-магазин: специалист добавляет товар, клиент кладет в корзину и оформляет заказ",
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._frontend_interaction_static_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/app.js"],
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+        acceptance_contract=contract,
+    )
+
+    assert result.status == "passed"
+
+
+def test_fast_gate_runs_generated_tests_for_create_workflow(monkeypatch, tmp_path: Path) -> None:
+    class FakeValidationSuite:
+        def validate_build(self, workspace_path: Path):
+            del workspace_path
+            return []
+
+        def validate_connectivity(self, workspace_path: Path):
+            del workspace_path
+            return []
+
+    runner = CheckRunner(FakeValidationSuite(), object())  # type: ignore[arg-type]
+    calls: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "_static_check",
+        lambda source_dir, changed_files: RunCheckResult(name="changed_files_static", status="passed", logs=["static"]),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_platform_invariants_smoke",
+        lambda **kwargs: RunCheckResult(name="platform_invariants", status="passed", logs=["platform"]),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_frontend_interaction_static_smoke",
+        lambda **kwargs: RunCheckResult(name="frontend_interaction_static_smoke", status="passed", logs=["flow"]),
+    )
+
+    def fake_python(_backend_dir, *, require_present=False):
+        calls.append(f"python:{require_present}")
+        return RunCheckResult(name="generated_app_python_tests", status="passed", logs=["python"])
+
+    def fake_js(_backend_dir, *, require_present=False):
+        calls.append(f"js:{require_present}")
+        return RunCheckResult(name="generated_app_js_tests", status="passed", logs=["js"])
+
+    monkeypatch.setattr(runner, "_run_python_app_tests", fake_python)
+    monkeypatch.setattr(runner, "_run_js_app_tests", fake_js)
+
+    execution = runner.run(
+        workspace_id="ws",
+        run_id="run",
+        source_dir=tmp_path,
+        changed_files=["miniapp/app/static/client/app.js"],
+        scope_mode="agentic",
+        check_profile="fast_gate",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract={"required": True, "features": {"status_update": True}, "flows": []},
+    )
+
+    results = {result.name: result for result in execution.results}
+    assert calls == ["python:True", "js:True"]
+    assert results["generated_app_python_tests"].status == "passed"
+    assert results["generated_app_js_tests"].status == "passed"
+    assert results["preview_boot_smoke"].status == "skipped"
 
 
 def test_agentic_platform_invariants_reject_single_page_role_surfaces(tmp_path: Path) -> None:
