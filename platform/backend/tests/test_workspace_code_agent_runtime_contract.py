@@ -115,6 +115,137 @@ def test_visual_style_edit_uses_focused_css_contract() -> None:
     assert schema["properties"]["operations"]["items"]["properties"]["content"]["maxLength"] == FOCUSED_VISUAL_CONTENT_MAX_LENGTH
 
 
+def test_patch_first_converts_large_existing_file_replace_for_edits() -> None:
+    runtime = object.__new__(WorkspaceCodeAgentRuntime)
+    before = "\n".join(f"line {index}" for index in range(600)) + "\n"
+    after = before.replace("line 300", "line 300 changed")
+    runtime.workspace_service = SimpleNamespace(try_read_text_file=lambda *_args, **_kwargs: before)
+
+    operations = runtime._enforce_patch_first_operations(
+        [
+            DraftFileOperation(
+                file_path="miniapp/app/static/client/app.js",
+                operation="replace",
+                content=after,
+                reason="Small behavior edit.",
+            )
+        ],
+        request=GenerateRequest(prompt="Исправь кнопку", intent="edit"),
+        workspace_id="ws",
+        run_id="run",
+    )
+
+    assert operations[0].operation == "patch"
+    assert operations[0].content is None
+    assert "--- a/miniapp/app/static/client/app.js" in str(operations[0].diff)
+    assert "+line 300 changed" in str(operations[0].diff)
+
+
+def test_patch_first_allows_create_and_tiny_existing_replace() -> None:
+    runtime = object.__new__(WorkspaceCodeAgentRuntime)
+    runtime.workspace_service = SimpleNamespace(try_read_text_file=lambda *_args, **_kwargs: "small\n")
+    operation = DraftFileOperation(
+        file_path="miniapp/app/static/client/index.html",
+        operation="replace",
+        content="small changed\n",
+        reason="Tiny page update.",
+    )
+
+    edit_ops = runtime._enforce_patch_first_operations(
+        [operation],
+        request=GenerateRequest(prompt="Переименуй заголовок", intent="edit"),
+        workspace_id="ws",
+        run_id="run",
+    )
+    create_ops = runtime._enforce_patch_first_operations(
+        [operation],
+        request=GenerateRequest(prompt="Создай приложение", intent="create"),
+        workspace_id="ws",
+        run_id="run",
+    )
+
+    assert edit_ops[0].operation == "replace"
+    assert create_ops[0].operation == "replace"
+
+
+def test_state_store_shards_heavy_reports_and_job_events(tmp_path) -> None:
+    store = StateStore(tmp_path / "platform-state.json")
+    events = [
+        JobEvent(event_type="running_checks", message=f"check {index}", details={"check_step": "x"}).model_dump(mode="json")
+        for index in range(StateStore.JOB_EVENT_SHARD_MIN_COUNT + 5)
+    ]
+    job = JobRecord(
+        workspace_id="ws_shard",
+        prompt="Build a catalog",
+        target_platform=TargetPlatform.TELEGRAM,
+        preview_profile=PreviewProfile.TELEGRAM_MOCK,
+        events=[JobEvent.model_validate(event) for event in events],
+    )
+
+    store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
+    store.upsert("reports", "run_artifacts:run_shard", {"workspace_id": "ws_shard", "diff": "x" * 4096})
+
+    raw_state = store._read()
+    raw_job = raw_state["jobs"][job.job_id]
+    raw_report = raw_state["reports"]["run_artifacts:run_shard"]
+    assert raw_job["event_storage_ref"].startswith("state-shards/job_events/")
+    assert len(raw_job["events"]) <= StateStore.JOB_EVENT_TAIL_LIMIT
+    assert raw_report["__sharded__"] is True
+
+    hydrated_job = store.get("jobs", job.job_id)
+    hydrated_report = store.get("reports", "run_artifacts:run_shard")
+    assert hydrated_job is not None and len(hydrated_job["events"]) == len(events)
+    assert hydrated_report == {"workspace_id": "ws_shard", "diff": "x" * 4096}
+
+
+def test_safe_copy_and_visual_edits_do_not_wait_for_preview_refresh() -> None:
+    visual = CreateRunRequest(prompt="Поменяй цвета и отступы", intent="edit")
+    copy = CreateRunRequest(prompt="Переименуй заголовок заказа", intent="edit")
+    behavior = CreateRunRequest(prompt="Не работает кнопка в корзину", intent="edit")
+    run = RunRecord(
+        workspace_id="ws",
+        prompt="",
+        intent="edit",
+        generation_mode=GenerationMode.FAST,
+    )
+
+    assert RunService._should_wait_for_preview_refresh(visual, run) is False
+    assert RunService._should_wait_for_preview_refresh(copy, run) is False
+    assert RunService._should_wait_for_preview_refresh(behavior, run) is True
+
+
+def test_noisy_check_progress_events_are_compacted() -> None:
+    assert WorkspaceCodeAgentRuntime._is_noisy_check_progress_event(
+        "final_checks_started",
+        {"check_step": "generated_app_js_tests", "check_status": "skipped"},
+    )
+    assert WorkspaceCodeAgentRuntime._is_noisy_check_progress_event(
+        "backend_compile_started",
+        {"check_step": "changed_files_static", "check_status": "passed"},
+    )
+    assert not WorkspaceCodeAgentRuntime._is_noisy_check_progress_event(
+        "final_checks_started",
+        {"check_step": "generated_app_js_tests", "check_status": "failed"},
+    )
+
+
+def test_compact_edit_tuning_reduces_output_budget() -> None:
+    copy_tuning = WorkspaceCodeAgentRuntime._agent_turn_tuning(
+        GenerationMode.FAST,
+        intent="edit",
+        focused_edit_kind="small_copy_edit",
+    )
+    standard_tuning = WorkspaceCodeAgentRuntime._agent_turn_tuning(
+        GenerationMode.FAST,
+        intent="edit",
+        focused_edit_kind="standard",
+    )
+
+    assert copy_tuning["reasoning"]["effort"] == "low"
+    assert copy_tuning["max_output_tokens"] <= 12000
+    assert standard_tuning["max_output_tokens"] <= 14000
+
+
 def test_platform_shell_stabilizer_restores_safe_top_spacing(tmp_path) -> None:
     source_dir = tmp_path / "source"
     base_path = source_dir / "miniapp/app/static/shared/base.css"
@@ -1514,7 +1645,7 @@ def test_agent_turn_tuning_caps_all_generation_modes() -> None:
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.FAST, intent="edit") == {
         "reasoning": {"effort": "low"},
-        "max_output_tokens": 16000,
+        "max_output_tokens": 14000,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.FAST) == {
         "reasoning": {"effort": "low"},

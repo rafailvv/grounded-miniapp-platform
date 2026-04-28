@@ -209,6 +209,7 @@ class RunService:
             apply_status="pending",
             current_stage="queued",
             progress_percent=2,
+            storage_version=2,
         )
         self._save_run(run)
         self.store.delete("reports", f"run_stop_request:{run.run_id}")
@@ -614,6 +615,11 @@ class RunService:
             for attr in ("acceptance_contract", "flow_coverage"):
                 if not getattr(run, attr, None) and isinstance(existing.get(attr), dict):
                     setattr(run, attr, dict(existing.get(attr) or {}))
+            for attr in ("event_storage_ref", "artifact_storage_ref"):
+                if not getattr(run, attr, None) and existing.get(attr):
+                    setattr(run, attr, str(existing.get(attr) or ""))
+            if int(existing.get("storage_version") or 0) > int(run.storage_version or 0):
+                run.storage_version = int(existing.get("storage_version") or run.storage_version)
             try:
                 run.iteration_count = max(int(run.iteration_count or 0), int(existing.get("iteration_count") or 0))
             except (TypeError, ValueError):
@@ -685,6 +691,12 @@ class RunService:
                 changed = True
             if not run.linked_job_id:
                 run.linked_job_id = job.job_id
+                changed = True
+            if job.event_storage_ref and run.event_storage_ref != job.event_storage_ref:
+                run.event_storage_ref = job.event_storage_ref
+                changed = True
+            if job.storage_version and job.storage_version > run.storage_version:
+                run.storage_version = job.storage_version
                 changed = True
             if run.status in {"failed", "blocked"} and self._is_generic_failure_reason(run.failure_reason):
                 specific = self._specific_failure_reason_from_job(job)
@@ -1011,16 +1023,20 @@ class RunService:
                         )
                     preview = self.preview_service.get(run.workspace_id)
                     if run.status == "completed" and run.apply_status == "applied":
-                        run.status = "running"
-                        run.current_stage = "refreshing preview"
-                        run.progress_percent = self._preview_refresh_progress(run.progress_percent)
+                        wait_for_preview = self._should_wait_for_preview_refresh(request, run)
+                        if wait_for_preview:
+                            run.status = "running"
+                            run.current_stage = "refreshing preview"
+                            run.progress_percent = self._preview_refresh_progress(run.progress_percent)
+                        else:
+                            run.preview_refresh_status = "running"
                         self._save_run(run)
                         preview = self._queue_preview_refresh(
                             run,
                             reason="run completion",
                             draft_run_id=None,
                             followup_request=request if should_queue_followup_verification else None,
-                            wait=True,
+                            wait=wait_for_preview,
                         )
                     self._save_run(run)
                     self._store_run_artifacts(run, change_plan, job, preview)
@@ -1092,16 +1108,20 @@ class RunService:
                         auto_fix_status="skipped",
                     )
             if queue_preview_reason is not None:
-                run.status = "running"
-                run.current_stage = "refreshing preview"
-                run.progress_percent = self._preview_refresh_progress(run.progress_percent)
+                wait_for_preview = self._should_wait_for_preview_refresh(request, run)
+                if wait_for_preview:
+                    run.status = "running"
+                    run.current_stage = "refreshing preview"
+                    run.progress_percent = self._preview_refresh_progress(run.progress_percent)
+                else:
+                    run.preview_refresh_status = "running"
                 self._save_run(run)
                 preview = self._queue_preview_refresh(
                     run,
                     reason=queue_preview_reason,
                     draft_run_id=None,
                     followup_request=request if should_queue_followup_verification else None,
-                    wait=True,
+                    wait=wait_for_preview,
                 )
             self._save_run(run)
             self._store_run_artifacts(run, change_plan, job, preview)
@@ -1326,8 +1346,10 @@ class RunService:
                 checks_summary = dict(run_payload.get("checks_summary") or {})
                 if preview.status == "running":
                     checks_summary["preview"] = "passed"
+                    run_payload["preview_refresh_status"] = "passed"
                 elif preview.status == "error":
                     checks_summary["preview"] = "failed"
+                    run_payload["preview_refresh_status"] = "failed"
                 if checks_summary:
                     run_payload["checks_summary"] = checks_summary
                 run_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1360,6 +1382,7 @@ class RunService:
             run.checks_summary = self._copy_checks_summary(run.checks_summary, preview="passed")
             run.current_stage = "completed"
             run.progress_percent = 100
+            run.preview_refresh_status = "passed"
         elif wait:
             run.status = "blocked"
             run.outcome_kind = "blocked_preview_infra"
@@ -1367,6 +1390,9 @@ class RunService:
             run.current_stage = "preview failed"
             run.progress_percent = self._terminal_failure_progress(run.progress_percent)
             run.checks_summary = self._copy_checks_summary(run.checks_summary, preview="failed")
+            run.preview_refresh_status = "failed"
+        elif run.preview_refresh_status == "pending":
+            run.preview_refresh_status = "running"
         run.updated_at = datetime.now(timezone.utc)
         self._save_run(run)
         artifacts_payload = self.store.get("reports", f"run_artifacts:{run.run_id}")
@@ -1780,6 +1806,9 @@ class RunService:
             },
         }
         self.store.upsert("reports", f"run_artifacts:{run.run_id}", payload)
+        run.storage_version = 2
+        run.artifact_storage_ref = self.store.expected_storage_ref("reports", f"run_artifacts:{run.run_id}")
+        self._save_run(run)
 
     def _resolve_intent(self, workspace: WorkspaceRecord, request: CreateRunRequest, *, resolved_role_scope: list[str] | None = None) -> str:
         if request.intent != "auto":
@@ -2347,6 +2376,25 @@ class RunService:
     def _should_queue_async_followup_verification(request: CreateRunRequest, run: RunRecord) -> bool:
         del request, run
         return False
+
+    @staticmethod
+    def _should_wait_for_preview_refresh(request: CreateRunRequest, run: RunRecord) -> bool:
+        if str(run.intent or "").strip().lower() not in {"edit", "refine", "role_only_change"}:
+            return True
+        probe = GenerateRequest(
+            prompt=request.prompt,
+            mode=request.mode,
+            target_platform=request.target_platform,
+            preview_profile=request.preview_profile,
+            generation_mode=run.generation_mode,
+            intent=run.intent,
+            target_role_scope=run.target_role_scope,
+            model_profile=run.model_profile,
+            linked_run_id=run.run_id,
+            resume_from_run_id=request.resume_from_run_id,
+            error_context=request.error_context,
+        )
+        return WorkspaceCodeAgentRuntime._focused_edit_kind(probe) not in {"visual_style_edit", "small_copy_edit"}
 
     def _should_apply_best_effort_after_failed_repairs(self, run: RunRecord, job: Any, *, meaningful_paths: list[str]) -> bool:
         del run, job, meaningful_paths

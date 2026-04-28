@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from datetime import datetime, timezone
+import difflib
 import json
 import logging
 import re
@@ -65,6 +66,8 @@ FAST_PARALLEL_WORKER_CONTENT_MAX_LENGTH = 14000
 FOCUSED_VISUAL_OPERATION_LIMIT = 4
 FOCUSED_VISUAL_CONTENT_MAX_LENGTH = 12000
 FOCUSED_VISUAL_MAX_ATTEMPTS = 2
+PATCH_FIRST_EXISTING_FILE_CHAR_LIMIT = 2500
+PATCH_FIRST_EXISTING_FILE_LINE_LIMIT = 120
 FOCUSED_VISUAL_STYLE_MARKERS = (
     "background",
     "border",
@@ -529,6 +532,73 @@ class WorkspaceCodeAgentRuntime:
                     html_path.write_text(updated, encoding="utf-8")
                     stabilized.append(html_path.relative_to(source_dir).as_posix())
         return list(dict.fromkeys(stabilized))
+
+    def _enforce_patch_first_operations(
+        self,
+        operations: list[DraftFileOperation],
+        *,
+        request: GenerateRequest,
+        workspace_id: str,
+        run_id: str,
+    ) -> list[DraftFileOperation]:
+        if str(request.intent or "").strip().lower() == "create":
+            return list(operations)
+        normalized: list[DraftFileOperation] = []
+        for operation in operations:
+            if operation.operation not in {"create", "replace"}:
+                normalized.append(operation)
+                continue
+            new_content = operation.content
+            if new_content is None:
+                normalized.append(operation)
+                continue
+            current_content = self.workspace_service.try_read_text_file(workspace_id, operation.file_path, run_id=run_id)
+            if current_content is None:
+                normalized.append(operation)
+                continue
+            if self._patch_first_allows_full_replace(operation, current_content):
+                normalized.append(operation)
+                continue
+            diff = self._unified_diff_for_existing_file(operation.file_path, current_content, new_content)
+            if not diff.strip():
+                normalized.append(operation)
+                continue
+            normalized.append(
+                DraftFileOperation(
+                    operation_id=operation.operation_id,
+                    file_path=operation.file_path,
+                    operation="patch",
+                    diff=diff,
+                    content=None,
+                    reason=f"{operation.reason} Converted to patch-first diff for existing file.",
+                )
+            )
+        return normalized
+
+    @staticmethod
+    def _patch_first_allows_full_replace(operation: DraftFileOperation, current_content: str) -> bool:
+        reason = str(operation.reason or "").lower()
+        if any(marker in reason for marker in ("apply conflict", "patch conflict", "hunk", "rejected", "precondition")):
+            return True
+        if len(current_content) <= PATCH_FIRST_EXISTING_FILE_CHAR_LIMIT:
+            return True
+        if len(current_content.splitlines()) <= PATCH_FIRST_EXISTING_FILE_LINE_LIMIT:
+            return True
+        return False
+
+    @staticmethod
+    def _unified_diff_for_existing_file(file_path: str, before: str, after: str) -> str:
+        before_lines = str(before or "").splitlines(keepends=True)
+        after_lines = str(after or "").splitlines(keepends=True)
+        return "".join(
+            difflib.unified_diff(
+                before_lines,
+                after_lines,
+                fromfile=f"a/{file_path}",
+                tofile=f"b/{file_path}",
+                lineterm="\n",
+            )
+        )
 
     @staticmethod
     def _ensure_base_shell_safe_spacing(content: str) -> str:
@@ -1101,7 +1171,12 @@ class WorkspaceCodeAgentRuntime:
             ),
             has_tooling_failure=CheckRunner.has_tooling_failure,
             plan_turn=_plan_turn,
-            apply_contract_sync=lambda operations: list(operations),
+            apply_contract_sync=lambda operations: self._enforce_patch_first_operations(
+                operations,
+                request=request,
+                workspace_id=workspace_id,
+                run_id=run_id,
+            ),
             post_apply_stabilize=self._stabilize_platform_shell,
             append_event=self._append_event,
             append_trace=self._append_trace,
@@ -1736,6 +1811,8 @@ class WorkspaceCodeAgentRuntime:
             fast_first_create_patch = fast_create_turn and not self.workspace_service.diff(workspace_id, run_id=run_id).strip()
             focused_edit_kind = self._focused_edit_kind(request)
             focused_visual_edit = focused_edit_kind == "visual_style_edit"
+            edit_turn = str(request.intent or "").strip().lower() in {"edit", "refine", "role_only_change"}
+            compact_edit_turn = edit_turn and focused_edit_kind in {"small_copy_edit", "behavior_edit", "standard"}
             agentic_workflow_turn = (
                 focused_edit_kind == "behavior_workflow_edit"
                 and generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
@@ -1752,12 +1829,14 @@ class WorkspaceCodeAgentRuntime:
                 FOCUSED_VISUAL_OPERATION_LIMIT
                 if focused_visual_edit
                 else AGENTIC_WORKFLOW_OPERATION_LIMIT if agentic_workflow_turn
+                else 8 if compact_edit_turn
                 else 20 if fast_create_turn else AGENT_TURN_OPERATION_LIMIT
             )
             content_max_length = (
                 FOCUSED_VISUAL_CONTENT_MAX_LENGTH
                 if focused_visual_edit
                 else 24000 if agentic_workflow_turn
+                else 9000 if compact_edit_turn
                 else 9000 if fast_create_turn else 18000
             )
             allow_tool_requests = False if focused_visual_edit else not fast_first_create_patch
@@ -2191,16 +2270,17 @@ class WorkspaceCodeAgentRuntime:
                 "In generated_app.test.mjs, prefer path.join(process.cwd(), 'app/static/<role>/index.html') for fixture paths. If using import.meta.url, wrap new URL(...) with fileURLToPath(...) before passing it to path/fs APIs.",
                 "For edit/refine tasks, update generated tests when the requested behavior changes so the new behavior is covered.",
                 "For edit/refine tasks, preserve existing ids/selectors/data-testid values that tests or existing scripts rely on, unless you update the affected generated test in the same response.",
+                "For edit/refine/fix/repair tasks, use patch-first operations for existing files: return unified hunk diffs instead of whole-file replace whenever the target file already exists.",
+                "For edit/refine/fix/repair tasks, full-file replace is only acceptable for new files, tiny existing files, create-mode work, or one conflicted file after a patch apply conflict.",
                 "For edit/refine tasks, keep the patch focused on one visible slice in the requested role files and usually return 1-2 operations: one small app-code patch plus one generated-test patch when tests need new expectations.",
-                "For edit/refine tasks, keep the response compact; prefer a hunk patch under 200 changed lines over a whole-file rewrite for small feature additions.",
+                "For edit/refine tasks, keep the response compact; prefer a hunk patch under 200 changed lines over a whole-file rewrite for feature additions.",
                 "For edit/refine tasks, do not rewrite the whole app or unrelated files; make the smallest complete visible change that satisfies the prompt.",
                 "If generated_app_python_tests or generated_app_js_tests failed, read the failure logs in latest_checks and patch the app or generated tests so that exact failure changes on the next attempt; do not repeat app-only patches that leave the same generated test failure.",
                 "If role_scope contains only client, prioritize miniapp/app/static/client files and do not change backend unless the prompt explicitly asks for API/data changes.",
                 "If role_scope contains only manager, prioritize miniapp/app/static/manager files and do not change backend unless the prompt explicitly asks for API/data changes.",
-                "For existing HTML/CSS/JS files, use replace with the full resulting file when a hunk patch would be large or ambiguous.",
                 "Every generated HTML route page must include /static/preview_bridge.js; role root pages should place it before the role app script. If a check reports page_missing_preview_bridge, patch only the missing script tag instead of rewriting the whole app.",
                 "If a check reports build.missing_static_page for route_manifest, either create that exact HTML file or remove the route from route_manifest; do not rewrite unrelated pages.",
-                "Prefer targeted patch operations over full-file replace when the file already exists.",
+                "Prefer targeted patch operations over full-file replace when the file already exists; the runtime may convert large existing-file replaces into unified diffs.",
                 "If the latest turn reports a patch apply conflict, return a full-file replace for that conflicted file unless the exact corrected hunk is obvious.",
                 "If you need more context, request list_files/read_files/search_files/inspect_diff/run_checks/run_command.",
                 "Tools are read-only diagnostics. They cannot write files, install packages, fetch networks, or apply edits.",
@@ -2412,8 +2492,10 @@ class WorkspaceCodeAgentRuntime:
     ) -> dict[str, Any]:
         if focused_edit_kind == "visual_style_edit":
             return {"reasoning": {"effort": "low"}, "max_output_tokens": FOCUSED_VISUAL_CONTENT_MAX_LENGTH}
+        if focused_edit_kind in {"small_copy_edit", "behavior_edit"}:
+            return {"reasoning": {"effort": "low"}, "max_output_tokens": 12000}
         if str(intent or "").lower() in {"edit", "refine", "role_only_change"}:
-            return {"reasoning": {"effort": "low"}, "max_output_tokens": 16000}
+            return {"reasoning": {"effort": "low"}, "max_output_tokens": 14000}
         if str(intent or "").lower() == "create":
             if generation_mode == GenerationMode.FAST:
                 return {"reasoning": {"effort": "low"}, "max_output_tokens": 28000}
@@ -5178,9 +5260,35 @@ test('role apps have separate frontend actions and styles', () => {{
                 details,
             )
         job.updated_at = datetime.now(timezone.utc)
-        self._sync_run_progress(job, event_type, message, details)
-        self._save_job(job)
-        self.workspace_log_service.append(job.workspace_id, source=f"agent.{event_type}", message=message, payload=details)
+        noisy_check_event = self._is_noisy_check_progress_event(event_type, details)
+        if not noisy_check_event:
+            self._sync_run_progress(job, event_type, message, details)
+        if not noisy_check_event or self._should_flush_noisy_event(job):
+            self._save_job(job)
+        if not noisy_check_event:
+            self.workspace_log_service.append(job.workspace_id, source=f"agent.{event_type}", message=message, payload=details)
+
+    @staticmethod
+    def _is_noisy_check_progress_event(event_type: str, details: dict[str, Any]) -> bool:
+        if "check_step" not in details:
+            return False
+        status = str(details.get("check_status") or "").strip().lower()
+        if status == "failed":
+            return False
+        if event_type in {
+            "build_started",
+            "frontend_build_started",
+            "backend_compile_started",
+            "final_checks_started",
+            "preview_validation_started",
+            "running_checks",
+        }:
+            return status in {"started", "passed", "skipped"}
+        return False
+
+    @staticmethod
+    def _should_flush_noisy_event(job: JobRecord) -> bool:
+        return len(job.events) % 10 == 0
 
     @staticmethod
     def _enriched_event_details(details: dict[str, Any]) -> dict[str, Any]:
@@ -5284,6 +5392,10 @@ test('role apps have separate frontend actions and styles', () => {{
         return f"{step_label.capitalize()} {status or 'completed'}."
 
     def _save_job(self, job: JobRecord) -> None:
+        if len(job.events) >= StateStore.JOB_EVENT_SHARD_MIN_COUNT:
+            job.storage_version = StateStore.STORAGE_VERSION
+            job.event_storage_ref = self.store.expected_storage_ref("job_events", job.job_id)
+            job.event_count = len(job.events)
         self.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
 
     def _store_report(self, key: str, payload: dict[str, Any]) -> None:
@@ -5310,6 +5422,9 @@ test('role apps have separate frontend actions and styles', () => {{
         stage, progress = self._run_progress_for_event(event_type, details=details, message=message)
         existing_progress = int(payload.get("progress_percent", 0))
         payload["linked_job_id"] = job.job_id
+        payload["storage_version"] = StateStore.STORAGE_VERSION
+        if job.event_storage_ref:
+            payload["event_storage_ref"] = job.event_storage_ref
         if self._should_update_run_stage(event_type, progress=progress, existing_progress=existing_progress):
             payload["current_stage"] = stage
         if event_type == "job_failed":

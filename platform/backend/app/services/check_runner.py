@@ -373,8 +373,6 @@ class CheckRunner:
                     ),
                 ]
             )
-            for skipped_name in ("generated_app_python_tests", "generated_app_js_tests", "preview_boot_smoke", "preview_connectivity_smoke", "browser_flow_smoke"):
-                self._emit_check_progress(progress_callback, skipped_name, "skipped", check_profile=check_profile)
             completed_at = utc_now()
             return CheckExecutionRecord(
                 workspace_id=workspace_id,

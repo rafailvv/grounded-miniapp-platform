@@ -204,6 +204,10 @@ class JobRecord(StrictModel):
     cache_stats: dict[str, Any] = Field(default_factory=dict)
     repair_iterations: list[dict[str, Any]] = Field(default_factory=list)
     apply_result: dict[str, Any] | None = None
+    storage_version: int = 1
+    event_storage_ref: str | None = None
+    event_count: int | None = None
+    artifact_storage_ref: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -536,6 +540,10 @@ class RunRecord(StrictModel):
     fix_attempts: list[dict[str, Any]] = Field(default_factory=list)
     scope_expansions: list[dict[str, Any]] = Field(default_factory=list)
     apply_result: dict[str, Any] | None = None
+    preview_refresh_status: Literal["pending", "running", "passed", "failed", "skipped"] = "pending"
+    storage_version: int = 1
+    event_storage_ref: str | None = None
+    artifact_storage_ref: str | None = None
     retrieval_stats: dict[str, Any] = Field(default_factory=dict)
     cache_stats: dict[str, Any] = Field(default_factory=dict)
     rolled_back: bool = False
