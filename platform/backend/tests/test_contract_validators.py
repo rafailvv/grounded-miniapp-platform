@@ -629,6 +629,42 @@ def test_dom_contract_accepts_conjunctive_if_guard_for_shared_role_script(tmp_pa
     assert issues == []
 
 
+def test_dom_contract_ignores_helper_parameters_shadowing_dom_bindings(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    role_dir = source_dir / "miniapp/app/static/client"
+    details_dir = role_dir / "details"
+    role_dir.mkdir(parents=True)
+    details_dir.mkdir(parents=True)
+    role_dir.joinpath("index.html").write_text(
+        "<main><h1 id='stat-new'></h1></main><script src='/static/client/app.js'></script>",
+        encoding="utf-8",
+    )
+    details_dir.joinpath("index.html").write_text(
+        "<main><section id='orders-list'></section><p id='orders-empty'></p></main><script src='/static/client/app.js'></script>",
+        encoding="utf-8",
+    )
+    role_dir.joinpath("app.js").write_text(
+        "const statNew = document.getElementById('stat-new');\n"
+        "function initRootPage() { if (!statNew) return; statNew.textContent = '0'; }\n"
+        "function renderOrders(listEl, emptyEl, records) { listEl.innerHTML = ''; emptyEl.textContent = records.length; }\n"
+        "function initDetailsPage() {\n"
+        "  const listEl = document.getElementById('orders-list');\n"
+        "  const emptyEl = document.getElementById('orders-empty');\n"
+        "  if (!listEl || !emptyEl) return;\n"
+        "  renderOrders(listEl, emptyEl, []);\n"
+        "}\n"
+        "document.addEventListener('DOMContentLoaded', () => { initRootPage(); initDetailsPage(); });\n",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._dom_contract_issues(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/app.js"],
+    )
+
+    assert issues == []
+
+
 def test_agentic_platform_invariants_reject_neutral_role_template(tmp_path: Path) -> None:
     app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
     workspace = app.state.container.workspace_service.create_workspace(
@@ -1381,6 +1417,7 @@ def test_generated_tests_explain_server_html_vs_js_rendered_content() -> None:
     diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
         [
             "AssertionError: 'Waterproof jacket' not found in '<!doctype html>...'",
+            "AssertionError: '<main class=\"page-shell\">' not found in '<!doctype html>...'",
             "assert(html.includes(\"Packing cubes\"))",
             'TypeError [ERR_INVALID_ARG_TYPE]: The "paths[0]" argument must be of type string. Received an instance of URL',
         ]
@@ -1391,6 +1428,8 @@ def test_generated_tests_explain_server_html_vs_js_rendered_content() -> None:
     assert diagnostics["static_html_assertion"]["problem"] == "js_test_asserts_dynamic_text_only_in_html"
     assert diagnostics["js_test_url_path_api"]["problem"] == "generated_js_test_passed_url_to_path_api"
     assert "fileURLToPath" in diagnostics["js_test_url_path_api"]["expected_path_api"]
+    assert diagnostics["exact_page_shell_tag_assertion"]["problem"] == "test_asserts_exact_page_shell_markup"
+    assert "page-shell token" in diagnostics["exact_page_shell_tag_assertion"]["expected_fix"]
 
 
 def test_generated_js_test_failure_reports_assertion_source(tmp_path: Path) -> None:
@@ -1419,6 +1458,38 @@ def test_generated_js_test_failure_reports_assertion_source(tmp_path: Path) -> N
     assert diagnostics["failing_test_location"]["line"] == 4
     assert diagnostics["assertion_source"]["source"] == 'assert(insightsHtml.includes("voice-first devices"));'
     assert diagnostics["expected_literal"] == "voice-first devices"
+
+
+def test_generated_js_test_failure_prefers_assertion_stack_location_and_regex_literal(tmp_path: Path) -> None:
+    test_file = tmp_path / "generated_app.test.mjs"
+    test_file.write_text(
+        "\n".join(
+            [
+                'import test from "node:test";',
+                'import assert from "node:assert";',
+                'test("role pages include assets and required buttons", () => {',
+                "  const clientHtml = read(clientIndex);",
+                "  assert.ok(clientHtml.match(/client-submit/));",
+                "});",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "test at tests/generated_app.test.mjs:3:1",
+            "AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:",
+            "  assert.ok(clientHtml.match(/client-submit/))",
+            "at TestContext.<anonymous> (file:///workspace/miniapp/tests/generated_app.test.mjs:5:10)",
+        ],
+        test_file=test_file,
+    )
+
+    assert diagnostics["failing_test_location"]["line"] == 5
+    assert diagnostics["assertion_source"]["source"] == "assert.ok(clientHtml.match(/client-submit/));"
+    assert diagnostics["expected_literal"] == "client-submit"
+    assert diagnostics["stale_selector_assertion"]["problem"] == "generated_js_test_requires_exact_selector_literal"
 
 
 def test_generated_post_persistence_failure_is_diagnostic() -> None:

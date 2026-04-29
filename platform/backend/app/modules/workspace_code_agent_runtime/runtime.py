@@ -909,6 +909,7 @@ class WorkspaceCodeAgentRuntime:
                         latest_diff_summary=latest_diff_summary,
                         acceptance_contract=acceptance_contract,
                         loop_started_at=loop_started_at,
+                        should_stop=should_stop,
                     )
                     if parallel_plan is not None:
                         return parallel_plan
@@ -1396,6 +1397,7 @@ class WorkspaceCodeAgentRuntime:
         latest_diff_summary: str | None,
         acceptance_contract: dict[str, Any],
         loop_started_at: float,
+        should_stop: Callable[[], bool] | None = None,
     ) -> WorkspaceLoopTurnPlan | None:
         del latest_preview_details, last_turn_summary, latest_diff_summary
         started = time.perf_counter()
@@ -1453,6 +1455,17 @@ class WorkspaceCodeAgentRuntime:
         create_gap: list[str] = []
         round_results: list[dict[str, Any]] = []
         for build_round in range(1, round_budget + 1):
+            if should_stop is not None and should_stop():
+                return WorkspaceLoopTurnPlan(
+                    outcome="fatal_invalid_response",
+                    assistant_message="Generation stopped by user request.",
+                    diagnosis="Generation stopped by user request before the next parallel build round.",
+                    files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                    failure_class="generation.stopped",
+                    failure_signature="generation.stopped",
+                    root_cause_summary="Generation stopped by user request.",
+                    metadata={"parallel_build": True, "stopped": True},
+                )
             budget_status = self._completion_budget_status(
                 job=job,
                 generation_mode=generation_mode,
@@ -1549,6 +1562,17 @@ class WorkspaceCodeAgentRuntime:
                     for worker in selected_workers
                 ]
             round_results.extend(results)
+            if should_stop is not None and should_stop():
+                return WorkspaceLoopTurnPlan(
+                    outcome="fatal_invalid_response",
+                    assistant_message="Generation stopped by user request.",
+                    diagnosis="Generation stopped by user request after the active parallel workers returned.",
+                    files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                    failure_class="generation.stopped",
+                    failure_signature="generation.stopped",
+                    root_cause_summary="Generation stopped by user request.",
+                    metadata={"parallel_build": True, "stopped": True},
+                )
             for result in sorted(results, key=lambda item: str(item.get("worker") or "")):
                 worker_id = str(result.get("worker") or "")
                 cache_stats = result.get("cache_stats") if isinstance(result.get("cache_stats"), dict) else {}
@@ -1902,6 +1926,8 @@ class WorkspaceCodeAgentRuntime:
                 "Use path-id update endpoints for mutable records, for example PATCH /api/products/{product_id} and PATCH /api/orders/{order_id}; generated tests and role JavaScript should call the same path shape.",
                 "Role app.js files are loaded by every page for that role. Guard every page-specific element before property access: use feedback?.textContent or if (feedback) blocks, and initialize page-specific workflows only when their root elements exist.",
                 "Generated Python tests must be unittest-discoverable: define import unittest and at least one unittest.TestCase subclass with test_* methods. Top-level pytest-style test functions are invalid because the platform runs python -m unittest discover.",
+                "Generated Python tests that use FastAPI TestClient must trigger app lifespan. Prefer `with TestClient(app) as client:` inside each test or create/tear down SQLAlchemy tables explicitly in setUp/tearDown; plain `self.client = TestClient(app)` can skip lifespan table creation.",
+                "Generated tests must not assert exact opening HTML tags or exact class attributes such as `<main class=\"page-shell\">` or `class=\"page-shell\"` because the platform may add safe-area inline attributes and extra shell classes. Assert that the class list contains the page-shell token, for example with a regex matching `class=\"[^\"]*\\bpage-shell\\b`, parse/query the DOM, or assert a stable wrapper id.",
                 "Generated JS tests must assert literal strings that actually exist in the files they read. Accept API constants/template literals by checking for /api plus resource names/methods instead of only exact fetch('/api/...') strings. Do not invent data-testid/control names unless the matching UI/JS source also contains them.",
                 "Use one consistent light visual system and preserve preview_bridge/page-shell safe spacing.",
                 "Do not return a refusal or fatal response. If details are incomplete, use the acceptance_contract and blueprint to create the best compact owned implementation.",
@@ -1914,7 +1940,9 @@ class WorkspaceCodeAgentRuntime:
                     "Generated tests worker must always return exactly the two required test files when they are missing: miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs.",
                     "Keep tests compact: Python unittest should verify role routes, GET empty, POST persists, PATCH/status persists; JS should statically verify role pages, role CSS links, real buttons/forms, and frontend API fetch methods.",
                     "Use the API paths and payload fields from the acceptance_contract/blueprint; do not wait for runtime tool reads in parallel build.",
+                    "For Python tests, use `with TestClient(app) as client:` so FastAPI lifespan creates DB tables before requests. For route shell assertions, check that the class attribute contains the page-shell token and `/static/preview_bridge.js`, not exact `class=\"page-shell\"` or an exact `<main ...>` opening tag.",
                     "Do not invent exact data-testid values in generated_app.test.mjs. Prefer generic assertions for <form, <button, role-specific headings, /api resource names, and HTTP methods unless the matching UI files are guaranteed to contain that exact test id.",
+                    "Generated JS tests must verify the real selectors/handlers used by the role JS. If the app binds `form.addEventListener` through `[data-client-form]`, do not require the script to reference a submit button id.",
                     "Do not assert optional fields that the backend schema does not create and return. If a test asserts a patched field such as price, notes, payment_status, or assignee, the backend model/update schema must include and persist that exact field; otherwise assert only fields that the API actually owns.",
                 ]
             )
@@ -2529,9 +2557,10 @@ class WorkspaceCodeAgentRuntime:
             "Generated tests must validate the requested behavior, all role roots, and shared role content without relying on network calls or non-template dependencies. "
             "For edit tasks, preserve existing selectors, ids, and data-testid attributes that generated tests assert unless the requested behavior intentionally replaces them; when behavior changes test expectations, update the generated test file in the same patch. "
             "Python generated tests run through FastAPI TestClient and see server-rendered HTML before browser JavaScript executes; do not assert JS-rendered item text there unless the text is also present in HTML source. Use Python tests for route status, preview bridge/static shell, and backend APIs when present. "
+            "Python generated tests must trigger FastAPI lifespan: use `with TestClient(app) as client:` inside tests or explicitly create SQLAlchemy tables in setUp/tearDown. Plain `self.client = TestClient(app)` is not enough for apps whose tables are created in lifespan. "
             "JS generated tests are responsible for frontend source/data assertions; read role HTML/JS/shared data files directly with node:test, node:assert, and fs/path. "
             "node:test does not export expect; generated_app.test.mjs must use import test from \"node:test\" and import assert from \"node:assert\" with assert.ok/assert.equal/assert.match. "
-            "Before writing generated_app.test.mjs, ensure every exact phrase asserted by includes() or match() is literally present in the file being read; prefer stable headings, route links, app title, and data-testid values over paraphrased expectations. "
+            "Before writing generated_app.test.mjs, ensure every exact phrase asserted by includes() or match() is literally present in the file being read; prefer stable headings, route links, app title, and real selectors over paraphrased expectations. Do not assert exact opening tags or exact class attributes like `<main class=\"page-shell\">` or `class=\"page-shell\"`; use a regex that checks the page-shell class token and allows extra attributes/classes. "
             "Generated JS tests execute from the miniapp directory, so file paths inside those tests must start with app/static/... or be resolved from import.meta.url to ../app/static; do not use miniapp/app/... in generated tests. "
             "In generated JS tests, path/fs APIs require string paths: use path.join(process.cwd(), 'app/static/...') or fileURLToPath(new URL('../app/static/...', import.meta.url)); never pass a URL object directly to path.resolve, path.join, or fs. "
             "In Fast create mode, if the provided file_contexts already include the role HTML shells and tests directory context, return a compact patch_ready response immediately instead of planning an exhaustive app architecture. "
@@ -2733,8 +2762,9 @@ class WorkspaceCodeAgentRuntime:
                 "For create tasks, include dependency-free generated tests in miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs.",
                 "For create tasks, generated Python tests must cover persistent API behavior: GET returns an empty list first, POST creates a user-supplied record, and a later GET returns the created record.",
                 "Python generated tests should use unittest plus FastAPI TestClient to verify role routes and backend/API behavior when backend state exists.",
+                "Python generated tests must trigger app lifespan with `with TestClient(app) as client:` or explicitly create SQLAlchemy tables before requests.",
                 "JS generated tests should use node:test plus node:assert plus fs/path only to verify role HTML/JS content, shared domain labels, role-specific selectors/actions, and absence of neutral template text; do not import or call expect.",
-                "In generated_app.test.mjs, only assert exact strings that literally appear in the file being read; do not paraphrase expected UI text.",
+                "In generated_app.test.mjs, only assert exact strings that literally appear in the file being read; do not paraphrase expected UI text, require unused button ids, or assert exact opening tags that may gain platform safe-area attributes.",
                 "Do not make Python TestClient tests assert text that is only rendered by browser JavaScript; either include the text in HTML source or move that assertion to generated_app.test.mjs.",
                 "When role content is populated from a shared JS data file, JS generated tests should read that data/source file directly and assert the shared item names there.",
                 "Generated JS tests run with cwd=miniapp, so read app/static/<role>/... paths or resolve from import.meta.url to ../app/static; never prefix paths with miniapp/app/ inside the test.",
@@ -3014,11 +3044,13 @@ class WorkspaceCodeAgentRuntime:
             "If generated Python/JS tests failed, patch the app and the exact stale/incorrect test expectation together when the requested behavior requires it.",
             "If generated_app_python_tests reports NO TESTS RAN, rewrite miniapp/tests/test_generated_app.py as unittest-discoverable tests with a unittest.TestCase subclass and test_* methods.",
             "If generated_app_python_tests reports AssertionError: 422 not found in [200, 201], the POST payload and Pydantic create schema are mismatched. Patch the API schema/routes and/or test payload together so required create fields are present and the request returns 200/201; do not keep retrying only the test file.",
-            "If generated_app_python_tests reports sqlite no such table, patch backend table creation: SQLAlchemy Base.metadata.create_all(bind=engine) must run after all generated model classes are declared/imported before TestClient requests.",
+            "If generated_app_python_tests reports sqlite no such table, patch backend table creation or the tests: SQLAlchemy Base.metadata.create_all(bind=engine) must run before TestClient requests, and tests using lifespan-created tables must use `with TestClient(app) as client:`.",
+            "If generated_app_python_tests or generated_app_js_tests fail because they assert `<main class=\"page-shell\">` or exact `class=\"page-shell\"`, patch the generated tests to assert the page-shell class token with a regex allowing extra attributes/classes; do not remove the platform safe-area style or extra shell classes.",
             "If generated Python tests get 404 on PATCH /api/<resource>/{id}, add or align a path-id PATCH endpoint and update frontend/tests to use the same route shape.",
             "If generated Python tests fail with an AssertionError for an unsupported or missing field, either add that exact field to the backend model/create/update/output schemas and persist it through GET, or remove the stale assertion from the generated test. The test and API schema must match exactly.",
             "If changed_files_static reports FastAPI Invalid args for response field involving sqlalchemy.orm.session.Session, patch endpoint signatures so every Session parameter uses Depends(get_db_session) or Depends(get_db), never next(get_db_session())/SessionLocal() defaults, and make the dependency a normal yield function without @contextmanager.",
             "If generated_app_js_tests fails because it expects a string missing from the file it reads, either add the real missing UI/JS control or update the test to assert a literal string that exists in the relevant generated source.",
+            "If generated_app_js_tests expects a button id inside a script but the real app binds a parent form/data-selector handler, patch the test to verify the actual selector, addEventListener, method, and /api flow instead of requiring an unused id string.",
             "Generated JS tests should not require exact fetch('/api/...') literals when the app uses API_ROOT/API_BASE constants or template literals; assert /api, resource names, methods, and real controls instead.",
             "If API connectivity failed, ensure frontend fetch paths and backend routes match and that POST/PATCH changes are visible through later GET.",
             "If platform_invariants reports unchecked_page_dom_id, patch the role app.js with optional chaining or explicit guards for every page-specific DOM element before textContent/classList/addEventListener/property access.",
@@ -3432,12 +3464,31 @@ class WorkspaceCodeAgentRuntime:
     @staticmethod
     def _api_resource_stems(source: str) -> set[str]:
         stems: set[str] = set()
-        for match in re.finditer(r"['\"](?P<path>/api/[A-Za-z0-9_/{}/-]+)", str(source or "")):
+        text = str(source or "")
+        api_prefixes = [
+            match.group("prefix").rstrip("/")
+            for match in re.finditer(
+                r"APIRouter\(\s*prefix\s*=\s*['\"](?P<prefix>/api(?:/[^'\"]*)?)['\"]",
+                text,
+            )
+        ]
+        for match in re.finditer(r"['\"](?P<path>/api/[A-Za-z0-9_/{}/-]+)", text):
             segments = [segment for segment in match.group("path").strip("/").split("/") if segment]
             if len(segments) >= 2 and segments[0] == "api":
                 stem = segments[1].strip("{}")
                 if stem:
                     stems.add(stem)
+        for match in re.finditer(r"@(?:router|api)\.(?:get|post|put|patch|delete)\(\s*['\"](?P<path>[^'\"]*)['\"]", text, re.IGNORECASE):
+            route_path = str(match.group("path") or "").strip()
+            if not route_path or route_path.startswith("/api/"):
+                continue
+            for prefix in api_prefixes:
+                combined = f"{prefix}/{route_path.lstrip('/')}"
+                segments = [segment for segment in combined.strip("/").split("/") if segment]
+                if len(segments) >= 2 and segments[0] == "api":
+                    stem = segments[1].strip("{}")
+                    if stem:
+                        stems.add(stem)
         return stems
 
     @staticmethod
@@ -4005,11 +4056,18 @@ class WorkspaceCodeAgentRuntime:
         job.current_fix_phase = loop_result.current_phase
         job.remaining_issues = [] if loop_result.status == "completed" else list(loop_result.remaining_issues)
         if loop_result.status != "completed":
-            job.failure_reason = self._specific_failure_reason(
-                default=job.failure_reason,
-                remaining_issues=job.remaining_issues,
-                latest_execution=loop_result.latest_execution,
-            )
+            if job.failure_class == "provider.insufficient_quota":
+                job.failure_reason = (
+                    job.root_cause_summary
+                    or job.failure_reason
+                    or "OpenAI provider quota is exhausted for the selected code generation model."
+                )
+            else:
+                job.failure_reason = self._specific_failure_reason(
+                    default=job.failure_reason,
+                    remaining_issues=job.remaining_issues,
+                    latest_execution=loop_result.latest_execution,
+                )
             latest_has_failed_checks = bool(
                 loop_result.latest_execution is not None
                 and any(result.status == "failed" for result in loop_result.latest_execution.results)

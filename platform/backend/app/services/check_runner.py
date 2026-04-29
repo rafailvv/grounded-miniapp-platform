@@ -2194,6 +2194,8 @@ class CheckRunner:
         for index, line in enumerate(lines):
             for var_name in variables:
                 for match in re.finditer(rf"\b{re.escape(var_name)}\s*\.", line):
+                    if cls._dom_variable_shadowed_by_function_param(lines, index, var_name):
+                        continue
                     prefix = line[: match.start()]
                     if prefix.rstrip().endswith("?"):
                         continue
@@ -2202,6 +2204,22 @@ class CheckRunner:
                         continue
                     unsafe.add(var_name)
         return unsafe
+
+    @staticmethod
+    def _dom_variable_shadowed_by_function_param(lines: list[str], index: int, var_name: str) -> bool:
+        for cursor in range(index, -1, -1):
+            line = lines[cursor]
+            match = re.search(r"\bfunction\s+[A-Za-z_$][\w$]*\s*\((?P<params>[^)]*)\)\s*\{", line)
+            if not match:
+                continue
+            params = {part.strip().split("=", 1)[0].strip() for part in match.group("params").split(",")}
+            if var_name not in params:
+                return False
+            if cursor == index:
+                return True
+            block = "\n".join(lines[cursor : index + 1])
+            return block.count("{") > block.count("}")
+        return False
 
     @staticmethod
     def _dom_access_context(lines: list[str], index: int) -> str:
@@ -2953,7 +2971,7 @@ class CheckRunner:
             if (match := cls._GENERATED_JS_TEST_LOCATION_RE.search(str(line or "")))
         ]
         if generated_js_locations:
-            first_location = generated_js_locations[0]
+            first_location = generated_js_locations[-1]
             diagnostics["failing_test_location"] = {
                 "file_path": "miniapp/tests/generated_app.test.mjs",
                 **first_location,
@@ -2974,6 +2992,16 @@ class CheckRunner:
                     literal_match = re.search(r"\.includes\(\s*([\"'`])(?P<literal>.+?)\1\s*\)", assertion_line)
                     if literal_match:
                         diagnostics["expected_literal"] = literal_match.group("literal")
+                    regex_match = re.search(r"\.match\(\s*/(?P<literal>[^/]+)/[a-zA-Z]*\s*\)", assertion_line)
+                    if regex_match:
+                        diagnostics["expected_literal"] = regex_match.group("literal")
+                        diagnostics["stale_selector_assertion"] = {
+                            "problem": "generated_js_test_requires_exact_selector_literal",
+                            "expected_fix": (
+                                "Patch generated_app.test.mjs to assert selectors/handlers that actually exist in the generated HTML/JS. "
+                                "If the app binds a form/data-selector handler, do not require an unused button id literal in the script or page."
+                            ),
+                        }
                     start = max(0, line_no - 4)
                     end = min(len(source_lines), line_no + 3)
                     diagnostics["assertion_context"] = [
@@ -3010,6 +3038,21 @@ class CheckRunner:
                     "Assert route/static shell in Python tests, include source text in HTML, or move JS-rendered item checks to generated_app.test.mjs."
                 ),
             }
+        if any(
+            "<main class=\\\"page-shell\\\">" in str(line or "")
+            or '<main class="page-shell">' in str(line or "")
+            or "class=\\\"page-shell\\\"" in str(line or "")
+            or 'class="page-shell"' in str(line or "")
+            for line in logs
+        ):
+            diagnostics["exact_page_shell_tag_assertion"] = {
+                "problem": "test_asserts_exact_page_shell_markup",
+                "expected_fix": (
+                    "The platform may add safe-area inline attributes and additional classes to the page shell. "
+                    "Generated tests should assert that the class list contains the page-shell token, for example with "
+                    "a regex allowing extra attributes/classes, instead of exact <main> markup or exact class=\"page-shell\"."
+                ),
+            }
         if any("assert(html.includes(" in str(line or "") for line in logs):
             diagnostics["static_html_assertion"] = {
                 "problem": "js_test_asserts_dynamic_text_only_in_html",
@@ -3029,7 +3072,11 @@ class CheckRunner:
             if table_match:
                 diagnostics["sqlite_missing_table"] = {
                     "table": str(table_match.group("table") or "").strip(),
-                    "expected_fix": "If generated SQLAlchemy models are defined in route modules, call Base.metadata.create_all(bind=engine) after all model classes are imported/declared before TestClient requests run.",
+                    "expected_fix": (
+                        "Ensure SQLAlchemy tables exist before TestClient requests. If the app creates tables in FastAPI lifespan, "
+                        "generated tests must use `with TestClient(app) as client:`; otherwise call Base.metadata.create_all(bind=engine) "
+                        "after all generated model classes are imported/declared before requests run."
+                    ),
                 }
                 break
         for line in reversed(logs):

@@ -701,6 +701,28 @@ def test_parallel_failures_target_owned_repair_workers() -> None:
     ) == {"backend_api", "generated_tests"}
 
 
+def test_api_resource_stems_include_fastapi_router_prefix_routes() -> None:
+    source = """
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/api")
+
+@router.get("/products")
+def list_products():
+    return []
+
+@router.post("/orders")
+def create_order():
+    return {}
+
+@router.patch("/orders/{order_id}/status")
+def update_order(order_id: str):
+    return {}
+"""
+
+    assert WorkspaceCodeAgentRuntime._api_resource_stems(source) == {"products", "orders"}
+
+
 def test_generated_test_failures_seed_backend_and_role_context_for_repair() -> None:
     execution = CheckExecutionRecord(
         workspace_id="ws",
