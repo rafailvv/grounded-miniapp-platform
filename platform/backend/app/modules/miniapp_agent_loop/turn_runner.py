@@ -64,6 +64,29 @@ class WorkspaceLoopTurnRunner:
             return "expanded"
         return "full_bundle"
 
+    @staticmethod
+    def _budget_state(callbacks: WorkspaceLoopCallbacks, attempt: int) -> dict[str, object]:
+        if callbacks.budget_status is None:
+            return {}
+        try:
+            state = callbacks.budget_status(attempt)
+        except Exception as exc:  # defensive: budget accounting must not crash generation
+            return {"exhausted": False, "budget_status_error": str(exc)}
+        return dict(state or {}) if isinstance(state, dict) else {}
+
+    @staticmethod
+    def _budget_failure_reason(state: dict[str, object]) -> str:
+        reason = str(state.get("reason") or "budget_exhausted").strip()
+        elapsed_ms = int(state.get("elapsed_ms") or 0)
+        token_total = int(state.get("total_tokens") or 0)
+        token_limit = int(state.get("token_limit") or 0)
+        time_limit_ms = int(state.get("time_limit_ms") or 0)
+        if reason == "token_budget_exhausted":
+            return f"Generation token budget exhausted: {token_total}/{token_limit} tokens."
+        if reason == "time_budget_exhausted":
+            return f"Generation time budget exhausted: {elapsed_ms}/{time_limit_ms} ms."
+        return "Generation budget exhausted before strict-green completion."
+
     def run(
         self,
         *,
@@ -106,6 +129,36 @@ class WorkspaceLoopTurnRunner:
                     failure_signature="stopped_by_user",
                     root_cause_summary="Run stopped by user.",
                     current_phase="failed",
+                    latest_execution=latest_execution,
+                    latest_preview_details=latest_preview_details,
+                    latest_apply_result=latest_apply_result,
+                    iterations=iterations,
+                    repair_iterations=repair_iterations,
+                    all_operations=all_operations,
+                    last_assistant_message=latest_assistant_message,
+                    turn_history=turn_history,
+                )
+
+            budget_state = self._budget_state(callbacks, attempt)
+            if budget_state.get("exhausted"):
+                failure_reason = self._budget_failure_reason(budget_state)
+                callbacks.append_event(
+                    job,
+                    "repair_iteration",
+                    failure_reason,
+                    {
+                        "attempt": attempt,
+                        "failure_class": str(budget_state.get("failure_class") or "generation.budget_exhausted"),
+                        "budget_status": budget_state,
+                    },
+                )
+                return self.results.blocked(
+                    summary=failure_reason,
+                    failure_reason=failure_reason,
+                    failure_class=str(budget_state.get("failure_class") or "generation.budget_exhausted"),
+                    failure_signature=str(budget_state.get("failure_signature") or budget_state.get("reason") or "generation.budget_exhausted"),
+                    root_cause_summary=failure_reason,
+                    current_phase=str(budget_state.get("current_phase") or "blocked_budget_exhausted"),
                     latest_execution=latest_execution,
                     latest_preview_details=latest_preview_details,
                     latest_apply_result=latest_apply_result,
@@ -286,15 +339,13 @@ class WorkspaceLoopTurnRunner:
                 )
 
             if attempt >= max_attempts:
-                return self.results.failed(
-                    outcome_kind="blocked_generation",
-                    summary="Workspace loop exhausted its retry budget without reaching a usable state.",
-                    failure_reason="Workspace loop exhausted its retry budget without reaching a usable state.",
-                    failure_class=progress_snapshot.get("failure_class"),
+                return self.results.blocked(
+                    summary="Workspace loop reached the internal safety turn cap before strict-green completion.",
+                    failure_reason="Workspace loop reached the internal safety turn cap before strict-green completion.",
+                    failure_class=progress_snapshot.get("failure_class") or "generation.safety_turn_cap",
                     failure_signature=self.feedback.progress_signature(progress_snapshot),
                     root_cause_summary=progress_snapshot.get("failure_summary"),
-                    current_phase="failed",
-                    remaining_issues=list(completion_state.get("remaining_issues") or []),
+                    current_phase="blocked_internal_safety_cap",
                     latest_execution=latest_execution,
                     latest_preview_details=latest_preview_details,
                     latest_apply_result=latest_apply_result,
@@ -304,7 +355,6 @@ class WorkspaceLoopTurnRunner:
                     last_assistant_message=latest_assistant_message,
                     turn_history=turn_history,
                 )
-
             next_attempt = attempt + 1
             if generation_mode == GenerationMode.FAST:
                 context_mode = self._next_fast_context_mode(
@@ -318,23 +368,17 @@ class WorkspaceLoopTurnRunner:
                     and repeated_no_progress >= 2
                     and not signature_changed
                 ):
-                    return self.results.failed(
-                        outcome_kind="blocked_generation",
-                        summary="Workspace loop stopped after repeated failure signatures in FAST mode without meaningful progress.",
-                        failure_reason="Workspace loop stopped after repeated failure signatures in FAST mode without meaningful progress.",
-                        failure_class=job.failure_class or progress_snapshot.get("failure_class"),
-                        failure_signature=job.failure_signature or current_signature,
-                        root_cause_summary=job.root_cause_summary or progress_snapshot.get("failure_summary"),
-                        current_phase="failed",
-                        remaining_issues=list(completion_state.get("remaining_issues") or []),
-                        latest_execution=latest_execution,
-                        latest_preview_details=latest_preview_details,
-                        latest_apply_result=latest_apply_result,
-                        iterations=iterations,
-                        repair_iterations=repair_iterations,
-                        all_operations=all_operations,
-                        last_assistant_message=latest_assistant_message,
-                        turn_history=turn_history,
+                    context_mode = "full_bundle"
+                    callbacks.append_event(
+                        job,
+                        "scope_expanded",
+                        "FAST repair expanded to full context after repeated unchanged failure signatures.",
+                        {
+                            "attempt": next_attempt,
+                            "context_mode": context_mode,
+                            "failure_signature": current_signature,
+                            "budget_status": budget_state,
+                        },
                     )
             elif attempt > 0 and not made_progress:
                 if context_mode == "minimal":
@@ -342,23 +386,16 @@ class WorkspaceLoopTurnRunner:
                 elif context_mode == "expanded":
                     context_mode = "full_bundle"
                 elif repeated_no_progress >= full_bundle_no_progress_limit:
-                    return self.results.failed(
-                        outcome_kind="blocked_generation",
-                        summary="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
-                        failure_reason="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
-                        failure_class=job.failure_class or progress_snapshot.get("failure_class"),
-                        failure_signature=job.failure_signature or current_signature,
-                        root_cause_summary=job.root_cause_summary or progress_snapshot.get("failure_summary"),
-                        current_phase="failed",
-                        remaining_issues=list(completion_state.get("remaining_issues") or []),
-                        latest_execution=latest_execution,
-                        latest_preview_details=latest_preview_details,
-                        latest_apply_result=latest_apply_result,
-                        iterations=iterations,
-                        repair_iterations=repair_iterations,
-                        all_operations=all_operations,
-                        last_assistant_message=latest_assistant_message,
-                        turn_history=turn_history,
+                    callbacks.append_event(
+                        job,
+                        "scope_expanded",
+                        "Repair kept full context after repeated unchanged failure signatures.",
+                        {
+                            "attempt": next_attempt,
+                            "context_mode": context_mode,
+                            "failure_signature": current_signature,
+                            "budget_status": budget_state,
+                        },
                     )
 
             plan = self.edit_validator.normalize_plan(
@@ -402,6 +439,29 @@ class WorkspaceLoopTurnRunner:
             latest_files_read = list(plan.files_read)
 
             if plan.outcome == "fatal_invalid_response":
+                if plan.failure_class in {"provider.insufficient_quota", "generation.budget_exhausted"}:
+                    is_quota = plan.failure_class == "provider.insufficient_quota"
+                    blocker_summary = (
+                        "OpenAI provider quota is exhausted for the selected code generation model."
+                        if is_quota
+                        else "Generation budget exhausted before strict-green completion."
+                    )
+                    return self.results.blocked(
+                        summary=blocker_summary,
+                        failure_reason=plan.diagnosis or blocker_summary,
+                        failure_class=plan.failure_class,
+                        failure_signature=plan.failure_signature or plan.failure_class,
+                        root_cause_summary=plan.root_cause_summary or blocker_summary,
+                        current_phase="blocked_provider_quota" if is_quota else "blocked_budget_exhausted",
+                        latest_execution=latest_execution,
+                        latest_preview_details=latest_preview_details,
+                        latest_apply_result=latest_apply_result,
+                        iterations=iterations,
+                        repair_iterations=repair_iterations,
+                        all_operations=all_operations,
+                        last_assistant_message=plan.assistant_message or latest_assistant_message,
+                        turn_history=turn_history,
+                    )
                 if attempt < max_attempts:
                     callbacks.append_event(
                         job,
@@ -477,24 +537,7 @@ class WorkspaceLoopTurnRunner:
                 elif context_mode == "expanded":
                     context_mode = "full_bundle"
                 elif repeated_no_progress >= full_bundle_no_progress_limit:
-                    return self.results.failed(
-                        outcome_kind="blocked_generation",
-                        summary="Workspace loop stopped after repeated no-progress turns with full context.",
-                        failure_reason=plan.diagnosis or "Workspace loop stopped after repeated no-progress turns with full context.",
-                        failure_class=plan.failure_class or progress_snapshot.get("failure_class"),
-                        failure_signature=plan.failure_signature or self.feedback.progress_signature(progress_snapshot),
-                        root_cause_summary=plan.root_cause_summary or progress_snapshot.get("failure_summary"),
-                        current_phase="failed",
-                        remaining_issues=list(completion_state.get("remaining_issues") or []),
-                        latest_execution=latest_execution,
-                        latest_preview_details=latest_preview_details,
-                        latest_apply_result=latest_apply_result,
-                        iterations=iterations,
-                        repair_iterations=repair_iterations,
-                        all_operations=all_operations,
-                        last_assistant_message=latest_assistant_message,
-                        turn_history=turn_history,
-                    )
+                    context_mode = "full_bundle"
                 latest_assistant_message = plan.assistant_message or plan.diagnosis or latest_assistant_message
                 previous_snapshot = progress_snapshot
                 continue

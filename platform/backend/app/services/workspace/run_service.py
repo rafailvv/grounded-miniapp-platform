@@ -613,7 +613,7 @@ class RunService:
             for attr in ("orchestration_phases", "worker_summaries"):
                 if not getattr(run, attr, None) and isinstance(existing.get(attr), list):
                     setattr(run, attr, list(existing.get(attr) or []))
-            for attr in ("acceptance_contract", "flow_coverage"):
+            for attr in ("acceptance_contract", "flow_coverage", "completion_budget", "budget_status"):
                 if not getattr(run, attr, None) and isinstance(existing.get(attr), dict):
                     setattr(run, attr, dict(existing.get(attr) or {}))
             for attr in ("event_storage_ref", "artifact_storage_ref"):
@@ -665,11 +665,8 @@ class RunService:
 
     @staticmethod
     def _terminal_failure_progress(progress: int | float | None) -> int:
-        try:
-            current = int(progress or 0)
-        except (TypeError, ValueError):
-            current = 0
-        return min(98, max(current, 98))
+        del progress
+        return 100
 
     @staticmethod
     def _preview_refresh_progress(progress: int | float | None) -> int:
@@ -708,11 +705,11 @@ class RunService:
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, list(getattr(job, attr) or []))
                     changed = True
-            for attr in ("acceptance_contract", "flow_coverage"):
+            for attr in ("acceptance_contract", "flow_coverage", "completion_budget", "budget_status"):
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, dict(getattr(job, attr) or {}))
                     changed = True
-        if run.status in {"failed", "blocked"} and int(run.progress_percent or 0) >= 100:
+        if run.status in {"failed", "blocked"} and int(run.progress_percent or 0) != 100:
             run.progress_percent = self._terminal_failure_progress(run.progress_percent)
             changed = True
         if self._failed_run_has_retained_draft(run):
@@ -947,6 +944,8 @@ class RunService:
             run.acceptance_contract = dict(getattr(job, "acceptance_contract", {}) or run.acceptance_contract)
             run.worker_summaries = list(getattr(job, "worker_summaries", []) or run.worker_summaries)
             run.flow_coverage = dict(getattr(job, "flow_coverage", {}) or run.flow_coverage)
+            run.completion_budget = dict(getattr(job, "completion_budget", {}) or run.completion_budget)
+            run.budget_status = dict(getattr(job, "budget_status", {}) or run.budget_status)
             run.repair_iterations = list(job.repair_iterations)
             run.fix_attempts = list(job.fix_attempts)
             run.scope_expansions = list(job.scope_expansions)
@@ -1074,7 +1073,10 @@ class RunService:
                     run.draft_ready = run.draft_status == "ready"
                     if run.current_fix_phase == "completed":
                         run.current_fix_phase = "failed"
-                    run.current_stage = "stopped" if self._is_stop_requested(run.run_id) else "blocked"
+                    if str(run.current_fix_phase or "") == "blocked_provider_quota":
+                        run.current_stage = "blocked_provider_quota"
+                    else:
+                        run.current_stage = "stopped" if self._is_stop_requested(run.run_id) else "blocked"
                     run.progress_percent = self._terminal_failure_progress(run.progress_percent)
                     if run.draft_ready:
                         run.summary = "Strict-green validation did not pass. Draft was retained for inspection."
@@ -1088,7 +1090,12 @@ class RunService:
                     run.apply_status = "blocked" if run.draft_ready else "failed"
                     if run.current_fix_phase == "completed":
                         run.current_fix_phase = "failed"
-                    run.current_stage = "blocked" if run.draft_ready else "failed"
+                    if str(run.current_fix_phase or "") == "blocked_provider_quota":
+                        run.current_stage = "blocked_provider_quota"
+                    elif str(run.current_fix_phase or "") == "blocked_budget_exhausted":
+                        run.current_stage = "blocked_budget_exhausted"
+                    else:
+                        run.current_stage = "blocked" if run.draft_ready else "failed"
                     run.progress_percent = self._terminal_failure_progress(run.progress_percent)
                     if run.draft_ready:
                         run.summary = "Strict-green validation did not pass. Draft was retained for inspection."

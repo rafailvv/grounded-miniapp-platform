@@ -1077,7 +1077,26 @@ def test_run_token_usage_accumulates_iteration_ready_details() -> None:
     }
 
 
-def test_run_save_preserves_live_token_usage_and_caps_failed_progress(tmp_path) -> None:
+def test_completion_budgets_are_time_and_token_based() -> None:
+    fast_budget = WorkspaceCodeAgentRuntime._completion_budget_for_mode(GenerationMode.FAST)
+    balanced_budget = WorkspaceCodeAgentRuntime._completion_budget_for_mode(GenerationMode.BALANCED)
+    quality_budget = WorkspaceCodeAgentRuntime._completion_budget_for_mode(GenerationMode.QUALITY)
+
+    assert fast_budget["time_limit_ms"] == 12 * 60 * 1000
+    assert fast_budget["token_limit"] == 600_000
+    assert balanced_budget["time_limit_ms"] == 25 * 60 * 1000
+    assert balanced_budget["token_limit"] == 1_200_000
+    assert quality_budget["time_limit_ms"] == 45 * 60 * 1000
+    assert quality_budget["token_limit"] == 2_500_000
+    assert WorkspaceCodeAgentRuntime._max_attempts(GenerationMode.FAST) >= 100
+
+
+def test_terminal_failure_progress_is_100_for_ui_status_separation() -> None:
+    assert RunService._terminal_failure_progress(0) == 100
+    assert WorkspaceCodeAgentRuntime._run_progress_for_event("job_failed")[1] == 100
+
+
+def test_run_save_preserves_live_token_usage_and_keeps_terminal_failure_at_100(tmp_path) -> None:
     service = object.__new__(RunService)
     service.store = StateStore(tmp_path / "state.json")
     run = RunRecord(
@@ -1103,7 +1122,7 @@ def test_run_save_preserves_live_token_usage_and_caps_failed_progress(tmp_path) 
     service._save_run(stale_terminal)
     saved = RunRecord.model_validate(service.store.get("runs", run.run_id))
 
-    assert saved.progress_percent == 98
+    assert saved.progress_percent == 100
     assert saved.linked_job_id == "job_live"
     assert saved.token_usage["total_tokens"] == 15
     assert saved.token_usage["turn_count"] == 1
@@ -1334,7 +1353,7 @@ def test_get_run_backfills_token_usage_and_specific_failure_from_job_events(tmp_
 
     hydrated = service.get_run(run.run_id)
 
-    assert hydrated.progress_percent == 98
+    assert hydrated.progress_percent == 100
     assert hydrated.linked_job_id == job.job_id
     assert hydrated.token_usage["total_tokens"] == 1200
     assert hydrated.token_usage["turn_count"] == 1

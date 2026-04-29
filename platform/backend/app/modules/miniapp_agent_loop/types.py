@@ -83,6 +83,7 @@ class WorkspaceLoopCallbacks:
     allow_optimistic_completion: bool = False
     skip_initial_checks: bool = False
     stop_if_requested: Callable[[], bool] | None = None
+    budget_status: Callable[[int], dict[str, Any]] | None = None
 
 
 __all__ = [

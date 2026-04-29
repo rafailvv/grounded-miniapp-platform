@@ -65,7 +65,32 @@ FAST_PARALLEL_WORKER_OPERATION_LIMIT = 5
 FAST_PARALLEL_WORKER_CONTENT_MAX_LENGTH = 14000
 FOCUSED_VISUAL_OPERATION_LIMIT = 4
 FOCUSED_VISUAL_CONTENT_MAX_LENGTH = 12000
-FOCUSED_VISUAL_MAX_ATTEMPTS = 2
+COMPLETION_BUDGETS = {
+    GenerationMode.FAST: {
+        "time_limit_ms": 12 * 60 * 1000,
+        "token_limit": 600_000,
+        "safety_turn_cap": 120,
+        "parallel_round_cap": 12,
+    },
+    GenerationMode.BALANCED: {
+        "time_limit_ms": 25 * 60 * 1000,
+        "token_limit": 1_200_000,
+        "safety_turn_cap": 220,
+        "parallel_round_cap": 20,
+    },
+    GenerationMode.QUALITY: {
+        "time_limit_ms": 45 * 60 * 1000,
+        "token_limit": 2_500_000,
+        "safety_turn_cap": 360,
+        "parallel_round_cap": 30,
+    },
+    GenerationMode.BASIC: {
+        "time_limit_ms": 12 * 60 * 1000,
+        "token_limit": 600_000,
+        "safety_turn_cap": 120,
+        "parallel_round_cap": 12,
+    },
+}
 PATCH_FIRST_EXISTING_FILE_CHAR_LIMIT = 2500
 PATCH_FIRST_EXISTING_FILE_LINE_LIMIT = 120
 FOCUSED_VISUAL_STYLE_MARKERS = (
@@ -391,6 +416,7 @@ class WorkspaceCodeAgentRuntime:
             error_context=request.error_context,
             current_fix_phase="agent_loop",
             execution_class="shell_app",
+            completion_budget=self._completion_budget_for_mode(generation_mode),
         )
         self._clear_agent_reports(workspace_id)
         self._clear_trace(workspace_id)
@@ -434,6 +460,7 @@ class WorkspaceCodeAgentRuntime:
                 draft_source=draft_source,
                 role_scope=role_scope,
                 generation_mode=generation_mode,
+                loop_started_at=started_at,
                 should_stop=should_stop,
             )
         return self._finalize_job(
@@ -655,6 +682,7 @@ class WorkspaceCodeAgentRuntime:
         draft_source: Path,
         role_scope: list[str],
         generation_mode: GenerationMode,
+        loop_started_at: float,
         should_stop: Callable[[], bool] | None,
     ) -> WorkspaceLoopResult:
         focused_edit_kind = self._focused_edit_kind(request)
@@ -880,6 +908,7 @@ class WorkspaceCodeAgentRuntime:
                         last_turn_summary=last_turn_summary,
                         latest_diff_summary=latest_diff_summary,
                         acceptance_contract=acceptance_contract,
+                        loop_started_at=loop_started_at,
                     )
                     if parallel_plan is not None:
                         return parallel_plan
@@ -1130,9 +1159,15 @@ class WorkspaceCodeAgentRuntime:
             append_event=self._append_event,
             append_trace=self._append_trace,
             store_report=self._store_report,
-            allow_optimistic_completion=True,
+            allow_optimistic_completion=False,
             skip_initial_checks=focused_visual_edit or create_intent,
             stop_if_requested=should_stop,
+            budget_status=lambda attempt: self._completion_budget_status(
+                job=job,
+                generation_mode=generation_mode,
+                started_at=loop_started_at,
+                attempt=attempt,
+            ),
         )
         return self.workspace_loop_engine.run(
             workspace_id=workspace_id,
@@ -1141,7 +1176,7 @@ class WorkspaceCodeAgentRuntime:
             draft_source=draft_source,
             role_scope=role_scope,
             generation_mode=generation_mode,
-            max_attempts=FOCUSED_VISUAL_MAX_ATTEMPTS if focused_visual_edit else self._max_attempts(generation_mode),
+            max_attempts=self._max_attempts(generation_mode),
             initial_operations=[],
             initial_assistant_message="Workspace code agent initialized.",
             initial_files_read=list(seed_context.keys()),
@@ -1360,6 +1395,7 @@ class WorkspaceCodeAgentRuntime:
         last_turn_summary: str | None,
         latest_diff_summary: str | None,
         acceptance_contract: dict[str, Any],
+        loop_started_at: float,
     ) -> WorkspaceLoopTurnPlan | None:
         del latest_preview_details, last_turn_summary, latest_diff_summary
         started = time.perf_counter()
@@ -1370,7 +1406,10 @@ class WorkspaceCodeAgentRuntime:
         blueprint["design_brief"] = self._parallel_create_design_brief(generation_mode)
         workers = self._fast_parallel_workers(blueprint)
         workers_by_id = {str(worker["worker"]): worker for worker in workers}
-        round_budget = self._parallel_create_round_budget(generation_mode)
+        round_budget = int(
+            (job.completion_budget if isinstance(job.completion_budget, dict) else {}).get("parallel_round_cap")
+            or self._parallel_create_round_budget(generation_mode)
+        )
         retry_worker_ids = list(workers_by_id.keys())
         successful_results: dict[str, dict[str, Any]] = {}
         failed_rounds: list[dict[str, Any]] = []
@@ -1414,6 +1453,28 @@ class WorkspaceCodeAgentRuntime:
         create_gap: list[str] = []
         round_results: list[dict[str, Any]] = []
         for build_round in range(1, round_budget + 1):
+            budget_status = self._completion_budget_status(
+                job=job,
+                generation_mode=generation_mode,
+                started_at=loop_started_at,
+                attempt=attempt,
+            )
+            if budget_status.get("exhausted"):
+                reason = str(budget_status.get("reason") or "budget_exhausted")
+                return WorkspaceLoopTurnPlan(
+                    outcome="fatal_invalid_response",
+                    assistant_message="Generation budget exhausted before parallel build completed.",
+                    diagnosis=(
+                        f"Generation token/time budget exhausted during parallel build ({reason})."
+                    ),
+                    files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                    failure_class="generation.budget_exhausted",
+                    failure_signature=f"generation.budget_exhausted:{reason}",
+                    root_cause_summary=(
+                        f"Generation token/time budget exhausted during parallel build ({reason})."
+                    ),
+                    metadata={"budget_status": budget_status, "parallel_build": True},
+                )
             round_started = time.perf_counter()
             selected_workers = [workers_by_id[worker_id] for worker_id in retry_worker_ids if worker_id in workers_by_id]
             if not selected_workers:
@@ -4524,7 +4585,7 @@ class WorkspaceCodeAgentRuntime:
         if self._should_update_run_stage(event_type, progress=progress, existing_progress=existing_progress):
             payload["current_stage"] = stage
         if event_type == "job_failed":
-            payload["progress_percent"] = min(98, max(progress, min(existing_progress, 98)))
+            payload["progress_percent"] = 100
         else:
             payload["progress_percent"] = max(existing_progress, progress)
         iteration_count = self._current_iteration_count(job.workspace_id)
@@ -4555,6 +4616,8 @@ class WorkspaceCodeAgentRuntime:
         payload["acceptance_contract"] = dict(job.acceptance_contract)
         payload["worker_summaries"] = list(job.worker_summaries)
         payload["flow_coverage"] = dict(job.flow_coverage)
+        payload["completion_budget"] = dict(job.completion_budget)
+        payload["budget_status"] = dict(job.budget_status)
         payload["fix_targets"] = list(job.fix_targets)
         payload["remaining_issues"] = list(job.remaining_issues)
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -4651,7 +4714,7 @@ class WorkspaceCodeAgentRuntime:
             "apply_completed": ("Applied to workspace", 98),
             "preview_rebuild_completed": ("Preview refreshed", 98),
             "job_completed": ("Complete", 99),
-            "job_failed": ("Failed", 98),
+            "job_failed": ("Failed", 100),
         }
         if event_type in progress_map:
             return progress_map[event_type]
@@ -4890,11 +4953,59 @@ class WorkspaceCodeAgentRuntime:
 
     @staticmethod
     def _max_attempts(generation_mode: GenerationMode) -> int:
-        if generation_mode == GenerationMode.FAST:
-            return 9
-        if generation_mode == GenerationMode.QUALITY:
-            return 12
-        return 10
+        budget = COMPLETION_BUDGETS.get(generation_mode) or COMPLETION_BUDGETS[GenerationMode.BALANCED]
+        return int(budget.get("safety_turn_cap") or 120)
+
+    @staticmethod
+    def _completion_budget_for_mode(generation_mode: GenerationMode | str | None) -> dict[str, Any]:
+        mode = WorkspaceCodeAgentRuntime._generation_mode(generation_mode)
+        budget = dict(COMPLETION_BUDGETS.get(mode) or COMPLETION_BUDGETS[GenerationMode.BALANCED])
+        budget["mode"] = mode.value
+        budget["policy"] = "time_or_token_budget"
+        return budget
+
+    @staticmethod
+    def _token_usage_total(usage: dict[str, Any] | None) -> int:
+        if not isinstance(usage, dict):
+            return 0
+        try:
+            return int(usage.get("total_tokens") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _completion_budget_status(
+        self,
+        *,
+        job: JobRecord,
+        generation_mode: GenerationMode,
+        started_at: float,
+        attempt: int,
+    ) -> dict[str, Any]:
+        budget = dict(job.completion_budget or self._completion_budget_for_mode(generation_mode))
+        elapsed_ms = int(max(0.0, time.perf_counter() - started_at) * 1000)
+        token_limit = int(budget.get("token_limit") or 0)
+        time_limit_ms = int(budget.get("time_limit_ms") or 0)
+        total_tokens = self._token_usage_total(job.token_usage)
+        reason: str | None = None
+        if token_limit > 0 and total_tokens >= token_limit:
+            reason = "token_budget_exhausted"
+        elif time_limit_ms > 0 and elapsed_ms >= time_limit_ms:
+            reason = "time_budget_exhausted"
+        status = {
+            "mode": generation_mode.value,
+            "attempt": int(attempt or 0),
+            "elapsed_ms": elapsed_ms,
+            "time_limit_ms": time_limit_ms,
+            "total_tokens": total_tokens,
+            "token_limit": token_limit,
+            "exhausted": reason is not None,
+            "reason": reason,
+            "failure_class": "generation.budget_exhausted" if reason else None,
+            "failure_signature": f"generation.budget_exhausted:{reason}" if reason else None,
+            "current_phase": "blocked_budget_exhausted" if reason else "agent_loop",
+        }
+        job.budget_status = status
+        return status
 
     @staticmethod
     def _tool_round_limit(generation_mode: GenerationMode) -> int:
