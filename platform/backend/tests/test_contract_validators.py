@@ -131,11 +131,43 @@ def test_build_validator_flags_missing_dom_id(tmp_path: Path) -> None:
     app.state.container.workspace_service.clone_template(workspace.workspace_id)
     source_dir = app.state.container.workspace_service.source_dir(workspace.workspace_id)
     script = source_dir / "miniapp/app/static/client/app.js"
-    script.write_text(script.read_text(encoding="utf-8") + "\ndocument.getElementById('missing-target');\n", encoding="utf-8")
+    script.write_text(
+        script.read_text(encoding="utf-8") + "\ndocument.getElementById('missing-target').textContent = 'Broken';\n",
+        encoding="utf-8",
+    )
 
     issues = BuildValidator().validate(source_dir)
 
     assert any(issue.code == "build.page_script_dom_contract" for issue in issues)
+
+
+def test_build_validator_allows_guarded_page_specific_dom_id(tmp_path: Path) -> None:
+    app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
+    workspace = app.state.container.workspace_service.create_workspace(
+        WorkspaceRecord(name="Guarded DOM Contract Workspace", path=str(tmp_path / "workspace"))
+    )
+    app.state.container.workspace_service.clone_template(workspace.workspace_id)
+    source_dir = app.state.container.workspace_service.source_dir(workspace.workspace_id)
+    manager_dir = source_dir / "miniapp/app/static/manager"
+    manager_dir.mkdir(parents=True, exist_ok=True)
+    manager_dir.joinpath("index.html").write_text(
+        """<!doctype html><html><head><link rel="stylesheet" href="/static/shared/base.css" /></head>
+<body><main class="page-shell"><div id="orders-list"></div></main><script src="/static/manager/app.js" defer></script></body></html>""",
+        encoding="utf-8",
+    )
+    manager_dir.joinpath("app.js").write_text(
+        "const missing = document.getElementById('page-specific-empty');\nif (!missing) {}\n",
+        encoding="utf-8",
+    )
+    manifest = source_dir / "miniapp/app/generated/route_manifest.json"
+    manifest.write_text(
+        json.dumps({"roles": {"manager": {"routes": {"/manager": "static/manager/index.html"}}}, "shared": {}}),
+        encoding="utf-8",
+    )
+
+    issues = BuildValidator().validate(source_dir)
+
+    assert not any(issue.code == "build.page_script_dom_contract" for issue in issues)
 
 
 def test_build_validator_accepts_shared_role_script_ids_on_child_pages(tmp_path: Path) -> None:
@@ -528,6 +560,75 @@ def test_dom_contract_accepts_guarded_shared_role_script_on_child_pages(tmp_path
     assert issues == []
 
 
+def test_dom_contract_accepts_block_return_guarded_helper(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    role_dir = source_dir / "miniapp/app/static/specialist"
+    inventory_dir = role_dir / "inventory"
+    inventory_dir.mkdir(parents=True)
+    role_dir.joinpath("index.html").write_text(
+        "<main><section id='orders-list'></section></main><script src='/static/specialist/app.js'></script>",
+        encoding="utf-8",
+    )
+    inventory_dir.joinpath("index.html").write_text(
+        "<main><p id='product-feedback'></p></main><script src='/static/specialist/app.js'></script>",
+        encoding="utf-8",
+    )
+    role_dir.joinpath("app.js").write_text(
+        "const ordersList = document.getElementById('orders-list');\n"
+        "const productFeedback = document.getElementById('product-feedback');\n"
+        "function setProductFeedback(message) {\n"
+        "  if (!productFeedback) {\n"
+        "    return;\n"
+        "  }\n"
+        "  productFeedback.textContent = message;\n"
+        "}\n"
+        "if (ordersList) { ordersList.innerHTML = ''; }\n",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._dom_contract_issues(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/specialist/app.js"],
+    )
+
+    assert issues == []
+
+
+def test_dom_contract_accepts_conjunctive_if_guard_for_shared_role_script(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    role_dir = source_dir / "miniapp/app/static/manager"
+    overview_dir = role_dir / "overview"
+    overview_dir.mkdir(parents=True)
+    role_dir.joinpath("index.html").write_text(
+        "<main><span id='totalOrders'></span><span id='inProgress'></span><span id='unpaid'></span><span id='deliveryQueue'></span></main><script src='/static/manager/app.js'></script>",
+        encoding="utf-8",
+    )
+    overview_dir.joinpath("index.html").write_text(
+        "<main><section id='overviewList'></section></main><script src='/static/manager/app.js'></script>",
+        encoding="utf-8",
+    )
+    role_dir.joinpath("app.js").write_text(
+        "const totalEl = document.getElementById('totalOrders');\n"
+        "const inProgressEl = document.getElementById('inProgress');\n"
+        "const unpaidEl = document.getElementById('unpaid');\n"
+        "const deliveryEl = document.getElementById('deliveryQueue');\n"
+        "if (totalEl && inProgressEl && unpaidEl && deliveryEl) {\n"
+        "  totalEl.textContent = '0';\n"
+        "  inProgressEl.textContent = '0';\n"
+        "  unpaidEl.textContent = '0';\n"
+        "  deliveryEl.textContent = '0';\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._dom_contract_issues(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/manager/app.js"],
+    )
+
+    assert issues == []
+
+
 def test_agentic_platform_invariants_reject_neutral_role_template(tmp_path: Path) -> None:
     app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
     workspace = app.state.container.workspace_service.create_workspace(
@@ -588,73 +689,64 @@ def test_focused_css_edit_check_profile_skips_generated_tests_and_preview(tmp_pa
     assert results["browser_flow_smoke"].status == "skipped"
 
 
-def _write_commerce_flow_source(source_dir: Path, *, handled_cart: bool) -> None:
+def _write_generic_flow_source(source_dir: Path, *, include_post: bool) -> None:
     client_dir = source_dir / "miniapp/app/static/client"
     specialist_dir = source_dir / "miniapp/app/static/specialist"
     manager_dir = source_dir / "miniapp/app/static/manager"
     for directory in (client_dir, specialist_dir, manager_dir):
         directory.mkdir(parents=True, exist_ok=True)
     client_dir.joinpath("index.html").write_text(
-        "<button data-action='add-to-cart'>В корзину</button><button id='checkout'>Оформить заказ</button>",
+        "<form id='request-form'><button type='submit'>Отправить</button></form>",
         encoding="utf-8",
     )
     client_js = (
-        "const cart = [];\n"
-        "fetch('/api/products');\n"
-        "document.addEventListener('click', (event) => { if (event.target.matches('[data-action=\"add-to-cart\"]')) { cart.push('product'); } });\n"
-        "fetch('/api/orders', { method: 'POST', body: JSON.stringify({ items: cart }) });\n"
-        if handled_cart
-        else "const cart = [];\nfetch('/api/products');\nfetch('/api/orders', { method: 'POST', body: JSON.stringify({ items: cart }) });\n"
+        "const requestForm = document.getElementById('request-form');\n"
+        "requestForm?.addEventListener('submit', (event) => { event.preventDefault(); fetch('/api/records', { method: 'POST', body: JSON.stringify({ title: 'test' }) }); });\n"
+        if include_post
+        else "fetch('/api/records');\n"
     )
     client_dir.joinpath("app.js").write_text(client_js, encoding="utf-8")
-    specialist_dir.joinpath("index.html").write_text("<form id='product-form'></form><section id='orders'></section>", encoding="utf-8")
+    specialist_dir.joinpath("index.html").write_text("<section id='queue'></section>", encoding="utf-8")
     specialist_dir.joinpath("app.js").write_text(
-        "fetch('/api/products', { method: 'POST', body: JSON.stringify({ name: 'test' }) });\n"
-        "fetch('/api/orders');\n"
-        "fetch('/api/orders/1', { method: 'PATCH', body: JSON.stringify({ status: 'packed' }) });\n",
+        "fetch('/api/records');\n"
+        "fetch('/api/records/1', { method: 'PATCH', body: JSON.stringify({ status: 'processed' }) });\n",
         encoding="utf-8",
     )
     manager_dir.joinpath("index.html").write_text("<section>Dashboard summary total count</section>", encoding="utf-8")
     manager_dir.joinpath("app.js").write_text(
-        "fetch('/api/orders');\nfetch('/api/orders/1', { method: 'PATCH', body: JSON.stringify({ status: 'reviewed' }) });\n",
+        "fetch('/api/records');\nfetch('/api/records/1', { method: 'PATCH', body: JSON.stringify({ status: 'reviewed' }) });\n",
         encoding="utf-8",
     )
     routes_dir = source_dir / "miniapp/app/routes"
     routes_dir.mkdir(parents=True, exist_ok=True)
-    routes_dir.joinpath("store.py").write_text(
+    routes_dir.joinpath("records.py").write_text(
         "from fastapi import APIRouter\n"
         "router = APIRouter()\n"
-        "@router.get('/api/products')\n"
-        "def products(): return []\n"
-        "@router.post('/api/products')\n"
-        "def create_product(payload: dict): return payload\n"
-        "@router.patch('/api/products/{product_id}')\n"
-        "def patch_product(product_id: str, payload: dict): return payload\n"
-        "@router.get('/api/orders')\n"
-        "def orders(): return []\n"
-        "@router.post('/api/orders')\n"
-        "def create_order(payload: dict): return payload\n"
-        "@router.patch('/api/orders/{order_id}')\n"
-        "def patch_order(order_id: str, payload: dict): return payload\n",
+        "@router.get('/api/records')\n"
+        "def records(): return []\n"
+        "@router.post('/api/records')\n"
+        "def create_record(payload: dict): return payload\n"
+        "@router.patch('/api/records/{record_id}')\n"
+        "def patch_record(record_id: str, payload: dict): return payload\n",
         encoding="utf-8",
     )
     tests_dir = source_dir / "miniapp/tests"
     tests_dir.mkdir(parents=True, exist_ok=True)
     tests_dir.joinpath("test_generated_app.py").write_text(
-        "from fastapi.testclient import TestClient\n# GET POST PATCH products orders cart\n",
+        "from fastapi.testclient import TestClient\n# GET POST PATCH records\n",
         encoding="utf-8",
     )
     tests_dir.joinpath("generated_app.test.mjs").write_text(
-        "import test from 'node:test';\n// products orders cart GET POST PATCH\n",
+        "import test from 'node:test';\n// records GET POST PATCH\n",
         encoding="utf-8",
     )
 
 
-def test_frontend_interaction_static_smoke_rejects_unhandled_cart_button(tmp_path: Path) -> None:
+def test_frontend_interaction_static_smoke_rejects_missing_frontend_post(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
-    _write_commerce_flow_source(source_dir, handled_cart=False)
+    _write_generic_flow_source(source_dir, include_post=False)
     contract = build_acceptance_contract(
-        prompt="Интернет-магазин: специалист добавляет товар, клиент кладет в корзину и оформляет заказ",
+        prompt="Клиент отправляет заявку, специалист обрабатывает, менеджер видит сводку",
         intent="create",
         generation_mode=GenerationMode.BALANCED,
     )
@@ -669,14 +761,14 @@ def test_frontend_interaction_static_smoke_rejects_unhandled_cart_button(tmp_pat
     )
 
     assert result.status == "failed"
-    assert "platform.workflow_add_to_cart_unhandled" in "\n".join(result.logs)
+    assert "platform.workflow_missing_frontend_post" in "\n".join(result.logs)
 
 
-def test_frontend_interaction_static_smoke_accepts_complete_commerce_flow(tmp_path: Path) -> None:
+def test_frontend_interaction_static_smoke_accepts_complete_generic_flow(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
-    _write_commerce_flow_source(source_dir, handled_cart=True)
+    _write_generic_flow_source(source_dir, include_post=True)
     contract = build_acceptance_contract(
-        prompt="Интернет-магазин: специалист добавляет товар, клиент кладет в корзину и оформляет заказ",
+        prompt="Клиент отправляет заявку, специалист обрабатывает, менеджер видит сводку",
         intent="create",
         generation_mode=GenerationMode.BALANCED,
     )
@@ -691,6 +783,61 @@ def test_frontend_interaction_static_smoke_accepts_complete_commerce_flow(tmp_pa
     )
 
     assert result.status == "passed"
+
+
+def test_frontend_interaction_smoke_accepts_composed_api_base_fetch() -> None:
+    text = (
+        'const API_BASE = "/api";\n'
+        'fetch(`${API_BASE}/products`, { method: "POST", body: JSON.stringify(payload) });\n'
+        'const ORDERS_ENDPOINT = `${API_BASE}/orders`;\n'
+        'fetch(ORDERS_ENDPOINT);\n'
+    )
+
+    assert CheckRunner._text_has_fetch(text, "/api/products", method="POST")
+    assert CheckRunner._text_has_fetch(text, "/api/orders", method="GET")
+
+
+def test_generated_python_tests_fail_fast_when_not_unittest_discoverable(tmp_path: Path) -> None:
+    backend_dir = tmp_path / "miniapp"
+    tests_dir = backend_dir / "tests"
+    tests_dir.mkdir(parents=True)
+    tests_dir.joinpath("test_generated_app.py").write_text(
+        "from fastapi.testclient import TestClient\n\n"
+        "def test_orders_persist():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._run_python_app_tests(backend_dir, require_present=True)
+
+    assert result.status == "failed"
+    assert result.diagnostics["unittest_discovery_failure"] == "pytest_style_top_level_functions"
+    assert "unittest.TestCase" in "\n".join(result.logs)
+
+
+def test_generated_test_diagnostics_extract_sqlite_missing_table() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) no such table: products",
+            "[SQL: SELECT products.id FROM products]",
+        ]
+    )
+
+    assert diagnostics["sqlite_missing_table"]["table"] == "products"
+    assert "create_all" in diagnostics["sqlite_missing_table"]["expected_fix"]
+
+
+def test_backend_import_diagnostics_extract_fastapi_session_dependency_error() -> None:
+    diagnostics = CheckRunner._extract_backend_import_diagnostics(
+        [
+            "fastapi.exceptions.FastAPIError: Invalid args for response field!",
+            "Hint: check that <class 'sqlalchemy.orm.session.Session'> is a valid Pydantic field type.",
+        ]
+    )
+
+    assert "Depends(get_db" in diagnostics["fastapi_session_dependency_error"]["expected_fix"]
+    assert "next(get_db_session())" in diagnostics["fastapi_session_dependency_error"]["expected_fix"]
 
 
 def test_fast_gate_runs_generated_tests_for_create_workflow(monkeypatch, tmp_path: Path) -> None:
@@ -934,6 +1081,19 @@ def test_agentic_platform_invariants_reject_roles_without_actions(tmp_path: Path
     assert "platform.missing_role_workflow_actions" in "\n".join(result.logs)
 
 
+def test_manager_refresh_control_counts_as_oversight_action() -> None:
+    content = """
+    <section class="metric-card">Dashboard total count</section>
+    <button id="manager-oversight" type="button">Обновить контроль</button>
+    <script>
+      const oversightBtn = document.getElementById("manager-oversight");
+      oversightBtn?.addEventListener("click", () => refreshManagerView());
+    </script>
+    """
+
+    assert CheckRunner._role_action_signals("manager", content) == ["dashboard", "oversight_action"]
+
+
 def test_fast_agentic_platform_invariants_accept_one_child_page_per_role(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     manifest = {"roles": {}, "shared": {}}
@@ -1009,6 +1169,43 @@ def test_balanced_agentic_platform_invariants_reject_shallow_design_depth(tmp_pa
 
     assert result.status == "failed"
     assert "platform.insufficient_mode_design_depth" in "\n".join(result.logs)
+
+
+def test_quality_design_depth_accepts_rich_css_without_brittle_media_marker() -> None:
+    rich_css = (
+        ".page { display: grid; }\n"
+        ".hero-card { padding: 20px; }\n"
+        ".dashboard-grid { display: grid; }\n"
+        ".metric-card { padding: 12px; }\n"
+        ".status-badge { border: 1px solid #ccd3df; }\n"
+        ".empty-state { color: #607086; }\n"
+        ".loading-state { opacity: .72; }\n"
+        ".success-state { color: #147a44; }\n"
+        ".error-state { color: #a33131; }\n"
+        ".workflow-form { display: grid; }\n"
+        ".input-field { min-height: 40px; }\n"
+        ".action-button { min-height: 40px; }\n"
+        ".list-panel { display: grid; }\n"
+        ".queue-list { display: grid; }\n"
+        ".control-button { min-height: 40px; }\n"
+        ".summary-card { padding: 16px; }\n"
+        ".detail-card { padding: 16px; }\n"
+        ".timeline-card { padding: 16px; }\n"
+    )
+
+    assert CheckRunner._role_design_depth_issue("specialist", rich_css, "", GenerationMode.QUALITY) is None
+
+
+def test_specialist_role_actions_accept_status_post_workflow() -> None:
+    content = """
+    <form id="status-form"><button id="specialist-status-update">Сохранить статус</button></form>
+    <section>Очередь заказов кондитера</section>
+    <script>
+      fetch('/api/status_updates', { method: 'POST', body: JSON.stringify({ status: 'ready' }) });
+    </script>
+    """
+
+    assert CheckRunner._role_action_signals("specialist", content) == ["status_update", "operations"]
 
 
 def test_quality_agentic_platform_invariants_require_three_child_pages_per_role(tmp_path: Path) -> None:

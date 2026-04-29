@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import PurePosixPath
 import os
 import re
@@ -746,9 +747,10 @@ class RunService:
     @staticmethod
     def _is_generic_failure_reason(reason: str | None) -> bool:
         text = str(reason or "").strip().lower()
-        return not text or text in {
+        return not text or text.startswith("missing create coverage:") or text in {
             "workspace loop exhausted its retry budget without reaching a usable state.",
             "workspace code agent failed.",
+            "parallel build did not produce a complete patch.",
         }
 
     @staticmethod
@@ -757,6 +759,13 @@ class RunService:
             specific_markers = ("operationalerror", "assertionerror", "syntaxerror", "no such table")
             generic_markers = ("failed", "error:", "traceback")
             clean = [" ".join(str(line or "").split()).strip() for line in logs if str(line or "").strip()]
+            for line in reversed(clean):
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and (payload.get("blocking") is True or str(payload.get("severity") or "").lower() == "high"):
+                    return line[:320]
             for line in reversed(clean):
                 lowered = line.lower()
                 if any(marker in lowered for marker in specific_markers):

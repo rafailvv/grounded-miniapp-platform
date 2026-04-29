@@ -254,7 +254,7 @@ class BuildValidator:
                 continue
             role_ids = role_html_ids(workspace_path, script_path_raw)
             html_ids = role_ids or page_ids
-            script_ids = extract_js_dom_ids(script_content)
+            script_ids = self._extract_unsafe_direct_dom_ids(script_content)
             missing_ids = sorted(script_ids - html_ids)
             if not missing_ids:
                 continue
@@ -376,6 +376,19 @@ class BuildValidator:
     @staticmethod
     def _extract_js_dom_ids(content: str) -> set[str]:
         return extract_js_dom_ids(content)
+
+    @staticmethod
+    def _extract_unsafe_direct_dom_ids(content: str) -> set[str]:
+        unsafe: set[str] = set()
+        pattern = re.compile(
+            r"""document\.(?:getElementById\(\s*["'](?P<id1>[A-Za-z0-9_-]+)["']\s*\)|querySelector\(\s*["']\#(?P<id2>[A-Za-z0-9_-]+)["']\s*\))\s*\.""",
+            re.DOTALL,
+        )
+        for match in pattern.finditer(str(content or "")):
+            dom_id = match.group("id1") or match.group("id2")
+            if dom_id:
+                unsafe.add(dom_id)
+        return unsafe
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any] | list[Any] | None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.models.common import GenerationMode, PreviewProfile, TargetPlatform
@@ -168,6 +169,14 @@ def test_patch_first_allows_create_and_tiny_existing_replace() -> None:
     assert create_ops[0].operation == "replace"
 
 
+def test_workspace_service_treats_runtime_artifacts_as_ignored_paths() -> None:
+    assert WorkspaceService._is_ignored_workspace_path(Path("miniapp/app/generated/app.db"))
+    assert WorkspaceService._is_ignored_workspace_path(Path("miniapp/app/generated/cache.sqlite3"))
+    assert WorkspaceService._is_ignored_workspace_path(Path("miniapp/app/routes/__pycache__/app.cpython-312.pyc"))
+    assert not WorkspaceService._is_ignored_workspace_path(Path("miniapp/app/generated/route_manifest.json"))
+    assert not WorkspaceService._is_ignored_workspace_path(Path("miniapp/app/static/client/app.js"))
+
+
 def test_state_store_shards_heavy_reports_and_job_events(tmp_path) -> None:
     store = StateStore(tmp_path / "platform-state.json")
     events = [
@@ -246,6 +255,78 @@ def test_compact_edit_tuning_reduces_output_budget() -> None:
     assert standard_tuning["max_output_tokens"] <= 14000
 
 
+def test_create_repair_prompt_uses_compact_failed_check_context() -> None:
+    runtime = object.__new__(WorkspaceCodeAgentRuntime)
+    large_file = "\n".join(f"const item{index} = {index};" for index in range(500))
+    files = {
+        "miniapp/tests/test_generated_app.py": "class TestGeneratedApp:\n    pass\n" + large_file,
+        "miniapp/tests/generated_app.test.mjs": "import test from 'node:test';\n" + large_file,
+        "miniapp/app/routes/orders.py": "from fastapi import APIRouter\n" + large_file,
+        "miniapp/app/static/client/app.js": "const checkoutButton = document.querySelector('[data-testid=\"checkout\"]');\n" + large_file,
+    }
+    diff = "\n".join(f"diff --git a/{path} b/{path}" for path in files)
+
+    class FakeWorkspaceService:
+        def file_tree(self, *_args, **_kwargs):
+            return list(files.keys()) + ["miniapp/app/static/client/index.html"]
+
+        def diff(self, *_args, **_kwargs):
+            return diff
+
+        def try_read_text_file(self, _workspace_id, path, **_kwargs):
+            return files.get(path)
+
+    runtime.workspace_service = FakeWorkspaceService()
+    execution = CheckExecutionRecord(
+        workspace_id="ws",
+        run_id="run",
+        results=[
+            RunCheckResult(
+                name="generated_app_js_tests",
+                status="failed",
+                details="Cart flow failed because checkout button has no effective handler. " + "x" * 4000,
+                command="node --test miniapp/tests/generated_app.test.mjs",
+                exit_code=1,
+                logs=["AssertionError: checkout handler missing " + "y" * 5000],
+                diagnostics={
+                    "file_path": "miniapp/tests/generated_app.test.mjs",
+                    "huge_payload": "z" * 6000,
+                },
+            )
+        ],
+    )
+
+    prompt = runtime._agent_user_prompt(
+        workspace_id="ws",
+        run_id="run",
+        request=GenerateRequest(
+            prompt="Я владелец пекарни, хочу каталог, корзину и оформление заказа.",
+            intent="create",
+            generation_mode=GenerationMode.FAST,
+        ),
+        attempt=2,
+        tool_round=0,
+        context_mode="minimal",
+        repeated_no_progress=0,
+        latest_execution=execution,
+        latest_preview_details={"container_logs": ["preview log " + "p" * 5000], "status": "running"},
+        seed_context={"miniapp/app/static/client/index.html": "seed" * 3000},
+        extra_file_context={"miniapp/app/static/manager/index.html": "extra" * 3000},
+        tool_results=[{"tool": "run_checks", "logs": ["tool log " + "t" * 7000], "files": files}],
+        last_turn_summary="previous turn",
+        latest_diff_summary=diff,
+    )
+    payload = json.loads(prompt)
+
+    assert payload["prompt_payload_mode"] == "compact_repair"
+    assert payload["context_pack"] == {}
+    assert payload["fast_create_required_file_set"] == []
+    assert "miniapp/tests/generated_app.test.mjs" in payload["file_contexts"]
+    assert len(prompt) < 35000
+    assert "z" * 2000 not in prompt
+    assert any("compact repair turn" in rule for rule in payload["rules"])
+
+
 def test_platform_shell_stabilizer_restores_safe_top_spacing(tmp_path) -> None:
     source_dir = tmp_path / "source"
     base_path = source_dir / "miniapp/app/static/shared/base.css"
@@ -280,7 +361,7 @@ def test_copy_and_behavior_edits_are_classified_separately() -> None:
     assert WorkspaceCodeAgentRuntime._focused_edit_kind(workflow_request) == "behavior_workflow_edit"
 
 
-def test_acceptance_contract_captures_commerce_workflow_and_orchestration() -> None:
+def test_acceptance_contract_captures_generic_workflow_and_orchestration() -> None:
     contract = build_acceptance_contract(
         prompt="Интернет-магазин: специалист добавляет товар, клиент кладет в корзину и оформляет заказ, менеджер видит заказы",
         intent="create",
@@ -294,9 +375,10 @@ def test_acceptance_contract_captures_commerce_workflow_and_orchestration() -> N
     )
 
     assert contract["required"] is True
-    assert contract["features"]["commerce_catalog_cart_order"] is True
-    assert any(flow["id"] == "commerce_catalog_cart_order" for flow in contract["flows"])
-    assert {item["resource"] for item in contract["required_endpoints"]} == {"products", "orders"}
+    assert "commerce_catalog_cart_order" not in contract["features"]
+    assert not any(flow["id"] == "commerce_catalog_cart_order" for flow in contract["flows"])
+    assert any(flow["id"] == "related_resource_workflow" for flow in contract["flows"])
+    assert {item["resource"] for item in contract["required_endpoints"]} == {"records", "status_updates"}
     assert orchestration["enabled"] is True
     assert [phase["id"] for phase in orchestration["phases"]] == [
         "spec_extract",
@@ -523,7 +605,43 @@ def test_fast_parallel_worker_merge_deduplicates_same_worker_path() -> None:
     assert manifests[0].content == '{"version": 2}'
 
 
-def test_fast_parallel_blueprint_uses_commerce_role_pages() -> None:
+def test_parallel_worker_repair_result_preserves_existing_owned_files() -> None:
+    existing = {
+        "worker": "generated_tests",
+        "status": "completed",
+        "outcome": "patch_ready",
+        "operations": [
+            DraftFileOperation(
+                file_path="miniapp/tests/test_generated_app.py",
+                operation="replace",
+                content="python test v1",
+                reason="python tests",
+            )
+        ],
+    }
+    repair = {
+        "worker": "generated_tests",
+        "status": "completed",
+        "outcome": "patch_ready",
+        "operations": [
+            DraftFileOperation(
+                file_path="miniapp/tests/generated_app.test.mjs",
+                operation="replace",
+                content="js test",
+                reason="js tests",
+            )
+        ],
+    }
+
+    merged = WorkspaceCodeAgentRuntime._merge_parallel_worker_repair_result(existing, repair)
+
+    assert [operation.file_path for operation in merged["operations"]] == [
+        "miniapp/tests/test_generated_app.py",
+        "miniapp/tests/generated_app.test.mjs",
+    ]
+
+
+def test_fast_parallel_blueprint_uses_generic_role_pages() -> None:
     contract = build_acceptance_contract(
         prompt="Интернет-магазин с каталогом, корзиной и заказами",
         intent="create",
@@ -534,9 +652,9 @@ def test_fast_parallel_blueprint_uses_commerce_role_pages() -> None:
     blueprint = WorkspaceCodeAgentRuntime._fast_parallel_blueprint(contract)
     workers = WorkspaceCodeAgentRuntime._fast_parallel_workers(blueprint)
 
-    assert blueprint["commerce_flow"] is True
-    assert blueprint["role_files"]["client"]["child"] == "miniapp/app/static/client/catalog/index.html"
-    assert blueprint["role_files"]["specialist"]["child"] == "miniapp/app/static/specialist/inventory/index.html"
+    assert "commerce_flow" not in blueprint
+    assert blueprint["role_files"]["client"]["child"] == "miniapp/app/static/client/request/index.html"
+    assert blueprint["role_files"]["specialist"]["child"] == "miniapp/app/static/specialist/queue/index.html"
     assert {worker["worker"] for worker in workers} == {
         "backend_api",
         "client_ui",
@@ -550,7 +668,6 @@ def test_no_platform_create_fallback_entrypoints_remain() -> None:
     removed_entrypoints = {
         "_fast_create_fallback_operations",
         "_fast_create_fallback_operations_with_cleanup",
-        "_fast_commerce_fallback_operations",
         "_fast_create_should_use_fallback_repair",
         "_mark_fast_create_fallback_job",
     }
@@ -577,7 +694,48 @@ def test_parallel_failures_target_owned_repair_workers() -> None:
             "miniapp/tests/test_generated_app.py API status/update coverage",
         ],
         {},
-    ) == {"backend_api", "client_ui", "specialist_ui", "manager_ui", "generated_tests"}
+    ) == {"backend_api", "client_ui", "generated_tests"}
+    assert WorkspaceCodeAgentRuntime._parallel_repair_targets_from_coverage_gap(
+        ["quality create: multiple API resources plus update/status endpoint"],
+        {},
+    ) == {"backend_api", "generated_tests"}
+
+
+def test_generated_test_failures_seed_backend_and_role_context_for_repair() -> None:
+    execution = CheckExecutionRecord(
+        workspace_id="ws",
+        run_id="run",
+        changed_files=[],
+        results=[
+            RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                logs=["AssertionError: 422 not found in [200, 201]"],
+            ),
+            RunCheckResult(
+                name="generated_app_js_tests",
+                status="failed",
+                logs=["Client submit control missing"],
+            ),
+        ],
+    )
+
+    targets = WorkspaceCodeAgentRuntime._target_files_from_execution(execution)
+
+    assert "miniapp/tests/test_generated_app.py" in targets
+    assert "miniapp/app/schemas.py" in targets
+    assert "miniapp/app/routes/app_api.py" in targets
+    assert "miniapp/tests/generated_app.test.mjs" in targets
+    assert "miniapp/app/static/client/index.html" in targets
+    assert "miniapp/app/static/manager/app.js" in targets
+
+
+def test_provider_quota_errors_are_classified_as_terminal_platform_blockers() -> None:
+    assert WorkspaceCodeAgentRuntime._is_provider_quota_error(
+        "OpenAI responses returned 429: {\"error\":{\"code\":\"insufficient_quota\"}}"
+    )
+    assert WorkspaceCodeAgentRuntime._is_provider_quota_error("You exceeded your current quota")
+    assert not WorkspaceCodeAgentRuntime._is_provider_quota_error("OpenAI responses returned 503")
 
 
 def test_create_patch_coverage_rejects_partial_role_slice() -> None:
@@ -658,7 +816,15 @@ def test_fast_create_patch_coverage_accepts_one_child_page_per_role_and_test_pat
         if operation.file_path.endswith("styles.css"):
             operation.content = ".page-shell { color: #172033; }\n.record-card { border: 1px solid #ddd; }\n.metric-card { padding: 12px; }\n"
         if operation.file_path == "miniapp/tests/test_generated_app.py":
-            operation.content = "client.get('/api/orders')\nclient.post('/api/orders', json={'title': 'User order'})\nclient.get('/api/orders')\nclient.patch('/api/orders/1', json={'status':'confirmed'})\n"
+            operation.content = (
+                "import unittest\n\n"
+                "class GeneratedAppTest(unittest.TestCase):\n"
+                "    def test_orders_persist_and_update(self):\n"
+                "        client.get('/api/orders')\n"
+                "        client.post('/api/orders', json={'title': 'User order'})\n"
+                "        client.get('/api/orders')\n"
+                "        client.patch('/api/orders/1', json={'status':'confirmed'})\n"
+            )
 
     assert WorkspaceCodeAgentRuntime._create_patch_coverage_gap(operations, request=request) == []
 
@@ -679,7 +845,7 @@ def test_parallel_mode_contracts_make_fast_balanced_quality_different() -> None:
         for mode in contracts
     }
 
-    assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.FAST) == 3
+    assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.FAST) == 4
     assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.BALANCED) == 5
     assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.QUALITY) == 7
     assert blueprints[GenerationMode.FAST]["required_child_pages_per_role"] == 1
@@ -716,6 +882,115 @@ def test_create_patch_coverage_rejects_static_only_app_without_api() -> None:
     assert "backend POST /api/<resource>" in missing
     assert "frontend form/fetch POST /api/<resource>" in missing
     assert "miniapp/tests/test_generated_app.py API persistence coverage" in missing
+
+
+def test_create_patch_coverage_requires_sqlalchemy_table_creation_and_unittest_tests() -> None:
+    request = GenerateRequest(prompt="Create a store", intent="create", generation_mode=GenerationMode.FAST)
+    operations = [
+        DraftFileOperation(
+            file_path="miniapp/app/routes/store_api.py",
+            operation="create",
+            content=(
+                "from fastapi import APIRouter\n"
+                "from app.db import Base\n"
+                "from sqlalchemy.orm import Session\n"
+                "router = APIRouter()\n"
+                "def get_db(): pass\n"
+                "class Product(Base):\n"
+                "    __tablename__ = 'products'\n"
+                "@router.get('/api/products')\n"
+                "def list_products(): return []\n"
+                "@router.post('/api/products')\n"
+                "def create_product(payload: dict): return payload\n"
+                "@router.patch('/api/products/{product_id}')\n"
+                "def update_product(product_id: int, payload: dict, session: Session = next(get_db())): return Item()\n"
+            ),
+            reason="test",
+        ),
+        DraftFileOperation(file_path="miniapp/app/main.py", operation="replace", content="include_router", reason="test"),
+        DraftFileOperation(file_path="miniapp/app/generated/route_manifest.json", operation="replace", content="{}", reason="test"),
+        DraftFileOperation(file_path="miniapp/tests/test_generated_app.py", operation="replace", content="client.get('/api/products')\nclient.post('/api/products')\nclient.patch('/api/products/1')", reason="test"),
+        DraftFileOperation(file_path="miniapp/tests/generated_app.test.mjs", operation="replace", content="node:test", reason="test"),
+    ]
+    for role, child in {"client": "catalog", "specialist": "inventory", "manager": "overview"}.items():
+        operations.extend(
+            [
+                DraftFileOperation(file_path=f"miniapp/app/static/{role}/index.html", operation="replace", content=f"/static/{role}/styles.css", reason="test"),
+                DraftFileOperation(file_path=f"miniapp/app/static/{role}/{child}/index.html", operation="replace", content=f"/static/{role}/styles.css", reason="test"),
+                DraftFileOperation(file_path=f"miniapp/app/static/{role}/app.js", operation="replace", content="fetch('/api/products', { method: 'POST' }); fetch('/api/products/1', { method: 'PATCH' });", reason="test"),
+                DraftFileOperation(file_path=f"miniapp/app/static/{role}/styles.css", operation="replace", content=".card { padding: 8px; }", reason="test"),
+            ]
+        )
+
+    missing = WorkspaceCodeAgentRuntime._create_patch_coverage_gap(operations, request=request)
+
+    assert "backend SQLAlchemy table creation via Base.metadata.create_all" in missing
+    assert "backend FastAPI SQLAlchemy Session dependency via Depends(get_db_session)" in missing
+    assert "backend undefined ORM Item model" in missing
+    assert "miniapp/tests/test_generated_app.py unittest.TestCase coverage" in missing
+
+
+def test_create_patch_coverage_accepts_fastapi_depends_session_default() -> None:
+    request = GenerateRequest(prompt="Create a store", intent="create", generation_mode=GenerationMode.FAST)
+    operations = [
+        DraftFileOperation(
+            file_path="miniapp/app/routes/store_api.py",
+            operation="create",
+            content=(
+                "from fastapi import APIRouter, Depends\n"
+                "from sqlalchemy.orm import Session\n"
+                "from app.db import Base\n"
+                "router = APIRouter()\n"
+                "def get_db_session():\n"
+                "    yield object()\n"
+                "class Product(Base):\n"
+                "    __tablename__ = 'products'\n"
+                "@router.get('/api/products')\n"
+                "def list_products(session: Session = Depends(get_db_session)): return []\n"
+                "@router.post('/api/products')\n"
+                "def create_product(payload: dict, session: Session = Depends(get_db_session)): return payload\n"
+                "@router.patch('/api/products/{product_id}')\n"
+                "def update_product(product_id: int, payload: dict, session: Session = Depends(get_db_session)): return payload\n"
+            ),
+            reason="test",
+        ),
+        DraftFileOperation(file_path="miniapp/app/main.py", operation="replace", content="Base.metadata.create_all(bind=engine)", reason="test"),
+    ]
+
+    missing = WorkspaceCodeAgentRuntime._create_patch_coverage_gap(operations, request=request)
+
+    assert "backend FastAPI SQLAlchemy Session dependency via Depends(get_db_session)" not in missing
+    assert "backend FastAPI generator dependency without @contextmanager" not in missing
+
+
+def test_create_patch_coverage_rejects_contextmanager_fastapi_dependency() -> None:
+    request = GenerateRequest(prompt="Create a store", intent="create", generation_mode=GenerationMode.FAST)
+    operations = [
+        DraftFileOperation(
+            file_path="miniapp/app/routes/store_api.py",
+            operation="create",
+            content=(
+                "from contextlib import contextmanager\n"
+                "from fastapi import APIRouter, Depends\n"
+                "from sqlalchemy.orm import Session\n"
+                "router = APIRouter()\n"
+                "@contextmanager\n"
+                "def get_db_session():\n"
+                "    yield object()\n"
+                "@router.get('/api/products')\n"
+                "def list_products(session: Session = Depends(get_db_session)): return []\n"
+                "@router.post('/api/products')\n"
+                "def create_product(payload: dict, session: Session = Depends(get_db_session)): return payload\n"
+                "@router.patch('/api/products/{product_id}')\n"
+                "def update_product(product_id: int, payload: dict, session: Session = Depends(get_db_session)): return payload\n"
+            ),
+            reason="test",
+        ),
+    ]
+
+    missing = WorkspaceCodeAgentRuntime._create_patch_coverage_gap(operations, request=request)
+
+    assert "backend FastAPI generator dependency without @contextmanager" in missing
 
 
 def test_balanced_create_patch_coverage_requires_two_child_pages_per_role() -> None:
@@ -1653,13 +1928,25 @@ def test_agent_turn_tuning_caps_all_generation_modes() -> None:
         "reasoning": {"effort": "low"},
         "max_output_tokens": 28000,
     }
+    assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.FAST, intent="create", repair_turn=True) == {
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": 26000,
+    }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED, intent="create") == {
         "reasoning": {"effort": "medium"},
         "max_output_tokens": 36000,
     }
+    assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED, intent="create", repair_turn=True) == {
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": 28000,
+    }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.QUALITY, intent="create") == {
         "reasoning": {"effort": "high"},
         "max_output_tokens": 52000,
+    }
+    assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.QUALITY, intent="create", repair_turn=True) == {
+        "reasoning": {"effort": "medium"},
+        "max_output_tokens": 30000,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED) == {
         "reasoning": {"effort": "medium"},

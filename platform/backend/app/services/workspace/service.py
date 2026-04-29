@@ -32,7 +32,7 @@ class WorkspaceService:
         ".vite",
         ".cache",
     }
-    IGNORED_TREE_SUFFIXES = (".pyc", ".pyo", ".tsbuildinfo")
+    IGNORED_TREE_SUFFIXES = (".pyc", ".pyo", ".tsbuildinfo", ".db", ".sqlite", ".sqlite3")
     IGNORED_TREE_NAMES = {".DS_Store", "vite.config.js", "vite.config.d.ts"}
 
     def __init__(self, settings: Settings, store: StateStore, workspace_log_service: WorkspaceLogService) -> None:
@@ -445,8 +445,22 @@ class WorkspaceService:
         draft_source = self.draft_source_dir(workspace_id, run_id)
         prepared_ops: list[PatchOperationModel] = []
         for operation in operations:
-            target_path = draft_source / self._safe_relative_path(operation.file_path)
-            current_content = target_path.read_text(encoding="utf-8") if target_path.exists() and target_path.is_file() else ""
+            relative_path = self._safe_relative_path(operation.file_path)
+            if self._is_ignored_workspace_path(relative_path):
+                raise ValueError(
+                    f"Refusing to patch generated runtime artifact {operation.file_path}. "
+                    "Repair source code, route files, static assets, or tests instead."
+                )
+            target_path = draft_source / relative_path
+            current_content = ""
+            if target_path.exists() and target_path.is_file():
+                try:
+                    current_content = target_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(
+                        f"Cannot patch non-UTF8 file {operation.file_path}. "
+                        "Repair source code, route files, static assets, or tests instead."
+                    ) from exc
             file_hash = self._file_hash(current_content) if target_path.exists() and target_path.is_file() else None
             if operation.operation == "patch":
                 diff = self._ensure_unified_diff_paths(str(operation.diff or operation.content or ""), operation.file_path)
@@ -514,7 +528,7 @@ class WorkspaceService:
         try:
             file_path = self._target_dir(workspace_id, run_id) / self._safe_relative_path(relative_path)
             return file_path.read_text(encoding="utf-8")
-        except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError):
             return None
 
     def file_tree(self, workspace_id: str, run_id: str | None = None) -> list[dict[str, str]]:
@@ -590,7 +604,10 @@ class WorkspaceService:
             if relative_path in backups:
                 return
             if target_path.exists() and target_path.is_file():
-                backups[relative_path] = ("file", target_path.read_text(encoding="utf-8"))
+                try:
+                    backups[relative_path] = ("file", target_path.read_text(encoding="utf-8"))
+                except UnicodeDecodeError:
+                    backups[relative_path] = ("other", None)
             elif target_path.exists():
                 backups[relative_path] = ("other", None)
             else:
@@ -622,8 +639,22 @@ class WorkspaceService:
             )
 
         for operation in envelope.ops:
-            target_path = target_root / self._safe_relative_path(operation.file_path)
-            existing_content = target_path.read_text(encoding="utf-8") if target_path.exists() and target_path.is_file() else ""
+            relative_path = self._safe_relative_path(operation.file_path)
+            if self._is_ignored_workspace_path(relative_path):
+                return failed(
+                    "conflict",
+                    f"Refusing to patch generated runtime artifact {operation.file_path}. Repair source code or tests instead.",
+                )
+            target_path = target_root / relative_path
+            existing_content = ""
+            if target_path.exists() and target_path.is_file():
+                try:
+                    existing_content = target_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    return failed(
+                        "conflict",
+                        f"Cannot patch non-UTF8 file {operation.file_path}. Repair source code or tests instead.",
+                    )
             precondition_hash = (operation.precondition or {}).get("file_hash") if operation.precondition else None
             if precondition_hash is not None and self._file_hash(existing_content) != precondition_hash:
                 return failed("conflict", f"Precondition hash mismatch for {operation.file_path}.")
@@ -1120,6 +1151,9 @@ class WorkspaceService:
                 "vite.config.d.ts",
                 "*.pyc",
                 "*.pyo",
+                "*.db",
+                "*.sqlite",
+                "*.sqlite3",
                 "*.tsbuildinfo",
             ),
             symlinks=True,
@@ -1161,6 +1195,9 @@ class WorkspaceService:
                         "vite.config.d.ts",
                         "*.pyc",
                         "*.pyo",
+                        "*.db",
+                        "*.sqlite",
+                        "*.sqlite3",
                         "*.tsbuildinfo",
                     ),
                 )

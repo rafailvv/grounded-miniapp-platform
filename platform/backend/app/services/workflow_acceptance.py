@@ -8,26 +8,21 @@ from app.models.common import GenerationMode
 ROLE_ORDER = ("client", "specialist", "manager")
 
 WORKFLOW_EDIT_MARKERS = (
-    "add to cart",
     "after adding",
     "button",
-    "cart",
-    "catalog",
-    "checkout",
     "does not load",
     "doesn't load",
+    "form",
+    "list",
     "order",
-    "product",
     "refresh",
     "should appear",
     "не подгружается",
     "не работает",
     "кнопк",
-    "каталог",
-    "корзин",
-    "оформлен",
+    "список",
+    "форма",
     "заказ",
-    "товар",
     "после добавления",
     "должно появляться",
     "появлялось",
@@ -36,27 +31,6 @@ WORKFLOW_EDIT_MARKERS = (
     "во всех трех",
     "во всех трёх",
 )
-
-COMMERCE_FLOW_MARKERS = (
-    "add to cart",
-    "cart",
-    "catalog",
-    "checkout",
-    "internet shop",
-    "online store",
-    "order",
-    "product",
-    "shop",
-    "store",
-    "интернет-магаз",
-    "магазин",
-    "каталог",
-    "корзин",
-    "оформлен",
-    "заказ",
-    "товар",
-)
-
 
 def normalized_generation_mode(generation_mode: GenerationMode | str | None) -> str:
     return str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
@@ -67,24 +41,19 @@ def is_behavior_workflow_prompt(prompt: str) -> bool:
     if not text:
         return False
     strong_markers = (
-        "add to cart",
         "after adding",
-        "cart",
-        "checkout",
         "does not load",
         "doesn't load",
         "не подгружается",
         "не работает",
         "не нажим",
-        "корзин",
-        "оформлен",
         "после добавления",
         "должно появляться",
         "появлялось",
     )
     if any(marker in text for marker in strong_markers):
         return True
-    broad_flow_terms = ("button", "кнопк", "catalog", "product", "order", "каталог", "товар", "заказ")
+    broad_flow_terms = ("button", "form", "list", "record", "order", "кнопк", "форма", "список", "запис", "заказ")
     if any(marker in text for marker in broad_flow_terms) and any(
         marker in text
         for marker in (
@@ -151,11 +120,6 @@ def is_behavior_workflow_prompt(prompt: str) -> bool:
     )
 
 
-def prompt_has_commerce_flow(prompt: str) -> bool:
-    text = str(prompt or "").strip().lower()
-    return bool(text) and any(marker in text for marker in COMMERCE_FLOW_MARKERS)
-
-
 def build_acceptance_contract(
     *,
     prompt: str,
@@ -178,7 +142,8 @@ def build_acceptance_contract(
             "test_requirements": [],
         }
 
-    commerce_flow = prompt_has_commerce_flow(prompt)
+    resource_count = 3 if mode_value == GenerationMode.QUALITY.value else 2 if mode_value == GenerationMode.BALANCED.value else 1
+    endpoint_resources = ["records", "status_updates", "summaries"][:resource_count]
     flows: list[dict[str, Any]] = [
         {
             "id": "role_shared_persistence",
@@ -196,39 +161,27 @@ def build_acceptance_contract(
             ],
         }
     ]
-    required_endpoints = [{"resource": "records", "methods": ["GET", "POST", "PATCH"]}]
-    required_buttons = ["client-submit", "specialist-status-update", "manager-oversight"]
-
-    if commerce_flow:
+    if resource_count >= 2:
         flows.append(
             {
-                "id": "commerce_catalog_cart_order",
-                "title": "Catalog, cart, checkout, and cross-role order visibility",
+                "id": "related_resource_workflow",
+                "title": "Related role workflow and operational updates",
                 "roles": list(ROLE_ORDER),
                 "requirements": [
-                    "Specialist can add or update products with inventory through a POST/PATCH product API.",
-                    "Client catalog loads products through GET /api/products after refresh.",
-                    "Client add-to-cart control has an effective JavaScript handler and updates cart state.",
-                    "Client checkout sends an order through POST /api/orders with chosen products/quantities.",
-                    "Specialist and manager can see the created order through persisted GET /api/orders and change/review status.",
+                    "At least two prompt-derived resources or workflows are connected through shared persisted state.",
+                    "Role pages expose different actions for creating, processing, and reviewing records.",
+                    "Specialist or manager status changes are visible to the other roles through later GET requests.",
                 ],
                 "required_tests": [
-                    "Create product -> catalog sees product -> add to cart handler exists -> checkout POST -> order appears for specialist/manager.",
-                    "Status change persists after GET.",
+                    "Generated tests cover the primary create/list/update flow and one related status or summary flow.",
                 ],
             }
         )
-        required_endpoints = [
-            {"resource": "products", "path": "/api/products", "methods": ["GET", "POST", "PATCH"]},
-            {"resource": "orders", "path": "/api/orders", "methods": ["GET", "POST", "PATCH"]},
-        ]
-        required_buttons = [
-            "product-create",
-            "add-to-cart",
-            "checkout",
-            "specialist-order-status",
-            "manager-order-review",
-        ]
+    required_endpoints = [
+        {"resource": resource, "path": f"/api/{resource}", "methods": ["GET", "POST", "PATCH"]}
+        for resource in endpoint_resources
+    ]
+    required_buttons = ["client-submit", "specialist-status-update", "manager-oversight"]
 
     return {
         "required": True,
@@ -237,10 +190,10 @@ def build_acceptance_contract(
         "workflow_kind": workflow_kind or ("create" if intent_value == "create" else "behavior_workflow_edit"),
         "roles": list(ROLE_ORDER),
         "features": {
-            "commerce_catalog_cart_order": commerce_flow,
             "cross_role_persistence": True,
             "refresh_persistence": True,
             "status_update": True,
+            "resource_count": resource_count,
         },
         "required_endpoints": required_endpoints,
         "required_buttons": required_buttons,
@@ -294,12 +247,12 @@ def orchestration_metadata_for_contract(
         {
             "worker": "client_ui",
             "ownership": ["miniapp/app/static/client/**"],
-            "responsibility": "Customer-facing forms, catalog/cart/order controls, and client-side API calls.",
+            "responsibility": "Customer-facing forms, saved-record controls, and client-side API calls.",
         },
         {
             "worker": "specialist_ui",
             "ownership": ["miniapp/app/static/specialist/**"],
-            "responsibility": "Operational queue, product/status actions, and saved-state visibility.",
+            "responsibility": "Operational queue, status actions, and saved-state visibility.",
         },
         {
             "worker": "manager_ui",

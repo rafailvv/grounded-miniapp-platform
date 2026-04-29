@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.models.artifacts import ApplyPatchResult
 from app.models.common import GenerationMode
 from app.models.domain import (
     CheckExecutionRecord,
@@ -401,6 +402,35 @@ class WorkspaceLoopTurnRunner:
             latest_files_read = list(plan.files_read)
 
             if plan.outcome == "fatal_invalid_response":
+                if attempt < max_attempts:
+                    callbacks.append_event(
+                        job,
+                        "repair_iteration",
+                        "Loop turn returned an invalid response. Retrying with the same failure packet instead of ending the run.",
+                        {
+                            "attempt": attempt + 1,
+                            "context_mode": context_mode,
+                            "diagnosis": plan.diagnosis,
+                        },
+                    )
+                    callbacks.append_trace(
+                        workspace_id,
+                        "workspace_loop",
+                        "Loop turn returned an invalid response; retrying.",
+                        {
+                            "attempt": attempt + 1,
+                            "context_mode": context_mode,
+                            "diagnosis": plan.diagnosis,
+                        },
+                    )
+                    turn_history[-1]["result"] = "invalid_response_retry"
+                    latest_assistant_message = plan.assistant_message or plan.diagnosis or latest_assistant_message
+                    previous_snapshot = progress_snapshot
+                    if context_mode == "minimal":
+                        context_mode = "expanded"
+                    elif context_mode == "expanded":
+                        context_mode = "full_bundle"
+                    continue
                 return self.results.failed(
                     outcome_kind="blocked_generation",
                     summary="Workspace loop stopped because the edit model returned an invalid response.",
@@ -485,14 +515,30 @@ class WorkspaceLoopTurnRunner:
                     "first_patch": not draft_diff_before_apply,
                 },
             )
-            envelope = self.context_builder.workspace_service.build_patch_envelope_for_draft(workspace_id, run_id, synced_operations)
-            apply_result = self.context_builder.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
-            latest_apply_result = apply_result.model_dump(mode="json")
+            try:
+                envelope = self.context_builder.workspace_service.build_patch_envelope_for_draft(workspace_id, run_id, synced_operations)
+                apply_result = self.context_builder.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
+                latest_apply_result = apply_result.model_dump(mode="json")
+                envelope_report: dict[str, object] = self.compact_patch_report_envelope(envelope)
+            except ValueError as exc:
+                apply_result = ApplyPatchResult(
+                    workspace_id=workspace_id,
+                    run_id=run_id,
+                    status="conflict",
+                    conflict_reason=str(exc),
+                )
+                latest_apply_result = apply_result.model_dump(mode="json")
+                envelope_report = {
+                    "not_built": True,
+                    "operation_count": len(synced_operations),
+                    "files": [operation.file_path for operation in synced_operations],
+                    "error": str(exc),
+                }
             callbacks.store_report(
                 f"patch:{workspace_id}",
                 {
                     "workspace_id": workspace_id,
-                    "envelope": self.compact_patch_report_envelope(envelope),
+                    "envelope": envelope_report,
                     "apply_result": latest_apply_result,
                 },
             )

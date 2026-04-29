@@ -139,6 +139,10 @@ class CheckRunner:
         r"table\s+(?P<table>[A-Za-z0-9_]+)\s+has no column named\s+(?P<column>[A-Za-z0-9_]+)",
         re.IGNORECASE,
     )
+    _SQLITE_MISSING_TABLE_RE = re.compile(
+        r"no such table:\s+(?P<table>[A-Za-z0-9_]+)",
+        re.IGNORECASE,
+    )
     _SHARED_STATE_UPDATE_RE = re.compile(
         r"Updated record\s+(?P<record_id>[A-Za-z0-9_-]+)\s+did not reflect\s+(?P<actor>[A-Za-z0-9_-]+)\s+changes in shared state\.\s+Payload:\s*(?P<payload>.*)$",
         re.IGNORECASE,
@@ -150,6 +154,10 @@ class CheckRunner:
     _GENERATED_JS_TEST_LOCATION_RE = re.compile(r"generated_app\.test\.mjs:(?P<line>\d+):(?P<column>\d+)")
     _STATIC_JS_SYNTAX_LOCATION_RE = re.compile(
         r"(?P<path>.*?/miniapp/(?P<relative>app/static/[^:\s]+\.js)):(?P<line>\d+)"
+    )
+    _FASTAPI_SESSION_RESPONSE_FIELD_RE = re.compile(
+        r"Invalid args for response field!.*sqlalchemy\.orm\.session\.Session",
+        re.IGNORECASE | re.DOTALL,
     )
 
     def __init__(self, validation_suite: ValidationSuite, preview_service: PreviewService) -> None:
@@ -608,9 +616,6 @@ class CheckRunner:
                     blocking=True,
                 )
             )
-        features = contract.get("features") if isinstance(contract.get("features"), dict) else {}
-        if features.get("commerce_catalog_cart_order"):
-            issues.extend(cls._commerce_flow_issues(role_text=role_text, backend_text=backend_text, tests_text=tests_text))
         return cls._dedupe_validation_issues(issues)
 
     @staticmethod
@@ -678,106 +683,7 @@ class CheckRunner:
         required_terms = ["post", "get"]
         if (contract.get("features") or {}).get("status_update"):
             required_terms.append("patch")
-        if (contract.get("features") or {}).get("commerce_catalog_cart_order"):
-            required_terms.extend(["products", "orders"])
         return all(term in lowered for term in required_terms)
-
-    @classmethod
-    def _commerce_flow_issues(cls, *, role_text: dict[str, str], backend_text: str, tests_text: str) -> list[ValidationIssue]:
-        issues: list[ValidationIssue] = []
-        client = role_text.get("client", "")
-        specialist = role_text.get("specialist", "")
-        manager = role_text.get("manager", "")
-        route_requirements = [
-            ("GET", "/api/products", "product catalog loading"),
-            ("POST", "/api/products", "specialist product creation"),
-            ("GET", "/api/orders", "order visibility"),
-            ("POST", "/api/orders", "checkout order creation"),
-            ("PATCH", "/api/orders", "order status updates"),
-        ]
-        for method, path, label in route_requirements:
-            if not cls._backend_has_route(backend_text, method=method, path=path):
-                issues.append(
-                    ValidationIssue(
-                        code="platform.workflow_missing_backend_route",
-                        message=f"Commerce flow requires {method} {path} for {label}.",
-                        severity="high",
-                        location="miniapp/app/routes",
-                        blocking=True,
-                    )
-                )
-        if not cls._text_has_fetch(client, "/api/products", method="GET"):
-            issues.append(
-                ValidationIssue(
-                    code="platform.workflow_catalog_not_loaded",
-                    message="Client catalog must fetch /api/products so products added by the specialist appear after refresh.",
-                    severity="high",
-                    location="miniapp/app/static/client",
-                    blocking=True,
-                )
-            )
-        if not cls._has_effective_add_to_cart_handler(client):
-            issues.append(
-                ValidationIssue(
-                    code="platform.workflow_add_to_cart_unhandled",
-                    message="Client add-to-cart control has no effective JavaScript click handler/cart state wiring.",
-                    severity="high",
-                    location="miniapp/app/static/client",
-                    blocking=True,
-                )
-            )
-        if not cls._text_has_fetch(client, "/api/orders", method="POST"):
-            issues.append(
-                ValidationIssue(
-                    code="platform.workflow_checkout_not_persisted",
-                    message="Client checkout must POST the cart/order to /api/orders.",
-                    severity="high",
-                    location="miniapp/app/static/client",
-                    blocking=True,
-                )
-            )
-        if not cls._text_has_fetch(specialist, "/api/products", method="POST"):
-            issues.append(
-                ValidationIssue(
-                    code="platform.workflow_specialist_product_create_missing",
-                    message="Specialist role must be able to add products through a POST /api/products flow.",
-                    severity="high",
-                    location="miniapp/app/static/specialist",
-                    blocking=True,
-                )
-            )
-        if not cls._text_has_fetch(specialist, "/api/orders", method="GET"):
-            issues.append(
-                ValidationIssue(
-                    code="platform.workflow_specialist_order_visibility_missing",
-                    message="Specialist role must load saved orders from /api/orders.",
-                    severity="high",
-                    location="miniapp/app/static/specialist",
-                    blocking=True,
-                )
-            )
-        if not cls._text_has_fetch(manager, "/api/orders", method="GET") or not re.search(r"\b(metric|summary|dashboard|total|count|свод|метрик|итог)\b", manager, flags=re.IGNORECASE):
-            issues.append(
-                ValidationIssue(
-                    code="platform.workflow_manager_order_dashboard_missing",
-                    message="Manager role must show persisted orders through dashboard/summary controls.",
-                    severity="high",
-                    location="miniapp/app/static/manager",
-                    blocking=True,
-                )
-            )
-        tests_lower = tests_text.lower()
-        if not all(term in tests_lower for term in ("products", "orders", "cart")):
-            issues.append(
-                ValidationIssue(
-                    code="platform.workflow_commerce_tests_incomplete",
-                    message="Generated tests must cover product creation, catalog/cart interaction, checkout order creation, and cross-role order visibility.",
-                    severity="high",
-                    location="miniapp/tests",
-                    blocking=True,
-                )
-            )
-        return issues
 
     @staticmethod
     def _backend_has_route(text: str, *, method: str, path: str) -> bool:
@@ -801,23 +707,28 @@ class CheckRunner:
     @staticmethod
     def _text_has_fetch(text: str, path: str, *, method: str | None = None) -> bool:
         lowered = str(text or "").lower()
-        if path.lower() not in lowered:
-            return False
+        path_lower = path.lower()
+        if path_lower not in lowered:
+            path_parts = [part for part in path_lower.strip("/").split("/") if part]
+            has_composed_path = (
+                len(path_parts) >= 2
+                and path_parts[0] == "api"
+                and "/api" in lowered
+                and path_parts[-1] in lowered
+                and ("fetch(" in lowered or "endpoint" in lowered or "api_base" in lowered)
+            )
+            if not has_composed_path:
+                return False
         if method is None or method.upper() == "GET":
             return True
-        return bool(re.search(rf"method\s*:\s*['\"]{method.lower()}['\"]", lowered, flags=re.IGNORECASE))
-
-    @staticmethod
-    def _has_effective_add_to_cart_handler(text: str) -> bool:
-        lowered = str(text or "").lower()
-        has_cart_control = any(marker in lowered for marker in ("add-to-cart", "addtocart", "в корз", "корзин"))
-        has_click_handler = bool(
-            re.search(r"addEventListener\(\s*['\"]click['\"]", text)
-            or re.search(r"\bonclick\s*=", text, flags=re.IGNORECASE)
-            or re.search(r"function\s+addToCart\b|const\s+addToCart\b|let\s+addToCart\b", text)
-        )
-        has_cart_state = any(marker in lowered for marker in ("cart", "корзин", "cartitems", "cart_items"))
-        return has_cart_control and has_click_handler and has_cart_state
+        method_name = method.lower()
+        if re.search(rf"method\s*:\s*['\"]{method_name}['\"]", lowered, flags=re.IGNORECASE):
+            return True
+        if method_name == "GET":
+            return True
+        if path_lower not in lowered:
+            return False
+        return False
 
     def _browser_flow_smoke(
         self,
@@ -881,6 +792,10 @@ class CheckRunner:
                 message = next((line for line in result.logs if line.strip()), message)
             if result.name == "changed_files_static":
                 message = next((line for line in result.logs if line.strip()), message)
+                diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+                session_dependency = diagnostics.get("fastapi_session_dependency_error") if isinstance(diagnostics, dict) else None
+                if isinstance(session_dependency, dict):
+                    message = str(session_dependency.get("expected_fix") or "").strip() or message
             if result.name == "platform_invariants":
                 location = "miniapp/app"
                 code = "platform.invariants"
@@ -944,6 +859,11 @@ class CheckRunner:
                     column_name = str(sqlite_issue.get("column") or "").strip()
                     if table_name and column_name:
                         message = f"Generated app DB schema mismatch: table {table_name} is missing column {column_name}".strip()
+                elif isinstance(diagnostics.get("sqlite_missing_table"), dict):
+                    sqlite_issue = diagnostics.get("sqlite_missing_table") or {}
+                    table_name = str(sqlite_issue.get("table") or "").strip()
+                    if table_name:
+                        message = f"Generated app DB schema missing table {table_name}; create tables before TestClient requests run.".strip()
                 else:
                     message = next((line for line in reversed(result.logs) if line.strip()), message)
             if result.name in {"preview_boot_smoke", "preview_connectivity_smoke", "browser_flow_smoke"}:
@@ -1485,7 +1405,8 @@ class CheckRunner:
         min_rules = 12 if value == GenerationMode.QUALITY.value else 8
         min_hits = 7 if value == GenerationMode.QUALITY.value else 5
         quality_structure_ok = value != GenerationMode.QUALITY.value or ("@media" in css and ("focus-visible" in css or ":focus" in css))
-        if css_rule_count >= min_rules and len(token_hits) >= min_hits and quality_structure_ok:
+        rich_quality_css = value == GenerationMode.QUALITY.value and css_rule_count >= min_rules + 6 and len(token_hits) >= min_hits + 1
+        if css_rule_count >= min_rules and len(token_hits) >= min_hits and (quality_structure_ok or rich_quality_css):
             return None
         return ValidationIssue(
             code="platform.insufficient_mode_design_depth",
@@ -1614,15 +1535,32 @@ class CheckRunner:
                 signals.append("post")
             return signals if {"form", "post"}.issubset(set(signals)) else []
         if role == "specialist":
-            if re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE):
+            has_update_method = bool(re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE))
+            has_status_post = bool(
+                re.search(r"method\s*:\s*['\"]post['\"]", text, flags=re.IGNORECASE)
+                and re.search(r"(status_updates|status|статус|готов|очеред)", lowered)
+            )
+            if has_update_method or has_status_post:
                 signals.append("status_update")
-            if re.search(r"\b(confirm|done|complete|assign|process|status|queue)\b", lowered):
+            if re.search(r"\b(confirm|done|complete|assign|process|status|queue)\b", lowered) or re.search(
+                r"(статус|готов|очеред|заказ|обнов|кондитер|работ)", lowered
+            ):
                 signals.append("operations")
             return signals if len(signals) >= 2 else []
         if role == "manager":
             if re.search(r"\b(metric|dashboard|summary|total|workload|overview|count)\b", lowered):
                 signals.append("dashboard")
-            if re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE) or re.search(r"\b(review|approve|escalate|assign)\b", lowered):
+            has_manager_control = bool(
+                re.search(r"\b(review|approve|escalate|assign|control|oversight|refresh|filter|audit)\b", lowered)
+                or re.search(r"\b(manager-oversight|manager-control|manager-review)\b", lowered)
+                or re.search(r"(контрол|обнов|провер|соглас|назнач|отч[её]т|фильтр)", lowered)
+            )
+            has_user_action_surface = bool(
+                re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE)
+                or re.search(r"addEventListener\s*\(", text)
+                or "<button" in lowered
+            )
+            if re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE) or (has_manager_control and has_user_action_surface):
                 signals.append("oversight_action")
             return signals if len(signals) >= 2 else []
         return signals
@@ -2163,8 +2101,11 @@ class CheckRunner:
                 if cls._html_references_script(html_relative, html_source, relative_path):
                     page_sources.append((html_relative, html_source, html_ids))
             available_dom_ids = extract_html_ids("\n".join(html_sources))
-            required_dom_ids = extract_js_dom_ids(js_source)
-            missing_ids = sorted(required_dom_ids - available_dom_ids)
+            bindings = cls._js_dom_id_bindings(js_source)
+            unsafe_variables = cls._unsafe_js_dom_variables(js_source, set(bindings))
+            unsafe_dom_ids = {bindings[var_name] for var_name in unsafe_variables if var_name in bindings}
+            unsafe_dom_ids.update(cls._unsafe_direct_dom_ids(js_source))
+            missing_ids = sorted(unsafe_dom_ids - available_dom_ids)
             if missing_ids:
                 issues.append(
                     ValidationIssue(
@@ -2276,7 +2217,11 @@ class CheckRunner:
             return True
         if re.search(rf"\bif\s*\([^)]*!\s*{escaped}\b[^)]*\)\s*return\b", context):
             return True
+        if re.search(rf"\bif\s*\([^)]*!\s*{escaped}\b[^)]*\)\s*\{{[\s\S]{{0,160}}\breturn\b", context):
+            return True
         if re.search(rf"\bif\s*\(\s*!\s*{escaped}\s*\)\s*return\b", context):
+            return True
+        if re.search(rf"\bif\s*\([^)]*\b{escaped}\b[^)]*\)\s*\{{[\s\S]{{0,400}}\b{escaped}\s*\.", context):
             return True
         return bool(re.search(rf"\bif\s*\(\s*{escaped}\b[\s\S]{{0,160}}\b{escaped}\s*\.", context))
 
@@ -2453,6 +2398,27 @@ class CheckRunner:
                 logs=[],
                 diagnostics={"missing_test_file": "tests/test_generated_app.py"} if require_present else {},
             )
+        try:
+            test_source = test_file.read_text(encoding="utf-8")
+        except OSError:
+            test_source = ""
+        if (
+            re.search(r"^\s*def\s+test_[A-Za-z0-9_]*\s*\(", test_source, flags=re.MULTILINE)
+            and "unittest.TestCase" not in test_source
+        ):
+            return RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                details="Generated Python app tests are not unittest-discoverable.",
+                command=f"{sys.executable} -m unittest discover -s tests -p test_generated_app.py",
+                exit_code=5,
+                logs=[
+                    "Generated Python app tests use top-level pytest-style test functions.",
+                    "The platform runs python -m unittest discover, so define import unittest and a unittest.TestCase subclass with test_* methods.",
+                    "Without a unittest.TestCase class, unittest reports NO TESTS RAN and the create run cannot complete.",
+                ],
+                diagnostics={"unittest_discovery_failure": "pytest_style_top_level_functions"},
+            )
         install_result = self._install_python_requirements(backend_dir)
         if install_result is not None:
             return install_result
@@ -2463,23 +2429,25 @@ class CheckRunner:
             python_path_parts.append(existing_python_path)
         env["PYTHONPATH"] = os.pathsep.join(python_path_parts)
         command = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_generated_app.py"]
-        try:
-            result = subprocess.run(
-                command,
-                cwd=backend_dir,
-                capture_output=True,
-                text=True,
-                timeout=int(os.getenv("GENERATED_APP_PYTHON_TEST_TIMEOUT_SEC", "240")),
-                env=env,
-            )
-        except subprocess.TimeoutExpired as exc:
-            return RunCheckResult(
-                name="generated_app_python_tests",
-                status="failed",
-                details="Generated Python app tests timed out.",
-                command=" ".join(command),
-                logs=self._command_logs("Generated Python app tests timed out.", exc.stdout or "", exc.stderr or ""),
-            )
+        with tempfile.TemporaryDirectory(prefix="miniapp-generated-tests-") as tmp_dir:
+            env["DATABASE_URL"] = f"sqlite:///{(Path(tmp_dir) / 'app.db').as_posix()}"
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=backend_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=int(os.getenv("GENERATED_APP_PYTHON_TEST_TIMEOUT_SEC", "240")),
+                    env=env,
+                )
+            except subprocess.TimeoutExpired as exc:
+                return RunCheckResult(
+                    name="generated_app_python_tests",
+                    status="failed",
+                    details="Generated Python app tests timed out.",
+                    command=" ".join(command),
+                    logs=self._command_logs("Generated Python app tests timed out.", exc.stdout or "", exc.stderr or ""),
+                )
         if result.returncode != 0:
             logs = self._command_logs("Generated Python app tests failed for the draft miniapp.", result.stdout, result.stderr)
             return RunCheckResult(
@@ -2889,13 +2857,15 @@ class CheckRunner:
                     logs=self._command_logs("Backend import smoke timed out.", exc.stdout or "", exc.stderr or ""),
                 )
         if result.returncode != 0:
+            logs = self._command_logs("Backend import smoke failed for the draft miniapp.", result.stdout, result.stderr)
             return RunCheckResult(
                 name="changed_files_static",
                 status="failed",
                 details="Backend import smoke failed for the draft miniapp.",
                 command=" ".join(command),
                 exit_code=result.returncode,
-                logs=self._command_logs("Backend import smoke failed for the draft miniapp.", result.stdout, result.stderr),
+                logs=logs,
+                diagnostics=self._extract_backend_import_diagnostics(logs),
             )
         return RunCheckResult(
             name="changed_files_static",
@@ -3055,6 +3025,14 @@ class CheckRunner:
         if missing_role_pages:
             diagnostics["missing_role_pages"] = list(dict.fromkeys(role for role in missing_role_pages if role))
         for line in reversed(logs):
+            table_match = cls._SQLITE_MISSING_TABLE_RE.search(str(line or ""))
+            if table_match:
+                diagnostics["sqlite_missing_table"] = {
+                    "table": str(table_match.group("table") or "").strip(),
+                    "expected_fix": "If generated SQLAlchemy models are defined in route modules, call Base.metadata.create_all(bind=engine) after all model classes are imported/declared before TestClient requests run.",
+                }
+                break
+        for line in reversed(logs):
             sqlite_match = cls._SQLITE_MISSING_COLUMN_RE.search(str(line or ""))
             if sqlite_match:
                 diagnostics["sqlite_missing_column"] = {
@@ -3105,6 +3083,21 @@ class CheckRunner:
                 "resource_slug": resource_slug or None,
             }
             break
+        return diagnostics
+
+    @classmethod
+    def _extract_backend_import_diagnostics(cls, logs: list[str]) -> dict[str, object]:
+        text = "\n".join(str(line or "") for line in logs)
+        diagnostics: dict[str, object] = {}
+        if cls._FASTAPI_SESSION_RESPONSE_FIELD_RE.search(text):
+            diagnostics["fastapi_session_dependency_error"] = {
+                "problem": "FastAPI treated a SQLAlchemy Session parameter as a request/response field.",
+                "expected_fix": (
+                    "Patch generated route functions so every parameter typed Session uses "
+                    "Depends(get_db_session) or Depends(get_db). Do not use next(get_db_session()), "
+                    "SessionLocal(), @contextmanager, or a live Session object as a default argument."
+                ),
+            }
         return diagnostics
 
     @staticmethod
