@@ -69,26 +69,26 @@ COMPLETION_BUDGETS = {
     GenerationMode.FAST: {
         "time_limit_ms": 12 * 60 * 1000,
         "token_limit": 600_000,
-        "safety_turn_cap": 120,
-        "parallel_round_cap": 12,
+        "safety_turn_cap": 180,
+        "parallel_round_cap": 10,
     },
     GenerationMode.BALANCED: {
         "time_limit_ms": 25 * 60 * 1000,
         "token_limit": 1_200_000,
-        "safety_turn_cap": 220,
-        "parallel_round_cap": 20,
+        "safety_turn_cap": 300,
+        "parallel_round_cap": 14,
     },
     GenerationMode.QUALITY: {
         "time_limit_ms": 45 * 60 * 1000,
         "token_limit": 2_500_000,
-        "safety_turn_cap": 360,
-        "parallel_round_cap": 30,
+        "safety_turn_cap": 500,
+        "parallel_round_cap": 18,
     },
     GenerationMode.BASIC: {
         "time_limit_ms": 12 * 60 * 1000,
         "token_limit": 600_000,
-        "safety_turn_cap": 120,
-        "parallel_round_cap": 12,
+        "safety_turn_cap": 180,
+        "parallel_round_cap": 10,
     },
 }
 PATCH_FIRST_EXISTING_FILE_CHAR_LIMIT = 2500
@@ -1094,11 +1094,11 @@ class WorkspaceCodeAgentRuntime:
                         files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
                         metadata={"raw_response": llm_payload},
                     )
-                has_product_draft = bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
+                has_app_draft = bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
                 existing_paths, existing_text_by_path = self._create_coverage_existing_state(
                     workspace_id=workspace_id,
                     run_id=run_id,
-                ) if has_product_draft else (set(), {})
+                ) if has_app_draft else (set(), {})
                 create_coverage_gap = self._create_patch_coverage_gap(
                     operations,
                     request=request,
@@ -1212,10 +1212,10 @@ class WorkspaceCodeAgentRuntime:
     def _parallel_create_round_budget(generation_mode: GenerationMode | str | None) -> int:
         mode = WorkspaceCodeAgentRuntime._generation_mode(generation_mode)
         if mode == GenerationMode.QUALITY:
-            return 7
+            return 18
         if mode == GenerationMode.BALANCED:
-            return 5
-        return 4
+            return 14
+        return 10
 
     @staticmethod
     def _parallel_worker_reasoning_effort(generation_mode: GenerationMode | str | None) -> str:
@@ -1230,8 +1230,8 @@ class WorkspaceCodeAgentRuntime:
         if mode == GenerationMode.QUALITY:
             return {
                 "mode": "quality",
-                "reasoning_effort": "high",
-                "round_budget": 7,
+                "reasoning_effort": "medium",
+                "round_budget": 18,
                 "target_resource_count": 3,
                 "required_child_pages_per_role": 3,
                 "workflow_depth": "planning, design pass, 3+ connected role workflows, richer validation, broad generated acceptance tests",
@@ -1240,17 +1240,18 @@ class WorkspaceCodeAgentRuntime:
         if mode == GenerationMode.BALANCED:
             return {
                 "mode": "balanced",
-                "reasoning_effort": "medium",
-                "round_budget": 5,
+                "reasoning_effort": "low",
+                "round_budget": 14,
                 "target_resource_count": 2,
-                "required_child_pages_per_role": 2,
-                "workflow_depth": "2-3 connected workflows/resources, shared cross-role state, status/update flows, stronger acceptance tests",
+                "required_child_pages_per_role": 1,
+                "max_child_pages_per_role": 2,
+                "workflow_depth": "1 required child page per role, at most 2 when the prompt clearly needs it; exactly 2 connected workflows/resources at most, shared cross-role state, status/update flows, stronger acceptance tests",
                 "design_level": "polished product UI with clearer hierarchy, dashboards, responsive lists, forms, badges, and state styling",
             }
         return {
             "mode": "fast",
             "reasoning_effort": "low",
-            "round_budget": 4,
+            "round_budget": 10,
             "target_resource_count": 1,
             "required_child_pages_per_role": 1,
             "workflow_depth": "compact MVP with one persistent resource, GET/POST, one status/update flow, forms, fetch, and generated tests",
@@ -1286,6 +1287,27 @@ class WorkspaceCodeAgentRuntime:
             "layout": "compact, practical, readable role screens with forms, lists, buttons, and status badges",
             "states": "include empty state text before user data exists",
             "role_depth": "keep small, but client creates, specialist processes, manager oversees",
+        }
+
+    @staticmethod
+    def _safe_resource_slug(value: object, *, default: str = "records") -> str:
+        slug = re.sub(r"[^a-z0-9_-]+", "_", str(value or "").strip().lower()).strip("_-")
+        slug = re.sub(r"_+", "_", slug)
+        if not slug:
+            return default
+        if slug[0].isdigit():
+            slug = f"item_{slug}"
+        return slug
+
+    @staticmethod
+    def _role_child_slugs_from_resources(resources: list[str]) -> dict[str, list[str]]:
+        primary = WorkspaceCodeAgentRuntime._safe_resource_slug(resources[0] if resources else "records")
+        secondary = WorkspaceCodeAgentRuntime._safe_resource_slug(resources[1] if len(resources) > 1 else f"{primary}_updates")
+        tertiary = WorkspaceCodeAgentRuntime._safe_resource_slug(resources[2] if len(resources) > 2 else f"{primary}_summary")
+        return {
+            "client": [primary, f"{primary}-details", f"{primary}-history"],
+            "specialist": [f"{primary}-work", secondary, f"{primary}-schedule"],
+            "manager": [f"{primary}-overview", tertiary, f"{primary}-control"],
         }
 
     @staticmethod
@@ -1360,6 +1382,26 @@ class WorkspaceCodeAgentRuntime:
         return targets
 
     @staticmethod
+    def _parallel_successful_operation_summaries(successful_results: dict[str, dict[str, Any]], *, max_items: int = 14) -> list[dict[str, str]]:
+        summaries: list[dict[str, str]] = []
+        for worker_id, result in sorted(successful_results.items()):
+            for operation in result.get("operations") or []:
+                if not isinstance(operation, DraftFileOperation):
+                    continue
+                text = str(operation.content or operation.diff or "")
+                summaries.append(
+                    {
+                        "worker": str(worker_id),
+                        "file_path": str(operation.file_path or ""),
+                        "operation": str(operation.operation or ""),
+                        "excerpt": truncate_tool_text(text, max_chars=1200),
+                    }
+                )
+                if len(summaries) >= max_items:
+                    return summaries
+        return summaries
+
+    @staticmethod
     def _parallel_worker_for_path(path: str) -> str | None:
         normalized = str(path or "").replace("\\", "/").lstrip("./").lower()
         if normalized.startswith("miniapp/app/static/client/") or "client" in normalized:
@@ -1412,7 +1454,10 @@ class WorkspaceCodeAgentRuntime:
             (job.completion_budget if isinstance(job.completion_budget, dict) else {}).get("parallel_round_cap")
             or self._parallel_create_round_budget(generation_mode)
         )
+        create_intent = str(request.intent or "").strip().lower() == "create"
         retry_worker_ids = list(workers_by_id.keys())
+        if create_intent and "generated_tests" in retry_worker_ids:
+            retry_worker_ids = [worker_id for worker_id in retry_worker_ids if worker_id != "generated_tests"]
         successful_results: dict[str, dict[str, Any]] = {}
         failed_rounds: list[dict[str, Any]] = []
         repair_context: list[dict[str, Any]] = []
@@ -1665,7 +1710,7 @@ class WorkspaceCodeAgentRuntime:
                 )
                 return WorkspaceLoopTurnPlan(
                     outcome="patch_ready",
-                    assistant_message="Parallel role workers produced a merged product patch.",
+                    assistant_message="Parallel role workers produced a merged app patch.",
                     diagnosis="The platform built backend, client, specialist, manager, and generated tests in parallel ownership lanes, then merged non-conflicting LLM-generated operations.",
                     operations=merged_operations,
                     files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
@@ -1703,6 +1748,16 @@ class WorkspaceCodeAgentRuntime:
                 "merge_error": merge_error,
                 "coverage_gap": create_gap,
                 "retry_workers": sorted(retry_targets),
+                "worker_errors": [
+                    {
+                        "worker": str(result.get("worker") or ""),
+                        "status": str(result.get("status") or ""),
+                        "error": truncate_tool_text(str(result.get("error") or ""), max_chars=700),
+                    }
+                    for result in results
+                    if result.get("status") == "error" or str(result.get("error") or "").strip()
+                ],
+                "successful_worker_outputs": self._parallel_successful_operation_summaries(successful_results),
             }
             failed_rounds.append(failed_round)
             repair_context = [*repair_context[-2:], failed_round]
@@ -1919,12 +1974,18 @@ class WorkspaceCodeAgentRuntime:
                 "On repair rounds, replace your whole owned slice only when needed; otherwise return the smallest complete owned-file operations that close the listed gap.",
                 f"{depth_rule} Do not add mock/seed/demo/sample/preloaded business records.",
                 "Generated UI must be usable with forms/buttons/fetch and must start from an empty state.",
+                "Maintain a concrete workflow map in your owned files: every visible form/control id must be referenced by role JavaScript, bound to a submit/click handler, call the intended API, and be covered by generated tests.",
+                "HTML form field names, JavaScript FormData/payload keys, backend schema fields, and generated test payloads must match exactly. Do not create fields that are visible but never submitted.",
+                "Do not add buttons that only change text locally unless the prompt explicitly asks for a local-only indicator; workflow buttons must fetch POST/PATCH/PUT/DELETE and refresh persisted state.",
                 "If this worker creates SQLAlchemy models, ensure tables exist for generated tests: call Base.metadata.create_all(bind=engine) after all model classes are declared/imported, or register an app startup hook that creates them before TestClient requests.",
                 "Do not introduce required POST/create schema fields that the generated client form and generated Python tests do not submit. Supplemental fields must be optional or have backend defaults unless the prompt explicitly requires them.",
                 "Every FastAPI endpoint parameter typed as SQLAlchemy Session must use Depends(get_db_session) or Depends(get_db); never use next(get_db_session()), SessionLocal(), @contextmanager, or a live Session as a default parameter.",
-                "Keep generated ORM models straightforward. Do not reference undefined relationship/model classes; if order items are stored simply, serialize them in a JSON/Text field instead of creating ad-hoc relationship code.",
-                "Use path-id update endpoints for mutable records, for example PATCH /api/products/{product_id} and PATCH /api/orders/{order_id}; generated tests and role JavaScript should call the same path shape.",
+                "Keep generated ORM models straightforward. Do not reference undefined relationship/model classes; if nested line items are stored simply, serialize them in a JSON/Text field instead of creating ad-hoc relationship code.",
+                "Do not add SQLAlchemy relationship()/back_populates between tables unless the child table has a real ForeignKey column. If unsure, avoid relationship() and query by id explicitly.",
+                "Use path-id update endpoints for mutable prompt-derived resources, for example PATCH /api/<resource>/{record_id}; generated tests and role JavaScript should call the same path shape.",
+                "For path-id PATCH endpoints, do not send the same id again inside the JSON body unless the backend patch schema explicitly accepts that field. Strict Pydantic patch schemas with extra=forbid reject duplicate body ids with 422.",
                 "Role app.js files are loaded by every page for that role. Guard every page-specific element before property access: use feedback?.textContent or if (feedback) blocks, and initialize page-specific workflows only when their root elements exist.",
+                "Role ownership is strict: client JS may only query client pages, specialist JS may only query specialist pages, and manager JS may only query manager pages. Do not add selectors like `[data-role=client]` inside specialist/manager scripts.",
                 "Generated Python tests must be unittest-discoverable: define import unittest and at least one unittest.TestCase subclass with test_* methods. Top-level pytest-style test functions are invalid because the platform runs python -m unittest discover.",
                 "Generated Python tests that use FastAPI TestClient must trigger app lifespan. Prefer `with TestClient(app) as client:` inside each test or create/tear down SQLAlchemy tables explicitly in setUp/tearDown; plain `self.client = TestClient(app)` can skip lifespan table creation.",
                 "Generated tests must not assert exact opening HTML tags or exact class attributes such as `<main class=\"page-shell\">` or `class=\"page-shell\"` because the platform may add safe-area inline attributes and extra shell classes. Assert that the class list contains the page-shell token, for example with a regex matching `class=\"[^\"]*\\bpage-shell\\b`, parse/query the DOM, or assert a stable wrapper id.",
@@ -1939,10 +2000,14 @@ class WorkspaceCodeAgentRuntime:
                 [
                     "Generated tests worker must always return exactly the two required test files when they are missing: miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs.",
                     "Keep tests compact: Python unittest should verify role routes, GET empty, POST persists, PATCH/status persists; JS should statically verify role pages, role CSS links, real buttons/forms, and frontend API fetch methods.",
-                    "Use the API paths and payload fields from the acceptance_contract/blueprint; do not wait for runtime tool reads in parallel build.",
+                    "Use the API paths and payload fields from the acceptance_contract/blueprint and, when repair_context includes successful_worker_outputs, align tests with those actual backend/UI file excerpts.",
+                    "The tests worker may run after backend/UI workers. Avoid exact headings, marketing phrases, route-link literals, function names, and role-specific text unless those values come directly from the contract or successful_worker_outputs. Prefer durable structural checks: role route returns 200, preview bridge exists, role CSS link exists, each role page has a form/button/list area, and app.js contains /api plus POST/PATCH methods.",
+                    "For frontend API assertions, do not require the exact literal `/api/records` when role JS may use `const API_BASE = '/api'` and template literals like `${API_BASE}/records`. Assert that the script contains `/api`, the resource slug such as `records`, and the HTTP method/handler.",
                     "For Python tests, use `with TestClient(app) as client:` so FastAPI lifespan creates DB tables before requests. For route shell assertions, check that the class attribute contains the page-shell token and `/static/preview_bridge.js`, not exact `class=\"page-shell\"` or an exact `<main ...>` opening tag.",
                     "Do not invent exact data-testid values in generated_app.test.mjs. Prefer generic assertions for <form, <button, role-specific headings, /api resource names, and HTTP methods unless the matching UI files are guaranteed to contain that exact test id.",
+                    "Do not assert that one role page loads another role's app script. Client pages load /static/client/app.js, specialist pages load /static/specialist/app.js, and manager pages load /static/manager/app.js.",
                     "Generated JS tests must verify the real selectors/handlers used by the role JS. If the app binds `form.addEventListener` through `[data-client-form]`, do not require the script to reference a submit button id.",
+                    "Generated JS tests must fail if an expected form/control id is present in HTML but not wired in the role JS, and must check the real field names used by FormData/payload construction.",
                     "Do not assert optional fields that the backend schema does not create and return. If a test asserts a patched field such as price, notes, payment_status, or assignee, the backend model/update schema must include and persist that exact field; otherwise assert only fields that the API actually owns.",
                 ]
             )
@@ -1951,7 +2016,7 @@ class WorkspaceCodeAgentRuntime:
                 [
                     "Backend worker must follow the blueprint API names consistently so generated tests and role JavaScript can call them.",
                     "Keep create schemas tolerant: only make fields required when they are clearly in the acceptance contract. Use optional/default values for extra operational fields so generated tests and forms do not receive 422 for missing nonessential fields.",
-                    "If using SQLAlchemy, prefer simple models and JSON/Text fields for nested order items unless relationship classes are fully declared and tested.",
+                    "If using SQLAlchemy, prefer simple models and JSON/Text fields for nested line items unless relationship classes are fully declared and tested.",
                 ]
             )
         return json.dumps(payload, ensure_ascii=False)
@@ -1964,11 +2029,23 @@ class WorkspaceCodeAgentRuntime:
     ) -> dict[str, Any]:
         mode_contract = WorkspaceCodeAgentRuntime._parallel_create_mode_contract(generation_mode)
         child_count = int(mode_contract.get("required_child_pages_per_role") or 1)
-        role_child_slugs = {
-            "client": ["request", "details", "history"],
-            "specialist": ["queue", "work", "calendar"],
-            "manager": ["overview", "reports", "control"],
-        }
+        target_resource_count = int(mode_contract.get("target_resource_count") or 1)
+        contract_endpoints = acceptance_contract.get("required_endpoints") if isinstance(acceptance_contract.get("required_endpoints"), list) else []
+        contract_features = acceptance_contract.get("features") if isinstance(acceptance_contract.get("features"), dict) else {}
+        feature_candidates = contract_features.get("prompt_resource_candidates") if isinstance(contract_features, dict) else []
+        resource_candidates = [
+            WorkspaceCodeAgentRuntime._safe_resource_slug(endpoint.get("resource"))
+            for endpoint in contract_endpoints
+            if isinstance(endpoint, dict) and str(endpoint.get("resource") or "").strip()
+        ]
+        resource_candidates.extend(
+            WorkspaceCodeAgentRuntime._safe_resource_slug(candidate)
+            for candidate in (feature_candidates if isinstance(feature_candidates, list) else [])
+            if str(candidate or "").strip()
+        )
+        resource_candidates.extend(["records", "updates", "summaries", "notes"])
+        resources = list(dict.fromkeys(resource_candidates))[: max(1, target_resource_count)]
+        role_child_slugs = WorkspaceCodeAgentRuntime._role_child_slugs_from_resources(resources)
         role_children = {
             role: [
                 {
@@ -1980,15 +2057,6 @@ class WorkspaceCodeAgentRuntime:
             ]
             for role, slugs in role_child_slugs.items()
         }
-        target_resource_count = int(mode_contract.get("target_resource_count") or 1)
-        contract_endpoints = acceptance_contract.get("required_endpoints") if isinstance(acceptance_contract.get("required_endpoints"), list) else []
-        resource_candidates = [
-            str(endpoint.get("resource") or "").strip().replace("-", "_")
-            for endpoint in contract_endpoints
-            if isinstance(endpoint, dict) and str(endpoint.get("resource") or "").strip()
-        ]
-        resource_candidates.extend(["records", "status_updates", "summaries", "notes"])
-        resources = list(dict.fromkeys(resource_candidates))[: max(1, target_resource_count)]
         return {
             "roles": list(ROLE_ORDER),
             "generation_mode": generation_mode.value,
@@ -2042,12 +2110,12 @@ class WorkspaceCodeAgentRuntime:
         backend_operation_limit = 7 if quality_depth else 6 if balanced_depth else 6
         role_operation_limit = 6 if quality_depth else 5 if balanced_depth else 4
         test_operation_limit = 3 if balanced_depth else 2
-        role_content_limit = 22000 if quality_depth else 18000 if balanced_depth else 14000
-        backend_content_limit = 22000 if quality_depth else 19000 if balanced_depth else 18000
-        test_content_limit = 24000 if quality_depth else 22000 if balanced_depth else 22000
-        role_output_limit = 42000 if quality_depth else 32000 if balanced_depth else 22000
-        backend_output_limit = 42000 if quality_depth else 32000 if balanced_depth else 24000
-        test_output_limit = 42000 if quality_depth else 32000 if balanced_depth else 26000
+        role_content_limit = 18000 if quality_depth else 12000 if balanced_depth else 10000
+        backend_content_limit = 18000 if quality_depth else 13000 if balanced_depth else 12000
+        test_content_limit = 18000 if quality_depth else 12000 if balanced_depth else 12000
+        role_output_limit = 26000 if quality_depth else 18000 if balanced_depth else 16000
+        backend_output_limit = 26000 if quality_depth else 18000 if balanced_depth else 16000
+        test_output_limit = 24000 if quality_depth else 16000 if balanced_depth else 16000
         return [
             {
                 "worker": "backend_api",
@@ -2239,6 +2307,7 @@ class WorkspaceCodeAgentRuntime:
             has_draft_diff = bool(current_draft_diff)
             create_turn = intent_value == "create"
             create_repair_turn = create_turn and has_draft_diff
+            workflow_slice_repair = create_repair_turn and self._workflow_slice_repair_needed(latest_execution)
             fast_create_turn = generation_mode == GenerationMode.FAST and create_turn
             fast_first_create_patch = fast_create_turn and not has_draft_diff
             focused_edit_kind = self._focused_edit_kind(request)
@@ -2257,12 +2326,21 @@ class WorkspaceCodeAgentRuntime:
                 model_profile=request.model_profile,
                 generation_mode=generation_mode,
             )
+            force_replace_only = bool(
+                create_repair_turn
+                and last_turn_summary
+                and "full-file replace operations for only the conflicted files" in str(last_turn_summary).lower()
+            )
             operation_limit = (
                 FOCUSED_VISUAL_OPERATION_LIMIT
                 if focused_visual_edit
-                else 6 if create_repair_turn and generation_mode == GenerationMode.FAST
-                else 8 if create_repair_turn and generation_mode == GenerationMode.BALANCED
-                else 10 if create_repair_turn
+                else 1 if force_replace_only
+                else 4 if workflow_slice_repair and generation_mode == GenerationMode.FAST
+                else 5 if workflow_slice_repair and generation_mode == GenerationMode.BALANCED
+                else 6 if workflow_slice_repair
+                else 2 if create_repair_turn and generation_mode == GenerationMode.FAST
+                else 2 if create_repair_turn and generation_mode == GenerationMode.BALANCED
+                else 3 if create_repair_turn
                 else AGENTIC_WORKFLOW_OPERATION_LIMIT if agentic_workflow_turn
                 else 8 if compact_edit_turn
                 else 20 if fast_create_turn else AGENT_TURN_OPERATION_LIMIT
@@ -2270,18 +2348,22 @@ class WorkspaceCodeAgentRuntime:
             content_max_length = (
                 FOCUSED_VISUAL_CONTENT_MAX_LENGTH
                 if focused_visual_edit
-                else 12000 if create_repair_turn and generation_mode == GenerationMode.FAST
-                else 12000 if create_repair_turn and generation_mode == GenerationMode.BALANCED
-                else 14000 if create_repair_turn
+                else 18000 if force_replace_only
+                else 10000 if workflow_slice_repair and generation_mode == GenerationMode.FAST
+                else 12000 if workflow_slice_repair and generation_mode == GenerationMode.BALANCED
+                else 16000 if workflow_slice_repair
+                else 6000 if create_repair_turn and generation_mode == GenerationMode.FAST
+                else 6000 if create_repair_turn and generation_mode == GenerationMode.BALANCED
+                else 8000 if create_repair_turn
                 else 24000 if agentic_workflow_turn
                 else 9000 if compact_edit_turn
                 else 9000 if fast_create_turn else 18000
             )
-            allow_tool_requests = False if focused_visual_edit else False if create_repair_turn and generation_mode == GenerationMode.FAST else not fast_first_create_patch
+            allow_tool_requests = False if focused_visual_edit else False if create_repair_turn else not fast_first_create_patch
             allowed_outcomes = (
                 ["patch_ready", "fatal_invalid_response"]
                 if focused_visual_edit
-                else ["patch_ready"] if create_repair_turn and generation_mode == GenerationMode.FAST
+                else ["patch_ready"] if create_repair_turn
                 else ["patch_ready"] if fast_first_create_patch else None
             )
             agent_schema = self._agent_turn_schema(
@@ -2289,6 +2371,7 @@ class WorkspaceCodeAgentRuntime:
                 content_max_length=content_max_length,
                 allow_tool_requests=allow_tool_requests,
                 allowed_outcomes=allowed_outcomes,
+                allowed_operations=["replace"] if force_replace_only else None,
             )
             user_prompt = self._agent_user_prompt(
                 workspace_id=workspace_id,
@@ -2317,6 +2400,7 @@ class WorkspaceCodeAgentRuntime:
                     "phase": "context_ready",
                     "has_draft_diff": has_draft_diff,
                     "prompt_payload_mode": "compact_repair" if create_repair_turn else "standard",
+                    "force_replace_only": force_replace_only,
                 },
             )
             self._append_event(
@@ -2330,6 +2414,7 @@ class WorkspaceCodeAgentRuntime:
                     "phase": "model_request",
                     "has_draft_diff": has_draft_diff,
                     "prompt_payload_mode": "compact_repair" if create_repair_turn else "standard",
+                    "force_replace_only": force_replace_only,
                 },
             )
             response = self.openai_client.generate_agent_turn(
@@ -2466,8 +2551,10 @@ class WorkspaceCodeAgentRuntime:
         content_max_length: int = 18000,
         allow_tool_requests: bool = True,
         allowed_outcomes: list[str] | None = None,
+        allowed_operations: list[str] | None = None,
     ) -> dict[str, Any]:
         outcome_values = allowed_outcomes or ["patch_ready", "tool_request", "no_progress", "fatal_invalid_response"]
+        operation_values = allowed_operations or ["create", "replace", "delete", "patch"]
         return {
             "type": "object",
             "additionalProperties": False,
@@ -2500,7 +2587,7 @@ class WorkspaceCodeAgentRuntime:
                         "additionalProperties": False,
                         "properties": {
                             "file_path": {"type": "string", "maxLength": 220},
-                            "operation": {"type": "string", "enum": ["create", "replace", "delete", "patch"]},
+                            "operation": {"type": "string", "enum": operation_values},
                             "content": {"type": ["string", "null"], "maxLength": content_max_length},
                             "diff": {"type": ["string", "null"], "maxLength": content_max_length},
                             "reason": {"type": "string", "maxLength": 600},
@@ -2540,14 +2627,16 @@ class WorkspaceCodeAgentRuntime:
             "For create tasks and workflow behavior edits, first satisfy the extracted acceptance contract: roles, data resources, buttons, forms, APIs, cross-role visibility, and refresh persistence must all be covered by generated tests. "
             "When a prompt says a button, form, list loading, post-submit visibility, or cross-role flow is broken, repair the whole workflow instead of making a narrow local patch. "
             "Role apps must be isolated inside the UI: do not add in-app links from client to specialist/manager, from specialist to client/manager, or from manager to client/specialist. The platform shell chooses the role entry; each role app may only link to its own child pages. "
-            "Create tasks must be multi-page: each role root is a dashboard/hub and each role must expose child pages for the mode budget. Fast requires at least one domain-specific child page per role; Balanced and Quality require at least two. "
+            "Each role app.js must query and initialize only that role's pages and controls; specialist code must not query client role roots/selectors, manager code must not depend on client/specialist DOM, and tests must not require cross-role scripts on the wrong role page. "
+            "Create tasks must be multi-page: each role root is a dashboard/hub and each role must expose child pages for the mode budget. Fast and Balanced require at least one prompt-specific child page per role; Balanced may add a second only when it clearly improves the requested workflow. Quality requires deeper role surfaces. "
             "Use miniapp/app/generated/route_manifest.json to declare role routes for generated child pages. Prefer a compact routes map, either top-level \"routes\": {\"/client/details\": \"static/client/details/index.html\"} or per-role \"routes\" maps. "
             "Never declare a route_manifest route unless its target file already exists or is created/replaced in the same operations array. "
             "The three role surfaces must be different but connected parts of one prompt-derived business context: client creates and reviews user-submitted records, specialist processes work and changes operational status, and manager sees dashboard metrics, workload, and oversight controls. "
             "Never leave a role as a neutral starter, generic preview, blank page, or placeholder surface. "
             "For create tasks, never ship static-only mockups. Every generated app must be usable: users can fill forms, submit actions, and see saved records through backend APIs. "
-            "When one role app.js is loaded by multiple pages for that role, page-specific DOM selectors must be null-safe: guard missing elements before property access/event listeners or split the code by page so one child page cannot break another page's catalog/list/form loading. "
-            "Do not add mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded business records to generated app source. Start with empty persistent state and domain-specific empty states; generated tests may create their own test payloads. "
+            "When one role app.js is loaded by multiple pages for that role, page-specific DOM selectors must be null-safe: guard missing elements before property access/event listeners or split the code by page so one child page cannot break another page's list/form loading. "
+            "JavaScript optional chaining cannot be used on the left side of an assignment; never write `element?.textContent = value`. Assign through a guarded variable or helper function. "
+            "Do not add mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded business records to generated app source. Start with empty persistent state and prompt-specific empty states; generated tests may create their own test payloads. "
             "Every create task must create or replace real per-role CSS files at static/client/styles.css, static/specialist/styles.css, and static/manager/styles.css; placeholder CSS or missing role CSS is invalid. Child pages must link the matching role CSS. "
             "In Fast create mode, build a compact working MVP with three distinct role apps, one key child page per role, one persistent backend resource exposed through GET and POST APIs, a minimal status/update endpoint, frontend fetch/form/status code, compact role CSS, and generated tests that prove POST then GET persistence and status update. Do not add extra child pages, extra resources, or large visual systems in Fast. Do not spend Fast first-patch operations on role_routes.py, generated/models.py, or shared/base.css. "
             "In Balanced create mode, build deeper separate client/specialist/manager role apps with two or three connected persistent resources, or one resource plus meaningful status/update workflows, so roles share real state instead of copied static content. Balanced design quality must be visibly stronger than Fast: polished light-mode product UI, clear hierarchy, responsive role dashboards, refined forms/lists/status badges, and real CSS classes for spacing, typography, buttons, cards, and states without decorative bloat. "
@@ -2568,7 +2657,7 @@ class WorkspaceCodeAgentRuntime:
             "run_checks is a read-only platform validation snapshot for the current draft; run_command is diagnostic-only and limited to safe test/search/read commands. Neither tool can rewrite files. "
             "All code changes must be returned in the operations array of the same structured JSON response. "
             "Use hunk patches when small edits are enough. Use full-file create/replace only when creating or substantially rewriting a file. "
-            "Do not edit generated app tests or generated manifests to hide failures. For edits, update tests only when the requested product behavior changes; for fixes, repair app code unless a test expectation is clearly stale because of the requested change. "
+            "Do not edit generated app tests or generated manifests to hide failures. For edits, update tests only when the requested app behavior changes; for fixes, repair app code unless a test expectation is clearly stale because of the requested change. "
             "Return only the structured JSON payload requested by the schema."
         )
 
@@ -2601,6 +2690,7 @@ class WorkspaceCodeAgentRuntime:
         compact_repair_prompt = has_draft_diff and (
             intent_value == "create" or focused_edit_kind == "behavior_workflow_edit"
         )
+        workflow_slice_repair = compact_repair_prompt and self._workflow_slice_repair_needed(latest_execution)
         acceptance_contract = build_acceptance_contract(
             prompt=request.prompt,
             intent=intent_value,
@@ -2618,7 +2708,7 @@ class WorkspaceCodeAgentRuntime:
                 [
                     "Focused visual_style_edit lane: change only CSS/style files listed in focused_edit_files. Do not edit HTML, JavaScript, backend routes, route_manifest.json, generated tests, docs, or unrelated files.",
                     f"Return one compact patch_ready response with at most {FOCUSED_VISUAL_OPERATION_LIMIT} operations and no tool requests. Prefer full-file replace for CSS if a hunk patch would be ambiguous or has already conflicted.",
-                    "Do not add product behavior, data, tests, API calls, navigation, or role copy for a pure style/color/spacing prompt.",
+                "Do not add business behavior, data, tests, API calls, navigation, or role copy for a pure style/color/spacing prompt.",
                     "CSS may use hex/rgb/hsl values for requested colors; the literal user color word does not need to appear in generated CSS.",
                     "Keep the existing top safe spacing and existing selectors/data-testid hooks intact while changing the visual styling.",
                 ]
@@ -2634,7 +2724,11 @@ class WorkspaceCodeAgentRuntime:
                 if content is not None:
                     repair_context[path] = content
         file_context_payload = (
-            self._compact_file_contexts(repair_context, max_files=14, max_chars=3500)
+            self._compact_file_contexts(
+                repair_context,
+                max_files=6 if repeated_no_progress else 8,
+                max_chars=1800 if repeated_no_progress else 2200,
+            )
             if compact_repair_prompt
             else {
                 **self._compact_file_contexts(
@@ -2669,6 +2763,13 @@ class WorkspaceCodeAgentRuntime:
             "tool_round": tool_round,
             "context_mode": context_mode,
             "repeated_no_progress": repeated_no_progress,
+            "repair_focus": (
+                "Repair the connected workflow slice from latest_checks in one coherent patch. Return 2-5 operations touching only the named backend/role/test files; keep selectors, payloads, routes, and generated tests aligned together."
+                if workflow_slice_repair
+                else "Patch only the first concrete blocking issue from latest_checks. Return 1-2 operations touching only the named file(s); do not repair all failures in one turn."
+                if compact_repair_prompt
+                else ""
+            ),
             "user_prompt": request.prompt,
             "error_context": request.error_context.model_dump(mode="json") if request.error_context else None,
             "role_scope": list(request.target_role_scope or ROLE_ORDER),
@@ -2718,20 +2819,32 @@ class WorkspaceCodeAgentRuntime:
                 else self._compact_checks(latest_execution)
             ),
             "preview": self._compact_preview_details(latest_preview_details) if compact_repair_prompt else latest_preview_details,
-            "latest_diff_summary": latest_diff_summary,
-            "last_turn_summary": last_turn_summary,
+            "latest_diff_summary": (
+                truncate_tool_text(str(latest_diff_summary or ""), max_chars=4000)
+                if compact_repair_prompt
+                else latest_diff_summary
+            ),
+            "last_turn_summary": (
+                truncate_tool_text(str(last_turn_summary or ""), max_chars=1800)
+                if compact_repair_prompt
+                else last_turn_summary
+            ),
             "tool_results": (
                 self._compact_tool_results(tool_results)
                 if compact_repair_prompt
                 else tool_results[-8:]
             ),
             "rules": (
-                self._compact_repair_rules(generation_mode=generation_mode, focused_edit_kind=focused_edit_kind)
+                self._compact_repair_rules(
+                    generation_mode=generation_mode,
+                    focused_edit_kind=focused_edit_kind,
+                    workflow_slice_repair=workflow_slice_repair,
+                )
                 if compact_repair_prompt
                 else [
                 *focused_rules,
                 f"Outside focused edit lanes, keep each turn applyable: return up to {AGENT_TURN_OPERATION_LIMIT} independent file operations together when they are part of the same coherent change.",
-                "For create and behavior_workflow_edit tasks, treat acceptance_contract as blocking product scope: every listed flow must have UI controls, JavaScript handlers, backend API persistence, cross-role visibility, refresh persistence, and generated tests.",
+                "For create and behavior_workflow_edit tasks, treat acceptance_contract as blocking app scope: every listed flow must have UI controls, JavaScript handlers, backend API persistence, cross-role visibility, refresh persistence, and generated tests.",
                 "If focused_edit_kind is behavior_workflow_edit, do not make a narrow one-file cosmetic fix. Repair the full user workflow across backend, client, specialist, manager, and generated tests so the scenario can run end to end.",
                 "For Balanced and Quality workflow runs, follow the orchestration ownership lanes: backend/API, client UI, specialist UI, manager UI, and generated tests should be reasoned as separate workstreams, then merged without overlapping ownership conflicts.",
                 "Implement the prompt-derived flow generically: one role creates/submits records, another processes or updates them, and manager reviews persisted state and summary information. Do not switch into a hard-coded domain template.",
@@ -2752,13 +2865,13 @@ class WorkspaceCodeAgentRuntime:
                 "Each role root should visibly link only to its own child pages and implement role-specific workflow rather than reusing the same list page for all roles. Do not include links between client, specialist, and manager role roots.",
                 "If a role app.js is shared across role child pages, initialize each page only when its DOM elements exist. Do not call render/list/form functions that dereference missing elements on another child page.",
                 "For create tasks, do not include mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded business records in generated app source.",
-                "For create tasks, app state starts empty. Use domain-specific empty-state copy plus forms/buttons so users can add their own records.",
+                "For create tasks, app state starts empty. Use prompt-specific empty-state copy plus forms/buttons so users can add their own records.",
                 "For Fast create tasks, keep each generated HTML/JS/CSS/test file compact and use zero preloaded business records.",
                 "For Fast create tasks, create the required role CSS files for client, specialist, and manager, but keep them compact and consistent instead of building a large visual system.",
                 "Use light mode by default for all generated UI: light surfaces, dark text, accessible contrast, and no dark backgrounds unless the user explicitly requested dark mode.",
                 "For broad create tasks, batch independent backend/static/style files in one response when the changes are clear; otherwise patch the most important working slice first and continue after checks.",
                 "For create tasks, generate client, specialist, and manager role roots even if the prompt mentions only one audience.",
-                "Each role root must be domain-specific, non-placeholder, and connected to the same product content; specialist is required and cannot remain the starter screen.",
+                "Each role root must be prompt-specific, non-placeholder, and connected to the same user-requested context; specialist is required and cannot remain the starter screen.",
                 "For create tasks, include dependency-free generated tests in miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs.",
                 "For create tasks, generated Python tests must cover persistent API behavior: GET returns an empty list first, POST creates a user-supplied record, and a later GET returns the created record.",
                 "Python generated tests should use unittest plus FastAPI TestClient to verify role routes and backend/API behavior when backend state exists.",
@@ -2872,27 +2985,22 @@ class WorkspaceCodeAgentRuntime:
             supporting_paths.extend([path for path in diff_paths if path.startswith("miniapp/app/static/") and path.endswith((".html", ".js"))][:4])
         if any("/routes/" in path for path in seed_paths):
             supporting_paths.extend(["miniapp/app/main.py", "miniapp/app/db.py", "miniapp/tests/test_generated_app.py"])
+        for role in ROLE_ORDER:
+            role_prefix = f"miniapp/app/static/{role}/"
+            if any(path.startswith(role_prefix) and path.endswith(("app.js", "styles.css")) for path in seed_paths):
+                supporting_paths.extend(
+                    [
+                        path
+                        for path in diff_paths
+                        if path.startswith(role_prefix) and path.endswith(".html")
+                    ][:4]
+                )
         for path in [*seed_paths, *supporting_paths]:
             normalized = str(path or "").strip().replace("\\", "/").lstrip("./")
             if normalized and normalized.startswith("miniapp/") and normalized not in ordered:
                 ordered.append(normalized)
 
-        def score(path: str) -> tuple[int, int]:
-            if path.endswith("miniapp/tests/test_generated_app.py") or path.endswith("miniapp/tests/generated_app.test.mjs"):
-                bucket = 0
-            elif "/routes/" in path or path.endswith("/main.py") or path.endswith("route_manifest.json"):
-                bucket = 1
-            elif path.endswith("/app.js"):
-                bucket = 2
-            elif path.endswith("/index.html"):
-                bucket = 3
-            elif path.endswith("/styles.css"):
-                bucket = 4
-            else:
-                bucket = 5
-            return bucket, ordered.index(path)
-
-        return sorted(ordered, key=score)[:8]
+        return ordered[:10]
 
     @staticmethod
     def _compact_acceptance_contract(contract: dict[str, Any]) -> dict[str, Any]:
@@ -2917,7 +3025,7 @@ class WorkspaceCodeAgentRuntime:
             "roles": contract.get("roles") if isinstance(contract, dict) else [],
             "features": contract.get("features") if isinstance(contract, dict) else {},
             "required_endpoints": list(contract.get("required_endpoints") or [])[:6] if isinstance(contract, dict) else [],
-            "required_buttons": list(contract.get("required_buttons") or [])[:10] if isinstance(contract, dict) else [],
+            "required_controls": list(contract.get("required_controls") or [])[:10] if isinstance(contract, dict) else [],
             "flows": compact_flows[:4],
             "test_requirements": list(contract.get("test_requirements") or [])[:8] if isinstance(contract, dict) else [],
         }
@@ -2982,20 +3090,51 @@ class WorkspaceCodeAgentRuntime:
         return truncate_tool_text(str(value), max_chars=max_chars)
 
     @staticmethod
+    def _workflow_slice_repair_needed(execution: CheckExecutionRecord) -> bool:
+        failed_results = [result for result in execution.results if result.status == "failed"]
+        failed_names = {str(result.name or "") for result in failed_results}
+        if not failed_names:
+            return False
+        has_workflow_check = bool({"connectivity_validators", "frontend_interaction_static_smoke"} & failed_names)
+        has_generated_check = bool({"generated_app_python_tests", "generated_app_js_tests"} & failed_names)
+        frontend_issue_count = 0
+        for result in failed_results:
+            if result.name == "frontend_interaction_static_smoke":
+                frontend_issue_count = len(result.logs or [])
+                break
+        return (
+            (has_workflow_check and has_generated_check)
+            or {"connectivity_validators", "frontend_interaction_static_smoke"}.issubset(failed_names)
+            or frontend_issue_count >= 3
+        )
+
+    @staticmethod
     def _compact_repair_checks(execution: CheckExecutionRecord) -> list[dict[str, object]]:
         failed_results = [result for result in execution.results if result.status != "passed"]
-        source_results = failed_results or execution.results[-4:]
+        priority = {
+            "changed_files_static": 0,
+            "generated_app_python_tests": 1,
+            "generated_app_js_tests": 2,
+            "connectivity_validators": 3,
+            "frontend_interaction_static_smoke": 4,
+            "platform_invariants": 5,
+        }
+        source_results = (
+            sorted(failed_results, key=lambda result: priority.get(str(result.name), 20))
+            if failed_results
+            else execution.results[-3:]
+        )
         payload: list[dict[str, object]] = []
-        for result in source_results[:8]:
+        for result in source_results[:3]:
             payload.append(
                 {
                     "name": result.name,
                     "status": result.status,
-                    "details": truncate_tool_text(str(result.details or ""), max_chars=700),
-                    "command": truncate_tool_text(str(result.command or ""), max_chars=300),
+                    "details": truncate_tool_text(str(result.details or ""), max_chars=420),
+                    "command": truncate_tool_text(str(result.command or ""), max_chars=180),
                     "exit_code": result.exit_code,
-                    "logs": [truncate_tool_text(str(line), max_chars=650) for line in result.logs[-6:]],
-                    "diagnostics": WorkspaceCodeAgentRuntime._compact_jsonish(result.diagnostics, max_chars=800, max_items=6),
+                    "logs": [truncate_tool_text(str(line), max_chars=420) for line in result.logs[-3:]],
+                    "diagnostics": WorkspaceCodeAgentRuntime._compact_jsonish(result.diagnostics, max_chars=900, max_items=6),
                 }
             )
         return payload
@@ -3034,30 +3173,59 @@ class WorkspaceCodeAgentRuntime:
         return compact
 
     @staticmethod
-    def _compact_repair_rules(*, generation_mode: GenerationMode, focused_edit_kind: str) -> list[str]:
+    def _compact_repair_rules(
+        *,
+        generation_mode: GenerationMode,
+        focused_edit_kind: str,
+        workflow_slice_repair: bool = False,
+    ) -> list[str]:
         mode_value = str(getattr(generation_mode, "value", generation_mode) or "")
         rules = [
             "This is a compact repair turn for an already generated draft. Do not rebuild the whole app.",
-            "Repair the failed latest_checks and make the next failure signature change; use the file_contexts and diff context already provided.",
+        ]
+        if workflow_slice_repair:
+            rules.extend(
+                [
+                    "The latest checks describe one connected workflow slice, not independent cosmetic problems. Patch the named backend/API, role HTML/JS/CSS, and generated tests together so selectors, form fields, payloads, routes, and assertions agree.",
+                    "Use a small multi-file patch for the connected slice. Do not spend separate turns on each stale generated-test phrase when the test file can be made durable in one operation.",
+                ]
+            )
+        else:
+            rules.extend(
+                [
+                    "Patch the first concrete blocking issue only. One good 1-file patch is better than a broad partial rewrite.",
+                    "Repair only the highest-priority failed latest_checks in this turn; if several checks fail, touch the first 1-2 concrete locations from logs/diagnostics and let the next turn handle the rest.",
+                ]
+            )
+        rules.extend([
             "Prefer patch operations for existing files. Use full replace only when a file is tiny, newly created, or a previous patch conflict makes a hunk unsafe.",
             "Keep create invariants intact: three isolated role apps, role CSS, preview_bridge on pages, no seed/mock/demo/preloaded business records, backend GET/POST/PATCH persistence, cross-role visibility, and generated Python/JS tests.",
             "If generated Python/JS tests failed, patch the app and the exact stale/incorrect test expectation together when the requested behavior requires it.",
+            "Never satisfy a generated test by adding one role's app script to another role page. Role pages must load only their own role app script; stale cross-role generated-test assertions must be corrected.",
             "If generated_app_python_tests reports NO TESTS RAN, rewrite miniapp/tests/test_generated_app.py as unittest-discoverable tests with a unittest.TestCase subclass and test_* methods.",
             "If generated_app_python_tests reports AssertionError: 422 not found in [200, 201], the POST payload and Pydantic create schema are mismatched. Patch the API schema/routes and/or test payload together so required create fields are present and the request returns 200/201; do not keep retrying only the test file.",
+            "If generated_app_python_tests reports that a path-id PATCH payload duplicates the id field, remove that id from the JSON body or add it to the patch schema only when the real frontend/backend workflow needs it. The endpoint path already identifies the record.",
             "If generated_app_python_tests reports sqlite no such table, patch backend table creation or the tests: SQLAlchemy Base.metadata.create_all(bind=engine) must run before TestClient requests, and tests using lifespan-created tables must use `with TestClient(app) as client:`.",
+            "If generated_app_python_tests reports SQLAlchemy NoForeignKeysError, patch the model relationship and column definitions together: add the missing ForeignKey or remove relationship()/back_populates and query by id explicitly.",
+            "If generated_app_python_tests reports AttributeError for a missing ORM/model field, align the field names across the ORM model, schemas, route payload builder, frontend payload, and generated tests. Do not serialize fields that are not persisted.",
             "If generated_app_python_tests or generated_app_js_tests fail because they assert `<main class=\"page-shell\">` or exact `class=\"page-shell\"`, patch the generated tests to assert the page-shell class token with a regex allowing extra attributes/classes; do not remove the platform safe-area style or extra shell classes.",
+            "If generated_app_js_tests reports `.text is not a function` for `new URL(...)`, patch generated_app.test.mjs to use fs.readFileSync with a string path or fileURLToPath; URL objects do not have a .text() method in Node tests.",
+            "If generated_app_js_tests asserts a quoted string containing `${...}`, patch generated_app.test.mjs to evaluate it as a template literal or precomputed expected string; do not assert the literal characters `${role}`.",
+            "If changed_files_static reports `Invalid left-hand side in assignment` for optional chaining, patch the exact JS line from `node --check`: replace `node?.textContent = value` with `if (node) node.textContent = value` or a safe helper.",
             "If generated Python tests get 404 on PATCH /api/<resource>/{id}, add or align a path-id PATCH endpoint and update frontend/tests to use the same route shape.",
             "If generated Python tests fail with an AssertionError for an unsupported or missing field, either add that exact field to the backend model/create/update/output schemas and persist it through GET, or remove the stale assertion from the generated test. The test and API schema must match exactly.",
             "If changed_files_static reports FastAPI Invalid args for response field involving sqlalchemy.orm.session.Session, patch endpoint signatures so every Session parameter uses Depends(get_db_session) or Depends(get_db), never next(get_db_session())/SessionLocal() defaults, and make the dependency a normal yield function without @contextmanager.",
             "If generated_app_js_tests fails because it expects a string missing from the file it reads, either add the real missing UI/JS control or update the test to assert a literal string that exists in the relevant generated source.",
+            "If generated_app_js_tests reports several stale literal includes()/match() assertions, replace or patch miniapp/tests/generated_app.test.mjs once so it verifies durable selectors, form ids, handlers, methods, and /api flows for all roles; do not spend one repair turn per text phrase.",
             "If generated_app_js_tests expects a button id inside a script but the real app binds a parent form/data-selector handler, patch the test to verify the actual selector, addEventListener, method, and /api flow instead of requiring an unused id string.",
             "Generated JS tests should not require exact fetch('/api/...') literals when the app uses API_ROOT/API_BASE constants or template literals; assert /api, resource names, methods, and real controls instead.",
+            "Generated JS tests should not require a regex like /\\/api\\/records/ when app code uses `pathBase = '/api'` and `${pathBase}/records`; update the test to check both pieces instead of changing working app code.",
             "If API connectivity failed, ensure frontend fetch paths and backend routes match and that POST/PATCH changes are visible through later GET.",
             "If platform_invariants reports unchecked_page_dom_id, patch the role app.js with optional chaining or explicit guards for every page-specific DOM element before textContent/classList/addEventListener/property access.",
             "If platform_invariants reports platform.insufficient_mode_design_depth, patch only the named role styles.css with real used classes for cards, metrics, badges, forms, lists, empty/loading/error/success/status states; for Quality add responsive and focus styling if it is missing.",
-            "If frontend interaction failed, wire the named button/form to a null-safe JavaScript handler and persisted API/state update.",
+            "If frontend interaction failed, patch exactly the named HTML/JS/CSS locations from the failed log. Do not rewrite unrelated pages.",
             "Return outcome=patch_ready with a small coherent operations array; do not ask for tools in Fast repair unless the required file is missing from file_contexts.",
-        ]
+        ])
         if mode_value == GenerationMode.BALANCED.value:
             rules.append("Balanced repair must preserve the richer UI/workflow depth already required for Balanced; do not simplify it down to Fast.")
         if mode_value == GenerationMode.QUALITY.value:
@@ -3092,14 +3260,6 @@ class WorkspaceCodeAgentRuntime:
                 )
             if result.name == "generated_app_js_tests":
                 candidates.append("miniapp/tests/generated_app.test.mjs")
-                for role in ROLE_ORDER:
-                    candidates.extend(
-                        [
-                            f"miniapp/app/static/{role}/index.html",
-                            f"miniapp/app/static/{role}/app.js",
-                            f"miniapp/app/static/{role}/styles.css",
-                        ]
-                    )
             for issue in diagnostics.get("issues") or []:
                 if isinstance(issue, dict):
                     candidates.extend([issue.get("location"), issue.get("path"), issue.get("file_path")])
@@ -3110,6 +3270,17 @@ class WorkspaceCodeAgentRuntime:
                     payload = None
                 if isinstance(payload, dict):
                     candidates.extend([payload.get("location"), payload.get("path"), payload.get("file_path")])
+                for static_match in re.finditer(
+                    r"readStatic\(\s*([\"'])(?P<path>(?:client|specialist|manager)/[^\"']+\.(?:html|js|css))\1",
+                    str(line or ""),
+                ):
+                    candidates.append(f"miniapp/app/static/{static_match.group('path')}")
+                role_match = re.search(r"\bconst\s+role\s*=\s*([\"'])(?P<role>client|specialist|manager)\1", str(line or ""))
+                if role_match:
+                    role = role_match.group("role")
+                    candidates.append(f"miniapp/app/static/{role}/app.js")
+                for match in re.finditer(r"(?:^|[/\\])(?P<path>miniapp[/\\][A-Za-z0-9_./\\-]+\.(?:py|js|mjs|html|css|json))", str(line or "")):
+                    candidates.append(match.group("path"))
             for candidate in candidates:
                 path = str(candidate or "").strip().replace("\\", "/").lstrip("./")
                 if path and path.startswith("miniapp/") and path not in paths:
@@ -3228,10 +3399,10 @@ class WorkspaceCodeAgentRuntime:
         if str(intent or "").lower() == "create":
             if repair_turn:
                 if generation_mode == GenerationMode.FAST:
-                    return {"reasoning": {"effort": "low"}, "max_output_tokens": 26000}
+                    return {"reasoning": {"effort": "low"}, "max_output_tokens": 10000}
                 if generation_mode == GenerationMode.QUALITY:
-                    return {"reasoning": {"effort": "medium"}, "max_output_tokens": 30000}
-                return {"reasoning": {"effort": "low"}, "max_output_tokens": 28000}
+                    return {"reasoning": {"effort": "low"}, "max_output_tokens": 16000}
+                return {"reasoning": {"effort": "low"}, "max_output_tokens": 14000}
             if generation_mode == GenerationMode.FAST:
                 return {"reasoning": {"effort": "low"}, "max_output_tokens": 28000}
             if generation_mode == GenerationMode.QUALITY:
@@ -3256,9 +3427,10 @@ class WorkspaceCodeAgentRuntime:
         create_task = str(request.intent or "").lower() == "create"
         if create_task:
             next_action = (
-                "The previous answer was too large. Return outcome=patch_ready now with a compact, complete first implementation. "
-                "Use no more than 12 concise file operations in this recovery turn, avoid inline styles and long comments, and do not request more context unless a specific required file is absent. "
-                "Keep the app working, not static-only: include one compact backend API route module with GET/POST persistence, main.py router registration, form/fetch frontend code, and generated tests. "
+                "The previous answer was too large. Return outcome=patch_ready now with a very small patch. "
+                "If this is a repair for an existing draft, use no more than 2 operations and touch only the first concrete failed files/checks; do not rebuild the whole app or request tools. "
+                "If this is the first implementation, use no more than 10 concise file operations, avoid inline styles and long comments, and do not request more context unless a specific required file is absent. "
+                "Keep the app working, not static-only: align backend API routes, form/fetch frontend code, and generated tests around the same persisted fields. "
                 "Do not add mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded business records."
             )
         else:
@@ -3345,14 +3517,27 @@ class WorkspaceCodeAgentRuntime:
             *{str(operation.file_path or "").strip().replace("\\", "/").lstrip("./") for operation in operations},
         }
         operation_text_by_path = {
-            str(operation.file_path or "").strip().replace("\\", "/").lstrip("./"): "\n".join(
+            str(path or "").strip().replace("\\", "/").lstrip("./"): str(text or "")
+            for path, text in (existing_text_by_path or {}).items()
+            if str(path or "").strip()
+        }
+        for operation in operations:
+            normalized_path = str(operation.file_path or "").strip().replace("\\", "/").lstrip("./")
+            if not normalized_path:
+                continue
+            if operation.operation in {"create", "replace"}:
+                operation_text_by_path[normalized_path] = str(operation.content or operation.diff or "")
+                continue
+            if operation.operation == "patch":
+                existing_text = operation_text_by_path.get(normalized_path, "")
+                patch_context = "\n".join(part for part in (str(operation.diff or ""), str(operation.content or "")) if part)
+                operation_text_by_path[normalized_path] = "\n".join(part for part in (existing_text, patch_context) if part)
+                continue
+            operation_text_by_path[normalized_path] = "\n".join(
                 part
-                for part in (str(operation.content or ""), str(operation.diff or ""))
+                for part in (operation_text_by_path.get(normalized_path, ""), str(operation.content or ""), str(operation.diff or ""))
                 if part
             )
-            for operation in operations
-        }
-        operation_text_by_path = {**(existing_text_by_path or {}), **operation_text_by_path}
         missing: list[str] = []
         required_files = [
             "miniapp/app/static/client/index.html",
@@ -3373,7 +3558,7 @@ class WorkspaceCodeAgentRuntime:
             if path not in touched:
                 missing.append(path)
         generation_mode = WorkspaceCodeAgentRuntime._generation_mode(request.generation_mode)
-        required_child_pages = 3 if generation_mode == GenerationMode.QUALITY else 1 if generation_mode == GenerationMode.FAST else 2
+        required_child_pages = 3 if generation_mode == GenerationMode.QUALITY else 1
         for role in ("client", "specialist", "manager"):
             child_pages = {
                 path
@@ -3381,8 +3566,15 @@ class WorkspaceCodeAgentRuntime:
                 if re.fullmatch(rf"miniapp/app/static/{role}/[^/]+/index\.html", path)
             }
             if len(child_pages) < required_child_pages:
+                child_marker = (
+                    "one-child-page"
+                    if required_child_pages == 1
+                    else "three-child-pages"
+                    if required_child_pages >= 3
+                    else "two-child-pages"
+                )
                 missing.append(
-                    f"miniapp/app/static/{role}/<{'one-child-page' if required_child_pages == 1 else 'two-child-pages'}>/index.html"
+                    f"miniapp/app/static/{role}/<{child_marker}>/index.html"
                 )
             css_path = f"miniapp/app/static/{role}/styles.css"
             css_text = operation_text_by_path.get(css_path, "")
@@ -3417,7 +3609,7 @@ class WorkspaceCodeAgentRuntime:
                 "miniapp/app/schemas.py",
             )
         )
-        if ("__tablename__" in backend_text or "class Product(Base)" in backend_text or "class Order(Base)" in backend_text) and "create_all" not in backend_bootstrap_text:
+        if "__tablename__" in backend_text and "create_all" not in backend_bootstrap_text:
             missing.append("backend SQLAlchemy table creation via Base.metadata.create_all")
         for match in re.finditer(r"\b\w+\s*:\s*Session\s*=\s*(?P<default>[^,\)\n]+)", backend_text):
             default_expression = str(match.group("default") or "").strip()
@@ -3428,8 +3620,8 @@ class WorkspaceCodeAgentRuntime:
             missing.append("backend FastAPI generator dependency without @contextmanager")
         if "Item(" in backend_text and not re.search(r"\b(class|import)\s+Item\b|from\s+\S+\s+import\s+[^;\n]*\bItem\b", backend_text):
             missing.append("backend undefined ORM Item model")
-        if ".product_items" in backend_text and "relationship(" not in backend_text:
-            missing.append("backend order item relationship or serialized items field")
+        if re.search(r"\.[A-Za-z0-9_]*items\b", backend_text) and "relationship(" not in backend_text and "JSON" not in backend_text and "Text" not in backend_text:
+            missing.append("backend nested item relationship or serialized items field")
         has_update_api = any(
             WorkspaceCodeAgentRuntime._has_backend_api_method(backend_text, method)
             for method in ("put", "patch", "delete")
@@ -3509,7 +3701,7 @@ class WorkspaceCodeAgentRuntime:
         return {
             "tool": "create_patch_coverage_correction",
             "contract": (
-                "Create runs must not apply a partial product slice that leaves another role as the starter template "
+                "Create runs must not apply a partial app slice that leaves another role as the starter template "
                 "or omits generated tests. The first patch must cover the required app surface evenly."
             ),
             "required_next_action": (
@@ -3548,7 +3740,7 @@ class WorkspaceCodeAgentRuntime:
         return {
             "tool": "focused_visual_edit_budget",
             "contract": (
-                "This is a small visual/style edit. It must use the focused CSS lane instead of the full create/product "
+                "This is a small visual/style edit. It must use the focused CSS lane instead of the full create/workflow "
                 "generation loop."
             ),
             "focused_edit_files": WorkspaceCodeAgentRuntime._focused_visual_css_paths(role_scope),
@@ -3866,7 +4058,7 @@ class WorkspaceCodeAgentRuntime:
             return RunCheckResult(
                 name="prompt_alignment_smoke",
                 status="skipped",
-                details="Prompt alignment smoke skipped because the draft has no product changes yet.",
+                details="Prompt alignment smoke skipped because the draft has no app changes yet.",
                 command="prompt alignment static smoke",
                 logs=[],
             )
@@ -3991,7 +4183,7 @@ class WorkspaceCodeAgentRuntime:
         del preview_details
         failed = [result for result in results if result.status == "failed"]
         has_diff = bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
-        no_product_diff = request.mode in {"generate", "fix"} and not has_diff
+        no_app_diff = request.mode in {"generate", "fix"} and not has_diff
         remaining_issues = [
             {
                 "kind": "check_failure",
@@ -4002,7 +4194,7 @@ class WorkspaceCodeAgentRuntime:
             }
             for result in failed
         ]
-        if no_product_diff:
+        if no_app_diff:
             remaining_issues.append(
                 {
                     "kind": "prompt_alignment",
@@ -4017,7 +4209,7 @@ class WorkspaceCodeAgentRuntime:
                 for issue in validation_snapshot.issues
                 if isinstance(issue, dict) and issue.get("blocking", False)
             )
-        complete = not failed and not no_product_diff
+        complete = not failed and not no_app_diff
         return {
             "strict_green": complete,
             "optimistic_complete": complete,
@@ -4253,7 +4445,7 @@ class WorkspaceCodeAgentRuntime:
             {
                 "tool": "generated_test_failure_context",
                 "contract": (
-                    "Generated tests are product acceptance tests. On an edit, either preserve the app selectors/text they still validly assert, "
+                    "Generated tests are app acceptance tests. On an edit, either preserve the app selectors/text they still validly assert, "
                     "or update the generated test file in the same patch when the requested behavior intentionally changes the expectation."
                 ),
                 "required_next_action": (
@@ -4401,7 +4593,7 @@ class WorkspaceCodeAgentRuntime:
                     "For platform.missing_create_get_api/platform.missing_create_post_api, create or register a backend /api route with persistent GET and POST behavior. "
                     "For platform.frontend_missing_post_api, add form/fetch code that POSTs user-provided records to /api. "
                     "For platform.preloaded_business_data, remove hard-coded business records and start from empty persistent state. "
-                    "For platform.missing_role_workflow_actions on manager, add a real manager dashboard control such as a review/refresh/filter/oversight button with a guarded JavaScript handler, or a PATCH/PUT oversight action if the product flow needs manager mutation. "
+                    "For platform.missing_role_workflow_actions on manager, add a real manager dashboard control such as a review/refresh/filter/oversight button with a guarded JavaScript handler, or a PATCH/PUT oversight action if the requested flow needs manager mutation. "
                     "Do not rewrite unrelated role pages."
                 ),
                 "issues": issues[:24],
@@ -4474,6 +4666,11 @@ class WorkspaceCodeAgentRuntime:
                 job.token_usage if isinstance(job.token_usage, dict) else {},
                 details,
             )
+            if isinstance(job.budget_status, dict):
+                job.budget_status = {
+                    **job.budget_status,
+                    "total_tokens": self._token_usage_total(job.token_usage),
+                }
         job.updated_at = datetime.now(timezone.utc)
         noisy_check_event = self._is_noisy_check_progress_event(event_type, details)
         if not noisy_check_event:
@@ -4675,7 +4872,15 @@ class WorkspaceCodeAgentRuntime:
         payload["worker_summaries"] = list(job.worker_summaries)
         payload["flow_coverage"] = dict(job.flow_coverage)
         payload["completion_budget"] = dict(job.completion_budget)
-        payload["budget_status"] = dict(job.budget_status)
+        budget_status = dict(job.budget_status)
+        token_usage = payload.get("token_usage") if isinstance(payload.get("token_usage"), dict) else {}
+        try:
+            usage_total = int(token_usage.get("total_tokens") or 0)
+        except (TypeError, ValueError):
+            usage_total = 0
+        if usage_total:
+            budget_status["total_tokens"] = usage_total
+        payload["budget_status"] = budget_status
         payload["fix_targets"] = list(job.fix_targets)
         payload["remaining_issues"] = list(job.remaining_issues)
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()

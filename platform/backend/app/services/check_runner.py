@@ -143,6 +143,10 @@ class CheckRunner:
         r"no such table:\s+(?P<table>[A-Za-z0-9_]+)",
         re.IGNORECASE,
     )
+    _PY_MISSING_ATTRIBUTE_RE = re.compile(
+        r"AttributeError:\s+'(?P<object>[A-Za-z0-9_]+)'\s+object\s+has\s+no\s+attribute\s+'(?P<attribute>[A-Za-z0-9_]+)'",
+        re.IGNORECASE,
+    )
     _SHARED_STATE_UPDATE_RE = re.compile(
         r"Updated record\s+(?P<record_id>[A-Za-z0-9_-]+)\s+did not reflect\s+(?P<actor>[A-Za-z0-9_-]+)\s+changes in shared state\.\s+Payload:\s*(?P<payload>.*)$",
         re.IGNORECASE,
@@ -152,6 +156,7 @@ class CheckRunner:
         re.IGNORECASE,
     )
     _GENERATED_JS_TEST_LOCATION_RE = re.compile(r"generated_app\.test\.mjs:(?P<line>\d+):(?P<column>\d+)")
+    _GENERATED_PY_TEST_LOCATION_RE = re.compile(r"test_generated_app\.py\", line (?P<line>\d+)")
     _STATIC_JS_SYNTAX_LOCATION_RE = re.compile(
         r"(?P<path>.*?/miniapp/(?P<relative>app/static/[^:\s]+\.js)):(?P<line>\d+)"
     )
@@ -322,17 +327,17 @@ class CheckRunner:
             python_details = (
                 "Generated Python app tests were skipped for a focused CSS-only visual edit."
                 if focused_details
-                else "Generated Python app tests were deferred until follow-up verification."
+                else "Generated Python app tests were deferred until the full verification gate."
             )
             js_details = (
                 "Generated JS app tests were skipped for a focused CSS-only visual edit."
                 if focused_details
-                else "Generated JS app tests were deferred until follow-up verification."
+                else "Generated JS app tests were deferred until the full verification gate."
             )
             preview_details = (
                 "Preview rebuild was skipped for a focused CSS-only visual edit until successful apply/final viewing."
                 if focused_details
-                else "Preview rebuild was deferred until follow-up verification."
+                else "Preview rebuild was deferred until the full verification gate."
             )
             results.extend(
                 [
@@ -363,7 +368,7 @@ class CheckRunner:
                         details=(
                             "Preview connectivity smoke was skipped for a focused CSS-only visual edit."
                             if focused_details
-                            else "Preview connectivity smoke was deferred until follow-up verification."
+                            else "Preview connectivity smoke was deferred until the full verification gate."
                         ),
                         command="preview deferred during focused edit" if focused_details else "preview deferred during fast gate",
                         logs=[],
@@ -374,7 +379,7 @@ class CheckRunner:
                         details=(
                             "Browser flow smoke was skipped for a focused CSS-only visual edit."
                             if focused_details
-                            else "Browser flow smoke was deferred until follow-up verification."
+                            else "Browser flow smoke was deferred until the full verification gate."
                         ),
                         command="browser/preview flow deferred during focused edit" if focused_details else "browser/preview flow deferred during fast gate",
                         logs=[],
@@ -616,7 +621,412 @@ class CheckRunner:
                     blocking=True,
                 )
             )
+        issues.extend(cls._frontend_role_wiring_issues(static_root))
+        issues.extend(cls._role_css_html_contract_issues(static_root))
         return cls._dedupe_validation_issues(issues)
+
+    @classmethod
+    def _frontend_role_wiring_issues(cls, static_root: Path) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        for role in ROLE_ORDER:
+            role_dir = static_root / role
+            js_path = role_dir / "app.js"
+            if not role_dir.exists() or not js_path.exists():
+                continue
+            try:
+                js_source = js_path.read_text(encoding="utf-8")
+            except OSError:
+                js_source = ""
+            html_files = sorted(role_dir.rglob("*.html"))
+            html_by_path: dict[str, str] = {}
+            for html_path in html_files:
+                try:
+                    html_by_path[html_path.relative_to(static_root.parents[2]).as_posix()] = html_path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+            combined_html = "\n".join(html_by_path.values())
+            issues.extend(cls._selector_wiring_issues(role, js_path, js_source, combined_html))
+            for relative_path, html_source in html_by_path.items():
+                issues.extend(cls._form_wiring_issues(relative_path, js_path, html_source, js_source))
+                issues.extend(cls._button_wiring_issues(relative_path, js_path, html_source, js_source))
+        return issues
+
+    @classmethod
+    def _selector_wiring_issues(cls, role: str, js_path: Path, js_source: str, combined_html: str) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        for selector in cls._literal_query_selectors(js_source):
+            if cls._selector_is_dynamic_or_generic(selector):
+                continue
+            if cls._html_has_simple_selector(combined_html, selector):
+                continue
+            if cls._selector_is_optional_feedback_target(js_source, selector):
+                continue
+            blocking = selector.strip().startswith("#")
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_selector_matches_no_html",
+                    message=(
+                        f"{js_path.relative_to(js_path.parents[4]).as_posix()} queries selector `{selector}`, "
+                        f"but no {role} HTML page contains that selector. Required workflows must not be guarded behind selectors that never match."
+                    ),
+                    severity="high" if blocking else "medium",
+                    location=js_path.relative_to(js_path.parents[4]).as_posix(),
+                    blocking=blocking,
+                )
+            )
+        return issues
+
+    @classmethod
+    def _selector_is_optional_feedback_target(cls, js_source: str, selector: str) -> bool:
+        bindings = cls._js_dom_selector_bindings(js_source)
+        matching_vars = [var_name for var_name, (_kind, value) in bindings.items() if value == selector]
+        if not matching_vars:
+            return False
+        text = str(js_source or "")
+        for var_name in matching_vars:
+            escaped = re.escape(var_name)
+            if re.search(rf"\b{escaped}\s*\.\s*(?:addEventListener|submit|click|value|checked)\b", text):
+                continue
+            if re.search(rf"\b{escaped}\s*&&", text) or re.search(rf"\b{escaped}\?\.", text):
+                return True
+            if re.search(rf"\bif\s*\(\s*{escaped}\s*\)", text):
+                return True
+        return False
+
+    @staticmethod
+    def _literal_query_selectors(js_source: str) -> list[str]:
+        selectors: list[str] = []
+        pattern = re.compile(
+            r"""\bquerySelector(?:All)?\(\s*(?:"(?P<double>[^"]+)"|'(?P<single>[^']+)'|`(?P<backtick>[^`]+)`)\s*\)"""
+        )
+        for match in pattern.finditer(str(js_source or "")):
+            selector = str(match.group("double") or match.group("single") or match.group("backtick") or "").strip()
+            if selector:
+                selectors.append(selector)
+        return list(dict.fromkeys(selectors))
+
+    @staticmethod
+    def _selector_is_dynamic_or_generic(selector: str) -> bool:
+        value = str(selector or "").strip()
+        if not value or any(marker in value for marker in (" ", ">", "+", "~", ",", ":not", "${")):
+            return True
+        return value.lower() in {"body", "main", "form", "button", "input", "select", "textarea"}
+
+    @staticmethod
+    def _html_has_simple_selector(html_source: str, selector: str) -> bool:
+        html = str(html_source or "")
+        value = str(selector or "").strip()
+        id_match = re.search(r"#(?P<id>[A-Za-z0-9_-]+)", value)
+        if id_match and id_match.group("id") not in extract_html_ids(html):
+            return False
+        class_names = re.findall(r"\.(?P<class>[A-Za-z0-9_-]+)", value)
+        if class_names:
+            html_classes = CheckRunner._html_class_names(html)
+            if any(class_name not in html_classes for class_name in class_names):
+                return False
+        attr_matches = re.findall(r"\[(?P<name>[A-Za-z0-9_:-]+)(?:\s*=\s*([\"']?)(?P<value>[^\]\"']+)\2)?\]", value)
+        for attr_name, _quote, attr_value in attr_matches:
+            if attr_value:
+                pattern = rf"\b{re.escape(attr_name)}\s*=\s*([\"']){re.escape(attr_value)}\1"
+            else:
+                pattern = rf"\b{re.escape(attr_name)}(?:\s*=|\s|>)"
+            if not re.search(pattern, html):
+                return False
+        if id_match or class_names or attr_matches:
+            return True
+        return value.lower() in html.lower()
+
+    @classmethod
+    def _form_wiring_issues(cls, relative_path: str, js_path: Path, html_source: str, js_source: str) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        for form in cls._html_forms(html_source):
+            form_id = str(form.get("id") or "").strip()
+            form_selectors = [str(selector) for selector in form.get("selectors") or [] if str(selector).strip()]
+            field_names = set(form.get("field_names") or [])
+            if not form_id and not form_selectors:
+                continue
+            form_label = f"#{form_id}" if form_id else form_selectors[0]
+            form_referenced = bool(
+                (form_id and cls._js_references_dom_id(js_source, form_id))
+                or any(cls._js_references_selector(js_source, selector) for selector in form_selectors)
+            )
+            form_has_submit_handler = bool(
+                (form_id and cls._js_has_submit_handler_for_id(js_source, form_id))
+                or any(cls._js_has_submit_handler_for_selector(js_source, selector) for selector in form_selectors)
+            )
+            if not form_referenced:
+                issues.append(
+                    ValidationIssue(
+                        code="platform.workflow_form_without_handler",
+                        message=f"{relative_path} has form {form_label}, but {js_path.name} never references it. Visible workflow forms must have a submit handler.",
+                        severity="high",
+                        location=relative_path,
+                        blocking=True,
+                    )
+                )
+                continue
+            if not form_has_submit_handler:
+                issues.append(
+                    ValidationIssue(
+                        code="platform.workflow_form_without_submit_handler",
+                        message=f"{relative_path} form {form_label} is referenced by JavaScript but no submit handler is wired for it.",
+                        severity="high",
+                        location=relative_path,
+                        blocking=True,
+                    )
+                )
+            if not field_names:
+                continue
+            if "Object.fromEntries" in js_source and "new FormData" in js_source:
+                data_props = set(re.findall(r"\bdata\.([A-Za-z_$][\w$]*)", js_source))
+                formdata_api_props = {"append", "delete", "entries", "forEach", "get", "getAll", "has", "keys", "set", "values"}
+                unknown_props = sorted(prop for prop in data_props if prop not in field_names and prop not in {"id"} | formdata_api_props)
+                if unknown_props:
+                    issues.append(
+                        ValidationIssue(
+                            code="platform.workflow_formdata_field_mismatch",
+                            message=(
+                                f"{relative_path} form {form_label} fields are {', '.join(sorted(field_names))}, "
+                                f"but JavaScript reads missing FormData properties: {', '.join(unknown_props[:6])}."
+                            ),
+                            severity="high",
+                            location=relative_path,
+                            blocking=True,
+                        )
+                    )
+            else:
+                missing_reads = sorted(name for name in field_names if not cls._js_reads_form_field(js_source, name))
+                if missing_reads:
+                    issues.append(
+                        ValidationIssue(
+                            code="platform.workflow_form_field_not_submitted",
+                            message=(
+                                f"{relative_path} form {form_label} contains fields not read by JavaScript payload: "
+                                f"{', '.join(missing_reads[:6])}."
+                            ),
+                            severity="high",
+                            location=relative_path,
+                            blocking=True,
+                        )
+                    )
+        return issues
+
+    @staticmethod
+    def _html_forms(html_source: str) -> list[dict[str, object]]:
+        forms: list[dict[str, object]] = []
+        for match in re.finditer(r"<form\b(?P<attrs>[^>]*)>(?P<body>.*?)</form>", str(html_source or ""), re.IGNORECASE | re.DOTALL):
+            attrs = match.group("attrs") or ""
+            body = match.group("body") or ""
+            form_id_match = re.search(r"\bid\s*=\s*([\"'])(?P<id>[^\"']+)\1", attrs, re.IGNORECASE)
+            selectors: list[str] = []
+            if form_id_match:
+                selectors.append(f"#{form_id_match.group('id')}")
+            for attr_match in re.finditer(
+                r"\b(?P<name>data-[A-Za-z0-9_-]+)(?:\s*=\s*([\"'])(?P<value>[^\"']*)\2)?",
+                attrs,
+                re.IGNORECASE,
+            ):
+                attr_name = attr_match.group("name")
+                attr_value = attr_match.group("value")
+                selectors.append(f"[{attr_name}=\"{attr_value}\"]" if attr_value else f"[{attr_name}]")
+            names = {
+                name_match.group("name")
+                for name_match in re.finditer(r"\bname\s*=\s*([\"'])(?P<name>[A-Za-z0-9_-]+)\1", body, re.IGNORECASE)
+            }
+            forms.append({"id": form_id_match.group("id") if form_id_match else "", "selectors": selectors, "field_names": sorted(names)})
+        return forms
+
+    @classmethod
+    def _button_wiring_issues(cls, relative_path: str, js_path: Path, html_source: str, js_source: str) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        for match in re.finditer(r"<button\b(?P<attrs>[^>]*)>", str(html_source or ""), re.IGNORECASE):
+            attrs = match.group("attrs") or ""
+            id_match = re.search(r"\bid\s*=\s*([\"'])(?P<id>[^\"']+)\1", attrs, re.IGNORECASE)
+            if not id_match:
+                continue
+            button_id = id_match.group("id")
+            type_match = re.search(r"\btype\s*=\s*([\"'])(?P<type>[^\"']+)\1", attrs, re.IGNORECASE)
+            if str(type_match.group("type") if type_match else "").lower() == "submit":
+                continue
+            if cls._js_references_dom_id(js_source, button_id):
+                continue
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_button_without_handler",
+                    message=f"{relative_path} has button #{button_id}, but {js_path.name} never references it. Visible action buttons must be wired or be plain links.",
+                    severity="high",
+                    location=relative_path,
+                    blocking=True,
+                )
+            )
+        return issues
+
+    @staticmethod
+    def _js_references_dom_id(js_source: str, dom_id: str) -> bool:
+        escaped = re.escape(str(dom_id or ""))
+        return bool(
+            re.search(rf"getElementById\(\s*([\"']){escaped}\1\s*\)", js_source)
+            or re.search(rf"querySelector\(\s*([\"'])#{escaped}\1\s*\)", js_source)
+            or re.search(rf"([\"']){escaped}\1", js_source)
+        )
+
+    @staticmethod
+    def _js_references_selector(js_source: str, selector: str) -> bool:
+        text = str(js_source or "")
+        value = str(selector or "").strip()
+        if not value:
+            return False
+        if value in text or value.replace('"', "'") in text:
+            return True
+        attr_match = re.match(r"\[(?P<name>data-[A-Za-z0-9_-]+)(?:=(?P<quote>[\"']?)(?P<value>[^\]\"']+)(?P=quote))?\]", value)
+        return bool(attr_match and attr_match.group("name") in text)
+
+    @staticmethod
+    def _js_has_submit_handler_for_id(js_source: str, dom_id: str) -> bool:
+        if not CheckRunner._js_references_dom_id(js_source, dom_id):
+            return False
+        text = str(js_source or "")
+        return bool(re.search(r"\.addEventListener\(\s*([\"'])submit\1", text) or re.search(r"\bonsubmit\s*=", text))
+
+    @staticmethod
+    def _js_has_submit_handler_for_selector(js_source: str, selector: str) -> bool:
+        if not CheckRunner._js_references_selector(js_source, selector):
+            return False
+        text = str(js_source or "")
+        return bool(re.search(r"\.addEventListener\(\s*([\"'])submit\1", text) or re.search(r"\bonsubmit\s*=", text))
+
+    @staticmethod
+    def _js_reads_form_field(js_source: str, field_name: str) -> bool:
+        escaped = re.escape(str(field_name or ""))
+        return bool(
+            re.search(rf"\.get\(\s*([\"']){escaped}\1\s*\)", js_source)
+            or re.search(rf"\b{escaped}\s*:", js_source)
+            or re.search(rf"\bdata\.{escaped}\b", js_source)
+            or re.search(rf"\b[A-Za-z_$][\w$]*\.{escaped}\b", js_source)
+        )
+
+    @classmethod
+    def _role_css_html_contract_issues(cls, static_root: Path) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        shared_css = cls._try_read_text(static_root / "shared/base.css")
+        for role in ROLE_ORDER:
+            role_dir = static_root / role
+            css_path = role_dir / "styles.css"
+            if not role_dir.exists() or not css_path.exists():
+                continue
+            css_text = cls._try_read_text(css_path)
+            html_text = "\n".join(cls._try_read_text(path) for path in sorted(role_dir.rglob("*.html")))
+            js_text = cls._try_read_text(role_dir / "app.js")
+            html_classes = cls._html_class_names(html_text)
+            css_classes = cls._css_class_selectors(f"{shared_css}\n{css_text}")
+            missing_classes = sorted(
+                class_name
+                for class_name in html_classes
+                if class_name not in css_classes and cls._html_class_requires_explicit_css_rule(class_name, css_classes)
+            )
+            if missing_classes:
+                issues.append(
+                    ValidationIssue(
+                        code="platform.html_class_without_css_rule",
+                        message=(
+                            f"{role} HTML uses classes without CSS rules: {', '.join(missing_classes[:8])}. "
+                            "Balanced/Quality layouts must style root headers, actions, cards, forms, and lists explicitly."
+                        ),
+                        severity="medium",
+                        location=css_path.relative_to(static_root.parents[2]).as_posix(),
+                        blocking=False,
+                    )
+                )
+            role_css_classes = cls._css_class_selectors(css_text)
+            used_classes = html_classes | cls._js_class_names(js_text)
+            if len(role_css_classes) >= 8:
+                used_ratio = len(role_css_classes & used_classes) / max(1, len(role_css_classes))
+                if used_ratio < 0.30:
+                    issues.append(
+                        ValidationIssue(
+                            code="platform.role_css_mostly_unused",
+                            message=f"{role} CSS appears disconnected from HTML/JS: only {used_ratio:.0%} of class rules are used.",
+                            severity="medium",
+                            location=css_path.relative_to(static_root.parents[2]).as_posix(),
+                            blocking=False,
+                        )
+                    )
+            responsive_ok = any(marker in css_text for marker in ("@media", "minmax(", "auto-fit", "auto-fill"))
+            wrap_ok = any(marker in css_text for marker in ("flex-wrap", "min-width: 0", "overflow-x", "word-break")) or (
+                "@media" in css_text and ("flex-direction: column" in css_text or "grid-template-columns: 1fr" in css_text)
+            )
+            if not responsive_ok or not wrap_ok:
+                issues.append(
+                    ValidationIssue(
+                        code="platform.role_css_missing_responsive_guards",
+                        message=f"{role} CSS lacks responsive/wrapping guards for Telegram-width screens.",
+                        severity="medium",
+                        location=css_path.relative_to(static_root.parents[2]).as_posix(),
+                        blocking=False,
+                    )
+                )
+        return issues
+
+    @staticmethod
+    def _html_class_requires_explicit_css_rule(class_name: str, css_classes: set[str]) -> bool:
+        value = str(class_name or "").strip()
+        if not value or value in {"page-shell"}:
+            return False
+        lowered = value.lower()
+        if "--" in lowered:
+            base = lowered.split("--", 1)[0]
+            if base in {item.lower() for item in css_classes}:
+                return False
+        if "__" in lowered:
+            base = lowered.split("__", 1)[0]
+            if base in {item.lower() for item in css_classes}:
+                return False
+        if "-" in lowered:
+            base = lowered.split("-", 1)[0]
+            if base in {item.lower() for item in css_classes}:
+                return False
+        if lowered.endswith(("-page", "-dashboard", "-root", "-home", "-work", "-queue", "-summary")):
+            return False
+        if lowered in {"panel"}:
+            return False
+        if re.match(r"^(?:client|specialist|manager)-(?:root|form|details|dashboard|page|home|work|queue|summary|subtext)$", lowered):
+            return False
+        if lowered in {"muted", "small", "subtle"} or any(marker in lowered for marker in ("eyebrow", "hint", "placeholder")):
+            return False
+        return True
+
+    @staticmethod
+    def _try_read_text(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8") if path.exists() else ""
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _html_class_names(html_source: str) -> set[str]:
+        classes: set[str] = set()
+        for match in re.finditer(r"\bclass\s*=\s*([\"'])(?P<classes>[^\"']+)\1", str(html_source or ""), re.IGNORECASE):
+            classes.update(part.strip() for part in match.group("classes").split() if part.strip())
+        return classes
+
+    @staticmethod
+    def _css_class_selectors(css_source: str) -> set[str]:
+        return {
+            match.group("class")
+            for match in re.finditer(r"\.(?P<class>[A-Za-z_-][A-Za-z0-9_-]*)\b", str(css_source or ""))
+        }
+
+    @staticmethod
+    def _js_class_names(js_source: str) -> set[str]:
+        classes: set[str] = set()
+        for match in re.finditer(r"\bclassName\s*=\s*([\"'`])(?P<classes>[^\"'`]+)\1", str(js_source or "")):
+            classes.update(part.strip() for part in match.group("classes").split() if part.strip())
+        for match in re.finditer(r"\bclassList\.add\((?P<args>[^)]*)\)", str(js_source or "")):
+            for literal in re.finditer(r"([\"'`])(?P<class>[A-Za-z0-9_-]+)\1", match.group("args")):
+                classes.add(literal.group("class"))
+        for match in re.finditer(r"""class\\?=\s*\\?["'](?P<classes>[^"'`<>]+)\\?["']""", str(js_source or "")):
+            classes.update(part.strip().strip("\\") for part in match.group("classes").split() if part.strip().strip("\\"))
+        return classes
 
     @staticmethod
     def _read_role_surface_text(role_dir: Path) -> str:
@@ -813,23 +1223,33 @@ class CheckRunner:
                 post_persistence_failure = diagnostics.get("post_persistence_failure") if isinstance(diagnostics, dict) else None
                 js_path_root = diagnostics.get("js_test_path_root") if isinstance(diagnostics, dict) else None
                 js_url_path_api = diagnostics.get("js_test_url_path_api") if isinstance(diagnostics, dict) else None
+                js_url_text_api = diagnostics.get("js_test_url_text_api") if isinstance(diagnostics, dict) else None
                 server_html_assertion = diagnostics.get("server_rendered_html_assertion") if isinstance(diagnostics, dict) else None
                 static_html_assertion = diagnostics.get("static_html_assertion") if isinstance(diagnostics, dict) else None
                 assertion_source = diagnostics.get("assertion_source") if isinstance(diagnostics, dict) else None
+                template_literal_assertion = diagnostics.get("js_test_unexpanded_template_literal") if isinstance(diagnostics, dict) else None
+                path_id_duplicate = diagnostics.get("path_id_payload_duplicate") if isinstance(diagnostics, dict) else None
                 if isinstance(js_path_root, dict):
                     expected_root = str(js_path_root.get("expected_root") or "").strip()
                     message = expected_root or "Generated JS tests used an invalid miniapp path root."
                 elif isinstance(js_url_path_api, dict):
                     expected_path_api = str(js_url_path_api.get("expected_path_api") or "").strip()
                     message = expected_path_api or "Generated JS tests passed a URL object to a path/fs API."
+                elif isinstance(js_url_text_api, dict):
+                    expected_text_api = str(js_url_text_api.get("expected_text_api") or "").strip()
+                    message = expected_text_api or "Generated JS tests tried to call .text() on a URL object."
                 elif isinstance(server_html_assertion, dict):
                     message = str(server_html_assertion.get("expected_scope") or "").strip() or "Generated Python tests asserted JS-rendered text in server HTML."
                 elif isinstance(static_html_assertion, dict):
                     message = str(static_html_assertion.get("expected_scope") or "").strip() or "Generated JS tests asserted dynamic text only in HTML."
+                elif isinstance(template_literal_assertion, dict):
+                    message = str(template_literal_assertion.get("expected_fix") or "").strip() or "Generated JS test asserted an unexpanded template literal."
                 elif isinstance(assertion_source, dict):
                     line_no = assertion_source.get("line")
                     source_text = str(assertion_source.get("source") or "").strip()
                     message = f"Generated JS test failed at generated_app.test.mjs:{line_no}: {source_text}".strip()
+                elif isinstance(path_id_duplicate, dict):
+                    message = str(path_id_duplicate.get("expected_fix") or "").strip() or "Generated Python test duplicates a path id in PATCH JSON payload."
                 elif isinstance(shared_state_failure, dict):
                     actor = str(shared_state_failure.get("actor") or "").strip()
                     resource_slug = str(shared_state_failure.get("resource_slug") or "").strip()
@@ -864,6 +1284,12 @@ class CheckRunner:
                     table_name = str(sqlite_issue.get("table") or "").strip()
                     if table_name:
                         message = f"Generated app DB schema missing table {table_name}; create tables before TestClient requests run.".strip()
+                elif isinstance(diagnostics.get("python_missing_attribute"), dict):
+                    attr_issue = diagnostics.get("python_missing_attribute") or {}
+                    message = str(attr_issue.get("expected_fix") or "").strip() or "Generated app reads a missing Python/ORM attribute."
+                elif isinstance(diagnostics.get("sqlalchemy_no_foreign_keys"), dict):
+                    relationship_issue = diagnostics.get("sqlalchemy_no_foreign_keys") or {}
+                    message = str(relationship_issue.get("expected_fix") or "").strip() or "Generated SQLAlchemy relationship has no ForeignKey."
                 else:
                     message = next((line for line in reversed(result.logs) if line.strip()), message)
             if result.name in {"preview_boot_smoke", "preview_connectivity_smoke", "browser_flow_smoke"}:
@@ -1298,7 +1724,7 @@ class CheckRunner:
                         code="platform.single_page_role_surface",
                         message=(
                             f"{role} role is too single-page. Generate at least {min_role_route_pages} routeable pages "
-                            f"for this role: /{role} plus at least {min_role_route_pages - 1} domain-specific child pages."
+                            f"for this role: /{role} plus at least {min_role_route_pages - 1} role-relevant child pages."
                         ),
                         severity="high",
                         location=f"miniapp/app/static/{role}",
@@ -2153,8 +2579,13 @@ class CheckRunner:
         if not unsafe_ids:
             return []
         issues: list[ValidationIssue] = []
-        for page_relative_path, _html_source, page_ids in page_sources:
-            missing_ids = sorted(dom_id for dom_id in unsafe_ids if dom_id not in page_ids)
+        for page_relative_path, html_source, page_ids in page_sources:
+            missing_ids = sorted(
+                dom_id
+                for dom_id in unsafe_ids
+                if dom_id not in page_ids
+                and not cls._dom_id_accesses_are_scoped_to_absent_page_guard(js_source, dom_id, html_source, page_ids)
+            )
             if not missing_ids:
                 continue
             issues.append(
@@ -2172,9 +2603,87 @@ class CheckRunner:
             )
         return issues
 
+    @classmethod
+    def _dom_id_accesses_are_scoped_to_absent_page_guard(
+        cls,
+        js_source: str,
+        dom_id: str,
+        html_source: str,
+        page_ids: set[str],
+    ) -> bool:
+        id_bindings = cls._js_dom_id_bindings(js_source)
+        target_vars = {var_name for var_name, bound_id in id_bindings.items() if bound_id == dom_id}
+        if not target_vars:
+            return False
+        guard_bindings = cls._js_dom_selector_bindings(js_source)
+        lines = str(js_source or "").splitlines()
+        saw_access = False
+        for index, line in enumerate(lines):
+            for var_name in target_vars:
+                for match in re.finditer(rf"\b{re.escape(var_name)}\s*\.", line):
+                    prefix = line[: match.start()]
+                    if prefix.rstrip().endswith("?"):
+                        continue
+                    saw_access = True
+                    active_guards = cls._active_absent_dom_guard_variables(
+                        lines,
+                        index,
+                        guard_bindings,
+                        html_source,
+                        page_ids,
+                        ignored_vars={var_name},
+                    )
+                    if not active_guards:
+                        return False
+        return saw_access
+
+    @classmethod
+    def _active_absent_dom_guard_variables(
+        cls,
+        lines: list[str],
+        index: int,
+        guard_bindings: dict[str, tuple[str, str]],
+        html_source: str,
+        page_ids: set[str],
+        *,
+        ignored_vars: set[str] | None = None,
+    ) -> set[str]:
+        ignored = set(ignored_vars or set())
+        active: set[str] = set()
+        for cursor in range(index, -1, -1):
+            line = lines[cursor]
+            for var_name, selector_info in guard_bindings.items():
+                if var_name in ignored or var_name in active:
+                    continue
+                escaped = re.escape(var_name)
+                if not re.search(rf"\bif\s*\(\s*{escaped}\s*\)\s*\{{", line):
+                    if not cls._dom_selector_binding_present_in_html(selector_info, html_source, page_ids):
+                        prefix = "\n".join(lines[max(0, cursor - 12) : index + 1])
+                        if re.search(rf"\bif\s*\(\s*!\s*{escaped}\s*\)\s*(?:\{{\s*)?return\b", prefix):
+                            active.add(var_name)
+                    continue
+                block = "\n".join(lines[cursor : index + 1])
+                if block.count("{") <= block.count("}"):
+                    continue
+                if not cls._dom_selector_binding_present_in_html(selector_info, html_source, page_ids):
+                    active.add(var_name)
+        return active
+
+    @staticmethod
+    def _dom_selector_binding_present_in_html(
+        selector_info: tuple[str, str],
+        html_source: str,
+        page_ids: set[str],
+    ) -> bool:
+        kind, value = selector_info
+        if kind == "id":
+            return value in page_ids
+        return CheckRunner._html_has_simple_selector(html_source, value)
+
     @staticmethod
     def _js_dom_id_bindings(js_source: str) -> dict[str, str]:
         bindings: dict[str, str] = {}
+        ambiguous_vars: set[str] = set()
         pattern = re.compile(
             r"""\b(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*document\.(?:getElementById\(\s*["'](?P<id1>[A-Za-z0-9_-]+)["']\s*\)|querySelector\(\s*["']\#(?P<id2>[A-Za-z0-9_-]+)["']\s*\))""",
             re.DOTALL,
@@ -2182,7 +2691,30 @@ class CheckRunner:
         for match in pattern.finditer(str(js_source or "")):
             dom_id = match.group("id1") or match.group("id2")
             if dom_id:
-                bindings[match.group("var")] = dom_id
+                var_name = match.group("var")
+                if var_name in bindings and bindings[var_name] != dom_id:
+                    ambiguous_vars.add(var_name)
+                    continue
+                bindings[var_name] = dom_id
+        for var_name in ambiguous_vars:
+            bindings.pop(var_name, None)
+        return bindings
+
+    @staticmethod
+    def _js_dom_selector_bindings(js_source: str) -> dict[str, tuple[str, str]]:
+        bindings: dict[str, tuple[str, str]] = {}
+        pattern = re.compile(
+            r"""\b(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*document\.(?:(?:getElementById\(\s*["'](?P<id>[A-Za-z0-9_-]+)["']\s*\))|(?:querySelector\(\s*(?:"(?P<double>[^"]+)"|'(?P<single>[^']+)'|`(?P<backtick>[^`]+)`)\s*\)))""",
+            re.DOTALL,
+        )
+        for match in pattern.finditer(str(js_source or "")):
+            var_name = match.group("var")
+            dom_id = match.group("id")
+            selector = match.group("double") or match.group("single") or match.group("backtick")
+            if dom_id:
+                bindings[var_name] = ("id", dom_id)
+            elif selector:
+                bindings[var_name] = ("selector", selector.strip())
         return bindings
 
     @classmethod
@@ -2253,8 +2785,21 @@ class CheckRunner:
         for match in pattern.finditer(str(js_source or "")):
             dom_id = match.group("id1") or match.group("id2")
             if dom_id:
+                if CheckRunner._direct_dom_id_access_is_guarded(str(js_source or ""), match.start(), dom_id):
+                    continue
                 unsafe.add(dom_id)
         return unsafe
+
+    @staticmethod
+    def _direct_dom_id_access_is_guarded(js_source: str, access_start: int, dom_id: str) -> bool:
+        prefix = str(js_source or "")[max(0, access_start - 500) : access_start]
+        escaped = re.escape(dom_id)
+        return bool(
+            re.search(
+                rf"\bif\s*\([^)]*(?:getElementById\(\s*([\"']){escaped}\1\s*\)|querySelector\(\s*([\"'])#{escaped}\2\s*\))[^)]*\)\s*\{{[\s\S]{{0,240}}$",
+                prefix,
+            )
+        )
 
     @classmethod
     def _html_references_script(cls, html_relative_path: str, html_source: str, script_relative_path: str) -> bool:
@@ -2475,7 +3020,7 @@ class CheckRunner:
                 command=" ".join(command),
                 exit_code=result.returncode,
                 logs=logs,
-                diagnostics=self._extract_generated_app_test_diagnostics(logs),
+                diagnostics=self._extract_generated_app_test_diagnostics(logs, test_file=test_file),
             )
         return RunCheckResult(
             name="generated_app_python_tests",
@@ -2971,6 +3516,42 @@ class CheckRunner:
             if (match := cls._GENERATED_JS_TEST_LOCATION_RE.search(str(line or "")))
         ]
         if generated_js_locations:
+            assertion_failures: list[dict[str, object]] = []
+            if test_file is not None and test_file.exists():
+                try:
+                    source_lines = test_file.read_text(encoding="utf-8").splitlines()
+                except OSError:
+                    source_lines = []
+                seen_lines: set[int] = set()
+                for location in generated_js_locations:
+                    line_no = int(location["line"])
+                    if line_no in seen_lines or not (1 <= line_no <= len(source_lines)):
+                        continue
+                    seen_lines.add(line_no)
+                    assertion_line = source_lines[line_no - 1].strip()
+                    failure: dict[str, object] = {
+                        "file_path": "miniapp/tests/generated_app.test.mjs",
+                        "line": line_no,
+                        "source": assertion_line,
+                    }
+                    literal_match = re.search(r"\.includes\(\s*([\"'`])(?P<literal>.+?)\1\s*\)", assertion_line)
+                    if literal_match:
+                        failure["expected_literal"] = literal_match.group("literal")
+                        if "${" in literal_match.group("literal"):
+                            diagnostics["js_test_unexpanded_template_literal"] = {
+                                "problem": "generated_js_test_asserts_unexpanded_template_literal",
+                                "expected_literal": literal_match.group("literal"),
+                                "expected_fix": (
+                                    "Generated JS tests asserted a quoted string containing `${...}`. Use a template literal/backtick "
+                                    "or construct the expected string before asserting, for example `/static/${role}/app.js` must be evaluated, not quoted literally."
+                                ),
+                            }
+                    regex_match = re.search(r"\.match\(\s*/(?P<literal>[^/]+)/[a-zA-Z]*\s*\)", assertion_line)
+                    if regex_match:
+                        failure["expected_literal"] = regex_match.group("literal")
+                    assertion_failures.append(failure)
+            if assertion_failures:
+                diagnostics["assertion_failures"] = assertion_failures[:4]
             first_location = generated_js_locations[-1]
             diagnostics["failing_test_location"] = {
                 "file_path": "miniapp/tests/generated_app.test.mjs",
@@ -2992,6 +3573,15 @@ class CheckRunner:
                     literal_match = re.search(r"\.includes\(\s*([\"'`])(?P<literal>.+?)\1\s*\)", assertion_line)
                     if literal_match:
                         diagnostics["expected_literal"] = literal_match.group("literal")
+                        if "${" in literal_match.group("literal"):
+                            diagnostics["js_test_unexpanded_template_literal"] = {
+                                "problem": "generated_js_test_asserts_unexpanded_template_literal",
+                                "expected_literal": literal_match.group("literal"),
+                                "expected_fix": (
+                                    "Generated JS tests asserted a quoted string containing `${...}`. Use a template literal/backtick "
+                                    "or construct the expected string before asserting, for example `/static/${role}/app.js` must be evaluated, not quoted literally."
+                                ),
+                            }
                     regex_match = re.search(r"\.match\(\s*/(?P<literal>[^/]+)/[a-zA-Z]*\s*\)", assertion_line)
                     if regex_match:
                         diagnostics["expected_literal"] = regex_match.group("literal")
@@ -3011,6 +3601,41 @@ class CheckRunner:
                         }
                         for index in range(start, end)
                     ]
+        generated_py_locations = [
+            {"line": int(match.group("line"))}
+            for line in logs
+            if (match := cls._GENERATED_PY_TEST_LOCATION_RE.search(str(line or "")))
+        ]
+        if generated_py_locations and test_file is not None and test_file.exists():
+            try:
+                source_lines = test_file.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                source_lines = []
+            py_assertion_failures: list[dict[str, object]] = []
+            seen_lines: set[int] = set()
+            for location in generated_py_locations:
+                line_no = int(location["line"])
+                if line_no in seen_lines or not (1 <= line_no <= len(source_lines)):
+                    continue
+                seen_lines.add(line_no)
+                start = max(0, line_no - 8)
+                end = min(len(source_lines), line_no + 4)
+                py_assertion_failures.append(
+                    {
+                        "file_path": "miniapp/tests/test_generated_app.py",
+                        "line": line_no,
+                        "source": source_lines[line_no - 1].strip(),
+                        "context": [
+                            {"line": index + 1, "source": source_lines[index]}
+                            for index in range(start, end)
+                        ],
+                    }
+                )
+            if py_assertion_failures:
+                diagnostics["python_assertion_failures"] = py_assertion_failures[:3]
+            duplicate_path_id = cls._python_duplicate_path_id_payload_issue("\n".join(source_lines))
+            if duplicate_path_id:
+                diagnostics["path_id_payload_duplicate"] = duplicate_path_id
         stack_excerpt = [str(line or "") for line in logs[-12:] if str(line or "").strip()]
         if stack_excerpt:
             diagnostics["stack_excerpt"] = stack_excerpt
@@ -3028,6 +3653,14 @@ class CheckRunner:
                 "expected_path_api": (
                     "In generated_app.test.mjs, path/fs APIs need strings. Use path.join(process.cwd(), 'app/static/...') "
                     "or fileURLToPath(new URL('../app/static/...', import.meta.url)); never pass a URL object directly to path.resolve/path.join/fs."
+                ),
+            }
+        if any(".text is not a function" in str(line or "") for line in logs) and any("new URL" in str(line or "") for line in logs):
+            diagnostics["js_test_url_text_api"] = {
+                "problem": "generated_js_test_called_text_on_url",
+                "expected_text_api": (
+                    "Generated JS tests cannot call .text() on URL objects. Read files with fs.readFileSync(path, 'utf8') "
+                    "or fs.readFileSync(fileURLToPath(new URL('../app/static/...', import.meta.url)), 'utf8')."
                 ),
             }
         if any("not found in '<!doctype html>" in str(line or "").lower() for line in logs):
@@ -3087,6 +3720,30 @@ class CheckRunner:
                     "column": str(sqlite_match.group("column") or "").strip(),
                 }
                 break
+        if any("NoForeignKeysError" in str(line or "") for line in logs):
+            diagnostics["sqlalchemy_no_foreign_keys"] = {
+                "problem": "relationship_without_foreign_key",
+                "expected_fix": (
+                    "Patch SQLAlchemy models so every relationship has a matching ForeignKey column, or remove relationship()/back_populates "
+                    "and query related status/update rows explicitly. Do not leave relationship('...') between tables without a ForeignKey."
+                ),
+            }
+        for line in reversed(logs):
+            attr_match = cls._PY_MISSING_ATTRIBUTE_RE.search(str(line or ""))
+            if not attr_match:
+                continue
+            object_name = str(attr_match.group("object") or "").strip()
+            attribute = str(attr_match.group("attribute") or "").strip()
+            diagnostics["python_missing_attribute"] = {
+                "object": object_name,
+                "attribute": attribute,
+                "expected_fix": (
+                    f"Generated app reads `{object_name}.{attribute}`, but the model/object has no such attribute. "
+                    "Patch the ORM model, schema, route payload builder, frontend payload, and generated tests so the field names match exactly; "
+                    "do not keep an output field that is not persisted."
+                ),
+            }
+            break
         for line in reversed(logs):
             shared_state_match = cls._SHARED_STATE_UPDATE_RE.search(str(line or ""))
             if not shared_state_match:
@@ -3131,6 +3788,37 @@ class CheckRunner:
             }
             break
         return diagnostics
+
+    @staticmethod
+    def _python_duplicate_path_id_payload_issue(test_source: str) -> dict[str, object] | None:
+        source = str(test_source or "")
+        assignment_pattern = re.compile(
+            r"\b(?P<payload>[A-Za-z_][A-Za-z0-9_]*)\s*\[\s*['\"](?P<field>[A-Za-z_][A-Za-z0-9_]*id)['\"]\s*\]\s*=\s*(?P<idvar>[A-Za-z_][A-Za-z0-9_]*)"
+        )
+        for match in assignment_pattern.finditer(source):
+            payload_var = match.group("payload")
+            field_name = match.group("field")
+            id_var = match.group("idvar")
+            window = source[match.start() : match.end() + 1200]
+            patch_pattern = re.compile(
+                rf"client\.patch\(\s*f?['\"][^'\"]*\{{\s*{re.escape(id_var)}\s*\}}[^'\"]*['\"][\s\S]{{0,500}}json\s*=\s*{re.escape(payload_var)}\b",
+                re.MULTILINE,
+            )
+            if not patch_pattern.search(window):
+                continue
+            line_no = source[: match.start()].count("\n") + 1
+            return {
+                "line": line_no,
+                "payload_var": payload_var,
+                "field": field_name,
+                "id_var": id_var,
+                "expected_fix": (
+                    f"Generated Python tests add `{field_name}` to `{payload_var}` while also sending the id in the PATCH path. "
+                    "For path-id PATCH endpoints, do not duplicate the path id in the JSON body unless the backend patch schema explicitly accepts it; "
+                    "otherwise strict Pydantic schemas return 422."
+                ),
+            }
+        return None
 
     @classmethod
     def _extract_backend_import_diagnostics(cls, logs: list[str]) -> dict[str, object]:

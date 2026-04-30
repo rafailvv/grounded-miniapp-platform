@@ -821,6 +821,383 @@ def test_frontend_interaction_static_smoke_accepts_complete_generic_flow(tmp_pat
     assert result.status == "passed"
 
 
+def test_frontend_interaction_static_smoke_rejects_balanced_html_js_mismatches(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    client_dir = source_dir / "miniapp/app/static/client"
+    specialist_dir = source_dir / "miniapp/app/static/specialist"
+    manager_dir = source_dir / "miniapp/app/static/manager"
+    for directory in (client_dir, specialist_dir, manager_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    client_dir.joinpath("index.html").write_text(
+        "<main class='page-shell' data-role='client'>"
+        "<form id='order-form'><input name='dessert_name'><input name='address'><button type='submit' id='client-submit'>Send</button></form>"
+        "</main>",
+        encoding="utf-8",
+    )
+    client_dir.joinpath("app.js").write_text(
+        "const page = document.querySelector(\".page[data-role='client']\");\n"
+        "const form = document.getElementById('order-form');\n"
+        "form?.addEventListener('submit', (event) => { event.preventDefault(); const formData = new FormData(form); fetch('/api/records', { method: 'POST', body: JSON.stringify({ item: formData.get('item'), address: formData.get('address') }) }); });\n",
+        encoding="utf-8",
+    )
+    specialist_dir.joinpath("index.html").write_text(
+        "<form id='update-form'><input name='record_id'><select name='status'></select><button type='submit'>Save</button></form>",
+        encoding="utf-8",
+    )
+    specialist_dir.joinpath("app.js").write_text(
+        "const form = document.getElementById('status-form');\n"
+        "form?.addEventListener('submit', () => fetch('/api/records/1', { method: 'PATCH', body: JSON.stringify({ status: 'ready' }) }));\n",
+        encoding="utf-8",
+    )
+    manager_dir.joinpath("index.html").write_text(
+        "<form id='oversight-form'><input name='recordId'><input name='note'><button type='submit'>Save</button></form>",
+        encoding="utf-8",
+    )
+    manager_dir.joinpath("app.js").write_text(
+        "const form = document.getElementById('oversight-form');\n"
+        "form?.addEventListener('submit', (event) => { event.preventDefault(); const data = Object.fromEntries(new FormData(form)); fetch('/api/status_updates', { method: 'POST', body: JSON.stringify({ record_id: data.record_id, status: data.status, note: data.note }) }); });\n",
+        encoding="utf-8",
+    )
+    contract = build_acceptance_contract(
+        prompt="Клиент оформляет заказ, специалист меняет статус, менеджер контролирует оплату",
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._frontend_interaction_static_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/app.js"],
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+        acceptance_contract=contract,
+    )
+
+    logs = "\n".join(result.logs)
+    assert result.status == "failed"
+    assert "platform.workflow_selector_matches_no_html" in logs
+    assert "platform.workflow_form_field_not_submitted" in logs
+    assert "platform.workflow_form_without_handler" in logs
+    assert "platform.workflow_formdata_field_mismatch" in logs
+
+
+def test_role_css_html_contract_rejects_unstyled_html_layout_classes(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    client_dir = static_root / "client"
+    client_dir.mkdir(parents=True)
+    client_dir.joinpath("index.html").write_text(
+        "<main class='page-shell'><header class='top actions'><button class='btn primary'>Go</button></header></main>",
+        encoding="utf-8",
+    )
+    client_dir.joinpath("app.js").write_text("", encoding="utf-8")
+    client_dir.joinpath("styles.css").write_text(
+        ".topbar { display: flex; flex-wrap: wrap; }\n"
+        ".actions { display: flex; flex-wrap: wrap; }\n"
+        ".btn { min-width: 0; }\n"
+        ".primary { color: white; }\n"
+        "@media (max-width: 720px) { .actions { flex-direction: column; } }\n",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._role_css_html_contract_issues(static_root)
+
+    assert any(issue.code == "platform.html_class_without_css_rule" and "top" in issue.message for issue in issues)
+    assert all(issue.blocking is False for issue in issues if issue.code == "platform.html_class_without_css_rule")
+
+
+def test_role_css_html_contract_reports_responsive_guard_without_blocking(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    client_dir = static_root / "client"
+    client_dir.mkdir(parents=True)
+    client_dir.joinpath("index.html").write_text(
+        "<main class='page-shell'><section class='orders'><article class='order-card'>A</article></section></main>",
+        encoding="utf-8",
+    )
+    client_dir.joinpath("app.js").write_text("", encoding="utf-8")
+    client_dir.joinpath("styles.css").write_text(
+        ".orders { display: grid; gap: 12px; }\n.order-card { padding: 12px; }\n",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._role_css_html_contract_issues(static_root)
+    responsive_issues = [issue for issue in issues if issue.code == "platform.role_css_missing_responsive_guards"]
+
+    assert responsive_issues
+    assert all(issue.blocking is False for issue in responsive_issues)
+
+
+def test_frontend_selector_diagnostic_does_not_block_dynamic_class_or_data_selectors(tmp_path: Path) -> None:
+    js_path = tmp_path / "source/miniapp/app/static/manager/app.js"
+    js_path.parent.mkdir(parents=True)
+    js_path.write_text("", encoding="utf-8")
+
+    issues = CheckRunner._selector_wiring_issues(
+        "manager",
+        js_path,
+        "document.querySelector('.card-status');\ndocument.querySelector('[data-metrics]');",
+        "<main id='manager-root'></main>",
+    )
+
+    assert {issue.code for issue in issues} == {"platform.workflow_selector_matches_no_html"}
+    assert all(issue.blocking is False for issue in issues)
+
+
+def test_frontend_form_wiring_accepts_data_attribute_form_selector(tmp_path: Path) -> None:
+    js_path = tmp_path / "source/miniapp/app/static/manager/app.js"
+    js_path.parent.mkdir(parents=True)
+    js_path.write_text("", encoding="utf-8")
+    html_source = (
+        "<form id='manager-oversight-form' data-oversight-form>"
+        "<input name='message'><button type='submit'>Save</button></form>"
+    )
+    js_source = (
+        "const root = document.querySelector('[data-page=manager-dashboard]');\n"
+        "const form = root.querySelector('[data-oversight-form]');\n"
+        "form?.addEventListener('submit', (event) => { event.preventDefault(); "
+        "const data = new FormData(form); fetch('/api/status_updates', { method: 'POST', body: JSON.stringify({ message: data.get('message') }) }); });"
+    )
+
+    issues = CheckRunner._form_wiring_issues("miniapp/app/static/manager/index.html", js_path, html_source, js_source)
+
+    assert not any(issue.code == "platform.workflow_form_without_handler" for issue in issues)
+    assert not any(issue.code == "platform.workflow_form_without_submit_handler" for issue in issues)
+
+
+def test_role_css_html_contract_allows_modifiers_and_assistive_copy_classes(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    client_dir = static_root / "client"
+    client_dir.mkdir(parents=True)
+    client_dir.joinpath("index.html").write_text(
+        "<main class='page page--client'><p class='eyebrow'>Client</p><p class='client-status-placeholder'>Empty</p></main>",
+        encoding="utf-8",
+    )
+    client_dir.joinpath("app.js").write_text("", encoding="utf-8")
+    client_dir.joinpath("styles.css").write_text(
+        ".page { min-width: 0; }\n"
+        "@media (max-width: 720px) { .page { padding: 12px; } }\n",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._role_css_html_contract_issues(static_root)
+
+    assert not any(issue.code == "platform.html_class_without_css_rule" for issue in issues)
+
+
+def test_role_css_html_contract_accepts_media_column_responsive_guard(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    client_dir = static_root / "client"
+    client_dir.mkdir(parents=True)
+    client_dir.joinpath("index.html").write_text(
+        "<main class='page-shell client-dashboard'><section class='summary-grid'><article class='summary-card'>A</article></section></main>",
+        encoding="utf-8",
+    )
+    client_dir.joinpath("app.js").write_text("", encoding="utf-8")
+    client_dir.joinpath("styles.css").write_text(
+        ".summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }\n"
+        ".summary-card { padding: 16px; }\n"
+        "@media (max-width: 640px) { .summary-grid { grid-template-columns: 1fr; } }\n",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._role_css_html_contract_issues(static_root)
+
+    assert not any(issue.code == "platform.role_css_missing_responsive_guards" for issue in issues)
+    assert not any(issue.code == "platform.html_class_without_css_rule" for issue in issues)
+
+
+def test_dom_invariant_accepts_page_scoped_guard_for_child_page_ids() -> None:
+    js_source = (
+        "const root = document.querySelector('[data-specialist-root]');\n"
+        "const workRoot = document.querySelector('[data-specialist-work]');\n"
+        "if (workRoot) {\n"
+        "  const log = document.getElementById('specialist-status-log');\n"
+        "  async function refreshLog() {\n"
+        "    log.innerHTML = '<li>ok</li>';\n"
+        "  }\n"
+        "  refreshLog();\n"
+        "}\n"
+        "if (root) { root.classList.add('ready'); }\n"
+    )
+
+    issues = CheckRunner._unchecked_page_dom_issues(
+        "miniapp/app/static/specialist/app.js",
+        js_source,
+        [
+            (
+                "miniapp/app/static/specialist/index.html",
+                "<main data-specialist-root id='specialist-root'></main>",
+                {"specialist-root"},
+            ),
+            (
+                "miniapp/app/static/specialist/work/index.html",
+                "<main data-specialist-work><ul id='specialist-status-log'></ul></main>",
+                {"specialist-status-log"},
+            ),
+        ],
+    )
+
+    assert not issues
+
+
+def test_dom_invariant_accepts_negative_page_root_return_guard() -> None:
+    js_source = (
+        "async function refreshOverviewPanel() {\n"
+        "  const root = document.querySelector('[data-page=\"manager-overview\"]');\n"
+        "  if (!root) {\n"
+        "    return;\n"
+        "  }\n"
+        "  const summary = document.getElementById('overview-record-summary');\n"
+        "  summary.innerHTML = '';\n"
+        "}\n"
+    )
+
+    issues = CheckRunner._unchecked_page_dom_issues(
+        "miniapp/app/static/manager/app.js",
+        js_source,
+        [
+            ("miniapp/app/static/manager/index.html", "<main data-page='manager-dashboard'></main>", set()),
+            (
+                "miniapp/app/static/manager/overview/index.html",
+                "<main data-page='manager-overview'><div id='overview-record-summary'></div></main>",
+                {"overview-record-summary"},
+            ),
+        ],
+    )
+
+    assert not issues
+
+
+def test_dom_invariant_accepts_direct_get_element_guard() -> None:
+    js_source = (
+        "const queueSelect = document.getElementById('specialist-queue');\n"
+        "if (queueSelect && document.getElementById('specialist-status-update')) {\n"
+        "  document.getElementById('specialist-status-update').addEventListener('click', () => {});\n"
+        "}\n"
+    )
+
+    issues = CheckRunner._unchecked_page_dom_issues(
+        "miniapp/app/static/specialist/app.js",
+        js_source,
+        [
+            ("miniapp/app/static/specialist/index.html", "<main></main>", set()),
+            (
+                "miniapp/app/static/specialist/queue/index.html",
+                "<select id='specialist-queue'></select><button id='specialist-status-update'></button>",
+                {"specialist-queue", "specialist-status-update"},
+            ),
+        ],
+    )
+
+    assert not issues
+
+
+def test_dom_invariant_does_not_reuse_duplicate_generic_bindings_across_functions() -> None:
+    js_source = (
+        "function setupMenu() {\n"
+        "  const form = document.querySelector('#menu-item-form');\n"
+        "  if (!form) return;\n"
+        "  form.addEventListener('submit', () => {});\n"
+        "}\n"
+        "function setupReady() {\n"
+        "  const form = document.querySelector('#ready-form');\n"
+        "  if (!form) return;\n"
+        "  form.addEventListener('submit', () => {});\n"
+        "}\n"
+    )
+
+    issues = CheckRunner._unchecked_page_dom_issues(
+        "miniapp/app/static/specialist/app.js",
+        js_source,
+        [
+            ("miniapp/app/static/specialist/queue/index.html", "<form id='ready-form'></form>", {"ready-form"}),
+            ("miniapp/app/static/specialist/index.html", "<form id='menu-item-form'></form>", {"menu-item-form"}),
+        ],
+    )
+
+    assert not issues
+
+
+def test_frontend_wiring_accepts_optional_feedback_and_form_property_reads(tmp_path: Path) -> None:
+    manager_dir = tmp_path / "source/miniapp/app/static/manager"
+    manager_dir.mkdir(parents=True)
+    js_path = manager_dir / "app.js"
+    html_source = (
+        "<form id='manager-oversight-form'>"
+        "<select name='order_id'></select>"
+        "<textarea name='note'></textarea>"
+        "<button type='submit'>Save</button>"
+        "</form>"
+        "<p id='manager-oversight-feedback'></p>"
+    )
+    js_source = (
+        "const feedback = document.querySelector('#manager-orders-feedback');\n"
+        "const form = document.querySelector('#manager-oversight-form');\n"
+        "form?.addEventListener('submit', (event) => {\n"
+        "  event.preventDefault();\n"
+        "  const orderId = form.order_id?.value;\n"
+        "  const note = form.note?.value?.trim();\n"
+        "  fetch('/api/status_updates', { method: 'POST', body: JSON.stringify({ order_id: orderId, detail: note }) });\n"
+        "  feedback && (feedback.textContent = 'Updated');\n"
+        "});\n"
+    )
+    js_path.write_text(js_source, encoding="utf-8")
+
+    selector_issues = CheckRunner._selector_wiring_issues("manager", js_path, js_source, html_source)
+    form_issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/manager/index.html",
+        js_path,
+        html_source,
+        js_source,
+    )
+
+    assert not any(issue.code == "platform.workflow_selector_matches_no_html" for issue in selector_issues)
+    assert not any(issue.code == "platform.workflow_form_field_not_submitted" for issue in form_issues)
+
+
+def test_frontend_wiring_ignores_formdata_api_methods(tmp_path: Path) -> None:
+    client_dir = tmp_path / "source/miniapp/app/static/client"
+    client_dir.mkdir(parents=True)
+    js_path = client_dir / "app.js"
+    html_source = (
+        "<form id='order-form'>"
+        "<input name='dessert'>"
+        "<input name='address'>"
+        "<button type='submit'>Save</button>"
+        "</form>"
+    )
+    js_source = (
+        "const form = document.querySelector('#order-form');\n"
+        "form.addEventListener('submit', (event) => {\n"
+        "  event.preventDefault();\n"
+        "  const data = new FormData(form);\n"
+        "  const payload = Object.fromEntries(data.entries());\n"
+        "  fetch('/api/records', { method: 'POST', body: JSON.stringify(payload) });\n"
+        "});\n"
+    )
+
+    issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/client/request/index.html",
+        js_path,
+        html_source,
+        js_source,
+    )
+
+    assert not any(issue.code == "platform.workflow_formdata_field_mismatch" for issue in issues)
+
+
+def test_js_class_names_include_inner_html_template_classes() -> None:
+    js_source = (
+        "list.innerHTML = records.map((record) => `"
+        "<article class=\\\"order-card status-card\\\">"
+        "<span class='badge badge-success'>${record.status}</span>"
+        "</article>`).join('');"
+    )
+
+    classes = CheckRunner._js_class_names(js_source)
+
+    assert {"order-card", "status-card", "badge", "badge-success"} <= classes
+
+
 def test_frontend_interaction_smoke_accepts_composed_api_base_fetch() -> None:
     text = (
         'const API_BASE = "/api";\n'
@@ -1432,6 +1809,42 @@ def test_generated_tests_explain_server_html_vs_js_rendered_content() -> None:
     assert "page-shell token" in diagnostics["exact_page_shell_tag_assertion"]["expected_fix"]
 
 
+def test_generated_js_test_url_text_failure_is_diagnostic() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "TypeError: (intermediate value).text is not a function",
+            "const content = String(new URL(`file:${clientRoot}`).text());",
+        ]
+    )
+
+    assert diagnostics["js_test_url_text_api"]["problem"] == "generated_js_test_called_text_on_url"
+    assert "fs.readFileSync" in diagnostics["js_test_url_text_api"]["expected_text_api"]
+
+
+def test_generated_python_no_foreign_keys_failure_is_diagnostic() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "sqlalchemy.exc.NoForeignKeysError: Could not determine join condition between parent/child tables on relationship Record.updates - there are no foreign keys linking these tables.",
+        ]
+    )
+
+    assert diagnostics["sqlalchemy_no_foreign_keys"]["problem"] == "relationship_without_foreign_key"
+    assert "ForeignKey" in diagnostics["sqlalchemy_no_foreign_keys"]["expected_fix"]
+
+
+def test_generated_python_missing_attribute_failure_is_diagnostic() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "AttributeError: 'Record' object has no attribute 'special_instructions'",
+        ]
+    )
+
+    issue = diagnostics["python_missing_attribute"]
+    assert issue["object"] == "Record"
+    assert issue["attribute"] == "special_instructions"
+    assert "field names match exactly" in issue["expected_fix"]
+
+
 def test_generated_js_test_failure_reports_assertion_source(tmp_path: Path) -> None:
     test_file = tmp_path / "generated_app.test.mjs"
     test_file.write_text(
@@ -1458,6 +1871,34 @@ def test_generated_js_test_failure_reports_assertion_source(tmp_path: Path) -> N
     assert diagnostics["failing_test_location"]["line"] == 4
     assert diagnostics["assertion_source"]["source"] == 'assert(insightsHtml.includes("voice-first devices"));'
     assert diagnostics["expected_literal"] == "voice-first devices"
+
+
+def test_generated_js_test_unexpanded_template_literal_is_diagnostic(tmp_path: Path) -> None:
+    test_file = tmp_path / "generated_app.test.mjs"
+    test_file.write_text(
+        "\n".join(
+            [
+                'import test from "node:test";',
+                'import assert from "node:assert";',
+                'test("role script", () => {',
+                '  assert.ok(content.includes("/static/${role}/app.js"));',
+                "});",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "AssertionError [ERR_ASSERTION]: role page must load its own scripts",
+            "at TestContext.<anonymous> (file:///workspace/miniapp/tests/generated_app.test.mjs:4:10)",
+        ],
+        test_file=test_file,
+    )
+
+    issue = diagnostics["js_test_unexpanded_template_literal"]
+    assert issue["problem"] == "generated_js_test_asserts_unexpanded_template_literal"
+    assert "${role}" in issue["expected_literal"]
 
 
 def test_generated_js_test_failure_prefers_assertion_stack_location_and_regex_literal(tmp_path: Path) -> None:
@@ -1502,6 +1943,69 @@ def test_generated_post_persistence_failure_is_diagnostic() -> None:
 
     assert diagnostics["post_persistence_failure"]["path"] == "/api/orders"
     assert diagnostics["post_persistence_failure"]["resource_slug"] == "orders"
+
+
+def test_generated_python_failure_includes_test_source_context(tmp_path: Path) -> None:
+    test_file = tmp_path / "test_generated_app.py"
+    test_file.write_text(
+        "\n".join(
+            [
+                "import unittest",
+                "class Generated(unittest.TestCase):",
+                "    def test_create(self):",
+                "        payload = {'dessert_name': 'Торт'}",
+                "        response = client.post('/api/records', json=payload)",
+                "        self.assertIn(response.status_code, {200, 201})",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            '  File "/tmp/miniapp/tests/test_generated_app.py", line 6, in test_create',
+            "    self.assertIn(response.status_code, {200, 201})",
+            "AssertionError: 422 not found in {200, 201}",
+        ],
+        test_file=test_file,
+    )
+
+    failure = diagnostics["python_assertion_failures"][0]
+    assert failure["line"] == 6
+    assert "payload" in "\n".join(item["source"] for item in failure["context"])
+
+
+def test_generated_python_failure_diagnoses_duplicate_path_id_payload(tmp_path: Path) -> None:
+    test_file = tmp_path / "test_generated_app.py"
+    test_file.write_text(
+        "\n".join(
+            [
+                "import unittest",
+                "class Generated(unittest.TestCase):",
+                "    def test_update(self):",
+                "        patch_record_payload = {'status': 'ready'}",
+                "        order_id = 1",
+                "        patch_record_payload['record_id'] = order_id",
+                "        patch_resp = client.patch(f'/api/records/{order_id}', json=patch_record_payload)",
+                "        self.assertTrue(200 <= patch_resp.status_code < 300)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            '  File "/tmp/miniapp/tests/test_generated_app.py", line 8, in test_update',
+            "    self.assertTrue(200 <= patch_resp.status_code < 300)",
+            "AssertionError: False is not true",
+        ],
+        test_file=test_file,
+    )
+
+    duplicate = diagnostics["path_id_payload_duplicate"]
+    assert duplicate["field"] == "record_id"
+    assert duplicate["payload_var"] == "patch_record_payload"
+    assert "do not duplicate" in duplicate["expected_fix"]
 
 
 def test_preview_ready_probes_all_role_roots(monkeypatch) -> None:

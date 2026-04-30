@@ -1,11 +1,120 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.models.common import GenerationMode
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
+GENERIC_RESOURCE_DEFAULTS = ("records", "updates", "summaries")
+PROMPT_RESOURCE_STOPWORDS = {
+    "about",
+    "action",
+    "actions",
+    "address",
+    "after",
+    "application",
+    "available",
+    "button",
+    "client",
+    "create",
+    "daily",
+    "dashboard",
+    "date",
+    "details",
+    "form",
+    "manager",
+    "mini",
+    "miniapp",
+    "owner",
+    "records",
+    "request",
+    "requests",
+    "role",
+    "roles",
+    "small",
+    "specialist",
+    "status",
+    "submit",
+    "through",
+    "update",
+    "updates",
+    "visible",
+    "workflow",
+    "workflows",
+    "want",
+    "with",
+    "адрес",
+    "вводить",
+    "видел",
+    "видеть",
+    "владелец",
+    "возможность",
+    "выбирать",
+    "добавлять",
+    "должен",
+    "должна",
+    "должны",
+    "заявка",
+    "заявки",
+    "информация",
+    "клиент",
+    "кнопка",
+    "которые",
+    "менеджер",
+    "мини",
+    "небольшой",
+    "нужно",
+    "оформлять",
+    "отмечать",
+    "приложение",
+    "сделать",
+    "смотреть",
+    "специалист",
+    "статус",
+    "статусы",
+    "удобно",
+    "форма",
+    "хочу",
+}
+CYRILLIC_TRANSLIT = str.maketrans(
+    {
+        "а": "a",
+        "б": "b",
+        "в": "v",
+        "г": "g",
+        "д": "d",
+        "е": "e",
+        "ё": "e",
+        "ж": "zh",
+        "з": "z",
+        "и": "i",
+        "й": "y",
+        "к": "k",
+        "л": "l",
+        "м": "m",
+        "н": "n",
+        "о": "o",
+        "п": "p",
+        "р": "r",
+        "с": "s",
+        "т": "t",
+        "у": "u",
+        "ф": "f",
+        "х": "h",
+        "ц": "ts",
+        "ч": "ch",
+        "ш": "sh",
+        "щ": "sch",
+        "ъ": "",
+        "ы": "y",
+        "ь": "",
+        "э": "e",
+        "ю": "yu",
+        "я": "ya",
+    }
+)
 
 WORKFLOW_EDIT_MARKERS = (
     "after adding",
@@ -14,7 +123,6 @@ WORKFLOW_EDIT_MARKERS = (
     "doesn't load",
     "form",
     "list",
-    "order",
     "refresh",
     "should appear",
     "не подгружается",
@@ -31,6 +139,32 @@ WORKFLOW_EDIT_MARKERS = (
     "во всех трех",
     "во всех трёх",
 )
+
+
+def _slug_from_prompt_token(token: str) -> str:
+    lowered = str(token or "").strip().lower().translate(CYRILLIC_TRANSLIT)
+    slug = re.sub(r"[^a-z0-9_]+", "_", lowered).strip("_")
+    slug = re.sub(r"_+", "_", slug)
+    if slug and slug[0].isdigit():
+        slug = f"item_{slug}"
+    return slug
+
+
+def prompt_resource_candidates(prompt: str, *, limit: int = 3) -> list[str]:
+    """Extract prompt-derived resource slugs without assuming a business domain."""
+    candidates: list[str] = []
+    for token in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{2,}", str(prompt or "")):
+        normalized = token.strip().lower().replace("ё", "е")
+        if normalized in PROMPT_RESOURCE_STOPWORDS:
+            continue
+        slug = _slug_from_prompt_token(normalized)
+        if len(slug) < 3 or slug in PROMPT_RESOURCE_STOPWORDS or slug in ROLE_ORDER:
+            continue
+        if slug not in candidates:
+            candidates.append(slug)
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 def normalized_generation_mode(generation_mode: GenerationMode | str | None) -> str:
     return str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
@@ -53,7 +187,7 @@ def is_behavior_workflow_prompt(prompt: str) -> bool:
     )
     if any(marker in text for marker in strong_markers):
         return True
-    broad_flow_terms = ("button", "form", "list", "record", "order", "кнопк", "форма", "список", "запис", "заказ")
+    broad_flow_terms = ("button", "form", "list", "record", "кнопк", "форма", "список", "запис", "заказ")
     if any(marker in text for marker in broad_flow_terms) and any(
         marker in text
         for marker in (
@@ -143,7 +277,11 @@ def build_acceptance_contract(
         }
 
     resource_count = 3 if mode_value == GenerationMode.QUALITY.value else 2 if mode_value == GenerationMode.BALANCED.value else 1
-    endpoint_resources = ["records", "status_updates", "summaries"][:resource_count]
+    prompt_resources = prompt_resource_candidates(prompt, limit=resource_count)
+    endpoint_resources = [
+        *prompt_resources,
+        *[resource for resource in GENERIC_RESOURCE_DEFAULTS if resource not in prompt_resources],
+    ][:resource_count]
     flows: list[dict[str, Any]] = [
         {
             "id": "role_shared_persistence",
@@ -181,8 +319,6 @@ def build_acceptance_contract(
         {"resource": resource, "path": f"/api/{resource}", "methods": ["GET", "POST", "PATCH"]}
         for resource in endpoint_resources
     ]
-    required_buttons = ["client-submit", "specialist-status-update", "manager-oversight"]
-
     return {
         "required": True,
         "intent": intent_value,
@@ -194,9 +330,14 @@ def build_acceptance_contract(
             "refresh_persistence": True,
             "status_update": True,
             "resource_count": resource_count,
+            "prompt_resource_candidates": prompt_resources,
         },
         "required_endpoints": required_endpoints,
-        "required_buttons": required_buttons,
+        "required_controls": [
+            {"role": "client", "action": "submit a prompt-derived create/request form through POST"},
+            {"role": "specialist", "action": "process or update saved work through POST/PATCH"},
+            {"role": "manager", "action": "review shared state and trigger an oversight/status action"},
+        ],
         "flows": flows,
         "test_requirements": [item for flow in flows for item in flow.get("required_tests", [])],
     }

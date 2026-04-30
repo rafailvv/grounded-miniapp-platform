@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from app.models.common import GenerationMode, PreviewProfile, StrictModel, TargetPlatform
 
@@ -477,13 +477,12 @@ class CodeChangePlan(StrictModel):
 
 
 class RunChecksSummary(StrictModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True, use_enum_values=True)
+
     validators: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
     build: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
     preview: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
     gate_status: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
-    followup_status: Literal["pending", "passed", "failed", "blocked", "skipped"] = "pending"
-    followup_run_id: str | None = None
-    auto_fix_status: Literal["pending", "passed", "failed", "blocked", "skipped"] = "skipped"
     issues: list[dict[str, Any]] = Field(default_factory=list)
 
 

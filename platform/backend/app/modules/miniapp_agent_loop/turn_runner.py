@@ -87,6 +87,12 @@ class WorkspaceLoopTurnRunner:
             return f"Generation time budget exhausted: {elapsed_ms}/{time_limit_ms} ms."
         return "Generation budget exhausted before strict-green completion."
 
+    @staticmethod
+    def _apply_conflict_required_next_action(repeated_conflict_count: int) -> str:
+        if repeated_conflict_count >= 2:
+            return "Return full-file replace operations for only the conflicted files."
+        return "Return corrected operations for the conflicted files."
+
     def run(
         self,
         *,
@@ -118,6 +124,7 @@ class WorkspaceLoopTurnRunner:
         repeated_no_progress = 0
         context_mode: LoopContextMode = "minimal"
         last_turn_summary: str | None = None
+        apply_conflict_counts: dict[tuple[str, ...], int] = {}
         full_bundle_no_progress_limit = 1 if generation_mode == GenerationMode.FAST else 3 if generation_mode == GenerationMode.QUALITY else self.MAX_FULL_BUNDLE_NO_PROGRESS
 
         for attempt in range(max_attempts + 1):
@@ -587,6 +594,14 @@ class WorkspaceLoopTurnRunner:
             )
             if apply_result.status != "applied":
                 if attempt < max_attempts:
+                    conflict_files = tuple(sorted(operation.file_path for operation in synced_operations if str(operation.file_path or "").strip()))
+                    apply_conflict_counts[conflict_files] = apply_conflict_counts.get(conflict_files, 0) + 1
+                    repeated_conflict_count = apply_conflict_counts[conflict_files]
+                    repeated_conflict_instruction = (
+                        " This same file set has failed to apply at least twice; return full-file replace operations for only the conflicted files with complete resulting file content, and do not return another hunk patch."
+                        if repeated_conflict_count >= 2
+                        else ""
+                    )
                     latest_operations = list(synced_operations)
                     latest_files_read = list(plan.files_read)
                     latest_assistant_message = plan.assistant_message or plan.diagnosis or latest_assistant_message
@@ -594,6 +609,7 @@ class WorkspaceLoopTurnRunner:
                         f"Previous patch did not apply: {apply_result.conflict_reason or apply_result.status}. "
                         "Return corrected operations. If a hunk patch was rejected, prefer replace with full resulting file content "
                         "for the conflicted file instead of repeating another approximate hunk."
+                        f"{repeated_conflict_instruction}"
                     )
                     turn_history[-1]["result"] = "apply_conflict"
                     turn_history[-1]["apply_error"] = apply_result.conflict_reason or apply_result.status
@@ -606,6 +622,8 @@ class WorkspaceLoopTurnRunner:
                             "status": apply_result.status,
                             "conflict_reason": apply_result.conflict_reason,
                             "files": [operation.file_path for operation in synced_operations],
+                            "repeated_conflict_count": repeated_conflict_count,
+                            "required_next_action": self._apply_conflict_required_next_action(repeated_conflict_count),
                         },
                     )
                     callbacks.append_trace(

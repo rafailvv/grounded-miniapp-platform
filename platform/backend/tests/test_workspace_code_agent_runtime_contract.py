@@ -40,7 +40,7 @@ def test_agent_prompt_declares_run_checks_read_only() -> None:
     assert "client, specialist, and manager" in prompt
     assert "three separate role apps" in prompt
     assert "Create tasks must be multi-page" in prompt
-    assert "Fast requires at least one domain-specific child page per role" in prompt
+    assert "Fast and Balanced require at least one prompt-specific child page per role" in prompt
     assert "static/client/styles.css" in prompt
     assert "placeholder CSS" in prompt
     assert "route_manifest.json" in prompt
@@ -378,7 +378,11 @@ def test_acceptance_contract_captures_generic_workflow_and_orchestration() -> No
     assert "commerce_catalog_cart_order" not in contract["features"]
     assert not any(flow["id"] == "commerce_catalog_cart_order" for flow in contract["flows"])
     assert any(flow["id"] == "related_resource_workflow" for flow in contract["flows"])
-    assert {item["resource"] for item in contract["required_endpoints"]} == {"records", "status_updates"}
+    resources = {item["resource"] for item in contract["required_endpoints"]}
+    assert resources != {"records", "status_updates"}
+    assert contract["features"]["prompt_resource_candidates"]
+    assert "required_buttons" not in contract
+    assert [item["role"] for item in contract["required_controls"]] == ["client", "specialist", "manager"]
     assert orchestration["enabled"] is True
     assert [phase["id"] for phase in orchestration["phases"]] == [
         "spec_extract",
@@ -653,8 +657,10 @@ def test_fast_parallel_blueprint_uses_generic_role_pages() -> None:
     workers = WorkspaceCodeAgentRuntime._fast_parallel_workers(blueprint)
 
     assert "commerce_flow" not in blueprint
-    assert blueprint["role_files"]["client"]["child"] == "miniapp/app/static/client/request/index.html"
-    assert blueprint["role_files"]["specialist"]["child"] == "miniapp/app/static/specialist/queue/index.html"
+    assert blueprint["role_files"]["client"]["child"].startswith("miniapp/app/static/client/")
+    assert blueprint["role_files"]["client"]["child"] != "miniapp/app/static/client/request/index.html"
+    assert blueprint["role_files"]["specialist"]["child"].startswith("miniapp/app/static/specialist/")
+    assert blueprint["role_files"]["specialist"]["child"] != "miniapp/app/static/specialist/queue/index.html"
     assert {worker["worker"] for worker in workers} == {
         "backend_api",
         "client_ui",
@@ -723,6 +729,108 @@ def update_order(order_id: str):
     assert WorkspaceCodeAgentRuntime._api_resource_stems(source) == {"products", "orders"}
 
 
+def test_create_patch_coverage_keeps_existing_content_for_repair_patch() -> None:
+    request = GenerateRequest(prompt="Create a bakery app", intent="create", generation_mode=GenerationMode.BALANCED)
+    required_paths = {
+        "miniapp/app/static/client/index.html",
+        "miniapp/app/static/client/request/index.html",
+        "miniapp/app/static/client/app.js",
+        "miniapp/app/static/client/styles.css",
+        "miniapp/app/static/specialist/index.html",
+        "miniapp/app/static/specialist/queue/index.html",
+        "miniapp/app/static/specialist/app.js",
+        "miniapp/app/static/specialist/styles.css",
+        "miniapp/app/static/manager/index.html",
+        "miniapp/app/static/manager/overview/index.html",
+        "miniapp/app/static/manager/app.js",
+        "miniapp/app/static/manager/styles.css",
+        "miniapp/app/generated/route_manifest.json",
+        "miniapp/app/main.py",
+        "miniapp/app/routes/app_api.py",
+        "miniapp/tests/test_generated_app.py",
+        "miniapp/tests/generated_app.test.mjs",
+    }
+    existing_text = {
+        "miniapp/app/static/client/index.html": '<link rel="stylesheet" href="/static/client/styles.css"><form></form>',
+        "miniapp/app/static/specialist/index.html": '<link rel="stylesheet" href="/static/specialist/styles.css">',
+        "miniapp/app/static/manager/index.html": '<link rel="stylesheet" href="/static/manager/styles.css">',
+        "miniapp/app/routes/app_api.py": (
+            "from fastapi import APIRouter\n"
+            "router = APIRouter(prefix='/api')\n"
+            "@router.get('/records')\n"
+            "def list_records(): return []\n"
+            "@router.post('/records')\n"
+            "def create_record(): return {}\n"
+            "@router.patch('/records/{record_id}')\n"
+            "def patch_record(record_id: int): return {}\n"
+            "@router.get('/status_updates')\n"
+            "def list_status_updates(): return []\n"
+        ),
+        "miniapp/app/static/client/app.js": "fetch('/api/records', { method: 'POST' });",
+        "miniapp/app/static/specialist/app.js": "fetch('/api/records/1', { method: 'PATCH' });",
+        "miniapp/tests/test_generated_app.py": (
+            "import unittest\n"
+            "class GeneratedAppTest(unittest.TestCase):\n"
+            "    def test_flow(self):\n"
+            "        client.get('/api/records'); client.post('/api/records'); client.patch('/api/records/1')\n"
+        ),
+    }
+
+    missing = WorkspaceCodeAgentRuntime._create_patch_coverage_gap(
+        [
+            DraftFileOperation(
+                file_path="miniapp/tests/test_generated_app.py",
+                operation="patch",
+                diff="@@\n-        client.patch('/api/records/1')\n+        client.patch('/api/records/1')\n",
+                reason="repair generated test assertion",
+            )
+        ],
+        request=request,
+        existing_paths=required_paths,
+        existing_text_by_path=existing_text,
+    )
+
+    assert "miniapp/tests/test_generated_app.py API persistence coverage" not in missing
+    assert "miniapp/tests/test_generated_app.py unittest.TestCase coverage" not in missing
+    assert "miniapp/tests/test_generated_app.py API status/update coverage" not in missing
+
+
+def test_repair_context_targets_traceback_file_paths() -> None:
+    execution = CheckExecutionRecord(
+        workspace_id="ws",
+        run_id="run",
+        results=[
+            RunCheckResult(
+                name="changed_files_static",
+                status="failed",
+                details="Backend import smoke failed.",
+                logs=[
+                    '  File "/tmp/workspace/source/miniapp/app/db.py", line 16, in <module>',
+                    "NameError: name 'create_engine' is not defined",
+                ],
+            )
+        ],
+    )
+
+    paths = WorkspaceCodeAgentRuntime._target_files_from_execution(execution)
+
+    assert "miniapp/app/db.py" in paths
+
+
+def test_repeated_apply_conflict_requires_full_file_replace() -> None:
+    assert WorkspaceLoopTurnRunner._apply_conflict_required_next_action(1) == "Return corrected operations for the conflicted files."
+    assert WorkspaceLoopTurnRunner._apply_conflict_required_next_action(2) == "Return full-file replace operations for only the conflicted files."
+
+
+def test_agent_turn_schema_can_force_replace_only_operations() -> None:
+    schema = WorkspaceCodeAgentRuntime._agent_turn_schema(allowed_operations=["replace"], operation_limit=1)
+
+    operation_schema = schema["properties"]["operations"]["items"]["properties"]["operation"]
+
+    assert operation_schema["enum"] == ["replace"]
+    assert schema["properties"]["operations"]["maxItems"] == 1
+
+
 def test_generated_test_failures_seed_backend_and_role_context_for_repair() -> None:
     execution = CheckExecutionRecord(
         workspace_id="ws",
@@ -737,7 +845,10 @@ def test_generated_test_failures_seed_backend_and_role_context_for_repair() -> N
             RunCheckResult(
                 name="generated_app_js_tests",
                 status="failed",
-                logs=["Client submit control missing"],
+                logs=[
+                    "Client submit control missing in readStatic(\"client/index.html\")",
+                    "actual: 'const role = \"manager\";'",
+                ],
             ),
         ],
     )
@@ -750,6 +861,42 @@ def test_generated_test_failures_seed_backend_and_role_context_for_repair() -> N
     assert "miniapp/tests/generated_app.test.mjs" in targets
     assert "miniapp/app/static/client/index.html" in targets
     assert "miniapp/app/static/manager/app.js" in targets
+    assert "miniapp/app/static/specialist/index.html" not in targets
+
+
+def test_workflow_slice_repair_detects_connected_check_failures() -> None:
+    execution = CheckExecutionRecord(
+        workspace_id="ws",
+        run_id="run",
+        changed_files=[],
+        results=[
+            RunCheckResult(
+                name="connectivity_validators",
+                status="failed",
+                logs=["missing backend route"],
+            ),
+            RunCheckResult(
+                name="frontend_interaction_static_smoke",
+                status="failed",
+                logs=["form missing handler", "button missing handler"],
+            ),
+            RunCheckResult(
+                name="generated_app_js_tests",
+                status="failed",
+                logs=["stale literal assertion"],
+            ),
+        ],
+    )
+
+    assert WorkspaceCodeAgentRuntime._workflow_slice_repair_needed(execution)
+    rules = WorkspaceCodeAgentRuntime._compact_repair_rules(
+        generation_mode=GenerationMode.BALANCED,
+        focused_edit_kind="",
+        workflow_slice_repair=True,
+    )
+    joined = "\n".join(rules)
+    assert "connected workflow slice" in joined
+    assert "Never satisfy a generated test by adding one role's app script to another role page" in joined
 
 
 def test_provider_quota_errors_are_classified_as_terminal_platform_blockers() -> None:
@@ -867,11 +1014,11 @@ def test_parallel_mode_contracts_make_fast_balanced_quality_different() -> None:
         for mode in contracts
     }
 
-    assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.FAST) == 4
-    assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.BALANCED) == 5
-    assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.QUALITY) == 7
+    assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.FAST) == 10
+    assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.BALANCED) == 14
+    assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.QUALITY) == 18
     assert blueprints[GenerationMode.FAST]["required_child_pages_per_role"] == 1
-    assert blueprints[GenerationMode.BALANCED]["required_child_pages_per_role"] == 2
+    assert blueprints[GenerationMode.BALANCED]["required_child_pages_per_role"] == 1
     assert blueprints[GenerationMode.QUALITY]["required_child_pages_per_role"] == 3
     assert blueprints[GenerationMode.FAST]["mode_contract"]["design_level"] != blueprints[GenerationMode.BALANCED]["mode_contract"]["design_level"]
     assert blueprints[GenerationMode.BALANCED]["mode_contract"]["design_level"] != blueprints[GenerationMode.QUALITY]["mode_contract"]["design_level"]
@@ -1015,8 +1162,8 @@ def test_create_patch_coverage_rejects_contextmanager_fastapi_dependency() -> No
     assert "backend FastAPI generator dependency without @contextmanager" in missing
 
 
-def test_balanced_create_patch_coverage_requires_two_child_pages_per_role() -> None:
-    request = GenerateRequest(prompt="Create a store", intent="create", generation_mode=GenerationMode.BALANCED)
+def test_quality_create_patch_coverage_requires_deeper_child_pages_per_role() -> None:
+    request = GenerateRequest(prompt="Create a store", intent="create", generation_mode=GenerationMode.QUALITY)
 
     def op(path: str) -> DraftFileOperation:
         return DraftFileOperation(file_path=path, operation="replace", content="<html></html>", reason="test")
@@ -1049,9 +1196,9 @@ def test_balanced_create_patch_coverage_requires_two_child_pages_per_role() -> N
 
     missing = WorkspaceCodeAgentRuntime._create_patch_coverage_gap(operations, request=request)
 
-    assert "miniapp/app/static/client/<two-child-pages>/index.html" in missing
-    assert "miniapp/app/static/specialist/<two-child-pages>/index.html" in missing
-    assert "miniapp/app/static/manager/<two-child-pages>/index.html" in missing
+    assert "miniapp/app/static/client/<three-child-pages>/index.html" in missing
+    assert "miniapp/app/static/specialist/<three-child-pages>/index.html" in missing
+    assert "miniapp/app/static/manager/<three-child-pages>/index.html" in missing
 
 
 def test_fix_completion_requires_meaningful_diff_even_when_checks_are_green() -> None:
@@ -1110,7 +1257,7 @@ def test_completion_budgets_are_time_and_token_based() -> None:
     assert balanced_budget["token_limit"] == 1_200_000
     assert quality_budget["time_limit_ms"] == 45 * 60 * 1000
     assert quality_budget["token_limit"] == 2_500_000
-    assert WorkspaceCodeAgentRuntime._max_attempts(GenerationMode.FAST) >= 100
+    assert WorkspaceCodeAgentRuntime._max_attempts(GenerationMode.FAST) >= 50
 
 
 def test_terminal_failure_progress_is_100_for_ui_status_separation() -> None:
@@ -1127,6 +1274,7 @@ def test_run_save_preserves_live_token_usage_and_keeps_terminal_failure_at_100(t
         intent="create",
         status="running",
         token_usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15, "turn_count": 1},
+        budget_status={"total_tokens": 0, "token_limit": 600_000, "exhausted": False},
         linked_job_id="job_live",
     )
     service._save_run(run)
@@ -1148,6 +1296,7 @@ def test_run_save_preserves_live_token_usage_and_keeps_terminal_failure_at_100(t
     assert saved.linked_job_id == "job_live"
     assert saved.token_usage["total_tokens"] == 15
     assert saved.token_usage["turn_count"] == 1
+    assert saved.budget_status["total_tokens"] == 15
 
 
 def test_stale_run_recovery_retains_nonempty_draft_for_resume(tmp_path) -> None:
@@ -1229,101 +1378,6 @@ def test_completed_source_run_closes_stale_resume_checkpoint_without_duplicate_r
     assert checkpoint["status"] == "completed"
     assert checkpoint["completed_by_run_id"] == "run_source"
     assert checkpoint["completion_reason"] == "source_run_completed_applied"
-
-
-def test_noop_loop_failure_can_finish_from_green_source() -> None:
-    job = SimpleNamespace(
-        failure_class=None,
-        failure_signature="workspace_loop_failure",
-        summary="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
-        failure_reason="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
-        root_cause_summary=None,
-        remaining_issues=[],
-    )
-
-    assert RunService._is_noop_loop_failure(job)
-
-
-def test_repeated_noop_failure_completes_when_current_source_is_green(tmp_path) -> None:
-    class FakeWorkspaceService:
-        discarded = False
-
-        def source_dir(self, workspace_id: str):
-            assert workspace_id == "ws"
-            return tmp_path
-
-        def draft_exists(self, workspace_id: str, run_id: str) -> bool:
-            assert workspace_id == "ws"
-            assert run_id == "run_noop"
-            return True
-
-        def discard_draft(self, workspace_id: str, run_id: str) -> None:
-            assert workspace_id == "ws"
-            assert run_id == "run_noop"
-            self.discarded = True
-
-    class FakeCheckRunner:
-        def run(self, **kwargs) -> CheckExecutionRecord:
-            assert kwargs["workspace_id"] == "ws"
-            assert kwargs["run_id"] == "run_noop"
-            assert kwargs["changed_files"] == []
-            return CheckExecutionRecord(
-                workspace_id="ws",
-                run_id="run_noop",
-                results=[
-                    RunCheckResult(name="schema_validators", status="passed"),
-                    RunCheckResult(name="connectivity_validators", status="passed"),
-                    RunCheckResult(name="changed_files_static", status="passed"),
-                    RunCheckResult(
-                        name="platform_invariants",
-                        status="passed",
-                        diagnostics={
-                            "role_coverage": {"client": {"status": "present"}},
-                            "generated_tests": {"python": {"status": "present"}},
-                            "neutral_template_findings": [],
-                        },
-                    ),
-                ],
-            )
-
-    service = object.__new__(RunService)
-    service.store = StateStore(tmp_path / "state.json")
-    service.workspace_service = FakeWorkspaceService()
-    service.check_runner = FakeCheckRunner()
-    service.preview_service = SimpleNamespace(get=lambda workspace_id: SimpleNamespace(status="healthy"))
-    service.workspace_log_service = SimpleNamespace(append=lambda *args, **kwargs: None)
-    job = JobRecord(
-        job_id="job_noop",
-        workspace_id="ws",
-        prompt="Create shop",
-        target_platform=TargetPlatform.TELEGRAM,
-        preview_profile=PreviewProfile.TELEGRAM_MOCK,
-        status="failed",
-        failure_signature="workspace_loop_failure",
-        summary="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
-        failure_reason="Workspace loop stopped after repeated failure signatures despite expanded-context and full-bundle retries.",
-    )
-    service.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
-    run = RunRecord(
-        run_id="run_noop",
-        workspace_id="ws",
-        prompt="Create shop",
-        intent="create",
-        status="failed",
-        apply_status="failed",
-        linked_job_id=job.job_id,
-        target_role_scope=["client", "specialist", "manager"],
-    )
-
-    completed = service._complete_blocked_noop_run_from_green_source(run=run, job=job, meaningful_paths=[])
-
-    assert completed
-    assert run.status == "completed"
-    assert run.apply_status == "noop"
-    assert run.failure_reason is None
-    assert service.workspace_service.discarded
-    saved_job = service.store.get("jobs", job.job_id)
-    assert saved_job["events"][-1]["details"]["reason"] == "green_source_noop"
 
 
 def test_preview_refresh_progress_does_not_step_back_from_99() -> None:
@@ -1802,8 +1856,10 @@ def test_output_cap_correction_for_create_requires_compact_patch() -> None:
     )
 
     assert correction["tool"] == "output_cap_correction"
-    assert "no more than 12 concise file operations" in str(correction["required_next_action"])
-    assert "backend API route module with GET/POST persistence" in str(correction["required_next_action"])
+    assert "no more than 2 operations" in str(correction["required_next_action"])
+    assert "touch only the first concrete failed files/checks" in str(correction["required_next_action"])
+    assert "no more than 10 concise file operations" in str(correction["required_next_action"])
+    assert "align backend API routes" in str(correction["required_next_action"])
     assert "Do not add mock data" in str(correction["required_next_action"])
     assert "do not request more context" in str(correction["required_next_action"])
 
@@ -1971,7 +2027,7 @@ def test_agent_turn_tuning_caps_all_generation_modes() -> None:
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.FAST, intent="create", repair_turn=True) == {
         "reasoning": {"effort": "low"},
-        "max_output_tokens": 26000,
+        "max_output_tokens": 10000,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED, intent="create") == {
         "reasoning": {"effort": "medium"},
@@ -1979,15 +2035,15 @@ def test_agent_turn_tuning_caps_all_generation_modes() -> None:
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED, intent="create", repair_turn=True) == {
         "reasoning": {"effort": "low"},
-        "max_output_tokens": 28000,
+        "max_output_tokens": 14000,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.QUALITY, intent="create") == {
         "reasoning": {"effort": "high"},
         "max_output_tokens": 52000,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.QUALITY, intent="create", repair_turn=True) == {
-        "reasoning": {"effort": "medium"},
-        "max_output_tokens": 30000,
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": 16000,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED) == {
         "reasoning": {"effort": "medium"},
@@ -1999,7 +2055,7 @@ def test_agent_turn_tuning_caps_all_generation_modes() -> None:
     }
 
 
-def test_green_draft_followup_keeps_agentic_quality_diagnostics() -> None:
+def test_agent_quality_from_execution_keeps_check_diagnostics() -> None:
     execution = CheckExecutionRecord(
         workspace_id="ws",
         run_id="run",
@@ -2044,20 +2100,21 @@ def test_green_draft_followup_keeps_agentic_quality_diagnostics() -> None:
     assert RunService._validation_scope_for_run(SimpleNamespace(intent="create", mode="generate")) == "agentic"
 
 
-def test_successful_agent_runs_do_not_spawn_hidden_followup_generation() -> None:
-    from app.models.domain import CreateRunRequest, RunRecord
-
-    request = CreateRunRequest(prompt="Создай приложение", mode="generate", intent="create")
-    run = RunRecord(
-        workspace_id="ws",
-        prompt=request.prompt,
-        intent="create",
-        status="completed",
-        apply_status="applied",
-        generation_mode=GenerationMode.FAST,
-    )
-
-    assert not RunService._should_queue_async_followup_verification(request, run)
+def test_run_service_has_no_hidden_fallback_or_followup_completion_paths() -> None:
+    removed_helpers = [
+        "_should_auto_fix_failed_generate",
+        "_build_auto_fix_request",
+        "_complete_blocked_noop_run_from_green_source",
+        "_complete_failed_run_from_green_draft",
+        "_is_noop_loop_failure",
+        "_should_queue_async_followup_verification",
+        "_launch_async_followup_verification",
+        "_run_async_followup_verification",
+        "_should_apply_best_effort_after_failed_repairs",
+        "_should_keep_draft_for_manual_review",
+    ]
+    for helper in removed_helpers:
+        assert not hasattr(RunService, helper)
 
 
 def test_fast_loop_reaches_full_context_before_repeated_signature_failure() -> None:
