@@ -1356,6 +1356,52 @@ def test_create_patch_coverage_requires_sqlalchemy_table_creation_and_unittest_t
     assert "miniapp/tests/test_generated_app.py unittest.TestCase coverage" in missing
 
 
+def test_create_patch_coverage_does_not_treat_request_item_schema_as_undefined_item_model() -> None:
+    request = GenerateRequest(prompt="Create a repair queue", intent="create", generation_mode=GenerationMode.FAST)
+    operations = [
+        DraftFileOperation(
+            file_path="miniapp/app/routes/repair_api.py",
+            operation="create",
+            content=(
+                "from fastapi import APIRouter\n"
+                "from app.schemas import StrictModel\n"
+                "router = APIRouter()\n"
+                "class RequestItem(StrictModel):\n"
+                "    id: int\n"
+                "@router.get('/api/requests')\n"
+                "def list_requests(): return []\n"
+                "@router.post('/api/requests')\n"
+                "def create_request(payload: dict): return payload\n"
+                "@router.patch('/api/requests/{request_id}')\n"
+                "def update_request(request_id: int, payload: dict): return payload\n"
+            ),
+            reason="test",
+        ),
+        DraftFileOperation(file_path="miniapp/app/main.py", operation="replace", content="include_router", reason="test"),
+        DraftFileOperation(file_path="miniapp/app/generated/route_manifest.json", operation="replace", content="{}", reason="test"),
+        DraftFileOperation(
+            file_path="miniapp/tests/test_generated_app.py",
+            operation="replace",
+            content="import unittest\nclass T(unittest.TestCase):\n def test_flow(self): client.get('/api/requests'); client.post('/api/requests'); client.patch('/api/requests/1')",
+            reason="test",
+        ),
+        DraftFileOperation(file_path="miniapp/tests/generated_app.test.mjs", operation="replace", content="node:test", reason="test"),
+    ]
+    for role, child in {"client": "request", "specialist": "queue", "manager": "overview"}.items():
+        operations.extend(
+            [
+                DraftFileOperation(file_path=f"miniapp/app/static/{role}/index.html", operation="replace", content=f"/static/{role}/styles.css", reason="test"),
+                DraftFileOperation(file_path=f"miniapp/app/static/{role}/{child}/index.html", operation="replace", content=f"/static/{role}/styles.css", reason="test"),
+                DraftFileOperation(file_path=f"miniapp/app/static/{role}/app.js", operation="replace", content="fetch('/api/requests', { method: 'POST' }); fetch('/api/requests/1', { method: 'PATCH' });", reason="test"),
+                DraftFileOperation(file_path=f"miniapp/app/static/{role}/styles.css", operation="replace", content=".card { padding: 8px; }", reason="test"),
+            ]
+        )
+
+    missing = WorkspaceCodeAgentRuntime._create_patch_coverage_gap(operations, request=request)
+
+    assert "backend undefined ORM Item model" not in missing
+
+
 def test_create_patch_coverage_accepts_fastapi_depends_session_default() -> None:
     request = GenerateRequest(prompt="Create a store", intent="create", generation_mode=GenerationMode.FAST)
     operations = [

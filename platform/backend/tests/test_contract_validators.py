@@ -940,6 +940,211 @@ def test_frontend_interaction_static_smoke_rejects_frontend_backend_field_mismat
     assert "platform.workflow_frontend_backend_field_mismatch" in "\n".join(result.logs)
 
 
+def test_frontend_wiring_rejects_post_payload_missing_required_backend_fields(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    specialist_dir = static_root / "specialist"
+    specialist_dir.mkdir(parents=True)
+    specialist_dir.joinpath("index.html").write_text(
+        "<form id='availability-form'>"
+        "<input name='direction'><input name='schedule'><input name='capacity'>"
+        "<button type='submit'>Save</button></form>",
+        encoding="utf-8",
+    )
+    specialist_dir.joinpath("app.js").write_text(
+        "const form = document.getElementById('availability-form');\n"
+        "form?.addEventListener('submit', (event) => { event.preventDefault(); "
+        "const data = new FormData(form); "
+        "fetch('/api/records', { method: 'POST', body: JSON.stringify({ "
+        "direction: data.get('direction'), schedule: data.get('schedule'), capacity: Number(data.get('capacity')) "
+        "}) }); });\n",
+        encoding="utf-8",
+    )
+    backend_text = (
+        "from app.schemas import StrictModel\n"
+        "class RecordCreate(StrictModel):\n"
+        "    parent_name: str\n"
+        "    child_name: str\n"
+        "    direction: str\n"
+        "    desired_date: str\n"
+        "    phone: str\n"
+        "    schedule: str = ''\n"
+        "    capacity: int | None = None\n"
+    )
+
+    issues = CheckRunner._frontend_role_wiring_issues(static_root, backend_text=backend_text)
+
+    assert any(issue.code == "platform.workflow_frontend_backend_required_field_missing" for issue in issues)
+
+
+def test_frontend_wiring_rejects_patch_payload_fields_backend_does_not_accept(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    manager_dir = static_root / "manager"
+    manager_dir.mkdir(parents=True)
+    manager_dir.joinpath("index.html").write_text("<main><button id='mark-paid'>Paid</button></main>", encoding="utf-8")
+    manager_dir.joinpath("app.js").write_text(
+        "async function updateRecord(id, payload) { await fetch(`/api/records/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }); }\n"
+        "document.getElementById('mark-paid')?.addEventListener('click', () => updateRecord(1, { manager_status: 'call', payment_status: 'paid' }));\n",
+        encoding="utf-8",
+    )
+    backend_text = (
+        "from app.schemas import StrictModel\n"
+        "class RecordPatch(StrictModel):\n"
+        "    status: str | None = None\n"
+        "    attendance: str | None = None\n"
+        "    notes: str | None = None\n"
+    )
+
+    issues = CheckRunner._frontend_role_wiring_issues(static_root, backend_text=backend_text)
+
+    assert any(issue.code == "platform.workflow_patch_payload_field_mismatch" for issue in issues)
+
+
+def test_frontend_wiring_rejects_patch_shorthand_fields_backend_does_not_accept(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    specialist_dir = static_root / "specialist"
+    specialist_dir.mkdir(parents=True)
+    specialist_dir.joinpath("index.html").write_text("<main><form id='status-form'></form></main>", encoding="utf-8")
+    specialist_dir.joinpath("app.js").write_text(
+        "const status = 'ready';\n"
+        "const diagnostic = 'wrong backend field';\n"
+        "fetch('/api/records/1', { method: 'PATCH', body: JSON.stringify({ status, diagnostic }) });\n",
+        encoding="utf-8",
+    )
+    backend_text = (
+        "from app.schemas import StrictModel\n"
+        "class RecordPatch(StrictModel):\n"
+        "    status: str | None = None\n"
+        "    diagnosis: str | None = None\n"
+    )
+
+    issues = CheckRunner._frontend_role_wiring_issues(static_root, backend_text=backend_text)
+
+    assert any(issue.code == "platform.workflow_patch_payload_field_mismatch" for issue in issues)
+
+
+def test_frontend_wiring_rejects_mutated_patch_payload_fields_backend_does_not_accept(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    specialist_dir = static_root / "specialist"
+    specialist_dir.mkdir(parents=True)
+    specialist_dir.joinpath("index.html").write_text("<main><form id='status-form'></form></main>", encoding="utf-8")
+    specialist_dir.joinpath("app.js").write_text(
+        "const payload = {};\n"
+        "payload.status = 'ready';\n"
+        "if (document.body.dataset.ready) payload.ready = true;\n"
+        "fetch('/api/records/1', { method: 'PATCH', body: JSON.stringify(payload) });\n",
+        encoding="utf-8",
+    )
+    backend_text = (
+        "from app.schemas import StrictModel\n"
+        "class RecordPatch(StrictModel):\n"
+        "    status: str | None = None\n"
+        "    diagnosis: str | None = None\n"
+    )
+
+    issues = CheckRunner._frontend_role_wiring_issues(static_root, backend_text=backend_text)
+
+    assert any(issue.code == "platform.workflow_patch_payload_field_mismatch" for issue in issues)
+
+
+def test_frontend_wiring_accepts_patch_shorthand_fields_backend_accepts(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    specialist_dir = static_root / "specialist"
+    specialist_dir.mkdir(parents=True)
+    specialist_dir.joinpath("index.html").write_text("<main><form id='status-form'></form></main>", encoding="utf-8")
+    specialist_dir.joinpath("app.js").write_text(
+        "const status = 'ready';\n"
+        "const diagnosis = 'valid field';\n"
+        "fetch('/api/records/1', { method: 'PATCH', body: JSON.stringify({ status, diagnosis }) });\n",
+        encoding="utf-8",
+    )
+    backend_text = (
+        "from app.schemas import StrictModel\n"
+        "class RecordPatch(StrictModel):\n"
+        "    status: str | None = None\n"
+        "    diagnosis: str | None = None\n"
+    )
+
+    issues = CheckRunner._frontend_role_wiring_issues(static_root, backend_text=backend_text)
+
+    assert not any(issue.code == "platform.workflow_patch_payload_field_mismatch" for issue in issues)
+
+
+def test_frontend_wiring_rejects_items_envelope_treated_as_array(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    manager_dir = static_root / "manager"
+    manager_dir.mkdir(parents=True)
+    manager_dir.joinpath("index.html").write_text("<main><section id='records'></section></main>", encoding="utf-8")
+    manager_dir.joinpath("app.js").write_text(
+        "async function loadRecords() {\n"
+        "  const response = await fetch('/api/records');\n"
+        "  const records = await response.json();\n"
+        "  document.getElementById('records').textContent = String(records.length);\n"
+        "  records.slice().reverse().forEach((record) => console.log(record));\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    backend_text = (
+        "from app.schemas import StrictModel\n"
+        "class RecordsEnvelope(StrictModel):\n"
+        "    items: list[dict]\n"
+        "@router.get('/records', response_model=RecordsEnvelope)\n"
+        "def list_records(): return RecordsEnvelope(items=[])\n"
+    )
+
+    issues = CheckRunner._frontend_role_wiring_issues(static_root, backend_text=backend_text)
+
+    assert any(issue.code == "platform.workflow_api_envelope_not_unwrapped" for issue in issues)
+
+
+def test_frontend_wiring_accepts_items_envelope_unwrap_helper(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    manager_dir = static_root / "manager"
+    manager_dir.mkdir(parents=True)
+    manager_dir.joinpath("index.html").write_text("<main><section id='records'></section></main>", encoding="utf-8")
+    manager_dir.joinpath("app.js").write_text(
+        "function normalizeItems(payload) { return Array.isArray(payload.items) ? payload.items : []; }\n"
+        "async function loadRecords() {\n"
+        "  const response = await fetch('/api/records');\n"
+        "  const records = await response.json();\n"
+        "  normalizeItems(records).slice().forEach((record) => console.log(record));\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    backend_text = (
+        "from app.schemas import StrictModel\n"
+        "class RecordsEnvelope(StrictModel):\n"
+        "    items: list[dict]\n"
+        "@router.get('/records', response_model=RecordsEnvelope)\n"
+        "def list_records(): return RecordsEnvelope(items=[])\n"
+    )
+
+    issues = CheckRunner._frontend_role_wiring_issues(static_root, backend_text=backend_text)
+
+    assert not any(issue.code == "platform.workflow_api_envelope_not_unwrapped" for issue in issues)
+
+
+def test_agentic_platform_invariants_reject_static_pages_missing_from_manifest(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_multipage_role_surfaces(source_dir)
+    _write_generated_test_placeholders(source_dir)
+    manifest_path = source_dir / "miniapp/app/generated/route_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["roles"]["manager"]["routes"]["/manager"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    runner = object.__new__(CheckRunner)
+
+    result = runner._platform_invariants_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/generated/route_manifest.json"],
+        scope_mode="agentic",
+        generation_mode=GenerationMode.FAST,
+    )
+
+    assert result.status == "failed"
+    assert "platform.role_route_manifest_incomplete" in "\n".join(result.logs)
+    assert "/manager" in "\n".join(result.logs)
+
+
 def test_formdata_field_validator_ignores_api_response_data_props(tmp_path: Path) -> None:
     client_dir = tmp_path / "source/miniapp/app/static/client"
     client_dir.mkdir(parents=True)
@@ -960,6 +1165,43 @@ def test_formdata_field_validator_ignores_api_response_data_props(tmp_path: Path
 
     issues = CheckRunner._form_wiring_issues(
         "miniapp/app/static/client/slots/index.html",
+        js_path,
+        html_source,
+        js_source,
+    )
+
+    assert not any(issue.code == "platform.workflow_formdata_field_mismatch" for issue in issues)
+
+
+def test_formdata_field_validator_ignores_api_envelope_items_props(tmp_path: Path) -> None:
+    client_dir = tmp_path / "source/miniapp/app/static/client"
+    client_dir.mkdir(parents=True)
+    js_path = client_dir / "app.js"
+    html_source = (
+        "<form id='client-request-form'>"
+        "<input name='customer_name'>"
+        "<input name='phone'>"
+        "<input name='preferred_day'>"
+        "<textarea name='bike_problem'></textarea>"
+        "<button type='submit'>Send</button>"
+        "</form>"
+    )
+    js_source = (
+        "const form = document.getElementById('client-request-form');\n"
+        "form?.addEventListener('submit', (event) => {\n"
+        "  event.preventDefault();\n"
+        "  const data = Object.fromEntries(new FormData(form).entries());\n"
+        "  fetch('/api/requests', { method: 'POST', body: JSON.stringify(data) });\n"
+        "});\n"
+        "async function loadRequests() {\n"
+        "  const response = await fetch('/api/requests');\n"
+        "  const data = await response.json();\n"
+        "  return data.items || [];\n"
+        "}\n"
+    )
+
+    issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/client/index.html",
         js_path,
         html_source,
         js_source,
@@ -1418,6 +1660,40 @@ def test_frontend_wiring_accepts_id_field_read_for_path_update(tmp_path: Path) -
 
     issues = CheckRunner._form_wiring_issues(
         "miniapp/app/static/specialist/requests-work/index.html",
+        js_path,
+        html_source,
+        js_source,
+    )
+
+    assert not any(issue.code == "platform.workflow_form_field_not_submitted" for issue in issues)
+
+
+def test_frontend_wiring_accepts_hidden_path_id_read_by_dom_id(tmp_path: Path) -> None:
+    specialist_dir = tmp_path / "source/miniapp/app/static/specialist"
+    specialist_dir.mkdir(parents=True)
+    js_path = specialist_dir / "app.js"
+    html_source = (
+        "<form id='specialist-status-form'>"
+        "<input id='specialist-request-id' name='request_id' type='hidden'>"
+        "<textarea id='specialist-diagnostic' name='diagnostic'></textarea>"
+        "<select id='specialist-status' name='status'></select>"
+        "<button type='submit'>Save</button>"
+        "</form>"
+    )
+    js_source = (
+        "const form = document.getElementById('specialist-status-form');\n"
+        "form?.addEventListener('submit', (event) => {\n"
+        "  event.preventDefault();\n"
+        "  const idField = document.getElementById('specialist-request-id');\n"
+        "  const requestId = idField ? String(idField.value || '').trim() : '';\n"
+        "  const diagnostic = document.getElementById('specialist-diagnostic');\n"
+        "  const status = document.getElementById('specialist-status');\n"
+        "  fetch(`/api/requests/${requestId}`, { method: 'PATCH', body: JSON.stringify({ diagnostic: diagnostic.value, status: status.value }) });\n"
+        "});\n"
+    )
+
+    issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/specialist/index.html",
         js_path,
         html_source,
         js_source,

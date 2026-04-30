@@ -628,7 +628,14 @@ class CheckRunner:
     @classmethod
     def _frontend_role_wiring_issues(cls, static_root: Path, *, backend_text: str = "") -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
-        backend_create_fields = cls._backend_create_schema_fields(backend_text)
+        backend_create_schemas = cls._backend_create_schema_contracts(backend_text)
+        backend_create_fields = {
+            field
+            for schema in backend_create_schemas
+            for field in set(schema.get("accepted") or set())
+        }
+        backend_patch_schemas = cls._backend_update_schema_contracts(backend_text)
+        backend_returns_items_envelope = cls._backend_returns_items_envelope(backend_text)
         for role in ROLE_ORDER:
             role_dir = static_root / role
             js_path = role_dir / "app.js"
@@ -655,9 +662,20 @@ class CheckRunner:
                         html_source,
                         js_source,
                         backend_create_fields=backend_create_fields,
+                        backend_create_schemas=backend_create_schemas,
                     )
                 )
                 issues.extend(cls._button_wiring_issues(relative_path, js_path, html_source, js_source))
+            issues.extend(
+                cls._frontend_backend_patch_payload_issues(
+                    role,
+                    js_path,
+                    js_source,
+                    backend_patch_schemas=backend_patch_schemas,
+                )
+            )
+            if backend_returns_items_envelope:
+                issues.extend(cls._frontend_api_envelope_issues(role, js_path, js_source))
         return issues
 
     @classmethod
@@ -771,9 +789,11 @@ class CheckRunner:
         js_source: str,
         *,
         backend_create_fields: set[str] | None = None,
+        backend_create_schemas: list[dict[str, object]] | None = None,
     ) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
         backend_create_fields = set(backend_create_fields or set())
+        backend_create_schemas = list(backend_create_schemas or [])
         forms = cls._html_forms(html_source)
         multiple_forms = len(forms) > 1
         for form in forms:
@@ -783,6 +803,11 @@ class CheckRunner:
             if not form_id and not form_selectors:
                 continue
             form_label = f"#{form_id}" if form_id else form_selectors[0]
+            field_ids_by_name = {
+                str(key): str(value)
+                for key, value in dict(form.get("field_ids_by_name") or {}).items()
+                if str(key).strip() and str(value).strip()
+            }
             form_referenced = bool(
                 (form_id and cls._js_references_dom_id(js_source, form_id))
                 or any(cls._js_references_selector(js_source, selector) for selector in form_selectors)
@@ -821,7 +846,22 @@ class CheckRunner:
                     for var_name in formdata_vars
                     for prop in re.findall(rf"\b{re.escape(var_name)}\.([A-Za-z_$][\w$]*)", js_source)
                 }
-                formdata_api_props = {"append", "delete", "entries", "forEach", "get", "getAll", "has", "keys", "set", "values"}
+                formdata_api_props = {
+                    "append",
+                    "delete",
+                    "entries",
+                    "forEach",
+                    "get",
+                    "getAll",
+                    "has",
+                    "keys",
+                    "set",
+                    "values",
+                    # Common API envelope fields may appear as data.items/data.total
+                    # elsewhere in the same role script after response.json().
+                    "items",
+                    "total",
+                }
                 unknown_props = sorted(prop for prop in data_props if prop not in field_names and prop not in {"id"} | formdata_api_props)
                 if unknown_props:
                     issues.append(
@@ -837,7 +877,12 @@ class CheckRunner:
                         )
                     )
             else:
-                missing_reads = sorted(name for name in field_names if not cls._js_reads_form_field(js_source, name))
+                missing_reads = sorted(
+                    name
+                    for name in field_names
+                    if not cls._js_reads_form_field(js_source, name)
+                    and not cls._js_reads_dom_field_id(js_source, field_ids_by_name.get(name, ""))
+                )
                 if missing_reads:
                     issues.append(
                         ValidationIssue(
@@ -850,7 +895,7 @@ class CheckRunner:
                             location=relative_path,
                             blocking=True,
                         )
-                    )
+                )
             if (
                 backend_create_fields
                 and re.search(r"\bmethod\s*:\s*([\"'`])POST\1", js_source, re.IGNORECASE)
@@ -873,6 +918,25 @@ class CheckRunner:
                                 f"{relative_path} form {form_label} can submit fields not accepted by the backend create schema: "
                                 f"{', '.join(unknown_payload_fields[:6])}. Align HTML names, JavaScript payload keys, "
                                 "backend create schema, and generated tests to one contract."
+                            ),
+                            severity="high",
+                            location=relative_path,
+                            blocking=True,
+                        )
+                    )
+                missing_required_sets = cls._missing_required_create_schema_sets(
+                    payload_fields,
+                    backend_create_schemas=backend_create_schemas,
+                )
+                if missing_required_sets:
+                    required_preview = ", ".join(sorted(missing_required_sets[0])[:8])
+                    issues.append(
+                        ValidationIssue(
+                            code="platform.workflow_frontend_backend_required_field_missing",
+                            message=(
+                                f"{relative_path} form {form_label} POST payload does not satisfy any backend create schema. "
+                                f"Missing required fields such as: {required_preview}. Align HTML inputs, JavaScript payload, "
+                                "backend create schema, and generated tests to one workflow contract."
                             ),
                             severity="high",
                             location=relative_path,
@@ -907,10 +971,27 @@ class CheckRunner:
 
     @staticmethod
     def _backend_create_schema_fields(backend_text: str) -> set[str]:
-        fields: set[str] = set()
+        return {
+            field
+            for schema in CheckRunner._backend_create_schema_contracts(backend_text)
+            for field in set(schema.get("accepted") or set())
+        }
+
+    @staticmethod
+    def _backend_create_schema_contracts(backend_text: str) -> list[dict[str, object]]:
+        return CheckRunner._backend_schema_contracts(backend_text, name_markers=("Create",))
+
+    @staticmethod
+    def _backend_update_schema_contracts(backend_text: str) -> list[dict[str, object]]:
+        return CheckRunner._backend_schema_contracts(backend_text, name_markers=("Patch", "Update", "Status"))
+
+    @staticmethod
+    def _backend_schema_contracts(backend_text: str, *, name_markers: tuple[str, ...]) -> list[dict[str, object]]:
+        contracts: list[dict[str, object]] = []
         text = str(backend_text or "")
+        markers_pattern = "|".join(re.escape(marker) for marker in name_markers)
         for match in re.finditer(
-            r"^class\s+[A-Za-z_][A-Za-z0-9_]*Create[A-Za-z0-9_]*\([^)]*(?:StrictModel|BaseModel)[^)]*\):\s*$",
+            rf"^class\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*(?:{markers_pattern})[A-Za-z0-9_]*)\([^)]*(?:StrictModel|BaseModel)[^)]*\):\s*$",
             text,
             re.MULTILINE,
         ):
@@ -918,9 +999,285 @@ class CheckRunner:
             next_match = re.search(r"^(?:class|def|@router\.)\s+", text[start:], re.MULTILINE)
             end = start + next_match.start() if next_match else len(text)
             body = text[start:end]
-            for field_match in re.finditer(r"^\s{4}([A-Za-z_][A-Za-z0-9_]*)\s*:", body, re.MULTILINE):
-                fields.add(field_match.group(1))
-        return fields
+            accepted: set[str] = set()
+            required: set[str] = set()
+            for field_match in re.finditer(
+                r"^\s{4}(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?P<type>[^=\n#]+?)(?:\s*=\s*(?P<default>[^\n#]+))?\s*$",
+                body,
+                re.MULTILINE,
+            ):
+                field_name = field_match.group("name")
+                field_type = str(field_match.group("type") or "")
+                default = field_match.group("default")
+                accepted.add(field_name)
+                optional = (
+                    CheckRunner._schema_field_default_is_optional(default)
+                    or "None" in field_type
+                    or "Optional[" in field_type
+                    or " | None" in field_type
+                    or "None |" in field_type
+                )
+                if not optional:
+                    required.add(field_name)
+            if accepted:
+                contracts.append(
+                    {
+                        "name": match.group("name"),
+                        "accepted": accepted,
+                        "required": required,
+                    }
+                )
+        return contracts
+
+    @staticmethod
+    def _schema_field_default_is_optional(default: str | None) -> bool:
+        if default is None:
+            return False
+        raw = str(default or "").strip()
+        if not raw:
+            return False
+        if raw in {"...", "Ellipsis"}:
+            return False
+        if raw.startswith("Field("):
+            inner = raw.removeprefix("Field(").rsplit(")", 1)[0].strip()
+            if not inner:
+                return False
+            first_arg = inner.split(",", 1)[0].strip()
+            if first_arg in {"...", "Ellipsis"}:
+                return False
+            if first_arg and "=" not in first_arg:
+                return True
+            default_match = re.search(r"\bdefault\s*=\s*(?P<value>[^,)]+)", inner)
+            if not default_match:
+                return False
+            return default_match.group("value").strip() not in {"...", "Ellipsis"}
+        return True
+
+    @staticmethod
+    def _missing_required_create_schema_sets(
+        payload_fields: set[str],
+        *,
+        backend_create_schemas: list[dict[str, object]],
+    ) -> list[set[str]]:
+        if not backend_create_schemas:
+            return []
+        payload = set(payload_fields or set())
+        required_sets = [
+            set(schema.get("required") or set())
+            for schema in backend_create_schemas
+            if set(schema.get("required") or set())
+        ]
+        if not required_sets:
+            return []
+        if any(required <= payload for required in required_sets):
+            return []
+        missing = [required - payload for required in required_sets]
+        return sorted((item for item in missing if item), key=lambda item: (len(item), sorted(item)))
+
+    @classmethod
+    def _frontend_backend_patch_payload_issues(
+        cls,
+        role: str,
+        js_path: Path,
+        js_source: str,
+        *,
+        backend_patch_schemas: list[dict[str, object]],
+    ) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        patch_payloads = cls._js_patch_payload_field_sets(js_source)
+        accepted_sets = [
+            set(schema.get("accepted") or set())
+            for schema in backend_patch_schemas
+            if set(schema.get("accepted") or set())
+        ]
+        if not patch_payloads or not accepted_sets:
+            return issues
+        allowed_path_fields = {"id", "record_id", "request_id", "order_id", "item_id"}
+        for payload_fields in patch_payloads:
+            effective_fields = set(payload_fields) - allowed_path_fields
+            if not effective_fields:
+                continue
+            if any(effective_fields <= accepted for accepted in accepted_sets):
+                continue
+            accepted_union = set().union(*accepted_sets)
+            unknown_fields = sorted(field for field in effective_fields if field not in accepted_union)
+            if not unknown_fields:
+                continue
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_patch_payload_field_mismatch",
+                    message=(
+                        f"{js_path.relative_to(js_path.parents[4]).as_posix()} sends PATCH fields not accepted by the backend update schema: "
+                        f"{', '.join(unknown_fields[:6])}. Role `{role}` actions must update fields the API actually accepts."
+                    ),
+                    severity="high",
+                    location=js_path.relative_to(js_path.parents[4]).as_posix(),
+                    blocking=True,
+                )
+            )
+        return issues
+
+    @classmethod
+    def _frontend_api_envelope_issues(cls, role: str, js_path: Path, js_source: str) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        text = str(js_source or "")
+        if not text.strip():
+            return issues
+        unwrap_helpers = cls._js_items_unwrap_helpers(text)
+        json_vars = {
+            match.group("var")
+            for match in re.finditer(
+                r"\b(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*(?:[^;\n]*?await\s+)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.json\(\)",
+                text,
+            )
+        }
+        for var_name in sorted(json_vars):
+            escaped = re.escape(var_name)
+            if re.search(rf"\b{escaped}\s*\.\s*items\b", text):
+                continue
+            if any(re.search(rf"\b{re.escape(helper)}\(\s*{escaped}\s*\)", text) for helper in unwrap_helpers):
+                continue
+            array_assumption = bool(
+                re.search(rf"\b{escaped}\s*\.\s*(?:length|slice|filter|map|forEach)\s*(?:\(|\b)", text)
+                or re.search(rf"Array\.isArray\(\s*{escaped}\s*\)\s*\?\s*{escaped}\s*:\s*\[\s*\]", text)
+            )
+            if not array_assumption:
+                continue
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_api_envelope_not_unwrapped",
+                    message=(
+                        f"{js_path.relative_to(js_path.parents[4]).as_posix()} treats `{var_name}` from response.json() as an array, "
+                        "but the backend list response is an envelope with `items`. Read `payload.items` before rendering role lists."
+                    ),
+                    severity="high",
+                    location=js_path.relative_to(js_path.parents[4]).as_posix(),
+                    blocking=True,
+                )
+            )
+        return issues
+
+    @staticmethod
+    def _js_items_unwrap_helpers(js_source: str) -> set[str]:
+        helpers: set[str] = set()
+        text = str(js_source or "")
+        for match in re.finditer(
+            r"\bfunction\s+(?P<name>[A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{(?P<body>[\s\S]{0,900}?)\}",
+            text,
+        ):
+            body = match.group("body")
+            if re.search(r"\.items\b", body) or re.search(r"Array\.isArray\([^)]*\.items\)", body):
+                helpers.add(match.group("name"))
+        for match in re.finditer(
+            r"\b(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*\([^)]*\)\s*=>\s*(?P<body>[^;\n]+)",
+            text,
+        ):
+            body = match.group("body")
+            if re.search(r"\.items\b", body) or re.search(r"Array\.isArray\([^)]*\.items\)", body):
+                helpers.add(match.group("name"))
+        return helpers
+
+    @staticmethod
+    def _backend_returns_items_envelope(backend_text: str) -> bool:
+        text = str(backend_text or "")
+        return bool(
+            re.search(r"^class\s+[A-Za-z_][A-Za-z0-9_]*(?:Envelope|ListOut|ListResponse)[A-Za-z0-9_]*\([^)]*(?:StrictModel|BaseModel)[^)]*\):[\s\S]{0,500}^\s{4}items\s*:", text, re.MULTILINE)
+            or re.search(r"response_model\s*=\s*[A-Za-z_][A-Za-z0-9_]*(?:Envelope|ListOut|ListResponse)\b", text)
+            or re.search(r"return\s+(?:[A-Za-z_][A-Za-z0-9_]*\()?\s*\{[^}]*['\"]items['\"]\s*:", text)
+        )
+
+    @classmethod
+    def _js_patch_payload_field_sets(cls, js_source: str) -> list[set[str]]:
+        text = str(js_source or "")
+        payloads: list[set[str]] = []
+
+        def add_fields(body: str) -> None:
+            fields = cls._js_object_literal_keys(body)
+            fields = {
+                field
+                for field in fields
+                if field not in {"body", "headers", "method", "signal", "credentials", "mode", "cache", "redirect"}
+            }
+            if fields:
+                payloads.append(fields)
+
+        for match in re.finditer(r"JSON\.stringify\(\s*\{(?P<body>[^{}]+)\}\s*\)", text, re.DOTALL):
+            nearby = text[max(0, match.start() - 700): match.end() + 350]
+            if re.search(r"\bmethod\s*:\s*([\"'`])PATCH\1", nearby, re.IGNORECASE):
+                add_fields(match.group("body"))
+
+        for match in re.finditer(
+            r"\b(?P<name>[A-Za-z_$][\w$]*)\s*\([^)]*,\s*\{(?P<body>[^{}]+)\}\s*\)",
+            text,
+            re.DOTALL,
+        ):
+            function_name = str(match.group("name") or "").lower()
+            if not any(marker in function_name for marker in ("update", "patch", "mark", "save", "change", "set")):
+                continue
+            add_fields(match.group("body"))
+
+        for patch_match in re.finditer(r"\bmethod\s*:\s*([\"'`])PATCH\1", text, re.IGNORECASE):
+            tail = text[patch_match.start(): patch_match.end() + 700]
+            payload_vars = {
+                match.group("var")
+                for match in re.finditer(r"JSON\.stringify\(\s*(?P<var>[A-Za-z_$][\w$]*)\s*\)", tail)
+            }
+            if not payload_vars:
+                continue
+            head = text[max(0, patch_match.start() - 1200): patch_match.start()]
+            for payload_var in sorted(payload_vars):
+                declaration_pattern = re.compile(
+                    rf"\b(?:const|let|var)\s+{re.escape(payload_var)}\s*=\s*\{{(?P<body>[^{{}}]*)\}}",
+                    re.DOTALL,
+                )
+                declarations = list(declaration_pattern.finditer(head))
+                fields: set[str] = set()
+                if declarations:
+                    fields.update(cls._js_object_literal_keys(declarations[-1].group("body")))
+                    mutation_start = declarations[-1].end()
+                    fields.update(cls._js_object_mutation_keys(head[mutation_start:], payload_var))
+                else:
+                    fields.update(cls._js_object_mutation_keys(head, payload_var))
+                fields = {
+                    field
+                    for field in fields
+                    if field not in {"body", "headers", "method", "signal", "credentials", "mode", "cache", "redirect"}
+                }
+                if fields:
+                    payloads.append(fields)
+
+        deduped: list[set[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for fields in payloads:
+            key = tuple(sorted(fields))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(fields)
+        return deduped
+
+    @staticmethod
+    def _js_object_literal_keys(body: str) -> set[str]:
+        keys: set[str] = set()
+        text = str(body or "")
+        for match in re.finditer(r"(?:^|[,{\s])(?P<key>[A-Za-z_$][\w$]*)\s*:", text):
+            keys.add(match.group("key"))
+        for match in re.finditer(r"(?:^|[,{\s])([\"'])(?P<key>[A-Za-z_$][\w$]*)\1\s*:", text):
+            keys.add(match.group("key"))
+        for match in re.finditer(r"(?:^|,)\s*(?P<key>[A-Za-z_$][\w$]*)\s*(?=,|$)", text, re.DOTALL):
+            keys.add(match.group("key"))
+        return keys
+
+    @staticmethod
+    def _js_object_mutation_keys(js_source: str, var_name: str) -> set[str]:
+        keys: set[str] = set()
+        text = str(js_source or "")
+        escaped = re.escape(var_name)
+        for match in re.finditer(rf"\b{escaped}\s*\.\s*(?P<key>[A-Za-z_$][\w$]*)\s*=", text):
+            keys.add(match.group("key"))
+        for match in re.finditer(rf"\b{escaped}\s*\[\s*([\"'])(?P<key>[A-Za-z_$][\w$]*)\1\s*\]\s*=", text):
+            keys.add(match.group("key"))
+        return keys
 
     @staticmethod
     def _form_looks_like_status_update(field_names: set[str]) -> bool:
@@ -981,7 +1338,21 @@ class CheckRunner:
                 name_match.group("name")
                 for name_match in re.finditer(r"\bname\s*=\s*([\"'])(?P<name>[A-Za-z0-9_-]+)\1", body, re.IGNORECASE)
             }
-            forms.append({"id": form_id_match.group("id") if form_id_match else "", "selectors": selectors, "field_names": sorted(names)})
+            field_ids_by_name: dict[str, str] = {}
+            for field_match in re.finditer(r"<(?:input|select|textarea)\b(?P<attrs>[^>]*)>", body, re.IGNORECASE | re.DOTALL):
+                field_attrs = field_match.group("attrs") or ""
+                name_attr = re.search(r"\bname\s*=\s*([\"'])(?P<name>[A-Za-z0-9_-]+)\1", field_attrs, re.IGNORECASE)
+                id_attr = re.search(r"\bid\s*=\s*([\"'])(?P<id>[A-Za-z0-9_-]+)\1", field_attrs, re.IGNORECASE)
+                if name_attr and id_attr:
+                    field_ids_by_name[name_attr.group("name")] = id_attr.group("id")
+            forms.append(
+                {
+                    "id": form_id_match.group("id") if form_id_match else "",
+                    "selectors": selectors,
+                    "field_names": sorted(names),
+                    "field_ids_by_name": field_ids_by_name,
+                }
+            )
         return forms
 
     @classmethod
@@ -1062,6 +1433,26 @@ class CheckRunner:
                 text,
             )
         )
+
+    @staticmethod
+    def _js_reads_dom_field_id(js_source: str, dom_id: str) -> bool:
+        value = str(dom_id or "").strip()
+        if not value:
+            return False
+        escaped = re.escape(value)
+        text = str(js_source or "")
+        if re.search(
+            rf"document\.(?:getElementById|querySelector)\(\s*([\"'])(?:#)?{escaped}\1\s*\)\s*\.\s*(?:value|checked)\b",
+            text,
+        ):
+            return True
+        bindings = CheckRunner._js_dom_id_bindings(text)
+        for var_name, bound_id in bindings.items():
+            if bound_id != value:
+                continue
+            if re.search(rf"\b{re.escape(var_name)}\s*\.\s*(?:value|checked)\b", text):
+                return True
+        return False
 
     @classmethod
     def _role_css_html_contract_issues(cls, static_root: Path) -> list[ValidationIssue]:
@@ -1665,6 +2056,7 @@ class CheckRunner:
                 generation_mode=generation_mode,
             )
             issues.extend(role_issues)
+            issues.extend(self._role_manifest_completeness_issues(source_dir))
             tests_issues, generated_tests = self._generated_tests_presence_issues(source_dir)
             issues.extend(tests_issues)
         elif css_only_focused_edit:
@@ -2541,6 +2933,44 @@ class CheckRunner:
             role: cls._dedupe_role_pages(pages)
             for role, pages in pages_by_role.items()
         }
+
+    @classmethod
+    def _role_manifest_completeness_issues(cls, source_dir: Path) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        pages_by_role = cls._routeable_role_pages(source_dir)
+        static_root = source_dir / "miniapp/app/static"
+        for role in ROLE_ORDER:
+            role_root = static_root / role
+            if not role_root.exists():
+                continue
+            route_sources = {
+                str(page.get("route_path") or "").rstrip("/") or f"/{role}": str(page.get("source") or "")
+                for page in pages_by_role.get(role, [])
+            }
+            manifest_routes = {
+                route
+                for route, source in route_sources.items()
+                if source and source != "filesystem"
+            }
+            missing_routes: list[str] = []
+            for html_path in sorted(role_root.rglob("index.html")):
+                route = cls._filesystem_role_route(role, role_root, html_path)
+                if route not in manifest_routes:
+                    missing_routes.append(route)
+            if missing_routes:
+                issues.append(
+                    ValidationIssue(
+                        code="platform.role_route_manifest_incomplete",
+                        message=(
+                            f"{role} role has static pages missing from generated/route_manifest.json: "
+                            f"{', '.join(missing_routes[:8])}. Every role page must be routeable through the platform shell."
+                        ),
+                        severity="high",
+                        location="miniapp/app/generated/route_manifest.json",
+                        blocking=True,
+                    )
+                )
+        return issues
 
     @staticmethod
     def _resolve_manifest_static_page(source_dir: Path, file_path_raw: str) -> Path:
