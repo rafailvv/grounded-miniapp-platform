@@ -24,7 +24,7 @@ from app.modules.workspace_code_agent_runtime.runtime import (
     WorkspaceCodeAgentRuntime,
 )
 from app.repositories.state_store import StateStore
-from app.services.workflow_acceptance import build_acceptance_contract, orchestration_metadata_for_contract
+from app.services.workflow_acceptance import build_acceptance_contract, orchestration_metadata_for_contract, prompt_resource_candidates
 from app.services.workspace.service import WorkspaceService
 from app.services.workspace.run_service import RunService
 
@@ -85,6 +85,20 @@ def test_fast_first_create_schema_can_force_patch_only_turn() -> None:
     assert "tool_request" not in schema["properties"]["outcome"]["enum"]
     assert schema["properties"]["outcome"]["enum"] == ["patch_ready"]
     assert schema["properties"]["operations"]["items"]["properties"]["content"]["maxLength"] == 7000
+
+
+def test_parallel_worker_schema_requires_non_empty_operations() -> None:
+    schema = WorkspaceCodeAgentRuntime._agent_turn_schema(
+        operation_limit=7,
+        content_max_length=12000,
+        allow_tool_requests=False,
+        allowed_outcomes=["patch_ready"],
+        min_operations=1,
+    )
+
+    assert schema["properties"]["operations"]["minItems"] == 1
+    assert schema["properties"]["operations"]["maxItems"] == 7
+    assert schema["properties"]["tool_requests"]["maxItems"] == 0
 
 
 def test_visual_style_edit_uses_focused_css_contract() -> None:
@@ -399,6 +413,19 @@ def test_acceptance_contract_captures_generic_workflow_and_orchestration() -> No
     }
 
 
+def test_prompt_resource_candidates_skip_intro_and_role_words() -> None:
+    candidates = prompt_resource_candidates(
+        "Я управляю небольшим детским центром. Родители оставляют заявку на занятие, педагог меняет статус.",
+        limit=3,
+    )
+
+    assert candidates[0] == "requests"
+    assert "upravlyayu" not in candidates
+    assert not any(candidate.startswith("nebolsh") for candidate in candidates)
+    assert not any(candidate.startswith("roditel") for candidate in candidates)
+    assert not any(candidate.startswith("zanyati") for candidate in candidates)
+
+
 def test_cross_role_behavior_addition_gets_workflow_contract() -> None:
     prompt = (
         "Добавь срочность заявки: клиент выбирает обычная или срочная, "
@@ -609,6 +636,73 @@ def test_fast_parallel_worker_merge_deduplicates_same_worker_path() -> None:
     assert manifests[0].content == '{"version": 2}'
 
 
+def test_parallel_worker_merge_accepts_deferred_generated_tests_slice() -> None:
+    results = [
+        {
+            "worker": "backend_api",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/app/routes/app_api.py",
+                    operation="replace",
+                    content="router = object()",
+                    reason="api",
+                )
+            ],
+        },
+        {
+            "worker": "client_ui",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/app/static/client/app.js",
+                    operation="replace",
+                    content="",
+                    reason="client",
+                )
+            ],
+        },
+        {
+            "worker": "specialist_ui",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/app/static/specialist/app.js",
+                    operation="replace",
+                    content="",
+                    reason="specialist",
+                )
+            ],
+        },
+        {
+            "worker": "manager_ui",
+            "status": "completed",
+            "outcome": "patch_ready",
+            "operations": [
+                DraftFileOperation(
+                    file_path="miniapp/app/static/manager/app.js",
+                    operation="replace",
+                    content="",
+                    reason="manager",
+                )
+            ],
+        },
+    ]
+
+    merged, error = WorkspaceCodeAgentRuntime._merge_fast_parallel_worker_operations(results)
+
+    assert error is None
+    assert {operation.file_path for operation in merged} == {
+        "miniapp/app/routes/app_api.py",
+        "miniapp/app/static/client/app.js",
+        "miniapp/app/static/specialist/app.js",
+        "miniapp/app/static/manager/app.js",
+    }
+
+
 def test_parallel_worker_repair_result_preserves_existing_owned_files() -> None:
     existing = {
         "worker": "generated_tests",
@@ -702,9 +796,42 @@ def test_parallel_failures_target_owned_repair_workers() -> None:
         {},
     ) == {"backend_api", "client_ui", "generated_tests"}
     assert WorkspaceCodeAgentRuntime._parallel_repair_targets_from_coverage_gap(
-        ["quality create: multiple API resources plus update/status endpoint"],
+        ["quality create: rich update/status endpoint"],
         {},
     ) == {"backend_api", "generated_tests"}
+
+
+def test_parallel_retry_defers_generated_tests_until_app_slices_exist() -> None:
+    worker_ids = {"backend_api", "client_ui", "specialist_ui", "manager_ui", "generated_tests"}
+    retry = WorkspaceCodeAgentRuntime._parallel_filter_retry_targets(
+        {"backend_api", "generated_tests"},
+        {"client_ui", "specialist_ui", "manager_ui"},
+        worker_ids,
+    )
+
+    assert retry == {"backend_api"}
+    assert WorkspaceCodeAgentRuntime._parallel_filter_retry_targets(
+        {"generated_tests"},
+        {"backend_api", "client_ui", "specialist_ui", "manager_ui"},
+        worker_ids,
+    ) == {"generated_tests"}
+
+
+def test_soft_create_coverage_gap_can_defer_to_validation_repair() -> None:
+    assert WorkspaceCodeAgentRuntime._is_soft_create_coverage_gap(
+        [
+            "backend status/update endpoint",
+            "frontend specialist/manager status update action",
+            "miniapp/tests/test_generated_app.py API status/update coverage",
+            "balanced create: second API resource or update/status endpoint",
+        ]
+    )
+    assert not WorkspaceCodeAgentRuntime._is_soft_create_coverage_gap(
+        ["miniapp/app/static/client/<one-child-page>/index.html"]
+    )
+    assert not WorkspaceCodeAgentRuntime._is_soft_create_coverage_gap(
+        ["frontend form/fetch POST /api/<resource>"]
+    )
 
 
 def test_api_resource_stems_include_fastapi_router_prefix_routes() -> None:
@@ -864,6 +991,45 @@ def test_generated_test_failures_seed_backend_and_role_context_for_repair() -> N
     assert "miniapp/app/static/specialist/index.html" not in targets
 
 
+def test_repair_context_expands_schema_and_role_wiring_files() -> None:
+    paths = WorkspaceCodeAgentRuntime._repair_context_paths(
+        failed_paths=[
+            "miniapp/tests/test_generated_app.py",
+            "miniapp/app/static/manager/index.html",
+        ],
+        diff_paths=[
+            "miniapp/app/routes/app_api.py",
+            "miniapp/app/schemas.py",
+            "miniapp/app/static/manager/index.html",
+            "miniapp/app/static/manager/zanyatiyami/index.html",
+            "miniapp/app/static/manager/app.js",
+            "miniapp/app/static/manager/styles.css",
+        ],
+    )
+
+    assert "miniapp/app/routes/app_api.py" in paths
+    assert "miniapp/app/schemas.py" in paths
+    assert "miniapp/app/static/manager/app.js" in paths
+    assert "miniapp/app/static/manager/styles.css" in paths
+    assert "miniapp/tests/generated_app.test.mjs" in paths
+
+
+def test_repair_context_includes_backend_for_frontend_schema_mismatch() -> None:
+    paths = WorkspaceCodeAgentRuntime._repair_context_paths(
+        failed_paths=["miniapp/app/static/specialist/requests-work/index.html"],
+        diff_paths=[
+            "miniapp/app/static/specialist/requests-work/index.html",
+            "miniapp/app/static/specialist/app.js",
+            "miniapp/app/static/specialist/styles.css",
+        ],
+    )
+
+    assert "miniapp/app/routes/app_api.py" in paths
+    assert "miniapp/app/schemas.py" in paths
+    assert "miniapp/tests/test_generated_app.py" in paths
+    assert "miniapp/app/static/specialist/app.js" in paths
+
+
 def test_workflow_slice_repair_detects_connected_check_failures() -> None:
     execution = CheckExecutionRecord(
         workspace_id="ws",
@@ -897,6 +1063,97 @@ def test_workflow_slice_repair_detects_connected_check_failures() -> None:
     joined = "\n".join(rules)
     assert "connected workflow slice" in joined
     assert "Never satisfy a generated test by adding one role's app script to another role page" in joined
+
+
+def test_compact_repair_checks_include_platform_and_frontend_diagnostics() -> None:
+    execution = CheckExecutionRecord(
+        workspace_id="ws",
+        run_id="run",
+        changed_files=[],
+        results=[
+            RunCheckResult(name="changed_files_static", status="failed", logs=["backend import failed"]),
+            RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                logs=["ImportError: missing schema"],
+            ),
+            RunCheckResult(
+                name="generated_app_js_tests",
+                status="failed",
+                logs=["stale selector"],
+            ),
+            RunCheckResult(
+                name="platform_invariants",
+                status="failed",
+                logs=['{"code":"preflight.route_schema_contract","location":"miniapp/app/schemas.py"}'],
+            ),
+            RunCheckResult(
+                name="frontend_interaction_static_smoke",
+                status="failed",
+                logs=['{"code":"platform.workflow_form_without_handler","location":"miniapp/app/static/client/request/index.html"}'],
+            ),
+        ],
+    )
+
+    compact = WorkspaceCodeAgentRuntime._compact_repair_checks(execution)
+    names = [item["name"] for item in compact]
+
+    assert "platform_invariants" in names
+    assert "frontend_interaction_static_smoke" in names
+    assert names.index("platform_invariants") < names.index("generated_app_python_tests")
+    assert WorkspaceCodeAgentRuntime._workflow_slice_repair_needed(execution)
+
+
+def test_generated_test_contract_mismatch_gets_workflow_repair_context() -> None:
+    execution = CheckExecutionRecord(
+        workspace_id="ws",
+        run_id="run",
+        changed_files=[],
+        results=[
+            RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                logs=["AssertionError: 422 != 200"],
+            ),
+            RunCheckResult(
+                name="generated_app_js_tests",
+                status="failed",
+                logs=["assert.ok(rootHtml.includes(page.css))"],
+            ),
+        ],
+    )
+
+    assert WorkspaceCodeAgentRuntime._workflow_slice_repair_needed(execution)
+    rules = "\n".join(
+        WorkspaceCodeAgentRuntime._compact_repair_rules(
+            generation_mode=GenerationMode.FAST,
+            focused_edit_kind="",
+            workflow_slice_repair=True,
+        )
+    )
+    assert "422 != 200" in rules
+    assert "backend create schema, frontend FormData/payload field names" in rules
+    assert "/static/<role>/styles.css" in rules
+    assert "workflow_frontend_backend_field_mismatch" in rules
+
+
+def test_operation_contract_correction_reports_empty_replace() -> None:
+    correction = WorkspaceCodeAgentRuntime._operation_contract_correction_result(
+        "Agent returned replace for miniapp/app/static/specialist/app.js without content.",
+        {
+            "operations": [
+                {
+                    "operation": "replace",
+                    "file_path": "miniapp/app/static/specialist/app.js",
+                    "content": None,
+                }
+            ]
+        },
+    )
+
+    assert correction["tool"] == "operation_contract_correction"
+    assert "create/replace require full resulting file content" in correction["contract"]
+    assert correction["previous_operations"][0]["has_content"] == "False"
 
 
 def test_provider_quota_errors_are_classified_as_terminal_platform_blockers() -> None:
@@ -1019,7 +1276,7 @@ def test_parallel_mode_contracts_make_fast_balanced_quality_different() -> None:
     assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.QUALITY) == 18
     assert blueprints[GenerationMode.FAST]["required_child_pages_per_role"] == 1
     assert blueprints[GenerationMode.BALANCED]["required_child_pages_per_role"] == 1
-    assert blueprints[GenerationMode.QUALITY]["required_child_pages_per_role"] == 3
+    assert blueprints[GenerationMode.QUALITY]["required_child_pages_per_role"] == 2
     assert blueprints[GenerationMode.FAST]["mode_contract"]["design_level"] != blueprints[GenerationMode.BALANCED]["mode_contract"]["design_level"]
     assert blueprints[GenerationMode.BALANCED]["mode_contract"]["design_level"] != blueprints[GenerationMode.QUALITY]["mode_contract"]["design_level"]
     assert len(blueprints[GenerationMode.QUALITY]["resources"]) >= len(blueprints[GenerationMode.BALANCED]["resources"])
@@ -1196,9 +1453,9 @@ def test_quality_create_patch_coverage_requires_deeper_child_pages_per_role() ->
 
     missing = WorkspaceCodeAgentRuntime._create_patch_coverage_gap(operations, request=request)
 
-    assert "miniapp/app/static/client/<three-child-pages>/index.html" in missing
-    assert "miniapp/app/static/specialist/<three-child-pages>/index.html" in missing
-    assert "miniapp/app/static/manager/<three-child-pages>/index.html" in missing
+    assert "miniapp/app/static/client/<two-child-pages>/index.html" in missing
+    assert "miniapp/app/static/specialist/<two-child-pages>/index.html" in missing
+    assert "miniapp/app/static/manager/<two-child-pages>/index.html" in missing
 
 
 def test_fix_completion_requires_meaningful_diff_even_when_checks_are_green() -> None:
@@ -2027,7 +2284,7 @@ def test_agent_turn_tuning_caps_all_generation_modes() -> None:
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.FAST, intent="create", repair_turn=True) == {
         "reasoning": {"effort": "low"},
-        "max_output_tokens": 10000,
+        "max_output_tokens": 18000,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED, intent="create") == {
         "reasoning": {"effort": "medium"},
@@ -2035,7 +2292,7 @@ def test_agent_turn_tuning_caps_all_generation_modes() -> None:
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED, intent="create", repair_turn=True) == {
         "reasoning": {"effort": "low"},
-        "max_output_tokens": 14000,
+        "max_output_tokens": 22000,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.QUALITY, intent="create") == {
         "reasoning": {"effort": "high"},
@@ -2043,7 +2300,7 @@ def test_agent_turn_tuning_caps_all_generation_modes() -> None:
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.QUALITY, intent="create", repair_turn=True) == {
         "reasoning": {"effort": "low"},
-        "max_output_tokens": 16000,
+        "max_output_tokens": 26000,
     }
     assert WorkspaceCodeAgentRuntime._agent_turn_tuning(GenerationMode.BALANCED) == {
         "reasoning": {"effort": "medium"},

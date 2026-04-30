@@ -8,6 +8,16 @@ from app.models.common import GenerationMode
 
 ROLE_ORDER = ("client", "specialist", "manager")
 GENERIC_RESOURCE_DEFAULTS = ("records", "updates", "summaries")
+PROMPT_RESOURCE_SEMANTIC_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"\b(request|requests|application|applications|inquiry|inquiries)\b", "requests"),
+    (r"\b(order|orders)\b", "orders"),
+    (r"\b(booking|bookings|reservation|reservations)\b", "bookings"),
+    (r"\b(appointment|appointments|visit|visits)\b", "appointments"),
+    (r"(заявк|обращен|запрос)", "requests"),
+    (r"(заказ)", "orders"),
+    (r"(брон|резерв)", "bookings"),
+    (r"(запис|визит|прием|приём)", "appointments"),
+)
 PROMPT_RESOURCE_STOPWORDS = {
     "about",
     "action",
@@ -46,9 +56,11 @@ PROMPT_RESOURCE_STOPWORDS = {
     "want",
     "with",
     "адрес",
+    "аккуратный",
     "вводить",
     "видел",
     "видеть",
+    "владею",
     "владелец",
     "возможность",
     "выбирать",
@@ -56,6 +68,14 @@ PROMPT_RESOURCE_STOPWORDS = {
     "должен",
     "должна",
     "должны",
+    "занятие",
+    "занятия",
+    "занятием",
+    "занятий",
+    "занятии",
+    "занятиях",
+    "данные",
+    "дату",
     "заявка",
     "заявки",
     "информация",
@@ -64,10 +84,12 @@ PROMPT_RESOURCE_STOPWORDS = {
     "которые",
     "менеджер",
     "мини",
+    "небольшим",
     "небольшой",
     "нужно",
     "оформлять",
     "отмечать",
+    "работаю",
     "приложение",
     "сделать",
     "смотреть",
@@ -78,6 +100,46 @@ PROMPT_RESOURCE_STOPWORDS = {
     "форма",
     "хочу",
 }
+PROMPT_RESOURCE_NOISE_PREFIXES = (
+    "build",
+    "create",
+    "need",
+    "want",
+    "work",
+    "аккурат",
+    "владе",
+    "долж",
+    "ежеднев",
+    "детск",
+    "занима",
+    "заняти",
+    "загруз",
+    "клиент",
+    "контакт",
+    "компани",
+    "маленьк",
+    "менедж",
+    "небольш",
+    "педагог",
+    "прилож",
+    "работа",
+    "расписан",
+    "родител",
+    "сервис",
+    "сет",
+    "служб",
+    "современ",
+    "специалист",
+    "студи",
+    "творчеств",
+    "подготов",
+    "пробн",
+    "направлен",
+    "центр",
+    "удобн",
+    "управля",
+    "хоч",
+)
 CYRILLIC_TRANSLIT = str.maketrans(
     {
         "а": "a",
@@ -150,15 +212,28 @@ def _slug_from_prompt_token(token: str) -> str:
     return slug
 
 
+def _is_prompt_resource_noise(token: str) -> bool:
+    normalized = str(token or "").strip().lower().replace("ё", "е")
+    if not normalized or normalized in PROMPT_RESOURCE_STOPWORDS:
+        return True
+    return any(normalized.startswith(prefix) for prefix in PROMPT_RESOURCE_NOISE_PREFIXES)
+
+
 def prompt_resource_candidates(prompt: str, *, limit: int = 3) -> list[str]:
     """Extract prompt-derived resource slugs without assuming a business domain."""
     candidates: list[str] = []
+    text = str(prompt or "").strip().lower().replace("ё", "е")
+    for pattern, slug in PROMPT_RESOURCE_SEMANTIC_PATTERNS:
+        if re.search(pattern, text) and slug not in candidates:
+            candidates.append(slug)
+        if len(candidates) >= limit:
+            return candidates
     for token in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{2,}", str(prompt or "")):
         normalized = token.strip().lower().replace("ё", "е")
-        if normalized in PROMPT_RESOURCE_STOPWORDS:
+        if _is_prompt_resource_noise(normalized):
             continue
         slug = _slug_from_prompt_token(normalized)
-        if len(slug) < 3 or slug in PROMPT_RESOURCE_STOPWORDS or slug in ROLE_ORDER:
+        if len(slug) < 3 or slug in ROLE_ORDER:
             continue
         if slug not in candidates:
             candidates.append(slug)
@@ -276,7 +351,7 @@ def build_acceptance_contract(
             "test_requirements": [],
         }
 
-    resource_count = 3 if mode_value == GenerationMode.QUALITY.value else 2 if mode_value == GenerationMode.BALANCED.value else 1
+    resource_count = 1
     prompt_resources = prompt_resource_candidates(prompt, limit=resource_count)
     endpoint_resources = [
         *prompt_resources,
@@ -299,19 +374,19 @@ def build_acceptance_contract(
             ],
         }
     ]
-    if resource_count >= 2:
+    if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
         flows.append(
             {
                 "id": "related_resource_workflow",
-                "title": "Related role workflow and operational updates",
+                "title": "Related status, summary, and operational updates",
                 "roles": list(ROLE_ORDER),
                 "requirements": [
-                    "At least two prompt-derived resources or workflows are connected through shared persisted state.",
-                    "Role pages expose different actions for creating, processing, and reviewing records.",
-                    "Specialist or manager status changes are visible to the other roles through later GET requests.",
+                    "One prompt-derived shared resource supports create, process/update, review, and summary workflows.",
+                    "Role pages expose different actions for creating, processing, and reviewing saved records.",
+                    "Specialist or manager status/payment/attendance changes are visible to the other roles through later GET requests.",
                 ],
                 "required_tests": [
-                    "Generated tests cover the primary create/list/update flow and one related status or summary flow.",
+                    "Generated tests cover the primary create/list/update flow and one related status, payment, attendance, or summary flow.",
                 ],
             }
         )

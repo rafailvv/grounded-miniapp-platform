@@ -621,13 +621,14 @@ class CheckRunner:
                     blocking=True,
                 )
             )
-        issues.extend(cls._frontend_role_wiring_issues(static_root))
+        issues.extend(cls._frontend_role_wiring_issues(static_root, backend_text=backend_text))
         issues.extend(cls._role_css_html_contract_issues(static_root))
         return cls._dedupe_validation_issues(issues)
 
     @classmethod
-    def _frontend_role_wiring_issues(cls, static_root: Path) -> list[ValidationIssue]:
+    def _frontend_role_wiring_issues(cls, static_root: Path, *, backend_text: str = "") -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
+        backend_create_fields = cls._backend_create_schema_fields(backend_text)
         for role in ROLE_ORDER:
             role_dir = static_root / role
             js_path = role_dir / "app.js"
@@ -647,7 +648,15 @@ class CheckRunner:
             combined_html = "\n".join(html_by_path.values())
             issues.extend(cls._selector_wiring_issues(role, js_path, js_source, combined_html))
             for relative_path, html_source in html_by_path.items():
-                issues.extend(cls._form_wiring_issues(relative_path, js_path, html_source, js_source))
+                issues.extend(
+                    cls._form_wiring_issues(
+                        relative_path,
+                        js_path,
+                        html_source,
+                        js_source,
+                        backend_create_fields=backend_create_fields,
+                    )
+                )
                 issues.extend(cls._button_wiring_issues(relative_path, js_path, html_source, js_source))
         return issues
 
@@ -660,6 +669,8 @@ class CheckRunner:
             if cls._html_has_simple_selector(combined_html, selector):
                 continue
             if cls._selector_is_optional_feedback_target(js_source, selector):
+                continue
+            if cls._selector_is_optional_fallback_query(js_source, selector):
                 continue
             blocking = selector.strip().startswith("#")
             issues.append(
@@ -691,6 +702,21 @@ class CheckRunner:
                 return True
             if re.search(rf"\bif\s*\(\s*{escaped}\s*\)", text):
                 return True
+        return False
+
+    @staticmethod
+    def _selector_is_optional_fallback_query(js_source: str, selector: str) -> bool:
+        value = str(selector or "").strip()
+        if not value:
+            return False
+        escaped = re.escape(value)
+        query_pattern = re.compile(
+            rf"""querySelector(?:All)?\(\s*(?:"{escaped}"|'{escaped}'|`{escaped}`)\s*\)"""
+        )
+        for line in str(js_source or "").splitlines():
+            if ("||" not in line and "??" not in line) or not query_pattern.search(line):
+                continue
+            return True
         return False
 
     @staticmethod
@@ -737,9 +763,20 @@ class CheckRunner:
         return value.lower() in html.lower()
 
     @classmethod
-    def _form_wiring_issues(cls, relative_path: str, js_path: Path, html_source: str, js_source: str) -> list[ValidationIssue]:
+    def _form_wiring_issues(
+        cls,
+        relative_path: str,
+        js_path: Path,
+        html_source: str,
+        js_source: str,
+        *,
+        backend_create_fields: set[str] | None = None,
+    ) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
-        for form in cls._html_forms(html_source):
+        backend_create_fields = set(backend_create_fields or set())
+        forms = cls._html_forms(html_source)
+        multiple_forms = len(forms) > 1
+        for form in forms:
             form_id = str(form.get("id") or "").strip()
             form_selectors = [str(selector) for selector in form.get("selectors") or [] if str(selector).strip()]
             field_names = set(form.get("field_names") or [])
@@ -777,8 +814,13 @@ class CheckRunner:
                 )
             if not field_names:
                 continue
-            if "Object.fromEntries" in js_source and "new FormData" in js_source:
-                data_props = set(re.findall(r"\bdata\.([A-Za-z_$][\w$]*)", js_source))
+            if not multiple_forms and "Object.fromEntries" in js_source and "new FormData" in js_source:
+                formdata_vars = cls._js_object_from_entries_formdata_vars(js_source)
+                data_props = {
+                    prop
+                    for var_name in formdata_vars
+                    for prop in re.findall(rf"\b{re.escape(var_name)}\.([A-Za-z_$][\w$]*)", js_source)
+                }
                 formdata_api_props = {"append", "delete", "entries", "forEach", "get", "getAll", "has", "keys", "set", "values"}
                 unknown_props = sorted(prop for prop in data_props if prop not in field_names and prop not in {"id"} | formdata_api_props)
                 if unknown_props:
@@ -809,7 +851,113 @@ class CheckRunner:
                             blocking=True,
                         )
                     )
+            if (
+                backend_create_fields
+                and re.search(r"\bmethod\s*:\s*([\"'`])POST\1", js_source, re.IGNORECASE)
+                and not (
+                    cls._form_looks_like_status_update(field_names)
+                    and re.search(r"\bmethod\s*:\s*([\"'`])(?:PATCH|PUT|DELETE)\1", js_source, re.IGNORECASE)
+                )
+            ):
+                payload_fields = cls._js_effective_form_payload_fields(js_source, field_names)
+                unknown_payload_fields = sorted(
+                    field
+                    for field in payload_fields
+                    if field not in backend_create_fields and field not in {"id", "record_id"}
+                )
+                if unknown_payload_fields:
+                    issues.append(
+                        ValidationIssue(
+                            code="platform.workflow_frontend_backend_field_mismatch",
+                            message=(
+                                f"{relative_path} form {form_label} can submit fields not accepted by the backend create schema: "
+                                f"{', '.join(unknown_payload_fields[:6])}. Align HTML names, JavaScript payload keys, "
+                                "backend create schema, and generated tests to one contract."
+                            ),
+                            severity="high",
+                            location=relative_path,
+                            blocking=True,
+                        )
+                    )
         return issues
+
+    @staticmethod
+    def _js_object_from_entries_formdata_vars(js_source: str) -> set[str]:
+        text = str(js_source or "")
+        vars_: set[str] = set()
+        direct_pattern = re.compile(
+            r"\b(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*Object\.fromEntries\(\s*new\s+FormData\b",
+            re.DOTALL,
+        )
+        vars_.update(match.group("var") for match in direct_pattern.finditer(text))
+        formdata_vars = {
+            match.group("var")
+            for match in re.finditer(
+                r"\b(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*new\s+FormData\b",
+                text,
+            )
+        }
+        for formdata_var in formdata_vars:
+            pattern = re.compile(
+                rf"\b(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*Object\.fromEntries\(\s*{re.escape(formdata_var)}(?:\.entries\(\))?\s*\)",
+                re.DOTALL,
+            )
+            vars_.update(match.group("var") for match in pattern.finditer(text))
+        return vars_
+
+    @staticmethod
+    def _backend_create_schema_fields(backend_text: str) -> set[str]:
+        fields: set[str] = set()
+        text = str(backend_text or "")
+        for match in re.finditer(
+            r"^class\s+[A-Za-z_][A-Za-z0-9_]*Create[A-Za-z0-9_]*\([^)]*(?:StrictModel|BaseModel)[^)]*\):\s*$",
+            text,
+            re.MULTILINE,
+        ):
+            start = match.end()
+            next_match = re.search(r"^(?:class|def|@router\.)\s+", text[start:], re.MULTILINE)
+            end = start + next_match.start() if next_match else len(text)
+            body = text[start:end]
+            for field_match in re.finditer(r"^\s{4}([A-Za-z_][A-Za-z0-9_]*)\s*:", body, re.MULTILINE):
+                fields.add(field_match.group(1))
+        return fields
+
+    @staticmethod
+    def _form_looks_like_status_update(field_names: set[str]) -> bool:
+        normalized = {str(field or "").strip().lower() for field in field_names}
+        update_markers = {
+            "status",
+            "state",
+            "stage",
+            "attendance",
+            "visit_status",
+            "payment_status",
+            "specialist_note",
+            "manager_note",
+            "note",
+            "record_id",
+            "request_id",
+            "id",
+        }
+        return bool(normalized & update_markers) and not {"parent_name", "phone", "direction", "preferred_date", "lesson_date"} & normalized
+
+    @staticmethod
+    def _js_effective_form_payload_fields(js_source: str, field_names: set[str]) -> set[str]:
+        text = str(js_source or "")
+        fields = set(field_names)
+        if "Object.fromEntries" not in text or "FormData" not in text:
+            return {
+                field
+                for field in field_names
+                if CheckRunner._js_reads_form_field(text, field)
+            }
+        for match in re.finditer(r"\bdelete\s+payload(?:\.([A-Za-z_$][\w$]*)|\[\s*([\"'])([A-Za-z_$][\w$]*)\2\s*\])", text):
+            fields.discard(str(match.group(1) or match.group(3) or ""))
+        for match in re.finditer(r"\bpayload(?:\.([A-Za-z_$][\w$]*)|\[\s*([\"'])([A-Za-z_$][\w$]*)\2\s*\])\s*=", text):
+            field = str(match.group(1) or match.group(3) or "")
+            if field:
+                fields.add(field)
+        return fields
 
     @staticmethod
     def _html_forms(html_source: str) -> list[dict[str, object]]:
@@ -846,7 +994,7 @@ class CheckRunner:
                 continue
             button_id = id_match.group("id")
             type_match = re.search(r"\btype\s*=\s*([\"'])(?P<type>[^\"']+)\1", attrs, re.IGNORECASE)
-            if str(type_match.group("type") if type_match else "").lower() == "submit":
+            if str(type_match.group("type") if type_match else "").lower() in {"submit", "reset"}:
                 continue
             if cls._js_references_dom_id(js_source, button_id):
                 continue
@@ -867,6 +1015,8 @@ class CheckRunner:
         return bool(
             re.search(rf"getElementById\(\s*([\"']){escaped}\1\s*\)", js_source)
             or re.search(rf"querySelector\(\s*([\"'])#{escaped}\1\s*\)", js_source)
+            or re.search(rf"querySelectorAll\(\s*([\"'])#{escaped}\1\s*\)", js_source)
+            or re.search(rf"closest\(\s*([\"'])#{escaped}\1\s*\)", js_source)
             or re.search(rf"([\"']){escaped}\1", js_source)
         )
 
@@ -898,11 +1048,19 @@ class CheckRunner:
     @staticmethod
     def _js_reads_form_field(js_source: str, field_name: str) -> bool:
         escaped = re.escape(str(field_name or ""))
+        text = str(js_source or "")
         return bool(
             re.search(rf"\.get\(\s*([\"']){escaped}\1\s*\)", js_source)
             or re.search(rf"\b{escaped}\s*:", js_source)
             or re.search(rf"\bdata\.{escaped}\b", js_source)
             or re.search(rf"\b[A-Za-z_$][\w$]*\.{escaped}\b", js_source)
+            or re.search(rf"\[\s*name\s*=\s*([\"']){escaped}\1\s*\]", text)
+            or re.search(rf"\bname\s*=\s*([\"']){escaped}\1", text)
+            or re.search(rf"\bcollectFormData\([^)]*\[[^\]]*([\"']){escaped}\1", text, re.DOTALL)
+            or re.search(
+                rf"\bfor\s*\([^)]*\bkey\b[^)]*\bof\b\s*\[[^\]]*([\"']){escaped}\1[^\]]*\][\s\S]{{0,500}}\.get\(\s*key\s*\)",
+                text,
+            )
         )
 
     @classmethod
@@ -1800,8 +1958,8 @@ class CheckRunner:
     def _min_role_route_pages(generation_mode: GenerationMode | str | None) -> int:
         value = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
         if value == GenerationMode.QUALITY.value:
-            return 4
-        return 2 if value == GenerationMode.FAST.value else MIN_ROLE_ROUTE_PAGES
+            return 3
+        return 2
 
     @staticmethod
     def _role_design_depth_issue(role: str, css_text: str, combined: str, generation_mode: GenerationMode | str | None) -> ValidationIssue | None:
@@ -1966,10 +2124,15 @@ class CheckRunner:
                 re.search(r"method\s*:\s*['\"]post['\"]", text, flags=re.IGNORECASE)
                 and re.search(r"(status_updates|status|статус|готов|очеред)", lowered)
             )
-            if has_update_method or has_status_post:
+            has_api_action = bool(
+                has_update_method
+                or has_status_post
+                or ("/api/" in lowered and "fetch(" in lowered and re.search(r"(status|attendance|visit|статус|посещ|отмет|сохран|готов|обнов)", lowered))
+            )
+            if has_api_action:
                 signals.append("status_update")
             if re.search(r"\b(confirm|done|complete|assign|process|status|queue)\b", lowered) or re.search(
-                r"(статус|готов|очеред|заказ|обнов|кондитер|работ)", lowered
+                r"(статус|готов|очеред|заявк|занят|посещ|педагог|обнов|сохран|отмет|работ)", lowered
             ):
                 signals.append("operations")
             return signals if len(signals) >= 2 else []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 from pathlib import Path
 
 from app.main import create_app
@@ -881,6 +882,147 @@ def test_frontend_interaction_static_smoke_rejects_balanced_html_js_mismatches(t
     assert "platform.workflow_formdata_field_mismatch" in logs
 
 
+def test_frontend_interaction_static_smoke_rejects_frontend_backend_field_mismatch(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    client_dir = source_dir / "miniapp/app/static/client"
+    routes_dir = source_dir / "miniapp/app/routes"
+    client_dir.mkdir(parents=True, exist_ok=True)
+    routes_dir.mkdir(parents=True, exist_ok=True)
+    for role in ("specialist", "manager"):
+        role_dir = source_dir / f"miniapp/app/static/{role}"
+        role_dir.mkdir(parents=True, exist_ok=True)
+        role_dir.joinpath("index.html").write_text("<main class='page-shell'><button id='refresh'>Refresh</button></main>", encoding="utf-8")
+        role_dir.joinpath("app.js").write_text(
+            "document.getElementById('refresh')?.addEventListener('click', () => fetch('/api/records', { method: 'PATCH' }));",
+            encoding="utf-8",
+        )
+        role_dir.joinpath("styles.css").write_text(".page-shell{min-width:0}@media(max-width:700px){.page-shell{display:block}}", encoding="utf-8")
+    client_dir.joinpath("index.html").write_text(
+        "<main class='page-shell'><form id='request-form'><input name='direction'><input name='lesson_date'><input name='comment'><button type='submit'>Send</button></form></main>",
+        encoding="utf-8",
+    )
+    client_dir.joinpath("app.js").write_text(
+        "const form = document.getElementById('request-form');\n"
+        "form?.addEventListener('submit', (event) => { event.preventDefault(); const payload = Object.fromEntries(new FormData(form).entries()); fetch('/api/records', { method: 'POST', body: JSON.stringify(payload) }); });\n",
+        encoding="utf-8",
+    )
+    client_dir.joinpath("styles.css").write_text(".page-shell{min-width:0}@media(max-width:700px){.page-shell{display:block}}", encoding="utf-8")
+    routes_dir.joinpath("app_api.py").write_text(
+        "from pydantic import BaseModel\n"
+        "class RecordCreate(BaseModel):\n"
+        "    direction: str\n"
+        "    lesson_date: str\n"
+        "    note: str = ''\n"
+        "def create(payload: RecordCreate): return payload\n",
+        encoding="utf-8",
+    )
+    tests_dir = source_dir / "miniapp/tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    tests_dir.joinpath("test_generated_app.py").write_text("import unittest\n# GET POST PATCH\n", encoding="utf-8")
+    tests_dir.joinpath("generated_app.test.mjs").write_text("// GET POST PATCH records\n", encoding="utf-8")
+
+    contract = build_acceptance_contract(
+        prompt="Клиент отправляет заявку, специалист меняет статус, менеджер видит сводку",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._frontend_interaction_static_smoke(
+        source_dir=source_dir,
+        changed_files=["miniapp/app/static/client/app.js"],
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract=contract,
+    )
+
+    assert result.status == "failed"
+    assert "platform.workflow_frontend_backend_field_mismatch" in "\n".join(result.logs)
+
+
+def test_formdata_field_validator_ignores_api_response_data_props(tmp_path: Path) -> None:
+    client_dir = tmp_path / "source/miniapp/app/static/client"
+    client_dir.mkdir(parents=True)
+    js_path = client_dir / "app.js"
+    html_source = (
+        "<form id='slot-form'>"
+        "<input name='date'>"
+        "<input name='direction'>"
+        "<input name='note'>"
+        "<button type='submit'>Save</button>"
+        "</form>"
+    )
+    js_source = (
+        "async function loadItems() { const response = await fetch('/api/records'); const data = await response.json(); return data.items || []; }\n"
+        "const form = document.getElementById('slot-form');\n"
+        "form?.addEventListener('submit', (event) => { event.preventDefault(); const payload = Object.fromEntries(new FormData(form).entries()); fetch('/api/records', { method: 'POST', body: JSON.stringify(payload) }); });\n"
+    )
+
+    issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/client/slots/index.html",
+        js_path,
+        html_source,
+        js_source,
+    )
+
+    assert not any(issue.code == "platform.workflow_formdata_field_mismatch" for issue in issues)
+
+
+def test_specialist_role_action_signals_accept_generic_saved_work_processing() -> None:
+    content = """
+    <main class="page-shell">
+      <form id="specialist-form"><select name="status"></select><button type="submit">Сохранить</button></form>
+    </main>
+    <script>
+      form.addEventListener('submit', () => fetch('/api/records/1', { method: updateMethod, body: JSON.stringify({ status: 'confirmed', attendance: 'visited' }) }));
+    </script>
+    """
+
+    signals = CheckRunner._role_action_signals("specialist", content)
+
+    assert {"status_update", "operations"} <= set(signals)
+
+
+def test_frontend_validator_allows_reset_buttons_and_status_update_forms(tmp_path: Path) -> None:
+    client_dir = tmp_path / "source/miniapp/app/static/client"
+    specialist_dir = tmp_path / "source/miniapp/app/static/specialist"
+    client_dir.mkdir(parents=True)
+    specialist_dir.mkdir(parents=True)
+    client_issues = CheckRunner._button_wiring_issues(
+        "miniapp/app/static/client/request/index.html",
+        client_dir / "app.js",
+        "<form><button id='resetTrial' type='reset'>Очистить</button></form>",
+        "",
+    )
+    assert not client_issues
+
+    specialist_issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/specialist/work/index.html",
+        specialist_dir / "app.js",
+        "<form id='request-form'><select name='status'></select><select name='attendance'></select><textarea name='specialist_note'></textarea><button type='submit'>Save</button></form>",
+        "const form = document.getElementById('request-form'); form?.addEventListener('submit', event => { event.preventDefault(); const payload = Object.fromEntries(new FormData(form).entries()); fetch('/api/records/1', { method: 'PATCH', body: JSON.stringify(payload) }); }); fetch('/api/records', { method: 'POST', body: '{}' });",
+        backend_create_fields={"parent_name", "phone", "direction", "preferred_date"},
+    )
+    assert not any(issue.code == "platform.workflow_frontend_backend_field_mismatch" for issue in specialist_issues)
+
+
+def test_formdata_field_validator_skips_cross_form_props_on_multi_form_pages(tmp_path: Path) -> None:
+    specialist_dir = tmp_path / "source/miniapp/app/static/specialist"
+    specialist_dir.mkdir(parents=True)
+    issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/specialist/index.html",
+        specialist_dir / "app.js",
+        "<form id='lesson-form'><input name='capacity'><button type='submit'>Add</button></form>"
+        "<form id='status-form'><input name='status'><button type='submit'>Save</button></form>",
+        "const lesson = document.getElementById('lesson-form');"
+        "lesson?.addEventListener('submit', event => { event.preventDefault(); const payload = Object.fromEntries(new FormData(lesson).entries()); payload.capacity = Number(payload.capacity); });"
+        "const status = document.getElementById('status-form');"
+        "status?.addEventListener('submit', event => { event.preventDefault(); const payload = { status: new FormData(status).get('status') }; fetch('/api/records/1', { method: 'PATCH', body: JSON.stringify(payload) }); });",
+    )
+
+    assert not any(issue.code == "platform.workflow_formdata_field_mismatch" for issue in issues)
+
+
 def test_role_css_html_contract_rejects_unstyled_html_layout_classes(tmp_path: Path) -> None:
     static_root = tmp_path / "source/miniapp/app/static"
     client_dir = static_root / "client"
@@ -1183,6 +1325,105 @@ def test_frontend_wiring_ignores_formdata_api_methods(tmp_path: Path) -> None:
     )
 
     assert not any(issue.code == "platform.workflow_formdata_field_mismatch" for issue in issues)
+
+
+def test_frontend_wiring_detects_collect_form_data_field_arrays(tmp_path: Path) -> None:
+    specialist_dir = tmp_path / "source/miniapp/app/static/specialist"
+    specialist_dir.mkdir(parents=True)
+    js_path = specialist_dir / "app.js"
+    html_source = (
+        "<form id='slot-form'>"
+        "<input name='session_date'>"
+        "<input name='session_time'>"
+        "<input name='available_seats'>"
+        "<textarea name='note'></textarea>"
+        "<button type='submit'>Save</button>"
+        "</form>"
+    )
+    js_source = (
+        "const form = document.querySelector('#slot-form');\n"
+        "function collectFormData(form, fields) { const data = new FormData(form); return Object.fromEntries(fields.map((field) => [field, data.get(field)])); }\n"
+        "form.addEventListener('submit', (event) => {\n"
+        "  event.preventDefault();\n"
+        "  const payload = collectFormData(form, ['session_date', 'session_time', 'available_seats', 'note']);\n"
+        "  fetch('/api/records', { method: 'POST', body: JSON.stringify(payload) });\n"
+        "});\n"
+    )
+
+    issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/specialist/slots/index.html",
+        js_path,
+        html_source,
+        js_source,
+    )
+
+    assert not any(issue.code == "platform.workflow_form_field_not_submitted" for issue in issues)
+
+
+def test_frontend_wiring_accepts_query_selector_all_button_handler(tmp_path: Path) -> None:
+    manager_dir = tmp_path / "source/miniapp/app/static/manager"
+    manager_dir.mkdir(parents=True)
+    js_path = manager_dir / "app.js"
+    html_source = "<button id='manager-refresh' type='button'>Refresh</button>"
+    js_source = (
+        "const refreshButtons = Array.from(document.querySelectorAll('#manager-refresh'));\n"
+        "refreshButtons.forEach((button) => button.addEventListener('click', refreshData));\n"
+    )
+
+    issues = CheckRunner._button_wiring_issues(
+        "miniapp/app/static/manager/index.html",
+        js_path,
+        html_source,
+        js_source,
+    )
+
+    assert not any(issue.code == "platform.workflow_button_without_handler" for issue in issues)
+
+
+def test_frontend_wiring_accepts_optional_fallback_selector(tmp_path: Path) -> None:
+    manager_dir = tmp_path / "source/miniapp/app/static/manager"
+    manager_dir.mkdir(parents=True)
+    js_path = manager_dir / "app.js"
+    html_source = "<p id='manager-refresh-status'></p>"
+    js_source = (
+        "const status = document.querySelector('#manager-refresh-status') || document.querySelector('#manager-status-feedback');\n"
+        "if (status) { status.textContent = 'Updated'; }\n"
+    )
+
+    issues = CheckRunner._selector_wiring_issues("manager", js_path, js_source, html_source)
+
+    assert not any(issue.code == "platform.workflow_selector_matches_no_html" for issue in issues)
+
+
+def test_frontend_wiring_accepts_id_field_read_for_path_update(tmp_path: Path) -> None:
+    specialist_dir = tmp_path / "source/miniapp/app/static/specialist"
+    specialist_dir.mkdir(parents=True)
+    js_path = specialist_dir / "app.js"
+    html_source = (
+        "<form id='specialist-status-form'>"
+        "<input name='request_id'>"
+        "<select name='status'></select>"
+        "<button type='submit'>Save</button>"
+        "</form>"
+    )
+    js_source = (
+        "const form = document.querySelector('#specialist-status-form');\n"
+        "form.addEventListener('submit', (event) => {\n"
+        "  event.preventDefault();\n"
+        "  const requestIdField = form.querySelector('[name=\"request_id\"]');\n"
+        "  const payload = { status: form.querySelector('[name=\"status\"]').value };\n"
+        "  fetch(`/api/requests/${requestIdField.value}`, { method: 'PATCH', body: JSON.stringify(payload) });\n"
+        "});\n"
+    )
+
+    issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/specialist/requests-work/index.html",
+        js_path,
+        html_source,
+        js_source,
+    )
+
+    assert not any(issue.code == "platform.workflow_form_field_not_submitted" for issue in issues)
 
 
 def test_js_class_names_include_inner_html_template_classes() -> None:
@@ -1621,10 +1862,20 @@ def test_specialist_role_actions_accept_status_post_workflow() -> None:
     assert CheckRunner._role_action_signals("specialist", content) == ["status_update", "operations"]
 
 
-def test_quality_agentic_platform_invariants_require_three_child_pages_per_role(tmp_path: Path) -> None:
+def test_quality_agentic_platform_invariants_require_two_child_pages_per_role(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     _write_multipage_role_surfaces(source_dir)
     _write_generated_test_placeholders(source_dir)
+    manifest = {"roles": {}, "shared": {}}
+    for role in ("client", "specialist", "manager"):
+        shutil.rmtree(source_dir / "miniapp/app/static" / role / "catalog", ignore_errors=True)
+        manifest["roles"][role] = {
+            "routes": {
+                f"/{role}": f"static/{role}/index.html",
+                f"/{role}/profile": f"static/{role}/profile/index.html",
+            }
+        }
+    (source_dir / "miniapp/app/generated/route_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     quality_css = (
         ".page-shell.quality-app { color: #172033; }\n"
         ".dashboard-grid { display: grid; }\n"
@@ -1654,7 +1905,7 @@ def test_quality_agentic_platform_invariants_require_three_child_pages_per_role(
 
     assert result.status == "failed"
     assert "platform.single_page_role_surface" in "\n".join(result.logs)
-    assert result.diagnostics["multipage_coverage"]["client"]["required_route_count"] == 4
+    assert result.diagnostics["multipage_coverage"]["client"]["required_route_count"] == 3
 
 
 def test_agentic_create_invariants_require_persistent_post_api(tmp_path: Path) -> None:
