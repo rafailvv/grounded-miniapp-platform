@@ -105,10 +105,12 @@ def test_preview_rebuild_returns_persisted_running_record(monkeypatch, tmp_path:
     )
     monkeypatch.setattr(service, "_select_proxy_port", lambda _workspace_id, _preview, _source_dir: 16789)
 
-    preview = service.rebuild("ws_return", source_dir=tmp_path)
+    preview = service.rebuild("ws_return", source_dir=tmp_path, draft_run_id="run_draft")
 
     assert preview.status == "running"
     assert preview.url == "http://localhost:16789"
+    assert preview.draft_run_id == "run_draft"
     persisted = store.get("previews", "ws_return")
     assert persisted["status"] == "running"
     assert persisted["url"] == "http://localhost:16789"
+    assert persisted["draft_run_id"] == "run_draft"

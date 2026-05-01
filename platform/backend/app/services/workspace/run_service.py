@@ -29,7 +29,7 @@ from app.models.domain import (
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
-from app.services.workflow_acceptance import build_acceptance_contract, orchestration_metadata_for_contract
+from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, orchestration_metadata_for_contract
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.service import WorkspaceService
@@ -184,6 +184,13 @@ class RunService:
             generation_mode=effective_generation_mode,
             focused_edit_kind=focused_edit_kind,
         )
+        implementation_plan = build_implementation_plan(
+            prompt=request.prompt,
+            intent=resolved_intent,
+            generation_mode=effective_generation_mode,
+            acceptance_contract=acceptance_contract,
+            orchestration=orchestration,
+        )
         run = RunRecord(
             workspace_id=workspace_id,
             prompt=request.prompt,
@@ -198,6 +205,7 @@ class RunService:
             resume_from_run_id=request.resume_from_run_id,
             source_revision_id=workspace.current_revision_id,
             error_context=request.error_context,
+            implementation_plan=implementation_plan,
             acceptance_contract=acceptance_contract,
             orchestration_phases=list(orchestration.get("phases") or []),
             worker_summaries=list(orchestration.get("worker_summaries") or []),
@@ -609,10 +617,18 @@ class RunService:
             run.token_usage = self._richer_token_usage(run.token_usage, existing_usage)
             if not run.linked_job_id and existing.get("linked_job_id"):
                 run.linked_job_id = str(existing.get("linked_job_id") or "")
-            for attr in ("orchestration_phases", "worker_summaries"):
+            for attr in ("orchestration_phases", "worker_summaries", "repair_issue_signatures"):
                 if not getattr(run, attr, None) and isinstance(existing.get(attr), list):
                     setattr(run, attr, list(existing.get(attr) or []))
-            for attr in ("acceptance_contract", "flow_coverage", "completion_budget", "budget_status"):
+            for attr in (
+                "implementation_plan",
+                "acceptance_contract",
+                "flow_coverage",
+                "browser_flow_proof",
+                "mobile_layout_report",
+                "completion_budget",
+                "budget_status",
+            ):
                 if not getattr(run, attr, None) and isinstance(existing.get(attr), dict):
                     setattr(run, attr, dict(existing.get(attr) or {}))
             for attr in ("event_storage_ref", "artifact_storage_ref"):
@@ -718,11 +734,19 @@ class RunService:
                 if specific and specific != run.failure_reason:
                     run.failure_reason = specific
                     changed = True
-            for attr in ("orchestration_phases", "worker_summaries"):
+            for attr in ("orchestration_phases", "worker_summaries", "repair_issue_signatures"):
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, list(getattr(job, attr) or []))
                     changed = True
-            for attr in ("acceptance_contract", "flow_coverage", "completion_budget", "budget_status"):
+            for attr in (
+                "implementation_plan",
+                "acceptance_contract",
+                "flow_coverage",
+                "browser_flow_proof",
+                "mobile_layout_report",
+                "completion_budget",
+                "budget_status",
+            ):
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, dict(getattr(job, attr) or {}))
                     changed = True
@@ -935,9 +959,13 @@ class RunService:
                 self._token_usage_from_job_events(job),
             )
             run.orchestration_phases = list(getattr(job, "orchestration_phases", []) or run.orchestration_phases)
+            run.implementation_plan = dict(getattr(job, "implementation_plan", {}) or run.implementation_plan)
             run.acceptance_contract = dict(getattr(job, "acceptance_contract", {}) or run.acceptance_contract)
             run.worker_summaries = list(getattr(job, "worker_summaries", []) or run.worker_summaries)
             run.flow_coverage = dict(getattr(job, "flow_coverage", {}) or run.flow_coverage)
+            run.browser_flow_proof = dict(getattr(job, "browser_flow_proof", {}) or run.browser_flow_proof)
+            run.repair_issue_signatures = list(getattr(job, "repair_issue_signatures", []) or run.repair_issue_signatures)
+            run.mobile_layout_report = dict(getattr(job, "mobile_layout_report", {}) or run.mobile_layout_report)
             run.completion_budget = dict(getattr(job, "completion_budget", {}) or run.completion_budget)
             run.budget_status = dict(getattr(job, "budget_status", {}) or run.budget_status)
             run.repair_iterations = list(job.repair_iterations)
@@ -1404,9 +1432,13 @@ class RunService:
             "generated_tests": run.generated_tests,
             "neutral_template_findings": run.neutral_template_findings,
             "orchestration_phases": run.orchestration_phases,
+            "implementation_plan": run.implementation_plan,
             "acceptance_contract": run.acceptance_contract,
             "worker_summaries": run.worker_summaries,
             "flow_coverage": run.flow_coverage,
+            "browser_flow_proof": run.browser_flow_proof,
+            "repair_issue_signatures": run.repair_issue_signatures,
+            "mobile_layout_report": run.mobile_layout_report,
             "preview": preview_payload,
             "draft_preview": {
                 key: value
@@ -1526,6 +1558,16 @@ class RunService:
                     "details": result.details,
                     "diagnostics": dict(diagnostics),
                     "logs": list(result.logs or []),
+                }
+            if result.name == "browser_flow_smoke":
+                flow_coverage = {
+                    **flow_coverage,
+                    "browser_flow": {
+                        "status": result.status,
+                        "details": result.details,
+                        "diagnostics": dict(diagnostics),
+                        "logs": list(result.logs or []),
+                    },
                 }
         return {
             "workspace_id": execution.workspace_id,

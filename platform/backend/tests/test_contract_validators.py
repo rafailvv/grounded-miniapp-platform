@@ -7,7 +7,7 @@ from pathlib import Path
 
 from app.main import create_app
 from app.models.common import GenerationMode
-from app.models.domain import RunCheckResult, WorkspaceRecord
+from app.models.domain import PreviewRecord, RunCheckResult, WorkspaceRecord
 from app.services.check_runner import CheckRunner
 from app.services.workflow_acceptance import build_acceptance_contract
 from app.services.workspace.preview_service import PreviewService
@@ -822,6 +822,274 @@ def test_frontend_interaction_static_smoke_accepts_complete_generic_flow(tmp_pat
     assert result.status == "passed"
 
 
+def _write_browser_flow_source(source_dir: Path, *, fixed_width_css: bool = False) -> None:
+    app_dir = source_dir / "miniapp/app"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    app_dir.joinpath("__init__.py").write_text("", encoding="utf-8")
+    app_dir.joinpath("main.py").write_text(
+        """
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI()
+THINGS = []
+
+
+class ThingCreate(BaseModel):
+    title: str
+    contact: str | None = None
+
+
+class ThingPatch(BaseModel):
+    status: str | None = None
+    note: str | None = None
+
+
+@app.get("/api/things")
+def list_things():
+    return {"items": THINGS, "total": len(THINGS)}
+
+
+@app.post("/api/things", status_code=201)
+def create_thing(payload: ThingCreate):
+    item = {"id": len(THINGS) + 1, "status": "new", **payload.model_dump()}
+    THINGS.append(item)
+    return item
+
+
+@app.patch("/api/things/{thing_id}")
+def update_thing(thing_id: int, payload: ThingPatch):
+    for item in THINGS:
+        if item["id"] == thing_id:
+            item.update(payload.model_dump(exclude_unset=True))
+            return item
+    raise HTTPException(status_code=404, detail="not found")
+""",
+        encoding="utf-8",
+    )
+    css = ".page-shell { max-width: 430px; width: 100%; min-width: 0; }\n"
+    if fixed_width_css:
+        css += ".summary-panel { min-width: 720px; }\n"
+    for role in ("client", "specialist", "manager"):
+        role_dir = source_dir / "miniapp/app/static" / role
+        role_dir.mkdir(parents=True, exist_ok=True)
+        role_dir.joinpath("index.html").write_text(
+            f"<main class='page-shell'><section class='summary-panel'>{role}</section></main>",
+            encoding="utf-8",
+        )
+        role_dir.joinpath("styles.css").write_text(css, encoding="utf-8")
+        role_dir.joinpath("app.js").write_text("fetch('/api/things');\n", encoding="utf-8")
+
+
+def _runner_for_browser_flow() -> CheckRunner:
+    class FakeValidationSuite:
+        def validate_build(self, workspace_path: Path):
+            del workspace_path
+            return []
+
+        def validate_connectivity(self, workspace_path: Path):
+            del workspace_path
+            return []
+
+    return CheckRunner(FakeValidationSuite(), object())  # type: ignore[arg-type]
+
+
+def test_api_workflow_smoke_fails_without_real_workflow_api_even_if_preview_running(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    (source_dir / "miniapp/app").mkdir(parents=True)
+    (source_dir / "miniapp/app/__init__.py").write_text("", encoding="utf-8")
+    (source_dir / "miniapp/app/main.py").write_text("from fastapi import FastAPI\napp = FastAPI()\n", encoding="utf-8")
+    contract = build_acceptance_contract(
+        prompt="Клиент создает объект, специалист обновляет, менеджер контролирует",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+    )
+    runner = _runner_for_browser_flow()
+
+    result = runner._api_workflow_smoke(
+        source_dir=source_dir,
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract=contract,
+    )
+
+    assert result.status == "failed"
+    assert result.diagnostics["failed_step"] == "api_discovery"
+
+
+def test_api_workflow_smoke_passes_generic_create_update_persistence(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_browser_flow_source(source_dir)
+    contract = build_acceptance_contract(
+        prompt="Клиент создает объект, специалист обновляет, менеджер контролирует",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+    )
+    contract["required_endpoints"] = [{"path": "/api/things", "methods": ["GET", "POST", "PATCH"]}]
+    runner = _runner_for_browser_flow()
+
+    result = runner._api_workflow_smoke(
+        source_dir=source_dir,
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract=contract,
+    )
+
+    assert result.status == "passed"
+    assert [step["step"] for step in result.diagnostics["steps"]] == [
+        "initial_get",
+        "client_create",
+        "create_persistence",
+        "specialist_update",
+        "client_refresh_visibility",
+    ]
+    assert result.diagnostics["api_paths"] == ["/api/things"]
+
+
+def test_browser_flow_smoke_fails_mobile_horizontal_overflow(monkeypatch, tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_browser_flow_source(source_dir, fixed_width_css=True)
+    contract = build_acceptance_contract(
+        prompt="Клиент создает объект, специалист обновляет, менеджер контролирует",
+        intent="create",
+        generation_mode=GenerationMode.QUALITY,
+    )
+    contract["required_endpoints"] = [{"path": "/api/things", "methods": ["GET", "POST", "PATCH"]}]
+    runner = _runner_for_browser_flow()
+    preview = PreviewRecord(workspace_id="ws", status="running", stage="running", url="http://localhost:1")
+    monkeypatch.setattr(
+        runner,
+        "_run_real_browser_ui_flow",
+        lambda **_kwargs: {
+            "passed": True,
+            "ui_steps": [{"action": "client_create", "route": "/client"}],
+            "created_marker": "browser-ui-proof",
+            "updated_marker": "browser-ui-updated",
+            "logs": ["Browser proof passed."],
+        },
+    )
+
+    result = runner._browser_flow_smoke(
+        source_dir=source_dir,
+        preview=preview,
+        preview_run_id="run",
+        generation_mode=GenerationMode.QUALITY,
+        acceptance_contract=contract,
+    )
+
+    assert result.status == "failed"
+    assert result.diagnostics["mobile_layout"]["status"] == "failed"
+    assert any("720px" in finding["message"] for finding in result.diagnostics["mobile_layout"]["findings"])
+
+
+def test_browser_flow_smoke_fails_when_playwright_infra_unavailable(monkeypatch, tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_browser_flow_source(source_dir)
+    contract = build_acceptance_contract(
+        prompt="Клиент создает объект, специалист обновляет, менеджер контролирует",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+    )
+    runner = _runner_for_browser_flow()
+    preview = PreviewRecord(workspace_id="ws", status="running", stage="running", url="http://localhost:1")
+    monkeypatch.setattr(
+        runner,
+        "_run_real_browser_ui_flow",
+        lambda **_kwargs: {
+            "passed": False,
+            "failed_step": "browser_infra_unavailable",
+            "infra_unavailable": True,
+            "logs": ["Playwright is not available."],
+            "ui_steps": [],
+        },
+    )
+
+    result = runner._browser_flow_smoke(
+        source_dir=source_dir,
+        preview=preview,
+        preview_run_id=None,
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract=contract,
+    )
+
+    assert result.status == "failed"
+    assert result.diagnostics["infra_unavailable"] is True
+    assert CheckRunner.classify_failure([result]) == "blocked_preview_infra"
+
+
+def test_browser_flow_smoke_fails_client_ui_missing_marker(monkeypatch, tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    _write_browser_flow_source(source_dir)
+    contract = build_acceptance_contract(
+        prompt="Клиент создает объект, специалист обновляет, менеджер контролирует",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+    )
+    runner = _runner_for_browser_flow()
+    preview = PreviewRecord(workspace_id="ws", status="running", stage="running", url="http://localhost:1")
+    monkeypatch.setattr(
+        runner,
+        "_run_real_browser_ui_flow",
+        lambda **_kwargs: {
+            "passed": False,
+            "failed_step": "client_refresh_visibility_ui",
+            "failed_role": "client",
+            "failed_route": "/client",
+            "failed_selector": "body",
+            "created_marker": "browser-ui-proof",
+            "updated_marker": "browser-ui-updated",
+            "api_after": {"items": [{"id": 1, "title": "browser-ui-proof"}]},
+            "logs": ["Client UI did not show the created marker after reload."],
+            "ui_steps": [{"action": "client_create", "route": "/client"}],
+        },
+    )
+
+    result = runner._browser_flow_smoke(
+        source_dir=source_dir,
+        preview=preview,
+        preview_run_id=None,
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract=contract,
+    )
+
+    assert result.status == "failed"
+    assert result.diagnostics["failed_step"] == "client_refresh_visibility_ui"
+    assert result.diagnostics["failed_role"] == "client"
+
+
+def test_browser_flow_select_filler_skips_empty_placeholder_options() -> None:
+    script = CheckRunner._real_browser_ui_flow_python_script()
+
+    assert "raw_options = [opt for opt in meta.get(\"options\") or [] if not opt.get(\"disabled\")]" in script
+    assert "options = [opt for opt in raw_options if str(opt.get(\"value\") or \"\").strip()]" in script
+    assert "locator.select_option(label=str(option.get(\"text\") or \"\").strip())" in script
+
+
+def test_browser_flow_mobile_overlap_ignores_parent_child_containment() -> None:
+    script = CheckRunner._real_browser_ui_flow_python_script()
+
+    assert "if (elA.contains(elB) || elB.contains(elA)) continue;" in script
+
+
+def test_frontend_wiring_rejects_undefined_formdata_submit_payload(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    client_dir = static_root / "client"
+    client_dir.mkdir(parents=True)
+    client_dir.joinpath("index.html").write_text(
+        "<main><form id='create-form'><input name='title'><button type='submit'>Save</button></form></main>",
+        encoding="utf-8",
+    )
+    client_dir.joinpath("app.js").write_text(
+        "document.getElementById('create-form').addEventListener('submit', async (event) => {\n"
+        "  event.preventDefault();\n"
+        "  await fetch('/api/records', { method: 'POST', body: JSON.stringify({ title: formData.get('title') }) });\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    issues = CheckRunner._frontend_role_wiring_issues(static_root, backend_text="")
+
+    assert any(issue.code == "platform.workflow_js_undefined_formdata" for issue in issues)
+
+
 def test_frontend_interaction_static_smoke_rejects_balanced_html_js_mismatches(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     client_dir = source_dir / "miniapp/app/static/client"
@@ -880,6 +1148,69 @@ def test_frontend_interaction_static_smoke_rejects_balanced_html_js_mismatches(t
     assert "platform.workflow_form_field_not_submitted" in logs
     assert "platform.workflow_form_without_handler" in logs
     assert "platform.workflow_formdata_field_mismatch" in logs
+
+
+def test_form_wiring_accepts_optional_chained_dom_field_reads(tmp_path: Path) -> None:
+    static_root = tmp_path / "source/miniapp/app/static"
+    specialist_dir = static_root / "specialist"
+    specialist_dir.mkdir(parents=True)
+    html = (
+        "<form id='status-form'>"
+        "<input id='record-id' name='request_id' required>"
+        "<textarea id='recommendation' name='recommendation' required></textarea>"
+        "<button type='submit'>Save</button>"
+        "</form>"
+    )
+    js = (
+        "const form = document.getElementById('status-form');\n"
+        "form?.addEventListener('submit', (event) => {\n"
+        "  event.preventDefault();\n"
+        "  const requestId = document.getElementById('record-id')?.value;\n"
+        "  const recommendation = document.getElementById('recommendation')?.value;\n"
+        "  fetch(`/api/requests/${requestId}`, { method: 'PATCH', body: JSON.stringify({ recommendation }) });\n"
+        "});\n"
+    )
+
+    issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/specialist/index.html",
+        specialist_dir / "app.js",
+        html,
+        js,
+    )
+
+    assert not any(issue.code == "platform.workflow_form_field_not_submitted" for issue in issues)
+
+
+def test_form_wiring_accepts_optional_chained_bound_dom_variable(tmp_path: Path) -> None:
+    specialist_dir = tmp_path / "source/miniapp/app/static/specialist"
+    specialist_dir.mkdir(parents=True)
+    js_path = specialist_dir / "app.js"
+    html_source = (
+        "<form id='status-form'>"
+        "<input id='specialist-request-id' name='request_id' required>"
+        "<select name='status'></select>"
+        "<button type='submit'>Save</button>"
+        "</form>"
+    )
+    js_source = (
+        "const requestIdInput = document.getElementById('specialist-request-id');\n"
+        "const form = document.getElementById('status-form');\n"
+        "form?.addEventListener('submit', (event) => {\n"
+        "  event.preventDefault();\n"
+        "  const requestId = requestIdInput?.value;\n"
+        "  const payload = { status: form.querySelector('[name=\"status\"]').value };\n"
+        "  fetch(`/api/requests/${requestId}`, { method: 'PATCH', body: JSON.stringify(payload) });\n"
+        "});\n"
+    )
+
+    issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/specialist/requests-work/index.html",
+        js_path,
+        html_source,
+        js_source,
+    )
+
+    assert not any(issue.code == "platform.workflow_form_field_not_submitted" for issue in issues)
 
 
 def test_frontend_interaction_static_smoke_rejects_frontend_backend_field_mismatch(tmp_path: Path) -> None:
@@ -1475,6 +1806,27 @@ def test_dom_invariant_accepts_direct_get_element_guard() -> None:
     assert not issues
 
 
+def test_dom_invariant_accepts_same_variable_absent_return_guard() -> None:
+    js_source = (
+        "function wireClientForm() {\n"
+        "  const form = document.getElementById('client-request-form');\n"
+        "  if (!form) return;\n"
+        "  form.addEventListener('submit', () => {});\n"
+        "}\n"
+    )
+
+    issues = CheckRunner._unchecked_page_dom_issues(
+        "miniapp/app/static/client/app.js",
+        js_source,
+        [
+            ("miniapp/app/static/client/requests/index.html", "<main><div id='client-requests-list'></div></main>", {"client-requests-list"}),
+            ("miniapp/app/static/client/index.html", "<form id='client-request-form'></form>", {"client-request-form"}),
+        ],
+    )
+
+    assert not issues
+
+
 def test_dom_invariant_does_not_reuse_duplicate_generic_bindings_across_functions() -> None:
     js_source = (
         "function setupMenu() {\n"
@@ -1622,7 +1974,28 @@ def test_frontend_wiring_accepts_query_selector_all_button_handler(tmp_path: Pat
     assert not any(issue.code == "platform.workflow_button_without_handler" for issue in issues)
 
 
-def test_frontend_wiring_accepts_optional_fallback_selector(tmp_path: Path) -> None:
+def test_frontend_wiring_accepts_helper_selector_button_handler(tmp_path: Path) -> None:
+    manager_dir = tmp_path / "source/miniapp/app/static/manager"
+    manager_dir.mkdir(parents=True)
+    js_path = manager_dir / "app.js"
+    html_source = "<button id='manager-refresh' type='button'>Refresh</button>"
+    js_source = (
+        "function qs(selector) { return document.querySelector(selector); }\n"
+        "const refreshButton = qs('#manager-refresh');\n"
+        "refreshButton?.addEventListener('click', refreshData);\n"
+    )
+
+    issues = CheckRunner._button_wiring_issues(
+        "miniapp/app/static/manager/index.html",
+        js_path,
+        html_source,
+        js_source,
+    )
+
+    assert not any(issue.code == "platform.workflow_button_without_handler" for issue in issues)
+
+
+def test_frontend_wiring_accepts_optional_alternate_selector(tmp_path: Path) -> None:
     manager_dir = tmp_path / "source/miniapp/app/static/manager"
     manager_dir.mkdir(parents=True)
     js_path = manager_dir / "app.js"
@@ -1666,6 +2039,42 @@ def test_frontend_wiring_accepts_id_field_read_for_path_update(tmp_path: Path) -
     )
 
     assert not any(issue.code == "platform.workflow_form_field_not_submitted" for issue in issues)
+
+
+def test_frontend_wiring_rejects_path_id_name_read_from_different_field(tmp_path: Path) -> None:
+    specialist_dir = tmp_path / "source/miniapp/app/static/specialist"
+    specialist_dir.mkdir(parents=True)
+    js_path = specialist_dir / "app.js"
+    html_source = (
+        "<form id='specialist-status-form'>"
+        "<input id='specialist-request-id' name='id' type='number'>"
+        "<select name='progress'></select>"
+        "<button type='submit'>Save</button>"
+        "</form>"
+    )
+    js_source = (
+        "const form = document.querySelector('#specialist-status-form');\n"
+        "form.addEventListener('submit', (event) => {\n"
+        "  event.preventDefault();\n"
+        "  const formData = new FormData(form);\n"
+        "  const requestId = formData.get('request_id');\n"
+        "  const payload = { progress: formData.get('progress') };\n"
+        "  fetch(`/api/requests/${requestId}`, { method: 'PATCH', body: JSON.stringify(payload) });\n"
+        "});\n"
+        "function render(item) { return item.id; }\n"
+    )
+
+    issues = CheckRunner._form_wiring_issues(
+        "miniapp/app/static/specialist/requests-work/index.html",
+        js_path,
+        html_source,
+        js_source,
+    )
+
+    assert any(
+        issue.code == "platform.workflow_form_field_not_submitted" and "id" in issue.message
+        for issue in issues
+    )
 
 
 def test_frontend_wiring_accepts_hidden_path_id_read_by_dom_id(tmp_path: Path) -> None:
@@ -1826,6 +2235,69 @@ def test_fast_gate_runs_generated_tests_for_create_workflow(monkeypatch, tmp_pat
     assert results["generated_app_python_tests"].status == "passed"
     assert results["generated_app_js_tests"].status == "passed"
     assert results["preview_boot_smoke"].status == "skipped"
+
+
+def test_full_create_skips_preview_when_generated_tests_fail(monkeypatch, tmp_path: Path) -> None:
+    class FakeValidationSuite:
+        def validate_build(self, workspace_path: Path):
+            del workspace_path
+            return []
+
+        def validate_connectivity(self, workspace_path: Path):
+            del workspace_path
+            return []
+
+    class PreviewShouldNotRun:
+        def rebuild(self, *args, **kwargs):  # pragma: no cover - failure path
+            raise AssertionError("preview rebuild should wait until generated tests pass")
+
+        def get(self, *args, **kwargs):  # pragma: no cover - failure path
+            raise AssertionError("preview get should wait until generated tests pass")
+
+    runner = CheckRunner(FakeValidationSuite(), PreviewShouldNotRun())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        runner,
+        "_static_check",
+        lambda source_dir, changed_files: RunCheckResult(name="changed_files_static", status="passed", logs=["static"]),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_platform_invariants_smoke",
+        lambda **kwargs: RunCheckResult(name="platform_invariants", status="passed", logs=["platform"]),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_frontend_interaction_static_smoke",
+        lambda **kwargs: RunCheckResult(name="frontend_interaction_static_smoke", status="passed", logs=["flow"]),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_run_python_app_tests",
+        lambda _backend_dir, *, require_present=False: RunCheckResult(name="generated_app_python_tests", status="passed", logs=["python"]),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_run_js_app_tests",
+        lambda _backend_dir, *, require_present=False: RunCheckResult(name="generated_app_js_tests", status="failed", logs=["js failed"]),
+    )
+
+    execution = runner.run(
+        workspace_id="ws",
+        run_id="run",
+        source_dir=tmp_path,
+        changed_files=["miniapp/app/static/client/app.js"],
+        scope_mode="agentic",
+        check_profile="full",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract={"required": True, "features": {"status_update": True}, "flows": []},
+        preview_run_id="run",
+    )
+
+    results = {result.name: result for result in execution.results}
+    assert results["generated_app_js_tests"].status == "failed"
+    assert results["preview_boot_smoke"].status == "skipped"
+    assert "generated app tests failed" in results["browser_flow_smoke"].details
 
 
 def test_agentic_platform_invariants_reject_single_page_role_surfaces(tmp_path: Path) -> None:
@@ -2458,6 +2930,164 @@ def test_generated_js_test_failure_prefers_assertion_stack_location_and_regex_li
     assert diagnostics["assertion_source"]["source"] == "assert.ok(clientHtml.match(/client-submit/));"
     assert diagnostics["expected_literal"] == "client-submit"
     assert diagnostics["stale_selector_assertion"]["problem"] == "generated_js_test_requires_exact_selector_literal"
+
+
+def test_generated_js_test_includes_on_role_html_variable_is_diagnostic(tmp_path: Path) -> None:
+    test_file = tmp_path / "generated_app.test.mjs"
+    test_file.write_text(
+        "\n".join(
+            [
+                'import test from "node:test";',
+                'import assert from "node:assert";',
+                'test("specialist child form exists", () => {',
+                "  assert.ok(specialistHtml.includes('id=\"specialist-status-form\"'));",
+                "});",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "test at tests/generated_app.test.mjs:3:1",
+            "AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:",
+            "  assert.ok(specialistHtml.includes('id=\"specialist-status-form\"'))",
+            "at TestContext.<anonymous> (file:///workspace/miniapp/tests/generated_app.test.mjs:4:10)",
+        ],
+        test_file=test_file,
+    )
+
+    issue = diagnostics["js_test_missing_generated_source_token"]
+    assert issue["problem"] == "generated_js_test_requires_token_on_wrong_page"
+    assert issue["token"] == 'id="specialist-status-form"'
+
+
+def test_generated_js_test_brittle_api_constant_name_is_diagnostic(tmp_path: Path) -> None:
+    test_file = tmp_path / "generated_app.test.mjs"
+    test_file.write_text(
+        "\n".join(
+            [
+                'import test from "node:test";',
+                'import assert from "node:assert";',
+                'test("manager page wires overview refresh and oversight controls", () => {',
+                "  assert.match(managerJs, /fetch\\(API_PATH/);",
+                "});",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "AssertionError [ERR_ASSERTION]: The input did not match the regular expression /fetch\\(API_PATH/.",
+            "at TestContext.<anonymous> (file:///workspace/miniapp/tests/generated_app.test.mjs:4:10)",
+        ],
+        test_file=test_file,
+    )
+
+    issue = diagnostics["js_test_brittle_api_constant_assertion"]
+    assert issue["problem"] == "generated_js_test_requires_exact_api_constant_name"
+    assert "API_PATH" in issue["expected_literal"]
+    assert "specific local constant name" in issue["expected_fix"]
+
+
+def test_generated_js_test_brittle_fetch_literal_path_is_diagnostic(tmp_path: Path) -> None:
+    test_file = tmp_path / "generated_app.test.mjs"
+    test_file.write_text(
+        "\n".join(
+            [
+                'import test from "node:test";',
+                'import assert from "node:assert";',
+                'test("manager fetches api", () => {',
+                "  assert.match(managerJs, /fetch\\s*\\(.*\\/api\\/requests/s);",
+                "});",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "AssertionError [ERR_ASSERTION]: The input did not match the regular expression /fetch\\s*\\(.*\\/api\\/requests/s.",
+            "at TestContext.<anonymous> (file:///workspace/miniapp/tests/generated_app.test.mjs:4:10)",
+        ],
+        test_file=test_file,
+    )
+
+    issue = diagnostics["js_test_brittle_api_constant_assertion"]
+    assert issue["problem"] == "generated_js_test_requires_exact_api_constant_name"
+    assert "\\/api\\/requests" in issue["expected_literal"]
+
+
+def test_generated_js_missing_token_failure_suggests_manifest_route_scope() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "AssertionError [ERR_ASSERTION]: missing token client-request-form",
+            "at htmlHasRoleWiring (file:///workspace/miniapp/tests/generated_app.test.mjs:16:12)",
+        ]
+    )
+
+    issue = diagnostics["js_test_missing_generated_source_token"]
+    assert issue["problem"] == "generated_js_test_requires_token_on_wrong_page"
+    assert issue["token"] == "client-request-form"
+    assert "route_manifest" in issue["expected_fix"]
+
+
+def test_generated_js_html_includes_id_failure_suggests_all_role_surfaces() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:",
+            "  assert.ok(html.includes('id=\"client-request-form\"'))",
+            "at TestContext.<anonymous> (file:///workspace/miniapp/tests/generated_app.test.mjs:20:10)",
+        ]
+    )
+
+    issue = diagnostics["js_test_missing_generated_source_token"]
+    assert issue["problem"] == "generated_js_test_requires_token_on_wrong_page"
+    assert issue["token"] == 'id="client-request-form"'
+    assert "all generated HTML files for that role" in issue["expected_fix"]
+
+
+def test_generated_js_plain_html_includes_failure_suggests_all_role_surfaces() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:",
+            '  assert.ok(childHtml.includes("manager-list"))',
+            "at TestContext.<anonymous> (file:///workspace/miniapp/tests/generated_app.test.mjs:71:10)",
+        ]
+    )
+
+    issue = diagnostics["js_test_missing_generated_source_token"]
+    assert issue["problem"] == "generated_js_test_requires_token_on_wrong_page"
+    assert issue["token"] == "manager-list"
+    assert "route_manifest" in issue["expected_fix"]
+
+
+def test_generated_js_missing_href_literal_is_brittle_navigation_diagnostic() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            'AssertionError [ERR_ASSERTION]: app/static/specialist/requests-work/index.html missing href="/specialist"',
+            "at checkHtml (file:///workspace/miniapp/tests/generated_app.test.mjs:18:12)",
+        ]
+    )
+
+    issue = diagnostics["js_test_brittle_route_link_assertion"]
+    assert issue["problem"] == "generated_js_test_requires_exact_route_link_literal"
+    assert issue["token"] == 'href="/specialist"'
+    assert "route_manifest" in issue["expected_fix"]
+
+
+def test_generated_js_manifest_static_target_enoent_is_diagnostic() -> None:
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "Error: ENOENT: no such file or directory, open '/workspace/miniapp/static/client/index.html'",
+            "at read (file:///workspace/miniapp/tests/generated_app.test.mjs:6:35)",
+        ]
+    )
+
+    issue = diagnostics["js_test_route_manifest_path_prefix"]
+    assert issue["problem"] == "generated_js_test_reads_route_manifest_target_without_app_prefix"
+    assert "Prefix manifest targets with app/" in issue["expected_root"]
 
 
 def test_generated_post_persistence_failure_is_diagnostic() -> None:

@@ -27,6 +27,7 @@ class StateStore:
         "agent_diagnostics:",
         "agent_quality:",
         "patch:",
+        "tool_result:",
     )
 
     @staticmethod

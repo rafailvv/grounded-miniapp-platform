@@ -65,7 +65,7 @@ class PreviewService:
             source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
             runtime_mode = self.runtime_manager.preferred_mode()
             preview.runtime_mode = runtime_mode
-            preview.draft_run_id = None
+            preview.draft_run_id = draft_run_id
             preview.status = "starting"
             preview.stage = "starting"
             preview.progress_percent = max(preview.progress_percent, 8)
@@ -166,7 +166,7 @@ class PreviewService:
             source_dir = source_dir or self.workspace_service.source_dir(workspace_id)
             runtime_mode = self.runtime_manager.preferred_mode()
             preview.runtime_mode = runtime_mode
-            preview.draft_run_id = None
+            preview.draft_run_id = draft_run_id
             preview.status = "starting"
             preview.stage = "rebuilding"
             preview.progress_percent = max(preview.progress_percent, 12)
@@ -245,7 +245,7 @@ class PreviewService:
             self._persist(preview)
             return preview
         preview.runtime_mode = self.runtime_manager.preferred_mode()
-        preview.draft_run_id = None
+        preview.draft_run_id = draft_run_id
         preview.status = "starting"
         preview.stage = "rebuilding"
         preview.progress_percent = 10
@@ -255,7 +255,7 @@ class PreviewService:
 
         worker = threading.Thread(
             target=self._rebuild_worker,
-            args=(workspace_id, source_dir, None, on_complete),
+            args=(workspace_id, source_dir, draft_run_id, on_complete),
             daemon=True,
         )
         worker.start()

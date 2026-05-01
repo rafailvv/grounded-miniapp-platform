@@ -374,6 +374,17 @@ class CheckRunner:
                         logs=[],
                     ),
                     RunCheckResult(
+                        name="api_workflow_smoke",
+                        status="skipped",
+                        details=(
+                            "API workflow smoke was skipped for a focused CSS-only visual edit."
+                            if focused_details
+                            else "API workflow smoke was deferred until the full verification gate."
+                        ),
+                        command="api workflow smoke deferred during focused edit" if focused_details else "api workflow smoke deferred during fast gate",
+                        logs=[],
+                    ),
+                    RunCheckResult(
                         name="browser_flow_smoke",
                         status="skipped",
                         details=(
@@ -412,7 +423,42 @@ class CheckRunner:
             js_tests_result.duration_ms = int((time.perf_counter() - js_tests_started) * 1000)
             return js_tests_result
 
-        def _run_preview_checks() -> tuple[RunCheckResult, RunCheckResult, RunCheckResult]:
+        def _skipped_preview_results(reason: str, *, duration_ms: int = 0) -> tuple[RunCheckResult, RunCheckResult, RunCheckResult, RunCheckResult]:
+            preview_boot_result = RunCheckResult(
+                name="preview_boot_smoke",
+                status="skipped",
+                details=reason,
+                duration_ms=duration_ms,
+                command="preview smoke (current session)",
+                logs=[],
+            )
+            connectivity_result = RunCheckResult(
+                name="preview_connectivity_smoke",
+                status="skipped",
+                details=reason,
+                duration_ms=duration_ms,
+                command="preview route smoke (current session)",
+                logs=[],
+            )
+            api_workflow_result = RunCheckResult(
+                name="api_workflow_smoke",
+                status="skipped",
+                details=reason,
+                duration_ms=duration_ms,
+                command="api workflow smoke",
+                logs=[],
+            )
+            browser_result = RunCheckResult(
+                name="browser_flow_smoke",
+                status="skipped",
+                details=reason,
+                duration_ms=duration_ms,
+                command="browser/preview flow smoke",
+                logs=[],
+            )
+            return preview_boot_result, connectivity_result, api_workflow_result, browser_result
+
+        def _run_preview_checks() -> tuple[RunCheckResult, RunCheckResult, RunCheckResult, RunCheckResult]:
             preview_started = time.perf_counter()
             if should_skip_preview or skip_preview_only:
                 duration_ms = int((time.perf_counter() - preview_started) * 1000)
@@ -421,32 +467,15 @@ class CheckRunner:
                     if skip_preview_only
                     else "Preview smoke skipped because validator or build checks already failed."
                 )
-                preview_boot_result = RunCheckResult(
-                    name="preview_boot_smoke",
-                    status="skipped",
-                    details=reason,
-                    duration_ms=duration_ms,
-                    command="preview smoke (current session)",
-                    logs=[],
+                return _skipped_preview_results(reason, duration_ms=duration_ms)
+            if preview_run_id is not None:
+                preview = self.preview_service.rebuild(
+                    workspace_id,
+                    source_dir=source_dir,
+                    draft_run_id=preview_run_id,
                 )
-                connectivity_result = RunCheckResult(
-                    name="preview_connectivity_smoke",
-                    status="skipped",
-                    details=reason,
-                    duration_ms=duration_ms,
-                    command="preview route smoke (current session)",
-                    logs=[],
-                )
-                browser_result = RunCheckResult(
-                    name="browser_flow_smoke",
-                    status="skipped",
-                    details=reason,
-                    duration_ms=duration_ms,
-                    command="browser/preview flow smoke",
-                    logs=[],
-                )
-                return preview_boot_result, connectivity_result, browser_result
-            preview = self.preview_service.get(workspace_id)
+            else:
+                preview = self.preview_service.get(workspace_id)
             preview_boot_result = RunCheckResult(
                 name="preview_boot_smoke",
                 status="skipped" if preview.status in {"stopped", "error"} else "passed",
@@ -459,6 +488,11 @@ class CheckRunner:
                 preview=preview,
                 preview_run_id=preview_run_id,
             )
+            api_workflow_result = self._api_workflow_smoke(
+                source_dir=source_dir,
+                generation_mode=generation_mode,
+                acceptance_contract=acceptance_contract,
+            )
             browser_result = self._browser_flow_smoke(
                 source_dir=source_dir,
                 preview=preview,
@@ -469,26 +503,50 @@ class CheckRunner:
             duration_ms = int((time.perf_counter() - preview_started) * 1000)
             preview_boot_result.duration_ms = duration_ms
             connectivity_result.duration_ms = duration_ms
+            api_workflow_result.duration_ms = duration_ms
             browser_result.duration_ms = duration_ms
-            return preview_boot_result, connectivity_result, browser_result
+            return preview_boot_result, connectivity_result, api_workflow_result, browser_result
 
-        for started_name in ("generated_app_python_tests", "generated_app_js_tests", "preview_boot_smoke", "preview_connectivity_smoke", "browser_flow_smoke"):
+        for started_name in ("generated_app_python_tests", "generated_app_js_tests"):
             self._emit_check_progress(progress_callback, started_name, "started", check_profile=check_profile)
 
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="check-runner") as executor:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="check-runner") as executor:
             python_future = executor.submit(_run_python_tests)
             js_future = executor.submit(_run_js_tests)
-            preview_future = executor.submit(_run_preview_checks)
             python_tests_result = python_future.result()
             js_tests_result = js_future.result()
-            preview_boot_result, connectivity_result, browser_flow_result = preview_future.result()
+
+        for result in (python_tests_result, js_tests_result):
+            self._emit_check_progress(
+                progress_callback,
+                result.name,
+                result.status,
+                duration_ms=result.duration_ms,
+                check_profile=check_profile,
+            )
+
+        generated_tests_failed = any(result.status == "failed" for result in (python_tests_result, js_tests_result))
+        if generated_tests_failed:
+            preview_boot_result, connectivity_result, api_workflow_result, browser_flow_result = _skipped_preview_results(
+                "Preview and browser flow were skipped because generated app tests failed. Repair source/tests first, then rerun preview gate."
+            )
+        else:
+            for started_name in (
+                "preview_boot_smoke",
+                "preview_connectivity_smoke",
+                "api_workflow_smoke",
+                "browser_flow_smoke",
+            ):
+                self._emit_check_progress(progress_callback, started_name, "started", check_profile=check_profile)
+            preview_boot_result, connectivity_result, api_workflow_result, browser_flow_result = _run_preview_checks()
 
         results.append(python_tests_result)
         results.append(js_tests_result)
         results.append(preview_boot_result)
         results.append(connectivity_result)
+        results.append(api_workflow_result)
         results.append(browser_flow_result)
-        for result in (python_tests_result, js_tests_result, preview_boot_result, connectivity_result, browser_flow_result):
+        for result in (preview_boot_result, connectivity_result, api_workflow_result, browser_flow_result):
             self._emit_check_progress(
                 progress_callback,
                 result.name,
@@ -653,6 +711,7 @@ class CheckRunner:
                 except OSError:
                     continue
             combined_html = "\n".join(html_by_path.values())
+            issues.extend(cls._js_obvious_undefined_workflow_issues(role, js_path, js_source))
             issues.extend(cls._selector_wiring_issues(role, js_path, js_source, combined_html))
             for relative_path, html_source in html_by_path.items():
                 issues.extend(
@@ -678,6 +737,66 @@ class CheckRunner:
                 issues.extend(cls._frontend_api_envelope_issues(role, js_path, js_source))
         return issues
 
+    @staticmethod
+    def _js_obvious_undefined_workflow_issues(role: str, js_path: Path, js_source: str) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+        text = str(js_source or "")
+        if "formData.get" not in text:
+            return issues
+
+        function_pattern = re.compile(
+            r"(?P<header>(?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\((?P<params>[^)]*)\)\s*\{|(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?\((?P<arrow_params>[^)]*)\)\s*=>\s*\{)",
+            re.DOTALL,
+        )
+        for match in function_pattern.finditer(text):
+            body_start = match.end()
+            depth = 1
+            index = body_start
+            while index < len(text) and depth > 0:
+                char = text[index]
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                index += 1
+            body = text[body_start : max(body_start, index - 1)]
+            if "formData.get" not in body:
+                continue
+            params = f"{match.group('params') or ''},{match.group('arrow_params') or ''}"
+            has_param = any(part.strip() == "formData" for part in params.split(","))
+            has_declaration = bool(re.search(r"\b(?:const|let|var)\s+formData\s*=\s*new\s+FormData\b", body))
+            if has_param or has_declaration:
+                continue
+            issues.append(
+                ValidationIssue(
+                    code="platform.workflow_js_undefined_formdata",
+                    message=(
+                        f"{js_path.relative_to(js_path.parents[4]).as_posix()} uses formData.get(...) in a {role} workflow "
+                        "without declaring `const formData = new FormData(form)` in the same function. This would crash in the browser before submit."
+                    ),
+                    severity="high",
+                    location=js_path.relative_to(js_path.parents[4]).as_posix(),
+                    blocking=True,
+                )
+            )
+        if not issues and not re.search(r"\b(?:const|let|var)\s+formData\s*=\s*new\s+FormData\b", text):
+            if not re.search(r"\bfunction\s+[A-Za-z_$][\w$]*\s*\([^)]*\bformData\b", text) and not re.search(
+                r"\([^)]*\bformData\b[^)]*\)\s*=>", text
+            ):
+                issues.append(
+                    ValidationIssue(
+                        code="platform.workflow_js_undefined_formdata",
+                        message=(
+                            f"{js_path.relative_to(js_path.parents[4]).as_posix()} uses formData.get(...) in a {role} workflow "
+                            "without declaring `const formData = new FormData(form)` in the same script."
+                        ),
+                        severity="high",
+                        location=js_path.relative_to(js_path.parents[4]).as_posix(),
+                        blocking=True,
+                    )
+                )
+        return issues
+
     @classmethod
     def _selector_wiring_issues(cls, role: str, js_path: Path, js_source: str, combined_html: str) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
@@ -688,7 +807,7 @@ class CheckRunner:
                 continue
             if cls._selector_is_optional_feedback_target(js_source, selector):
                 continue
-            if cls._selector_is_optional_fallback_query(js_source, selector):
+            if cls._selector_is_optional_alternate_query(js_source, selector):
                 continue
             blocking = selector.strip().startswith("#")
             issues.append(
@@ -723,7 +842,7 @@ class CheckRunner:
         return False
 
     @staticmethod
-    def _selector_is_optional_fallback_query(js_source: str, selector: str) -> bool:
+    def _selector_is_optional_alternate_query(js_source: str, selector: str) -> bool:
         value = str(selector or "").strip()
         if not value:
             return False
@@ -880,8 +999,14 @@ class CheckRunner:
                 missing_reads = sorted(
                     name
                     for name in field_names
-                    if not cls._js_reads_form_field(js_source, name)
-                    and not cls._js_reads_dom_field_id(js_source, field_ids_by_name.get(name, ""))
+                    if not (
+                        (
+                            cls._js_reads_form_path_id_field(js_source, name)
+                            if cls._is_path_id_field(name)
+                            else cls._js_reads_form_field(js_source, name)
+                        )
+                        or cls._js_reads_dom_field_id(js_source, field_ids_by_name.get(name, ""))
+                    )
                 )
                 if missing_reads:
                     issues.append(
@@ -1388,6 +1513,7 @@ class CheckRunner:
             or re.search(rf"querySelector\(\s*([\"'])#{escaped}\1\s*\)", js_source)
             or re.search(rf"querySelectorAll\(\s*([\"'])#{escaped}\1\s*\)", js_source)
             or re.search(rf"closest\(\s*([\"'])#{escaped}\1\s*\)", js_source)
+            or re.search(rf"([\"'])#{escaped}\1", js_source)
             or re.search(rf"([\"']){escaped}\1", js_source)
         )
 
@@ -1435,6 +1561,21 @@ class CheckRunner:
         )
 
     @staticmethod
+    def _is_path_id_field(field_name: str) -> bool:
+        value = str(field_name or "").strip().lower()
+        return value in {"id", "record_id", "request_id", "order_id", "item_id"} or value.endswith("_id")
+
+    @staticmethod
+    def _js_reads_form_path_id_field(js_source: str, field_name: str) -> bool:
+        escaped = re.escape(str(field_name or ""))
+        text = str(js_source or "")
+        return bool(
+            re.search(rf"\.get\(\s*([\"']){escaped}\1\s*\)", text)
+            or re.search(rf"\[\s*name\s*=\s*([\"']){escaped}\1\s*\]", text)
+            or re.search(rf"\bname\s*=\s*([\"']){escaped}\1", text)
+        )
+
+    @staticmethod
     def _js_reads_dom_field_id(js_source: str, dom_id: str) -> bool:
         value = str(dom_id or "").strip()
         if not value:
@@ -1442,7 +1583,7 @@ class CheckRunner:
         escaped = re.escape(value)
         text = str(js_source or "")
         if re.search(
-            rf"document\.(?:getElementById|querySelector)\(\s*([\"'])(?:#)?{escaped}\1\s*\)\s*\.\s*(?:value|checked)\b",
+            rf"document\.(?:getElementById|querySelector)\(\s*([\"'])(?:#)?{escaped}\1\s*\)\s*(?:\?\.|\.)\s*(?:value|checked)\b",
             text,
         ):
             return True
@@ -1450,7 +1591,7 @@ class CheckRunner:
         for var_name, bound_id in bindings.items():
             if bound_id != value:
                 continue
-            if re.search(rf"\b{re.escape(var_name)}\s*\.\s*(?:value|checked)\b", text):
+            if re.search(rf"\b{re.escape(var_name)}\s*(?:\?\.|\.)\s*(?:value|checked)\b", text):
                 return True
         return False
 
@@ -1689,6 +1830,51 @@ class CheckRunner:
             return False
         return False
 
+    def _api_workflow_smoke(
+        self,
+        *,
+        source_dir: Path,
+        generation_mode: GenerationMode | str | None,
+        acceptance_contract: dict[str, Any] | None,
+    ) -> RunCheckResult:
+        del generation_mode
+        contract = dict(acceptance_contract or {})
+        if not contract.get("required"):
+            return RunCheckResult(
+                name="api_workflow_smoke",
+                status="skipped",
+                details="API workflow smoke skipped because no create/workflow acceptance contract is required.",
+                command="api workflow smoke",
+                logs=[],
+            )
+        proof = self._run_generic_browser_flow_proof(source_dir=source_dir, acceptance_contract=contract)
+        logs = [str(item) for item in proof.get("logs") or [] if str(item).strip()]
+        diagnostics = {
+            "workflow_kind": contract.get("workflow_kind") or "create",
+            "entity_labels": list((contract.get("features") or {}).get("prompt_resource_candidates") or []),
+            "roles_checked": list(contract.get("roles") or ROLE_ORDER),
+            "steps": proof.get("steps") or [],
+            "api_paths": proof.get("api_paths") or [],
+            "created_state_marker": proof.get("created_state_marker"),
+            "updated_state_marker": proof.get("updated_state_marker"),
+            "api_before": proof.get("api_before"),
+            "api_after": proof.get("api_after"),
+            "failed_step": proof.get("failed_step"),
+            "failed_role": proof.get("failed_role"),
+            "failed_route": proof.get("failed_route"),
+            "failed_selector": proof.get("failed_selector"),
+        }
+        if not logs:
+            logs = ["Generic API workflow proof passed."]
+        return RunCheckResult(
+            name="api_workflow_smoke",
+            status="passed" if bool(proof.get("passed")) else "failed",
+            details="Generic API workflow proof checked GET/POST persistence and update visibility before browser UI proof.",
+            command="api workflow smoke",
+            logs=logs,
+            diagnostics=diagnostics,
+        )
+
     def _browser_flow_smoke(
         self,
         *,
@@ -1698,41 +1884,1132 @@ class CheckRunner:
         generation_mode: GenerationMode | str | None,
         acceptance_contract: dict[str, Any] | None,
     ) -> RunCheckResult:
-        del source_dir
-        mode = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
         contract = dict(acceptance_contract or {})
-        if mode not in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value} or not contract.get("required"):
+        if not contract.get("required"):
             return RunCheckResult(
                 name="browser_flow_smoke",
                 status="skipped",
-                details="Browser flow smoke skipped because this run does not require Balanced/Quality workflow preview verification.",
-                command="browser/preview flow smoke",
+                details="Browser flow smoke skipped because no create/workflow acceptance contract is required.",
+                command="playwright browser flow smoke",
                 logs=[],
             )
-        if preview_run_id is not None:
-            return RunCheckResult(
-                name="browser_flow_smoke",
-                status="skipped",
-                details="Browser flow smoke skipped because preview is source-only and cannot validate the draft state.",
-                command="browser/preview flow smoke",
-                logs=[],
+        mobile_report = self._mobile_layout_report(source_dir=source_dir, generation_mode=generation_mode)
+        preview_status = getattr(preview, "status", None)
+        preview_url = str(getattr(preview, "url", "") or "")
+        if preview_run_id is not None and getattr(preview, "draft_run_id", None) != preview_run_id:
+            proof = {
+                "passed": False,
+                "failed_step": "preview_draft_mismatch",
+                "infra_unavailable": True,
+                "logs": ["Browser UI proof requires the running preview to be built from the current draft."],
+                "ui_steps": [],
+            }
+        elif preview_status != "running" or not preview_url:
+            proof = {
+                "passed": False,
+                "failed_step": "preview_unavailable",
+                "infra_unavailable": True,
+                "logs": ["Browser UI proof requires a running preview URL before completion."],
+                "ui_steps": [],
+            }
+        else:
+            proof = self._run_real_browser_ui_flow(
+                source_dir=source_dir,
+                preview_url=preview_url,
+                acceptance_contract=contract,
             )
-        if getattr(preview, "status", None) != "running" or not getattr(preview, "url", None):
-            return RunCheckResult(
-                name="browser_flow_smoke",
-                status="failed",
-                details="Browser flow smoke requires a running preview for Balanced/Quality workflow verification.",
-                command="browser/preview flow smoke",
-                logs=[getattr(preview, "last_error", None) or "Preview is not running."],
-            )
+        preview_status = getattr(preview, "status", None)
+        logs = [
+            *[str(item) for item in proof.get("logs") or [] if str(item).strip()],
+            *[str(item.get("message") or item) for item in mobile_report.get("findings") or []],
+        ]
+        proof_passed = bool(proof.get("passed"))
+        mobile_passed = str(mobile_report.get("status") or "") != "failed"
+        diagnostics = {
+            "workflow_kind": contract.get("workflow_kind") or "create",
+            "entity_labels": list((contract.get("features") or {}).get("prompt_resource_candidates") or []),
+            "roles_checked": list(contract.get("roles") or ROLE_ORDER),
+            "steps": proof.get("ui_steps") or proof.get("steps") or [],
+            "ui_steps": proof.get("ui_steps") or [],
+            "api_paths": proof.get("api_paths") or [],
+            "created_state_marker": proof.get("created_state_marker") or proof.get("created_marker"),
+            "updated_state_marker": proof.get("updated_state_marker") or proof.get("updated_marker"),
+            "created_marker": proof.get("created_marker") or proof.get("created_state_marker"),
+            "updated_marker": proof.get("updated_marker") or proof.get("updated_state_marker"),
+            "console_errors": proof.get("console_errors") or [],
+            "visible_errors": proof.get("visible_errors") or [],
+            "screenshots": proof.get("screenshots") or [],
+            "api_before": proof.get("api_before"),
+            "api_after": proof.get("api_after"),
+            "failed_step": proof.get("failed_step"),
+            "failed_role": proof.get("failed_role"),
+            "failed_route": proof.get("failed_route"),
+            "failed_selector": proof.get("failed_selector"),
+            "action": proof.get("action"),
+            "infra_unavailable": bool(proof.get("infra_unavailable")),
+            "preview_url": preview_url,
+            "preview_status": preview_status,
+            "mobile_layout": mobile_report,
+        }
+        if not logs:
+            logs = ["Playwright browser workflow proof and mobile layout checks passed."]
         return RunCheckResult(
             name="browser_flow_smoke",
-            status="passed",
-            details="Running preview is available for manual/browser flow verification; static interaction and generated tests covered the workflow contract.",
-            command="browser/preview flow smoke",
-            logs=[f"Preview available at {getattr(preview, 'url', '')}"],
-            diagnostics={"flow_ids": [flow.get("id") for flow in contract.get("flows", []) if isinstance(flow, dict)]},
+            status="passed" if proof_passed and mobile_passed else "failed",
+            details=(
+                "Playwright end-to-end workflow proof clicked role UI, executed JavaScript, checked API state, refresh persistence, cross-role visibility, and mobile layout."
+            ),
+            command="playwright browser flow smoke",
+            logs=logs,
+            diagnostics=diagnostics,
         )
+
+    def _run_real_browser_ui_flow(
+        self,
+        *,
+        source_dir: Path,
+        preview_url: str,
+        acceptance_contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        api_paths = [
+            str(endpoint.get("path") or "").strip()
+            for endpoint in acceptance_contract.get("required_endpoints") or []
+            if isinstance(endpoint, dict) and str(endpoint.get("path") or "").strip()
+        ]
+        api_paths = list(dict.fromkeys(path for path in api_paths if path.startswith("/api/")))
+        routes_by_role = self._role_preview_routes(source_dir)
+        payload = {
+            "base_url": preview_url.rstrip("/"),
+            "api_paths": api_paths,
+            "routes_by_role": routes_by_role,
+            "screenshot_dir": tempfile.mkdtemp(prefix="miniapp-browser-ui-proof-"),
+        }
+        script = self._real_browser_ui_flow_python_script()
+        env = {**os.environ}
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", script, json.dumps(payload)],
+                cwd=source_dir / "miniapp",
+                capture_output=True,
+                text=True,
+                timeout=int(os.getenv("BROWSER_UI_FLOW_TIMEOUT_SEC", "180")),
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "passed": False,
+                "failed_step": "timeout",
+                "logs": self._command_logs("Playwright browser UI proof timed out.", exc.stdout or "", exc.stderr or ""),
+                "ui_steps": [],
+                "screenshots": [],
+            }
+        output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
+        parsed: dict[str, Any] | None = None
+        for line in reversed(result.stdout.splitlines()):
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                parsed = candidate
+                break
+        if parsed is None:
+            return {
+                "passed": False,
+                "failed_step": "invalid_browser_proof_output",
+                "logs": self._command_logs("Playwright browser UI proof did not return JSON.", result.stdout, result.stderr),
+                "ui_steps": [],
+                "screenshots": [],
+            }
+        parsed.setdefault("logs", [])
+        if result.returncode != 0:
+            parsed["passed"] = False
+            parsed["logs"] = [*list(parsed.get("logs") or []), *self._command_logs("Playwright browser UI proof failed.", "", output)]
+        return parsed
+
+    @staticmethod
+    def _real_browser_ui_flow_python_script() -> str:
+        return r'''
+import json
+import os
+import re
+import sys
+import traceback
+from pathlib import Path
+from urllib.error import URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
+
+try:
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+except Exception as exc:
+    print(json.dumps({
+        "passed": False,
+        "failed_step": "browser_infra_unavailable",
+        "infra_unavailable": True,
+        "logs": [f"Playwright is not available: {exc.__class__.__name__}: {exc}"],
+        "ui_steps": [],
+        "screenshots": [],
+    }, ensure_ascii=False))
+    sys.exit(1)
+
+
+PAYLOAD = json.loads(sys.argv[1] or "{}")
+BASE_URL = str(PAYLOAD.get("base_url") or "").rstrip("/")
+ROUTES_BY_ROLE = PAYLOAD.get("routes_by_role") or {}
+REQUESTED_API_PATHS = [str(path) for path in PAYLOAD.get("api_paths") or [] if str(path).startswith("/api/")]
+SCREENSHOT_DIR = Path(PAYLOAD.get("screenshot_dir") or "/tmp/miniapp-browser-ui-proof")
+SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+STEPS = []
+CONSOLE_ERRORS = []
+VISIBLE_ERRORS = []
+SCREENSHOTS = []
+OPENAPI = {}
+API_PATHS = []
+BASE_API_PATH = ""
+CREATED_MARKER = "browser-ui-proof"
+UPDATED_MARKER = "browser-ui-updated"
+API_BEFORE = None
+API_AFTER = None
+
+
+def emit(result):
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def safe_screenshot(page, label):
+    try:
+        path = SCREENSHOT_DIR / f"{len(SCREENSHOTS) + 1:02d}-{label}.png"
+        page.screenshot(path=str(path), full_page=True)
+        SCREENSHOTS.append(str(path))
+    except Exception:
+        pass
+
+
+def fail(step, message, page=None, **extra):
+    if page is not None:
+        safe_screenshot(page, step)
+    result = {
+        "passed": False,
+        "failed_step": step,
+        "logs": [message],
+        "ui_steps": STEPS,
+        "created_marker": CREATED_MARKER,
+        "updated_marker": UPDATED_MARKER,
+        "console_errors": CONSOLE_ERRORS[-20:],
+        "visible_errors": VISIBLE_ERRORS[-20:],
+        "screenshots": SCREENSHOTS,
+        "api_paths": API_PATHS,
+        "api_before": API_BEFORE,
+        "api_after": API_AFTER,
+        **extra,
+    }
+    emit(result)
+    sys.exit(1)
+
+
+def request_json(method, path, payload=None):
+    data = None
+    headers = {"Accept": "application/json", "User-Agent": "browser-flow-smoke"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = Request(urljoin(BASE_URL + "/", path.lstrip("/")), data=data, headers=headers, method=method.upper())
+    with urlopen(request, timeout=8.0) as response:
+        body = response.read().decode("utf-8", errors="ignore")
+        if not body:
+            return None
+        return json.loads(body)
+
+
+def items_from(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("items", "records", "data", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        return [payload]
+    return []
+
+
+def contains_marker(value, marker):
+    if isinstance(value, str):
+        return marker in value
+    if isinstance(value, dict):
+        return any(contains_marker(item, marker) for item in value.values())
+    if isinstance(value, list):
+        return any(contains_marker(item, marker) for item in value)
+    return False
+
+
+def find_id(value):
+    if isinstance(value, dict):
+        for key in ("id", "record_id", "request_id", "order_id", "item_id"):
+            candidate = value.get(key)
+            if candidate not in (None, ""):
+                return candidate
+    return None
+
+
+def find_created(payload, marker, created_id=None):
+    for item in items_from(payload):
+        if created_id is not None and isinstance(item, dict) and str(find_id(item)) == str(created_id):
+            return item
+        if contains_marker(item, marker):
+            return item
+    return None
+
+
+def discover_api():
+    global OPENAPI, API_PATHS, BASE_API_PATH
+    try:
+        OPENAPI = request_json("GET", "/openapi.json") or {}
+    except Exception as exc:
+        fail("openapi_discovery", f"Preview OpenAPI could not be loaded: {exc}")
+    all_paths = OPENAPI.get("paths") or {}
+    API_PATHS = [path for path in REQUESTED_API_PATHS if path in all_paths and "get" in all_paths[path] and "post" in all_paths[path]]
+    if not API_PATHS:
+        API_PATHS = [path for path, methods in all_paths.items() if str(path).startswith("/api/") and "get" in methods and "post" in methods]
+    API_PATHS = list(dict.fromkeys(API_PATHS))
+    if not API_PATHS:
+        fail("api_discovery", "No GET+POST /api resource is discoverable for browser UI proof.")
+    BASE_API_PATH = API_PATHS[0]
+
+
+def normalize_routes(role):
+    routes = ROUTES_BY_ROLE.get(role) or [f"/{role}"]
+    normalized = []
+    for route in routes:
+        route = "/" + str(route).strip("/")
+        if route not in normalized:
+            normalized.append(route)
+    if f"/{role}" not in normalized:
+        normalized.insert(0, f"/{role}")
+    return normalized[:8]
+
+
+def goto(page, route):
+    page.goto(urljoin(BASE_URL + "/", route.lstrip("/")), wait_until="domcontentloaded", timeout=12000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=4000)
+    except PlaywrightTimeoutError:
+        pass
+    STEPS.append({"action": "open", "route": route})
+
+
+def body_text(page):
+    try:
+        return page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        return ""
+
+
+def collect_visible_errors(page):
+    text = body_text(page)
+    lowered = text.lower()
+    markers = [
+        "referenceerror",
+        "typeerror",
+        "is not defined",
+        "undefined variable",
+        "ошибка",
+        "не удалось",
+        "failed to",
+    ]
+    found = [marker for marker in markers if marker in lowered]
+    if found:
+        VISIBLE_ERRORS.append(text[:700])
+    return found
+
+
+def check_runtime_errors(page, step, route):
+    visible = collect_visible_errors(page)
+    if CONSOLE_ERRORS:
+        fail(step, f"Browser JavaScript error during {step}: {CONSOLE_ERRORS[-1]}", page, failed_route=route)
+    if visible:
+        fail(step, f"Visible runtime/error text appeared during {step}: {visible[0]}", page, failed_route=route)
+
+
+def control_meta(locator):
+    return locator.evaluate(
+        """el => ({
+            tag: el.tagName.toLowerCase(),
+            type: (el.getAttribute('type') || '').toLowerCase(),
+            name: el.getAttribute('name') || '',
+            id: el.id || '',
+            required: !!el.required,
+            disabled: !!el.disabled,
+            hidden: !!el.hidden || el.offsetParent === null,
+            value: el.value || '',
+            options: el.tagName.toLowerCase() === 'select'
+                ? Array.from(el.options).map(o => ({ value: o.value, text: o.textContent || '', disabled: !!o.disabled }))
+                : []
+        })"""
+    )
+
+
+def value_for(meta, marker, purpose, created_id=None):
+    name = str(meta.get("name") or meta.get("id") or "").lower()
+    typ = str(meta.get("type") or "")
+    if created_id is not None and (name in {"id", "record_id", "request_id", "order_id", "item_id"} or name.endswith("_id")):
+        return str(created_id)
+    if typ in {"number", "range"} or any(token in name for token in ("count", "quantity", "stock", "price", "amount", "total")):
+        return "3"
+    if typ in {"date", "datetime-local"} or "date" in name or "day" in name:
+        return "2026-05-20"
+    if typ == "time" or "time" in name:
+        return "12:30"
+    if typ == "email" or "email" in name:
+        return "flow@example.test"
+    if typ == "tel" or "phone" in name or "contact" in name:
+        return "+79000000000"
+    if "status" in name or "stage" in name or "state" in name:
+        return "ready" if purpose == "update" else "new"
+    if purpose == "update":
+        return f"{marker} {name or 'note'}"
+    return f"{marker} {name or 'value'}"
+
+
+def fill_control(locator, marker, purpose, created_id=None):
+    try:
+        meta = control_meta(locator)
+    except Exception:
+        return False
+    if meta.get("disabled") or meta.get("hidden"):
+        return False
+    tag = meta.get("tag")
+    typ = meta.get("type")
+    if typ in {"hidden", "button", "submit", "reset", "file", "image"}:
+        return False
+    try:
+        if tag == "select":
+            raw_options = [opt for opt in meta.get("options") or [] if not opt.get("disabled")]
+            options = [opt for opt in raw_options if str(opt.get("value") or "").strip()]
+            if not options:
+                options = [opt for opt in raw_options if str(opt.get("text") or "").strip()]
+            if not options:
+                return False
+            option = options[-1] if purpose == "update" and len(options) > 1 else options[0]
+            option_value = str(option.get("value") or "").strip()
+            if option_value:
+                locator.select_option(value=option_value)
+            else:
+                locator.select_option(label=str(option.get("text") or "").strip())
+            return True
+        if typ in {"checkbox", "radio"}:
+            locator.check(timeout=1500)
+            return True
+        locator.fill(str(value_for(meta, marker, purpose, created_id)), timeout=1500)
+        return True
+    except Exception:
+        return False
+
+
+def submit_form(page, form, role, route, marker, purpose, created_id=None):
+    controls = form.locator("input, textarea, select")
+    filled = 0
+    for index in range(controls.count()):
+        if fill_control(controls.nth(index), marker, purpose, created_id):
+            filled += 1
+    submit = form.locator("button[type=submit], input[type=submit], button:not([type]), button")
+    try:
+        if submit.count():
+            submit.first.click(timeout=2500)
+        else:
+            form.evaluate("form => form.requestSubmit ? form.requestSubmit() : form.submit()")
+    except Exception as exc:
+        fail(f"{role}_{purpose}_click", f"Could not submit {role} {purpose} form: {exc}", page, failed_role=role, failed_route=route, failed_selector="form")
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(700)
+    STEPS.append({"action": f"{role}_{purpose}", "route": route, "filled_controls": filled})
+    return filled
+
+
+def fill_page_update_controls(page, marker, created_id):
+    controls = page.locator("input, textarea, select")
+    filled = 0
+    for index in range(controls.count()):
+        if fill_control(controls.nth(index), marker, "update", created_id):
+            filled += 1
+    return filled
+
+
+def click_update_button(page, role, route):
+    patterns = re.compile(r"(save|update|status|ready|done|confirm|approve|process|complete|сохран|обнов|статус|готов|подтверд|выполн|обработ)", re.I)
+    buttons = page.locator("button, [role=button], input[type=button], input[type=submit]")
+    for index in range(min(buttons.count(), 12)):
+        button = buttons.nth(index)
+        try:
+            text = (button.inner_text(timeout=1000) or button.get_attribute("value") or "").strip()
+        except Exception:
+            text = ""
+        if not patterns.search(text):
+            continue
+        try:
+            button.click(timeout=2500)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except PlaywrightTimeoutError:
+                pass
+            page.wait_for_timeout(700)
+            STEPS.append({"action": f"{role}_button_update", "route": route, "text": text[:80]})
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def submit_client_create(page):
+    for route in normalize_routes("client"):
+        goto(page, route)
+        forms = page.locator("form")
+        for index in range(forms.count()):
+            form = forms.nth(index)
+            controls = form.locator("input, textarea, select")
+            if controls.count() == 0:
+                continue
+            submit_form(page, form, "client", route, CREATED_MARKER, "create")
+            check_runtime_errors(page, "client_create_ui", route)
+            return route
+    fail("client_form_discovery", "No client form with fillable controls was found in client role routes.", page, failed_role="client", failed_selector="form")
+
+
+def submit_specialist_update(page, created_id, before_item):
+    before_text = json.dumps(before_item, ensure_ascii=False, sort_keys=True)
+    for route in normalize_routes("specialist"):
+        goto(page, route)
+        forms = page.locator("form")
+        for index in range(forms.count()):
+            form = forms.nth(index)
+            controls = form.locator("input, textarea, select")
+            if controls.count() == 0:
+                continue
+            submit_form(page, form, "specialist", route, UPDATED_MARKER, "update", created_id)
+            check_runtime_errors(page, "specialist_update_ui", route)
+            return route
+        fill_page_update_controls(page, UPDATED_MARKER, created_id)
+        if click_update_button(page, "specialist", route):
+            check_runtime_errors(page, "specialist_update_ui", route)
+            return route
+    fail("specialist_update_discovery", "No specialist update form/control was found for the created state.", page, failed_role="specialist", failed_selector="form/button", api_after=before_item)
+
+
+def click_refresh_controls(page):
+    buttons = page.locator("button, [role=button], a")
+    for index in range(min(buttons.count(), 12)):
+        button = buttons.nth(index)
+        try:
+            text = button.inner_text(timeout=500).strip()
+        except Exception:
+            continue
+        if re.search(r"(refresh|reload|обнов|перезагруз)", text, re.I):
+            try:
+                button.click(timeout=1000)
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+
+def route_text_after_reload(page, route):
+    goto(page, route)
+    click_refresh_controls(page)
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=10000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=4000)
+        except PlaywrightTimeoutError:
+            pass
+    except Exception:
+        pass
+    page.wait_for_timeout(500)
+    return body_text(page)
+
+
+def role_has_marker(page, role, marker):
+    texts = []
+    for route in normalize_routes(role):
+        text = route_text_after_reload(page, route)
+        texts.append((route, text))
+        check_runtime_errors(page, f"{role}_reload_visibility", route)
+        if marker in text:
+            return True, route, text
+    return False, texts[-1][0] if texts else f"/{role}", texts[-1][1] if texts else ""
+
+
+def text_has_nonempty_summary(text):
+    lowered = text.lower()
+    empty_markers = ("пока нет", "нет данных", "нет сохран", "empty", "no records", "nothing yet")
+    if any(marker in lowered for marker in empty_markers):
+        return False
+    numbers = [int(match) for match in re.findall(r"\b([1-9]\d*)\b", text)]
+    return bool(numbers)
+
+
+def check_horizontal_overflow(page, route, role):
+    try:
+        report = page.evaluate(
+            """() => {
+                const root = document.documentElement;
+                const overflow = root.scrollWidth > window.innerWidth + 2 || document.body.scrollWidth > window.innerWidth + 2;
+                const critical = Array.from(document.querySelectorAll('main, section, form, article, header, nav, .card, [class*=card], [class*=panel]')).slice(0, 80);
+                const overlaps = [];
+                for (let i = 0; i < critical.length; i++) {
+                    const elA = critical[i];
+                    const a = critical[i].getBoundingClientRect();
+                    if (!a.width || !a.height) continue;
+                    for (let j = i + 1; j < critical.length; j++) {
+                        const elB = critical[j];
+                        if (elA.contains(elB) || elB.contains(elA)) continue;
+                        const b = critical[j].getBoundingClientRect();
+                        if (!b.width || !b.height) continue;
+                        const x = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+                        const y = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+                        if (x < 8 || y < 8) continue;
+                        if (x * y > Math.min(a.width * a.height, b.width * b.height) * 0.65) {
+                            overlaps.push({ a: critical[i].className || critical[i].tagName, b: critical[j].className || critical[j].tagName });
+                        }
+                    }
+                }
+                return { overflow, scrollWidth: root.scrollWidth, viewport: window.innerWidth, overlaps: overlaps.slice(0, 3) };
+            }"""
+        )
+    except Exception:
+        return
+    if report.get("overflow"):
+        fail("mobile_horizontal_overflow", f"{role} route {route} has horizontal overflow at mobile viewport: scrollWidth={report.get('scrollWidth')} viewport={report.get('viewport')}.", page, failed_role=role, failed_route=route)
+    if report.get("overlaps"):
+        fail("mobile_overlap", f"{role} route {route} has overlapping critical UI blocks at mobile viewport.", page, failed_role=role, failed_route=route)
+
+
+def item_changed(before_item, after_item):
+    if not isinstance(before_item, dict) or not isinstance(after_item, dict):
+        return before_item != after_item
+    ignored = {"updated_at", "created_at", "id"}
+    before = {key: value for key, value in before_item.items() if key not in ignored}
+    after = {key: value for key, value in after_item.items() if key not in ignored}
+    return before != after
+
+
+def run_flow(page):
+    global API_BEFORE, API_AFTER
+    discover_api()
+    try:
+        API_BEFORE = request_json("GET", BASE_API_PATH)
+    except (URLError, OSError, ValueError) as exc:
+        fail("initial_api_get", f"GET {BASE_API_PATH} failed before UI proof: {exc}")
+    submit_client_create(page)
+    try:
+        after_create = request_json("GET", BASE_API_PATH)
+    except Exception as exc:
+        fail("client_create_api_after", f"GET {BASE_API_PATH} failed after client UI submit: {exc}", page, failed_role="client")
+    created_item = find_created(after_create, CREATED_MARKER)
+    if created_item is None:
+        fail("client_create_state_change", "Client UI submit did not create a persisted API item containing the proof marker.", page, failed_role="client", api_before=API_BEFORE, api_after=after_create)
+    created_id = find_id(created_item)
+    if created_id is None:
+        fail("created_id_missing", "Created UI state does not expose an id usable by another role update.", page, failed_role="client", api_after=after_create)
+    has_marker, route, text = role_has_marker(page, "client", CREATED_MARKER)
+    if not has_marker:
+        fail("client_refresh_visibility_ui", "Client UI did not show the created marker after reload, although API state exists.", page, failed_role="client", failed_route=route, api_after=after_create)
+    submit_specialist_update(page, created_id, created_item)
+    try:
+        API_AFTER = request_json("GET", BASE_API_PATH)
+    except Exception as exc:
+        fail("specialist_update_api_after", f"GET {BASE_API_PATH} failed after specialist UI update: {exc}", page, failed_role="specialist")
+    updated_item = find_created(API_AFTER, CREATED_MARKER, created_id)
+    if updated_item is None:
+        fail("specialist_update_lost_state", "Specialist UI update lost the created shared state.", page, failed_role="specialist", api_after=API_AFTER)
+    if not contains_marker(updated_item, UPDATED_MARKER) and not item_changed(created_item, updated_item):
+        fail("specialist_update_state_change", "Specialist UI action did not persist a changed shared state.", page, failed_role="specialist", api_before=after_create, api_after=API_AFTER)
+    manager_created, manager_route, manager_text = role_has_marker(page, "manager", CREATED_MARKER)
+    manager_updated = UPDATED_MARKER in manager_text
+    manager_summary = text_has_nonempty_summary(manager_text)
+    if not (manager_created or manager_updated or manager_summary):
+        fail("manager_visibility_ui", "Manager UI did not show the created/updated shared state or a non-empty summary after reload.", page, failed_role="manager", failed_route=manager_route, api_after=API_AFTER)
+    if len(items_from(API_AFTER)) > 0 and re.search(r"\b0\b", manager_text) and not (manager_created or manager_updated or manager_summary):
+        fail("manager_empty_state_mismatch", "Manager UI shows an empty/zero state while API has persisted items.", page, failed_role="manager", failed_route=manager_route, api_after=API_AFTER)
+    client_created, client_route, client_text = role_has_marker(page, "client", CREATED_MARKER)
+    if not client_created:
+        fail("client_final_refresh_visibility_ui", "Client UI lost the created state after specialist update and reload.", page, failed_role="client", failed_route=client_route, api_after=API_AFTER)
+    if contains_marker(updated_item, UPDATED_MARKER) and UPDATED_MARKER not in client_text:
+        fail("client_updated_status_visibility_ui", "Client UI did not show updated shared state after specialist update and reload.", page, failed_role="client", failed_route=client_route, api_after=API_AFTER)
+    for role in ("client", "specialist", "manager"):
+        for route in normalize_routes(role)[:4]:
+            route_text_after_reload(page, route)
+            check_horizontal_overflow(page, route, role)
+    emit({
+        "passed": True,
+        "failed_step": None,
+        "logs": [f"Playwright browser UI proof passed through {BASE_API_PATH}."],
+        "ui_steps": STEPS,
+        "created_marker": CREATED_MARKER,
+        "updated_marker": UPDATED_MARKER,
+        "console_errors": CONSOLE_ERRORS[-20:],
+        "visible_errors": VISIBLE_ERRORS[-20:],
+        "screenshots": SCREENSHOTS,
+        "api_paths": API_PATHS,
+        "api_before": API_BEFORE,
+        "api_after": API_AFTER,
+    })
+
+
+try:
+    if not BASE_URL:
+        fail("preview_unavailable", "Browser UI proof requires a preview base URL.", infra_unavailable=True)
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(headless=True)
+        except Exception as exc:
+            fail("browser_infra_unavailable", f"Chromium could not be launched for Playwright browser proof: {exc}", infra_unavailable=True)
+        context = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True)
+        page = context.new_page()
+        page.on("console", lambda msg: CONSOLE_ERRORS.append(f"{msg.type}: {msg.text}") if msg.type == "error" and "favicon" not in msg.text.lower() else None)
+        page.on("pageerror", lambda exc: CONSOLE_ERRORS.append(f"pageerror: {exc}"))
+        try:
+            run_flow(page)
+        finally:
+            context.close()
+            browser.close()
+except SystemExit:
+    raise
+except Exception as exc:
+    emit({
+        "passed": False,
+        "failed_step": "browser_runtime_exception",
+        "logs": [f"Playwright browser UI proof crashed: {exc.__class__.__name__}: {exc}", traceback.format_exc(limit=8)],
+        "ui_steps": STEPS,
+        "created_marker": CREATED_MARKER,
+        "updated_marker": UPDATED_MARKER,
+        "console_errors": CONSOLE_ERRORS[-20:],
+        "visible_errors": VISIBLE_ERRORS[-20:],
+        "screenshots": SCREENSHOTS,
+        "api_paths": API_PATHS,
+        "api_before": API_BEFORE,
+        "api_after": API_AFTER,
+    })
+    sys.exit(1)
+'''
+
+    @staticmethod
+    def _role_preview_routes(source_dir: Path) -> dict[str, list[str]]:
+        pages_by_role = CheckRunner._routeable_role_pages(source_dir)
+        routes_by_role: dict[str, list[str]] = {}
+        for role in ROLE_ORDER:
+            role_routes = CheckRunner._unique_role_routes(pages_by_role.get(role, []))
+            root_route = f"/{role}"
+            routes: list[str] = []
+            if root_route in role_routes:
+                routes.append(root_route)
+            routes.extend(route for route in role_routes if route != root_route)
+            if not routes:
+                routes = [root_route]
+            routes_by_role[role] = list(dict.fromkeys(routes))[:12]
+        return routes_by_role
+
+    def _run_generic_browser_flow_proof(self, *, source_dir: Path, acceptance_contract: dict[str, Any]) -> dict[str, Any]:
+        backend_dir = source_dir / "miniapp"
+        install_result = self._install_python_requirements(
+            backend_dir,
+            result_name="browser_flow_smoke",
+            purpose="Browser flow Python dependency",
+        )
+        if install_result is not None:
+            return {
+                "passed": False,
+                "failed_step": "dependency_install",
+                "logs": install_result.logs or [install_result.details or "Dependency install failed."],
+            }
+        api_paths = [
+            str(endpoint.get("path") or "").strip()
+            for endpoint in acceptance_contract.get("required_endpoints") or []
+            if isinstance(endpoint, dict) and str(endpoint.get("path") or "").strip()
+        ]
+        api_paths = list(dict.fromkeys(path for path in api_paths if path.startswith("/api/")))
+        script = self._generic_browser_flow_python_script()
+        env = {**os.environ}
+        python_path_parts = [str(backend_dir)]
+        if env.get("PYTHONPATH"):
+            python_path_parts.append(str(env.get("PYTHONPATH")))
+        env["PYTHONPATH"] = os.pathsep.join(python_path_parts)
+        with tempfile.TemporaryDirectory(prefix="miniapp-browser-flow-") as tmp_dir:
+            env["DATABASE_URL"] = f"sqlite:///{(Path(tmp_dir) / 'browser_flow.db').as_posix()}"
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-c", script, json.dumps(api_paths)],
+                    cwd=backend_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=int(os.getenv("BROWSER_FLOW_TIMEOUT_SEC", "120")),
+                    env=env,
+                )
+            except subprocess.TimeoutExpired as exc:
+                return {
+                    "passed": False,
+                    "failed_step": "timeout",
+                    "logs": self._command_logs("Generic browser flow proof timed out.", exc.stdout or "", exc.stderr or ""),
+                }
+        output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
+        parsed: dict[str, Any] | None = None
+        for line in reversed(result.stdout.splitlines()):
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                parsed = candidate
+                break
+        if parsed is None:
+            return {
+                "passed": False,
+                "failed_step": "invalid_proof_output",
+                "logs": self._command_logs("Generic browser flow proof did not return JSON.", result.stdout, result.stderr),
+            }
+        parsed.setdefault("logs", [])
+        if result.returncode != 0:
+            parsed["passed"] = False
+            parsed["logs"] = [*list(parsed.get("logs") or []), *self._command_logs("Generic browser flow proof failed.", "", output)]
+        return parsed
+
+    @staticmethod
+    def _generic_browser_flow_python_script() -> str:
+        return r'''
+import json
+import sys
+
+from fastapi.testclient import TestClient
+from app import main as main_module
+
+
+app = getattr(main_module, "app", None)
+if app is None and hasattr(main_module, "create_app"):
+    app = main_module.create_app()
+if app is None:
+    raise RuntimeError("Generated app.main must expose `app` or `create_app()`.")
+
+
+def resolve_schema(openapi, schema):
+    schema = dict(schema or {})
+    ref = schema.get("$ref")
+    if ref:
+        name = str(ref).rsplit("/", 1)[-1]
+        return dict((openapi.get("components") or {}).get("schemas", {}).get(name, {}) or {})
+    for key in ("anyOf", "oneOf", "allOf"):
+        variants = schema.get(key)
+        if isinstance(variants, list):
+            merged = {}
+            for variant in variants:
+                resolved = resolve_schema(openapi, variant)
+                if resolved.get("type") != "null":
+                    merged.update(resolved)
+            if merged:
+                return merged
+    return schema
+
+
+def request_schema(openapi, path, method):
+    operation = ((openapi.get("paths") or {}).get(path) or {}).get(method.lower()) or {}
+    content = ((operation.get("requestBody") or {}).get("content") or {})
+    schema = (content.get("application/json") or content.get("application/x-www-form-urlencoded") or {}).get("schema") or {}
+    return resolve_schema(openapi, schema)
+
+
+def schema_type(schema):
+    if not isinstance(schema, dict):
+        return "string"
+    if schema.get("type"):
+        return schema.get("type")
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if isinstance(variants, list):
+            for variant in variants:
+                resolved = resolve_schema(OPENAPI, variant)
+                typ = resolved.get("type")
+                if typ and typ != "null":
+                    return typ
+    return "string"
+
+
+def value_for(name, schema, marker, purpose):
+    lname = str(name or "").lower()
+    schema = resolve_schema(OPENAPI, schema if isinstance(schema, dict) else {})
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        preferred = ("ready", "done", "completed", "confirmed", "approved", "paid", "in_progress", "processing") if purpose == "update" else tuple(enum)
+        for value in preferred:
+            if value in enum:
+                return value
+        return enum[-1] if purpose == "update" else enum[0]
+    typ = schema_type(schema)
+    if lname in {"id", "pk"} or lname.endswith("_id"):
+        return 1
+    if typ in {"integer", "number"}:
+        if "price" in lname or "cost" in lname:
+            return 1200
+        if "quantity" in lname or "count" in lname or "stock" in lname:
+            return 3
+        return 1
+    if typ == "boolean":
+        return True if purpose == "update" else False
+    if typ == "array":
+        return [f"{marker} item"]
+    if typ == "object":
+        return {"value": marker}
+    if "email" in lname:
+        return "flow@example.test"
+    if "phone" in lname or "tel" in lname or "contact" in lname:
+        return "+79000000000"
+    if "date" in lname or "day" in lname or "time" in lname:
+        return "2026-05-20"
+    if "status" in lname or "state" in lname or "stage" in lname:
+        return "ready" if purpose == "update" else "new"
+    if "address" in lname:
+        return f"{marker} address"
+    if "name" in lname or "title" in lname or "item" in lname or "product" in lname:
+        value = f"{marker} {name}"
+    elif purpose == "update":
+        value = f"{marker} updated {name}"
+    else:
+        value = f"{marker} {name}"
+    max_length = schema.get("maxLength")
+    try:
+        if max_length and int(max_length) > 0:
+            value = value[: int(max_length)]
+    except (TypeError, ValueError):
+        pass
+    return value or marker
+
+
+def build_payload(openapi, path, method, marker, purpose):
+    schema = request_schema(openapi, path, method)
+    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = [str(item) for item in schema.get("required") or [] if str(item).strip()]
+    names = list(dict.fromkeys([*required, *[name for name in props if name not in {"id", "pk"}]][:10]))
+    if not names and method.lower() == "patch":
+        names = ["status"]
+    if not names:
+        names = ["title"]
+    return {name: value_for(name, props.get(name, {}), marker, purpose) for name in names}
+
+
+def items_from(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("items", "records", "data", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        return [payload]
+    return []
+
+
+def contains_marker(value, marker):
+    if isinstance(value, str):
+        return marker in value
+    if isinstance(value, dict):
+        return any(contains_marker(item, marker) for item in value.values())
+    if isinstance(value, list):
+        return any(contains_marker(item, marker) for item in value)
+    return False
+
+
+def find_id(value):
+    if isinstance(value, dict):
+        for key in ("id", "record_id", "request_id", "order_id", "item_id"):
+            if value.get(key) not in (None, ""):
+                return value.get(key)
+    return None
+
+
+def find_created(payload, marker, created_id=None):
+    for item in items_from(payload):
+        if created_id is not None and isinstance(item, dict) and str(find_id(item)) == str(created_id):
+            return item
+        if contains_marker(item, marker):
+            return item
+    return None
+
+
+def update_path_for(openapi, base_path):
+    paths = openapi.get("paths") or {}
+    base = base_path.rstrip("/")
+    for path, methods in paths.items():
+        if "patch" in methods and (str(path).startswith(base + "/") or str(path) == base):
+            return path
+    for path, methods in paths.items():
+        if "put" in methods and (str(path).startswith(base + "/") or str(path) == base):
+            return path
+    return ""
+
+
+def concrete(path, item_id):
+    value = str(path)
+    for token in ("{id}", "{record_id}", "{request_id}", "{order_id}", "{item_id}"):
+        value = value.replace(token, str(item_id))
+    import re
+    return re.sub(r"\{[^}/]+\}", str(item_id), value)
+
+
+def fail(step, message, **extra):
+    result = {
+        "passed": False,
+        "failed_step": step,
+        "logs": [message],
+        "steps": STEPS,
+        **extra,
+    }
+    print(json.dumps(result, ensure_ascii=False))
+    sys.exit(1)
+
+
+OPENAPI = app.openapi()
+STEPS = []
+requested_paths = json.loads(sys.argv[1] or "[]")
+all_paths = OPENAPI.get("paths") or {}
+api_paths = [path for path in requested_paths if path in all_paths and "get" in all_paths[path] and "post" in all_paths[path]]
+if not api_paths:
+    api_paths = [path for path, methods in all_paths.items() if path.startswith("/api/") and "get" in methods and "post" in methods]
+api_paths = list(dict.fromkeys(api_paths))
+if not api_paths:
+    fail("api_discovery", "No generic GET+POST /api resource was discoverable from the generated app OpenAPI schema.", api_paths=[])
+
+base_path = api_paths[0]
+marker = "browser-flow-proof"
+update_marker = "browser-flow-updated"
+
+try:
+    with TestClient(app) as client:
+        before = client.get(base_path)
+        if before.status_code >= 400:
+            fail("initial_get", f"GET {base_path} returned {before.status_code}.", api_paths=api_paths)
+        before_json = before.json()
+        STEPS.append({"step": "initial_get", "path": base_path, "status": before.status_code})
+
+        create_payload = build_payload(OPENAPI, base_path, "post", marker, "create")
+        create = client.post(base_path, json=create_payload)
+        if not (200 <= create.status_code < 300):
+            fail("client_create", f"POST {base_path} returned {create.status_code}; payload={create_payload}; body={create.text[:500]}", api_paths=api_paths, api_before=before_json)
+        create_json = create.json()
+        created_id = find_id(create_json)
+        STEPS.append({"step": "client_create", "path": base_path, "status": create.status_code, "id": created_id})
+
+        after_create = client.get(base_path)
+        after_create_json = after_create.json()
+        created_item = find_created(after_create_json, marker, created_id)
+        if created_item is None:
+            fail("create_persistence", f"POST {base_path} did not persist a discoverable item/state through later GET.", api_paths=api_paths, api_before=before_json, api_after=after_create_json)
+        created_id = created_id or find_id(created_item)
+        if created_id is None:
+            fail("created_id", "Created state did not expose an id usable for specialist/manager update flow.", api_paths=api_paths, api_after=after_create_json)
+        STEPS.append({"step": "create_persistence", "path": base_path, "status": after_create.status_code, "id": created_id})
+
+        update_template = update_path_for(OPENAPI, base_path)
+        if not update_template:
+            fail("update_route_discovery", f"No generic PATCH/PUT route exists for created state under {base_path}.", api_paths=api_paths, api_after=after_create_json)
+        method = "patch" if "patch" in (all_paths.get(update_template) or {}) else "put"
+        update_path = concrete(update_template, created_id)
+        update_payload = build_payload(OPENAPI, update_template, method, update_marker, "update")
+        update = getattr(client, method)(update_path, json=update_payload)
+        if not (200 <= update.status_code < 300):
+            fail("specialist_update", f"{method.upper()} {update_path} returned {update.status_code}; payload={update_payload}; body={update.text[:500]}", api_paths=api_paths, api_after=after_create_json)
+        STEPS.append({"step": "specialist_update", "path": update_path, "status": update.status_code, "payload": update_payload})
+
+        after_update = client.get(base_path)
+        after_update_json = after_update.json()
+        updated_item = find_created(after_update_json, marker, created_id)
+        if updated_item is None:
+            fail("manager_visibility", "Manager/shared GET state could not find the created item after update.", api_paths=api_paths, api_after=after_update_json)
+        update_visible = any(contains_marker(updated_item.get(key) if isinstance(updated_item, dict) else updated_item, str(value)) for key, value in update_payload.items())
+        if not update_visible and not contains_marker(updated_item, update_marker):
+            if isinstance(updated_item, dict) and update_payload:
+                matching = [key for key, value in update_payload.items() if str(updated_item.get(key)) == str(value)]
+                update_visible = bool(matching)
+        if not update_visible:
+            fail("refresh_persistence", f"Updated state was not visible through later GET. Payload={update_payload}; item={updated_item}", api_paths=api_paths, api_before=before_json, api_after=after_update_json)
+        STEPS.append({"step": "client_refresh_visibility", "path": base_path, "status": after_update.status_code})
+
+        print(json.dumps({
+            "passed": True,
+            "failed_step": None,
+            "api_paths": api_paths,
+            "created_state_marker": marker,
+            "updated_state_marker": update_marker,
+            "api_before": before_json,
+            "api_after": after_update_json,
+            "steps": STEPS,
+            "logs": [f"Generic workflow proof passed through {base_path} and {update_path}."],
+        }, ensure_ascii=False))
+except Exception as exc:
+    fail("runtime_exception", f"Generic workflow proof crashed: {exc.__class__.__name__}: {exc}", api_paths=api_paths)
+'''
+
+    @classmethod
+    def _mobile_layout_report(cls, *, source_dir: Path, generation_mode: GenerationMode | str | None) -> dict[str, Any]:
+        mode = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
+        strict_mode = mode in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
+        findings: list[dict[str, Any]] = []
+        static_root = source_dir / "miniapp/app/static"
+        for role in ROLE_ORDER:
+            role_dir = static_root / role
+            if not role_dir.exists():
+                continue
+            css_text = ""
+            for css_path in sorted(role_dir.rglob("*.css")):
+                try:
+                    css = css_path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                css_text += "\n" + css
+                for match in re.finditer(r"(?P<prop>^|[;{]\s*)(?P<name>min-width|width)\s*:\s*(?P<value>\d{3,5})px", css, re.IGNORECASE | re.MULTILINE):
+                    value = int(match.group("value"))
+                    if value > 430:
+                        rel = css_path.relative_to(source_dir).as_posix()
+                        findings.append(
+                            {
+                                "role": role,
+                                "file": rel,
+                                "viewport": "360-430px",
+                                "message": f"{rel} sets {match.group('name')}:{value}px, which can force horizontal scrolling in Telegram mobile viewports.",
+                            }
+                        )
+                if strict_mode and "grid-template-columns" in css and "@media" not in css:
+                    rel = css_path.relative_to(source_dir).as_posix()
+                    findings.append(
+                        {
+                            "role": role,
+                            "file": rel,
+                            "viewport": "360-430px",
+                            "message": f"{rel} defines grid columns without a mobile @media rule.",
+                        }
+                    )
+            for html_path in sorted(role_dir.rglob("*.html")):
+                try:
+                    html = html_path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if "<table" in html.lower() and "overflow-x" not in css_text.lower():
+                    rel = html_path.relative_to(source_dir).as_posix()
+                    findings.append(
+                        {
+                            "role": role,
+                            "file": rel,
+                            "viewport": "360-430px",
+                            "message": f"{rel} uses a table without an overflow/wrapping mobile container.",
+                        }
+                    )
+        return {
+            "status": "failed" if findings else "passed",
+            "viewports": ["360x740", "390x844", "430x932"],
+            "findings": findings,
+        }
 
     @staticmethod
     def failing_issues(results: list[RunCheckResult]) -> list[ValidationIssue]:
@@ -1777,6 +3054,10 @@ class CheckRunner:
                 static_html_assertion = diagnostics.get("static_html_assertion") if isinstance(diagnostics, dict) else None
                 assertion_source = diagnostics.get("assertion_source") if isinstance(diagnostics, dict) else None
                 template_literal_assertion = diagnostics.get("js_test_unexpanded_template_literal") if isinstance(diagnostics, dict) else None
+                brittle_api_constant_assertion = (
+                    diagnostics.get("js_test_brittle_api_constant_assertion") if isinstance(diagnostics, dict) else None
+                )
+                missing_generated_js_token = diagnostics.get("js_test_missing_generated_source_token") if isinstance(diagnostics, dict) else None
                 path_id_duplicate = diagnostics.get("path_id_payload_duplicate") if isinstance(diagnostics, dict) else None
                 if isinstance(js_path_root, dict):
                     expected_root = str(js_path_root.get("expected_root") or "").strip()
@@ -1793,6 +3074,16 @@ class CheckRunner:
                     message = str(static_html_assertion.get("expected_scope") or "").strip() or "Generated JS tests asserted dynamic text only in HTML."
                 elif isinstance(template_literal_assertion, dict):
                     message = str(template_literal_assertion.get("expected_fix") or "").strip() or "Generated JS test asserted an unexpanded template literal."
+                elif isinstance(brittle_api_constant_assertion, dict):
+                    message = (
+                        str(brittle_api_constant_assertion.get("expected_fix") or "").strip()
+                        or "Generated JS test required a brittle API constant name."
+                    )
+                elif isinstance(missing_generated_js_token, dict):
+                    message = (
+                        str(missing_generated_js_token.get("expected_fix") or "").strip()
+                        or "Generated JS test required a token on the wrong generated page."
+                    )
                 elif isinstance(assertion_source, dict):
                     line_no = assertion_source.get("line")
                     source_text = str(assertion_source.get("source") or "").strip()
@@ -1841,14 +3132,18 @@ class CheckRunner:
                     message = str(relationship_issue.get("expected_fix") or "").strip() or "Generated SQLAlchemy relationship has no ForeignKey."
                 else:
                     message = next((line for line in reversed(result.logs) if line.strip()), message)
-            if result.name in {"preview_boot_smoke", "preview_connectivity_smoke", "browser_flow_smoke"}:
+            if result.name in {"preview_boot_smoke", "preview_connectivity_smoke", "api_workflow_smoke", "browser_flow_smoke"}:
                 location = "preview"
                 code = (
                     "connectivity.preview_route_unreachable"
                     if result.name == "preview_connectivity_smoke"
+                    else "preview.api_workflow_failed" if result.name == "api_workflow_smoke"
                     else "preview.workflow_flow_failed" if result.name == "browser_flow_smoke"
                     else "preview.rebuild_failed"
                 )
+                diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+                if result.name == "browser_flow_smoke" and diagnostics.get("infra_unavailable"):
+                    code = "preview.browser_infra_unavailable"
                 message = next((line for line in reversed(result.logs) if line.strip()), message)
             issues.append(
                 ValidationIssue(
@@ -1874,7 +3169,17 @@ class CheckRunner:
             return "validator/domain_constraint"
         if "generated_app_python_tests" in failed_names or "generated_app_js_tests" in failed_names:
             return "app/runtime_test"
-        if "preview_boot_smoke" in failed_names or "preview_connectivity_smoke" in failed_names or "browser_flow_smoke" in failed_names:
+        for result in results:
+            if result.name == "browser_flow_smoke" and result.status == "failed":
+                diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+                if diagnostics.get("infra_unavailable"):
+                    return "blocked_preview_infra"
+        if (
+            "preview_boot_smoke" in failed_names
+            or "preview_connectivity_smoke" in failed_names
+            or "api_workflow_smoke" in failed_names
+            or "browser_flow_smoke" in failed_names
+        ):
             return "runtime_preview_boot"
         return None
 
@@ -1942,11 +3247,11 @@ class CheckRunner:
                 command="preview route smoke (current session)",
                 logs=[],
             )
-        if preview_run_id is not None:
+        if preview_run_id is not None and getattr(preview, "draft_run_id", None) != preview_run_id:
             return RunCheckResult(
                 name="preview_connectivity_smoke",
                 status="skipped",
-                details="Preview connectivity smoke skipped because preview is source-only and does not validate draft state.",
+                details="Preview connectivity smoke skipped because running preview does not match the draft under validation.",
                 command="preview route smoke (current session)",
                 logs=[],
             )
@@ -2295,8 +3600,8 @@ class CheckRunner:
                     ValidationIssue(
                         code="platform.missing_role_workflow_actions",
                         message=(
-                            f"{role} role lacks its own workflow actions. Client must create records, "
-                            "specialist must process/update work, and manager must expose dashboard/oversight actions."
+                            f"{role} role lacks its own workflow actions. Client must create user-provided state, "
+                            "specialist must process/update shared work, and manager must expose dashboard/oversight actions."
                         ),
                         severity="high",
                         location=f"miniapp/app/static/{role}",
@@ -2348,9 +3653,7 @@ class CheckRunner:
 
     @staticmethod
     def _min_role_route_pages(generation_mode: GenerationMode | str | None) -> int:
-        value = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
-        if value == GenerationMode.QUALITY.value:
-            return 3
+        del generation_mode
         return 2
 
     @staticmethod
@@ -2617,7 +3920,7 @@ class CheckRunner:
             issues.append(
                 ValidationIssue(
                     code="platform.missing_create_get_api",
-                    message="Create runs must expose at least one GET /api resource so saved user records can be listed.",
+                    message="Create runs must expose at least one GET /api resource so saved user-created state can be listed.",
                     severity="high",
                     location="miniapp/app/routes",
                     blocking=True,
@@ -2627,7 +3930,7 @@ class CheckRunner:
             issues.append(
                 ValidationIssue(
                     code="platform.missing_create_post_api",
-                    message="Create runs must expose at least one POST /api resource so users can save new records.",
+                    message="Create runs must expose at least one POST /api resource so users can save new state.",
                     severity="high",
                     location="miniapp/app/routes",
                     blocking=True,
@@ -2639,7 +3942,7 @@ class CheckRunner:
                 ValidationIssue(
                     code="platform.frontend_missing_post_api",
                     message=(
-                        "Create runs must include frontend form/fetch code that POSTs user-provided records to /api."
+                        "Create runs must include frontend form/fetch code that POSTs user-provided state to /api."
                         if not raw_post_present
                         else "Frontend contains POST and /api markers, but the validator could not pair them confidently; generated tests must confirm the flow."
                     ),
@@ -2664,7 +3967,7 @@ class CheckRunner:
                 ValidationIssue(
                     code="platform.frontend_missing_update_api",
                     message=(
-                        "Create runs must include specialist or manager frontend actions that update saved records through /api."
+                        "Create runs must include specialist or manager frontend actions that update saved shared state through /api."
                         if not raw_update_present
                         else "Frontend contains update-method and /api markers, but the validator could not pair them confidently; generated tests must confirm the flow."
                     ),
@@ -2761,7 +4064,7 @@ class CheckRunner:
                     code="platform.preloaded_business_data",
                     message=(
                         f"{relative_path} appears to include preloaded business data ({marker}). "
-                        "Create apps must start with empty persistent state and let users add records."
+                        "Create apps must start with empty persistent state and let users add their own data."
                     ),
                     severity="high",
                     location=relative_path,
@@ -3224,7 +4527,6 @@ class CheckRunner:
                         guard_bindings,
                         html_source,
                         page_ids,
-                        ignored_vars={var_name},
                     )
                     if not active_guards:
                         return False
@@ -4139,9 +5441,25 @@ class CheckRunner:
                                     "or construct the expected string before asserting, for example `/static/${role}/app.js` must be evaluated, not quoted literally."
                                 ),
                             }
-                    regex_match = re.search(r"\.match\(\s*/(?P<literal>[^/]+)/[a-zA-Z]*\s*\)", assertion_line)
+                    regex_match = re.search(
+                        r"(?:\.match\(\s*|assert\.match\([^,]+,\s*)/(?P<literal>(?:\\/|[^/])+)/[a-zA-Z]*\s*\)",
+                        assertion_line,
+                    )
                     if regex_match:
                         failure["expected_literal"] = regex_match.group("literal")
+                        expected_literal = regex_match.group("literal")
+                        if re.search(r"fetch\\\(API(?:_|[A-Z])", expected_literal) or (
+                            "fetch" in expected_literal and "\\/api" in expected_literal
+                        ):
+                            diagnostics["js_test_brittle_api_constant_assertion"] = {
+                                "problem": "generated_js_test_requires_exact_api_constant_name",
+                                "expected_literal": expected_literal,
+                                "expected_fix": (
+                                    "Generated JS tests must not require a specific local constant name or a literal /api path inside fetch(...). "
+                                    "Patch generated_app.test.mjs to assert the real frontend contract instead: the role script contains /api, "
+                                    "the resource path/name, the required HTTP method, a submit/click handler, and fetch(...) somewhere in the source."
+                                ),
+                            }
                     assertion_failures.append(failure)
             if assertion_failures:
                 diagnostics["assertion_failures"] = assertion_failures[:4]
@@ -4175,9 +5493,25 @@ class CheckRunner:
                                     "or construct the expected string before asserting, for example `/static/${role}/app.js` must be evaluated, not quoted literally."
                                 ),
                             }
-                    regex_match = re.search(r"\.match\(\s*/(?P<literal>[^/]+)/[a-zA-Z]*\s*\)", assertion_line)
+                    regex_match = re.search(
+                        r"(?:\.match\(\s*|assert\.match\([^,]+,\s*)/(?P<literal>(?:\\/|[^/])+)/[a-zA-Z]*\s*\)",
+                        assertion_line,
+                    )
                     if regex_match:
                         diagnostics["expected_literal"] = regex_match.group("literal")
+                        expected_literal = regex_match.group("literal")
+                        if re.search(r"fetch\\\(API(?:_|[A-Z])", expected_literal) or (
+                            "fetch" in expected_literal and "\\/api" in expected_literal
+                        ):
+                            diagnostics["js_test_brittle_api_constant_assertion"] = {
+                                "problem": "generated_js_test_requires_exact_api_constant_name",
+                                "expected_literal": expected_literal,
+                                "expected_fix": (
+                                    "Generated JS tests must not require a specific local constant name or a literal /api path inside fetch(...). "
+                                    "Patch generated_app.test.mjs to assert the real frontend contract instead: the role script contains /api, "
+                                    "the resource path/name, the required HTTP method, a submit/click handler, and fetch(...) somewhere in the source."
+                                ),
+                            }
                         diagnostics["stale_selector_assertion"] = {
                             "problem": "generated_js_test_requires_exact_selector_literal",
                             "expected_fix": (
@@ -4232,10 +5566,104 @@ class CheckRunner:
         stack_excerpt = [str(line or "") for line in logs[-12:] if str(line or "").strip()]
         if stack_excerpt:
             diagnostics["stack_excerpt"] = stack_excerpt
+        missing_token_match = next(
+            (
+                re.search(r"missing token (?P<token>[A-Za-z0-9_-]+)", str(line or ""))
+                for line in logs
+                if "missing token " in str(line or "")
+            ),
+            None,
+        )
+        if missing_token_match:
+            token = missing_token_match.group("token")
+            diagnostics["js_test_missing_generated_source_token"] = {
+                "problem": "generated_js_test_requires_token_on_wrong_page",
+                "token": token,
+                "expected_fix": (
+                    f"Generated JS tests required `{token}` on a page where it is not present. "
+                    "Patch generated_app.test.mjs to read the actual route_manifest target that owns that control, "
+                    "or add the control to the UI only if the workflow is genuinely missing. Do not require every role root page "
+                    "to duplicate child-page forms/buttons."
+                ),
+            }
+        missing_includes_match = next(
+            (
+                re.search(
+                    r"\b[A-Za-z0-9_]*Html\.includes\(\s*([\"'])(?P<literal>(?:id|href)=\\?[\"'][^\"']+\\?[\"'])\1",
+                    str(line or ""),
+                )
+                for line in logs
+                if "Html.includes(" in str(line or "") and ("id=" in str(line or "") or "href=" in str(line or ""))
+            ),
+            None,
+        )
+        if missing_includes_match:
+            literal = missing_includes_match.group("literal").replace('\\"', '"').replace("\\'", "'")
+            diagnostics["js_test_missing_generated_source_token"] = {
+                "problem": "generated_js_test_requires_token_on_wrong_page",
+                "token": literal,
+                "expected_fix": (
+                    f"Generated JS tests required `{literal}` in one specific HTML file, but workflow controls may live on either "
+                    "the role root or the role child route from route_manifest. Patch generated_app.test.mjs to read all generated "
+                    "HTML files for that role and assert the control on the actual page that contains it; only change UI if the "
+                    "control is missing from every role surface."
+                ),
+            }
+        missing_href_match = next(
+            (
+                re.search(r"missing (?P<literal>href=\\?[\"'][^\"']+\\?[\"'])", str(line or ""))
+                for line in logs
+                if "missing href=" in str(line or "")
+            ),
+            None,
+        )
+        if missing_href_match:
+            literal = missing_href_match.group("literal").replace('\\"', '"').replace("\\'", "'")
+            diagnostics["js_test_brittle_route_link_assertion"] = {
+                "problem": "generated_js_test_requires_exact_route_link_literal",
+                "token": literal,
+                "expected_fix": (
+                    f"Generated JS tests required `{literal}` as an exact navigation/back-link literal. "
+                    "Route navigation details are not the workflow proof. Patch generated_app.test.mjs to verify "
+                    "route_manifest entries, role CSS/script links, real forms/buttons, and API wiring instead. "
+                    "Only add a link to the UI when the product workflow genuinely needs that link."
+                ),
+            }
+        missing_plain_includes_match = next(
+            (
+                re.search(
+                    r"\b(?:html|[A-Za-z0-9_]*Html)\.includes\(\s*([\"'])(?P<literal>[A-Za-z][A-Za-z0-9_-]{2,})\1",
+                    str(line or ""),
+                )
+                for line in logs
+                if ".includes(" in str(line or "")
+            ),
+            None,
+        )
+        if missing_plain_includes_match and "js_test_missing_generated_source_token" not in diagnostics:
+            literal = missing_plain_includes_match.group("literal")
+            diagnostics["js_test_missing_generated_source_token"] = {
+                "problem": "generated_js_test_requires_token_on_wrong_page",
+                "token": literal,
+                "expected_fix": (
+                    f"Generated JS tests required `{literal}` in one specific HTML file. Patch generated_app.test.mjs "
+                    "to search all actual HTML files for that role from route_manifest and assert the control/content on "
+                    "the page that really contains it; only add UI if it is absent from every role surface."
+                ),
+            }
         if any("miniapp/miniapp/app/" in str(line or "") for line in logs):
             diagnostics["js_test_path_root"] = {
                 "problem": "generated_js_test_prefixed_miniapp_twice",
                 "expected_root": "Generated JS tests run from cwd=miniapp; use app/static/<role>/... or resolve ../app/static from import.meta.url.",
+            }
+        if any(re.search(r"/miniapp/static/(?:client|specialist|manager)/", str(line or "")) for line in logs):
+            diagnostics["js_test_route_manifest_path_prefix"] = {
+                "problem": "generated_js_test_reads_route_manifest_target_without_app_prefix",
+                "expected_root": (
+                    "route_manifest maps browser routes to static/<role>/... targets, but generated_app.test.mjs runs "
+                    "from cwd=miniapp. Prefix manifest targets with app/ before fs.readFileSync, or normalize through a helper "
+                    "such as `const sourcePath = target.startsWith('app/') ? target : `app/${target}``."
+                ),
             }
         if any(
             "ERR_INVALID_ARG_TYPE" in str(line or "") and "Received an instance of URL" in str(line or "")

@@ -16,7 +16,9 @@ from app.models.domain import (
     RunRecord,
 )
 from app.modules.miniapp_agent_loop.tool_agent_runtime import validate_workspace_command
+from app.modules.miniapp_agent_loop.edit_validator import WorkspaceLoopEditValidator
 from app.modules.miniapp_agent_loop.turn_runner import WorkspaceLoopTurnRunner
+from app.modules.miniapp_agent_loop.types import WorkspaceLoopTurnPlan
 from app.modules.workspace_code_agent_runtime.runtime import (
     FOCUSED_VISUAL_CONTENT_MAX_LENGTH,
     FOCUSED_VISUAL_OPERATION_LIMIT,
@@ -24,7 +26,12 @@ from app.modules.workspace_code_agent_runtime.runtime import (
     WorkspaceCodeAgentRuntime,
 )
 from app.repositories.state_store import StateStore
-from app.services.workflow_acceptance import build_acceptance_contract, orchestration_metadata_for_contract, prompt_resource_candidates
+from app.services.workflow_acceptance import (
+    build_acceptance_contract,
+    build_implementation_plan,
+    orchestration_metadata_for_contract,
+    prompt_resource_candidates,
+)
 from app.services.workspace.service import WorkspaceService
 from app.services.workspace.run_service import RunService
 
@@ -40,7 +47,7 @@ def test_agent_prompt_declares_run_checks_read_only() -> None:
     assert "client, specialist, and manager" in prompt
     assert "three separate role apps" in prompt
     assert "Create tasks must be multi-page" in prompt
-    assert "Fast and Balanced require at least one prompt-specific child page per role" in prompt
+    assert "Additional pages/resources should come from the implementation plan and user prompt" in prompt
     assert "static/client/styles.css" in prompt
     assert "placeholder CSS" in prompt
     assert "route_manifest.json" in prompt
@@ -56,7 +63,7 @@ def test_agent_prompt_declares_run_checks_read_only() -> None:
     assert 'node:test does not export expect' in prompt
     assert "Generate normal light-mode interfaces by default" in prompt
     assert "Do not give roles different color palettes" in prompt
-    assert "Balanced design quality must be visibly stronger than Fast" in prompt
+    assert "meaningfully stronger UI than Fast" in prompt
     assert "Quality design quality must be top-tier and product-ready" in prompt
     assert "page-specific DOM selectors must be null-safe" in prompt
     assert "Visible generated UI copy must use the user's language" in prompt
@@ -70,6 +77,26 @@ def test_agent_prompt_declares_run_checks_read_only() -> None:
     assert "run_command" in schema["properties"]["tool_requests"]["items"]["properties"]["tool"]["enum"]
     assert "miniapp/tests/test_generated_app.py" in SEED_CONTEXT_PATHS
     assert "miniapp/tests/generated_app.test.mjs" in SEED_CONTEXT_PATHS
+
+
+def test_edit_validator_rejects_patch_envelope_as_replace_content() -> None:
+    plan = WorkspaceLoopTurnPlan(
+        outcome="patch_ready",
+        operations=[
+            DraftFileOperation(
+                file_path="miniapp/app/static/specialist/app.js",
+                operation="replace",
+                content="*** Begin Patch\n*** Delete File: miniapp/app/static/specialist/app.js\n*** End Patch\n",
+                reason="bad replace",
+            )
+        ],
+    )
+
+    normalized = WorkspaceLoopEditValidator.normalize_plan(plan)
+
+    assert normalized.outcome == "fatal_invalid_response"
+    assert normalized.failure_class == "generation.invalid_patch_operation"
+    assert normalized.operations == []
 
 
 def test_fast_first_create_schema_can_force_patch_only_turn() -> None:
@@ -219,6 +246,52 @@ def test_state_store_shards_heavy_reports_and_job_events(tmp_path) -> None:
     hydrated_report = store.get("reports", "run_artifacts:run_shard")
     assert hydrated_job is not None and len(hydrated_job["events"]) == len(events)
     assert hydrated_report == {"workspace_id": "ws_shard", "diff": "x" * 4096}
+
+
+def test_runtime_spills_large_tool_results_to_artifacts(tmp_path) -> None:
+    runtime = object.__new__(WorkspaceCodeAgentRuntime)
+    runtime.store = StateStore(tmp_path / "platform-state.json")
+    large_result = {
+        "tool": "run_checks",
+        "status": "failed",
+        "logs": ["Generated test failed: " + ("x" * 8000)],
+        "details": {"stdout": "line\n" * 3000, "stderr": "error\n" * 1200},
+    }
+
+    compact = runtime._compact_tool_results(
+        [large_result],
+        workspace_id="ws_tool",
+        run_id="run_tool",
+        max_items=1,
+    )
+
+    assert len(compact) == 1
+    assert compact[0]["tool"] == "run_checks"
+    assert compact[0]["has_more"] is True
+    assert compact[0]["original_chars"] > 6000
+    assert "tool_result" not in compact[0]
+    ref = str(compact[0]["persisted_output_ref"])
+    raw_report = runtime.store._read()["reports"][ref]
+    assert raw_report["__sharded__"] is True
+
+    hydrated_report = runtime.store.get("reports", ref)
+    assert hydrated_report is not None
+    assert hydrated_report["tool_result"] == large_result
+
+
+def test_runtime_keeps_small_tool_results_inline(tmp_path) -> None:
+    runtime = object.__new__(WorkspaceCodeAgentRuntime)
+    runtime.store = StateStore(tmp_path / "platform-state.json")
+
+    compact = runtime._compact_tool_results(
+        [{"tool": "ls", "status": "ok", "output": "miniapp/app/main.py"}],
+        workspace_id="ws_tool",
+        run_id="run_tool",
+        max_items=1,
+    )
+
+    assert compact == [{"tool": "ls", "status": "ok", "output": "miniapp/app/main.py"}]
+    assert runtime.store._read()["reports"] == {}
 
 
 def test_safe_copy_and_visual_edits_do_not_wait_for_preview_refresh() -> None:
@@ -387,6 +460,13 @@ def test_acceptance_contract_captures_generic_workflow_and_orchestration() -> No
         generation_mode=GenerationMode.BALANCED,
         focused_edit_kind="standard",
     )
+    implementation_plan = build_implementation_plan(
+        prompt="Интернет-магазин: специалист добавляет товар, клиент кладет в корзину и оформляет заказ, менеджер видит заказы",
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+        acceptance_contract=contract,
+        orchestration=orchestration,
+    )
 
     assert contract["required"] is True
     assert "commerce_catalog_cart_order" not in contract["features"]
@@ -394,7 +474,7 @@ def test_acceptance_contract_captures_generic_workflow_and_orchestration() -> No
     assert any(flow["id"] == "related_resource_workflow" for flow in contract["flows"])
     resources = {item["resource"] for item in contract["required_endpoints"]}
     assert resources != {"records", "status_updates"}
-    assert contract["features"]["prompt_resource_candidates"]
+    assert contract["features"]["resource_strategy"] == "prompt_derived_without_fixed_domain_template"
     assert "required_buttons" not in contract
     assert [item["role"] for item in contract["required_controls"]] == ["client", "specialist", "manager"]
     assert orchestration["enabled"] is True
@@ -411,6 +491,9 @@ def test_acceptance_contract_captures_generic_workflow_and_orchestration() -> No
         "manager_ui",
         "generated_tests",
     }
+    assert implementation_plan["principle"] == "plan_inspect_build_verify_repair_final_browser_proof"
+    assert implementation_plan["test_contract"]["browser_flow_required"] is True
+    assert implementation_plan["mobile_design_contract"]["no_horizontal_scroll"] is True
 
 
 def test_prompt_resource_candidates_skip_intro_and_role_words() -> None:
@@ -424,6 +507,16 @@ def test_prompt_resource_candidates_skip_intro_and_role_words() -> None:
     assert not any(candidate.startswith("nebolsh") for candidate in candidates)
     assert not any(candidate.startswith("roditel") for candidate in candidates)
     assert not any(candidate.startswith("zanyati") for candidate in candidates)
+
+
+def test_prompt_resource_candidates_prefer_tasks_over_intro_verb() -> None:
+    candidates = prompt_resource_candidates(
+        "Я руковожу небольшой студией разработки. Клиент описывает задачу, разработчик меняет статус задачи.",
+        limit=3,
+    )
+
+    assert candidates[0] == "tasks"
+    assert "rukovozhu" not in candidates
 
 
 def test_cross_role_behavior_addition_gets_workflow_contract() -> None:
@@ -820,6 +913,8 @@ def test_parallel_retry_defers_generated_tests_until_app_slices_exist() -> None:
 def test_soft_create_coverage_gap_can_defer_to_validation_repair() -> None:
     assert WorkspaceCodeAgentRuntime._is_soft_create_coverage_gap(
         [
+            "miniapp/tests/test_generated_app.py API persistence coverage",
+            "miniapp/tests/test_generated_app.py unittest.TestCase coverage",
             "backend status/update endpoint",
             "frontend specialist/manager status update action",
             "miniapp/tests/test_generated_app.py API status/update coverage",
@@ -832,6 +927,81 @@ def test_soft_create_coverage_gap_can_defer_to_validation_repair() -> None:
     assert not WorkspaceCodeAgentRuntime._is_soft_create_coverage_gap(
         ["frontend form/fetch POST /api/<resource>"]
     )
+
+
+def test_missing_generated_tests_get_explicit_repair_priority() -> None:
+    execution = CheckExecutionRecord(
+        workspace_id="ws",
+        run_id="run",
+        results=[
+            RunCheckResult(
+                name="platform_invariants",
+                status="failed",
+                details="Platform invariant smoke failed.",
+                logs=[
+                    '{"code": "platform.missing_generated_app_tests", "location": "miniapp/tests/test_generated_app.py"}',
+                    '{"code": "platform.missing_generated_app_tests", "location": "miniapp/tests/generated_app.test.mjs"}',
+                ],
+            ),
+            RunCheckResult(
+                name="generated_app_python_tests",
+                status="failed",
+                details="Generated Python app tests are required for agentic create/edit runs but were not present in the draft workspace.",
+            ),
+        ],
+    )
+
+    assert WorkspaceCodeAgentRuntime._missing_generated_tests_repair_needed(execution)
+    rules = WorkspaceCodeAgentRuntime._compact_repair_rules(
+        generation_mode=GenerationMode.QUALITY,
+        focused_edit_kind="standard",
+        workflow_slice_repair=True,
+        missing_generated_tests_repair=True,
+    )
+    joined = "\n".join(rules)
+    assert "Create both miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs" in joined
+    assert "Do not defer missing tests" in joined
+
+
+def test_repair_rules_do_not_force_patch_into_one_role_script() -> None:
+    rules = WorkspaceCodeAgentRuntime._compact_repair_rules(
+        generation_mode=GenerationMode.QUALITY,
+        focused_edit_kind="standard",
+        workflow_slice_repair=True,
+    )
+    joined = "\n".join(rules)
+
+    assert "another role script already owns the real update workflow" in joined
+    assert "instead of adding fake PATCH code to the read-only role" in joined
+    assert "assert.match(managerJs, /PATCH/)" in joined
+    assert "assert manager GET/summary/refresh wiring instead" in joined
+
+
+def test_repair_rules_require_exact_button_id_handler_or_link() -> None:
+    rules = WorkspaceCodeAgentRuntime._compact_repair_rules(
+        generation_mode=GenerationMode.QUALITY,
+        focused_edit_kind="standard",
+        workflow_slice_repair=True,
+    )
+    joined = "\n".join(rules)
+
+    assert "workflow_button_without_handler" in joined
+    assert "exact id string" in joined
+    assert "plain link/remove it" in joined
+
+
+def test_repair_rules_avoid_brittle_generated_js_selector_assertions() -> None:
+    rules = WorkspaceCodeAgentRuntime._compact_repair_rules(
+        generation_mode=GenerationMode.QUALITY,
+        focused_edit_kind="standard",
+        workflow_slice_repair=True,
+    )
+    joined = "\n".join(rules)
+
+    assert "exact `id=\"...\"` quote style" in joined
+    assert "single or double quotes" in joined
+    assert "optional refresh/filter button id" in joined
+    assert "actual required workflow controls" in joined
 
 
 def test_api_resource_stems_include_fastapi_router_prefix_routes() -> None:
@@ -989,6 +1159,34 @@ def test_generated_test_failures_seed_backend_and_role_context_for_repair() -> N
     assert "miniapp/app/static/client/index.html" in targets
     assert "miniapp/app/static/manager/app.js" in targets
     assert "miniapp/app/static/specialist/index.html" not in targets
+
+
+def test_frontend_workflow_failure_targets_role_js_and_backend_contract() -> None:
+    execution = CheckExecutionRecord(
+        workspace_id="ws",
+        run_id="run",
+        changed_files=[],
+        results=[
+            RunCheckResult(
+                name="frontend_interaction_static_smoke",
+                status="failed",
+                logs=[
+                    (
+                        '{"code": "platform.workflow_form_field_not_submitted", '
+                        '"location": "miniapp/app/static/specialist/requests-work/index.html", '
+                        '"message": "field coach_note is not read"}'
+                    )
+                ],
+            )
+        ],
+    )
+
+    targets = WorkspaceCodeAgentRuntime._target_files_from_execution(execution)
+
+    assert "miniapp/app/static/specialist/requests-work/index.html" in targets
+    assert "miniapp/app/static/specialist/app.js" in targets
+    assert "miniapp/app/schemas.py" in targets
+    assert "miniapp/app/routes/app_api.py" in targets
 
 
 def test_repair_context_expands_schema_and_role_wiring_files() -> None:
@@ -1276,7 +1474,7 @@ def test_parallel_mode_contracts_make_fast_balanced_quality_different() -> None:
     assert WorkspaceCodeAgentRuntime._parallel_create_round_budget(GenerationMode.QUALITY) == 18
     assert blueprints[GenerationMode.FAST]["required_child_pages_per_role"] == 1
     assert blueprints[GenerationMode.BALANCED]["required_child_pages_per_role"] == 1
-    assert blueprints[GenerationMode.QUALITY]["required_child_pages_per_role"] == 2
+    assert blueprints[GenerationMode.QUALITY]["required_child_pages_per_role"] == 1
     assert blueprints[GenerationMode.FAST]["mode_contract"]["design_level"] != blueprints[GenerationMode.BALANCED]["mode_contract"]["design_level"]
     assert blueprints[GenerationMode.BALANCED]["mode_contract"]["design_level"] != blueprints[GenerationMode.QUALITY]["mode_contract"]["design_level"]
     assert len(blueprints[GenerationMode.QUALITY]["resources"]) >= len(blueprints[GenerationMode.BALANCED]["resources"])
@@ -1303,7 +1501,7 @@ def test_create_patch_coverage_rejects_static_only_app_without_api() -> None:
 
     missing = WorkspaceCodeAgentRuntime._create_patch_coverage_gap([op(path) for path in paths], request=request)
 
-    assert "miniapp/app/routes/<domain_resource>.py" in missing
+    assert "miniapp/app/routes/app_api.py or prompt-derived API route" in missing
     assert "backend GET /api/<resource>" in missing
     assert "backend POST /api/<resource>" in missing
     assert "frontend form/fetch POST /api/<resource>" in missing
@@ -1554,7 +1752,7 @@ def test_completion_budgets_are_time_and_token_based() -> None:
     balanced_budget = WorkspaceCodeAgentRuntime._completion_budget_for_mode(GenerationMode.BALANCED)
     quality_budget = WorkspaceCodeAgentRuntime._completion_budget_for_mode(GenerationMode.QUALITY)
 
-    assert fast_budget["time_limit_ms"] == 12 * 60 * 1000
+    assert fast_budget["time_limit_ms"] == 18 * 60 * 1000
     assert fast_budget["token_limit"] == 600_000
     assert balanced_budget["time_limit_ms"] == 25 * 60 * 1000
     assert balanced_budget["token_limit"] == 1_200_000
@@ -2159,9 +2357,9 @@ def test_output_cap_correction_for_create_requires_compact_patch() -> None:
     )
 
     assert correction["tool"] == "output_cap_correction"
-    assert "no more than 2 operations" in str(correction["required_next_action"])
-    assert "touch only the first concrete failed files/checks" in str(correction["required_next_action"])
-    assert "no more than 10 concise file operations" in str(correction["required_next_action"])
+    assert "smallest coherent failing workflow slice" in str(correction["required_next_action"])
+    assert "touch only the concrete failed files/checks" in str(correction["required_next_action"])
+    assert "compact but complete prompt-derived app surface" in str(correction["required_next_action"])
     assert "align backend API routes" in str(correction["required_next_action"])
     assert "Do not add mock data" in str(correction["required_next_action"])
     assert "do not request more context" in str(correction["required_next_action"])
@@ -2185,7 +2383,7 @@ def test_fast_create_budget_prefers_frontend_first_compact_patch() -> None:
     budget = WorkspaceCodeAgentRuntime._fast_create_budget_result()
 
     assert budget["tool"] == "fast_create_budget"
-    assert "up to 20 concise operations" in str(budget["required_next_action"])
+    assert "compact working product" in str(budget["required_next_action"])
     assert "first answer" in str(budget["required_next_action"])
     assert "backend persistence" in str(budget["contract"])
     assert "three separate role root apps" in str(budget["required_next_action"])
@@ -2608,6 +2806,44 @@ def test_patch_with_separate_full_content_is_coerced_to_replace() -> None:
 
     assert operations[0].operation == "replace"
     assert operations[0].content == 'const role = "client";\nwindow.setupPreviewBridge?.(role);\n'
+
+
+def test_create_with_full_file_text_in_diff_is_coerced_to_content() -> None:
+    runtime = object.__new__(WorkspaceCodeAgentRuntime)
+    operations = runtime._coerce_operations(
+        [
+            {
+                "file_path": "miniapp/tests/test_generated_app.py",
+                "operation": "create",
+                "content": None,
+                "diff": "import unittest\n\nclass GeneratedAppTests(unittest.TestCase):\n    def test_smoke(self):\n        self.assertTrue(True)\n",
+                "reason": "Create generated tests.",
+            }
+        ]
+    )
+
+    assert operations[0].operation == "create"
+    assert operations[0].diff is None
+    assert "GeneratedAppTests" in str(operations[0].content)
+
+
+def test_replace_with_unified_diff_in_diff_field_is_coerced_to_patch() -> None:
+    runtime = object.__new__(WorkspaceCodeAgentRuntime)
+    operations = runtime._coerce_operations(
+        [
+            {
+                "file_path": "miniapp/app/static/client/app.js",
+                "operation": "replace",
+                "content": None,
+                "diff": "--- a/miniapp/app/static/client/app.js\n+++ b/miniapp/app/static/client/app.js\n@@\n-old\n+new\n",
+                "reason": "Patch existing JS.",
+            }
+        ]
+    )
+
+    assert operations[0].operation == "patch"
+    assert operations[0].content is None
+    assert str(operations[0].diff).startswith("--- a/miniapp/app/static/client/app.js")
 
 
 def test_codex_update_patch_can_be_applied_to_expected_file() -> None:

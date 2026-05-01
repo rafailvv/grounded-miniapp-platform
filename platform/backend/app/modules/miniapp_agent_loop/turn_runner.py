@@ -147,34 +147,6 @@ class WorkspaceLoopTurnRunner:
                 )
 
             budget_state = self._budget_state(callbacks, attempt)
-            if budget_state.get("exhausted"):
-                failure_reason = self._budget_failure_reason(budget_state)
-                callbacks.append_event(
-                    job,
-                    "repair_iteration",
-                    failure_reason,
-                    {
-                        "attempt": attempt,
-                        "failure_class": str(budget_state.get("failure_class") or "generation.budget_exhausted"),
-                        "budget_status": budget_state,
-                    },
-                )
-                return self.results.blocked(
-                    summary=failure_reason,
-                    failure_reason=failure_reason,
-                    failure_class=str(budget_state.get("failure_class") or "generation.budget_exhausted"),
-                    failure_signature=str(budget_state.get("failure_signature") or budget_state.get("reason") or "generation.budget_exhausted"),
-                    root_cause_summary=failure_reason,
-                    current_phase=str(budget_state.get("current_phase") or "blocked_budget_exhausted"),
-                    latest_execution=latest_execution,
-                    latest_preview_details=latest_preview_details,
-                    latest_apply_result=latest_apply_result,
-                    iterations=iterations,
-                    repair_iterations=repair_iterations,
-                    all_operations=all_operations,
-                    last_assistant_message=latest_assistant_message,
-                    turn_history=turn_history,
-                )
 
             has_file_edits = bool(all_operations)
             skip_initial_checks = bool(callbacks.skip_initial_checks and attempt == 0 and not has_file_edits)
@@ -335,6 +307,36 @@ class WorkspaceLoopTurnRunner:
                     root_cause_summary="Platform runtime cannot execute the required validation steps.",
                     current_phase="failed",
                     remaining_issues=[],
+                    latest_execution=latest_execution,
+                    latest_preview_details=latest_preview_details,
+                    latest_apply_result=latest_apply_result,
+                    iterations=iterations,
+                    repair_iterations=repair_iterations,
+                    all_operations=all_operations,
+                    last_assistant_message=latest_assistant_message,
+                    turn_history=turn_history,
+                )
+
+            budget_state = self._budget_state(callbacks, attempt)
+            if budget_state.get("exhausted"):
+                failure_reason = self._budget_failure_reason(budget_state)
+                callbacks.append_event(
+                    job,
+                    "repair_iteration",
+                    failure_reason,
+                    {
+                        "attempt": attempt,
+                        "failure_class": str(budget_state.get("failure_class") or "generation.budget_exhausted"),
+                        "budget_status": budget_state,
+                    },
+                )
+                return self.results.blocked(
+                    summary=failure_reason,
+                    failure_reason=failure_reason,
+                    failure_class=str(budget_state.get("failure_class") or "generation.budget_exhausted"),
+                    failure_signature=str(budget_state.get("failure_signature") or budget_state.get("reason") or "generation.budget_exhausted"),
+                    root_cause_summary=failure_reason,
+                    current_phase=str(budget_state.get("current_phase") or "blocked_budget_exhausted"),
                     latest_execution=latest_execution,
                     latest_preview_details=latest_preview_details,
                     latest_apply_result=latest_apply_result,
