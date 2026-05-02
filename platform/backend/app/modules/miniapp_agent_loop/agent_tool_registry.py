@@ -22,6 +22,7 @@ AgentActivityKind = Literal[
     "process_started",
     "command_output_delta",
     "process_completed",
+    "process_failed",
     "context_suggestion",
     "hook_started",
     "hook_completed",
@@ -106,6 +107,14 @@ class AgentToolRegistry:
             activity="reading",
             progress_label="Inspecting draft diff",
         ),
+        "read_artifact_ref": AgentToolSpec(
+            name="read_artifact_ref",
+            kind="read_only",
+            concurrency_safe=True,
+            output_cap_chars=12000,
+            activity="reading",
+            progress_label="Reading stored tool artifact",
+        ),
         "semantic_scan": AgentToolSpec(
             name="semantic_scan",
             kind="read_only",
@@ -174,7 +183,7 @@ class AgentToolRegistry:
         return cls.kind(tool_name) in {"read_only", "verification"}
 
     @classmethod
-    def plan_batches(cls, tool_requests: list[dict[str, Any]]) -> AgentToolBatchPlan:
+    def plan_batches(cls, tool_calls: list[dict[str, Any]]) -> AgentToolBatchPlan:
         read_only: list[dict[str, Any]] = []
         mutating: list[dict[str, Any]] = []
         verification: list[dict[str, Any]] = []
@@ -187,7 +196,7 @@ class AgentToolRegistry:
                 return
             batches.append(AgentToolBatch(concurrency_safe=concurrency_safe, requests=[request_item]))
 
-        for request in tool_requests:
+        for request in tool_calls:
             if not isinstance(request, dict):
                 continue
             spec = cls.spec(request.get("tool"))
@@ -211,6 +220,42 @@ class AgentToolRegistry:
             unknown_requests=unknown,
             ordered_batches=batches,
         )
+
+    @classmethod
+    def openai_tools(cls) -> list[dict[str, Any]]:
+        tools: list[dict[str, Any]] = []
+        for name in sorted(cls._SPECS):
+            spec = cls._SPECS[name]
+            tools.append(
+                {
+                    "type": "function",
+                    "name": name,
+                    "description": (
+                        f"{spec.progress_label}. Kind: {spec.kind}. "
+                        "Use this generic code-agent tool only when it directly advances the current plan."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "mode": {"type": "string", "enum": ["exact", "final"]},
+                            "targets": {"type": "array", "items": {"type": "string"}},
+                            "file_path": {"type": "string"},
+                            "pattern": {"type": "string"},
+                            "command": {"type": "string"},
+                            "process_id": {"type": "string"},
+                            "artifact_ref": {"type": "string"},
+                            "content": {"type": "string"},
+                            "diff": {"type": "string"},
+                            "worker_id": {"type": "string"},
+                            "owner_scope": {"type": "string"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["reason"],
+                    },
+                }
+            )
+        return tools
 
 
 READ_ONLY_AGENT_TOOLS = frozenset(

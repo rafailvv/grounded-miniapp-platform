@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,9 +29,17 @@ from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
 from app.modules.miniapp_agent_loop.agent_command_policy import command_policy_snapshot
 from app.modules.miniapp_agent_loop.agent_coordinator import AgentCoordinator
 from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager
-from app.modules.miniapp_agent_loop.engine import AgentLoopEngine
+from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
+from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
+from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoop
+from app.modules.miniapp_agent_loop.agent_tool_changes import (
+    file_changes_from_mutating_tool_calls,
+    is_mutating_agent_tool_call,
+)
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
+from app.modules.miniapp_agent_loop.agent_worker_branch_loop import AgentWorkerBranchLoop, WorkerBranchResult
 from app.modules.miniapp_agent_loop.agent_worker_runtime import AgentWorkerRuntime
+from app.modules.miniapp_agent_loop.agent_worker_tasks import AgentWorkerTaskPlanner
 from app.modules.miniapp_agent_loop.agent_kernel import compact_agent_memory
 from app.modules.miniapp_agent_loop.agent_memory_store import AgentMemoryStore
 from app.modules.miniapp_agent_loop.agent_scratchpad import AgentScratchpad
@@ -40,7 +49,7 @@ from app.modules.miniapp_agent_loop.environment_snapshot import AgentEnvironment
 from app.modules.miniapp_agent_loop.rollout_trace import RolloutTraceRecorder
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.tool_agent_runtime import (
-    normalize_tool_requests,
+    normalize_tool_calls,
     truncate_tool_text,
     validate_workspace_command,
 )
@@ -52,7 +61,12 @@ from app.modules.workspace_code_agent_runtime.budget import (
     completion_budget_status,
     token_usage_total,
 )
+from app.modules.workspace_code_agent_runtime.artifact_reporter import WorkspaceAgentArtifactReporter
+from app.modules.workspace_code_agent_runtime.browser_replay import BrowserProofReplay
+from app.modules.workspace_code_agent_runtime.check_orchestrator import WorkspaceAgentCheckOrchestrator
+from app.modules.workspace_code_agent_runtime.completion_gate import WorkspaceAgentCompletionGate
 from app.modules.workspace_code_agent_runtime.prompt_contract import agent_system_prompt
+from app.modules.workspace_code_agent_runtime.process_recovery import AgentProcessRecovery
 from app.modules.workspace_code_agent_runtime.tool_executor import AgentToolExecutor
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
@@ -77,9 +91,7 @@ QUALITY_FIDELITY = {
     GenerationMode.BALANCED: "balanced_app",
     GenerationMode.BASIC: "basic_app",
 }
-AGENT_TURN_DRAFT_ACTION_LIMIT = 20
-AGENTIC_WORKFLOW_DRAFT_ACTION_LIMIT = 32
-FOCUSED_VISUAL_DRAFT_ACTION_LIMIT = 4
+FOCUSED_VISUAL_WRITE_LIMIT = 4
 FOCUSED_VISUAL_CONTENT_MAX_LENGTH = 12000
 TOOL_RESULT_SPILL_THRESHOLD_CHARS = 6000
 PATCH_FIRST_EXISTING_FILE_CHAR_LIMIT = 2500
@@ -322,7 +334,7 @@ class WorkspaceCodeAgentRuntime:
         runtime_manager: PreviewRuntimeManager,
         openai_client: OpenAIClient,
         workspace_log_service: WorkspaceLogService,
-        agent_loop_engine: AgentLoopEngine,
+        agent_tool_call_loop: AgentToolCallLoop,
         context_pack_builder: Any | None = None,
     ) -> None:
         self.store = store
@@ -332,22 +344,39 @@ class WorkspaceCodeAgentRuntime:
         self.runtime_manager = runtime_manager
         self.openai_client = openai_client
         self.workspace_log_service = workspace_log_service
-        self.agent_loop_engine = agent_loop_engine
+        self.agent_tool_call_loop = agent_tool_call_loop
+        self.artifact_reporter = WorkspaceAgentArtifactReporter(store)
+        self.check_orchestrator = WorkspaceAgentCheckOrchestrator()
+        self.completion_gate = WorkspaceAgentCompletionGate(workspace_service)
+        self.browser_replay = BrowserProofReplay()
+        self.process_recovery = AgentProcessRecovery()
         self.file_state_cache = AgentFileStateCache()
         self.turn_diff_tracker = AgentTurnDiffTracker()
         self.worker_manager = AgentWorkerManager()
         self.worker_runtime = AgentWorkerRuntime()
+        self.worker_branch_loop = AgentWorkerBranchLoop(
+            openai_client=openai_client,
+            workspace_service=workspace_service,
+            read_artifact=lambda ref: self.store.get("reports", ref),
+        )
         self.memory_store = AgentMemoryStore()
         self.hook_manager = AgentHookManager()
         self.context_pressure = AgentContextPressureAnalyzer()
         self.rollout_trace = RolloutTraceRecorder()
+        self.transcript_store = AgentTranscriptStore()
+        self.process_manager = AgentProcessManager()
         self.tool_batch_summaries: dict[str, list[dict[str, object]]] = {}
         self.context_pressure_history: dict[str, list[dict[str, Any]]] = {}
         self.scratchpads: dict[str, AgentScratchpad] = {}
         self.coordinators: dict[str, AgentCoordinator] = {}
         self.environment_snapshots: dict[str, dict[str, object]] = {}
         self.verification_reports: dict[str, dict[str, object]] = {}
-        self.tool_executor = AgentToolExecutor(workspace_service=workspace_service, file_state_cache=self.file_state_cache)
+        self.tool_executor = AgentToolExecutor(
+            workspace_service=workspace_service,
+            file_state_cache=self.file_state_cache,
+            process_manager=self.process_manager,
+            read_artifact=lambda ref: self.store.get("reports", ref),
+        )
         self.context_pack_builder = context_pack_builder
 
     def get_job(self, job_id: str) -> JobRecord:
@@ -566,18 +595,18 @@ class WorkspaceCodeAgentRuntime:
                     stabilized.append(html_path.relative_to(source_dir).as_posix())
         return list(dict.fromkeys(stabilized))
 
-    def _enforce_patch_first_draft_actions(
+    def _enforce_patch_first_file_changes(
         self,
-        draft_actions: list[DraftAction],
+        file_changes: list[DraftAction],
         *,
         request: GenerateRequest,
         workspace_id: str,
         run_id: str,
     ) -> list[DraftAction]:
         if str(request.intent or "").strip().lower() == "create":
-            return list(draft_actions)
+            return list(file_changes)
         normalized: list[DraftAction] = []
-        for operation in draft_actions:
+        for operation in file_changes:
             if operation.operation not in {"create", "replace"}:
                 normalized.append(operation)
                 continue
@@ -739,12 +768,40 @@ class WorkspaceCodeAgentRuntime:
         coordinator.start_phase("planning", "Implementation plan and role workflow contract prepared.")
         self.rollout_trace.append(artifact_run_id, "plan", {"generation_mode": str(generation_mode), "intent": str(request.intent or "")})
         job.scratchpad_ref = f"scratchpad:{workspace_id}:{artifact_run_id}"
+        job.agent_transcript_ref = f"agent_transcript:{workspace_id}:{artifact_run_id}"
+        job.tool_result_messages_ref = f"tool_result_messages:{workspace_id}:{artifact_run_id}"
+        job.resume_checkpoint_ref = f"resume_checkpoint:{workspace_id}:{artifact_run_id}"
         job.command_policy_ref = f"command_policy:{workspace_id}:{artifact_run_id}"
         job.context_pressure_ref = f"context_pressure:{workspace_id}:{artifact_run_id}"
         job.hook_trace_ref = f"hook_trace:{workspace_id}:{artifact_run_id}"
         job.semantic_graph_ref = f"semantic_graph:{workspace_id}:{artifact_run_id}"
         job.worker_prefix_ref = f"worker_prefix:{workspace_id}:{artifact_run_id}"
+        restored_process_view = self.process_recovery.restore_view(self.store.get("reports", job.resume_checkpoint_ref))
+        if restored_process_view.get("stale_processes"):
+            self._store_report(
+                f"process_recovery:{workspace_id}:{artifact_run_id}",
+                {"workspace_id": workspace_id, "run_id": run_id, **restored_process_view},
+            )
+            self._append_event(
+                job,
+                "tool_progress",
+                "Recovered process checkpoint; stale running processes will be rerun if needed.",
+                {"process_recovery_ref": f"process_recovery:{workspace_id}:{artifact_run_id}", **restored_process_view},
+            )
+        self._configure_transcript_persistence(job, artifact_run_id, restore_existing=True)
         self._store_report(job.scratchpad_ref, {"workspace_id": workspace_id, "run_id": run_id, **scratchpad.snapshot()})
+        self._store_report(
+            job.resume_checkpoint_ref,
+            {
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "phase": "planning",
+                "agent_transcript_ref": job.agent_transcript_ref,
+                "scratchpad_ref": job.scratchpad_ref,
+                "todo_plan": coordinator.snapshot().get("todo_plan", []),
+                "process_summary": self.process_recovery.checkpoint(self.process_manager.snapshot()),
+            },
+        )
         self._store_report(job.command_policy_ref, {"workspace_id": workspace_id, "run_id": run_id, **command_policy_snapshot()})
         self._store_report(job.context_pressure_ref, {"workspace_id": workspace_id, "run_id": run_id, "items": []})
         self._store_report(job.hook_trace_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.hook_manager.snapshot(artifact_run_id)})
@@ -761,6 +818,10 @@ class WorkspaceCodeAgentRuntime:
             {"workspace_id": workspace_id, "run_id": run_id, "snapshot": environment_snapshot},
         )
         worker_mailbox = self.worker_manager.mailbox_for_plan(
+            generation_mode=generation_mode,
+            implementation_plan=implementation_plan,
+        )
+        worker_tasks = AgentWorkerTaskPlanner.worker_tasks(
             generation_mode=generation_mode,
             implementation_plan=implementation_plan,
         )
@@ -782,13 +843,19 @@ class WorkspaceCodeAgentRuntime:
         job.worker_mailbox_ref = f"worker_mailbox:{workspace_id}:{artifact_run_id}"
         self._store_report(
             job.worker_mailbox_ref,
-            {"workspace_id": workspace_id, "run_id": run_id, "mailbox": worker_mailbox},
+            {"workspace_id": workspace_id, "run_id": run_id, "mailbox": worker_mailbox, "worker_tasks": worker_tasks},
         )
-        worker_drafts = self.worker_runtime.prepare(
+        writer_worker_tasks = [
+            task
+            for task in worker_tasks
+            if str(task.get("worker_id") or "").strip() not in {"design_verifier", "fresh_verifier"}
+        ]
+        worker_drafts = self.worker_runtime.prepare_workspace_branches(
+            workspace_id=workspace_id,
             run_id=artifact_run_id,
             generation_mode=generation_mode,
-            draft_source=draft_source,
-            worker_specs=coordinator.worker_specs(),
+            workspace_service=self.workspace_service,
+            worker_specs=writer_worker_tasks,
         )
         job.worker_drafts_ref = f"worker_drafts:{workspace_id}:{artifact_run_id}"
         job.worker_merge_ref = f"worker_merge:{workspace_id}:{artifact_run_id}"
@@ -844,11 +911,25 @@ class WorkspaceCodeAgentRuntime:
                     "worker_mailbox_ref": job.worker_mailbox_ref,
                 },
             )
+        coordinator.complete_phase("planning", "Implementation plan, scratchpad, policy, and worker metadata persisted.")
+        scratchpad.set_next_action(
+            action="inspect draft files and semantic maps before patching",
+            reason="planning_complete",
+            payload={"semantic_graph_ref": job.semantic_graph_ref, "worker_prefix_ref": job.worker_prefix_ref},
+        )
         initial_context = (
             self._focused_visual_initial_context(workspace_id, run_id, role_scope=role_scope)
             if focused_visual_edit
             else self._initial_file_context(workspace_id, run_id, role_scope=role_scope)
         )
+        coordinator.complete_phase("reading", "Initial draft files and semantic maps selected.")
+        scratchpad.append_worker_note(
+            "coordinator",
+            "Initial draft context selected.",
+            {"file_count": len(initial_context), "files": list(initial_context.keys())[:24]},
+        )
+        scratchpad.set_next_action(action="produce the smallest useful draft patch", reason="reading_complete")
+        self._store_report(job.scratchpad_ref, {"workspace_id": workspace_id, "run_id": run_id, **scratchpad.snapshot(), **coordinator.snapshot()})
         tool_results: list[dict[str, object]] = []
         if focused_visual_edit:
             tool_results.append(self._focused_visual_edit_budget_result(role_scope=role_scope))
@@ -856,6 +937,28 @@ class WorkspaceCodeAgentRuntime:
             self._focused_visual_css_paths(role_scope) if focused_visual_edit else ["miniapp", "docs", "README.md"]
         )
         cached_no_diff_checks: tuple[CheckExecutionRecord, dict[str, Any]] | None = None
+        branch_initial_file_changes: list[DraftAction] = []
+        branch_initial_message = "Workspace code agent initialized."
+        if (
+            worker_drafts.get("enabled")
+            and bool(acceptance_contract.get("required"))
+            and not focused_visual_edit
+            and writer_worker_tasks
+        ):
+            branch_initial_file_changes, branch_changed_files, branch_message = self._run_parallel_worker_branches(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                request=request,
+                job=job,
+                generation_mode=generation_mode,
+                worker_tasks=writer_worker_tasks,
+                worker_drafts=worker_drafts,
+                worker_prefix=worker_prefix,
+            )
+            if branch_changed_files:
+                last_changed_files = branch_changed_files
+                branch_initial_message = branch_message
 
         def _execute_checks(changed_files: list[str]) -> tuple[CheckExecutionRecord, dict[str, Any]]:
             nonlocal last_changed_files, cached_no_diff_checks
@@ -873,19 +976,19 @@ class WorkspaceCodeAgentRuntime:
             )
             if not has_draft_diff and cached_no_diff_checks is not None:
                 return cached_no_diff_checks
-            check_profile = (
-                "focused_edit"
-                if focused_visual_edit
-                else "full" if create_intent or acceptance_contract.get("required") or generation_mode == GenerationMode.QUALITY else "fast_gate"
+            check_plan = self.check_orchestrator.plan(
+                focused_visual_edit=focused_visual_edit,
+                create_intent=create_intent,
+                acceptance_required=bool(acceptance_contract.get("required")),
+                generation_mode=generation_mode,
+                has_draft_diff=has_draft_diff,
             )
-            scope_mode = "focused_edit" if focused_visual_edit else "agentic"
-            check_attempt = 1 if has_draft_diff else 0
 
             def _check_progress_callback(check_step: str, payload: dict[str, Any]) -> None:
                 event_type = self._check_progress_event_type(check_step)
                 details = {
                     **payload,
-                    "attempt": check_attempt,
+                    "attempt": check_plan.check_attempt,
                     "has_file_edits": has_draft_diff,
                     "has_draft_diff": has_draft_diff,
                     "changed_files": list(last_changed_files),
@@ -898,18 +1001,19 @@ class WorkspaceCodeAgentRuntime:
                 source_dir=draft_source,
                 changed_files=list(last_changed_files),
                 preview_run_id=run_id,
-                scope_mode=scope_mode,
-                check_profile=check_profile,
+                scope_mode=check_plan.scope_mode,
+                check_profile=check_plan.check_profile,
                 intent=str(request.intent or ""),
                 generation_mode=generation_mode,
                 acceptance_contract=acceptance_contract,
                 progress_callback=_check_progress_callback,
             )
-            if (
-                check_profile == "fast_gate"
-                and self._fast_gate_passed(execution.results)
-                and self.workspace_service.diff(workspace_id, run_id=run_id).strip()
-                and not (str(request.intent or "").strip().lower() == "create" or bool(acceptance_contract.get("required")))
+            if self.check_orchestrator.should_run_final_gate(
+                check_profile=check_plan.check_profile,
+                execution=execution,
+                has_draft_diff=bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip()),
+                create_intent=str(request.intent or "").strip().lower() == "create",
+                acceptance_required=bool(acceptance_contract.get("required")),
             ):
                 self._append_event(
                     job,
@@ -931,17 +1035,15 @@ class WorkspaceCodeAgentRuntime:
                     progress_callback=_check_progress_callback,
                 )
             execution.completed_at = datetime.now(timezone.utc)
+            self.transcript_store.append_check_snapshot(
+                artifact_run_id,
+                failed_count=sum(1 for item in execution.results if item.status == "failed"),
+                result_names=[item.name for item in execution.results],
+            )
+            self._store_transcript_snapshot(job, artifact_run_id)
             self._store_agent_quality_report(workspace_id, run_id, execution)
             preview = self.preview_service.get(workspace_id)
-            preview_details = {
-                "status": "skipped",
-                "stage": getattr(preview, "stage", "idle"),
-                "progress_percent": getattr(preview, "progress_percent", 0),
-                "logs": list(getattr(preview, "logs", [])),
-                "last_error": getattr(preview, "last_error", None),
-                "containers": [],
-                "container_logs": {},
-            }
+            preview_details = self.check_orchestrator.preview_details(preview)
             if any(item.status == "failed" for item in execution.results) and not focused_visual_edit:
                 self._collect_preview_diagnostics(workspace_id, preview_details)
             if not has_draft_diff:
@@ -963,12 +1065,11 @@ class WorkspaceCodeAgentRuntime:
             del validation_snapshot
             extra_file_context: dict[str, str] = {}
             local_tool_results = list(tool_results)
-            seen_tool_requests: set[str] = set()
+            seen_tool_calls: set[str] = set()
             self_blocked_correction_sent = False
             generic_fatal_correction_sent = False
             output_cap_correction_sent = False
             tool_budget_correction_sent = False
-            draft_action_contract_correction_sent = False
             create_repair_turn = create_intent and bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
             self._add_failed_generated_test_context(
                 workspace_id=workspace_id,
@@ -1030,16 +1131,16 @@ class WorkspaceCodeAgentRuntime:
                             self._append_event(
                                 job,
                                 "repair_iteration",
-                                "Agent exceeded the structured output cap. Retrying with a smaller patch contract.",
+                                "Agent exceeded the model output cap. Retrying with smaller tool calls.",
                                 {"attempt": attempt, "tool_round": tool_round, "reason": "output_cap"},
                             )
                             continue
                         return AgentTurnPlan(
                             outcome="needs_context",
-                            assistant_message="Agent response exceeded the structured output cap.",
+                            assistant_message="Agent response exceeded the model output cap.",
                             diagnosis=(
-                                "The previous response was too large to return as valid JSON. "
-                                "Retry with a smaller draft action set, prefer compact replace actions, and keep this turn applyable."
+                                "The previous response was too large. Retry with one small apply_patch_to_draft "
+                                "or write_file tool call for the next concrete failing slice."
                             ),
                             files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
                             metadata={"error": str(llm_payload.get("error") or ""), "retry_reason": "max_output_tokens"},
@@ -1053,38 +1154,62 @@ class WorkspaceCodeAgentRuntime:
                         failure_signature="generation.agent_invalid_response",
                         root_cause_summary=str(llm_payload.get("error") or ""),
                     )
-                outcome = str(llm_payload.get("outcome") or "").strip().lower()
-                raw_tool_requests = self._agent_tool_requests(llm_payload.get("tool_requests") or [])
-                mutating_draft_actions, mutating_tool_trace = self._draft_actions_from_mutating_tool_requests(raw_tool_requests)
-                if mutating_draft_actions:
-                    raw_tool_requests = [
-                        item for item in raw_tool_requests if not self._is_mutating_agent_tool_request(item)
-                    ]
-                    raw_draft_actions = llm_payload.get("draft_actions") if isinstance(llm_payload.get("draft_actions"), list) else []
-                    llm_payload["draft_actions"] = [
-                        *list(raw_draft_actions),
-                        *[operation.model_dump(mode="json") for operation in mutating_draft_actions],
+                raw_tool_calls = self._agent_tool_calls(llm_payload.get("tool_calls") or [])
+                mutating_file_changes, mutating_tool_trace = self._file_changes_from_mutating_tool_calls(raw_tool_calls)
+                if mutating_file_changes:
+                    raw_tool_calls = [
+                        item for item in raw_tool_calls if not self._is_mutating_agent_tool_call(item)
                     ]
                     local_tool_results.extend(mutating_tool_trace)
                     tool_results.extend(mutating_tool_trace)
-                    if outcome == "tool_request" and not raw_tool_requests:
-                        outcome = "patch_ready"
-                if outcome == "tool_request" or raw_tool_requests:
-                    signature = json.dumps(raw_tool_requests, ensure_ascii=True, sort_keys=True)
-                    if signature in seen_tool_requests:
+                    self.transcript_store.append_tool_results(artifact_run_id, mutating_tool_trace)
+                    self._store_transcript_snapshot(job, artifact_run_id)
+                    if raw_tool_calls:
+                        new_context, executed_results = self._execute_tool_calls(
+                            workspace_id=workspace_id,
+                            run_id=run_id,
+                            draft_source=draft_source,
+                            tool_calls=raw_tool_calls,
+                            execute_checks=_execute_checks,
+                            job=job,
+                        )
+                        extra_file_context.update(new_context)
+                        local_tool_results.extend(executed_results)
+                        tool_results.extend(executed_results)
+                    return AgentTurnPlan(
+                        outcome="changes_ready",
+                        assistant_message=str(
+                            llm_payload.get("assistant_message")
+                            or llm_payload.get("diagnosis")
+                            or "Agent prepared draft writes through mutating tools."
+                        ),
+                        diagnosis=str(llm_payload.get("diagnosis") or ""),
+                        file_changes=mutating_file_changes,
+                        files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
+                        expected_verification=str(llm_payload.get("expected_verification") or ""),
+                        rationale_by_file={str(key): str(value) for key, value in dict(llm_payload.get("rationale_by_file") or {}).items()},
+                        metadata={
+                            "tool_results": list(local_tool_results),
+                            "acceptance_checks": list(llm_payload.get("acceptance_checks") or []),
+                            "tool_call_contract": "mutating tool calls are converted to internal draft changes before apply",
+                        },
+                    )
+                if raw_tool_calls:
+                    signature = json.dumps(raw_tool_calls, ensure_ascii=True, sort_keys=True)
+                    if signature in seen_tool_calls:
                         return AgentTurnPlan(
                             outcome="needs_context",
                             assistant_message="Agent repeated an already satisfied tool request.",
-                            diagnosis="The requested diagnostic context is already available; the next turn must patch code.",
+                            diagnosis="The requested diagnostic context is already available; the next turn must use apply_patch_to_draft or write_file.",
                             files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
-                            metadata={"tool_requests": raw_tool_requests},
+                            metadata={"tool_calls": raw_tool_calls},
                         )
-                    seen_tool_requests.add(signature)
-                    new_context, executed_results = self._execute_tool_requests(
+                    seen_tool_calls.add(signature)
+                    new_context, executed_results = self._execute_tool_calls(
                         workspace_id=workspace_id,
                         run_id=run_id,
                         draft_source=draft_source,
-                        tool_requests=raw_tool_requests,
+                        tool_calls=raw_tool_calls,
                         execute_checks=_execute_checks,
                         job=job,
                     )
@@ -1094,14 +1219,14 @@ class WorkspaceCodeAgentRuntime:
                     if tool_round < self._tool_round_limit(generation_mode):
                         continue
                     if not tool_budget_correction_sent:
-                        correction = self._tool_budget_correction_result(raw_tool_requests, request=request)
+                        correction = self._tool_budget_correction_result(raw_tool_calls, request=request)
                         local_tool_results.append(correction)
                         tool_results.append(correction)
                         tool_budget_correction_sent = True
                         self._append_event(
                             job,
                             "repair_iteration",
-                            "Agent requested more diagnostic tools than Fast mode allows. Retrying with patch-only instructions.",
+                            "Agent requested more diagnostic tools than the current lane allows. Retrying with write-tool-only instructions.",
                             {"attempt": attempt, "tool_round": tool_round, "reason": "tool_budget_exhausted"},
                         )
                         continue
@@ -1110,120 +1235,26 @@ class WorkspaceCodeAgentRuntime:
                         assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or ""),
                         diagnosis=str(llm_payload.get("diagnosis") or "Agent requested more tools than the turn budget allows."),
                         files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
-                        metadata={"tool_requests": raw_tool_requests},
+                        metadata={"tool_calls": raw_tool_calls},
                     )
-                if outcome == "fatal_invalid_response":
-                    if (
-                        not self_blocked_correction_sent
-                        and self._is_self_blocked_tool_contract_response(llm_payload)
-                    ):
-                        correction = self._tool_contract_correction_result(llm_payload)
-                        local_tool_results.append(correction)
-                        tool_results.append(correction)
-                        self_blocked_correction_sent = True
-                        self._append_event(
-                            job,
-                            "repair_iteration",
-                            "Agent misunderstood the read-only tool contract. Retrying with corrected tool instructions.",
-                            {"attempt": attempt, "tool_round": tool_round, "reason": "self_blocked_tool_contract"},
-                        )
-                        continue
-                    if (
-                        not generic_fatal_correction_sent
-                        and self._is_empty_fatal_agent_response(llm_payload)
-                    ):
-                        correction = self._empty_fatal_correction_result(llm_payload)
-                        local_tool_results.append(correction)
-                        tool_results.append(correction)
-                        generic_fatal_correction_sent = True
-                        self._append_event(
-                            job,
-                            "repair_iteration",
-                            "Agent returned an empty fatal response. Retrying with corrected task instructions.",
-                            {"attempt": attempt, "tool_round": tool_round, "reason": "empty_fatal_response"},
-                        )
-                        continue
-                    return AgentTurnPlan(
-                        outcome="fatal_invalid_response",
-                        assistant_message=str(llm_payload.get("assistant_message") or ""),
-                        diagnosis=str(llm_payload.get("diagnosis") or "Agent declared a fatal invalid response."),
-                        files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
+                if not generic_fatal_correction_sent and self._is_empty_fatal_agent_response(llm_payload):
+                    correction = self._empty_fatal_correction_result(llm_payload)
+                    local_tool_results.append(correction)
+                    tool_results.append(correction)
+                    generic_fatal_correction_sent = True
+                    self._append_event(
+                        job,
+                        "repair_iteration",
+                        "Agent returned text without tool calls. Retrying with corrected task instructions.",
+                        {"attempt": attempt, "tool_round": tool_round, "reason": "empty_tool_step"},
                     )
-                try:
-                    draft_actions = self._coerce_draft_actions(llm_payload.get("draft_actions") or [])
-                except ValueError as exc:
-                    if not draft_action_contract_correction_sent:
-                        correction = self._draft_action_contract_correction_result(str(exc), llm_payload)
-                        local_tool_results.append(correction)
-                        tool_results.append(correction)
-                        draft_action_contract_correction_sent = True
-                        self._append_event(
-                            job,
-                            "repair_iteration",
-                            "Agent returned invalid draft actions. Retrying with the draft action contract instead of failing the run.",
-                            {"attempt": attempt, "tool_round": tool_round, "reason": "invalid_draft_actions", "error": str(exc)[:500]},
-                        )
-                        continue
-                    return AgentTurnPlan(
-                        outcome="fatal_invalid_response",
-                        assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or ""),
-                        diagnosis=str(exc),
-                        files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
-                        metadata={"raw_response": llm_payload, "draft_action_error": str(exc)},
-                        failure_class="generation.invalid_draft_actions",
-                        failure_signature="generation.invalid_draft_actions",
-                        root_cause_summary=str(exc),
-                    )
-                if not draft_actions:
-                    if create_repair_turn and not draft_action_contract_correction_sent:
-                        correction = self._draft_action_contract_correction_result(
-                            "Repair turns must return a non-empty draft actions list with concrete patch/create/replace actions.",
-                            llm_payload,
-                        )
-                        local_tool_results.append(correction)
-                        tool_results.append(correction)
-                        draft_action_contract_correction_sent = True
-                        self._append_event(
-                            job,
-                            "repair_iteration",
-                            "Agent repair returned no draft actions. Retrying with the draft action contract.",
-                            {"attempt": attempt, "tool_round": tool_round, "reason": "empty_repair_draft_actions"},
-                        )
-                        continue
-                    if (
-                        not self_blocked_correction_sent
-                        and self._is_self_blocked_tool_contract_response(llm_payload)
-                    ):
-                        correction = self._tool_contract_correction_result(llm_payload)
-                        local_tool_results.append(correction)
-                        tool_results.append(correction)
-                        self_blocked_correction_sent = True
-                        self._append_event(
-                            job,
-                            "repair_iteration",
-                            "Agent misunderstood how file edits are applied. Retrying with the draft action contract.",
-                            {"attempt": attempt, "tool_round": tool_round, "reason": "self_blocked_no_draft_actions"},
-                        )
-                        continue
-                    return AgentTurnPlan(
-                        outcome="no_op",
-                        assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or ""),
-                        diagnosis=str(llm_payload.get("diagnosis") or "Agent did not return file edits."),
-                        files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
-                        metadata={"raw_response": llm_payload},
-                    )
+                    continue
                 return AgentTurnPlan(
-                    outcome="patch_ready",
-                    assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or "Agent prepared code edits."),
-                    diagnosis=str(llm_payload.get("diagnosis") or ""),
-                    draft_actions=draft_actions,
+                    outcome="no_op",
+                    assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or ""),
+                    diagnosis=str(llm_payload.get("diagnosis") or "Agent did not call a tool."),
                     files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
-                    expected_verification=str(llm_payload.get("expected_verification") or ""),
-                    rationale_by_file={str(key): str(value) for key, value in dict(llm_payload.get("rationale_by_file") or {}).items()},
-                    metadata={
-                        "tool_results": list(local_tool_results),
-                        "acceptance_checks": list(llm_payload.get("acceptance_checks") or []),
-                    },
+                    metadata={"raw_response": llm_payload, "required_next_action": "use_tool_call"},
                 )
             return AgentTurnPlan(
                 outcome="no_op",
@@ -1232,45 +1263,50 @@ class WorkspaceCodeAgentRuntime:
                 files_read=list(initial_context.keys()),
             )
 
-        def _apply_contract_sync(draft_actions: list[DraftAction]) -> list[DraftAction]:
-            synced = self._enforce_patch_first_draft_actions(
-                draft_actions,
+        def _apply_change_sync(file_changes: list[DraftAction]) -> list[DraftAction]:
+            synced = self._enforce_patch_first_file_changes(
+                file_changes,
                 request=request,
                 workspace_id=workspace_id,
                 run_id=run_id,
             )
             merge_report = self.worker_runtime.merge_report(artifact_run_id, synced)
+            branch_results = self.worker_runtime.record_branch_results(artifact_run_id, synced)
             job.worker_merge_ref = f"worker_merge:{workspace_id}:{artifact_run_id}"
             self._store_report(job.worker_merge_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.worker_runtime.snapshot(artifact_run_id)})
+            for branch in branch_results:
+                ref = f"worker_branch:{workspace_id}:{artifact_run_id}:{branch.get('worker_id')}"
+                job.worker_branch_refs = list(dict.fromkeys([*job.worker_branch_refs, ref]))
+                self._store_report(ref, {"workspace_id": workspace_id, "run_id": run_id, "branch": branch})
             ownership_ok = bool((merge_report.get("ownership") if isinstance(merge_report.get("ownership"), dict) else {}).get("ok"))
             if not ownership_ok:
                 scratchpad.append_failed_fix(
                     "worker_merge_conflict",
-                    "Worker merge guard found conflicting draft actions.",
+                    "Worker merge guard found conflicting draft changes.",
                     merge_report,
                 )
                 self._append_event(
                     job,
                     "worker_failed",
-                    "Worker merge guard found conflicting draft actions.",
+                    "Worker merge guard found conflicting draft changes.",
                     {"worker_id": "merge", "merge_report": merge_report, "artifact_ref": job.worker_merge_ref},
                 )
             else:
                 self._append_event(
                     job,
                     "worker_completed",
-                    "Worker draft actions passed ownership merge guard.",
+                    "Worker draft changes passed ownership merge guard.",
                     {"worker_id": "merge", "merge_report": merge_report, "artifact_ref": job.worker_merge_ref},
                 )
             return synced
 
-        def _before_apply(turn: int, draft_actions: list[DraftAction]) -> None:
-            paths = [operation.file_path for operation in draft_actions]
+        def _before_apply(turn: int, file_changes: list[DraftAction]) -> None:
+            paths = [operation.file_path for operation in file_changes]
             self._record_hook(
                 job=job,
                 hook="pre_apply_patch",
                 status="started",
-                payload={"turn": turn, "paths": paths, "draft_action_count": len(draft_actions)},
+                payload={"turn": turn, "paths": paths, "file_change_count": len(file_changes)},
             )
             self.turn_diff_tracker.capture_baseline(
                 workspace_service=self.workspace_service,
@@ -1279,9 +1315,11 @@ class WorkspaceCodeAgentRuntime:
                 turn=turn,
                 paths=paths,
             )
+            self.transcript_store.append_file_changes(artifact_run_id, turn=turn, file_changes=file_changes)
+            self._store_transcript_snapshot(job, artifact_run_id)
             self.rollout_trace.append(artifact_run_id, "patch_apply_started", {"turn": turn, "paths": paths})
 
-        def _after_apply(turn: int, draft_actions: list[DraftAction], apply_result: Any, paths: list[str]) -> None:
+        def _after_apply(turn: int, file_changes: list[DraftAction], apply_result: Any, paths: list[str]) -> None:
             self.file_state_cache.invalidate(run_id, paths)
             record = self.turn_diff_tracker.record_result(
                 workspace_service=self.workspace_service,
@@ -1301,6 +1339,12 @@ class WorkspaceCodeAgentRuntime:
                 "draft_apply",
                 f"Applied turn {turn} draft changes.",
                 {"paths": paths, "turn_diff_ref": job.turn_diff_ref, "changed_summary": record.summary()},
+            )
+            coordinator.complete_phase("editing", f"Applied turn {turn} draft changes.")
+            scratchpad.set_next_action(
+                action="run static, API, generated, browser, and mobile proof",
+                reason="patch_applied",
+                payload={"turn": turn, "paths": paths, "turn_diff_ref": job.turn_diff_ref},
             )
             self.rollout_trace.append(artifact_run_id, "patch_apply_completed", record.summary())
             self._record_hook(
@@ -1341,6 +1385,28 @@ class WorkspaceCodeAgentRuntime:
                 acceptance_contract=acceptance_contract,
                 require_browser_proof=bool((create_intent or acceptance_contract.get("required")) and not focused_visual_edit),
             ).model_dump()
+            browser_replay_packet = self.browser_replay.failed_step_packet(latest_execution)
+            if browser_replay_packet:
+                browser_replay_ref = f"browser_replay:{workspace_id}:{artifact_run_id}:latest"
+                self._store_report(
+                    browser_replay_ref,
+                    {"workspace_id": workspace_id, "run_id": run_id, "packet": browser_replay_packet},
+                )
+                job.browser_step_refs = list(dict.fromkeys([*job.browser_step_refs, browser_replay_ref]))
+                report["browser_replay_ref"] = browser_replay_ref
+                report["browser_replay_packet"] = browser_replay_packet
+                scratchpad.set_next_action(
+                    action="repair failed browser step, rerun that step, then rerun full proof",
+                    reason="browser_proof_failed",
+                    payload={"browser_replay_ref": browser_replay_ref, "packet": browser_replay_packet},
+                )
+                job.repair_issue_signatures.append(
+                    {
+                        "check": "browser_flow_smoke",
+                        "signature": str(browser_replay_packet.get("failed_step") or browser_replay_packet.get("failed_selector") or "browser_step_failed"),
+                        "repair_packet_ref": browser_replay_ref,
+                    }
+                )
             report["worker_id"] = "fresh_verifier"
             report["fresh_context"] = True
             self.verification_reports[artifact_run_id] = report
@@ -1360,11 +1426,49 @@ class WorkspaceCodeAgentRuntime:
                     },
                     save=False,
                 )
+            if report.get("status") == "passed" and not coordinator.ready_to_finalize():
+                missing = coordinator.incomplete_required_todos()
+                report = {
+                    **report,
+                    "status": "failed",
+                    "summary": "Coordinator todo gate is incomplete.",
+                    "issues": [
+                        *list(report.get("issues") or []),
+                        {
+                            "kind": "todo_plan_incomplete",
+                            "details": "A create/workflow run cannot complete until planning, reading, editing, checking, and browser proof todo items are completed.",
+                            "missing": missing,
+                        },
+                    ],
+                }
+                coordinator.start_phase("repairing", "Coordinator todo gate requires targeted repair before completion.")
+            elif report.get("status") == "passed":
+                coordinator.complete_phase("completed", "Run passed strict checks, browser proof, and verifier gate.")
             job.verification_report_ref = f"verification_report:{workspace_id}:{artifact_run_id}"
+            job.verifier_review_ref = f"verifier_review:{workspace_id}:{artifact_run_id}"
             self._store_report(
                 job.verification_report_ref,
                 {"workspace_id": workspace_id, "run_id": run_id, "report": report},
             )
+            self._store_report(
+                job.verifier_review_ref,
+                {"workspace_id": workspace_id, "run_id": run_id, "review": report},
+            )
+            browser_step_ref = f"browser_steps:{workspace_id}:{artifact_run_id}:fresh_verifier"
+            job.browser_step_refs = list(dict.fromkeys([*job.browser_step_refs, browser_step_ref]))
+            self._store_report(
+                browser_step_ref,
+                {
+                    "workspace_id": workspace_id,
+                    "run_id": run_id,
+                    "worker_id": "fresh_verifier",
+                    "status": report.get("status"),
+                    "issues": report.get("issues", []),
+                    "proof": report,
+                },
+            )
+            self.transcript_store.append_browser_proof(artifact_run_id, report)
+            self._store_transcript_snapshot(job, artifact_run_id)
             self._store_report(job.scratchpad_ref, {"workspace_id": workspace_id, "run_id": run_id, **scratchpad.snapshot(), **coordinator.snapshot()})
             self.rollout_trace.append(artifact_run_id, "verification_worker", report)
             self._record_hook(
@@ -1437,7 +1541,7 @@ class WorkspaceCodeAgentRuntime:
             ),
             has_tooling_failure=CheckRunner.has_tooling_failure,
             plan_turn=_plan_turn,
-            apply_contract_sync=_apply_contract_sync,
+            apply_change_sync=_apply_change_sync,
             verify_completion=_verify_completion,
             before_apply=_before_apply,
             after_apply=_after_apply,
@@ -1457,19 +1561,187 @@ class WorkspaceCodeAgentRuntime:
                 attempt=attempt,
             ),
         )
-        return self.agent_loop_engine.run(
+        return self.agent_tool_call_loop.run(
             workspace_id=workspace_id,
             run_id=run_id,
             job=job,
             draft_source=draft_source,
             role_scope=role_scope,
             generation_mode=generation_mode,
-            initial_draft_actions=[],
-            initial_assistant_message="Workspace code agent initialized.",
+            initial_file_changes=branch_initial_file_changes,
+            initial_assistant_message=branch_initial_message,
             initial_files_read=list(initial_context.keys()),
             initial_changed_files=last_changed_files,
             callbacks=callbacks,
         )
+
+    def _run_parallel_worker_branches(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        artifact_run_id: str,
+        request: GenerateRequest,
+        job: JobRecord,
+        generation_mode: GenerationMode,
+        worker_tasks: list[dict[str, Any]],
+        worker_drafts: dict[str, Any],
+        worker_prefix: dict[str, Any],
+    ) -> tuple[list[DraftAction], list[str], str]:
+        workers_by_id = {
+            str(worker.get("worker_id") or ""): worker
+            for worker in worker_drafts.get("workers") or []
+            if isinstance(worker, dict)
+        }
+        tasks = [
+            task
+            for task in worker_tasks
+            if str(task.get("worker_id") or "").strip() in workers_by_id
+        ]
+        if not tasks:
+            return [], [], "Workspace code agent initialized."
+        self._append_activity(
+            job,
+            "worker_started",
+            "Starting isolated worker branches",
+            {"worker_count": len(tasks), "status": "started"},
+            save=False,
+        )
+        for task in tasks:
+            worker_id = str(task.get("worker_id") or "").strip()
+            self._append_event(
+                job,
+                "worker_started",
+                f"Worker {worker_id} started an isolated tool loop.",
+                {
+                    "worker_id": worker_id,
+                    "branch_run_id": workers_by_id.get(worker_id, {}).get("branch_run_id"),
+                    "transcript_ref": workers_by_id.get(worker_id, {}).get("transcript_ref"),
+                },
+            )
+        results: list[WorkerBranchResult] = []
+        max_workers = min(5, len(tasks))
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="agent-worker") as executor:
+            futures = {}
+            for task in tasks:
+                worker_id = str(task.get("worker_id") or "").strip()
+                worker = workers_by_id[worker_id]
+                futures[
+                    executor.submit(
+                        self.worker_branch_loop.run,
+                        workspace_id=workspace_id,
+                        parent_run_id=artifact_run_id,
+                        branch_run_id=str(worker.get("branch_run_id") or ""),
+                        branch_source=Path(str(worker.get("source_dir") or "")),
+                        generation_mode=generation_mode,
+                        model_profile=request.model_profile,
+                        user_prompt=request.prompt,
+                        worker_task=task,
+                        worker_prefix=worker_prefix,
+                        max_steps=4 if generation_mode == GenerationMode.QUALITY else 3,
+                    )
+                ] = worker_id
+            for future in as_completed(futures):
+                worker_id = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = WorkerBranchResult(
+                        worker_id=worker_id,
+                        owner_scope=str(workers_by_id.get(worker_id, {}).get("owner_scope") or worker_id),
+                        branch_run_id=str(workers_by_id.get(worker_id, {}).get("branch_run_id") or ""),
+                        source_dir=str(workers_by_id.get(worker_id, {}).get("source_dir") or ""),
+                        status="failed",
+                        error=str(exc),
+                    )
+                results.append(result)
+                ref = f"worker_branch:{workspace_id}:{artifact_run_id}:{worker_id}"
+                job.worker_branch_refs = list(dict.fromkeys([*job.worker_branch_refs, ref]))
+                self._store_report(ref, {"workspace_id": workspace_id, "run_id": run_id, "branch": result.as_dict()})
+                if result.token_usage:
+                    job.token_usage = self._merge_run_token_usage(
+                        job.token_usage if isinstance(job.token_usage, dict) else {},
+                        result.token_usage,
+                    )
+                    job.cache_stats = self._merge_cache_stats(job.cache_stats, result.token_usage)
+                event_type = "worker_completed" if result.status == "changes_ready" else "worker_failed" if result.status == "failed" else "worker_completed"
+                message = (
+                    f"Worker {worker_id} produced branch changes."
+                    if result.status == "changes_ready"
+                    else f"Worker {worker_id} finished without branch changes."
+                    if result.status == "no_changes"
+                    else f"Worker {worker_id} failed its branch loop."
+                )
+                self._append_event(
+                    job,
+                    event_type,
+                    message,
+                    {
+                        "worker_id": worker_id,
+                        "branch_run_id": result.branch_run_id,
+                        "status": result.status,
+                        "changed_files": list(result.changed_files),
+                        "file_change_count": len(result.file_changes),
+                        "token_usage": dict(result.token_usage),
+                        "model": result.model,
+                        "error": result.error,
+                        "artifact_ref": ref,
+                    },
+                )
+        file_changes = [change for result in results if result.status == "changes_ready" for change in result.file_changes]
+        if not file_changes:
+            self._store_report(
+                job.worker_merge_ref or f"worker_merge:{workspace_id}:{artifact_run_id}",
+                {"workspace_id": workspace_id, "run_id": run_id, **self.worker_runtime.snapshot(artifact_run_id)},
+            )
+            return [], [], "Worker branches completed without mergeable changes; coordinator will continue."
+        merge_report = self.worker_runtime.merge_report(artifact_run_id, file_changes)
+        job.worker_merge_ref = job.worker_merge_ref or f"worker_merge:{workspace_id}:{artifact_run_id}"
+        if not bool((merge_report.get("ownership") if isinstance(merge_report.get("ownership"), dict) else {}).get("ok")):
+            self._store_report(job.worker_merge_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.worker_runtime.snapshot(artifact_run_id)})
+            self._append_event(
+                job,
+                "worker_failed",
+                "Worker branch merge found conflicting owned changes.",
+                {"worker_id": "merge", "merge_report": merge_report, "artifact_ref": job.worker_merge_ref},
+            )
+            return [], [], "Worker branches need coordinator repair after merge conflict."
+        envelope = self.workspace_service.build_patch_envelope_for_file_changes(workspace_id, run_id, file_changes)
+        apply_result = self.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
+        merge_payload = {
+            "merge_report": merge_report,
+            "apply_result": apply_result.model_dump(mode="json"),
+            "branch_results": [result.as_dict() for result in results],
+        }
+        self._store_report(job.worker_merge_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.worker_runtime.snapshot(artifact_run_id), **merge_payload})
+        if apply_result.status != "applied":
+            self._append_event(
+                job,
+                "worker_failed",
+                "Worker branch merge patch could not be applied to the coordinator draft.",
+                {"worker_id": "merge", "apply_result": apply_result.model_dump(mode="json"), "artifact_ref": job.worker_merge_ref},
+            )
+            return [], [], "Worker branches need coordinator repair after merge apply conflict."
+        branch_results = self.worker_runtime.record_branch_results(artifact_run_id, file_changes)
+        for branch in branch_results:
+            ref = f"worker_branch_merge:{workspace_id}:{artifact_run_id}:{branch.get('worker_id')}"
+            job.worker_branch_refs = list(dict.fromkeys([*job.worker_branch_refs, ref]))
+            self._store_report(ref, {"workspace_id": workspace_id, "run_id": run_id, "branch": branch})
+        changed_files = list(dict.fromkeys([change.file_path for change in file_changes if change.file_path]))
+        self._append_activity(
+            job,
+            "worker_completed",
+            "Merged isolated worker branch diffs",
+            {"worker_count": len(results), "changed_files": changed_files, "status": "completed"},
+            save=False,
+        )
+        self._append_event(
+            job,
+            "worker_completed",
+            "Merged isolated worker branch diffs into the coordinator draft.",
+            {"worker_id": "merge", "changed_files": changed_files, "file_change_count": len(file_changes), "artifact_ref": job.worker_merge_ref},
+        )
+        return file_changes, changed_files, "Isolated worker branches produced the initial coordinator draft."
 
     def _request_agent_turn(
         self,
@@ -1534,20 +1806,6 @@ class WorkspaceCodeAgentRuntime:
                 and last_turn_summary
                 and "full-file replace actions for only the conflicted files" in str(last_turn_summary).lower()
             )
-            draft_action_limit = (
-                FOCUSED_VISUAL_DRAFT_ACTION_LIMIT
-                if focused_visual_edit
-                else 1 if force_replace_only
-                else 8 if workflow_slice_repair and generation_mode == GenerationMode.FAST
-                else 10 if workflow_slice_repair and generation_mode == GenerationMode.BALANCED
-                else 12 if workflow_slice_repair
-                else 2 if create_repair_turn and generation_mode == GenerationMode.FAST
-                else 2 if create_repair_turn and generation_mode == GenerationMode.BALANCED
-                else 3 if create_repair_turn
-                else AGENTIC_WORKFLOW_DRAFT_ACTION_LIMIT if agentic_workflow_turn
-                else 8 if compact_edit_turn
-                else 20 if fast_create_turn else AGENT_TURN_DRAFT_ACTION_LIMIT
-            )
             content_max_length = (
                 FOCUSED_VISUAL_CONTENT_MAX_LENGTH
                 if focused_visual_edit
@@ -1562,20 +1820,7 @@ class WorkspaceCodeAgentRuntime:
                 else 9000 if compact_edit_turn
                 else 9000 if fast_create_turn else 18000
             )
-            allow_tool_requests = False if focused_visual_edit else False if create_repair_turn else True
-            allowed_outcomes = (
-                ["patch_ready", "fatal_invalid_response"]
-                if focused_visual_edit
-                else ["patch_ready"] if create_repair_turn
-                else None
-            )
-            agent_schema = self._agent_action_schema(
-                draft_action_limit=draft_action_limit,
-                content_max_length=content_max_length,
-                allow_tool_requests=allow_tool_requests,
-                allowed_outcomes=allowed_outcomes,
-                allowed_draft_action_types=["replace"] if force_replace_only else None,
-            )
+            del content_max_length
             user_prompt = self._agent_user_prompt(
                 workspace_id=workspace_id,
                 run_id=run_id,
@@ -1618,7 +1863,7 @@ class WorkspaceCodeAgentRuntime:
             self._append_event(
                 job,
                 "agent_turn_started",
-                "Workspace code agent is generating the next draft action.",
+                "Workspace code agent is selecting the next tool call.",
                 {
                     "attempt": attempt,
                     "tool_round": tool_round,
@@ -1629,13 +1874,15 @@ class WorkspaceCodeAgentRuntime:
                     "force_replace_only": force_replace_only,
                 },
             )
-            response = self.openai_client.generate_agent_turn(
-                schema_name="workspace_code_agent_action_v1",
-                schema=agent_schema,
+            artifact_run_id = run_id or job.job_id
+            transcript_context = self.transcript_store.next_model_context(artifact_run_id)
+            pending_tool_results = list(transcript_context.get("tool_result_messages") or [])
+            response = self.openai_client.generate_agent_tool_step(
+                tools=AgentToolRegistry.openai_tools(),
                 system_prompt=self._agent_system_prompt(),
                 user_prompt=user_prompt,
                 prompt_cache_key=self._prompt_cache_key(workspace_id, run_id, request.prompt),
-                stable_prefix="workspace_code_agent_runtime_v2",
+                stable_prefix="workspace_code_agent_tool_loop_v1",
                 model_override=primary_model,
                 responses_tuning_override=self._agent_turn_tuning(
                     generation_mode,
@@ -1643,19 +1890,52 @@ class WorkspaceCodeAgentRuntime:
                     focused_edit_kind=focused_edit_kind,
                     repair_turn=create_repair_turn,
                 ),
+                previous_response_id=str(transcript_context.get("previous_response_id") or "") or None,
+                tool_result_messages=pending_tool_results,
             )
             job.llm_model = str(response.get("model") or "")
             turn_cache_stats = response.get("cache_stats") or {}
             job.cache_stats = self._merge_cache_stats(job.cache_stats, turn_cache_stats)
             payload = response.get("payload")
-            if isinstance(payload, str):
-                payload = json.loads(payload)
             parsed_payload = payload if isinstance(payload, dict) else {}
-            raw_draft_actions = parsed_payload.get("draft_actions")
-            raw_tool_requests = parsed_payload.get("tool_requests")
-            draft_action_count = len(raw_draft_actions) if isinstance(raw_draft_actions, list) else 0
-            tool_request_count = len(raw_tool_requests) if isinstance(raw_tool_requests, list) else 0
+            raw_tool_calls = parsed_payload.get("tool_calls")
+            tool_call_count = len(raw_tool_calls) if isinstance(raw_tool_calls, list) else 0
             duration_ms = int((time.perf_counter() - turn_started_at) * 1000)
+            normalized_tool_calls = [item for item in raw_tool_calls if isinstance(item, dict)] if isinstance(raw_tool_calls, list) else []
+            self.transcript_store.append_model_turn(
+                artifact_run_id,
+                attempt=attempt,
+                tool_round=tool_round,
+                response_id=str(parsed_payload.get("response_id") or ""),
+                assistant_message=str(parsed_payload.get("assistant_message") or ""),
+                tool_calls=normalized_tool_calls,
+                model=job.llm_model,
+                usage={
+                    "input_tokens": int(turn_cache_stats.get("input_tokens") or 0),
+                    "output_tokens": int(turn_cache_stats.get("output_tokens") or 0),
+                    "reasoning_tokens": int(turn_cache_stats.get("reasoning_tokens") or 0),
+                    "total_tokens": int(turn_cache_stats.get("total_tokens") or 0),
+                },
+                consumed_tool_result_count=len(pending_tool_results),
+            )
+            self.transcript_store.append_tool_calls(artifact_run_id, normalized_tool_calls)
+            job.active_tool_uses = [
+                {
+                    "tool_use_id": str(item.get("tool_use_id") or ""),
+                    "tool": str(item.get("tool") or ""),
+                    "status": "requested",
+                    "attempt": attempt,
+                    "tool_round": tool_round,
+                }
+                for item in normalized_tool_calls
+            ]
+            self._store_transcript_snapshot(job, artifact_run_id)
+            self._store_resume_checkpoint(
+                job,
+                artifact_run_id,
+                phase="model_turn",
+                extra={"attempt": attempt, "tool_round": tool_round, "pending_tool_results": len(pending_tool_results)},
+            )
             self._append_agent_diagnostic(
                 workspace_id,
                 {
@@ -1668,23 +1948,19 @@ class WorkspaceCodeAgentRuntime:
                     "duration_ms": duration_ms,
                     "status": "completed",
                     "model": job.llm_model,
-                    "outcome": str(parsed_payload.get("outcome") or ""),
-                    "draft_action_count": draft_action_count,
-                    "draft_action_files": [
-                        str(item.get("file_path") or "")
-                        for item in raw_draft_actions
-                        if isinstance(item, dict) and str(item.get("file_path") or "").strip()
-                    ] if isinstance(raw_draft_actions, list) else [],
-                    "tool_request_count": tool_request_count,
-                    "tool_requests": [
+                    "response_id": str(parsed_payload.get("response_id") or ""),
+                    "tool_call_count": tool_call_count,
+                    "consumed_tool_result_count": len(pending_tool_results),
+                    "tool_calls": [
                         {
                             "tool": str(item.get("tool") or ""),
+                            "tool_use_id": str(item.get("tool_use_id") or ""),
                             "mode": str(item.get("mode") or ""),
                             "targets": [str(target) for target in item.get("targets") or []] if isinstance(item, dict) else [],
                         }
-                        for item in raw_tool_requests
+                        for item in raw_tool_calls
                         if isinstance(item, dict)
-                    ] if isinstance(raw_tool_requests, list) else [],
+                    ] if isinstance(raw_tool_calls, list) else [],
                     "token_usage": {
                         "input_tokens": int(turn_cache_stats.get("input_tokens") or 0),
                         "output_tokens": int(turn_cache_stats.get("output_tokens") or 0),
@@ -1700,9 +1976,8 @@ class WorkspaceCodeAgentRuntime:
                 {
                     "attempt": attempt,
                     "tool_round": tool_round,
-                    "outcome": str(parsed_payload.get("outcome") or ""),
-                    "draft_action_count": draft_action_count,
-                    "tool_request_count": tool_request_count,
+                    "response_id": str(parsed_payload.get("response_id") or ""),
+                    "tool_call_count": tool_call_count,
                     "model": job.llm_model,
                     "input_tokens": int(turn_cache_stats.get("input_tokens") or 0),
                     "output_tokens": int(turn_cache_stats.get("output_tokens") or 0),
@@ -1711,7 +1986,7 @@ class WorkspaceCodeAgentRuntime:
                     "has_draft_diff": bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip()),
                 },
             )
-            return payload if isinstance(payload, dict) else {"error": "Agent returned a non-object payload."}
+            return parsed_payload if parsed_payload else {"error": "Agent returned no tool-step payload."}
         except Exception as exc:
             error_text = str(exc)
             self._append_agent_diagnostic(
@@ -1755,81 +2030,6 @@ class WorkspaceCodeAgentRuntime:
     def _is_provider_quota_error(error_text: str) -> bool:
         lowered = str(error_text or "").lower()
         return "insufficient_quota" in lowered or "exceeded your current quota" in lowered
-
-    @staticmethod
-    def _agent_action_schema(
-        *,
-        draft_action_limit: int = AGENT_TURN_DRAFT_ACTION_LIMIT,
-        content_max_length: int = 18000,
-        allow_tool_requests: bool = True,
-        allowed_outcomes: list[str] | None = None,
-        allowed_draft_action_types: list[str] | None = None,
-        min_draft_actions: int = 0,
-    ) -> dict[str, Any]:
-        outcome_values = allowed_outcomes or ["patch_ready", "tool_request", "no_progress", "fatal_invalid_response"]
-        draft_action_values = allowed_draft_action_types or ["create", "replace", "delete", "patch"]
-        return {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "outcome": {"type": "string", "enum": outcome_values},
-                "assistant_message": {"type": "string"},
-                "diagnosis": {"type": "string"},
-                "tool_requests": {
-                    "type": "array",
-                    "maxItems": 12 if allow_tool_requests else 0,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "tool": {
-                                "type": "string",
-                                "enum": sorted(AgentToolRegistry.names()),
-                            },
-                            "mode": {"type": "string", "enum": ["exact", "final"]},
-                            "targets": {"type": "array", "items": {"type": "string"}},
-                            "file_path": {"type": "string"},
-                            "pattern": {"type": "string"},
-                            "command": {"type": "string"},
-                            "content": {"type": "string"},
-                            "diff": {"type": "string"},
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["tool", "targets", "reason"],
-                    },
-                },
-                "draft_actions": {
-                    "type": "array",
-                    "minItems": max(0, int(min_draft_actions)),
-                    "maxItems": draft_action_limit,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "file_path": {"type": "string", "maxLength": 220},
-                            "operation": {"type": "string", "enum": draft_action_values},
-                            "content": {"type": ["string", "null"], "maxLength": content_max_length},
-                            "diff": {"type": ["string", "null"], "maxLength": content_max_length},
-                            "reason": {"type": "string", "maxLength": 600},
-                        },
-                        "required": ["file_path", "operation", "reason"],
-                    },
-                },
-                "expected_verification": {"type": "string"},
-                "rationale_by_file": {"type": "object", "additionalProperties": {"type": "string"}},
-                "acceptance_checks": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": [
-                "outcome",
-                "assistant_message",
-                "diagnosis",
-                "tool_requests",
-                "draft_actions",
-                "expected_verification",
-                "rationale_by_file",
-                "acceptance_checks",
-            ],
-        }
 
     @staticmethod
     def _agent_system_prompt() -> str:
@@ -1890,7 +2090,7 @@ class WorkspaceCodeAgentRuntime:
             focused_rules.extend(
                 [
                     "Focused visual_style_edit lane: change only CSS/style files listed in focused_edit_files. Do not edit HTML, JavaScript, backend routes, route_manifest.json, generated tests, docs, or unrelated files.",
-                    f"Return one compact patch_ready response with at most {FOCUSED_VISUAL_DRAFT_ACTION_LIMIT} draft actions and no tool requests. Prefer full-file replace for CSS if a hunk patch would be ambiguous or has already conflicted.",
+                    f"Use one compact mutating tool batch with at most {FOCUSED_VISUAL_WRITE_LIMIT} CSS writes. Prefer write_file for CSS if a hunk patch would be ambiguous or has already conflicted.",
                 "Do not add business behavior, data, tests, API calls, navigation, or role copy for a pure style/color/spacing prompt.",
                     "CSS may use hex/rgb/hsl values for requested colors; the literal user color word does not need to appear in generated CSS.",
                     "Keep the existing top safe spacing and existing selectors/data-testid hooks intact while changing the visual styling.",
@@ -1942,6 +2142,24 @@ class WorkspaceCodeAgentRuntime:
                 if compact_repair_prompt
                 else implementation_plan
             ),
+            "worker_branching": (
+                self._compact_jsonish(
+                    {
+                        "mailbox": AgentWorkerManager.mailbox_for_plan(
+                            generation_mode=generation_mode,
+                            implementation_plan=implementation_plan,
+                        ),
+                        "worker_tasks": AgentWorkerTaskPlanner.worker_tasks(
+                            generation_mode=generation_mode,
+                            implementation_plan=implementation_plan,
+                        ),
+                    },
+                    max_chars=2600,
+                    max_items=12,
+                )
+                if generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
+                else {"enabled": False, "mode": "single_agent_loop"}
+            ),
             "orchestration": (
                 self._compact_orchestration_metadata(orchestration)
                 if compact_repair_prompt
@@ -1967,9 +2185,9 @@ class WorkspaceCodeAgentRuntime:
                 "Create or replace both missing generated test files now: miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. In the same coherent patch, also fix the first API/frontend schema mismatch from latest_checks if one is listed. Do not spend this turn only on CSS, copy, or a single frontend mismatch while generated tests are absent."
                 if missing_generated_tests_repair
                 else
-                "Repair the connected workflow slice from latest_checks in one coherent patch. Return 2-5 draft actions touching only the named backend/role/test files; keep selectors, payloads, routes, and generated tests aligned together."
+                "Repair the connected workflow slice from latest_checks in one coherent mutating tool batch touching only the named backend/role/test files; keep selectors, payloads, routes, and generated tests aligned together."
                 if workflow_slice_repair
-                else "Patch only the first concrete blocking issue from latest_checks. Return 1-2 draft actions touching only the named file(s); do not repair all failures in one turn."
+                else "Patch only the first concrete blocking issue from latest_checks. Use 1-2 apply_patch_to_draft/write_file calls touching only the named file(s); do not repair all failures in one turn."
                 if compact_repair_prompt
                 else ""
             ),
@@ -2023,7 +2241,7 @@ class WorkspaceCodeAgentRuntime:
                 if compact_repair_prompt
                 else [
                     *focused_rules,
-                    f"Keep each turn applyable: return up to {AGENT_TURN_DRAFT_ACTION_LIMIT} coherent draft actions, or request only the specific tools needed for the next patch.",
+                    f"Keep each turn applyable: use mutating tools for a compact coherent edit, or request only the specific read-only tools needed for the next patch.",
                     "Use the implementation_plan and acceptance_contract as the product contract. Derive entities, fields, routes, labels, and role actions from the user's prompt and current code, not from platform templates.",
                     "Create/workflow completion requires real UI controls, JavaScript handlers, backend persistence, generated tests, cross-role visibility, refresh persistence, and browser/mobile proof.",
                     "Build three isolated role surfaces in the miniapp shell: client creates/submits the main prompt-derived state, specialist processes or updates it, manager reviews/control-checks the persisted state. Do not link role roots to each other.",
@@ -2034,7 +2252,7 @@ class WorkspaceCodeAgentRuntime:
                     "For edit/refine/fix/repair, patch existing files with small unified diffs. Use full-file replace only for new files, tiny files, create-mode work, or a file that repeatedly conflicts.",
                     "If checks/browser proof fail, repair the concrete failing slice from latest_checks/tool_results: align selectors, payload fields, API routes, rendered state, and tests together. Do not rewrite unrelated files.",
                     "Read-only tools never write files. Mutating tools are serialized through the draft edit validator. run_command is limited to safe diagnostics such as unittest, py_compile, node tests/checks, rg, sed, and ls.",
-                    "If you have enough context, return outcome=patch_ready with explicit draft_actions or mutating draft tool requests. Do not return no_progress unless the blocker is exact and external.",
+                    "If you have enough context, call apply_patch_to_draft or write_file. Do not stop unless the blocker is exact and external.",
                 ]
             ),
         }
@@ -2584,7 +2802,7 @@ class WorkspaceCodeAgentRuntime:
         rules = [
             "This is a compact code-agent repair turn for the current draft. Do not rebuild the whole app unless the failing file is missing.",
             "Read the latest check/browser diagnostics as the source of truth, patch the smallest connected slice, then let validation run again.",
-            "Prefer patch draft actions for existing files. Use full replace only for a new/missing/tiny file or after a repeated apply conflict on that same file.",
+            "Prefer apply_patch_to_draft for existing files. Use write_file only for a new/missing/tiny file or after a repeated apply conflict on that same file.",
             "Keep the app prompt-owned and prompt-derived: do not introduce platform templates, seed/demo/mock business records, or fixed resource/page names.",
             "For create/workflow failures, keep HTML controls, JavaScript handlers, API routes/schemas, persistence, and generated tests aligned to one actual contract.",
             "Browser-flow failures are product failures: make the UI action change persisted state, make other roles observe it, and make reload preserve it.",
@@ -2689,13 +2907,13 @@ class WorkspaceCodeAgentRuntime:
                     paths.append(path)
         return paths[:16]
 
-    def _execute_tool_requests(
+    def _execute_tool_calls(
         self,
         *,
         workspace_id: str,
         run_id: str,
         draft_source: Path,
-        tool_requests: list[dict[str, Any]],
+        tool_calls: list[dict[str, Any]],
         execute_checks: Callable[[list[str]], tuple[CheckExecutionRecord, dict[str, Any]]],
         job: JobRecord | None = None,
     ) -> tuple[dict[str, str], list[dict[str, object]]]:
@@ -2719,14 +2937,119 @@ class WorkspaceCodeAgentRuntime:
                 )
             self.rollout_trace.append(artifact_run_id, "tool_batch", dict(summary))
 
-        return self.tool_executor.execute(
+        loaded_context, tool_results = self.tool_executor.execute(
             workspace_id=workspace_id,
             run_id=run_id,
             draft_source=draft_source,
-            tool_requests=tool_requests,
+            tool_calls=tool_calls,
             execute_checks=execute_checks,
             append_activity=append_activity if job is not None else None,
             append_batch_summary=append_batch_summary,
+        )
+        if job is not None:
+            artifact_run_id = run_id or job.job_id
+            self.transcript_store.append_tool_results(artifact_run_id, tool_results)
+            completed_ids = {str(item.get("tool_use_id") or "") for item in tool_results if isinstance(item, dict)}
+            if completed_ids and job.active_tool_uses:
+                job.active_tool_uses = [
+                    {
+                        **item,
+                        "status": "completed" if str(item.get("tool_use_id") or "") in completed_ids else item.get("status", "requested"),
+                    }
+                    for item in job.active_tool_uses
+                ]
+            job.active_processes = list(self.process_manager.snapshot().get("active_processes") or [])
+            self._store_transcript_snapshot(job, artifact_run_id)
+            self._store_resume_checkpoint(
+                job,
+                artifact_run_id,
+                phase="tool_results",
+                extra={"tool_result_count": len(tool_results)},
+            )
+        return loaded_context, tool_results
+
+    def _store_resume_checkpoint(
+        self,
+        job: JobRecord,
+        artifact_run_id: str,
+        *,
+        phase: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        job.resume_checkpoint_ref = job.resume_checkpoint_ref or f"resume_checkpoint:{job.workspace_id}:{artifact_run_id}"
+        coordinator = self.coordinators.get(artifact_run_id)
+        scratchpad = self.scratchpads.get(artifact_run_id)
+        checkpoint = {
+            "workspace_id": job.workspace_id,
+            "run_id": job.linked_run_id,
+            "job_id": job.job_id,
+            "phase": phase,
+            "status": job.status,
+            "current_stage": job.current_stage,
+            "agent_transcript_ref": job.agent_transcript_ref,
+            "tool_result_messages_ref": job.tool_result_messages_ref,
+            "scratchpad_ref": job.scratchpad_ref,
+            "file_change_history_ref": job.file_change_history_ref,
+            "replay_trace_ref": job.replay_trace_ref,
+            "todo_plan": coordinator.snapshot().get("todo_plan", []) if coordinator else [],
+            "scratchpad": scratchpad.snapshot() if scratchpad else {},
+            "process_summary": self.process_recovery.checkpoint(self.process_manager.snapshot()),
+            "stored_at": datetime.now(timezone.utc).isoformat(),
+        }
+        checkpoint.update(extra or {})
+        self._store_report(job.resume_checkpoint_ref, checkpoint)
+
+    def _configure_transcript_persistence(
+        self,
+        job: JobRecord,
+        artifact_run_id: str,
+        *,
+        restore_existing: bool = False,
+    ) -> None:
+        job.agent_transcript_ref = job.agent_transcript_ref or f"agent_transcript:{job.workspace_id}:{artifact_run_id}"
+        job.tool_result_messages_ref = job.tool_result_messages_ref or f"tool_result_messages:{job.workspace_id}:{artifact_run_id}"
+        if self.transcript_store.is_configured(artifact_run_id):
+            return
+        existing = self.store.get("reports", job.agent_transcript_ref) if restore_existing else None
+
+        def write(snapshot: dict[str, Any]) -> None:
+            self._store_report(
+                job.agent_transcript_ref or f"agent_transcript:{job.workspace_id}:{artifact_run_id}",
+                {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **snapshot},
+            )
+            self._store_report(
+                job.tool_result_messages_ref or f"tool_result_messages:{job.workspace_id}:{artifact_run_id}",
+                {
+                    "workspace_id": job.workspace_id,
+                    "run_id": job.linked_run_id,
+                    "items": snapshot.get("all_tool_result_messages", []),
+                    "pending_items": snapshot.get("tool_result_messages", []),
+                    "transcript_ref": job.agent_transcript_ref,
+                },
+            )
+
+        self.transcript_store.configure_persistence(
+            artifact_run_id,
+            writer=write,
+            existing=existing if isinstance(existing, dict) else None,
+        )
+
+    def _store_transcript_snapshot(self, job: JobRecord, artifact_run_id: str) -> None:
+        self._configure_transcript_persistence(job, artifact_run_id)
+        snapshot = self.transcript_store.snapshot(artifact_run_id)
+        self._store_report(
+            job.agent_transcript_ref,
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **snapshot},
+        )
+        self._store_report(
+            job.tool_result_messages_ref,
+            {
+                "workspace_id": job.workspace_id,
+                "run_id": job.linked_run_id,
+                "items": snapshot.get("all_tool_result_messages", []),
+                "pending_items": snapshot.get("tool_result_messages", []),
+                "transcript_ref": job.agent_transcript_ref,
+            },
         )
 
     @staticmethod
@@ -2774,79 +3097,49 @@ class WorkspaceCodeAgentRuntime:
         create_task = str(request.intent or "").lower() == "create"
         if create_task:
             next_action = (
-                "The previous answer was too large. Return outcome=patch_ready now with a very small patch. "
-                "If this is a repair for an existing draft, patch the smallest coherent failing workflow slice and touch only the concrete failed files/checks; do not rebuild the whole app or request tools. "
-                "If this is the first implementation, return a compact but complete prompt-derived app surface, avoid inline styles and long comments, and do not request more context unless a specific required file is absent. "
+                "The previous answer was too large. Call one very small apply_patch_to_draft or write_file tool now. "
+                "If this is a repair for an existing draft, patch the smallest coherent failing workflow slice and touch only the concrete failed files/checks; do not rebuild the whole app. "
+                "If this is the first implementation, write a compact but complete prompt-derived app surface, avoid inline styles and long comments, and do not request more context unless a specific required file is absent. "
                 "Keep the app working, not static-only: align backend API routes, form/fetch frontend code, and generated tests around the same persisted fields. "
                 "Do not add mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded business records."
             )
         else:
             next_action = (
-                "The previous answer was too large. Return outcome=patch_ready now with 1-2 focused draft actions for the requested edit. "
-                "Prefer full-file replace for the single visible role file that needs the change instead of fragile multi-file hunks. "
+                "The previous answer was too large. Call 1-2 focused apply_patch_to_draft/write_file tools for the requested edit. "
+                "Prefer write_file for the single visible role file that needs the change instead of fragile multi-file hunks. "
                 "Do not request more context unless a required file is absent."
             )
         return {
             "tool": "output_cap_correction",
-            "contract": "The action payload exceeded the model output cap; tools cannot recover this automatically.",
+            "contract": "The model step exceeded the output cap; tools cannot recover this automatically.",
             "required_next_action": next_action,
             "previous_error": str(payload.get("error") or "")[:1200],
         }
 
     @staticmethod
-    def _tool_budget_correction_result(tool_requests: list[dict[str, Any]], *, request: GenerateRequest) -> dict[str, object]:
+    def _tool_budget_correction_result(tool_calls: list[dict[str, Any]], *, request: GenerateRequest) -> dict[str, object]:
         create_task = str(request.intent or "").strip().lower() == "create"
         return {
             "tool": "tool_budget_correction",
             "contract": "This agent turn has reached its diagnostic tool budget. Continue with the context and validation packet already provided.",
             "required_next_action": (
-                "Return outcome=patch_ready now. Do not request more tools in the next answer. "
+                "Call apply_patch_to_draft or write_file now. Do not request more read-only tools in the next answer. "
                 "Use the file_contexts and latest_checks already provided. "
                 + (
-                    "For create, produce compact draft actions that advance the prompt-derived app contract across backend, role UI, frontend behavior, route manifest when needed, and generated tests. Keep HTML concise and do not include large inline style blocks or preloaded business records."
+                    "For create, produce compact writes that advance the prompt-derived app contract across backend, role UI, frontend behavior, route manifest when needed, and generated tests. Keep HTML concise and do not include large inline style blocks or preloaded business records."
                     if create_task
                     else "For edit/fix, patch the smallest complete set of files needed for the requested behavior."
                 )
             ),
-            "ignored_tool_requests": [
+            "ignored_tool_calls": [
                 {
                     "tool": str(item.get("tool") or ""),
                     "targets": [str(target) for target in item.get("targets") or []] if isinstance(item, dict) else [],
                     "reason": str(item.get("reason") or "")[:400] if isinstance(item, dict) else "",
                 }
-                for item in tool_requests
+                for item in tool_calls
                 if isinstance(item, dict)
             ],
-        }
-
-    @staticmethod
-    def _draft_action_contract_correction_result(error: str, payload: dict[str, Any]) -> dict[str, object]:
-        raw_draft_actions = payload.get("draft_actions")
-        draft_action_summary: list[dict[str, str]] = []
-        if isinstance(raw_draft_actions, list):
-            for item in raw_draft_actions[:8]:
-                if isinstance(item, dict):
-                    draft_action_summary.append(
-                        {
-                            "operation": str(item.get("operation") or ""),
-                            "file_path": str(item.get("file_path") or ""),
-                            "has_content": str(item.get("content") is not None),
-                            "has_diff": str(bool(str(item.get("diff") or "").strip())),
-                        }
-                    )
-        return {
-            "tool": "draft_action_contract_correction",
-            "contract": (
-                "Draft actions must be directly applyable. create/replace require full resulting file content; "
-                "patch requires a unified diff; delete needs only file_path. Empty replace/create draft actions are invalid."
-            ),
-            "required_next_action": (
-                "Return outcome=patch_ready again with corrected draft actions for only the failing files. "
-                "If you choose replace, include the full final file content. If you choose patch, include a valid unified diff. "
-                "Do not end the run because of this formatting error."
-            ),
-            "previous_error": str(error or "")[:1200],
-            "previous_draft_actions": draft_action_summary,
         }
 
     @staticmethod
@@ -2859,7 +3152,7 @@ class WorkspaceCodeAgentRuntime:
             ),
             "focused_edit_files": WorkspaceCodeAgentRuntime._focused_visual_css_paths(role_scope),
             "required_next_action": (
-                "Return outcome=patch_ready with 1-4 CSS-only draft actions. Prefer replace with the full resulting CSS file "
+                "Use apply_patch_to_draft or write_file for 1-4 CSS-only edits. Prefer write_file with the full resulting CSS file "
                 "when a hunk patch is ambiguous. Do not edit backend, JavaScript, HTML, route manifests, generated tests, "
                 "or docs. Do not request tools when the listed CSS files are already provided in file_contexts."
             ),
@@ -2867,9 +3160,7 @@ class WorkspaceCodeAgentRuntime:
 
     @staticmethod
     def _is_self_blocked_tool_contract_response(payload: dict[str, Any]) -> bool:
-        if str(payload.get("outcome") or "").strip().lower() not in {"fatal_invalid_response", "no_progress"}:
-            return False
-        if payload.get("draft_actions"):
+        if payload.get("tool_calls"):
             return False
         text = " ".join(
             str(payload.get(key) or "")
@@ -2918,17 +3209,15 @@ class WorkspaceCodeAgentRuntime:
     def _tool_contract_correction_result(payload: dict[str, Any]) -> dict[str, object]:
         return {
             "tool": "tool_contract_correction",
-            "contract": "Read-only tools inspect context/checks. Mutating draft tools are converted to DraftAction and validated before apply; they do not bypass the edit validator.",
-            "required_next_action": "Return outcome=patch_ready with draft_actions or apply_patch_to_draft/write_file requests for concrete files, or request read-only context only if specific files are still missing.",
+            "contract": "Read-only tools inspect context/checks. apply_patch_to_draft and write_file are the only write tools and are validated before apply.",
+            "required_next_action": "Call apply_patch_to_draft/write_file for concrete files, or request read-only context only if specific files are still missing.",
             "previous_outcome": str(payload.get("outcome") or ""),
             "previous_diagnosis": str(payload.get("diagnosis") or payload.get("assistant_message") or "")[:1200],
         }
 
     @staticmethod
     def _is_empty_fatal_agent_response(payload: dict[str, Any]) -> bool:
-        if str(payload.get("outcome") or "").strip().lower() != "fatal_invalid_response":
-            return False
-        if payload.get("draft_actions") or payload.get("tool_requests"):
+        if payload.get("tool_calls"):
             return False
         text = " ".join(str(payload.get(key) or "") for key in ("assistant_message", "diagnosis")).strip().lower()
         return (
@@ -2955,18 +3244,19 @@ class WorkspaceCodeAgentRuntime:
         return {
             "tool": "fatal_response_correction",
             "contract": "The user is asking for ordinary workspace code generation/editing. This is allowed platform work.",
-            "required_next_action": "Do not return fatal_invalid_response without a concrete blocker. Return patch_ready draft_actions or request read-only context.",
+            "required_next_action": "Do not return fatal_invalid_response without a concrete blocker. Use apply_patch_to_draft/write_file or request read-only context.",
             "previous_outcome": str(payload.get("outcome") or ""),
             "previous_message": str(payload.get("diagnosis") or payload.get("assistant_message") or "")[:1200],
         }
 
     @staticmethod
-    def _agent_tool_requests(raw_tool_requests: list[Any]) -> list[dict[str, Any]]:
+    def _agent_tool_calls(raw_tool_calls: list[Any]) -> list[dict[str, Any]]:
         allowed_tools = {
             "list_files",
             "read_files",
             "search_files",
             "inspect_diff",
+            "read_artifact_ref",
             "semantic_scan",
             "run_checks",
             "run_command",
@@ -2976,56 +3266,17 @@ class WorkspaceCodeAgentRuntime:
         }
         return [
             item
-            for item in normalize_tool_requests(raw_tool_requests)
+            for item in normalize_tool_calls(raw_tool_calls)
             if str(item.get("tool") or "").strip().lower() in allowed_tools
         ]
 
     @staticmethod
-    def _is_mutating_agent_tool_request(request_item: dict[str, Any]) -> bool:
-        return str(request_item.get("tool") or "").strip().lower() in {"apply_patch_to_draft", "write_file"}
+    def _is_mutating_agent_tool_call(request_item: dict[str, Any]) -> bool:
+        return is_mutating_agent_tool_call(request_item)
 
     @staticmethod
-    def _draft_actions_from_mutating_tool_requests(tool_requests: list[dict[str, Any]]) -> tuple[list[DraftAction], list[dict[str, object]]]:
-        draft_actions: list[DraftAction] = []
-        trace: list[dict[str, object]] = []
-        for request_item in tool_requests:
-            tool = str(request_item.get("tool") or "").strip().lower()
-            if tool not in {"apply_patch_to_draft", "write_file"}:
-                continue
-            targets = [
-                WorkspaceCodeAgentRuntime._strip_leading_dot_slash(target)
-                for target in request_item.get("targets") or []
-                if str(target or "").strip()
-            ]
-            file_path = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(request_item.get("file_path") or (targets[0] if targets else ""))
-            reason = str(request_item.get("reason") or f"{tool} requested by agent").strip()
-            if tool == "write_file":
-                draft_actions.append(
-                    DraftAction(
-                        file_path=file_path,
-                        operation="replace",
-                        content=str(request_item.get("content") or ""),
-                        reason=reason,
-                    )
-                )
-            else:
-                draft_actions.append(
-                    DraftAction(
-                        file_path=file_path,
-                        operation="patch",
-                        diff=str(request_item.get("diff") or request_item.get("content") or ""),
-                        reason=reason,
-                    )
-                )
-            trace.append(
-                {
-                    "tool": tool,
-                    "contract": "mutating tool request converted to a DraftAction for serialized draft apply",
-                    "file_path": file_path,
-                    "reason": reason,
-                }
-            )
-        return draft_actions, trace
+    def _file_changes_from_mutating_tool_calls(tool_calls: list[dict[str, Any]]) -> tuple[list[DraftAction], list[dict[str, object]]]:
+        return file_changes_from_mutating_tool_calls(tool_calls)
 
     @staticmethod
     def _strip_leading_dot_slash(raw_path: object) -> str:
@@ -3033,84 +3284,6 @@ class WorkspaceCodeAgentRuntime:
         while path.startswith("./"):
             path = path[2:]
         return path
-
-    def _coerce_draft_actions(self, raw_draft_actions: list[Any]) -> list[DraftAction]:
-        draft_actions: list[DraftAction] = []
-        for item in raw_draft_actions:
-            if not isinstance(item, dict):
-                continue
-            operation = DraftAction.model_validate(item)
-            file_path = self._strip_leading_dot_slash(operation.file_path)
-            raw_patch = str(operation.diff or operation.content or "") if operation.operation == "patch" else ""
-            codex_patch_paths = self._codex_update_patch_paths(raw_patch)
-            if len(codex_patch_paths) == 1:
-                file_path = codex_patch_paths[0]
-            if not file_path or file_path.startswith("/") or ".." in Path(file_path).parts:
-                raise ValueError(f"Agent returned an unsafe file path: {operation.file_path}")
-            if any(file_path == prefix.rstrip("/") or file_path.startswith(prefix) for prefix in READ_ONLY_WRITE_PREFIXES):
-                raise ValueError(f"Agent attempted to edit a read-only/generated surface: {file_path}")
-            if operation.operation in {"create", "replace"} and operation.content is None:
-                diff_text = str(operation.diff or "").strip()
-                if diff_text:
-                    if self._looks_like_unified_diff(diff_text):
-                        draft_actions.append(
-                            DraftAction(
-                                operation_id=operation.operation_id,
-                                file_path=file_path,
-                                operation="patch",
-                                content=None,
-                                diff=diff_text,
-                                reason=operation.reason,
-                            )
-                        )
-                        continue
-                    draft_actions.append(
-                        DraftAction(
-                            operation_id=operation.operation_id,
-                            file_path=file_path,
-                            operation=operation.operation,
-                            content=str(operation.diff),
-                            diff=None,
-                            reason=operation.reason,
-                        )
-                    )
-                    continue
-                raise ValueError(f"Agent returned {operation.operation} for {file_path} without content.")
-            if operation.operation == "patch" and not str(operation.diff or operation.content or "").strip():
-                raise ValueError(f"Agent returned patch for {file_path} without a unified diff.")
-            if operation.operation == "patch":
-                if not self._looks_like_unified_diff(raw_patch):
-                    raise ValueError(f"Agent returned patch for {file_path} without a valid unified diff.")
-            draft_actions.append(
-                DraftAction(
-                    operation_id=operation.operation_id,
-                    file_path=file_path,
-                    operation=operation.operation,
-                    content=None if operation.operation == "patch" else operation.content,
-                    diff=operation.diff or (operation.content if operation.operation == "patch" else None),
-                    reason=operation.reason,
-                )
-            )
-        return draft_actions
-
-    @staticmethod
-    def _looks_like_unified_diff(text: str) -> bool:
-        value = str(text or "")
-        return bool(
-            re.search(r"^@@\s", value, flags=re.MULTILINE)
-            or re.search(r"^(---|\+\+\+)\s+", value, flags=re.MULTILINE)
-            or re.search(r"^diff --git\s+", value, flags=re.MULTILINE)
-            or re.search(r"^\*\*\* Update File:\s+", value, flags=re.MULTILINE)
-        )
-
-    @staticmethod
-    def _codex_update_patch_paths(text: str) -> list[str]:
-        paths: list[str] = []
-        for match in re.finditer(r"^\*\*\* Update File:\s+(.+)$", str(text or ""), flags=re.MULTILINE):
-            path = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(match.group(1))
-            if path:
-                paths.append(path)
-        return list(dict.fromkeys(paths))
 
     def _store_agent_quality_report(self, workspace_id: str, run_id: str, execution: CheckExecutionRecord) -> None:
         role_coverage: dict[str, Any] = {}
@@ -3170,59 +3343,16 @@ class WorkspaceCodeAgentRuntime:
         validation_snapshot: ValidationSnapshot | None,
     ) -> dict[str, object]:
         del preview_details
-        failed = [result for result in results if result.status == "failed"]
-        has_diff = bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
-        no_app_diff = request.mode in {"generate", "fix"} and not has_diff
-        remaining_issues = [
-            {
-                "kind": "check_failure",
-                "check": result.name,
-                "details": result.details,
-                "logs": result.logs[-8:],
-                "blocking": True,
-            }
-            for result in failed
-        ]
-        if no_app_diff:
-            remaining_issues.append(
-                {
-                    "kind": "meaningful_diff",
-                    "check": "meaningful_diff",
-                    "details": "Generation must create a prompt-specific draft diff before completion.",
-                    "blocking": True,
-                }
-            )
-        if validation_snapshot is not None:
-            remaining_issues.extend(
-                issue
-                for issue in validation_snapshot.issues
-                if isinstance(issue, dict) and issue.get("blocking", False)
-            )
-        complete = not failed and not no_app_diff
-        return {
-            "strict_green": complete,
-            "optimistic_complete": complete,
-            "preview_ok": True,
-            "validators_ok": not any(result.status == "failed" for result in results if result.name in {"schema_validators", "connectivity_validators"}),
-            "build_ok": not any(result.status == "failed" for result in results if result.name == "changed_files_static"),
-            "canonical_smoke_ok": not any(result.status == "failed" for result in results if result.name == "platform_invariants"),
-            "remaining_issues": remaining_issues,
-        }
-
-    def _validation_snapshot_from_execution(self, execution: CheckExecutionRecord) -> ValidationSnapshot:
-        issues = [issue.model_dump(mode="json") for issue in CheckRunner.failing_issues(execution.results)]
-        build_failed = any(item.status == "failed" for item in execution.results if item.name == "changed_files_static")
-        return ValidationSnapshot(
-            platform_valid=not bool(issues),
-            checks_valid=not bool(issues),
-            build_valid=not build_failed,
-            blocking=bool(issues),
-            issues=issues,
+        return self.completion_gate.completion_state(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            request_mode=request.mode,
+            results=results,
+            validation_snapshot=validation_snapshot,
         )
 
-    @staticmethod
-    def _fast_gate_passed(results: list[RunCheckResult]) -> bool:
-        return not any(result.status == "failed" for result in results)
+    def _validation_snapshot_from_execution(self, execution: CheckExecutionRecord) -> ValidationSnapshot:
+        return self.completion_gate.validation_snapshot_from_execution(execution)
 
     def _finalize_job(self, *, job: JobRecord, loop_result: AgentLoopResult, elapsed_ms: int) -> JobRecord:
         job.status = loop_result.status
@@ -3309,6 +3439,7 @@ class WorkspaceCodeAgentRuntime:
         large_tool_output_refs: list[str] = []
         process_output_items: list[dict[str, Any]] = []
         semantic_graph_items: list[dict[str, Any]] = []
+        artifact_read_items: list[dict[str, Any]] = []
         artifact_run_id = job.linked_run_id or job.job_id
         for turn in loop_result.turn_history:
             metadata = turn.get("metadata") if isinstance(turn, dict) else {}
@@ -3336,6 +3467,14 @@ class WorkspaceCodeAgentRuntime:
                         )
                     if item.get("tool") == "semantic_scan":
                         semantic_graph_items.append(dict(item))
+                    if item.get("tool") == "read_artifact_ref":
+                        artifact_read_items.append(
+                            {
+                                "tool_use_id": item.get("tool_use_id"),
+                                "artifact_ref": item.get("artifact_ref"),
+                                "found": item.get("found"),
+                            }
+                        )
                     compact_item = self._compact_tool_result(
                         item,
                         workspace_id=job.workspace_id,
@@ -3354,17 +3493,18 @@ class WorkspaceCodeAgentRuntime:
                 "has_content": bool(operation.content),
                 "has_diff": bool(operation.diff),
             }
-            for operation in loop_result.all_draft_actions
+            for operation in loop_result.all_file_changes
         ]
         job.compaction_summaries = [
             compact_agent_memory(
                 turn_history=loop_result.turn_history,
-                draft_action_count=len(loop_result.all_draft_actions),
+                file_change_count=len(loop_result.all_file_changes),
                 last_assistant_message=truncate_tool_text(loop_result.last_assistant_message, max_chars=1200),
             )
         ]
+        job.agent_transcript_ref = job.agent_transcript_ref or f"agent_transcript:{job.workspace_id}:{artifact_run_id}"
         job.tool_trace_ref = f"tool_trace:{job.workspace_id}:{artifact_run_id}"
-        job.draft_patch_history_ref = f"draft_patch_history:{job.workspace_id}:{artifact_run_id}"
+        job.file_change_history_ref = f"file_change_history:{job.workspace_id}:{artifact_run_id}"
         job.large_tool_outputs_ref = f"large_tool_outputs:{job.workspace_id}:{artifact_run_id}" if large_tool_output_refs else None
         job.browser_proof_ref = f"browser_proof:{job.workspace_id}:{artifact_run_id}" if job.browser_flow_proof else None
         job.file_state_cache_ref = f"file_state_cache:{job.workspace_id}:{artifact_run_id}"
@@ -3380,6 +3520,24 @@ class WorkspaceCodeAgentRuntime:
         job.trace_reducer_ref = f"trace_reducer:{job.workspace_id}:{artifact_run_id}"
         job.exec_trace_ref = f"exec_trace:{job.workspace_id}:{artifact_run_id}" if process_output_items else None
         job.process_outputs_ref = f"process_outputs:{job.workspace_id}:{artifact_run_id}" if process_output_items else None
+        job.tool_result_messages_ref = job.tool_result_messages_ref or f"tool_result_messages:{job.workspace_id}:{artifact_run_id}"
+        job.artifact_read_trace_ref = f"artifact_read_trace:{job.workspace_id}:{artifact_run_id}" if artifact_read_items else None
+        job.active_processes = list(self.process_manager.snapshot().get("active_processes") or [])
+        job.resume_checkpoint_ref = job.resume_checkpoint_ref or f"resume_checkpoint:{job.workspace_id}:{artifact_run_id}"
+        worker_branch_refs = [
+            *job.worker_branch_refs,
+            *[
+                ref
+                for ref in [job.worker_drafts_ref, job.worker_merge_ref, job.worker_mailbox_ref, job.worker_prefix_ref]
+                if ref
+            ],
+        ]
+        job.worker_branch_refs = list(
+            dict.fromkeys(
+                worker_branch_refs
+            )
+        )
+        job.verifier_review_ref = job.verifier_review_ref or job.verification_report_ref
         job.context_pressure_ref = job.context_pressure_ref or f"context_pressure:{job.workspace_id}:{artifact_run_id}"
         job.hook_trace_ref = job.hook_trace_ref or f"hook_trace:{job.workspace_id}:{artifact_run_id}"
         job.semantic_graph_ref = job.semantic_graph_ref or f"semantic_graph:{job.workspace_id}:{artifact_run_id}"
@@ -3388,8 +3546,14 @@ class WorkspaceCodeAgentRuntime:
         job.command_policy_ref = job.command_policy_ref or f"command_policy:{job.workspace_id}:{artifact_run_id}"
         job.verification_report_ref = job.verification_report_ref or f"verification_report:{job.workspace_id}:{artifact_run_id}"
         job.rollout_trace_ref = f"rollout_trace:{job.workspace_id}:{artifact_run_id}"
+        self._store_transcript_snapshot(job, artifact_run_id)
         self._store_report(job.tool_trace_ref, {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, "items": tool_trace_items})
-        self._store_report(job.draft_patch_history_ref, {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, "items": patch_history})
+        if job.artifact_read_trace_ref:
+            self._store_report(
+                job.artifact_read_trace_ref,
+                {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, "items": artifact_read_items},
+            )
+        self._store_report(job.file_change_history_ref, {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, "items": patch_history})
         self._store_report(
             job.file_state_cache_ref,
             {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **self.file_state_cache.snapshot(artifact_run_id)},
@@ -3460,6 +3624,14 @@ class WorkspaceCodeAgentRuntime:
                 "reducer": trace_snapshot.get("reducer", {}),
             },
         )
+        self._store_resume_checkpoint(job, artifact_run_id, phase="final_artifacts")
+        if job.verifier_review_ref:
+            self._store_report(
+                job.verifier_review_ref,
+                self.store.get("reports", job.verifier_review_ref)
+                or self.store.get("reports", job.verification_report_ref)
+                or {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, "review": {}},
+            )
         if job.exec_trace_ref:
             self._store_report(
                 job.exec_trace_ref,
@@ -3724,7 +3896,7 @@ class WorkspaceCodeAgentRuntime:
                     "or update the generated test file in the same patch when the requested behavior intentionally changes the expectation."
                 ),
                 "required_next_action": (
-                    "Return draft actions that make the next generated test result different: restore missing selectors/ids in app code, "
+                    "Use apply_patch_to_draft/write_file so the next generated test result changes: restore missing selectors/ids in app code, "
                     "or patch miniapp/tests/test_generated_app.py / miniapp/tests/generated_app.test.mjs together with the app change. "
                     "Do not keep returning single app-file patches that leave the same generated test failure."
                 ),
@@ -3995,6 +4167,7 @@ class WorkspaceCodeAgentRuntime:
             "process_started",
             "command_output_delta",
             "process_completed",
+            "process_failed",
             "context_suggestion",
             "hook_started",
             "hook_completed",
@@ -4028,6 +4201,7 @@ class WorkspaceCodeAgentRuntime:
             "process_started",
             "command_output_delta",
             "process_completed",
+            "process_failed",
             "context_suggestion",
             "hook_started",
             "hook_completed",
@@ -4106,7 +4280,7 @@ class WorkspaceCodeAgentRuntime:
     @staticmethod
     def _enriched_event_details(details: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(details)
-        for key in ("files", "changed_files", "draft_action_files"):
+        for key in ("files", "changed_files", "file_change_files"):
             raw_files = enriched.get(key)
             if isinstance(raw_files, list) and raw_files:
                 files = [str(path) for path in raw_files if str(path).strip()]
@@ -4211,8 +4385,26 @@ class WorkspaceCodeAgentRuntime:
             job.event_count = len(job.events)
         self.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
 
+    def write_process_stdin(self, process_id: str, data: str) -> dict[str, Any]:
+        ok = self.process_manager.write_stdin(process_id, data)
+        return {"process_id": process_id, "ok": ok}
+
+    def terminate_process(self, process_id: str) -> dict[str, Any]:
+        ok = self.process_manager.terminate(process_id)
+        return {"process_id": process_id, "ok": ok}
+
+    def read_process_output(
+        self,
+        process_id: str,
+        *,
+        stream: str = "stdout",
+        start: int | None = None,
+        end: int | None = None,
+    ) -> dict[str, Any]:
+        return self.process_manager.read_output(process_id, stream=stream, start=start, end=end)
+
     def _store_report(self, key: str, payload: dict[str, Any]) -> None:
-        self.store.upsert("reports", key, payload)
+        self.artifact_reporter.store_report(key, payload)
 
     def _clear_trace(self, workspace_id: str) -> None:
         self._store_report(f"trace:{workspace_id}", {"workspace_id": workspace_id, "entries": []})
@@ -4283,8 +4475,9 @@ class WorkspaceCodeAgentRuntime:
         payload["agent_turns"] = list(job.agent_turns)
         payload["agent_activity_events"] = list(job.agent_activity_events)
         payload["agent_memory"] = dict(job.agent_memory)
+        payload["agent_transcript_ref"] = job.agent_transcript_ref
         payload["tool_trace_ref"] = job.tool_trace_ref
-        payload["draft_patch_history_ref"] = job.draft_patch_history_ref
+        payload["file_change_history_ref"] = job.file_change_history_ref
         payload["browser_proof_ref"] = job.browser_proof_ref
         payload["large_tool_outputs_ref"] = job.large_tool_outputs_ref
         payload["file_state_cache_ref"] = job.file_state_cache_ref
@@ -4304,6 +4497,12 @@ class WorkspaceCodeAgentRuntime:
         payload["exec_trace_ref"] = job.exec_trace_ref
         payload["process_outputs_ref"] = job.process_outputs_ref
         payload["context_pressure_ref"] = job.context_pressure_ref
+        payload["tool_result_messages_ref"] = job.tool_result_messages_ref
+        payload["active_processes"] = list(job.active_processes)
+        payload["resume_checkpoint_ref"] = job.resume_checkpoint_ref
+        payload["worker_branch_refs"] = list(job.worker_branch_refs)
+        payload["verifier_review_ref"] = job.verifier_review_ref
+        payload["browser_step_refs"] = list(job.browser_step_refs)
         payload["hook_trace_ref"] = job.hook_trace_ref
         payload["semantic_graph_ref"] = job.semantic_graph_ref
         payload["worker_prefix_ref"] = job.worker_prefix_ref
@@ -4582,13 +4781,13 @@ class WorkspaceCodeAgentRuntime:
 
     @classmethod
     def _iteration_ready_stage(cls, details: dict[str, Any]) -> str:
-        draft_action_count = cls._safe_int(details.get("draft_action_count"), default=0)
-        tool_request_count = cls._safe_int(details.get("tool_request_count"), default=0)
+        file_change_count = cls._safe_int(details.get("file_change_count", details.get("file_change_count")), default=0)
+        tool_call_count = cls._safe_int(details.get("tool_call_count"), default=0)
         outcome = str(details.get("outcome") or "").strip().lower()
-        if draft_action_count > 0:
-            return f"Prepared {draft_action_count} file edit{'s' if draft_action_count != 1 else ''}"
-        if tool_request_count > 0:
-            return f"Requested {tool_request_count} context read{'s' if tool_request_count != 1 else ''}"
+        if file_change_count > 0:
+            return f"Prepared {file_change_count} file edit{'s' if file_change_count != 1 else ''}"
+        if tool_call_count > 0:
+            return f"Requested {tool_call_count} context read{'s' if tool_call_count != 1 else ''}"
         if outcome in {"no_progress", "no_op"}:
             return "No file edits returned"
         return "Model response received"
@@ -4597,18 +4796,18 @@ class WorkspaceCodeAgentRuntime:
     def _iteration_ready_progress(cls, details: dict[str, Any]) -> int:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
         tool_round = cls._safe_int(details.get("tool_round"), default=0)
-        draft_action_count = cls._safe_int(details.get("draft_action_count"), default=0)
-        tool_request_count = cls._safe_int(details.get("tool_request_count"), default=0)
+        file_change_count = cls._safe_int(details.get("file_change_count", details.get("file_change_count")), default=0)
+        tool_call_count = cls._safe_int(details.get("tool_call_count"), default=0)
         if bool(details.get("has_draft_diff")):
-            if draft_action_count > 0:
+            if file_change_count > 0:
                 return min(94, 87 + max(0, attempt - 2) * 3)
-            if tool_request_count > 0:
+            if tool_call_count > 0:
                 return min(93, 85 + max(0, attempt - 2) * 3)
             return min(92, 84 + max(0, attempt - 2) * 3)
         base = 38 + max(0, attempt - 1) * 5 + tool_round * 2
-        if draft_action_count > 0:
+        if file_change_count > 0:
             return min(51, base + 7)
-        if tool_request_count > 0:
+        if tool_call_count > 0:
             return min(50, base + 3)
         return min(50, base + 2)
 
@@ -4616,7 +4815,7 @@ class WorkspaceCodeAgentRuntime:
     def _repair_stage(cls, details: dict[str, Any]) -> str:
         reason = str(details.get("reason") or "").strip()
         outcome = str(details.get("outcome") or "").strip()
-        if reason == "self_blocked_no_draft_actions":
+        if reason == "self_blocked_no_file_changes":
             return "Correcting edit contract"
         if outcome in {"needs_context", "no_op"}:
             return "No file edits yet; reading more context"

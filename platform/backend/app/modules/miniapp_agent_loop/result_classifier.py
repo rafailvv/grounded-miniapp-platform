@@ -20,7 +20,7 @@ class AgentLoopResultFactory:
         latest_apply_result,
         iterations,
         repair_iterations,
-        all_draft_actions,
+        all_file_changes,
         last_assistant_message: str,
         turn_history,
     ) -> AgentLoopResult:
@@ -39,7 +39,7 @@ class AgentLoopResultFactory:
             latest_apply_result=latest_apply_result,
             iterations=iterations,
             repair_iterations=repair_iterations,
-            all_draft_actions=all_draft_actions,
+            all_file_changes=all_file_changes,
             last_assistant_message=last_assistant_message,
             turn_history=turn_history,
         )
@@ -58,7 +58,7 @@ class AgentLoopResultFactory:
         latest_apply_result,
         iterations,
         repair_iterations,
-        all_draft_actions,
+        all_file_changes,
         last_assistant_message: str,
         turn_history,
     ) -> AgentLoopResult:
@@ -77,7 +77,7 @@ class AgentLoopResultFactory:
             latest_apply_result=latest_apply_result,
             iterations=iterations,
             repair_iterations=repair_iterations,
-            all_draft_actions=all_draft_actions,
+            all_file_changes=all_file_changes,
             last_assistant_message=last_assistant_message,
             turn_history=turn_history,
         )
@@ -90,7 +90,7 @@ class AgentLoopResultFactory:
         latest_apply_result,
         iterations,
         repair_iterations,
-        all_draft_actions,
+        all_file_changes,
         last_assistant_message: str,
         turn_history,
     ) -> AgentLoopResult:
@@ -109,7 +109,7 @@ class AgentLoopResultFactory:
             latest_apply_result=latest_apply_result,
             iterations=iterations,
             repair_iterations=repair_iterations,
-            all_draft_actions=all_draft_actions,
+            all_file_changes=all_file_changes,
             last_assistant_message=last_assistant_message,
             turn_history=turn_history,
         )

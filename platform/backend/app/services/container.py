@@ -13,7 +13,8 @@ from app.services.engine import (
     ContextBudgetManager,
     PromptStateManager,
 )
-from app.modules.miniapp_agent_loop.engine import AgentLoopEngine
+from app.modules.miniapp_agent_loop.agent_tool_call_loop import AgentToolCallLoop
+from app.modules.miniapp_agent_loop.context_builder import AgentContextBuilder
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.services.patch_service import PatchService
 from app.services.workspace.preview_service import PreviewService
@@ -29,7 +30,6 @@ class ServiceContainer:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self.store = StateStore(self.settings.data_dir / "platform-state.json")
-        self.store.migrate_persisted_runtime_state()
         self.store.shard_large_runtime_payloads()
         self.workspace_log_service = WorkspaceLogService(self.settings)
         self.workspace_service = WorkspaceService(self.settings, self.store, self.workspace_log_service)
@@ -45,11 +45,8 @@ class ServiceContainer:
             self.runtime_manager,
             self.workspace_log_service,
         )
-        self.agent_loop_engine = AgentLoopEngine(
-            self.store,
-            self.workspace_service,
-            self.workspace_log_service,
-        )
+        self.agent_context_builder = AgentContextBuilder(store=self.store, workspace_service=self.workspace_service)
+        self.agent_tool_call_loop = AgentToolCallLoop(context_builder=self.agent_context_builder)
         self.validation_suite = ValidationSuite()
         self.check_runner = CheckRunner(self.validation_suite, self.preview_service)
         self.openai_client = OpenAIClient(self.settings, self.workspace_log_service)
@@ -69,7 +66,7 @@ class ServiceContainer:
             runtime_manager=self.runtime_manager,
             openai_client=self.openai_client,
             workspace_log_service=self.workspace_log_service,
-            agent_loop_engine=self.agent_loop_engine,
+            agent_tool_call_loop=self.agent_tool_call_loop,
             context_pack_builder=self.context_pack_builder,
         )
         self.run_service = RunService(

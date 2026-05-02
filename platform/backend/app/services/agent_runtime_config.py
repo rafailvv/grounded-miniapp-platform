@@ -141,7 +141,7 @@ class RetryPolicy:
             return "tool_budget_exhausted"
         if "scope mismatch" in text or "outside its scope" in text or "outside the planned scope" in text:
             return "scope_mismatch"
-        if "returned empty text" in text or "returned non-json text" in text or "did not contain structured text output" in text:
+        if "returned empty text" in text or "returned non-json text" in text or "did not contain text output" in text:
             return "empty_model_output"
         status_match = re.search(r"returned\s+(\d{3})", text)
         if status_match:

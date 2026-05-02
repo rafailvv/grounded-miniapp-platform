@@ -380,11 +380,11 @@ class WorkspaceService:
         )
         return target_draft
 
-    def apply_draft_actions(self, workspace_id: str, run_id: str, draft_actions: list[DraftAction]) -> Path:
+    def apply_file_changes(self, workspace_id: str, run_id: str, file_changes: list[DraftAction]) -> Path:
         draft_source = self.draft_source_dir(workspace_id, run_id)
         if not draft_source.exists():
             self.prepare_draft(workspace_id, run_id)
-        envelope = self.build_patch_envelope_for_draft_actions(workspace_id, run_id, draft_actions)
+        envelope = self.build_patch_envelope_for_file_changes(workspace_id, run_id, file_changes)
         result = self.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
         if result.status != "applied":
             raise ValueError(result.conflict_reason or "Draft patch could not be applied.")
@@ -447,11 +447,11 @@ class WorkspaceService:
         )
         return revision
 
-    def build_patch_envelope_for_draft_actions(self, workspace_id: str, run_id: str, draft_actions: list[DraftAction]) -> PatchEnvelope:
+    def build_patch_envelope_for_file_changes(self, workspace_id: str, run_id: str, file_changes: list[DraftAction]) -> PatchEnvelope:
         workspace = self.get_workspace(workspace_id)
         draft_source = self.draft_source_dir(workspace_id, run_id)
         prepared_ops: list[PatchOperationModel] = []
-        for operation in draft_actions:
+        for operation in file_changes:
             relative_path = self._safe_relative_path(operation.file_path)
             if self._is_ignored_workspace_path(relative_path):
                 raise ValueError(
@@ -496,7 +496,7 @@ class WorkspaceService:
             risk_level="medium",
             ops=prepared_ops,
             post_actions={"run": ["validators", "preview_smoke"]},
-            ui={"title": "Draft patch", "summary": f"{len(prepared_ops)} draft actions"},
+            ui={"title": "Draft patch", "summary": f"{len(prepared_ops)} file changes"},
         )
 
     def apply_patch_envelope(self, workspace_id: str, envelope: PatchEnvelope, *, message: str) -> ApplyPatchResult:

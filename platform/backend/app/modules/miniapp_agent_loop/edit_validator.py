@@ -8,7 +8,7 @@ from app.modules.miniapp_agent_loop.types import AgentTurnPlan
 
 class AgentEditValidator:
     PATCH_ENVELOPE_MARKERS = ("*** Begin Patch", "*** End Patch", "*** Add File:", "*** Delete File:", "*** Update File:")
-    MAX_DRAFT_ACTION_COUNT = 80
+    MAX_FILE_CHANGE_COUNT = 80
     MAX_SINGLE_CONTENT_CHARS = 260_000
     MAX_TOTAL_CONTENT_CHARS = 900_000
     PROTECTED_PATHS = (
@@ -22,10 +22,10 @@ class AgentEditValidator:
 
     @staticmethod
     def normalize_plan(plan: AgentTurnPlan) -> AgentTurnPlan:
-        if plan.outcome == "patch_ready" and not plan.draft_actions:
+        if plan.outcome == "changes_ready" and not plan.file_changes:
             plan.outcome = "no_op"
-        if plan.outcome == "patch_ready":
-            issue = AgentEditValidator._first_invalid_draft_action(plan.draft_actions)
+        if plan.outcome == "changes_ready":
+            issue = AgentEditValidator._first_invalid_file_change(plan.file_changes)
             if issue:
                 code, message = issue
                 plan.outcome = "fatal_invalid_response"
@@ -33,22 +33,22 @@ class AgentEditValidator:
                 plan.failure_class = "generation.invalid_edit_operation"
                 plan.failure_signature = f"generation.invalid_edit_operation:{code}"
                 plan.root_cause_summary = message
-                plan.draft_actions = []
+                plan.file_changes = []
         return plan
 
     @classmethod
-    def _first_invalid_draft_action(cls, draft_actions: list[DraftAction]) -> tuple[str, str] | None:
-        if len(draft_actions) > cls.MAX_DRAFT_ACTION_COUNT:
+    def _first_invalid_file_change(cls, file_changes: list[DraftAction]) -> tuple[str, str] | None:
+        if len(file_changes) > cls.MAX_FILE_CHANGE_COUNT:
             return (
-                "too_many_draft_actions",
-                f"Turn returned {len(draft_actions)} draft actions; split the edit into smaller patch-first turns.",
+                "too_many_file_changes",
+                f"Turn returned {len(file_changes)} file changes; split the edit into smaller patch-first tool calls.",
             )
         total_chars = 0
         seen_paths: set[str] = set()
-        for operation in draft_actions:
+        for operation in file_changes:
             normalized_path = cls._normalize_path(getattr(operation, "file_path", ""))
             if not normalized_path:
-                return ("unsafe_path", "Every draft action must target a relative path inside miniapp/.")
+                return ("unsafe_path", "Every file change must target a relative path inside miniapp/.")
             if normalized_path in seen_paths:
                 return ("duplicate_path", f"{normalized_path} was edited more than once in the same turn; merge it into one operation.")
             seen_paths.add(normalized_path)

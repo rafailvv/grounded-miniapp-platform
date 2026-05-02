@@ -14,7 +14,7 @@ from app.models.domain import (
 )
 
 
-LoopOutcome = Literal["patch_ready", "no_op", "needs_context", "fatal_invalid_response"]
+LoopOutcome = Literal["changes_ready", "no_op", "needs_context", "fatal_invalid_response"]
 LoopContextMode = Literal["minimal", "expanded"]
 
 
@@ -23,7 +23,7 @@ class AgentTurnPlan:
     outcome: LoopOutcome
     assistant_message: str = ""
     diagnosis: str | None = None
-    draft_actions: list[DraftAction] = field(default_factory=list)
+    file_changes: list[DraftAction] = field(default_factory=list)
     files_read: list[str] = field(default_factory=list)
     failure_class: str | None = None
     failure_signature: str | None = None
@@ -63,7 +63,7 @@ class AgentLoopResult:
     latest_apply_result: dict[str, Any] | None
     iterations: list[RunIterationRecord]
     repair_iterations: list[RepairIterationRecord]
-    all_draft_actions: list[DraftAction]
+    all_file_changes: list[DraftAction]
     last_assistant_message: str
     turn_history: list[dict[str, Any]] = field(default_factory=list)
 
@@ -75,7 +75,7 @@ class AgentLoopCallbacks:
     completion_state: Callable[[list[Any], dict[str, Any], ValidationSnapshot | None], dict[str, Any]]
     has_tooling_failure: Callable[[list[Any]], bool]
     plan_turn: Callable[..., AgentTurnPlan]
-    apply_contract_sync: Callable[[list[DraftAction]], list[DraftAction]]
+    apply_change_sync: Callable[[list[DraftAction]], list[DraftAction]]
     verify_completion: Callable[[CheckExecutionRecord | None, dict[str, Any]], dict[str, Any]] | None
     before_apply: Callable[[int, list[DraftAction]], None] | None
     after_apply: Callable[[int, list[DraftAction], Any, list[str]], None] | None

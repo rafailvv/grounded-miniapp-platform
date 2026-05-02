@@ -13,7 +13,6 @@ from app.api import (
     routes_documents,
     routes_export,
     routes_files,
-    routes_generation,
     routes_preview,
     routes_runs,
     routes_validation,
@@ -76,7 +75,6 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
     app.include_router(routes_workspaces.router)
     app.include_router(routes_documents.router)
     app.include_router(routes_chat.router)
-    app.include_router(routes_generation.router)
     app.include_router(routes_runs.router)
     app.include_router(routes_validation.router)
     app.include_router(routes_files.router)

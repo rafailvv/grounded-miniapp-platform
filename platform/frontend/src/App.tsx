@@ -298,7 +298,7 @@ function isCompletedGenerateRun(run?: Run | null): boolean {
 type RunIterationView = {
   iteration_id: string;
   assistant_message: string;
-  draft_actions: Array<{ file_path: string; operation: string }>;
+  file_changes: Array<{ file_path: string; operation: string }>;
   role_scope: RoleKey[];
   created_at?: string;
 };
@@ -366,7 +366,7 @@ function normalizeRunIterations(iterations: unknown): RunIterationView[] {
         {
           iteration_id: `timeline-${index}`,
           assistant_message: iteration,
-          draft_actions: [],
+          file_changes: [],
           role_scope: [],
           created_at: undefined,
         },
@@ -376,9 +376,8 @@ function normalizeRunIterations(iterations: unknown): RunIterationView[] {
       return [];
     }
     const record = iteration as Record<string, unknown>;
-    const legacyKey = "oper" + "ations";
-    const rawDraftActions = asRecordArray(record.draft_actions);
-    const draftActions = (rawDraftActions.length ? rawDraftActions : asRecordArray(record[legacyKey])).flatMap((operation) => {
+    const rawFileChanges = asRecordArray(record.file_changes);
+    const fileChanges = rawFileChanges.flatMap((operation) => {
       const filePath = typeof operation.file_path === "string" ? operation.file_path : "";
       const operationName = typeof operation.operation === "string" ? operation.operation : "";
       if (!filePath && !operationName) {
@@ -398,7 +397,7 @@ function normalizeRunIterations(iterations: unknown): RunIterationView[] {
             : typeof record.message === "string"
               ? record.message
               : "",
-        draft_actions: draftActions,
+        file_changes: fileChanges,
         role_scope: normalizeRoleScope(record.role_scope),
         created_at: typeof record.created_at === "string" ? record.created_at : undefined,
       },
@@ -2742,9 +2741,9 @@ export default function App() {
                         <span>{formatRoleScope(iteration.role_scope)}</span>
                       </div>
                       <p>{iteration.assistant_message}</p>
-                      {iteration.draft_actions.length ? (
+                      {iteration.file_changes.length ? (
                         <p>
-                          {iteration.draft_actions.map((operation) => `${operation.operation} ${operation.file_path}`).join(", ")}
+                          {iteration.file_changes.map((operation) => `${operation.operation} ${operation.file_path}`).join(", ")}
                         </p>
                       ) : null}
                     </div>

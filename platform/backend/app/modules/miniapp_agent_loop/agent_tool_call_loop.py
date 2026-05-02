@@ -22,7 +22,7 @@ from app.modules.miniapp_agent_loop.result_classifier import AgentLoopResultFact
 from app.modules.miniapp_agent_loop.types import AgentLoopCallbacks, AgentLoopResult
 
 
-class AgentQueryLoop:
+class AgentToolCallLoop:
     """Claude/Codex-style agent loop for draft miniapp edits.
 
     The loop does not generate a full application as one deterministic platform
@@ -72,7 +72,7 @@ class AgentQueryLoop:
                     name="initial_patch_pending",
                     status="failed",
                     details="Initial checks are waiting for the first agent patch.",
-                    command="agent query loop",
+                    command="agent tool-call loop",
                     logs=[],
                 )
             ],
@@ -94,7 +94,7 @@ class AgentQueryLoop:
         draft_source: Path,
         role_scope: list[str],
         generation_mode: GenerationMode,
-        initial_draft_actions,
+        initial_file_changes,
         initial_assistant_message: str,
         initial_files_read: list[str],
         initial_changed_files: list[str],
@@ -105,8 +105,8 @@ class AgentQueryLoop:
         latest_execution: CheckExecutionRecord | None = None
         latest_preview_details: dict[str, Any] = {}
         latest_apply_result: dict[str, Any] | None = None
-        latest_draft_actions = list(initial_draft_actions or [])
-        all_draft_actions = list(initial_draft_actions or [])
+        latest_file_changes = list(initial_file_changes or [])
+        all_file_changes = list(initial_file_changes or [])
         latest_files_read = list(initial_files_read or [])
         latest_assistant_message = str(initial_assistant_message or "").strip()
         changed_files = list(initial_changed_files or [])
@@ -133,7 +133,7 @@ class AgentQueryLoop:
                     latest_apply_result=latest_apply_result,
                     iterations=iterations,
                     repair_iterations=repair_iterations,
-                    all_draft_actions=all_draft_actions,
+                    all_file_changes=all_file_changes,
                     last_assistant_message=latest_assistant_message,
                     turn_history=turn_history,
                 )
@@ -166,13 +166,13 @@ class AgentQueryLoop:
                     latest_apply_result=latest_apply_result,
                     iterations=iterations,
                     repair_iterations=repair_iterations,
-                    all_draft_actions=all_draft_actions,
+                    all_file_changes=all_file_changes,
                     last_assistant_message=latest_assistant_message,
                     turn_history=turn_history,
                 )
 
             has_draft_diff = bool(
-                all_draft_actions
+                all_file_changes
                 or self.context_builder.workspace_service.diff(workspace_id, run_id=run_id).strip()
             )
             skip_checks = bool(callbacks.skip_initial_checks and turn == 0 and not has_draft_diff)
@@ -196,7 +196,7 @@ class AgentQueryLoop:
                 callbacks.append_event(
                     job,
                     "spec_extract_started",
-                    "Agent query loop planned the first patch before baseline validation.",
+                    "Agent tool-call loop planned the first patch before baseline validation.",
                     {"turn": turn, "has_draft_diff": False},
                 )
                 if callbacks.append_activity:
@@ -231,15 +231,15 @@ class AgentQueryLoop:
                 iterations.append(
                     RunIterationRecord(
                         run_id=run_id,
-                        assistant_message=latest_assistant_message or f"agent query turn {turn}",
+                        assistant_message=latest_assistant_message or f"agent tool-call step {turn}",
                         files_read=list(latest_files_read),
-                        draft_actions=[
+                        file_changes=[
                             RunIterationAction(
                                 file_path=operation.file_path,
                                 operation=operation.operation,
                                 reason=operation.reason,
                             )
-                            for operation in latest_draft_actions
+                            for operation in latest_file_changes
                         ],
                         check_results=latest_execution.results,
                         diff_summary=self.context_builder.current_diff_summary(workspace_id, run_id),
@@ -308,23 +308,24 @@ class AgentQueryLoop:
                             "failure_class": "verification_worker",
                             "signature": "verification_worker_failed",
                         }
-                if callbacks.append_activity:
-                    callbacks.append_activity(
-                        job,
-                        "completed",
-                        "Strict green completion reached",
-                        {"turn": turn, "status": "completed"},
+                else:
+                    if callbacks.append_activity:
+                        callbacks.append_activity(
+                            job,
+                            "completed",
+                            "Strict green completion reached",
+                            {"turn": turn, "status": "completed"},
+                        )
+                    return self.results.completed(
+                        latest_execution=latest_execution,
+                        latest_preview_details=latest_preview_details,
+                        latest_apply_result=latest_apply_result,
+                        iterations=iterations,
+                        repair_iterations=repair_iterations,
+                        all_file_changes=all_file_changes,
+                        last_assistant_message=latest_assistant_message,
+                        turn_history=turn_history,
                     )
-                return self.results.completed(
-                    latest_execution=latest_execution,
-                    latest_preview_details=latest_preview_details,
-                    latest_apply_result=latest_apply_result,
-                    iterations=iterations,
-                    repair_iterations=repair_iterations,
-                    all_draft_actions=all_draft_actions,
-                    last_assistant_message=latest_assistant_message,
-                    turn_history=turn_history,
-                )
 
             if callbacks.has_tooling_failure(latest_execution.results if latest_execution else []):
                 return self.results.failed(
@@ -341,7 +342,7 @@ class AgentQueryLoop:
                     latest_apply_result=latest_apply_result,
                     iterations=iterations,
                     repair_iterations=repair_iterations,
-                    all_draft_actions=all_draft_actions,
+                    all_file_changes=all_file_changes,
                     last_assistant_message=latest_assistant_message,
                     turn_history=turn_history,
                 )
@@ -356,7 +357,7 @@ class AgentQueryLoop:
 
             memory = compact_agent_memory(
                 turn_history=turn_history,
-                draft_action_count=len(all_draft_actions),
+                file_change_count=len(all_file_changes),
                 last_assistant_message=latest_assistant_message,
             )
             job.agent_memory = dict(memory)
@@ -376,7 +377,7 @@ class AgentQueryLoop:
                     {
                         "turn": turn,
                         "failed_signature_count": len(memory.get("failed_signatures") or []),
-                        "draft_action_count": len(all_draft_actions),
+                        "file_change_count": len(all_file_changes),
                     },
                 )
             callbacks.store_report(
@@ -469,7 +470,7 @@ class AgentQueryLoop:
                         latest_apply_result=latest_apply_result,
                         iterations=iterations,
                         repair_iterations=repair_iterations,
-                        all_draft_actions=all_draft_actions,
+                        all_file_changes=all_file_changes,
                         last_assistant_message=latest_assistant_message,
                         turn_history=turn_history,
                     )
@@ -501,32 +502,32 @@ class AgentQueryLoop:
                 turn += 1
                 continue
 
-            synced_draft_actions = (
-                list(plan.draft_actions)
+            synced_file_changes = (
+                list(plan.file_changes)
                 if bool(plan.metadata.get("skip_contract_sync"))
-                else callbacks.apply_contract_sync(list(plan.draft_actions))
+                else callbacks.apply_change_sync(list(plan.file_changes))
             )
             callbacks.append_event(
                 job,
                 "patch_apply_started",
                 "Applying agent patch to draft.",
-                {"turn": turn + 1, "files": [operation.file_path for operation in synced_draft_actions]},
+                {"turn": turn + 1, "files": [operation.file_path for operation in synced_file_changes]},
             )
             if callbacks.append_activity:
                 callbacks.append_activity(
                     job,
                     "applying_patch",
-                    "Applying agent draft actions",
+                    "Applying agent draft changes",
                     {
                         "turn": turn + 1,
-                        "draft_action_count": len(synced_draft_actions),
-                        "file_count": len({operation.file_path for operation in synced_draft_actions}),
+                        "file_change_count": len(synced_file_changes),
+                        "file_count": len({operation.file_path for operation in synced_file_changes}),
                     },
                 )
             if callbacks.before_apply is not None:
-                callbacks.before_apply(turn + 1, synced_draft_actions)
+                callbacks.before_apply(turn + 1, synced_file_changes)
             try:
-                envelope = self.context_builder.workspace_service.build_patch_envelope_for_draft_actions(workspace_id, run_id, synced_draft_actions)
+                envelope = self.context_builder.workspace_service.build_patch_envelope_for_file_changes(workspace_id, run_id, synced_file_changes)
                 apply_result = self.context_builder.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
                 latest_apply_result = apply_result.model_dump(mode="json")
             except ValueError as exc:
@@ -540,9 +541,9 @@ class AgentQueryLoop:
             if callbacks.after_apply is not None:
                 callbacks.after_apply(
                     turn + 1,
-                    synced_draft_actions,
+                    synced_file_changes,
                     apply_result,
-                    [operation.file_path for operation in synced_draft_actions],
+                    [operation.file_path for operation in synced_file_changes],
                 )
 
             callbacks.store_report(
@@ -551,18 +552,18 @@ class AgentQueryLoop:
                     "workspace_id": workspace_id,
                     "run_id": run_id,
                     "turn": turn + 1,
-                    "draft_actions": [
+                    "file_changes": [
                         {
                             "file_path": operation.file_path,
                             "operation": operation.operation,
                             "reason": operation.reason,
                         }
-                        for operation in synced_draft_actions
+                        for operation in synced_file_changes
                     ],
                     "apply_result": latest_apply_result,
                 },
             )
-            latest_draft_actions = list(synced_draft_actions)
+            latest_file_changes = list(synced_file_changes)
             if apply_result.status != "applied":
                 turn_history[-1]["result"] = "apply_conflict"
                 turn_history[-1]["apply_error"] = apply_result.conflict_reason or apply_result.status
@@ -583,7 +584,7 @@ class AgentQueryLoop:
                 turn += 1
                 continue
 
-            changed_files = callbacks.post_apply_stabilize(workspace_id, run_id, apply_result, [operation.file_path for operation in synced_draft_actions]) if callbacks.post_apply_stabilize else [operation.file_path for operation in synced_draft_actions]
+            changed_files = callbacks.post_apply_stabilize(workspace_id, run_id, apply_result, [operation.file_path for operation in synced_file_changes]) if callbacks.post_apply_stabilize else [operation.file_path for operation in synced_file_changes]
             if callbacks.append_activity:
                 callbacks.append_activity(
                     job,
@@ -591,7 +592,7 @@ class AgentQueryLoop:
                     "Draft patch applied",
                     {"turn": turn + 1, "changed_file_count": len(set(changed_files)), "status": "applied"},
                 )
-            all_draft_actions.extend(synced_draft_actions)
+            all_file_changes.extend(synced_file_changes)
             turn_history[-1]["result"] = "applied"
             turn_history[-1]["files_changed"] = list(changed_files)
             if turn > 0:

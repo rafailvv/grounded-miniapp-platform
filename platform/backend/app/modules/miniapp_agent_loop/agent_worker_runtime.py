@@ -15,7 +15,11 @@ from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManag
 class WorkerDraft:
     worker_id: str
     owner_scope: str
+    branch_run_id: str
     source_dir: str
+    agent_loop_ref: str
+    transcript_ref: str
+    repair_cycle_ref: str
     status: str = "ready"
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -23,7 +27,11 @@ class WorkerDraft:
         return {
             "worker_id": self.worker_id,
             "owner_scope": self.owner_scope,
+            "branch_run_id": self.branch_run_id,
             "source_dir": self.source_dir,
+            "agent_loop_ref": self.agent_loop_ref,
+            "transcript_ref": self.transcript_ref,
+            "repair_cycle_ref": self.repair_cycle_ref,
             "status": self.status,
             "created_at": self.created_at,
         }
@@ -35,6 +43,7 @@ class AgentWorkerRuntime:
     def __init__(self) -> None:
         self._drafts: dict[str, list[WorkerDraft]] = {}
         self._merge_reports: dict[str, list[dict[str, Any]]] = {}
+        self._branch_results: dict[str, list[dict[str, Any]]] = {}
 
     def prepare(
         self,
@@ -62,14 +71,51 @@ class AgentWorkerRuntime:
                 WorkerDraft(
                     worker_id=worker_id,
                     owner_scope=str(spec.get("owner_scope") or worker_id),
+                    branch_run_id=f"{run_id}__worker__{worker_id}",
                     source_dir=str(target),
+                    agent_loop_ref=f"worker_agent_loop:{run_id}:{worker_id}",
+                    transcript_ref=f"worker_transcript:{run_id}:{worker_id}",
+                    repair_cycle_ref=f"worker_repair_cycle:{run_id}:{worker_id}",
                 )
             )
         self._drafts[run_id] = drafts
         return {"enabled": True, "mode": str(generation_mode.value), "workers": [item.as_dict() for item in drafts]}
 
-    def merge_report(self, run_id: str, draft_actions: list[DraftAction]) -> dict[str, Any]:
-        ownership = AgentWorkerManager.validate_non_conflicting(draft_actions)
+    def prepare_workspace_branches(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        generation_mode: GenerationMode,
+        workspace_service: Any,
+        worker_specs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if generation_mode == GenerationMode.FAST:
+            self._drafts[run_id] = []
+            return {"enabled": False, "mode": "single_loop", "workers": []}
+        drafts: list[WorkerDraft] = []
+        for spec in worker_specs:
+            worker_id = str(spec.get("worker_id") or "").strip()
+            if not worker_id:
+                continue
+            branch_run_id = f"{run_id}__worker__{worker_id}"
+            source_dir = workspace_service.clone_draft(workspace_id, run_id, branch_run_id)
+            drafts.append(
+                WorkerDraft(
+                    worker_id=worker_id,
+                    owner_scope=str(spec.get("owner_scope") or worker_id),
+                    branch_run_id=branch_run_id,
+                    source_dir=str(source_dir),
+                    agent_loop_ref=f"worker_agent_loop:{run_id}:{worker_id}",
+                    transcript_ref=f"worker_transcript:{run_id}:{worker_id}",
+                    repair_cycle_ref=f"worker_repair_cycle:{run_id}:{worker_id}",
+                )
+            )
+        self._drafts[run_id] = drafts
+        return {"enabled": True, "mode": str(generation_mode.value), "workers": [item.as_dict() for item in drafts]}
+
+    def merge_report(self, run_id: str, file_changes: list[DraftAction]) -> dict[str, Any]:
+        ownership = AgentWorkerManager.validate_non_conflicting(file_changes)
         report = {
             "run_id": run_id,
             "status": "accepted" if ownership.get("ok") else "conflict",
@@ -78,6 +124,33 @@ class AgentWorkerRuntime:
         }
         self._merge_reports.setdefault(run_id, []).append(report)
         return report
+
+    def record_branch_results(self, run_id: str, file_changes: list[DraftAction]) -> list[dict[str, Any]]:
+        grouped: dict[str, list[DraftAction]] = {}
+        for action in file_changes:
+            grouped.setdefault(AgentWorkerManager.owner_for_path(action.file_path), []).append(action)
+        results: list[dict[str, Any]] = []
+        for owner, changes in sorted(grouped.items()):
+            result = {
+                "run_id": run_id,
+                "worker_id": owner,
+                "status": "branch_diff_ready",
+                "agent_loop": "branch_scoped",
+                "transcript_ref": f"worker_transcript:{run_id}:{owner}",
+                "repair_cycle_ref": f"worker_repair_cycle:{run_id}:{owner}",
+                "file_count": len(changes),
+                "paths": [item.file_path for item in changes],
+                "self_check": {
+                    "status": "ready_for_merge",
+                    "owned_paths_only": all(AgentWorkerManager.owner_for_path(item.file_path) == owner for item in changes),
+                    "path_count": len(changes),
+                },
+                "summary": f"{owner} branch produced {len(changes)} owned draft change(s).",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            results.append(result)
+        self._branch_results.setdefault(run_id, []).extend(results)
+        return results
 
     def worker_failure_packet(self, *, run_id: str, signature: str, paths: list[str], message: str) -> dict[str, Any]:
         owners = sorted({AgentWorkerManager.owner_for_path(path) for path in paths if str(path).strip()})
@@ -95,5 +168,5 @@ class AgentWorkerRuntime:
             "run_id": run_id,
             "drafts": [item.as_dict() for item in self._drafts.get(run_id, [])],
             "merge_reports": list(self._merge_reports.get(run_id, [])),
+            "branch_results": list(self._branch_results.get(run_id, [])),
         }
-

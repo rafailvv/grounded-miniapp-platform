@@ -19,6 +19,7 @@ class AgentScratchpad:
     worker_notes: list[dict[str, Any]] = field(default_factory=list)
     failed_fixes: list[dict[str, Any]] = field(default_factory=list)
     compact_boundaries: list[dict[str, Any]] = field(default_factory=list)
+    next_action: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def _plan_to_markdown(plan: dict[str, Any], todo: list[dict[str, Any]]) -> str:
@@ -63,6 +64,14 @@ class AgentScratchpad:
             }
         )
 
+    def set_next_action(self, *, action: str, reason: str = "", payload: dict[str, Any] | None = None) -> None:
+        self.next_action = {
+            "updated_at": _now(),
+            "action": str(action or "")[:800],
+            "reason": str(reason or "")[:800],
+            "payload": payload or {},
+        }
+
     def record_compact_boundary(
         self,
         *,
@@ -79,6 +88,7 @@ class AgentScratchpad:
             "next_action": str(next_action or "")[:800],
         }
         self.compact_boundaries.append(item)
+        self.set_next_action(action=next_action, reason="compact_boundary", payload=item)
         return item
 
     def snapshot(self) -> dict[str, Any]:
@@ -89,7 +99,7 @@ class AgentScratchpad:
                 "route_ui_manifest.json": self.route_ui_manifest,
                 "worker_notes.jsonl": list(self.worker_notes),
                 "failed_fixes.jsonl": list(self.failed_fixes),
+                "next_action.json": dict(self.next_action),
             },
             "compact_boundaries": list(self.compact_boundaries),
         }
-

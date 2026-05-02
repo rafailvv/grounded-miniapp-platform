@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 from typing import Any, Callable
+from uuid import uuid4
 
 from app.modules.miniapp_agent_loop.agent_command_policy import CommandPolicyDecision
 
@@ -74,6 +75,7 @@ class HeadTailOutputBuffer:
 
 @dataclass(frozen=True)
 class AgentCommandResult:
+    process_id: str
     command: str
     argv: list[str]
     cwd: str
@@ -93,6 +95,7 @@ class AgentCommandResult:
     def as_dict(self) -> dict[str, Any]:
         payload = {
             "tool": "run_command",
+            "process_id": self.process_id,
             "command": self.command,
             "argv": self.argv,
             "cwd": self.cwd,
@@ -145,6 +148,9 @@ class AgentProcessManager:
 
     def __init__(self, *, deterministic_env: dict[str, str] | None = None) -> None:
         self.deterministic_env = dict(deterministic_env or DEFAULT_AGENT_ENV)
+        self._active: dict[str, subprocess.Popen[str]] = {}
+        self._active_meta: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
 
     def run(
         self,
@@ -156,9 +162,11 @@ class AgentProcessManager:
         max_output_chars: int,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         yield_time_ms: int = 1000,
+        process_id: str | None = None,
     ) -> AgentCommandResult:
         started = time.perf_counter()
         started_at = datetime.now(timezone.utc).isoformat()
+        resolved_process_id = str(process_id or f"proc_{uuid4().hex[:12]}")
         stdout_buffer = HeadTailOutputBuffer(max_chars=max_output_chars)
         stderr_buffer = HeadTailOutputBuffer(max_chars=max_output_chars)
         output_delta_count = 0
@@ -172,6 +180,7 @@ class AgentProcessManager:
         if not decision.allowed:
             return AgentCommandResult(
                 command=command,
+                process_id=resolved_process_id,
                 argv=list(decision.argv),
                 cwd=str(cwd),
                 started_at=started_at,
@@ -191,6 +200,7 @@ class AgentProcessManager:
         if not decision.argv:
             return AgentCommandResult(
                 command=command,
+                process_id=resolved_process_id,
                 argv=[],
                 cwd=str(cwd),
                 started_at=started_at,
@@ -212,6 +222,7 @@ class AgentProcessManager:
         if not cwd.exists():
             return AgentCommandResult(
                 command=command,
+                process_id=resolved_process_id,
                 argv=list(decision.argv),
                 cwd=str(cwd),
                 started_at=started_at,
@@ -227,11 +238,12 @@ class AgentProcessManager:
                 policy_decision=policy_payload,
                 error=f"Command cwd does not exist: {cwd}",
             )
-        emit({"status": "started", "command": command, "argv": list(decision.argv), "cwd": str(cwd)})
+        emit({"status": "started", "process_id": resolved_process_id, "command": command, "argv": list(decision.argv), "cwd": str(cwd)})
         try:
             process = subprocess.Popen(
                 list(decision.argv),
                 cwd=cwd,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -243,6 +255,7 @@ class AgentProcessManager:
         except OSError as exc:
             return AgentCommandResult(
                 command=command,
+                process_id=resolved_process_id,
                 argv=list(decision.argv),
                 cwd=str(cwd),
                 started_at=started_at,
@@ -258,6 +271,19 @@ class AgentProcessManager:
                 policy_decision=policy_payload,
                 error=str(exc),
             )
+        with self._lock:
+            self._active[resolved_process_id] = process
+            self._active_meta[resolved_process_id] = {
+                "process_id": resolved_process_id,
+                "command": command,
+                "argv": list(decision.argv),
+                "cwd": str(cwd),
+                "started_at": started_at,
+                "status": "running",
+                "stdout": stdout_buffer.snapshot(),
+                "stderr": stderr_buffer.snapshot(),
+                "output_delta_count": 0,
+            }
 
         lock = threading.Lock()
 
@@ -270,9 +296,15 @@ class AgentProcessManager:
                     with lock:
                         buffer.append(chunk)
                         output_delta_count += 1
+                    with self._lock:
+                        meta = self._active_meta.get(resolved_process_id)
+                        if meta is not None:
+                            meta[stream_name] = buffer.snapshot()
+                            meta["output_delta_count"] = output_delta_count
                     emit(
                         {
                             "status": "output_delta",
+                            "process_id": resolved_process_id,
                             "stream": stream_name,
                             "chars": len(chunk),
                             "elapsed_ms": int((time.perf_counter() - started) * 1000),
@@ -313,6 +345,7 @@ class AgentProcessManager:
                 emit(
                     {
                         "status": "heartbeat",
+                        "process_id": resolved_process_id,
                         "elapsed_ms": int((time.perf_counter() - started) * 1000),
                         "output_delta_count": output_delta_count,
                     }
@@ -333,14 +366,32 @@ class AgentProcessManager:
         emit(
             {
                 "status": "completed",
+                "process_id": resolved_process_id,
                 "elapsed_ms": duration_ms,
                 "exit_code": exit_code,
                 "semantic_status": semantic_status,
                 "success": success,
             }
         )
+        with self._lock:
+            meta = self._active_meta.get(resolved_process_id, {})
+            meta.update(
+                {
+                    "status": "completed",
+                    "exit_code": exit_code,
+                    "semantic_status": semantic_status,
+                    "success": success,
+                    "duration_ms": duration_ms,
+                    "stdout": stdout_buffer.snapshot(),
+                    "stderr": stderr_buffer.snapshot(),
+                    "output_delta_count": output_delta_count,
+                }
+            )
+            self._active.pop(resolved_process_id, None)
+            self._active_meta[resolved_process_id] = meta
         return AgentCommandResult(
             command=command,
+            process_id=resolved_process_id,
             argv=list(decision.argv),
             cwd=str(cwd),
             started_at=started_at,
@@ -356,6 +407,59 @@ class AgentProcessManager:
             policy_decision=policy_payload,
             error=f"Command timed out after {timeout_seconds}s." if timed_out else None,
         )
+
+    def write_stdin(self, process_id: str, data: str) -> bool:
+        with self._lock:
+            process = self._active.get(process_id)
+        if process is None or process.stdin is None:
+            return False
+        process.stdin.write(data)
+        process.stdin.flush()
+        with self._lock:
+            meta = self._active_meta.get(process_id)
+            if meta is not None:
+                meta["last_stdin_write_at"] = datetime.now(timezone.utc).isoformat()
+                meta["stdin_write_count"] = int(meta.get("stdin_write_count") or 0) + 1
+        return True
+
+    def terminate(self, process_id: str) -> bool:
+        with self._lock:
+            process = self._active.get(process_id)
+        if process is None:
+            return False
+        process.terminate()
+        with self._lock:
+            meta = self._active_meta.get(process_id)
+            if meta is not None:
+                meta["terminate_requested_at"] = datetime.now(timezone.utc).isoformat()
+        return True
+
+    def read_output(self, process_id: str, *, stream: str = "stdout", start: int | None = None, end: int | None = None) -> dict[str, Any]:
+        stream_name = stream if stream in {"stdout", "stderr"} else "stdout"
+        with self._lock:
+            meta = dict(self._active_meta.get(process_id) or {})
+        payload = meta.get(stream_name) if isinstance(meta.get(stream_name), dict) else {}
+        text = str(payload.get("excerpt") or "")
+        sliced = text[slice(start, end)]
+        return {
+            "process_id": process_id,
+            "stream": stream_name,
+            "start": start,
+            "end": end,
+            "content": sliced,
+            "total_chars": payload.get("total_chars", len(text)),
+            "omitted_chars": payload.get("omitted_chars", 0),
+            "status": meta.get("status", "unknown"),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            active = [item for item in self._active_meta.values() if str(item.get("status") or "") == "running"]
+            return {
+                "active_processes": active,
+                "processes": list(self._active_meta.values()),
+                "active_count": len(self._active),
+            }
 
     @staticmethod
     def _policy_payload(decision: CommandPolicyDecision) -> dict[str, Any]:

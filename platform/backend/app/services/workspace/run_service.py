@@ -370,6 +370,7 @@ class RunService:
         run.outcome_kind = run.outcome_kind or "blocked_generation"
         target_platform = getattr(run, "target_platform", None)
         preview_profile = getattr(run, "preview_profile", None)
+        run.resume_checkpoint_ref = self._resume_checkpoint_ref_for_run(run)
         checkpoint = {
             "status": "pending",
             "source_run_id": run.run_id,
@@ -383,8 +384,16 @@ class RunService:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "reason": "stale_run_recovery_retained_draft",
         }
-        self.store.upsert("reports", f"resume_checkpoint:{run.workspace_id}", checkpoint)
+        self.store.upsert("reports", run.resume_checkpoint_ref, checkpoint)
         return True
+
+    @staticmethod
+    def _resume_checkpoint_ref_for_run(run: RunRecord) -> str:
+        return run.resume_checkpoint_ref or f"resume_checkpoint:{run.workspace_id}:{run.run_id}"
+
+    def _load_run_resume_checkpoint(self, run: RunRecord) -> dict[str, Any] | None:
+        payload = self.store.get("reports", self._resume_checkpoint_ref_for_run(run))
+        return dict(payload) if isinstance(payload, dict) else None
 
     def _recover_orphaned_terminal_jobs(self) -> None:
         for item in self.store.list("jobs"):
@@ -610,6 +619,32 @@ class RunService:
         self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts)
         return run
 
+    def write_process_stdin(self, run_id: str, process_id: str, data: str) -> dict[str, Any]:
+        self.get_run(run_id)
+        result = self.code_agent_runtime.write_process_stdin(process_id, data)
+        result["run_id"] = run_id
+        return result
+
+    def terminate_process(self, run_id: str, process_id: str) -> dict[str, Any]:
+        self.get_run(run_id)
+        result = self.code_agent_runtime.terminate_process(process_id)
+        result["run_id"] = run_id
+        return result
+
+    def read_process_output(
+        self,
+        run_id: str,
+        process_id: str,
+        *,
+        stream: str = "stdout",
+        start: int | None = None,
+        end: int | None = None,
+    ) -> dict[str, Any]:
+        self.get_run(run_id)
+        result = self.code_agent_runtime.read_process_output(process_id, stream=stream, start=start, end=end)
+        result["run_id"] = run_id
+        return result
+
     def _save_run(self, run: RunRecord) -> None:
         existing = self.store.get("runs", run.run_id)
         if isinstance(existing, dict):
@@ -621,8 +656,9 @@ class RunService:
                 if not getattr(run, attr, None) and isinstance(existing.get(attr), list):
                     setattr(run, attr, list(existing.get(attr) or []))
             for attr in (
+                "agent_transcript_ref",
                 "tool_trace_ref",
-                "draft_patch_history_ref",
+                "file_change_history_ref",
                 "browser_proof_ref",
                 "large_tool_outputs_ref",
                 "file_state_cache_ref",
@@ -641,6 +677,10 @@ class RunService:
                 "rollout_trace_ref",
                 "exec_trace_ref",
                 "process_outputs_ref",
+                "tool_result_messages_ref",
+                "artifact_read_trace_ref",
+                "resume_checkpoint_ref",
+                "verifier_review_ref",
                 "context_pressure_ref",
                 "hook_trace_ref",
                 "semantic_graph_ref",
@@ -649,6 +689,9 @@ class RunService:
             ):
                 if not getattr(run, attr, None) and existing.get(attr):
                     setattr(run, attr, str(existing.get(attr) or ""))
+            for attr in ("active_processes", "worker_branch_refs", "browser_step_refs"):
+                if not getattr(run, attr, None) and isinstance(existing.get(attr), list):
+                    setattr(run, attr, list(existing.get(attr) or []))
             for attr in (
                 "implementation_plan",
                 "agent_memory",
@@ -769,8 +812,9 @@ class RunService:
                     setattr(run, attr, list(getattr(job, attr) or []))
                     changed = True
             for attr in (
+                "agent_transcript_ref",
                 "tool_trace_ref",
-                "draft_patch_history_ref",
+                "file_change_history_ref",
                 "browser_proof_ref",
                 "large_tool_outputs_ref",
                 "file_state_cache_ref",
@@ -789,6 +833,10 @@ class RunService:
                 "rollout_trace_ref",
                 "exec_trace_ref",
                 "process_outputs_ref",
+                "tool_result_messages_ref",
+                "artifact_read_trace_ref",
+                "resume_checkpoint_ref",
+                "verifier_review_ref",
                 "context_pressure_ref",
                 "hook_trace_ref",
                 "semantic_graph_ref",
@@ -797,6 +845,10 @@ class RunService:
             ):
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, str(getattr(job, attr) or ""))
+                    changed = True
+            for attr in ("active_processes", "worker_branch_refs", "browser_step_refs"):
+                if not getattr(run, attr, None) and getattr(job, attr, None):
+                    setattr(run, attr, list(getattr(job, attr) or []))
                     changed = True
             for attr in (
                 "implementation_plan",
@@ -943,36 +995,11 @@ class RunService:
                 error_context=request.error_context,
             )
             with self.openai_client.workspace_logging(run.workspace_id):
-                if request.mode == "fix" and self._should_resume_failed_generation_from_checkpoint(run, request):
-                    self.workspace_log_service.append(
-                        run.workspace_id,
-                        source="run.resume",
-                        message="Fix request matched a saved generation checkpoint. Continuing generation from the prepared draft.",
-                        payload={
-                            "run_id": run.run_id,
-                            "source_run_id": request.resume_from_run_id,
-                        },
-                    )
-                    resumed_generate_request = generate_request.model_copy(update={"mode": "generate"})
-                    job = self.code_agent_runtime.generate(
-                        run.workspace_id,
-                        resumed_generate_request,
-                        should_stop=lambda: self._is_stop_requested(run.run_id),
-                    )
-                else:
-                    job = (
-                        self.code_agent_runtime.generate(
-                            run.workspace_id,
-                            generate_request,
-                            should_stop=lambda: self._is_stop_requested(run.run_id),
-                        )
-                        if request.mode == "fix"
-                        else self.code_agent_runtime.generate(
-                            run.workspace_id,
-                            generate_request,
-                            should_stop=lambda: self._is_stop_requested(run.run_id),
-                        )
-                    )
+                job = self.code_agent_runtime.generate(
+                    run.workspace_id,
+                    generate_request,
+                    should_stop=lambda: self._is_stop_requested(run.run_id),
+                )
             preview = self.preview_service.get(run.workspace_id)
             change_plan = self._build_change_plan(
                 workspace_id=run.workspace_id,
@@ -1023,8 +1050,9 @@ class RunService:
             run.implementation_plan = dict(getattr(job, "implementation_plan", {}) or run.implementation_plan)
             run.agent_activity_events = list(getattr(job, "agent_activity_events", []) or run.agent_activity_events)
             run.agent_memory = dict(getattr(job, "agent_memory", {}) or run.agent_memory)
+            run.agent_transcript_ref = getattr(job, "agent_transcript_ref", None) or run.agent_transcript_ref
             run.tool_trace_ref = getattr(job, "tool_trace_ref", None) or run.tool_trace_ref
-            run.draft_patch_history_ref = getattr(job, "draft_patch_history_ref", None) or run.draft_patch_history_ref
+            run.file_change_history_ref = getattr(job, "file_change_history_ref", None) or run.file_change_history_ref
             run.browser_proof_ref = getattr(job, "browser_proof_ref", None) or run.browser_proof_ref
             run.large_tool_outputs_ref = getattr(job, "large_tool_outputs_ref", None) or run.large_tool_outputs_ref
             run.file_state_cache_ref = getattr(job, "file_state_cache_ref", None) or run.file_state_cache_ref
@@ -1043,6 +1071,14 @@ class RunService:
             run.rollout_trace_ref = getattr(job, "rollout_trace_ref", None) or run.rollout_trace_ref
             run.exec_trace_ref = getattr(job, "exec_trace_ref", None) or run.exec_trace_ref
             run.process_outputs_ref = getattr(job, "process_outputs_ref", None) or run.process_outputs_ref
+            run.tool_result_messages_ref = getattr(job, "tool_result_messages_ref", None) or run.tool_result_messages_ref
+            run.active_processes = list(getattr(job, "active_processes", []) or run.active_processes)
+            run.artifact_read_trace_ref = getattr(job, "artifact_read_trace_ref", None) or run.artifact_read_trace_ref
+            run.active_tool_uses = list(getattr(job, "active_tool_uses", []) or run.active_tool_uses)
+            run.resume_checkpoint_ref = getattr(job, "resume_checkpoint_ref", None) or run.resume_checkpoint_ref
+            run.worker_branch_refs = list(getattr(job, "worker_branch_refs", []) or run.worker_branch_refs)
+            run.verifier_review_ref = getattr(job, "verifier_review_ref", None) or run.verifier_review_ref
+            run.browser_step_refs = list(getattr(job, "browser_step_refs", []) or run.browser_step_refs)
             run.context_pressure_ref = getattr(job, "context_pressure_ref", None) or run.context_pressure_ref
             run.hook_trace_ref = getattr(job, "hook_trace_ref", None) or run.hook_trace_ref
             run.semantic_graph_ref = getattr(job, "semantic_graph_ref", None) or run.semantic_graph_ref
@@ -1390,23 +1426,21 @@ class RunService:
         return preview
 
     def _queue_resume_generation_from_checkpoint_if_needed(self, run: RunRecord, request: CreateRunRequest) -> None:
-        checkpoint = self.store.get("reports", f"resume_checkpoint:{run.workspace_id}")
+        if request.mode != "fix":
+            return
+        source_run_id = str(request.resume_from_run_id or "").strip()
+        if not source_run_id:
+            return
+        try:
+            source_run = self.get_run(source_run_id)
+        except KeyError:
+            return
+        if source_run.workspace_id != run.workspace_id:
+            return
+        checkpoint = self._load_run_resume_checkpoint(source_run)
         if not checkpoint or checkpoint.get("status") != "pending":
             return
-        if checkpoint.get("mode") == "fix":
-            return
         if request.apply_strategy != "staged_auto_apply" or run.apply_status != "applied":
-            return
-        source_run_id = str(checkpoint.get("source_run_id") or "")
-        if request.mode != "fix":
-            if source_run_id == run.run_id:
-                checkpoint["status"] = "completed"
-                checkpoint["completed_by_run_id"] = run.run_id
-                checkpoint["completed_at"] = datetime.now(timezone.utc).isoformat()
-                checkpoint["completion_reason"] = "source_run_completed_applied"
-                self.store.upsert("reports", f"resume_checkpoint:{run.workspace_id}", checkpoint)
-            return
-        if source_run_id and source_run_id != str(request.resume_from_run_id or ""):
             return
 
         resume_request = CreateRunRequest(
@@ -1426,7 +1460,7 @@ class RunService:
         checkpoint["resumed_run_id"] = resumed_run.run_id
         checkpoint["resumed_from_fix_run_id"] = run.run_id
         checkpoint["resumed_at"] = datetime.now(timezone.utc).isoformat()
-        self.store.upsert("reports", f"resume_checkpoint:{run.workspace_id}", checkpoint)
+        self.store.upsert("reports", self._resume_checkpoint_ref_for_run(source_run), checkpoint)
         self.workspace_log_service.append(
             run.workspace_id,
             source="run.resume",
@@ -1443,28 +1477,6 @@ class RunService:
             f"Fix applied. Continuing generation in run {resumed_run.run_id}.",
             {"resumed_run_id": resumed_run.run_id, "source_run_id": checkpoint.get("source_run_id")},
         )
-
-    def _should_resume_failed_generation_from_checkpoint(self, run: RunRecord, request: CreateRunRequest) -> bool:
-        if request.mode != "fix":
-            return False
-        source_run_id = str(request.resume_from_run_id or "").strip()
-        if not source_run_id:
-            return False
-        try:
-            source_run = self.get_run(source_run_id)
-        except KeyError:
-            return False
-        if source_run.workspace_id != run.workspace_id:
-            return False
-        if source_run.status not in {"blocked", "failed"}:
-            return False
-        failure_class = str(source_run.failure_class or "")
-        if not failure_class.startswith("generation."):
-            return False
-        checkpoint = self.store.get("reports", f"resume_checkpoint:{run.workspace_id}")
-        if not checkpoint or checkpoint.get("status") != "pending":
-            return False
-        return str(checkpoint.get("source_run_id") or "") == source_run_id
 
     def _preview_snapshot(self, workspace_id: str, preview: Any | None = None) -> dict[str, Any]:
         current = preview or self.preview_service.get(workspace_id)
@@ -1504,6 +1516,10 @@ class RunService:
                 },
                 "apply_result": job.apply_result,
             }
+        agent_transcript = self.store.get("reports", run.agent_transcript_ref) if run.agent_transcript_ref else None
+        scratchpad = self.store.get("reports", run.scratchpad_ref) if run.scratchpad_ref else None
+        worker_merge = self.store.get("reports", run.worker_merge_ref) if run.worker_merge_ref else None
+        process_outputs = self.store.get("reports", run.process_outputs_ref) if run.process_outputs_ref else None
         payload = {
             "run": run.model_dump(mode="json"),
             "job": job.model_dump(mode="json"),
@@ -1521,12 +1537,13 @@ class RunService:
             "implementation_plan": run.implementation_plan,
             "agent_activity_events": run.agent_activity_events,
             "agent_memory": run.agent_memory,
+            "agent_transcript_ref": run.agent_transcript_ref,
             "acceptance_contract": run.acceptance_contract,
             "worker_summaries": run.worker_summaries,
             "flow_coverage": run.flow_coverage,
             "browser_flow_proof": run.browser_flow_proof,
             "tool_trace_ref": run.tool_trace_ref,
-            "draft_patch_history_ref": run.draft_patch_history_ref,
+            "file_change_history_ref": run.file_change_history_ref,
             "browser_proof_ref": run.browser_proof_ref,
             "large_tool_outputs_ref": run.large_tool_outputs_ref,
             "file_state_cache_ref": run.file_state_cache_ref,
@@ -1545,25 +1562,52 @@ class RunService:
             "rollout_trace_ref": run.rollout_trace_ref,
             "exec_trace_ref": run.exec_trace_ref,
             "process_outputs_ref": run.process_outputs_ref,
+            "tool_result_messages_ref": run.tool_result_messages_ref,
+            "active_processes": run.active_processes,
+            "artifact_read_trace_ref": run.artifact_read_trace_ref,
+            "resume_checkpoint_ref": run.resume_checkpoint_ref,
+            "worker_branch_refs": run.worker_branch_refs,
+            "verifier_review_ref": run.verifier_review_ref,
+            "browser_step_refs": run.browser_step_refs,
+            "active_tool_uses": run.active_tool_uses,
             "context_pressure_ref": run.context_pressure_ref,
             "hook_trace_ref": run.hook_trace_ref,
             "semantic_graph_ref": run.semantic_graph_ref,
             "worker_prefix_ref": run.worker_prefix_ref,
             "replay_trace_ref": run.replay_trace_ref,
-            "process_outputs": self.store.get("reports", run.process_outputs_ref) if run.process_outputs_ref else None,
+            "process_outputs": process_outputs,
+            "tool_result_messages": self.store.get("reports", run.tool_result_messages_ref) if run.tool_result_messages_ref else None,
+            "agent_transcript": agent_transcript,
+            "artifact_read_trace": self.store.get("reports", run.artifact_read_trace_ref) if run.artifact_read_trace_ref else None,
+            "resume_checkpoint": self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None,
+            "verifier_review": self.store.get("reports", run.verifier_review_ref) if run.verifier_review_ref else None,
+            "browser_steps": [self.store.get("reports", ref) for ref in run.browser_step_refs if ref],
             "context_pressure": self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else None,
             "hook_trace": self.store.get("reports", run.hook_trace_ref) if run.hook_trace_ref else None,
             "semantic_graph": self.store.get("reports", run.semantic_graph_ref) if run.semantic_graph_ref else None,
             "replay_trace": self.store.get("reports", run.replay_trace_ref) if run.replay_trace_ref else None,
-            "todo_plan": ((self.store.get("reports", run.scratchpad_ref) or {}).get("files") or {}).get("plan.md") if run.scratchpad_ref else None,
+            "reduced_graph": (agent_transcript or {}).get("reduced_graph", []) if isinstance(agent_transcript, dict) else [],
+            "todo_plan": (scratchpad or {}).get("todo_plan", []) if isinstance(scratchpad, dict) else [],
+            "todo_plan_markdown": ((scratchpad or {}).get("files") or {}).get("plan.md") if isinstance(scratchpad, dict) else None,
+            "scratchpad": scratchpad,
             "worker_results": {
                 "drafts": self.store.get("reports", run.worker_drafts_ref) if run.worker_drafts_ref else None,
-                "merge": self.store.get("reports", run.worker_merge_ref) if run.worker_merge_ref else None,
+                "merge": worker_merge,
             },
-            "merge_conflicts": (self.store.get("reports", run.worker_merge_ref) or {}).get("merge_reports", []) if run.worker_merge_ref else [],
-            "compact_boundaries": (self.store.get("reports", run.scratchpad_ref) or {}).get("compact_boundaries", []) if run.scratchpad_ref else [],
+            "worker_merge_reports": (worker_merge or {}).get("merge_reports", []) if isinstance(worker_merge, dict) else [],
+            "merge_conflicts": [
+                item
+                for item in ((worker_merge or {}).get("merge_reports", []) if isinstance(worker_merge, dict) else [])
+                if isinstance(item, dict) and item.get("status") == "conflict"
+            ],
+            "compact_boundaries": (scratchpad or {}).get("compact_boundaries", []) if isinstance(scratchpad, dict) else [],
             "command_policy_decisions": (self.store.get("reports", run.command_policy_ref) or {}).get("examples", []) if run.command_policy_ref else [],
             "browser_proof_steps": (run.browser_flow_proof or {}).get("steps", []),
+            "process_refs": {
+                "process_outputs_ref": run.process_outputs_ref,
+                "active_processes": run.active_processes,
+                "output_count": len((process_outputs or {}).get("items", [])) if isinstance(process_outputs, dict) else 0,
+            },
             "repair_issue_signatures": run.repair_issue_signatures,
             "mobile_layout_report": run.mobile_layout_report,
             "preview": preview_payload,
@@ -2093,13 +2137,10 @@ class RunService:
         for iteration in iterations:
             if not isinstance(iteration, dict):
                 continue
-            legacy_key = "oper" + "ations"
-            draft_actions = iteration.get("draft_actions")
-            if not isinstance(draft_actions, list):
-                draft_actions = iteration.get(legacy_key)
-            if not isinstance(draft_actions, list):
+            file_changes = iteration.get("file_changes")
+            if not isinstance(file_changes, list):
                 continue
-            for operation in draft_actions:
+            for operation in file_changes:
                 if not isinstance(operation, dict):
                     continue
                 file_path = operation.get("file_path")

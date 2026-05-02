@@ -8,15 +8,15 @@ The user's prompt is the only source of product meaning. Template files provide 
 - Create connected `client`, `specialist`, and `manager` role surfaces for every new app.
 - Keep the three roles tied to the same product content: shared app title, shared prompt-derived objects, and consistent labels/actions.
 - Never leave a role as a generic preview, blank page, or neutral starter.
-- Generate a multi-page app, not one long page. Each role root (`/client`, `/specialist`, `/manager`) is a hub, and each role needs at least two prompt-specific child pages.
-- Declare child pages in `miniapp/app/generated/route_manifest.json`. Use a compact `routes` map, either top-level or per-role, for example `"/client/catalog": "static/client/catalog/index.html"`.
-- The older profile flow is only a routing pattern: use a profile/settings child page when useful, but keep its content specific to the user's product.
-- Root pages should link to child pages and summarize the role workflow; detailed catalog/order/task/report/profile content belongs on child pages.
+- Build as many pages as the prompt-derived workflow needs. Each role root (`/client`, `/specialist`, `/manager`) is a focused role entrypoint, not a copy of the same generic page.
+- Declare additional route pages in `miniapp/app/generated/route_manifest.json` only when they support a real prompt-derived workflow. Use neutral paths and file names chosen from the product plan, not platform examples.
+- Add settings or profile pages only when the requested workflow actually needs them.
+- Root pages should expose the primary role workflow and link only to useful supporting pages.
 - Name models, routes, pages, and UI with the user's own business language from the prompt.
 - Generate light-mode UI by default: light backgrounds, dark readable text, and accessible contrast. Use a dark theme only when the user explicitly asks for it.
 - Every generated create app must be usable, not static-only: include forms/buttons, frontend `fetch` calls, and backend APIs that save user-provided records.
 - Do not include mock data, seed data, demo data, sample data, fixtures, preloaded records, or hard-coded business records in generated app source. Start with empty persistent state and prompt-specific empty states.
-- Fast create needs at least one persistent resource with `GET` and `POST`. Balanced should connect two or three resources or add status/update behavior. Quality should provide detailed multi-role workflows with several endpoints.
+- Fast create needs at least one prompt-derived persistent flow with `GET` and `POST`. Balanced should connect a small number of related flows or add status/update behavior. Quality should provide detailed multi-role workflows with richer validation and design.
 - Add generated app tests in `miniapp/tests/test_generated_app.py` and `miniapp/tests/generated_app.test.mjs`.
 - Keep generated tests dependency-free beyond the template runtime: Python `unittest` + FastAPI `TestClient`, and Node `node:test` + `fs/path`.
 - Generated JS tests run from the `miniapp/` directory; read `app/static/<role>/...`, not `miniapp/app/static/<role>/...`.
@@ -30,7 +30,7 @@ The user's prompt is the only source of product meaning. Template files provide 
 - `miniapp/app/main.py`: app creation, static mounting, route registration, exception handlers.
 - `miniapp/app/db.py`: SQLAlchemy engine, `Base`, `SessionLocal`, generated persistent models.
 - `miniapp/app/schemas.py`: Pydantic models used by generated API routes.
-- `miniapp/app/routes/<feature>.py`: one coherent backend feature.
+- `miniapp/app/routes/<feature>.py`: one coherent backend workflow.
 - `miniapp/app/static/<role>/index.html`: role hub page.
 - `miniapp/app/static/<role>/<feature>/index.html`: role child page declared in the route manifest.
 - `miniapp/tests/`: product-specific generated tests for role roots, backend APIs when present, and shared role content.
@@ -42,6 +42,6 @@ The user's prompt is the only source of product meaning. Template files provide 
 - Keep page-local `index.html`, `styles.css`, and `app.js` files in sync.
 - Keep generated routers, schemas, and database models importable.
 - Keep all `/client`, `/specialist`, and `/manager` role roots loadable.
-- Keep at least three routeable pages per role: the role root plus at least two child pages.
+- Keep every role routeable and useful; add supporting pages only when they make the workflow clearer.
 - Keep generated Python and JS tests present and passing after create/edit/fix.
 - Run checks after meaningful edits and fix reported failures in app code.

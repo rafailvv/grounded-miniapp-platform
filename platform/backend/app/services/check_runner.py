@@ -22,7 +22,7 @@ from urllib.request import Request, urlopen
 from app.models.common import GenerationMode
 from app.models.artifacts import ValidationIssue
 from app.models.domain import CheckExecutionRecord, RunCheckResult, utc_now
-from app.modules.miniapp_validation.generation_preflight_validation import GenerationPreflightValidation
+from app.modules.miniapp_validation.agent_static_validation import AgentStaticValidation
 from app.services.workspace.preview_service import PreviewService
 from app.validators.static_analysis import (
     extract_declared_routes,
@@ -1860,7 +1860,6 @@ class CheckRunner:
         logs = [str(item) for item in proof.get("logs") or [] if str(item).strip()]
         diagnostics = {
             "workflow_kind": contract.get("workflow_kind") or "create",
-            "entity_labels": list((contract.get("features") or {}).get("prompt_resource_candidates") or []),
             "roles_checked": list(contract.get("roles") or ROLE_ORDER),
             "steps": proof.get("steps") or [],
             "api_paths": proof.get("api_paths") or [],
@@ -1936,7 +1935,6 @@ class CheckRunner:
         mobile_passed = str(mobile_report.get("status") or "") != "failed"
         diagnostics = {
             "workflow_kind": contract.get("workflow_kind") or "create",
-            "entity_labels": list((contract.get("features") or {}).get("prompt_resource_candidates") or []),
             "roles_checked": list(contract.get("roles") or ROLE_ORDER),
             "steps": proof.get("ui_steps") or proof.get("steps") or [],
             "ui_steps": proof.get("ui_steps") or [],
@@ -3367,8 +3365,8 @@ except Exception as exc:
             or path.startswith("miniapp/app/generated/")
             for path in relevant_changed
         ):
-            issues.extend(GenerationPreflightValidation.preflight_profile_schema_issues(source_dir))
-            issues.extend(GenerationPreflightValidation.preflight_route_schema_issues(source_dir))
+            issues.extend(AgentStaticValidation.profile_schema_issues(source_dir))
+            issues.extend(AgentStaticValidation.route_schema_issues(source_dir))
         if agentic_scope:
             role_issues, role_coverage, neutral_template_findings = self._role_surface_issues(
                 source_dir,

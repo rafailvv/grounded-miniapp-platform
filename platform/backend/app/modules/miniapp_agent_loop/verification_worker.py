@@ -61,6 +61,23 @@ class VerificationWorker:
                 diagnostics = dict(browser.diagnostics or {})
                 if not diagnostics:
                     issues.append({"kind": "missing_browser_diagnostics", "check": "browser_flow_smoke"})
+                roles_checked = set(str(role) for role in diagnostics.get("roles_checked") or [])
+                required_roles = {"client", "specialist", "manager"}
+                if not required_roles.issubset(roles_checked):
+                    issues.append(
+                        {
+                            "kind": "browser_proof_missing_roles",
+                            "check": "browser_flow_smoke",
+                            "missing_roles": sorted(required_roles - roles_checked),
+                        }
+                    )
+                ui_steps = diagnostics.get("ui_steps") or diagnostics.get("steps") or []
+                if not isinstance(ui_steps, list) or not ui_steps:
+                    issues.append({"kind": "browser_proof_missing_ui_steps", "check": "browser_flow_smoke"})
+                if not (diagnostics.get("created_marker") or diagnostics.get("created_state_marker")):
+                    issues.append({"kind": "browser_proof_missing_created_marker", "check": "browser_flow_smoke"})
+                if not (diagnostics.get("updated_marker") or diagnostics.get("updated_state_marker")):
+                    issues.append({"kind": "browser_proof_missing_updated_marker", "check": "browser_flow_smoke"})
                 mobile = diagnostics.get("mobile_layout")
                 if isinstance(mobile, dict) and (mobile.get("horizontal_overflow") or mobile.get("critical_overlap")):
                     issues.append({"kind": "mobile_layout_failed", "diagnostics": mobile})

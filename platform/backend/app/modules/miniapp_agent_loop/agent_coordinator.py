@@ -93,6 +93,13 @@ class AgentCoordinator:
             item.status == "completed" or item.phase in {"repairing", "completed"} for item in self.todo
         )
 
+    def incomplete_required_todos(self) -> list[dict[str, str]]:
+        return [
+            item.as_dict()
+            for item in self.todo
+            if item.status != "completed" and item.phase not in {"repairing", "completed"}
+        ]
+
     def complete_phase(self, phase: CoordinatorPhase, summary: str = "") -> dict[str, Any]:
         for item in self.todo:
             if item.phase == phase and item.status in {"pending", "in_progress"}:
@@ -125,4 +132,5 @@ class AgentCoordinator:
             "worker_specs": self.worker_specs(),
             "verification_completed": self.verification_completed(),
             "ready_to_finalize": self.ready_to_finalize(),
+            "incomplete_required_todos": self.incomplete_required_todos(),
         }

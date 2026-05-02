@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def test_deleted_generation_runtime_packages_do_not_exist() -> None:
+def test_removed_generation_runtime_packages_do_not_exist() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     deleted_paths = [
         Path("platform/backend/app/modules/" + "miniapp_" + "generation" + "_runtime"),
@@ -18,9 +18,10 @@ def test_deleted_generation_runtime_packages_do_not_exist() -> None:
         Path("platform/backend/app/services/run_service.py"),
         Path("platform/backend/app/services/workspace_service.py"),
         Path("platform/backend/app/services/preview_service.py"),
-        Path("platform/backend/app/services/agent_loop_engine.py"),
+        Path("platform/backend/app/services/" + "agent_" + "loop_" + "engine.py"),
         Path("platform/backend/app/services/workspace_log_service.py"),
         Path("platform/backend/app/services/runtime_manager.py"),
+        Path("platform/backend/app/modules/miniapp_agent_loop/engine.py"),
         Path("platform/backend/app/models/" + "grounded_" + "spec.py"),
         Path("platform/backend/app/models/" + "app_" + "ir.py"),
         Path("platform/backend/app/validators/" + "grounded_" + "spec_validator.py"),
@@ -28,12 +29,13 @@ def test_deleted_generation_runtime_packages_do_not_exist() -> None:
         Path("platform/backend/app/ai/" + "open" + "router" + "_client.py"),
         Path("contracts/" + "grounded-" + "spec.v1.json"),
         Path("contracts/" + "app-" + "ir.v1.json"),
+        Path("platform/backend/app/models/" + "leg" + "acy_" + "state_" + "migr" + "ation.py"),
     ]
 
     assert [path for path in deleted_paths if (repo_root / path).exists()] == []
 
 
-def test_active_backend_sources_do_not_reference_legacy_generation_tokens() -> None:
+def test_active_sources_do_not_reference_retired_generation_tokens() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     scan_roots = [
         repo_root / "platform/backend/app",
@@ -68,10 +70,14 @@ def test_active_backend_sources_do_not_reference_legacy_generation_tokens() -> N
         "Workspace" + "Loop" + "Turn" + "Runner",
         "Workspace" + "Loop",
         "work" + "space_" + "loop",
+        "Agent" + "Loop" + "Engine",
+        "agent_" + "loop_" + "engine",
         "prompt_" + "alignment",
         "Draft" + "File" + "Operation",
         "fix_" + "attempts",
         "scope_" + "expansions",
+        "draft_" + "actions",
+        "draft_" + "patch_history_ref",
         "com" + "merce",
         "bak" + "ery",
         "ca" + "rt",

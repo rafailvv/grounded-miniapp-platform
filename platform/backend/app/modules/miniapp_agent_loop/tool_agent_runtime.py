@@ -11,11 +11,11 @@ from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 
 MAX_TOOL_OUTPUT_CHARS = 6000
 
-def normalize_tool_requests(raw_tool_requests: list[Any]) -> list[dict[str, Any]]:
+def normalize_tool_calls(raw_tool_calls: list[Any]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
-    if not isinstance(raw_tool_requests, list):
+    if not isinstance(raw_tool_calls, list):
         return normalized
-    for item in raw_tool_requests:
+    for item in raw_tool_calls:
         if not isinstance(item, dict):
             continue
         tool = str(item.get("tool") or "").strip().lower()
@@ -36,13 +36,17 @@ def normalize_tool_requests(raw_tool_requests: list[Any]) -> list[dict[str, Any]
         normalized.append(
             {
                 "tool": tool,
+                "tool_use_id": str(item.get("tool_use_id") or "").strip(),
                 "mode": mode,
                 "targets": targets[:12],
                 "file_path": _strip_leading_dot_slash(item.get("file_path") or ""),
                 "pattern": str(item.get("pattern") or "").strip(),
                 "command": str(item.get("command") or "").strip(),
+                "artifact_ref": str(item.get("artifact_ref") or "").strip(),
                 "content": str(item.get("content") or ""),
                 "diff": str(item.get("diff") or ""),
+                "worker_id": str(item.get("worker_id") or "").strip(),
+                "owner_scope": str(item.get("owner_scope") or "").strip(),
                 "reason": str(item.get("reason") or "").strip(),
             }
         )
@@ -159,16 +163,20 @@ def run_workspace_command(
     timeout_seconds: int,
     max_output_chars: int = MAX_TOOL_OUTPUT_CHARS,
     progress_callback=None,
+    process_manager: AgentProcessManager | None = None,
+    process_id: str | None = None,
 ) -> dict[str, object]:
     started_at = time.perf_counter()
     decision = decide_workspace_command(command)
-    result = AgentProcessManager().run(
+    manager = process_manager or AgentProcessManager()
+    result = manager.run(
         draft_source=draft_source,
         command=command,
         decision=decision,
         timeout_seconds=timeout_seconds,
         max_output_chars=max_output_chars,
         progress_callback=progress_callback,
+        process_id=process_id,
     ).as_dict()
     result.setdefault("duration_ms", int((time.perf_counter() - started_at) * 1000))
     return result

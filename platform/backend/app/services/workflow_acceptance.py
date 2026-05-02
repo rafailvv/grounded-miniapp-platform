@@ -7,39 +7,6 @@ from app.models.common import GenerationMode
 
 ROLE_ORDER = ("client", "specialist", "manager")
 
-WORKFLOW_EDIT_MARKERS = (
-    "after adding",
-    "button",
-    "does not load",
-    "doesn't load",
-    "form",
-    "list",
-    "refresh",
-    "should appear",
-    "не подгружается",
-    "не работает",
-    "кнопк",
-    "список",
-    "форма",
-    "после добавления",
-    "должно появляться",
-    "появлялось",
-    "сохраняться",
-    "срочн",
-    "во всех трех",
-    "во всех трёх",
-)
-
-def prompt_resource_candidates(prompt: str, *, limit: int = 3) -> list[str]:
-    """Compatibility shim for older callers.
-
-    The platform must not derive API/resource/page names from prompt words. A
-    Claude/Codex-style code agent should infer concrete entities in its own
-    implementation plan and then validators verify the actual code it produced.
-    """
-    del prompt, limit
-    return []
-
 def normalized_generation_mode(generation_mode: GenerationMode | str | None) -> str:
     return str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
 
@@ -61,7 +28,7 @@ def is_behavior_workflow_prompt(prompt: str) -> bool:
     )
     if any(marker in text for marker in strong_markers):
         return True
-    broad_flow_terms = ("button", "form", "list", "record", "кнопк", "форма", "список")
+    broad_flow_terms = ("button", "form", "list", "кнопк", "форма", "список")
     if any(marker in text for marker in broad_flow_terms) and any(
         marker in text
         for marker in (
@@ -192,9 +159,6 @@ def build_acceptance_contract(
             "cross_role_persistence": True,
             "refresh_persistence": True,
             "workflow_update": True,
-            "resource_count": 0,
-            "prompt_resource_candidates": [],
-            "resource_strategy": "llm_plan_owned_no_platform_resource_template",
             "api_discovery_required": True,
         },
         "required_endpoints": [],
@@ -225,11 +189,6 @@ def build_implementation_plan(
     intent_value = str(intent or "").strip().lower()
     mode_value = normalized_generation_mode(generation_mode)
     contract = dict(acceptance_contract or {})
-    resources = []
-    for endpoint in contract.get("required_endpoints") or []:
-        if isinstance(endpoint, dict) and str(endpoint.get("resource") or "").strip():
-            resources.append(str(endpoint.get("resource")).strip())
-    resources = list(dict.fromkeys(resources))
     required_controls = [
         dict(item)
         for item in (contract.get("required_controls") or [])
@@ -242,7 +201,7 @@ def build_implementation_plan(
         "generation_mode": mode_value,
         "principle": "plan_inspect_build_verify_repair_final_browser_proof",
         "roles": list(contract.get("roles") or ROLE_ORDER),
-        "primary_entities": resources,
+        "primary_entities": [],
         "role_actions": {
             "client": "perform the prompt-derived user create, submit, select, or save action through UI and POST API",
             "specialist": "perform the prompt-derived operational processing/update action through UI and update API",
@@ -258,6 +217,17 @@ def build_implementation_plan(
             "three_separate_role_apps": True,
             "no_cross_role_navigation": True,
             "role_specific_actions": True,
+            "role_independence": {
+                "client": "user-facing mobile app for the primary prompt-derived create/select/save flow; no links to specialist or manager surfaces",
+                "specialist": "operational mobile app for processing/updating shared state; no client-only duplicate page",
+                "manager": "oversight mobile app for summary, control, status, and workload visibility; no specialist-only duplicate page",
+            },
+            "shared_state_contract": [
+                "client-created state is stored through backend persistence",
+                "specialist can load the same state and persist an update",
+                "manager can load the updated state and summary",
+                "client can reload and see the update through UI",
+            ],
         },
         "test_contract": {
             "generated_tests_required": bool(contract.get("required")),
@@ -272,7 +242,7 @@ def build_implementation_plan(
         "agent_todos": [
             {"id": "plan", "status": "completed", "content": "Extract prompt-owned roles, entities, UI controls, APIs, tests, and mobile constraints."},
             {"id": "inspect", "status": "pending", "content": "Read/search only the workspace files needed for the next patch."},
-            {"id": "build", "status": "pending", "content": "Patch backend, role UI, frontend behavior, and generated tests through validated draft actions."},
+            {"id": "build", "status": "pending", "content": "Patch backend, role UI, frontend behavior, and generated tests through validated code-agent write tools."},
             {"id": "verify", "status": "pending", "content": "Run static/API/generated/browser/mobile proof against the actual generated workflow."},
             {"id": "repair", "status": "pending", "content": "Patch the concrete failed slice until strict green completion."},
         ],
@@ -280,7 +250,16 @@ def build_implementation_plan(
             "target_viewports": ["360x740", "390x844", "430x932"],
             "no_horizontal_scroll": True,
             "responsive_cards_forms_lists": True,
+            "safe_top_spacing_required": True,
+            "no_fixed_width_tables_or_panels": True,
+            "touch_targets_min_height": "44px where practical",
+            "states_required": ["empty", "loading", "success", "error"],
             "quality_runs_require_post_green_design_pass": mode_value == GenerationMode.QUALITY.value,
+        },
+        "mode_quality_contract": {
+            "fast": "smallest complete mobile product: one shared persisted flow, compact CSS, all roles functional",
+            "balanced": "moderate mobile product: richer layout, one related update/summary flow, clear role separation",
+            "quality": "product-ready mobile mini-app: polished UI, refined states, stronger validation, post-green design pass",
         },
         "orchestration": {
             "execution_style": (orchestration or {}).get("execution_style"),
@@ -300,10 +279,10 @@ def orchestration_metadata_for_contract(
     workflow_kind = str(focused_edit_kind or "").strip().lower()
     enabled = bool((contract or {}).get("required"))
     execution_style = (
-        "agent_query_loop"
+        "agent_tool_call_loop"
         if enabled and mode_value == GenerationMode.FAST.value
-        else "agent_query_loop_with_design_pass" if enabled and mode_value == GenerationMode.QUALITY.value
-        else "agent_query_loop" if enabled else "none"
+        else "agent_tool_call_loop_with_design_pass" if enabled and mode_value == GenerationMode.QUALITY.value
+        else "agent_tool_call_loop" if enabled else "none"
     )
     isolated_worker_drafts = enabled and mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
     phases = [

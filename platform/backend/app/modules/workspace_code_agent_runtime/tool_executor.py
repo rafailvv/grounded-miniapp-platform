@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from app.models.domain import CheckExecutionRecord
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
+from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.modules.miniapp_agent_loop.agent_kernel import plan_agent_tool_batches
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
@@ -30,9 +31,18 @@ class AgentToolExecutor:
     state and can be expensive or stateful.
     """
 
-    def __init__(self, *, workspace_service: WorkspaceService, file_state_cache: AgentFileStateCache | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        workspace_service: WorkspaceService,
+        file_state_cache: AgentFileStateCache | None = None,
+        process_manager: AgentProcessManager | None = None,
+        read_artifact: Callable[[str], dict[str, Any] | None] | None = None,
+    ) -> None:
         self.workspace_service = workspace_service
         self.file_state_cache = file_state_cache or AgentFileStateCache()
+        self.process_manager = process_manager or AgentProcessManager()
+        self.read_artifact = read_artifact
 
     def execute(
         self,
@@ -40,7 +50,7 @@ class AgentToolExecutor:
         workspace_id: str,
         run_id: str,
         draft_source: Path,
-        tool_requests: list[dict[str, Any]],
+        tool_calls: list[dict[str, Any]],
         execute_checks: Callable[[list[str]], tuple[CheckExecutionRecord, dict[str, Any]]],
         append_activity: Callable[[str, str, dict[str, Any] | None], None] | None = None,
         append_batch_summary: Callable[[dict[str, object]], None] | None = None,
@@ -48,7 +58,7 @@ class AgentToolExecutor:
         loaded_context: dict[str, str] = {}
         tool_results: list[dict[str, object]] = []
         workspace_tree = self.workspace_service.file_tree(workspace_id, run_id=run_id)
-        tool_batch_plan = plan_agent_tool_batches(tool_requests)
+        tool_batch_plan = plan_agent_tool_batches(tool_calls)
         tool_results.append(
             {
                 "tool": "agent_tool_batch",
@@ -170,8 +180,23 @@ class AgentToolExecutor:
                 emit_activity(activity, label, {"tool_use_id": use_id, "tool": tool_name, "targets": request_targets, "status": "completed", "path_count": len(result.get("paths") or [])})
                 emit_activity("hook_completed", "Post-tool hook", {"hook": "post_tool_use", "tool_use_id": use_id, "tool": tool_name, "status": "completed"})
                 return local_context, result
+            if tool_name == "read_artifact_ref":
+                artifact_ref = str(request_item.get("artifact_ref") or (request_targets[0] if request_targets else "")).strip()
+                artifact_payload = self.read_artifact(artifact_ref) if self.read_artifact is not None and artifact_ref else None
+                result = {
+                    "tool": "read_artifact_ref",
+                    "tool_use_id": use_id,
+                    "artifact_ref": artifact_ref,
+                    "found": artifact_payload is not None,
+                    "payload": artifact_payload,
+                    "reason": reason,
+                }
+                emit_activity(activity, label, {"tool_use_id": use_id, "tool": tool_name, "artifact_ref": artifact_ref, "status": "completed", "found": artifact_payload is not None})
+                emit_activity("hook_completed", "Post-tool hook", {"hook": "post_tool_use", "tool_use_id": use_id, "tool": tool_name, "status": "completed"})
+                return local_context, result
             if tool_name == "run_command":
                 command = str(request_item.get("command") or "").strip()
+                process_id = str(request_item.get("process_id") or request_item.get("tool_use_id") or use_id)
                 command_started = time.perf_counter()
                 delta_counter = {"count": 0}
 
@@ -181,7 +206,7 @@ class AgentToolExecutor:
                         emit_activity(
                             "process_started",
                             "Diagnostic process started",
-                            {"tool_use_id": use_id, "tool": tool_name, "command": command, **payload},
+                            {"tool_use_id": use_id, "process_id": process_id, "tool": tool_name, "command": command, **payload},
                         )
                     elif status == "output_delta":
                         delta_counter["count"] += 1
@@ -189,19 +214,20 @@ class AgentToolExecutor:
                             emit_activity(
                                 "command_output_delta",
                                 "Diagnostic command emitted output",
-                                {"tool_use_id": use_id, "tool": tool_name, "command": command, **payload},
+                                {"tool_use_id": use_id, "process_id": process_id, "tool": tool_name, "command": command, **payload},
                             )
                     elif status == "heartbeat":
                         emit_activity(
                             "tool_progress",
                             "Diagnostic command still running",
-                            {"tool_use_id": use_id, "tool": tool_name, "command": command, **payload},
+                            {"tool_use_id": use_id, "process_id": process_id, "tool": tool_name, "command": command, **payload},
                         )
                     elif status == "completed":
+                        activity_type = "process_completed" if payload.get("success") else "process_failed"
                         emit_activity(
-                            "process_completed",
-                            "Diagnostic process completed",
-                            {"tool_use_id": use_id, "tool": tool_name, "command": command, **payload},
+                            activity_type,
+                            "Diagnostic process completed" if payload.get("success") else "Diagnostic process failed",
+                            {"tool_use_id": use_id, "process_id": process_id, "tool": tool_name, "command": command, **payload},
                         )
 
                 result = {
@@ -211,6 +237,8 @@ class AgentToolExecutor:
                         timeout_seconds=25,
                         max_output_chars=AgentToolRegistry.spec("run_command").output_cap_chars if AgentToolRegistry.spec("run_command") else 6000,
                         progress_callback=command_progress,
+                        process_manager=self.process_manager,
+                        process_id=process_id,
                     ),
                     "reason": reason,
                     "tool_use_id": use_id,

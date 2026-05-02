@@ -39,8 +39,8 @@ def agent_tool_kind(tool_name: object) -> Literal["read_only", "mutating", "unkn
     return "unknown"
 
 
-def plan_agent_tool_batches(tool_requests: list[dict[str, Any]]) -> AgentToolBatchPlan:
-    return AgentToolRegistry.plan_batches(tool_requests)
+def plan_agent_tool_batches(tool_calls: list[dict[str, Any]]) -> AgentToolBatchPlan:
+    return AgentToolRegistry.plan_batches(tool_calls)
 
 
 def decide_agent_budget(
@@ -83,7 +83,7 @@ def decide_agent_budget(
 def compact_agent_memory(
     *,
     turn_history: list[dict[str, Any]],
-    draft_action_count: int,
+    file_change_count: int,
     last_assistant_message: str,
     max_recent_turns: int = 6,
 ) -> dict[str, Any]:
@@ -97,7 +97,7 @@ def compact_agent_memory(
         "kind": "agent_memory_summary",
         "turn_count": len(turn_history),
         "recent_turns": recent_turns,
-        "draft_action_count": draft_action_count,
+        "file_change_count": file_change_count,
         "failed_signatures": failed_signatures[-10:],
         "last_assistant_message": str(last_assistant_message or "")[:1200],
     }

@@ -69,13 +69,18 @@ class AgentWorkerManager:
             "mode": str(getattr(generation_mode, "value", generation_mode) or ""),
             "workers": workers,
             "plan_entities": list(implementation_plan.get("primary_entities") or [])[:8],
+            "worker_prompt_contract": (
+                "Each worker prompt must be self-contained: owner scope, path prefixes, exact product plan slice, "
+                "expected self-check, and repair instruction. Continue the same worker for failures in owned paths; "
+                "use a fresh verifier only after green checks."
+            ),
             "merge_policy": "accept non-conflicting owned diffs; return conflicts to the owning worker as a repair packet",
         }
 
     @classmethod
-    def validate_non_conflicting(cls, draft_actions: list[DraftAction]) -> dict[str, object]:
+    def validate_non_conflicting(cls, file_changes: list[DraftAction]) -> dict[str, object]:
         by_path: dict[str, list[dict[str, str]]] = {}
-        for action in draft_actions:
+        for action in file_changes:
             path = str(action.file_path or "").strip()
             owner = cls.owner_for_path(path)
             by_path.setdefault(path, []).append(

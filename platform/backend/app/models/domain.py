@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, ClassVar, Literal
+from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field
 
 from app.models.common import GenerationMode, PreviewProfile, StrictModel, TargetPlatform
 
@@ -79,13 +79,6 @@ class ChatTurnRecord(StrictModel):
 
 
 class JobEvent(StrictModel):
-    _LEGACY_BUILD_PREFIX: ClassVar[str] = "parallel" + "_build"
-    _LEGACY_EVENT_TYPE_MAP: ClassVar[dict[str, str]] = {
-        f"{_LEGACY_BUILD_PREFIX}_started": "agent_build_started",
-        f"{_LEGACY_BUILD_PREFIX}_completed": "agent_build_completed",
-        f"{_LEGACY_BUILD_PREFIX}_failed": "agent_build_failed",
-    }
-
     event_id: str = Field(default_factory=lambda: new_id("evt"))
     event_type: Literal[
         "job_started",
@@ -146,13 +139,6 @@ class JobEvent(StrictModel):
     message: str
     details: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
-
-    @field_validator("event_type", mode="before")
-    @classmethod
-    def normalize_legacy_event_type(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            return cls._LEGACY_EVENT_TYPE_MAP.get(value, value)
-        return value
 
 class ValidationSnapshot(StrictModel):
     platform_valid: bool = False
@@ -220,8 +206,9 @@ class JobRecord(StrictModel):
     agent_turns: list[dict[str, Any]] = Field(default_factory=list)
     agent_activity_events: list[dict[str, Any]] = Field(default_factory=list)
     agent_memory: dict[str, Any] = Field(default_factory=dict)
+    agent_transcript_ref: str | None = None
     tool_trace_ref: str | None = None
-    draft_patch_history_ref: str | None = None
+    file_change_history_ref: str | None = None
     browser_proof_ref: str | None = None
     large_tool_outputs_ref: str | None = None
     file_state_cache_ref: str | None = None
@@ -240,6 +227,14 @@ class JobRecord(StrictModel):
     rollout_trace_ref: str | None = None
     exec_trace_ref: str | None = None
     process_outputs_ref: str | None = None
+    tool_result_messages_ref: str | None = None
+    active_processes: list[dict[str, Any]] = Field(default_factory=list)
+    artifact_read_trace_ref: str | None = None
+    active_tool_uses: list[dict[str, Any]] = Field(default_factory=list)
+    resume_checkpoint_ref: str | None = None
+    worker_branch_refs: list[str] = Field(default_factory=list)
+    verifier_review_ref: str | None = None
+    browser_step_refs: list[str] = Field(default_factory=list)
     context_pressure_ref: str | None = None
     hook_trace_ref: str | None = None
     semantic_graph_ref: str | None = None
@@ -262,15 +257,6 @@ class JobRecord(StrictModel):
     artifact_storage_ref: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _drop_legacy_agent_reports(cls, value: Any) -> Any:
-        if isinstance(value, dict):
-            value = dict(value)
-            value.pop("fix_" + "attempts", None)
-            value.pop("scope_" + "expansions", None)
-        return value
 
 class PreviewRecord(StrictModel):
     preview_id: str = Field(default_factory=lambda: new_id("preview"))
@@ -449,7 +435,7 @@ class RunIterationRecord(StrictModel):
     run_id: str
     assistant_message: str
     files_read: list[str] = Field(default_factory=list)
-    draft_actions: list[RunIterationAction] = Field(default_factory=list)
+    file_changes: list[RunIterationAction] = Field(default_factory=list)
     check_results: list[RunCheckResult] = Field(default_factory=list)
     diff_summary: str | None = None
     role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
@@ -457,18 +443,6 @@ class RunIterationRecord(StrictModel):
     token_usage: dict[str, Any] = Field(default_factory=dict)
     failure_class: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_legacy_draft_actions(cls, value: Any) -> Any:
-        if isinstance(value, dict) and "draft_actions" not in value:
-            old_key = "oper" + "ations"
-            if isinstance(value.get(old_key), list):
-                value = dict(value)
-                value["draft_actions"] = value.get(old_key)
-                value.pop(old_key, None)
-        return value
-
 
 class RepairIterationRecord(StrictModel):
     repair_iteration_id: str = Field(default_factory=lambda: new_id("repair_iter"))
@@ -577,8 +551,9 @@ class RunRecord(StrictModel):
     agent_turns: list[dict[str, Any]] = Field(default_factory=list)
     agent_activity_events: list[dict[str, Any]] = Field(default_factory=list)
     agent_memory: dict[str, Any] = Field(default_factory=dict)
+    agent_transcript_ref: str | None = None
     tool_trace_ref: str | None = None
-    draft_patch_history_ref: str | None = None
+    file_change_history_ref: str | None = None
     browser_proof_ref: str | None = None
     large_tool_outputs_ref: str | None = None
     file_state_cache_ref: str | None = None
@@ -597,6 +572,14 @@ class RunRecord(StrictModel):
     rollout_trace_ref: str | None = None
     exec_trace_ref: str | None = None
     process_outputs_ref: str | None = None
+    tool_result_messages_ref: str | None = None
+    active_processes: list[dict[str, Any]] = Field(default_factory=list)
+    artifact_read_trace_ref: str | None = None
+    active_tool_uses: list[dict[str, Any]] = Field(default_factory=list)
+    resume_checkpoint_ref: str | None = None
+    worker_branch_refs: list[str] = Field(default_factory=list)
+    verifier_review_ref: str | None = None
+    browser_step_refs: list[str] = Field(default_factory=list)
     context_pressure_ref: str | None = None
     hook_trace_ref: str | None = None
     semantic_graph_ref: str | None = None
@@ -621,16 +604,6 @@ class RunRecord(StrictModel):
     rolled_back_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _drop_legacy_agent_reports(cls, value: Any) -> Any:
-        if isinstance(value, dict):
-            value = dict(value)
-            value.pop("fix_" + "attempts", None)
-            value.pop("scope_" + "expansions", None)
-        return value
-
 
 class CreateRunRequest(StrictModel):
     prompt: str
