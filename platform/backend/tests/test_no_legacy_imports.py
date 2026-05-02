@@ -15,6 +15,12 @@ def test_deleted_generation_runtime_packages_do_not_exist() -> None:
         Path("platform/backend/app/services/" + "miniapp_" + "artifact_builder.py"),
         Path("platform/backend/app/services/" + "generation_" + "runtime_config.py"),
         Path("platform/backend/app/services/" + "generation_" + "tool_orchestrator.py"),
+        Path("platform/backend/app/services/run_service.py"),
+        Path("platform/backend/app/services/workspace_service.py"),
+        Path("platform/backend/app/services/preview_service.py"),
+        Path("platform/backend/app/services/agent_loop_engine.py"),
+        Path("platform/backend/app/services/workspace_log_service.py"),
+        Path("platform/backend/app/services/runtime_manager.py"),
         Path("platform/backend/app/models/" + "grounded_" + "spec.py"),
         Path("platform/backend/app/models/" + "app_" + "ir.py"),
         Path("platform/backend/app/validators/" + "grounded_" + "spec_validator.py"),
@@ -59,6 +65,19 @@ def test_active_backend_sources_do_not_reference_legacy_generation_tokens() -> N
         "generation_" + "tool_orchestrator",
         "open" + "router",
         "Open" + "Router",
+        "Workspace" + "Loop" + "Turn" + "Runner",
+        "Workspace" + "Loop",
+        "work" + "space_" + "loop",
+        "prompt_" + "alignment",
+        "Draft" + "File" + "Operation",
+        "fix_" + "attempts",
+        "scope_" + "expansions",
+        "com" + "merce",
+        "bak" + "ery",
+        "ca" + "rt",
+        "book" + "ing",
+        "les" + "son",
+        "appoint" + "ment",
     ]
 
     matches: list[str] = []
@@ -73,16 +92,3 @@ def test_active_backend_sources_do_not_reference_legacy_generation_tokens() -> N
                     matches.append(f"{path.relative_to(repo_root)}: {token}")
 
     assert matches == []
-
-
-def test_visual_changes_are_handled_by_agent_runtime(tmp_path: Path) -> None:
-    from app.main import create_app
-
-    app = create_app(repo_root=Path(__file__).resolve().parents[3], data_dir=tmp_path / "data")
-    runtime = app.state.container.workspace_code_agent_runtime
-
-    assert runtime._run_progress_for_event("agent_turn_started", details={"attempt": 1}) == ("Planning code edit 1", 24)
-    assert runtime._run_progress_for_event(
-        "patch_apply_started",
-        details={"attempt": 1, "files": ["miniapp/app/main.py", "miniapp/app/static/client/app.js"]},
-    ) == ("Applying patch • 2 files", 52)

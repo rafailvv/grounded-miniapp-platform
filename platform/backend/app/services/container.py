@@ -13,7 +13,7 @@ from app.services.engine import (
     ContextBudgetManager,
     PromptStateManager,
 )
-from app.modules.miniapp_agent_loop.engine import WorkspaceLoopEngine
+from app.modules.miniapp_agent_loop.engine import AgentLoopEngine
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.services.patch_service import PatchService
 from app.services.workspace.preview_service import PreviewService
@@ -45,7 +45,7 @@ class ServiceContainer:
             self.runtime_manager,
             self.workspace_log_service,
         )
-        self.workspace_loop_engine = WorkspaceLoopEngine(
+        self.agent_loop_engine = AgentLoopEngine(
             self.store,
             self.workspace_service,
             self.workspace_log_service,
@@ -69,7 +69,7 @@ class ServiceContainer:
             runtime_manager=self.runtime_manager,
             openai_client=self.openai_client,
             workspace_log_service=self.workspace_log_service,
-            workspace_loop_engine=self.workspace_loop_engine,
+            agent_loop_engine=self.agent_loop_engine,
             context_pack_builder=self.context_pack_builder,
         )
         self.run_service = RunService(

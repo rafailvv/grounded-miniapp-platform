@@ -95,8 +95,6 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
     check_results = container.workspace_code_agent_runtime.current_report(workspace_id, "check_results")
     trace = container.workspace_code_agent_runtime.current_report(workspace_id, "trace")
     fix_case = container.workspace_code_agent_runtime.current_report(workspace_id, "fix_case")
-    fix_attempts = container.workspace_code_agent_runtime.current_report(workspace_id, "fix_attempts")
-    scope_expansions = container.workspace_code_agent_runtime.current_report(workspace_id, "scope_expansions")
     fix_runtime = container.workspace_code_agent_runtime.current_report(workspace_id, "fix_runtime")
 
     return {
@@ -123,8 +121,6 @@ def get_workspace_logs(workspace_id: str, container: ServiceContainer = Depends(
             "candidate_diff": candidate_diff,
             "check_results": check_results,
             "fix_case": fix_case,
-            "fix_attempts": fix_attempts,
-            "scope_expansions": scope_expansions,
             "fix_runtime": fix_runtime,
         },
     }

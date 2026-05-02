@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.services.runtime_manager import PreviewRuntimeManager
+from app.services.workspace.runtime_manager import PreviewRuntimeManager
 
 
 _PREVIEW_PROJECT_PREFIX = "grounded_preview_"

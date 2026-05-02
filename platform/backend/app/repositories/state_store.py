@@ -24,10 +24,39 @@ class StateStore:
         "iterations:",
         "candidate_diff:",
         "trace:",
+        "agent_activity:",
         "agent_diagnostics:",
         "agent_quality:",
         "patch:",
         "tool_result:",
+        "tool_trace:",
+        "draft_patch_history:",
+        "large_tool_outputs:",
+        "browser_proof:",
+        "compaction_summaries:",
+        "acceptance_contract:",
+        "implementation_plan:",
+        "file_state_cache:",
+        "turn_diff:",
+        "environment_snapshot:",
+        "tool_batch_summaries:",
+        "worker_mailbox:",
+        "scratchpad:",
+        "agent_memory_store:",
+        "worker_drafts:",
+        "worker_merge:",
+        "trace_bundle:",
+        "trace_reducer:",
+        "command_policy:",
+        "verification_report:",
+        "rollout_trace:",
+        "exec_trace:",
+        "process_outputs:",
+        "context_pressure:",
+        "hook_trace:",
+        "semantic_graph:",
+        "worker_prefix:",
+        "replay_trace:",
     )
 
     @staticmethod
@@ -504,12 +533,15 @@ class StateStore:
         if not isinstance(snapshot, dict):
             return False
         changed = False
+        legacy_prompt_gate = StateStore._historical_runtime_value("prompt", "_alignment", "_valid")
+        if legacy_prompt_gate in snapshot:
+            snapshot.pop(legacy_prompt_gate, None)
+            changed = True
         legacy_spec = snapshot.pop(StateStore._historical_runtime_value("grounded", "_spec", "_valid"), None)
         legacy_ir = snapshot.pop(StateStore._historical_runtime_value("app", "_ir", "_valid"), None)
         if legacy_spec is not None or legacy_ir is not None:
             inferred_valid = bool(legacy_spec) or bool(legacy_ir)
             snapshot.setdefault("platform_valid", inferred_valid)
-            snapshot.setdefault("prompt_alignment_valid", inferred_valid)
             snapshot.setdefault("checks_valid", inferred_valid)
             changed = True
         if "checks_valid" not in snapshot:
@@ -517,9 +549,6 @@ class StateStore:
             changed = True
         if "platform_valid" not in snapshot:
             snapshot["platform_valid"] = bool(snapshot.get("checks_valid"))
-            changed = True
-        if "prompt_alignment_valid" not in snapshot:
-            snapshot["prompt_alignment_valid"] = bool(snapshot.get("checks_valid"))
             changed = True
         payload["validation_snapshot"] = snapshot
         return changed

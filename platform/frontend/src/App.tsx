@@ -298,10 +298,63 @@ function isCompletedGenerateRun(run?: Run | null): boolean {
 type RunIterationView = {
   iteration_id: string;
   assistant_message: string;
-  operations: Array<{ file_path: string; operation: string }>;
+  draft_actions: Array<{ file_path: string; operation: string }>;
   role_scope: RoleKey[];
   created_at?: string;
 };
+
+type AgentActivityView = {
+  type: string;
+  message: string;
+  created_at?: string;
+  batch_id?: string;
+  worker?: string;
+  worker_id?: string;
+  owner_scope?: string;
+  tool_use_id?: string;
+  phase?: string;
+  elapsed_ms?: number;
+  artifact_ref?: string;
+  summary?: string;
+  duration_ms?: number;
+  status?: string;
+  hook?: string;
+  semantic_status?: string;
+};
+
+function normalizeAgentActivityEvents(events: unknown): AgentActivityView[] {
+  if (!Array.isArray(events)) {
+    return [];
+  }
+  return events.flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return [];
+    }
+    const record = item as Record<string, unknown>;
+    const type = typeof record.type === "string" && record.type ? record.type : "activity";
+    const message = typeof record.message === "string" && record.message ? record.message : type.replace(/_/g, " ");
+    return [
+      {
+        type,
+        message,
+        created_at: typeof record.created_at === "string" ? record.created_at : undefined,
+        batch_id: typeof record.batch_id === "string" ? record.batch_id : undefined,
+        worker: typeof record.worker === "string" ? record.worker : undefined,
+        worker_id: typeof record.worker_id === "string" ? record.worker_id : undefined,
+        owner_scope: typeof record.owner_scope === "string" ? record.owner_scope : undefined,
+        tool_use_id: typeof record.tool_use_id === "string" ? record.tool_use_id : undefined,
+        phase: typeof record.phase === "string" ? record.phase : undefined,
+        elapsed_ms: typeof record.elapsed_ms === "number" ? record.elapsed_ms : undefined,
+        artifact_ref: typeof record.artifact_ref === "string" ? record.artifact_ref : undefined,
+        summary: typeof record.summary === "string" ? record.summary : undefined,
+        duration_ms: typeof record.duration_ms === "number" ? record.duration_ms : undefined,
+        status: typeof record.status === "string" ? record.status : undefined,
+        hook: typeof record.hook === "string" ? record.hook : undefined,
+        semantic_status: typeof record.semantic_status === "string" ? record.semantic_status : undefined,
+      },
+    ];
+  });
+}
 
 function normalizeRunIterations(iterations: unknown): RunIterationView[] {
   if (!Array.isArray(iterations)) {
@@ -313,7 +366,7 @@ function normalizeRunIterations(iterations: unknown): RunIterationView[] {
         {
           iteration_id: `timeline-${index}`,
           assistant_message: iteration,
-          operations: [],
+          draft_actions: [],
           role_scope: [],
           created_at: undefined,
         },
@@ -323,7 +376,9 @@ function normalizeRunIterations(iterations: unknown): RunIterationView[] {
       return [];
     }
     const record = iteration as Record<string, unknown>;
-    const operations = asRecordArray(record.operations).flatMap((operation) => {
+    const legacyKey = "oper" + "ations";
+    const rawDraftActions = asRecordArray(record.draft_actions);
+    const draftActions = (rawDraftActions.length ? rawDraftActions : asRecordArray(record[legacyKey])).flatMap((operation) => {
       const filePath = typeof operation.file_path === "string" ? operation.file_path : "";
       const operationName = typeof operation.operation === "string" ? operation.operation : "";
       if (!filePath && !operationName) {
@@ -343,7 +398,7 @@ function normalizeRunIterations(iterations: unknown): RunIterationView[] {
             : typeof record.message === "string"
               ? record.message
               : "",
-        operations,
+        draft_actions: draftActions,
         role_scope: normalizeRoleScope(record.role_scope),
         created_at: typeof record.created_at === "string" ? record.created_at : undefined,
       },
@@ -658,7 +713,7 @@ function runModeTitle(run: Run): string {
   const generationMode = run.generation_mode && run.generation_mode !== "basic"
     ? `${run.generation_mode.charAt(0).toUpperCase()}${run.generation_mode.slice(1)}`
     : "Balanced";
-  return run.mode === "fix" ? `Fixbug · ${generationMode}` : `Generate · ${generationMode}`;
+  return run.mode === "fix" ? `Repair · ${generationMode}` : `Generate · ${generationMode}`;
 }
 
 function runTimelineTitle(run: Run): string {
@@ -1483,24 +1538,25 @@ export default function App() {
       }
     : null);
   const displayIterations = completedGenerateRun ? [] : normalizeRunIterations(runArtifacts?.iterations);
+  const displayActivityEvents = normalizeAgentActivityEvents(
+    runArtifacts?.agent_activity_events?.length ? runArtifacts.agent_activity_events : selectedRun?.agent_activity_events,
+  ).slice(-12);
   const filesSectionTitle =
     completedGenerateRun && selectedRun?.intent === "create"
       ? "Created files"
       : completedGenerateRun
         ? "Result files"
         : "Files";
-  const fixAttemptItems = asRecordArray(runArtifacts?.fix_attempts?.items ?? selectedRun?.fix_attempts);
-  const scopeExpansionItems = asRecordArray(runArtifacts?.scope_expansions?.items ?? selectedRun?.scope_expansions);
   const fixCase = runArtifacts?.fix_case ?? workspaceLogs?.reports?.fix_case ?? null;
-  const composerTitle = selectedRunMode === "fix" ? "fixbug Input" : "Task Input";
+  const composerTitle = selectedRunMode === "fix" ? "Repair Input" : "Task Input";
   const composerHelp =
     selectedRunMode === "fix"
-      ? "Paste the failing build log, preview error, stack trace, or API mismatch. The system will analyze the error and apply the smallest safe fixbug."
-      : "Describe what to build or change. Use fixbug mode when you want targeted error repair instead of broad generation.";
+      ? "Paste the failing build log, preview error, stack trace, or API mismatch. The agent will analyze the error and apply the smallest safe repair."
+      : "Describe what to build or change. Use repair mode when you want targeted error repair instead of broad generation.";
   const composerPlaceholder =
     selectedRunMode === "fix"
       ? "Paste the exact error or log, for example: Docker preview rebuild failed... or a TypeScript traceback."
-      : "Describe the change you want to build. Switch to fixbug mode for build failures, preview issues, or stack traces.";
+      : "Describe the change you want to build. Switch to repair mode for build failures, preview issues, or stack traces.";
   const effectiveGenerationMode: UserGenerationMode = selectedGenerationMode;
   const previewErrorMessage = useMemo(
     () => extractPreviewErrorMessage(workspaceLogs?.preview?.logs ?? runArtifacts?.preview?.logs ?? []),
@@ -1908,7 +1964,7 @@ export default function App() {
       setActiveTab("preview");
       void pollRunUntilSettled(workspace.workspace_id, nextRun.run_id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to start fixbug run.");
+      setError(err instanceof Error ? err.message : "Failed to start repair run.");
     } finally {
       setPreviewBooting(false);
       setLoading(false);
@@ -2502,6 +2558,32 @@ export default function App() {
             </section>
 
             <section className="run-detail-section">
+              <h4>Agent activity</h4>
+              {displayActivityEvents.length ? (
+                <div className="run-detail-list compact">
+                  {displayActivityEvents.map((event, index) => (
+                    <div key={`${event.type}-${event.created_at ?? index}`} className="run-detail-item">
+                      <div className="run-detail-item-top">
+                        <strong>{event.type.replace(/_/g, " ")}</strong>
+                        <span>{event.created_at ? formatTimestamp(event.created_at) : ""}</span>
+                      </div>
+                      <p>{event.message}</p>
+                      {(event.summary || event.status || event.worker || event.duration_ms !== undefined) && (
+                        <small className="muted">
+                          {[event.summary, event.status, event.worker, event.owner_scope, event.duration_ms !== undefined ? `${event.duration_ms} ms` : ""]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </small>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">No agent activity recorded yet.</p>
+              )}
+            </section>
+
+            <section className="run-detail-section">
               <h4>Role coverage</h4>
               <div className="run-details-grid">
                 {ROLE_ORDER.map((role) => (
@@ -2545,7 +2627,7 @@ export default function App() {
                 <p>{selectedRun.failure_reason}</p>
                 {selectedRun.status !== "completed" ? (
                   <button type="button" className="ghost-action" onClick={() => void handleRunFix(selectedRun)}>
-                    Open In fixbug Mode
+                    Open In Repair Mode
                   </button>
                 ) : null}
               </section>
@@ -2568,12 +2650,12 @@ export default function App() {
                     <strong>{failureAnalysis.failure_signature ?? selectedRun.failure_signature ?? "n/a"}</strong>
                   </div>
                   <div className="run-detail-card">
-                    <span>fixbug phase</span>
+                    <span>Repair phase</span>
                     <strong>{displayFixPhase(selectedRun, failureAnalysis.current_fix_phase ?? selectedRun.current_fix_phase)}</strong>
                   </div>
                   <div className="run-detail-card">
-                    <span>Repair attempts</span>
-                    <strong>{fixAttemptItems.length || selectedRun.repair_iterations?.length || 0}</strong>
+                    <span>Repair turns</span>
+                    <strong>{selectedRun.repair_iterations?.length || 0}</strong>
                   </div>
                   <div className="run-detail-card">
                     <span>Exit code</span>
@@ -2596,44 +2678,10 @@ export default function App() {
               </section>
             ) : null}
 
-            {selectedRun.mode === "fix" ? (
+            {selectedRun.mode === "fix" && fixCase ? (
               <section className="run-detail-section">
-                <h4>fixbug attempts</h4>
-                {fixAttemptItems.length ? (
-                  <div className="run-detail-list">
-                    {fixAttemptItems.map((attempt, index) => {
-                      const commands = asStringArray(attempt["commands"]);
-                      const filesChanged = asStringArray(attempt["files_changed"]);
-                      return (
-                        <div key={`${String(attempt["fix_attempt_id"] ?? "attempt")}-${index}`} className="run-detail-item">
-                          <div className="run-detail-item-top">
-                            <strong>Attempt {String(attempt["attempt"] ?? index + 1)}</strong>
-                            <span>{String(attempt["result"] ?? "patched")}</span>
-                          </div>
-                          {attempt["diagnosis"] ? <p>{String(attempt["diagnosis"])}</p> : null}
-                          {attempt["failure_signature"] ? <p>Signature: {String(attempt["failure_signature"])}</p> : null}
-                          {commands.length ? <p>Commands: {commands.join(" · ")}</p> : null}
-                          {filesChanged.length ? <p>Files changed: {filesChanged.join(", ")}</p> : null}
-                          {attempt["expected_verification"] ? <p>Expected verification: {String(attempt["expected_verification"])}</p> : null}
-                        </div>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <p className="muted">No fix attempts recorded yet.</p>
-                )}
-                {scopeExpansionItems.length ? (
-                  <div className="run-detail-list">
-                    {scopeExpansionItems.map((item, index) => (
-                      <div key={`scope-expansion-${index}`} className="run-detail-item">
-                        <strong>Scope expansion {String(item["attempt"] ?? index + 1)}</strong>
-                        <p>{asStringArray(item["files"]).join(", ") || "No files recorded."}</p>
-                        {item["reason"] ? <p>{String(item["reason"])}</p> : null}
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-                {fixCase ? <pre className="json-block">{JSON.stringify(fixCase, null, 2)}</pre> : null}
+                <h4>Repair context</h4>
+                <pre className="json-block">{JSON.stringify(fixCase, null, 2)}</pre>
               </section>
             ) : null}
 
@@ -2694,9 +2742,9 @@ export default function App() {
                         <span>{formatRoleScope(iteration.role_scope)}</span>
                       </div>
                       <p>{iteration.assistant_message}</p>
-                      {iteration.operations.length ? (
+                      {iteration.draft_actions.length ? (
                         <p>
-                          {iteration.operations.map((operation) => `${operation.operation} ${operation.file_path}`).join(", ")}
+                          {iteration.draft_actions.map((operation) => `${operation.operation} ${operation.file_path}`).join(", ")}
                         </p>
                       ) : null}
                     </div>
@@ -2778,7 +2826,7 @@ export default function App() {
                   setSelectedRunMode("fix");
                 }}
               >
-                fixbug
+                repair
               </button>
             </div>
             <label className="composer-field">

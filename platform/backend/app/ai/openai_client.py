@@ -765,7 +765,7 @@ class OpenAIClient:
         last_error: Exception | None = None
         provider_label = "OpenAI"
         base_url = self.openai_base_url.rstrip("/")
-        for attempt in range(1, self.retry_policy.max_attempts + 1):
+        for attempt in range(1, self.retry_policy.max_provider_attempts + 1):
             try:
                 started = time.perf_counter()
                 with httpx.Client(

@@ -617,11 +617,41 @@ class RunService:
             run.token_usage = self._richer_token_usage(run.token_usage, existing_usage)
             if not run.linked_job_id and existing.get("linked_job_id"):
                 run.linked_job_id = str(existing.get("linked_job_id") or "")
-            for attr in ("orchestration_phases", "worker_summaries", "repair_issue_signatures"):
+            for attr in ("orchestration_phases", "worker_summaries", "repair_issue_signatures", "agent_activity_events"):
                 if not getattr(run, attr, None) and isinstance(existing.get(attr), list):
                     setattr(run, attr, list(existing.get(attr) or []))
             for attr in (
+                "tool_trace_ref",
+                "draft_patch_history_ref",
+                "browser_proof_ref",
+                "large_tool_outputs_ref",
+                "file_state_cache_ref",
+                "turn_diff_ref",
+                "environment_snapshot_ref",
+                "tool_batch_summaries_ref",
+                "worker_mailbox_ref",
+                "scratchpad_ref",
+                "memory_ref",
+                "worker_drafts_ref",
+                "worker_merge_ref",
+                "trace_bundle_ref",
+                "trace_reducer_ref",
+                "command_policy_ref",
+                "verification_report_ref",
+                "rollout_trace_ref",
+                "exec_trace_ref",
+                "process_outputs_ref",
+                "context_pressure_ref",
+                "hook_trace_ref",
+                "semantic_graph_ref",
+                "worker_prefix_ref",
+                "replay_trace_ref",
+            ):
+                if not getattr(run, attr, None) and existing.get(attr):
+                    setattr(run, attr, str(existing.get(attr) or ""))
+            for attr in (
                 "implementation_plan",
+                "agent_memory",
                 "acceptance_contract",
                 "flow_coverage",
                 "browser_flow_proof",
@@ -734,12 +764,43 @@ class RunService:
                 if specific and specific != run.failure_reason:
                     run.failure_reason = specific
                     changed = True
-            for attr in ("orchestration_phases", "worker_summaries", "repair_issue_signatures"):
+            for attr in ("orchestration_phases", "worker_summaries", "repair_issue_signatures", "agent_activity_events"):
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, list(getattr(job, attr) or []))
                     changed = True
             for attr in (
+                "tool_trace_ref",
+                "draft_patch_history_ref",
+                "browser_proof_ref",
+                "large_tool_outputs_ref",
+                "file_state_cache_ref",
+                "turn_diff_ref",
+                "environment_snapshot_ref",
+                "tool_batch_summaries_ref",
+                "worker_mailbox_ref",
+                "scratchpad_ref",
+                "memory_ref",
+                "worker_drafts_ref",
+                "worker_merge_ref",
+                "trace_bundle_ref",
+                "trace_reducer_ref",
+                "command_policy_ref",
+                "verification_report_ref",
+                "rollout_trace_ref",
+                "exec_trace_ref",
+                "process_outputs_ref",
+                "context_pressure_ref",
+                "hook_trace_ref",
+                "semantic_graph_ref",
+                "worker_prefix_ref",
+                "replay_trace_ref",
+            ):
+                if not getattr(run, attr, None) and getattr(job, attr, None):
+                    setattr(run, attr, str(getattr(job, attr) or ""))
+                    changed = True
+            for attr in (
                 "implementation_plan",
+                "agent_memory",
                 "acceptance_contract",
                 "flow_coverage",
                 "browser_flow_proof",
@@ -790,9 +851,9 @@ class RunService:
     def _is_generic_failure_reason(reason: str | None) -> bool:
         text = str(reason or "").strip().lower()
         return not text or text.startswith("missing create coverage:") or text in {
-            "workspace loop exhausted its retry budget without reaching a usable state.",
+            "workspace code agent exhausted its completion budget without reaching a usable state.",
             "workspace code agent failed.",
-            "parallel build did not produce a complete patch.",
+            "agent loop did not produce a complete patch.",
         }
 
     @staticmethod
@@ -960,6 +1021,33 @@ class RunService:
             )
             run.orchestration_phases = list(getattr(job, "orchestration_phases", []) or run.orchestration_phases)
             run.implementation_plan = dict(getattr(job, "implementation_plan", {}) or run.implementation_plan)
+            run.agent_activity_events = list(getattr(job, "agent_activity_events", []) or run.agent_activity_events)
+            run.agent_memory = dict(getattr(job, "agent_memory", {}) or run.agent_memory)
+            run.tool_trace_ref = getattr(job, "tool_trace_ref", None) or run.tool_trace_ref
+            run.draft_patch_history_ref = getattr(job, "draft_patch_history_ref", None) or run.draft_patch_history_ref
+            run.browser_proof_ref = getattr(job, "browser_proof_ref", None) or run.browser_proof_ref
+            run.large_tool_outputs_ref = getattr(job, "large_tool_outputs_ref", None) or run.large_tool_outputs_ref
+            run.file_state_cache_ref = getattr(job, "file_state_cache_ref", None) or run.file_state_cache_ref
+            run.turn_diff_ref = getattr(job, "turn_diff_ref", None) or run.turn_diff_ref
+            run.environment_snapshot_ref = getattr(job, "environment_snapshot_ref", None) or run.environment_snapshot_ref
+            run.tool_batch_summaries_ref = getattr(job, "tool_batch_summaries_ref", None) or run.tool_batch_summaries_ref
+            run.worker_mailbox_ref = getattr(job, "worker_mailbox_ref", None) or run.worker_mailbox_ref
+            run.scratchpad_ref = getattr(job, "scratchpad_ref", None) or run.scratchpad_ref
+            run.memory_ref = getattr(job, "memory_ref", None) or run.memory_ref
+            run.worker_drafts_ref = getattr(job, "worker_drafts_ref", None) or run.worker_drafts_ref
+            run.worker_merge_ref = getattr(job, "worker_merge_ref", None) or run.worker_merge_ref
+            run.trace_bundle_ref = getattr(job, "trace_bundle_ref", None) or run.trace_bundle_ref
+            run.trace_reducer_ref = getattr(job, "trace_reducer_ref", None) or run.trace_reducer_ref
+            run.command_policy_ref = getattr(job, "command_policy_ref", None) or run.command_policy_ref
+            run.verification_report_ref = getattr(job, "verification_report_ref", None) or run.verification_report_ref
+            run.rollout_trace_ref = getattr(job, "rollout_trace_ref", None) or run.rollout_trace_ref
+            run.exec_trace_ref = getattr(job, "exec_trace_ref", None) or run.exec_trace_ref
+            run.process_outputs_ref = getattr(job, "process_outputs_ref", None) or run.process_outputs_ref
+            run.context_pressure_ref = getattr(job, "context_pressure_ref", None) or run.context_pressure_ref
+            run.hook_trace_ref = getattr(job, "hook_trace_ref", None) or run.hook_trace_ref
+            run.semantic_graph_ref = getattr(job, "semantic_graph_ref", None) or run.semantic_graph_ref
+            run.worker_prefix_ref = getattr(job, "worker_prefix_ref", None) or run.worker_prefix_ref
+            run.replay_trace_ref = getattr(job, "replay_trace_ref", None) or run.replay_trace_ref
             run.acceptance_contract = dict(getattr(job, "acceptance_contract", {}) or run.acceptance_contract)
             run.worker_summaries = list(getattr(job, "worker_summaries", []) or run.worker_summaries)
             run.flow_coverage = dict(getattr(job, "flow_coverage", {}) or run.flow_coverage)
@@ -969,8 +1057,6 @@ class RunService:
             run.completion_budget = dict(getattr(job, "completion_budget", {}) or run.completion_budget)
             run.budget_status = dict(getattr(job, "budget_status", {}) or run.budget_status)
             run.repair_iterations = list(job.repair_iterations)
-            run.fix_attempts = list(job.fix_attempts)
-            run.scope_expansions = list(job.scope_expansions)
             run.apply_result = dict(job.apply_result or {})
             run.retrieval_stats = dict(job.retrieval_stats)
             run.cache_stats = dict(job.cache_stats)
@@ -1433,10 +1519,51 @@ class RunService:
             "neutral_template_findings": run.neutral_template_findings,
             "orchestration_phases": run.orchestration_phases,
             "implementation_plan": run.implementation_plan,
+            "agent_activity_events": run.agent_activity_events,
+            "agent_memory": run.agent_memory,
             "acceptance_contract": run.acceptance_contract,
             "worker_summaries": run.worker_summaries,
             "flow_coverage": run.flow_coverage,
             "browser_flow_proof": run.browser_flow_proof,
+            "tool_trace_ref": run.tool_trace_ref,
+            "draft_patch_history_ref": run.draft_patch_history_ref,
+            "browser_proof_ref": run.browser_proof_ref,
+            "large_tool_outputs_ref": run.large_tool_outputs_ref,
+            "file_state_cache_ref": run.file_state_cache_ref,
+            "turn_diff_ref": run.turn_diff_ref,
+            "environment_snapshot_ref": run.environment_snapshot_ref,
+            "tool_batch_summaries_ref": run.tool_batch_summaries_ref,
+            "worker_mailbox_ref": run.worker_mailbox_ref,
+            "scratchpad_ref": run.scratchpad_ref,
+            "memory_ref": run.memory_ref,
+            "worker_drafts_ref": run.worker_drafts_ref,
+            "worker_merge_ref": run.worker_merge_ref,
+            "trace_bundle_ref": run.trace_bundle_ref,
+            "trace_reducer_ref": run.trace_reducer_ref,
+            "command_policy_ref": run.command_policy_ref,
+            "verification_report_ref": run.verification_report_ref,
+            "rollout_trace_ref": run.rollout_trace_ref,
+            "exec_trace_ref": run.exec_trace_ref,
+            "process_outputs_ref": run.process_outputs_ref,
+            "context_pressure_ref": run.context_pressure_ref,
+            "hook_trace_ref": run.hook_trace_ref,
+            "semantic_graph_ref": run.semantic_graph_ref,
+            "worker_prefix_ref": run.worker_prefix_ref,
+            "replay_trace_ref": run.replay_trace_ref,
+            "process_outputs": self.store.get("reports", run.process_outputs_ref) if run.process_outputs_ref else None,
+            "context_pressure": self.store.get("reports", run.context_pressure_ref) if run.context_pressure_ref else None,
+            "hook_trace": self.store.get("reports", run.hook_trace_ref) if run.hook_trace_ref else None,
+            "semantic_graph": self.store.get("reports", run.semantic_graph_ref) if run.semantic_graph_ref else None,
+            "replay_trace": self.store.get("reports", run.replay_trace_ref) if run.replay_trace_ref else None,
+            "todo_plan": ((self.store.get("reports", run.scratchpad_ref) or {}).get("files") or {}).get("plan.md") if run.scratchpad_ref else None,
+            "worker_results": {
+                "drafts": self.store.get("reports", run.worker_drafts_ref) if run.worker_drafts_ref else None,
+                "merge": self.store.get("reports", run.worker_merge_ref) if run.worker_merge_ref else None,
+            },
+            "merge_conflicts": (self.store.get("reports", run.worker_merge_ref) or {}).get("merge_reports", []) if run.worker_merge_ref else [],
+            "compact_boundaries": (self.store.get("reports", run.scratchpad_ref) or {}).get("compact_boundaries", []) if run.scratchpad_ref else [],
+            "command_policy_decisions": (self.store.get("reports", run.command_policy_ref) or {}).get("examples", []) if run.command_policy_ref else [],
+            "browser_proof_steps": (run.browser_flow_proof or {}).get("steps", []),
             "repair_issue_signatures": run.repair_issue_signatures,
             "mobile_layout_report": run.mobile_layout_report,
             "preview": preview_payload,
@@ -1929,7 +2056,9 @@ class RunService:
 
     @staticmethod
     def _is_meaningful_source_path(file_path: str) -> bool:
-        normalized = file_path.strip().lstrip("./")
+        normalized = str(file_path or "").strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
         if not normalized:
             return False
         path = PurePosixPath(normalized)
@@ -1964,10 +2093,13 @@ class RunService:
         for iteration in iterations:
             if not isinstance(iteration, dict):
                 continue
-            operations = iteration.get("operations")
-            if not isinstance(operations, list):
+            legacy_key = "oper" + "ations"
+            draft_actions = iteration.get("draft_actions")
+            if not isinstance(draft_actions, list):
+                draft_actions = iteration.get(legacy_key)
+            if not isinstance(draft_actions, list):
                 continue
-            for operation in operations:
+            for operation in draft_actions:
                 if not isinstance(operation, dict):
                     continue
                 file_path = operation.get("file_path")

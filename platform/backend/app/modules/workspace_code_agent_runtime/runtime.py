@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextvars import copy_context
 from datetime import datetime, timezone
 import difflib
 import hashlib
@@ -18,8 +16,7 @@ from app.models.artifacts import ValidationIssue
 from app.models.common import GenerationMode
 from app.models.domain import (
     CheckExecutionRecord,
-    DraftFileOperation,
-    FixAttemptRecord,
+    DraftAction,
     GenerateRequest,
     JobEvent,
     JobRecord,
@@ -27,16 +24,36 @@ from app.models.domain import (
     RunCheckResult,
     ValidationSnapshot,
 )
-from app.modules.miniapp_agent_loop.engine import WorkspaceLoopEngine
+from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
+from app.modules.miniapp_agent_loop.agent_command_policy import command_policy_snapshot
+from app.modules.miniapp_agent_loop.agent_coordinator import AgentCoordinator
+from app.modules.miniapp_agent_loop.agent_hooks import AgentHookManager
+from app.modules.miniapp_agent_loop.engine import AgentLoopEngine
+from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
+from app.modules.miniapp_agent_loop.agent_worker_runtime import AgentWorkerRuntime
+from app.modules.miniapp_agent_loop.agent_kernel import compact_agent_memory
+from app.modules.miniapp_agent_loop.agent_memory_store import AgentMemoryStore
+from app.modules.miniapp_agent_loop.agent_scratchpad import AgentScratchpad
+from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
+from app.modules.miniapp_agent_loop.context_pressure import AgentContextPressureAnalyzer
+from app.modules.miniapp_agent_loop.environment_snapshot import AgentEnvironmentSnapshot
+from app.modules.miniapp_agent_loop.rollout_trace import RolloutTraceRecorder
+from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.tool_agent_runtime import (
-    list_workspace_files,
     normalize_tool_requests,
-    run_workspace_command,
-    search_workspace_files,
-    summarize_read_file_payloads,
     truncate_tool_text,
+    validate_workspace_command,
 )
-from app.modules.miniapp_agent_loop.types import WorkspaceLoopCallbacks, WorkspaceLoopResult, WorkspaceLoopTurnPlan
+from app.modules.miniapp_agent_loop.types import AgentLoopCallbacks, AgentLoopResult, AgentTurnPlan
+from app.modules.miniapp_agent_loop.turn_diff_tracker import AgentTurnDiffTracker
+from app.modules.miniapp_agent_loop.verification_worker import VerificationWorker
+from app.modules.workspace_code_agent_runtime.budget import (
+    completion_budget_for_mode,
+    completion_budget_status,
+    token_usage_total,
+)
+from app.modules.workspace_code_agent_runtime.prompt_contract import agent_system_prompt
+from app.modules.workspace_code_agent_runtime.tool_executor import AgentToolExecutor
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
 from app.services.platform_shell import BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
@@ -60,40 +77,11 @@ QUALITY_FIDELITY = {
     GenerationMode.BALANCED: "balanced_app",
     GenerationMode.BASIC: "basic_app",
 }
-AGENT_TURN_OPERATION_LIMIT = 20
-AGENTIC_WORKFLOW_OPERATION_LIMIT = 32
-FAST_PARALLEL_WORKER_COUNT = 5
-FAST_PARALLEL_WORKER_OPERATION_LIMIT = 5
-FAST_PARALLEL_WORKER_CONTENT_MAX_LENGTH = 14000
-FOCUSED_VISUAL_OPERATION_LIMIT = 4
+AGENT_TURN_DRAFT_ACTION_LIMIT = 20
+AGENTIC_WORKFLOW_DRAFT_ACTION_LIMIT = 32
+FOCUSED_VISUAL_DRAFT_ACTION_LIMIT = 4
 FOCUSED_VISUAL_CONTENT_MAX_LENGTH = 12000
 TOOL_RESULT_SPILL_THRESHOLD_CHARS = 6000
-COMPLETION_BUDGETS = {
-    GenerationMode.FAST: {
-        "time_limit_ms": 18 * 60 * 1000,
-        "token_limit": 600_000,
-        "safety_turn_cap": 180,
-        "parallel_round_cap": 10,
-    },
-    GenerationMode.BALANCED: {
-        "time_limit_ms": 25 * 60 * 1000,
-        "token_limit": 1_200_000,
-        "safety_turn_cap": 300,
-        "parallel_round_cap": 14,
-    },
-    GenerationMode.QUALITY: {
-        "time_limit_ms": 45 * 60 * 1000,
-        "token_limit": 2_500_000,
-        "safety_turn_cap": 500,
-        "parallel_round_cap": 18,
-    },
-    GenerationMode.BASIC: {
-        "time_limit_ms": 18 * 60 * 1000,
-        "token_limit": 600_000,
-        "safety_turn_cap": 180,
-        "parallel_round_cap": 10,
-    },
-}
 PATCH_FIRST_EXISTING_FILE_CHAR_LIMIT = 2500
 PATCH_FIRST_EXISTING_FILE_LINE_LIMIT = 120
 FOCUSED_VISUAL_STYLE_MARKERS = (
@@ -201,7 +189,7 @@ READ_ONLY_WRITE_PREFIXES = (
     ".next/",
     ".vite/",
 )
-SEED_CONTEXT_PATHS = (
+INITIAL_CONTEXT_PATHS = (
     "miniapp/tests/test_generated_app.py",
     "miniapp/tests/generated_app.test.mjs",
     "README.md",
@@ -334,7 +322,7 @@ class WorkspaceCodeAgentRuntime:
         runtime_manager: PreviewRuntimeManager,
         openai_client: OpenAIClient,
         workspace_log_service: WorkspaceLogService,
-        workspace_loop_engine: WorkspaceLoopEngine,
+        agent_loop_engine: AgentLoopEngine,
         context_pack_builder: Any | None = None,
     ) -> None:
         self.store = store
@@ -344,7 +332,22 @@ class WorkspaceCodeAgentRuntime:
         self.runtime_manager = runtime_manager
         self.openai_client = openai_client
         self.workspace_log_service = workspace_log_service
-        self.workspace_loop_engine = workspace_loop_engine
+        self.agent_loop_engine = agent_loop_engine
+        self.file_state_cache = AgentFileStateCache()
+        self.turn_diff_tracker = AgentTurnDiffTracker()
+        self.worker_manager = AgentWorkerManager()
+        self.worker_runtime = AgentWorkerRuntime()
+        self.memory_store = AgentMemoryStore()
+        self.hook_manager = AgentHookManager()
+        self.context_pressure = AgentContextPressureAnalyzer()
+        self.rollout_trace = RolloutTraceRecorder()
+        self.tool_batch_summaries: dict[str, list[dict[str, object]]] = {}
+        self.context_pressure_history: dict[str, list[dict[str, Any]]] = {}
+        self.scratchpads: dict[str, AgentScratchpad] = {}
+        self.coordinators: dict[str, AgentCoordinator] = {}
+        self.environment_snapshots: dict[str, dict[str, object]] = {}
+        self.verification_reports: dict[str, dict[str, object]] = {}
+        self.tool_executor = AgentToolExecutor(workspace_service=workspace_service, file_state_cache=self.file_state_cache)
         self.context_pack_builder = context_pack_builder
 
     def get_job(self, job_id: str) -> JobRecord:
@@ -419,7 +422,7 @@ class WorkspaceCodeAgentRuntime:
             error_context=request.error_context,
             current_fix_phase="agent_loop",
             execution_class="shell_app",
-            completion_budget=self._completion_budget_for_mode(generation_mode),
+            completion_budget=completion_budget_for_mode(generation_mode),
         )
         self._clear_agent_reports(workspace_id)
         self._clear_trace(workspace_id)
@@ -440,18 +443,18 @@ class WorkspaceCodeAgentRuntime:
 
         draft_source = self._prepare_draft(workspace_id=workspace_id, run_id=run_id, request=request)
         self._store_report(
-            f"spec:{workspace_id}",
+            f"spec:{workspace_id}:{run_id}",
             {
                 "workspace_id": workspace_id,
                 "source": "user_prompt",
                 "prompt": request.prompt,
                 "runtime": "workspace_code_agent",
-            "domain_policy": "Prompt semantics are authoritative; no app category is assumed.",
+                "prompt_policy": "Prompt semantics are authoritative; no app category is assumed.",
             },
         )
         self._store_report(
-            f"execution_class:{workspace_id}",
-            {"workspace_id": workspace_id, "execution_class": "shell_app", "runtime": "workspace_code_agent"},
+            f"execution_class:{workspace_id}:{run_id}",
+            {"workspace_id": workspace_id, "run_id": run_id, "execution_class": "shell_app", "runtime": "workspace_code_agent"},
         )
 
         with self.openai_client.routing_context(model_profile=model_profile, generation_mode=generation_mode):
@@ -519,7 +522,7 @@ class WorkspaceCodeAgentRuntime:
                 paths.append(f"miniapp/app/static/{role}/styles.css")
         return list(dict.fromkeys(paths))
 
-    def _focused_visual_seed_context(self, workspace_id: str, run_id: str, *, role_scope: list[str]) -> dict[str, str]:
+    def _focused_visual_initial_context(self, workspace_id: str, run_id: str, *, role_scope: list[str]) -> dict[str, str]:
         contexts: dict[str, str] = {}
         for path in self._focused_visual_css_paths(role_scope):
             content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
@@ -563,18 +566,18 @@ class WorkspaceCodeAgentRuntime:
                     stabilized.append(html_path.relative_to(source_dir).as_posix())
         return list(dict.fromkeys(stabilized))
 
-    def _enforce_patch_first_operations(
+    def _enforce_patch_first_draft_actions(
         self,
-        operations: list[DraftFileOperation],
+        draft_actions: list[DraftAction],
         *,
         request: GenerateRequest,
         workspace_id: str,
         run_id: str,
-    ) -> list[DraftFileOperation]:
+    ) -> list[DraftAction]:
         if str(request.intent or "").strip().lower() == "create":
-            return list(operations)
-        normalized: list[DraftFileOperation] = []
-        for operation in operations:
+            return list(draft_actions)
+        normalized: list[DraftAction] = []
+        for operation in draft_actions:
             if operation.operation not in {"create", "replace"}:
                 normalized.append(operation)
                 continue
@@ -594,7 +597,7 @@ class WorkspaceCodeAgentRuntime:
                 normalized.append(operation)
                 continue
             normalized.append(
-                DraftFileOperation(
+                DraftAction(
                     operation_id=operation.operation_id,
                     file_path=operation.file_path,
                     operation="patch",
@@ -606,7 +609,7 @@ class WorkspaceCodeAgentRuntime:
         return normalized
 
     @staticmethod
-    def _patch_first_allows_full_replace(operation: DraftFileOperation, current_content: str) -> bool:
+    def _patch_first_allows_full_replace(operation: DraftAction, current_content: str) -> bool:
         reason = str(operation.reason or "").lower()
         if any(marker in reason for marker in ("apply conflict", "patch conflict", "hunk", "rejected", "precondition")):
             return True
@@ -687,7 +690,7 @@ class WorkspaceCodeAgentRuntime:
         generation_mode: GenerationMode,
         loop_started_at: float,
         should_stop: Callable[[], bool] | None,
-    ) -> WorkspaceLoopResult:
+    ) -> AgentLoopResult:
         focused_edit_kind = self._focused_edit_kind(request)
         focused_visual_edit = focused_edit_kind == "visual_style_edit"
         create_intent = str(request.intent or "").strip().lower() == "create"
@@ -717,9 +720,104 @@ class WorkspaceCodeAgentRuntime:
             "status": "planned" if acceptance_contract.get("required") else "not_required",
             "required_flows": [flow.get("id") for flow in acceptance_contract.get("flows", []) if isinstance(flow, dict)],
         }
+        artifact_run_id = run_id or job.job_id
+        self.tool_batch_summaries[artifact_run_id] = []
+        self.context_pressure_history[artifact_run_id] = []
+        coordinator = AgentCoordinator(run_id=artifact_run_id, generation_mode=generation_mode, implementation_plan=implementation_plan)
+        scratchpad = AgentScratchpad(run_id=artifact_run_id)
+        scratchpad.set_plan(implementation_plan, coordinator.snapshot().get("todo_plan", []))  # type: ignore[arg-type]
+        scratchpad.set_route_ui_manifest(
+            {
+                "roles": list(ROLE_ORDER),
+                "flows": list(acceptance_contract.get("flows") or []),
+                "api_contract": implementation_plan.get("api_contract") or {},
+                "ui_contract": implementation_plan.get("ui_contract") or {},
+            }
+        )
+        self.coordinators[artifact_run_id] = coordinator
+        self.scratchpads[artifact_run_id] = scratchpad
+        coordinator.start_phase("planning", "Implementation plan and role workflow contract prepared.")
+        self.rollout_trace.append(artifact_run_id, "plan", {"generation_mode": str(generation_mode), "intent": str(request.intent or "")})
+        job.scratchpad_ref = f"scratchpad:{workspace_id}:{artifact_run_id}"
+        job.command_policy_ref = f"command_policy:{workspace_id}:{artifact_run_id}"
+        job.context_pressure_ref = f"context_pressure:{workspace_id}:{artifact_run_id}"
+        job.hook_trace_ref = f"hook_trace:{workspace_id}:{artifact_run_id}"
+        job.semantic_graph_ref = f"semantic_graph:{workspace_id}:{artifact_run_id}"
+        job.worker_prefix_ref = f"worker_prefix:{workspace_id}:{artifact_run_id}"
+        self._store_report(job.scratchpad_ref, {"workspace_id": workspace_id, "run_id": run_id, **scratchpad.snapshot()})
+        self._store_report(job.command_policy_ref, {"workspace_id": workspace_id, "run_id": run_id, **command_policy_snapshot()})
+        self._store_report(job.context_pressure_ref, {"workspace_id": workspace_id, "run_id": run_id, "items": []})
+        self._store_report(job.hook_trace_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.hook_manager.snapshot(artifact_run_id)})
+        semantic_graph = semantic_scan(root=draft_source, targets=["miniapp/app", "miniapp/tests"])
+        self._store_report(job.semantic_graph_ref, {"workspace_id": workspace_id, "run_id": run_id, "graph": semantic_graph})
+        environment_snapshot = AgentEnvironmentSnapshot.capture(
+            draft_source=draft_source,
+            command_policy=validate_workspace_command,
+        )
+        self.environment_snapshots[artifact_run_id] = environment_snapshot
+        job.environment_snapshot_ref = f"environment_snapshot:{workspace_id}:{artifact_run_id}"
+        self._store_report(
+            job.environment_snapshot_ref,
+            {"workspace_id": workspace_id, "run_id": run_id, "snapshot": environment_snapshot},
+        )
+        worker_mailbox = self.worker_manager.mailbox_for_plan(
+            generation_mode=generation_mode,
+            implementation_plan=implementation_plan,
+        )
+        worker_prefix = self._worker_prefix_payload(
+            implementation_plan=implementation_plan,
+            acceptance_contract=acceptance_contract,
+            semantic_graph=semantic_graph,
+            current_diff_summary="",
+        )
+        self._store_report(
+            job.worker_prefix_ref,
+            {
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "prefix": worker_prefix,
+                "contract": "Balanced/Quality workers share this stable prefix; only owned task directive differs.",
+            },
+        )
+        job.worker_mailbox_ref = f"worker_mailbox:{workspace_id}:{artifact_run_id}"
+        self._store_report(
+            job.worker_mailbox_ref,
+            {"workspace_id": workspace_id, "run_id": run_id, "mailbox": worker_mailbox},
+        )
+        worker_drafts = self.worker_runtime.prepare(
+            run_id=artifact_run_id,
+            generation_mode=generation_mode,
+            draft_source=draft_source,
+            worker_specs=coordinator.worker_specs(),
+        )
+        job.worker_drafts_ref = f"worker_drafts:{workspace_id}:{artifact_run_id}"
+        job.worker_merge_ref = f"worker_merge:{workspace_id}:{artifact_run_id}"
+        self._store_report(job.worker_drafts_ref, {"workspace_id": workspace_id, "run_id": run_id, **worker_drafts})
+        self._store_report(job.worker_merge_ref, {"workspace_id": workspace_id, "run_id": run_id, "merge_reports": []})
+        if worker_drafts.get("enabled"):
+            for worker in worker_drafts.get("workers") or []:
+                if isinstance(worker, dict):
+                    self._append_event(
+                        job,
+                        "worker_started",
+                        f"Prepared isolated worker draft for {worker.get('worker_id')}.",
+                        {"worker_id": worker.get("worker_id"), "owner_scope": worker.get("owner_scope"), "artifact_ref": job.worker_drafts_ref},
+                    )
+        self._append_activity(
+            job,
+            "planning",
+            "Coordinator prepared todo plan and worker drafts.",
+            {
+                "phase": "planning",
+                "status": "completed",
+                "summary": "Plan, scratchpad, command policy, and worker draft metadata are ready.",
+                "artifact_ref": job.scratchpad_ref,
+            },
+            save=False,
+        )
         if acceptance_contract.get("required"):
             self._store_report(
-                f"acceptance_contract:{workspace_id}",
+                f"acceptance_contract:{workspace_id}:{run_id}",
                 {
                     "workspace_id": workspace_id,
                     "run_id": run_id,
@@ -729,7 +827,7 @@ class WorkspaceCodeAgentRuntime:
                 },
             )
             self._store_report(
-                f"implementation_plan:{workspace_id}",
+                f"implementation_plan:{workspace_id}:{run_id}",
                 {"workspace_id": workspace_id, "run_id": run_id, "implementation_plan": implementation_plan},
             )
             self._append_event(
@@ -742,16 +840,16 @@ class WorkspaceCodeAgentRuntime:
                     "orchestration_enabled": bool(orchestration.get("enabled")),
                     "flow_ids": [flow.get("id") for flow in acceptance_contract.get("flows", []) if isinstance(flow, dict)],
                     "primary_entities": list(implementation_plan.get("primary_entities") or []),
+                    "environment_snapshot_ref": job.environment_snapshot_ref,
+                    "worker_mailbox_ref": job.worker_mailbox_ref,
                 },
             )
-        seed_context = (
-            self._focused_visual_seed_context(workspace_id, run_id, role_scope=role_scope)
+        initial_context = (
+            self._focused_visual_initial_context(workspace_id, run_id, role_scope=role_scope)
             if focused_visual_edit
-            else self._seed_file_context(workspace_id, run_id, role_scope=role_scope)
+            else self._initial_file_context(workspace_id, run_id, role_scope=role_scope)
         )
         tool_results: list[dict[str, object]] = []
-        if generation_mode == GenerationMode.FAST and str(request.intent or "").lower() == "create":
-            tool_results.append(self._fast_create_budget_result())
         if focused_visual_edit:
             tool_results.append(self._focused_visual_edit_budget_result(role_scope=role_scope))
         last_changed_files: list[str] = (
@@ -832,16 +930,8 @@ class WorkspaceCodeAgentRuntime:
                     acceptance_contract=acceptance_contract,
                     progress_callback=_check_progress_callback,
                 )
-            prompt_smoke = self._prompt_alignment_smoke(
-                workspace_id=workspace_id,
-                run_id=run_id,
-                prompt=request.prompt,
-                intent=str(request.intent or ""),
-                focused_edit_kind=focused_edit_kind,
-            )
-            execution.results.append(prompt_smoke)
             execution.completed_at = datetime.now(timezone.utc)
-            self._store_agent_quality_report(workspace_id, execution)
+            self._store_agent_quality_report(workspace_id, run_id, execution)
             preview = self.preview_service.get(workspace_id)
             preview_details = {
                 "status": "skipped",
@@ -868,7 +958,8 @@ class WorkspaceCodeAgentRuntime:
             repeated_no_progress: int,
             last_turn_summary: str | None,
             latest_diff_summary: str | None,
-        ) -> WorkspaceLoopTurnPlan:
+            agent_memory: dict[str, Any] | None = None,
+        ) -> AgentTurnPlan:
             del validation_snapshot
             extra_file_context: dict[str, str] = {}
             local_tool_results = list(tool_results)
@@ -877,9 +968,7 @@ class WorkspaceCodeAgentRuntime:
             generic_fatal_correction_sent = False
             output_cap_correction_sent = False
             tool_budget_correction_sent = False
-            operation_contract_correction_sent = False
-            create_patch_coverage_correction_sent = False
-            fast_parallel_attempted = False
+            draft_action_contract_correction_sent = False
             create_repair_turn = create_intent and bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
             self._add_failed_generated_test_context(
                 workspace_id=workspace_id,
@@ -903,40 +992,6 @@ class WorkspaceCodeAgentRuntime:
                 tool_results=local_tool_results,
             )
             for tool_round in range(self._tool_round_limit(generation_mode) + 4):
-                if (
-                    not fast_parallel_attempted
-                    and tool_round == 0
-                    and self._should_use_fast_parallel_build(
-                        request=request,
-                        generation_mode=generation_mode,
-                        focused_edit_kind=focused_edit_kind,
-                        attempt=attempt,
-                        workspace_id=workspace_id,
-                        run_id=run_id,
-                        acceptance_contract=acceptance_contract,
-                    )
-                ):
-                    fast_parallel_attempted = True
-                    parallel_plan = self._request_fast_parallel_plan(
-                        job=job,
-                        workspace_id=workspace_id,
-                        run_id=run_id,
-                        request=request,
-                        attempt=attempt,
-                        context_mode=context_mode,
-                        latest_execution=latest_execution,
-                        latest_preview_details=latest_preview_details,
-                        seed_context=seed_context,
-                        extra_file_context=extra_file_context,
-                        tool_results=local_tool_results,
-                        last_turn_summary=last_turn_summary,
-                        latest_diff_summary=latest_diff_summary,
-                        acceptance_contract=acceptance_contract,
-                        loop_started_at=loop_started_at,
-                        should_stop=should_stop,
-                    )
-                    if parallel_plan is not None:
-                        return parallel_plan
                 llm_payload = self._request_agent_turn(
                     job=job,
                     workspace_id=workspace_id,
@@ -948,19 +1003,20 @@ class WorkspaceCodeAgentRuntime:
                     repeated_no_progress=repeated_no_progress,
                     latest_execution=latest_execution,
                     latest_preview_details=latest_preview_details,
-                    seed_context=seed_context,
+                    initial_context=initial_context,
                     extra_file_context=extra_file_context,
                     tool_results=local_tool_results,
                     last_turn_summary=last_turn_summary,
                     latest_diff_summary=latest_diff_summary,
+                    agent_memory=agent_memory,
                 )
                 if "error" in llm_payload:
                     if self._is_provider_quota_error(str(llm_payload.get("error") or "")):
-                        return WorkspaceLoopTurnPlan(
+                        return AgentTurnPlan(
                             outcome="fatal_invalid_response",
                             assistant_message=str(llm_payload.get("error") or ""),
                             diagnosis=str(llm_payload.get("error") or ""),
-                            files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                            files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
                             failure_class="provider.insufficient_quota",
                             failure_signature="provider.insufficient_quota",
                             root_cause_summary="OpenAI provider quota is exhausted for the selected code generation model.",
@@ -978,60 +1034,59 @@ class WorkspaceCodeAgentRuntime:
                                 {"attempt": attempt, "tool_round": tool_round, "reason": "output_cap"},
                             )
                             continue
-                        return WorkspaceLoopTurnPlan(
+                        return AgentTurnPlan(
                             outcome="needs_context",
                             assistant_message="Agent response exceeded the structured output cap.",
                             diagnosis=(
                                 "The previous response was too large to return as valid JSON. "
-                                "Retry with a smaller operation set, prefer compact replace operations, and keep this turn applyable."
+                                "Retry with a smaller draft action set, prefer compact replace actions, and keep this turn applyable."
                             ),
-                            files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                            files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
                             metadata={"error": str(llm_payload.get("error") or ""), "retry_reason": "max_output_tokens"},
                         )
-                    return WorkspaceLoopTurnPlan(
+                    return AgentTurnPlan(
                         outcome="fatal_invalid_response",
                         assistant_message=str(llm_payload.get("error") or ""),
                         diagnosis=str(llm_payload.get("error") or ""),
-                        files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                        files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
                         failure_class="generation.agent_invalid_response",
                         failure_signature="generation.agent_invalid_response",
                         root_cause_summary=str(llm_payload.get("error") or ""),
                     )
                 outcome = str(llm_payload.get("outcome") or "").strip().lower()
                 raw_tool_requests = self._agent_tool_requests(llm_payload.get("tool_requests") or [])
+                mutating_draft_actions, mutating_tool_trace = self._draft_actions_from_mutating_tool_requests(raw_tool_requests)
+                if mutating_draft_actions:
+                    raw_tool_requests = [
+                        item for item in raw_tool_requests if not self._is_mutating_agent_tool_request(item)
+                    ]
+                    raw_draft_actions = llm_payload.get("draft_actions") if isinstance(llm_payload.get("draft_actions"), list) else []
+                    llm_payload["draft_actions"] = [
+                        *list(raw_draft_actions),
+                        *[operation.model_dump(mode="json") for operation in mutating_draft_actions],
+                    ]
+                    local_tool_results.extend(mutating_tool_trace)
+                    tool_results.extend(mutating_tool_trace)
+                    if outcome == "tool_request" and not raw_tool_requests:
+                        outcome = "patch_ready"
                 if outcome == "tool_request" or raw_tool_requests:
                     signature = json.dumps(raw_tool_requests, ensure_ascii=True, sort_keys=True)
                     if signature in seen_tool_requests:
-                        return WorkspaceLoopTurnPlan(
+                        return AgentTurnPlan(
                             outcome="needs_context",
                             assistant_message="Agent repeated an already satisfied tool request.",
                             diagnosis="The requested diagnostic context is already available; the next turn must patch code.",
-                            files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                            files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
                             metadata={"tool_requests": raw_tool_requests},
                         )
                     seen_tool_requests.add(signature)
-                    is_fast_first_create_patch = str(request.intent or "").strip().lower() == "create" and not self.workspace_service.diff(
-                        workspace_id,
-                        run_id=run_id,
-                    ).strip()
-                    if is_fast_first_create_patch and not tool_budget_correction_sent:
-                        correction = self._tool_budget_correction_result(raw_tool_requests, request=request)
-                        local_tool_results.append(correction)
-                        tool_results.append(correction)
-                        tool_budget_correction_sent = True
-                        self._append_event(
-                            job,
-                            "repair_iteration",
-                            "Fast create skipped diagnostic reads before the first create patch and requested patch-only output.",
-                            {"attempt": attempt, "tool_round": tool_round, "reason": "fast_first_patch_no_tools"},
-                        )
-                        continue
                     new_context, executed_results = self._execute_tool_requests(
                         workspace_id=workspace_id,
                         run_id=run_id,
                         draft_source=draft_source,
                         tool_requests=raw_tool_requests,
                         execute_checks=_execute_checks,
+                        job=job,
                     )
                     extra_file_context.update(new_context)
                     local_tool_results.extend(executed_results)
@@ -1050,11 +1105,11 @@ class WorkspaceCodeAgentRuntime:
                             {"attempt": attempt, "tool_round": tool_round, "reason": "tool_budget_exhausted"},
                         )
                         continue
-                    return WorkspaceLoopTurnPlan(
+                    return AgentTurnPlan(
                         outcome="needs_context",
                         assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or ""),
                         diagnosis=str(llm_payload.get("diagnosis") or "Agent requested more tools than the turn budget allows."),
-                        files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                        files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
                         metadata={"tool_requests": raw_tool_requests},
                     )
                 if outcome == "fatal_invalid_response":
@@ -1088,51 +1143,51 @@ class WorkspaceCodeAgentRuntime:
                             {"attempt": attempt, "tool_round": tool_round, "reason": "empty_fatal_response"},
                         )
                         continue
-                    return WorkspaceLoopTurnPlan(
+                    return AgentTurnPlan(
                         outcome="fatal_invalid_response",
                         assistant_message=str(llm_payload.get("assistant_message") or ""),
                         diagnosis=str(llm_payload.get("diagnosis") or "Agent declared a fatal invalid response."),
-                        files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                        files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
                     )
                 try:
-                    operations = self._coerce_operations(llm_payload.get("operations") or [])
+                    draft_actions = self._coerce_draft_actions(llm_payload.get("draft_actions") or [])
                 except ValueError as exc:
-                    if not operation_contract_correction_sent:
-                        correction = self._operation_contract_correction_result(str(exc), llm_payload)
+                    if not draft_action_contract_correction_sent:
+                        correction = self._draft_action_contract_correction_result(str(exc), llm_payload)
                         local_tool_results.append(correction)
                         tool_results.append(correction)
-                        operation_contract_correction_sent = True
+                        draft_action_contract_correction_sent = True
                         self._append_event(
                             job,
                             "repair_iteration",
-                            "Agent returned invalid file operations. Retrying with the operations contract instead of failing the run.",
-                            {"attempt": attempt, "tool_round": tool_round, "reason": "invalid_operations", "error": str(exc)[:500]},
+                            "Agent returned invalid draft actions. Retrying with the draft action contract instead of failing the run.",
+                            {"attempt": attempt, "tool_round": tool_round, "reason": "invalid_draft_actions", "error": str(exc)[:500]},
                         )
                         continue
-                    return WorkspaceLoopTurnPlan(
+                    return AgentTurnPlan(
                         outcome="fatal_invalid_response",
                         assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or ""),
                         diagnosis=str(exc),
-                        files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
-                        metadata={"raw_response": llm_payload, "operation_error": str(exc)},
-                        failure_class="generation.invalid_operations",
-                        failure_signature="generation.invalid_operations",
+                        files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
+                        metadata={"raw_response": llm_payload, "draft_action_error": str(exc)},
+                        failure_class="generation.invalid_draft_actions",
+                        failure_signature="generation.invalid_draft_actions",
                         root_cause_summary=str(exc),
                     )
-                if not operations:
-                    if create_repair_turn and not operation_contract_correction_sent:
-                        correction = self._operation_contract_correction_result(
-                            "Repair turns must return a non-empty operations array with concrete patch/create/replace operations.",
+                if not draft_actions:
+                    if create_repair_turn and not draft_action_contract_correction_sent:
+                        correction = self._draft_action_contract_correction_result(
+                            "Repair turns must return a non-empty draft actions list with concrete patch/create/replace actions.",
                             llm_payload,
                         )
                         local_tool_results.append(correction)
                         tool_results.append(correction)
-                        operation_contract_correction_sent = True
+                        draft_action_contract_correction_sent = True
                         self._append_event(
                             job,
                             "repair_iteration",
-                            "Agent repair returned no file operations. Retrying with the operations contract.",
-                            {"attempt": attempt, "tool_round": tool_round, "reason": "empty_repair_operations"},
+                            "Agent repair returned no draft actions. Retrying with the draft action contract.",
+                            {"attempt": attempt, "tool_round": tool_round, "reason": "empty_repair_draft_actions"},
                         )
                         continue
                     if (
@@ -1146,46 +1201,23 @@ class WorkspaceCodeAgentRuntime:
                         self._append_event(
                             job,
                             "repair_iteration",
-                            "Agent misunderstood how file edits are applied. Retrying with the operations contract.",
-                            {"attempt": attempt, "tool_round": tool_round, "reason": "self_blocked_no_operations"},
+                            "Agent misunderstood how file edits are applied. Retrying with the draft action contract.",
+                            {"attempt": attempt, "tool_round": tool_round, "reason": "self_blocked_no_draft_actions"},
                         )
                         continue
-                    return WorkspaceLoopTurnPlan(
+                    return AgentTurnPlan(
                         outcome="no_op",
                         assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or ""),
                         diagnosis=str(llm_payload.get("diagnosis") or "Agent did not return file edits."),
-                        files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                        files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
                         metadata={"raw_response": llm_payload},
                     )
-                has_app_draft = bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
-                existing_paths, existing_text_by_path = self._create_coverage_existing_state(
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                ) if has_app_draft else (set(), {})
-                create_coverage_gap = self._create_patch_coverage_gap(
-                    operations,
-                    request=request,
-                    existing_paths=existing_paths,
-                    existing_text_by_path=existing_text_by_path,
-                )
-                if create_coverage_gap and not create_patch_coverage_correction_sent:
-                    correction = self._create_patch_coverage_correction_result(create_coverage_gap)
-                    local_tool_results.append(correction)
-                    tool_results.append(correction)
-                    create_patch_coverage_correction_sent = True
-                    self._append_event(
-                        job,
-                        "repair_iteration",
-                        "Agent create patch missed required role/test coverage. Retrying before applying a partial app.",
-                        {"attempt": attempt, "tool_round": tool_round, "missing": create_coverage_gap},
-                    )
-                    continue
-                return WorkspaceLoopTurnPlan(
+                return AgentTurnPlan(
                     outcome="patch_ready",
                     assistant_message=str(llm_payload.get("assistant_message") or llm_payload.get("diagnosis") or "Agent prepared code edits."),
                     diagnosis=str(llm_payload.get("diagnosis") or ""),
-                    operations=operations,
-                    files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
+                    draft_actions=draft_actions,
+                    files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
                     expected_verification=str(llm_payload.get("expected_verification") or ""),
                     rationale_by_file={str(key): str(value) for key, value in dict(llm_payload.get("rationale_by_file") or {}).items()},
                     metadata={
@@ -1193,14 +1225,206 @@ class WorkspaceCodeAgentRuntime:
                         "acceptance_checks": list(llm_payload.get("acceptance_checks") or []),
                     },
                 )
-            return WorkspaceLoopTurnPlan(
+            return AgentTurnPlan(
                 outcome="no_op",
                 assistant_message="Agent turn ended without producing edits.",
                 diagnosis="Agent turn ended without producing edits.",
-                files_read=list(seed_context.keys()),
+                files_read=list(initial_context.keys()),
             )
 
-        callbacks = WorkspaceLoopCallbacks(
+        def _apply_contract_sync(draft_actions: list[DraftAction]) -> list[DraftAction]:
+            synced = self._enforce_patch_first_draft_actions(
+                draft_actions,
+                request=request,
+                workspace_id=workspace_id,
+                run_id=run_id,
+            )
+            merge_report = self.worker_runtime.merge_report(artifact_run_id, synced)
+            job.worker_merge_ref = f"worker_merge:{workspace_id}:{artifact_run_id}"
+            self._store_report(job.worker_merge_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.worker_runtime.snapshot(artifact_run_id)})
+            ownership_ok = bool((merge_report.get("ownership") if isinstance(merge_report.get("ownership"), dict) else {}).get("ok"))
+            if not ownership_ok:
+                scratchpad.append_failed_fix(
+                    "worker_merge_conflict",
+                    "Worker merge guard found conflicting draft actions.",
+                    merge_report,
+                )
+                self._append_event(
+                    job,
+                    "worker_failed",
+                    "Worker merge guard found conflicting draft actions.",
+                    {"worker_id": "merge", "merge_report": merge_report, "artifact_ref": job.worker_merge_ref},
+                )
+            else:
+                self._append_event(
+                    job,
+                    "worker_completed",
+                    "Worker draft actions passed ownership merge guard.",
+                    {"worker_id": "merge", "merge_report": merge_report, "artifact_ref": job.worker_merge_ref},
+                )
+            return synced
+
+        def _before_apply(turn: int, draft_actions: list[DraftAction]) -> None:
+            paths = [operation.file_path for operation in draft_actions]
+            self._record_hook(
+                job=job,
+                hook="pre_apply_patch",
+                status="started",
+                payload={"turn": turn, "paths": paths, "draft_action_count": len(draft_actions)},
+            )
+            self.turn_diff_tracker.capture_baseline(
+                workspace_service=self.workspace_service,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                turn=turn,
+                paths=paths,
+            )
+            self.rollout_trace.append(artifact_run_id, "patch_apply_started", {"turn": turn, "paths": paths})
+
+        def _after_apply(turn: int, draft_actions: list[DraftAction], apply_result: Any, paths: list[str]) -> None:
+            self.file_state_cache.invalidate(run_id, paths)
+            record = self.turn_diff_tracker.record_result(
+                workspace_service=self.workspace_service,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                turn=turn,
+                paths=paths,
+                apply_result=apply_result,
+                owner_for_path=self._worker_owner_for_path,
+            )
+            job.turn_diff_ref = f"turn_diff:{workspace_id}:{artifact_run_id}"
+            self._store_report(
+                job.turn_diff_ref,
+                {"workspace_id": workspace_id, "run_id": run_id, **self.turn_diff_tracker.snapshot(run_id)},
+            )
+            scratchpad.append_worker_note(
+                "draft_apply",
+                f"Applied turn {turn} draft changes.",
+                {"paths": paths, "turn_diff_ref": job.turn_diff_ref, "changed_summary": record.summary()},
+            )
+            self.rollout_trace.append(artifact_run_id, "patch_apply_completed", record.summary())
+            self._record_hook(
+                job=job,
+                hook="post_apply_patch",
+                status="completed" if getattr(apply_result, "status", "") == "applied" else "failed",
+                payload={"turn": turn, "paths": paths, "apply_status": getattr(apply_result, "status", None), "turn_diff_ref": job.turn_diff_ref},
+            )
+            job.semantic_graph_ref = f"semantic_graph:{workspace_id}:{artifact_run_id}"
+            self._store_report(
+                job.semantic_graph_ref,
+                {"workspace_id": workspace_id, "run_id": run_id, "graph": semantic_scan(root=draft_source, targets=["miniapp/app", "miniapp/tests"])},
+            )
+
+        def _post_apply_stabilize(
+            stabilize_workspace_id: str,
+            stabilize_run_id: str,
+            apply_result: Any,
+            paths: list[str],
+        ) -> list[str]:
+            changed = self._stabilize_platform_shell(stabilize_workspace_id, stabilize_run_id, apply_result, paths)
+            self.file_state_cache.invalidate(stabilize_run_id, changed)
+            return changed
+
+        def _verify_completion(
+            latest_execution: CheckExecutionRecord | None,
+            latest_preview_details: dict[str, Any],
+        ) -> dict[str, Any]:
+            self._append_event(
+                job,
+                "worker_started",
+                "Fresh verifier worker started after validation checks.",
+                {"worker_id": "fresh_verifier", "phase": "browser_verifying"},
+            )
+            report = VerificationWorker.verify(
+                latest_execution=latest_execution,
+                preview_details=latest_preview_details,
+                acceptance_contract=acceptance_contract,
+                require_browser_proof=bool((create_intent or acceptance_contract.get("required")) and not focused_visual_edit),
+            ).model_dump()
+            report["worker_id"] = "fresh_verifier"
+            report["fresh_context"] = True
+            self.verification_reports[artifact_run_id] = report
+            coordinator.complete_phase("checking", "Validation checks reached strict green before verifier.")
+            if report.get("status") == "passed":
+                coordinator.complete_phase("browser_verifying", "Browser and mobile proof passed.")
+            else:
+                coordinator.start_phase("repairing", "Verifier found unresolved proof issues.")
+                self._append_activity(
+                    job,
+                    "verifier_nudge",
+                    "Verifier requires targeted repair before completion",
+                    {
+                        "phase": "repairing",
+                        "status": "failed",
+                        "issue_count": len(report.get("issues") or []),
+                    },
+                    save=False,
+                )
+            job.verification_report_ref = f"verification_report:{workspace_id}:{artifact_run_id}"
+            self._store_report(
+                job.verification_report_ref,
+                {"workspace_id": workspace_id, "run_id": run_id, "report": report},
+            )
+            self._store_report(job.scratchpad_ref, {"workspace_id": workspace_id, "run_id": run_id, **scratchpad.snapshot(), **coordinator.snapshot()})
+            self.rollout_trace.append(artifact_run_id, "verification_worker", report)
+            self._record_hook(
+                job=job,
+                hook="post_browser_verify",
+                status="completed" if report.get("status") == "passed" else "failed",
+                payload={"worker_id": "fresh_verifier", "verification_report_ref": job.verification_report_ref},
+            )
+            self._append_event(
+                job,
+                "worker_completed" if report.get("status") == "passed" else "worker_failed",
+                "Fresh verifier worker completed.",
+                {"worker_id": "fresh_verifier", "status": report.get("status"), "artifact_ref": job.verification_report_ref},
+            )
+            return report
+
+        def _record_compact_boundary(payload: dict[str, Any]) -> None:
+            failed_signatures = [
+                str(item)
+                for item in (payload.get("memory") or {}).get("failed_signatures", [])
+                if str(item).strip()
+            ] if isinstance(payload.get("memory"), dict) else []
+            boundary = scratchpad.record_compact_boundary(
+                plan=implementation_plan,
+                diff_summary=str(payload.get("latest_diff_summary") or ""),
+                failed_signatures=failed_signatures,
+                next_action="repair the smallest failing workflow slice and rerun exact proof",
+            )
+            signature = str(payload.get("latest_failure_signature") or "").strip()
+            if signature:
+                self.memory_store.record_failure(
+                    artifact_run_id,
+                    signature,
+                    "Latest repair boundary recorded for the next agent turn.",
+                    {"turn": payload.get("turn"), "boundary": boundary},
+                )
+            stale_checks = self.memory_store.verify_stale_claims(artifact_run_id, draft_source)
+            job.agent_memory = {
+                **dict(payload.get("memory") or {}),
+                "store_ref": f"agent_memory_store:{workspace_id}:{artifact_run_id}",
+                "stale_checks": stale_checks[-12:],
+            }
+            job.scratchpad_ref = f"scratchpad:{workspace_id}:{artifact_run_id}"
+            job.memory_ref = f"agent_memory_store:{workspace_id}:{artifact_run_id}"
+            self._store_report(job.scratchpad_ref, {"workspace_id": workspace_id, "run_id": run_id, **scratchpad.snapshot()})
+            self._store_report(job.memory_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.memory_store.snapshot(artifact_run_id)})
+            self._append_activity(
+                job,
+                "compact_boundary",
+                "Stored compact repair boundary",
+                {
+                    "phase": "repairing",
+                    "status": "completed",
+                    "artifact_ref": job.scratchpad_ref,
+                    "summary": "Plan, diff summary, failure signatures, and next action were compacted.",
+                },
+                save=False,
+            )
+
+        callbacks = AgentLoopCallbacks(
             execute_checks=_execute_checks,
             build_validation_snapshot=self._validation_snapshot_from_execution,
             completion_state=lambda results, preview_details, validation_snapshot=None: self._completion_state(
@@ -1213,1225 +1437,39 @@ class WorkspaceCodeAgentRuntime:
             ),
             has_tooling_failure=CheckRunner.has_tooling_failure,
             plan_turn=_plan_turn,
-            apply_contract_sync=lambda operations: self._enforce_patch_first_operations(
-                operations,
-                request=request,
-                workspace_id=workspace_id,
-                run_id=run_id,
-            ),
-            post_apply_stabilize=self._stabilize_platform_shell,
+            apply_contract_sync=_apply_contract_sync,
+            verify_completion=_verify_completion,
+            before_apply=_before_apply,
+            after_apply=_after_apply,
+            post_apply_stabilize=_post_apply_stabilize,
             append_event=self._append_event,
+            append_activity=self._append_activity,
             append_trace=self._append_trace,
             store_report=self._store_report,
+            record_compact_boundary=_record_compact_boundary,
             allow_optimistic_completion=False,
             skip_initial_checks=focused_visual_edit or create_intent,
             stop_if_requested=should_stop,
-            budget_status=lambda attempt: self._completion_budget_status(
+            budget_status=lambda attempt: completion_budget_status(
                 job=job,
-                generation_mode=generation_mode,
+                mode=generation_mode,
                 started_at=loop_started_at,
                 attempt=attempt,
             ),
         )
-        return self.workspace_loop_engine.run(
+        return self.agent_loop_engine.run(
             workspace_id=workspace_id,
             run_id=run_id,
             job=job,
             draft_source=draft_source,
             role_scope=role_scope,
             generation_mode=generation_mode,
-            max_attempts=self._max_attempts(generation_mode),
-            initial_operations=[],
+            initial_draft_actions=[],
             initial_assistant_message="Workspace code agent initialized.",
-            initial_files_read=list(seed_context.keys()),
+            initial_files_read=list(initial_context.keys()),
             initial_changed_files=last_changed_files,
             callbacks=callbacks,
         )
-
-    def _should_use_fast_parallel_build(
-        self,
-        *,
-        request: GenerateRequest,
-        generation_mode: GenerationMode,
-        focused_edit_kind: str,
-        attempt: int,
-        workspace_id: str,
-        run_id: str,
-        acceptance_contract: dict[str, Any],
-    ) -> bool:
-        del generation_mode
-        if int(attempt or 0) > 1:
-            return False
-        if not acceptance_contract.get("required"):
-            return False
-        intent = str(request.intent or "").strip().lower()
-        if intent not in {"create", "edit", "refine", "role_only_change"}:
-            return False
-        if focused_edit_kind not in {"standard", "behavior_workflow_edit"} and intent != "create":
-            return False
-        return not bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
-
-    @staticmethod
-    def _parallel_create_round_budget(generation_mode: GenerationMode | str | None) -> int:
-        mode = WorkspaceCodeAgentRuntime._generation_mode(generation_mode)
-        if mode == GenerationMode.QUALITY:
-            return 18
-        if mode == GenerationMode.BALANCED:
-            return 14
-        return 10
-
-    @staticmethod
-    def _parallel_worker_reasoning_effort(generation_mode: GenerationMode | str | None) -> str:
-        mode = WorkspaceCodeAgentRuntime._generation_mode(generation_mode)
-        if mode == GenerationMode.QUALITY:
-            return "medium"
-        return "low"
-
-    @staticmethod
-    def _parallel_create_mode_contract(generation_mode: GenerationMode | str | None) -> dict[str, object]:
-        mode = WorkspaceCodeAgentRuntime._generation_mode(generation_mode)
-        if mode == GenerationMode.QUALITY:
-            return {
-                "mode": "quality",
-                "reasoning_effort": "medium",
-                "round_budget": 18,
-                "required_child_pages_per_role": 1,
-                "resource_strategy": "derive resources from the implementation plan and prompt; do not force a one-resource template",
-                "workflow_depth": "planning, design pass, prompt-derived entities and workflows, richer role dashboards, richer validation, broad generated acceptance tests",
-                "design_level": "product-ready, highly refined, responsive, with empty/loading/error/success states",
-            }
-        if mode == GenerationMode.BALANCED:
-            return {
-                "mode": "balanced",
-                "reasoning_effort": "low",
-                "round_budget": 14,
-                "required_child_pages_per_role": 1,
-                "resource_strategy": "derive resources from the implementation plan and prompt; add related resources only when they are needed for the requested workflow",
-                "workflow_depth": "one required child page per role, plus prompt-derived related surfaces when they help the requested workflow; shared cross-role state and stronger acceptance tests",
-                "design_level": "polished product UI with clearer hierarchy, dashboards, responsive lists, forms, badges, and state styling",
-            }
-        return {
-            "mode": "fast",
-            "reasoning_effort": "low",
-            "round_budget": 10,
-            "required_child_pages_per_role": 1,
-            "resource_strategy": "derive the smallest complete data model from the prompt; do not force a fixed requests/records template",
-            "workflow_depth": "compact working MVP with prompt-derived persistence, GET/POST, update flow, forms, fetch, and generated tests",
-            "design_level": "compact real CSS, consistent light palette, no placeholder styling",
-        }
-
-    @staticmethod
-    def _parallel_create_design_brief(generation_mode: GenerationMode | str | None) -> dict[str, object]:
-        mode = WorkspaceCodeAgentRuntime._generation_mode(generation_mode)
-        common = {
-            "palette": "neutral light product UI with restrained accents; no random digital/neon palettes",
-            "role_isolation": "client, specialist, and manager are separate apps; role pages must not link to other role apps",
-            "shell_spacing": "preserve Telegram top safe spacing; do not override .page-shell padding unless using the shared safe expression",
-            "css": "real per-role styles.css files with classes used by HTML; no placeholder CSS",
-        }
-        if mode == GenerationMode.QUALITY:
-            return {
-                **common,
-                "layout": "product-ready dashboards with dense but readable sections, responsive grids, accessible forms, and refined state surfaces",
-                "states": "include visible empty, loading, success, validation, and error states where the role workflow needs them",
-                "css_depth": "each role CSS should include substantial used selectors plus responsive and focus-visible styling where controls exist",
-                "role_depth": "each role should feel like its own purpose-built app, not a copied page with changed labels",
-            }
-        if mode == GenerationMode.BALANCED:
-            return {
-                **common,
-                "layout": "polished role dashboards, clear form/list hierarchy, status badges, metrics, and responsive card/table patterns",
-                "states": "include empty, success, and error states for the main workflow",
-                "role_depth": "each role needs distinct actions and layout emphasis",
-            }
-        return {
-            **common,
-            "layout": "compact, practical, readable role screens with forms, lists, buttons, and status badges",
-            "states": "include empty state text before user data exists",
-            "role_depth": "keep small, but client creates, specialist processes, manager oversees",
-        }
-
-    @staticmethod
-    def _safe_resource_slug(value: object, *, default: str = "records") -> str:
-        slug = re.sub(r"[^a-z0-9_-]+", "_", str(value or "").strip().lower()).strip("_-")
-        slug = re.sub(r"_+", "_", slug)
-        if not slug:
-            return default
-        if slug[0].isdigit():
-            slug = f"item_{slug}"
-        return slug
-
-    @staticmethod
-    def _role_child_slugs_from_resources(resources: list[str]) -> dict[str, list[str]]:
-        primary = WorkspaceCodeAgentRuntime._safe_resource_slug(resources[0] if resources else "records")
-        secondary = WorkspaceCodeAgentRuntime._safe_resource_slug(resources[1] if len(resources) > 1 else f"{primary}_updates")
-        tertiary = WorkspaceCodeAgentRuntime._safe_resource_slug(resources[2] if len(resources) > 2 else f"{primary}_summary")
-        return {
-            "client": [primary, f"{primary}-details", f"{primary}-history"],
-            "specialist": [f"{primary}-work", secondary, f"{primary}-schedule"],
-            "manager": [f"{primary}-overview", tertiary, f"{primary}-control"],
-        }
-
-    @staticmethod
-    def _parallel_initial_failure_context(latest_execution: CheckExecutionRecord) -> dict[str, object]:
-        failures: list[dict[str, object]] = []
-        for result in latest_execution.results:
-            if result.status != "failed":
-                continue
-            failures.append(
-                {
-                    "check": result.name,
-                    "details": str(result.details or "")[:800],
-                    "logs": [str(line or "")[:600] for line in list(result.logs or [])[:4]],
-                }
-            )
-        if not failures:
-            return {}
-        return {
-            "round": 0,
-            "source": "latest_checks",
-            "failed_checks": failures[:4],
-        }
-
-    @staticmethod
-    def _parallel_repair_targets_from_merge_error(error: str, worker_ids: object) -> set[str]:
-        worker_set = {str(worker_id) for worker_id in worker_ids}
-        text = str(error or "")
-        lowered = text.lower()
-        targets = {worker_id for worker_id in worker_set if worker_id.lower() in lowered}
-        for file_match in re.findall(r"miniapp/[A-Za-z0-9_./-]+", text):
-            mapped = WorkspaceCodeAgentRuntime._parallel_worker_for_path(file_match)
-            if mapped:
-                targets.add(mapped)
-        if "route_manifest" in lowered or "main.py" in lowered or "/routes/" in lowered or "backend" in lowered or "api" in lowered:
-            targets.add("backend_api")
-        if "test" in lowered:
-            targets.add("generated_tests")
-        return {target for target in targets if target in worker_set}
-
-    @staticmethod
-    def _parallel_repair_targets_from_coverage_gap(gap: list[str], blueprint: dict[str, Any]) -> set[str]:
-        del blueprint
-        targets: set[str] = set()
-        for item in gap:
-            text = str(item or "").lower()
-            mapped = WorkspaceCodeAgentRuntime._parallel_worker_for_path(text)
-            if mapped:
-                targets.add(mapped)
-            if "backend" in text or "/api/" in text or "/routes/" in text or "main.py" in text or "route_manifest" in text:
-                targets.add("backend_api")
-            if (
-                "sqlalchemy" in text
-                or "create_all" in text
-                or "table creation" in text
-                or "session dependency" in text
-                or "generator dependency" in text
-            ):
-                targets.add("backend_api")
-            if "test" in text:
-                targets.add("generated_tests")
-            if "frontend form" in text or "fetch post" in text:
-                targets.add("client_ui")
-            if "status/update" in text or "update action" in text:
-                if "frontend" in text:
-                    targets.update({"specialist_ui", "manager_ui"})
-                targets.update({"backend_api", "generated_tests"})
-            if "balanced create" in text or "quality create" in text:
-                if any(marker in text for marker in ("api resource", "endpoint", "status/update", "backend")):
-                    targets.update({"backend_api", "generated_tests"})
-                else:
-                    targets.update({"backend_api", "client_ui", "specialist_ui", "manager_ui", "generated_tests"})
-        return targets
-
-    @staticmethod
-    def _parallel_filter_retry_targets(
-        retry_targets: set[str],
-        successful_worker_ids: set[str],
-        worker_ids: set[str],
-    ) -> set[str]:
-        filtered = {worker_id for worker_id in retry_targets if worker_id in worker_ids}
-        if not filtered:
-            filtered = set(worker_ids)
-        app_slice_workers = {"backend_api", "client_ui", "specialist_ui", "manager_ui"} & set(worker_ids)
-        if "generated_tests" in filtered and any(worker_id not in successful_worker_ids for worker_id in app_slice_workers):
-            filtered.discard("generated_tests")
-            if not filtered:
-                filtered = {worker_id for worker_id in app_slice_workers if worker_id not in successful_worker_ids}
-        return filtered
-
-    @staticmethod
-    def _is_soft_create_coverage_gap(gap: list[str]) -> bool:
-        if not gap:
-            return False
-        hard_markers = (
-            "<one-child-page>",
-            "<two-child-pages>",
-            "<three-child-pages>",
-            "html link to role CSS",
-            "real role CSS",
-            "miniapp/app/static/",
-            "miniapp/app/generated/route_manifest.json",
-            "miniapp/app/main.py",
-            "miniapp/app/routes/app_api.py or prompt-derived API route",
-            "backend GET /api/<resource>",
-            "backend POST /api/<resource>",
-            "backend SQLAlchemy table creation",
-            "backend FastAPI SQLAlchemy Session dependency",
-            "backend FastAPI generator dependency",
-            "backend undefined ORM",
-            "backend nested item relationship",
-            "frontend form/fetch POST /api/<resource>",
-        )
-        return not any(
-            any(marker in str(item or "") for marker in hard_markers)
-            for item in gap
-        )
-
-    @staticmethod
-    def _parallel_successful_operation_summaries(successful_results: dict[str, dict[str, Any]], *, max_items: int = 14) -> list[dict[str, str]]:
-        summaries: list[dict[str, str]] = []
-        for worker_id, result in sorted(successful_results.items()):
-            for operation in result.get("operations") or []:
-                if not isinstance(operation, DraftFileOperation):
-                    continue
-                text = str(operation.content or operation.diff or "")
-                summaries.append(
-                    {
-                        "worker": str(worker_id),
-                        "file_path": str(operation.file_path or ""),
-                        "operation": str(operation.operation or ""),
-                        "excerpt": truncate_tool_text(text, max_chars=1200),
-                    }
-                )
-                if len(summaries) >= max_items:
-                    return summaries
-        return summaries
-
-    @staticmethod
-    def _parallel_worker_for_path(path: str) -> str | None:
-        normalized = str(path or "").replace("\\", "/").lstrip("./").lower()
-        if normalized.startswith("miniapp/app/static/client/") or "client" in normalized:
-            return "client_ui"
-        if normalized.startswith("miniapp/app/static/specialist/") or "specialist" in normalized:
-            return "specialist_ui"
-        if normalized.startswith("miniapp/app/static/manager/") or "manager" in normalized:
-            return "manager_ui"
-        if normalized.startswith("miniapp/tests/") or "test_generated_app" in normalized or "generated_app.test" in normalized:
-            return "generated_tests"
-        if (
-            normalized.startswith("miniapp/app/routes/")
-            or normalized in {"miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py", "miniapp/app/generated/route_manifest.json"}
-            or "backend" in normalized
-            or "/api/" in normalized
-        ):
-            return "backend_api"
-        return None
-
-    def _request_fast_parallel_plan(
-        self,
-        *,
-        job: JobRecord,
-        workspace_id: str,
-        run_id: str,
-        request: GenerateRequest,
-        attempt: int,
-        context_mode: str,
-        latest_execution: CheckExecutionRecord,
-        latest_preview_details: dict[str, object],
-        seed_context: dict[str, str],
-        extra_file_context: dict[str, str],
-        tool_results: list[dict[str, object]],
-        last_turn_summary: str | None,
-        latest_diff_summary: str | None,
-        acceptance_contract: dict[str, Any],
-        loop_started_at: float,
-        should_stop: Callable[[], bool] | None = None,
-    ) -> WorkspaceLoopTurnPlan | None:
-        del latest_preview_details, last_turn_summary, latest_diff_summary
-        started = time.perf_counter()
-        generation_mode = self._generation_mode(request.generation_mode)
-        blueprint = self._fast_parallel_blueprint(acceptance_contract, generation_mode=generation_mode)
-        mode_contract = self._parallel_create_mode_contract(generation_mode)
-        blueprint["mode_contract"] = mode_contract
-        blueprint["design_brief"] = self._parallel_create_design_brief(generation_mode)
-        blueprint["implementation_plan"] = dict(job.implementation_plan or {})
-        workers = self._fast_parallel_workers(blueprint)
-        workers_by_id = {str(worker["worker"]): worker for worker in workers}
-        round_budget = int(
-            (job.completion_budget if isinstance(job.completion_budget, dict) else {}).get("parallel_round_cap")
-            or self._parallel_create_round_budget(generation_mode)
-        )
-        create_intent = str(request.intent or "").strip().lower() == "create"
-        retry_worker_ids = list(workers_by_id.keys())
-        if create_intent and "generated_tests" in retry_worker_ids:
-            retry_worker_ids = [worker_id for worker_id in retry_worker_ids if worker_id != "generated_tests"]
-        successful_results: dict[str, dict[str, Any]] = {}
-        failed_rounds: list[dict[str, Any]] = []
-        repair_context: list[dict[str, Any]] = []
-        initial_failure_context = self._parallel_initial_failure_context(latest_execution)
-        if initial_failure_context:
-            repair_context.append(initial_failure_context)
-        self._append_event(
-            job,
-            "parallel_build_started",
-            "Parallel role build started.",
-            {
-                "attempt": attempt,
-                "worker_count": len(workers),
-                "execution_style": "parallel_role_workers",
-                "generation_mode": generation_mode.value,
-                "round_budget": round_budget,
-                "has_draft_diff": False,
-            },
-        )
-        self._store_report(
-            f"parallel_build:{workspace_id}",
-            {
-                "workspace_id": workspace_id,
-                "run_id": run_id,
-                "mode": generation_mode.value,
-                "blueprint": blueprint,
-                "mode_contract": mode_contract,
-                "workers": [
-                    {
-                        "worker": worker["worker"],
-                        "ownership": worker["ownership"],
-                        "responsibility": worker["responsibility"],
-                    }
-                    for worker in workers
-                ],
-            },
-        )
-        merged_operations: list[DraftFileOperation] = []
-        merge_error: str | None = None
-        create_gap: list[str] = []
-        round_results: list[dict[str, Any]] = []
-        for build_round in range(1, round_budget + 1):
-            if should_stop is not None and should_stop():
-                return WorkspaceLoopTurnPlan(
-                    outcome="fatal_invalid_response",
-                    assistant_message="Generation stopped by user request.",
-                    diagnosis="Generation stopped by user request before the next parallel build round.",
-                    files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
-                    failure_class="generation.stopped",
-                    failure_signature="generation.stopped",
-                    root_cause_summary="Generation stopped by user request.",
-                    metadata={"parallel_build": True, "stopped": True},
-                )
-            budget_status = self._completion_budget_status(
-                job=job,
-                generation_mode=generation_mode,
-                started_at=loop_started_at,
-                attempt=attempt,
-            )
-            if budget_status.get("exhausted"):
-                reason = str(budget_status.get("reason") or "budget_exhausted")
-                return WorkspaceLoopTurnPlan(
-                    outcome="fatal_invalid_response",
-                    assistant_message="Generation budget exhausted before parallel build completed.",
-                    diagnosis=(
-                        f"Generation token/time budget exhausted during parallel build ({reason})."
-                    ),
-                    files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
-                    failure_class="generation.budget_exhausted",
-                    failure_signature=f"generation.budget_exhausted:{reason}",
-                    root_cause_summary=(
-                        f"Generation token/time budget exhausted during parallel build ({reason})."
-                    ),
-                    metadata={"budget_status": budget_status, "parallel_build": True},
-                )
-            round_started = time.perf_counter()
-            selected_workers = [workers_by_id[worker_id] for worker_id in retry_worker_ids if worker_id in workers_by_id]
-            if not selected_workers:
-                selected_workers = workers
-            self._append_event(
-                job,
-                "parallel_build_started" if build_round == 1 else "repair_iteration",
-                "Parallel role build round started." if build_round == 1 else "Targeted parallel repair round started.",
-                {
-                    "attempt": attempt,
-                    "round": build_round,
-                    "round_budget": round_budget,
-                    "workers": [str(worker["worker"]) for worker in selected_workers],
-                    "generation_mode": generation_mode.value,
-                },
-            )
-            results: list[dict[str, Any]] = []
-            try:
-                with ThreadPoolExecutor(max_workers=min(len(selected_workers), max(1, FAST_PARALLEL_WORKER_COUNT)), thread_name_prefix="role-agent-worker") as executor:
-                    future_to_worker = {}
-                    for worker in selected_workers:
-                        ctx = copy_context()
-                        future = executor.submit(
-                            ctx.run,
-                            self._request_fast_parallel_worker,
-                            job,
-                            workspace_id,
-                            run_id,
-                            request,
-                            attempt,
-                            context_mode,
-                            seed_context,
-                            extra_file_context,
-                            tool_results,
-                            acceptance_contract,
-                            blueprint,
-                            worker,
-                            build_round,
-                            repair_context,
-                        )
-                        future_to_worker[future] = worker
-                    for future in as_completed(future_to_worker):
-                        worker = future_to_worker[future]
-                        try:
-                            result = future.result()
-                        except Exception as exc:
-                            result = {
-                                "worker": worker["worker"],
-                                "status": "error",
-                                "error": str(exc),
-                                "error_class": exc.__class__.__name__,
-                                "payload": {},
-                                "operations": [],
-                                "cache_stats": {},
-                                "duration_ms": 0,
-                            }
-                        result["round"] = build_round
-                        results.append(result)
-            except Exception as exc:
-                results = [
-                    {
-                        "worker": str(worker["worker"]),
-                        "status": "error",
-                        "error": str(exc),
-                        "error_class": exc.__class__.__name__,
-                        "payload": {},
-                        "operations": [],
-                        "cache_stats": {},
-                        "duration_ms": 0,
-                        "round": build_round,
-                    }
-                    for worker in selected_workers
-                ]
-            round_results.extend(results)
-            if should_stop is not None and should_stop():
-                return WorkspaceLoopTurnPlan(
-                    outcome="fatal_invalid_response",
-                    assistant_message="Generation stopped by user request.",
-                    diagnosis="Generation stopped by user request after the active parallel workers returned.",
-                    files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
-                    failure_class="generation.stopped",
-                    failure_signature="generation.stopped",
-                    root_cause_summary="Generation stopped by user request.",
-                    metadata={"parallel_build": True, "stopped": True},
-                )
-            for result in sorted(results, key=lambda item: str(item.get("worker") or "")):
-                worker_id = str(result.get("worker") or "")
-                cache_stats = result.get("cache_stats") if isinstance(result.get("cache_stats"), dict) else {}
-                if cache_stats:
-                    job.cache_stats = self._merge_cache_stats(job.cache_stats, cache_stats)
-                if result.get("model") and not job.llm_model:
-                    job.llm_model = str(result.get("model") or "")
-                operation_files = [operation.file_path for operation in result.get("operations") or []]
-                self._append_agent_diagnostic(
-                    workspace_id,
-                    {
-                        "run_id": run_id,
-                        "job_id": job.job_id,
-                        "attempt": attempt,
-                        "round": build_round,
-                        "worker": worker_id,
-                        "context_mode": context_mode,
-                        "duration_ms": int(result.get("duration_ms") or 0),
-                        "status": result.get("status"),
-                        "model": result.get("model"),
-                        "outcome": result.get("outcome"),
-                        "operation_count": len(operation_files),
-                        "operation_files": operation_files,
-                        "error": result.get("error"),
-                        "token_usage": {
-                            "input_tokens": int(cache_stats.get("input_tokens") or 0),
-                            "output_tokens": int(cache_stats.get("output_tokens") or 0),
-                            "reasoning_tokens": int(cache_stats.get("reasoning_tokens") or 0),
-                            "total_tokens": int(cache_stats.get("total_tokens") or 0),
-                        },
-                    },
-                )
-                self._append_event(
-                    job,
-                    "iteration_ready",
-                    f"Parallel role worker {worker_id} returned.",
-                    {
-                        "attempt": attempt,
-                        "round": build_round,
-                        "worker": worker_id,
-                        "outcome": str(result.get("outcome") or result.get("status") or ""),
-                        "operation_count": len(operation_files),
-                        "model": result.get("model") or "",
-                        "input_tokens": int(cache_stats.get("input_tokens") or 0),
-                        "output_tokens": int(cache_stats.get("output_tokens") or 0),
-                        "reasoning_tokens": int(cache_stats.get("reasoning_tokens") or 0),
-                        "total_tokens": int(cache_stats.get("total_tokens") or 0),
-                        "has_draft_diff": False,
-                    },
-                )
-                if result.get("status") == "completed" and str(result.get("outcome") or "").strip().lower() == "patch_ready" and result.get("operations"):
-                    successful_results[worker_id] = self._merge_parallel_worker_repair_result(
-                        successful_results.get(worker_id),
-                        result,
-                    )
-
-            missing_workers = [worker_id for worker_id in workers_by_id if worker_id not in successful_results]
-            app_slice_workers = {"backend_api", "client_ui", "specialist_ui", "manager_ui"} & set(workers_by_id)
-            deferrable_missing_tests = (
-                set(missing_workers) == {"generated_tests"}
-                and all(worker_id in successful_results for worker_id in app_slice_workers)
-                and build_round >= 2
-            )
-            if missing_workers and not deferrable_missing_tests:
-                merged_operations = []
-                merge_error = f"Workers missing patch_ready result: {', '.join(missing_workers)}."
-                create_gap = []
-            else:
-                current_results = [
-                    successful_results[worker_id]
-                    for worker_id in workers_by_id
-                    if worker_id in successful_results
-                ]
-                merged_operations, merge_error = self._merge_fast_parallel_worker_operations(current_results)
-                create_gap = self._create_patch_coverage_gap(merged_operations, request=request) if merge_error is None else []
-
-            defer_soft_coverage_gap = (
-                merge_error is None
-                and bool(create_gap)
-                and build_round >= 2
-                and self._is_soft_create_coverage_gap(create_gap)
-            )
-            if merge_error is None and (not create_gap or defer_soft_coverage_gap):
-                duration_ms = int((time.perf_counter() - started) * 1000)
-                job.flow_coverage = {
-                    **dict(job.flow_coverage or {}),
-                    "status": "parallel_patch_ready_with_deferred_coverage" if defer_soft_coverage_gap else "parallel_patch_ready",
-                    "parallel_worker_count": len(workers),
-                    "merged_file_count": len({operation.file_path for operation in merged_operations}),
-                    "build_rounds": build_round,
-                    "repair_rounds": max(0, build_round - 1),
-                    "deferred_coverage_gap": create_gap if defer_soft_coverage_gap else [],
-                    "mode_contract": mode_contract,
-                    "failed_rounds": failed_rounds,
-                }
-                self._append_event(
-                    job,
-                    "parallel_build_completed",
-                    "Parallel role build produced a merged patch.",
-                    {
-                        "attempt": attempt,
-                        "rounds": build_round,
-                        "duration_ms": duration_ms,
-                        "worker_count": len(workers),
-                        "operation_count": len(merged_operations),
-                        "deferred_coverage_gap": create_gap if defer_soft_coverage_gap else [],
-                    },
-                )
-                return WorkspaceLoopTurnPlan(
-                    outcome="patch_ready",
-                    assistant_message="Parallel role workers produced a merged app patch.",
-                    diagnosis="The platform built backend, client, specialist, manager, and generated tests in parallel ownership lanes, then merged non-conflicting LLM-generated operations.",
-                    operations=merged_operations,
-                    files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
-                    expected_verification="Run static validators, frontend interaction smoke, generated Python/JS tests, and preview checks.",
-                    rationale_by_file={operation.file_path: operation.reason for operation in merged_operations},
-                    metadata={
-                        "parallel_build": True,
-                        "generation_mode": generation_mode.value,
-                        "worker_count": len(workers),
-                        "build_rounds": build_round,
-                        "repair_rounds": max(0, build_round - 1),
-                        "mode_contract": mode_contract,
-                        "worker_summaries": [
-                            {
-                                "worker": result.get("worker"),
-                                "status": result.get("status"),
-                                "round": result.get("round"),
-                                "operation_count": len(result.get("operations") or []),
-                            }
-                            for result in sorted(round_results, key=lambda item: (int(item.get("round") or 0), str(item.get("worker") or "")))
-                        ],
-                    },
-                )
-
-            retry_targets = (
-                self._parallel_repair_targets_from_merge_error(merge_error or "", workers_by_id.keys())
-                if merge_error
-                else self._parallel_repair_targets_from_coverage_gap(create_gap, blueprint)
-            )
-            retry_targets = self._parallel_filter_retry_targets(
-                retry_targets,
-                set(successful_results),
-                set(workers_by_id),
-            )
-            failed_round = {
-                "round": build_round,
-                "duration_ms": int((time.perf_counter() - round_started) * 1000),
-                "merge_error": merge_error,
-                "coverage_gap": create_gap,
-                "retry_workers": sorted(retry_targets),
-                "worker_errors": [
-                    {
-                        "worker": str(result.get("worker") or ""),
-                        "status": str(result.get("status") or ""),
-                        "error": truncate_tool_text(str(result.get("error") or ""), max_chars=700),
-                    }
-                    for result in results
-                    if result.get("status") == "error" or str(result.get("error") or "").strip()
-                ],
-                "successful_worker_outputs": self._parallel_successful_operation_summaries(successful_results),
-            }
-            failed_rounds.append(failed_round)
-            repair_context = [*repair_context[-2:], failed_round]
-            tool_results.append(
-                {
-                    "tool": "parallel_role_repair",
-                    "status": "needs_repair",
-                    "round": build_round,
-                    "merge_error": merge_error,
-                    "coverage_gap": create_gap,
-                    "retry_workers": sorted(retry_targets),
-                    "required_next_action": "Retry only the listed ownership workers and return complete patch_ready operations for their owned files.",
-                }
-            )
-            self._append_event(
-                job,
-                "repair_iteration",
-                "Parallel role build needs targeted repair.",
-                {
-                    "attempt": attempt,
-                    "round": build_round,
-                    "round_budget": round_budget,
-                    "merge_error": merge_error,
-                    "coverage_gap_count": len(create_gap),
-                    "retry_workers": sorted(retry_targets),
-                    "generation_mode": generation_mode.value,
-                },
-            )
-            retry_worker_ids = [worker_id for worker_id in workers_by_id if worker_id in retry_targets]
-
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        final_reason = merge_error or (f"Missing create coverage: {', '.join(create_gap[:8])}" if create_gap else "Parallel build did not produce a complete patch.")
-        job.flow_coverage = {
-            **dict(job.flow_coverage or {}),
-            "status": "parallel_build_exhausted",
-            "parallel_worker_count": len(workers),
-            "build_rounds": round_budget,
-            "repair_rounds": max(0, round_budget - 1),
-            "failed_rounds": failed_rounds,
-            "mode_contract": mode_contract,
-        }
-        self._append_event(
-            job,
-            "parallel_build_failed",
-            "Parallel role build exhausted targeted repair rounds.",
-            {
-                "attempt": attempt,
-                "duration_ms": duration_ms,
-                "round_budget": round_budget,
-                "reason": final_reason,
-                "generation_mode": generation_mode.value,
-            },
-        )
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        return WorkspaceLoopTurnPlan(
-            outcome="fatal_invalid_response",
-            assistant_message="Parallel role build could not produce a complete patch inside the mode repair budget.",
-            diagnosis=final_reason,
-            files_read=list({*seed_context.keys(), *extra_file_context.keys()}),
-            failure_class="generation.parallel_build_exhausted",
-            failure_signature=f"generation.parallel_build_exhausted:{generation_mode.value}",
-            root_cause_summary=final_reason,
-            metadata={
-                "parallel_build": True,
-                "generation_mode": generation_mode.value,
-                "worker_count": len(workers),
-                "build_rounds": round_budget,
-                "repair_rounds": max(0, round_budget - 1),
-                "failed_rounds": failed_rounds,
-            },
-        )
-
-    def _request_fast_parallel_worker(
-        self,
-        job: JobRecord,
-        workspace_id: str,
-        run_id: str,
-        request: GenerateRequest,
-        attempt: int,
-        context_mode: str,
-        seed_context: dict[str, str],
-        extra_file_context: dict[str, str],
-        tool_results: list[dict[str, object]],
-        acceptance_contract: dict[str, Any],
-        blueprint: dict[str, Any],
-        worker: dict[str, Any],
-        build_round: int = 1,
-        repair_context: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        started = time.perf_counter()
-        generation_mode = self._generation_mode(request.generation_mode)
-        schema = self._agent_turn_schema(
-            operation_limit=int(worker.get("operation_limit") or FAST_PARALLEL_WORKER_OPERATION_LIMIT),
-            content_max_length=int(worker.get("content_max_length") or FAST_PARALLEL_WORKER_CONTENT_MAX_LENGTH),
-            allow_tool_requests=False,
-            allowed_outcomes=["patch_ready"],
-            min_operations=1,
-        )
-        model = models_for_role("agent_turn", model_profile=request.model_profile, generation_mode=generation_mode)
-        response = self.openai_client.generate_agent_turn(
-            schema_name=f"parallel_{generation_mode.value}_{worker['worker']}_v1",
-            schema=schema,
-            system_prompt=self._agent_system_prompt(),
-            user_prompt=self._fast_parallel_worker_prompt(
-                workspace_id=workspace_id,
-                run_id=run_id,
-                request=request,
-                attempt=attempt,
-                context_mode=context_mode,
-                seed_context=seed_context,
-                extra_file_context=extra_file_context,
-                tool_results=tool_results,
-                acceptance_contract=acceptance_contract,
-                blueprint=blueprint,
-                worker=worker,
-                build_round=build_round,
-                repair_context=repair_context or [],
-            ),
-            prompt_cache_key=self._prompt_cache_key(workspace_id, run_id, f"{request.prompt}:{generation_mode.value}:{worker['worker']}:round:{build_round}"),
-            stable_prefix="workspace_code_agent_parallel_role_workers_v1",
-            model_override=model,
-            responses_tuning_override={
-                "reasoning": {"effort": self._parallel_worker_reasoning_effort(generation_mode)},
-                "max_output_tokens": int(worker.get("max_output_tokens") or 14000),
-            },
-        )
-        if response.get("error"):
-            duration_ms = int((time.perf_counter() - started) * 1000)
-            return {
-                "worker": worker["worker"],
-                "status": "error",
-                "outcome": "fatal_invalid_response",
-                "model": str(response.get("model") or ""),
-                "payload": {},
-                "operations": [],
-                "cache_stats": response.get("cache_stats") if isinstance(response.get("cache_stats"), dict) else {},
-                "duration_ms": duration_ms,
-                "error": str(response.get("error") or ""),
-            }
-        payload = response.get("payload")
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        parsed = payload if isinstance(payload, dict) else {}
-        operations = self._coerce_operations(parsed.get("operations") or [])
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        outcome = str(parsed.get("outcome") or "")
-        if outcome.strip().lower() == "patch_ready" and not operations:
-            return {
-                "worker": worker["worker"],
-                "status": "error",
-                "outcome": outcome,
-                "model": str(response.get("model") or ""),
-                "payload": parsed,
-                "operations": [],
-                "cache_stats": response.get("cache_stats") if isinstance(response.get("cache_stats"), dict) else {},
-                "duration_ms": duration_ms,
-                "error": (
-                    f"{worker['worker']} returned patch_ready with no operations. "
-                    f"Return create/replace/patch operations for required_files: {', '.join(map(str, worker.get('required_files') or []))}."
-                ),
-            }
-        return {
-            "worker": worker["worker"],
-            "status": "completed",
-            "outcome": outcome,
-            "model": str(response.get("model") or ""),
-            "payload": parsed,
-            "operations": operations,
-            "cache_stats": response.get("cache_stats") if isinstance(response.get("cache_stats"), dict) else {},
-            "duration_ms": duration_ms,
-        }
-
-    def _fast_parallel_worker_prompt(
-        self,
-        *,
-        workspace_id: str,
-        run_id: str,
-        request: GenerateRequest,
-        attempt: int,
-        context_mode: str,
-        seed_context: dict[str, str],
-        extra_file_context: dict[str, str],
-        tool_results: list[dict[str, object]],
-        acceptance_contract: dict[str, Any],
-        blueprint: dict[str, Any],
-        worker: dict[str, Any],
-        build_round: int = 1,
-        repair_context: list[dict[str, Any]] | None = None,
-    ) -> str:
-        generation_mode = self._generation_mode(request.generation_mode)
-        depth_rule = (
-            "Keep Fast compact but complete."
-            if generation_mode == GenerationMode.FAST
-            else "Keep this worker compact, but add Balanced-level workflow detail within your ownership zone."
-            if generation_mode == GenerationMode.BALANCED
-            else "Keep this worker compact, but make the owned UI/API/test slice polished and product-ready within the output cap."
-        )
-        payload = {
-            "task": "Parallel role worker: return only operations for your ownership zone. Other workers are running in parallel.",
-            "workspace_id": workspace_id,
-            "run_id": run_id,
-            "mode": request.mode,
-            "intent": request.intent,
-            "generation_mode": generation_mode.value,
-            "attempt": attempt,
-            "build_round": build_round,
-            "context_mode": context_mode,
-            "worker": {
-                "id": worker["worker"],
-                "responsibility": worker["responsibility"],
-                "ownership": worker["ownership"],
-                "required_files": worker["required_files"],
-            },
-            "user_prompt": request.prompt,
-            "acceptance_contract": acceptance_contract,
-            "implementation_plan": blueprint.get("implementation_plan") or {},
-            "parallel_blueprint": blueprint,
-            "mode_contract": blueprint.get("mode_contract"),
-            "design_brief": blueprint.get("design_brief"),
-            "repair_context": list(repair_context or [])[-3:],
-            "file_contexts": self._compact_file_contexts(
-                {**seed_context, **extra_file_context},
-                max_files=16,
-                max_chars=4500,
-            ),
-            "tool_results": self._compact_tool_results(
-                tool_results,
-                workspace_id=workspace_id,
-                run_id=run_id,
-                max_items=4,
-            ),
-            "rules": [
-                "Return outcome=patch_ready with create/replace/patch operations only inside your ownership list.",
-                "patch_ready with an empty operations array is invalid. If this is a retry after a no-operation response, return concrete create/replace/patch operations for your required_files now.",
-                "Do not edit files owned by another worker. The merge layer rejects overlapping file paths.",
-                "Use the exact required_files paths for this worker unless the prompt and blueprint require an additional file inside your ownership zone.",
-                "Create or replace every required_files path owned by this worker. On repair rounds, include the missing required file named in coverage_gap even if the rest of your slice was already generated.",
-                "On repair rounds, replace your whole owned slice only when needed; otherwise return the smallest complete owned-file operations that close the listed gap.",
-                f"{depth_rule} Do not add mock/seed/demo/sample/preloaded business records.",
-                "Generated UI must be usable with forms/buttons/fetch and must start from an empty state.",
-                "Maintain a concrete workflow map in your owned files: every visible form/control id must be referenced by role JavaScript, bound to a submit/click handler, call the intended API, and be covered by generated tests.",
-                "Use stable generic wiring ids so HTML, JS, and tests do not drift: client create form `client-request-form`, specialist status/update form `specialist-status-form`, optional specialist create form `specialist-create-form`, manager refresh/control button `manager-refresh`. If you choose different ids, the same response must use those exact ids in HTML, JS, and tests.",
-                "HTML form field names, JavaScript FormData/payload keys, backend schema fields, and generated test payloads must match exactly. Do not create fields that are visible but never submitted.",
-                "Keep API response shape and frontend rendering aligned. If GET returns an envelope such as `{ items, total }`, every role JS list renderer must unwrap `payload.items`; otherwise return a plain list consistently.",
-                "Do not add buttons that only change text locally unless the prompt explicitly asks for a local-only indicator; workflow buttons must fetch POST/PATCH/PUT/DELETE and refresh persisted state.",
-                "If this worker creates SQLAlchemy models, ensure tables exist for generated tests: call Base.metadata.create_all(bind=engine) after all model classes are declared/imported, or register an app startup hook that creates them before TestClient requests.",
-                "Do not introduce required POST/create schema fields that the generated client form and generated Python tests do not submit. Supplemental fields must be optional or have backend defaults unless the prompt explicitly requires them.",
-                "Every FastAPI endpoint parameter typed as SQLAlchemy Session must use Depends(get_db_session) or Depends(get_db); never use next(get_db_session()), SessionLocal(), @contextmanager, or a live Session as a default parameter.",
-                "Keep generated ORM models straightforward. Do not reference undefined relationship/model classes; if nested line items are stored simply, serialize them in a JSON/Text field instead of creating ad-hoc relationship code.",
-                "Do not add SQLAlchemy relationship()/back_populates between tables unless the child table has a real ForeignKey column. If unsure, avoid relationship() and query by id explicitly.",
-                "Use path-id update endpoints for mutable prompt-derived resources, for example PATCH /api/<resource>/{record_id}; generated tests and role JavaScript should call the same path shape.",
-                "For path-id PATCH endpoints, do not send the same id again inside the JSON body unless the backend patch schema explicitly accepts that field. Strict Pydantic patch schemas with extra=forbid reject duplicate body ids with 422.",
-                "Role app.js files are loaded by every page for that role. Guard every page-specific element before property access: use feedback?.textContent or if (feedback) blocks, and initialize page-specific workflows only when their root elements exist.",
-                "Role ownership is strict: client JS may only query client pages, specialist JS may only query specialist pages, and manager JS may only query manager pages. Do not add selectors like `[data-role=client]` inside specialist/manager scripts.",
-                "Generated Python tests must be unittest-discoverable: define import unittest and at least one unittest.TestCase subclass with test_* methods. Top-level pytest-style test functions are invalid because the platform runs python -m unittest discover.",
-                "Generated Python tests that use FastAPI TestClient must trigger app lifespan. Prefer `with TestClient(app) as client:` inside each test or create/tear down SQLAlchemy tables explicitly in setUp/tearDown; plain `self.client = TestClient(app)` can skip lifespan table creation.",
-                "Generated tests must not assert exact opening HTML tags or exact class attributes such as `<main class=\"page-shell\">` or `class=\"page-shell\"` because the platform may add safe-area inline attributes and extra shell classes. Assert that the class list contains the page-shell token, for example with a regex matching `class=\"[^\"]*\\bpage-shell\\b`, parse/query the DOM, or assert a stable wrapper id.",
-                "Generated JS tests must assert literal strings that actually exist in the files they read. Accept API constants/template literals by checking for /api plus resource names/methods instead of only exact fetch('/api/...') strings. Do not invent data-testid/control names unless the matching UI/JS source also contains them.",
-                "Use one consistent light visual system and preserve preview_bridge/page-shell safe spacing.",
-                "Do not return a refusal or fatal response. If details are incomplete, use the implementation_plan, acceptance_contract, and blueprint to create the best compact owned implementation.",
-            ],
-        }
-        worker_id = str(worker.get("worker") or "")
-        if worker_id == "generated_tests":
-            payload["rules"].extend(
-                [
-                    "Generated tests worker must always return exactly the two required test files when they are missing: miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs.",
-                    "Keep tests compact: Python unittest should verify role routes, GET empty, POST persists, PATCH/status persists; JS should statically verify role pages, role CSS links, real buttons/forms, and frontend API fetch methods.",
-                    "Use the API paths and payload fields from the acceptance_contract/blueprint and, when repair_context includes successful_worker_outputs, align tests with those actual backend/UI file excerpts.",
-                    "When successful_worker_outputs include backend schema/model excerpts, extract the exact required create/update fields from those excerpts and use only those fields in Python payloads. Do not use prompt aliases such as preferred_date/comment/visit_status if the actual backend fields are lesson_date/notes/attendance.",
-                    "The tests worker may run after backend/UI workers. Avoid exact headings, marketing phrases, route-link literals, function names, and role-specific text unless those values come directly from the contract or successful_worker_outputs. Prefer durable structural checks: role route returns 200, preview bridge exists, role CSS link exists, each role page has a form/button/list area, and app.js contains /api plus POST/PATCH methods.",
-                    "Python route-shell tests must not keep a table of exact title_snippet or heading phrases and then assert self.assertIn(title_snippet, body). Headings and copy are UI implementation details; assert route status, preview_bridge, role CSS/script links, page-shell token, and presence of generic form/list/action elements.",
-                    "For role CSS/script links in generated JS tests, compare against browser href/src values such as /static/<role>/styles.css and /static/<role>/app.js, not source-tree paths such as app/static/<role>/styles.css.",
-                    "For frontend API assertions, do not require the exact literal `/api/records` when role JS may use `const API_BASE = '/api'` and template literals like `${API_BASE}/records`. Assert that the script contains `/api`, the resource slug such as `records`, and the HTTP method/handler.",
-                    "For frontend API assertions, do not require exact local constant names such as API_PATH, API_URL, apiUrl, or API_BASE. Variable names are implementation details; assert fetch usage, /api/resource markers, HTTP methods, and real form/button handlers.",
-                    "For Python tests, use `with TestClient(app) as client:` so FastAPI lifespan creates DB tables before requests. For route shell assertions, check that the class attribute contains the page-shell token and `/static/preview_bridge.js`, not exact `class=\"page-shell\"` or an exact `<main ...>` opening tag.",
-                    "For Python API create tests, accept either 200 or 201 for successful POST unless the generated API explicitly documents a different success status. Do not fail a working create flow solely because the route returns HTTP 201 Created.",
-                    "Do not require exact navigation/back-link literals such as `href=\"/specialist\"` on child pages. Verify route_manifest coverage and role-local workflow surfaces instead; links are UI details unless they are part of a submitted workflow.",
-                    "Do not invent exact data-testid values in generated_app.test.mjs. Prefer generic assertions for <form, <button, role-specific headings, /api resource names, and HTTP methods unless the matching UI files are guaranteed to contain that exact test id.",
-                    "Do not assert that one role page loads another role's app script. Client pages load /static/client/app.js, specialist pages load /static/specialist/app.js, and manager pages load /static/manager/app.js.",
-                    "Generated JS tests must verify the real selectors/handlers used by the role JS. If the app binds `form.addEventListener` through `[data-client-form]`, do not require the script to reference a submit button id.",
-                    "Generated JS tests must fail if an expected form/control id is present in HTML but not wired in the role JS, and must check the real field names used by FormData/payload construction.",
-                    "Generated JS tests must respect role workflow split: client JS may only POST/create while specialist or manager JS owns PATCH/status/update. Do not require PATCH in the client script unless the client UI really exposes a status update control.",
-                    "Generated JS tests should read all actual HTML files for a role from route_manifest when looking for workflow controls. A client form may be on /client or /client/<resource>; a specialist queue may be on /specialist or /specialist/<resource>. Assert the control exists on at least one real role surface, then assert the corresponding JS handler/API method.",
-                    "Generated JS tests must check controls on the route where they actually live. If a create form is on /client/<resource>, assert that child HTML, not the /client root, contains the form id.",
-                    "Generated JS tests must not require workflow controls on both a role root and a role child page. It is valid for /<role> to be a dashboard/entry page and for /<role>/<resource> to own the form/list/action; assert each control only on the manifest route that actually contains it.",
-                    "Generated JS tests must read route_manifest.json from app/generated/route_manifest.json relative to the miniapp working directory, not from app/static/generated/route_manifest.json.",
-                    "Generated tests must follow the actual route_manifest and actual HTML attributes. Do not require invented route names, data attributes, ids, or class names that are not present in the generated files.",
-                    "Do not assert optional fields that the backend schema does not create and return. If a test asserts a patched field such as price, notes, payment_status, or assignee, the backend model/update schema must include and persist that exact field; otherwise assert only fields that the API actually owns.",
-                ]
-            )
-        elif worker_id == "backend_api":
-            payload["rules"].extend(
-                [
-                    "Backend worker must never return only a diagnosis or an empty operations array. For create, return concrete operations for app_api.py, main.py, route_manifest.json, and db.py/schemas.py when needed.",
-                    "Minimum backend create slice: miniapp/app/routes/app_api.py defines APIRouter(prefix='/api'), SQLAlchemy persistence, GET /<resource>, POST /<resource>, PATCH /<resource>/{id}; miniapp/app/main.py imports and includes that router; route_manifest.json maps every role root/child route from the blueprint, including /client, /specialist, /manager and every child page.",
-                    "Backend worker must follow the blueprint API names consistently so generated tests and role JavaScript can call them.",
-                    "Keep create schemas tolerant: only make fields required when they are clearly in the acceptance contract. Use optional/default values for extra operational fields so generated tests and forms do not receive 422 for missing nonessential fields.",
-                    "If using SQLAlchemy, prefer simple models and JSON/Text fields for nested line items unless relationship classes are fully declared and tested.",
-                ]
-            )
-        return json.dumps(payload, ensure_ascii=False)
-
-    @staticmethod
-    def _fast_parallel_blueprint(
-        acceptance_contract: dict[str, Any],
-        *,
-        generation_mode: GenerationMode = GenerationMode.FAST,
-    ) -> dict[str, Any]:
-        mode_contract = WorkspaceCodeAgentRuntime._parallel_create_mode_contract(generation_mode)
-        child_count = int(mode_contract.get("required_child_pages_per_role") or 1)
-        contract_endpoints = acceptance_contract.get("required_endpoints") if isinstance(acceptance_contract.get("required_endpoints"), list) else []
-        contract_features = acceptance_contract.get("features") if isinstance(acceptance_contract.get("features"), dict) else {}
-        feature_candidates = contract_features.get("prompt_resource_candidates") if isinstance(contract_features, dict) else []
-        resource_candidates = [
-            WorkspaceCodeAgentRuntime._safe_resource_slug(endpoint.get("resource"))
-            for endpoint in contract_endpoints
-            if isinstance(endpoint, dict) and str(endpoint.get("resource") or "").strip()
-        ]
-        resource_candidates.extend(
-            WorkspaceCodeAgentRuntime._safe_resource_slug(candidate)
-            for candidate in (feature_candidates if isinstance(feature_candidates, list) else [])
-            if str(candidate or "").strip()
-        )
-        resource_candidates.extend(["records"])
-        resources = list(dict.fromkeys(resource_candidates)) or ["records"]
-        role_child_slugs = WorkspaceCodeAgentRuntime._role_child_slugs_from_resources(resources)
-        role_children = {
-            role: [
-                {
-                    "slug": slug,
-                    "path": f"miniapp/app/static/{role}/{slug}/index.html",
-                    "route": f"/{role}/{slug}",
-                }
-                for slug in slugs[:child_count]
-            ]
-            for role, slugs in role_child_slugs.items()
-        }
-        return {
-            "roles": list(ROLE_ORDER),
-            "generation_mode": generation_mode.value,
-            "required_child_pages_per_role": child_count,
-            "mode_contract": mode_contract,
-            "backend_route_file": "miniapp/app/routes/app_api.py",
-            "route_manifest": "miniapp/app/generated/route_manifest.json",
-            "main_file": "miniapp/app/main.py",
-            "resources": resources,
-            "api_paths": [f"/api/{resource}" for resource in resources],
-            "role_files": {
-                "client": {
-                    "root": "miniapp/app/static/client/index.html",
-                    "child": role_children["client"][0]["path"],
-                    "child_route": role_children["client"][0]["route"],
-                    "children": role_children["client"],
-                    "app_js": "miniapp/app/static/client/app.js",
-                    "css": "miniapp/app/static/client/styles.css",
-                },
-                "specialist": {
-                    "root": "miniapp/app/static/specialist/index.html",
-                    "child": role_children["specialist"][0]["path"],
-                    "child_route": role_children["specialist"][0]["route"],
-                    "children": role_children["specialist"],
-                    "app_js": "miniapp/app/static/specialist/app.js",
-                    "css": "miniapp/app/static/specialist/styles.css",
-                },
-                "manager": {
-                    "root": "miniapp/app/static/manager/index.html",
-                    "child": role_children["manager"][0]["path"],
-                    "child_route": role_children["manager"][0]["route"],
-                    "children": role_children["manager"],
-                    "app_js": "miniapp/app/static/manager/app.js",
-                    "css": "miniapp/app/static/manager/styles.css",
-                },
-            },
-            "test_files": [
-                "miniapp/tests/test_generated_app.py",
-                "miniapp/tests/generated_app.test.mjs",
-            ],
-        }
-
-    @staticmethod
-    def _fast_parallel_workers(blueprint: dict[str, Any]) -> list[dict[str, Any]]:
-        role_files = blueprint.get("role_files") if isinstance(blueprint.get("role_files"), dict) else {}
-        mode_contract = blueprint.get("mode_contract") if isinstance(blueprint.get("mode_contract"), dict) else {}
-        child_pages = int(blueprint.get("required_child_pages_per_role") or mode_contract.get("required_child_pages_per_role") or 1)
-        target_resources = int(len(blueprint.get("resources") or []) or 1)
-        quality_depth = child_pages >= 3 or str(mode_contract.get("mode") or "") == "quality"
-        balanced_depth = quality_depth or child_pages >= 2 or target_resources >= 2
-        backend_operation_limit = 7 if quality_depth else 6 if balanced_depth else 6
-        role_operation_limit = 6 if quality_depth else 5 if balanced_depth else 4
-        test_operation_limit = 3 if balanced_depth else 2
-        role_content_limit = 18000 if quality_depth else 12000 if balanced_depth else 10000
-        backend_content_limit = 18000 if quality_depth else 13000 if balanced_depth else 12000
-        test_content_limit = 18000 if quality_depth else 12000 if balanced_depth else 12000
-        role_output_limit = 26000 if quality_depth else 18000 if balanced_depth else 16000
-        backend_output_limit = 26000 if quality_depth else 18000 if balanced_depth else 16000
-        test_output_limit = 24000 if quality_depth else 16000 if balanced_depth else 16000
-        return [
-            {
-                "worker": "backend_api",
-                "responsibility": "Create shared persistence, API routes, main.py registration, and route_manifest for all role pages.",
-                "ownership": [
-                    "miniapp/app/routes/**",
-                    "miniapp/app/main.py",
-                    "miniapp/app/db.py",
-                    "miniapp/app/schemas.py",
-                    "miniapp/app/generated/route_manifest.json",
-                ],
-                "required_files": [
-                    blueprint.get("backend_route_file"),
-                    blueprint.get("main_file"),
-                    "miniapp/app/db.py",
-                    "miniapp/app/schemas.py",
-                    blueprint.get("route_manifest"),
-                ],
-                "operation_limit": backend_operation_limit,
-                "content_max_length": backend_content_limit,
-                "max_output_tokens": backend_output_limit,
-            },
-            *[
-                {
-                    "worker": f"{role}_ui",
-                    "responsibility": f"Create the {role} role app root, required child pages, role JavaScript, and role CSS with role-specific workflow actions.",
-                    "ownership": [f"miniapp/app/static/{role}/**"],
-                    "required_files": [
-                        role_payload.get("root"),
-                        *[
-                            child.get("path")
-                            for child in role_payload.get("children", [])
-                            if isinstance(child, dict)
-                        ],
-                        role_payload.get("app_js"),
-                        role_payload.get("css"),
-                    ],
-                    "operation_limit": role_operation_limit,
-                    "content_max_length": role_content_limit,
-                    "max_output_tokens": role_output_limit,
-                }
-                for role, role_payload in role_files.items()
-                if role in ROLE_ORDER and isinstance(role_payload, dict)
-            ],
-            {
-                "worker": "generated_tests",
-                "responsibility": "Create generated Python and JS tests that cover the complete acceptance contract and cross-role flow.",
-                "ownership": ["miniapp/tests/**"],
-                "required_files": list(blueprint.get("test_files") or []),
-                "operation_limit": test_operation_limit,
-                "content_max_length": test_content_limit,
-                "max_output_tokens": test_output_limit,
-            },
-        ]
-
-    @classmethod
-    def _merge_fast_parallel_worker_operations(cls, results: list[dict[str, Any]]) -> tuple[list[DraftFileOperation], str | None]:
-        operations: list[DraftFileOperation] = []
-        seen_paths: dict[str, str] = {}
-        operation_index_by_path: dict[str, int] = {}
-        for result in results:
-            worker = str(result.get("worker") or "").strip()
-            if not worker:
-                return [], "A parallel worker result did not include a worker id."
-            if result.get("status") != "completed":
-                return [], f"{worker} failed: {result.get('error') or result.get('status')}"
-            if str(result.get("outcome") or "").strip().lower() != "patch_ready":
-                return [], f"{worker} returned {result.get('outcome') or 'no outcome'} instead of patch_ready."
-            raw_operations = result.get("operations")
-            if not isinstance(raw_operations, list) or not raw_operations:
-                return [], f"{worker} returned no operations."
-            ownership = cls._ownership_for_parallel_worker_result(result)
-            for operation in raw_operations:
-                if not isinstance(operation, DraftFileOperation):
-                    return [], f"{worker} returned an invalid operation."
-                path = str(operation.file_path or "").replace("\\", "/").lstrip("./")
-                if not cls._path_matches_any_ownership(path, ownership):
-                    return [], f"{worker} attempted to edit {path} outside ownership {ownership}."
-                previous_worker = seen_paths.get(path)
-                if previous_worker and previous_worker != worker:
-                    return [], f"{path} was edited by both {previous_worker} and {worker}."
-                seen_paths[path] = worker
-                if path in operation_index_by_path:
-                    operations[operation_index_by_path[path]] = operation
-                    continue
-                operation_index_by_path[path] = len(operations)
-                operations.append(operation)
-        return operations, None
-
-    @staticmethod
-    def _merge_parallel_worker_repair_result(
-        existing: dict[str, Any] | None,
-        result: dict[str, Any],
-    ) -> dict[str, Any]:
-        if not existing or not isinstance(existing.get("operations"), list):
-            return result
-        merged = dict(existing)
-        merged.update({key: value for key, value in result.items() if key != "operations"})
-        operations_by_path: dict[str, DraftFileOperation] = {}
-        ordered_paths: list[str] = []
-        for operation in [*(existing.get("operations") or []), *(result.get("operations") or [])]:
-            if not isinstance(operation, DraftFileOperation):
-                continue
-            path = str(operation.file_path or "").strip().replace("\\", "/").lstrip("./")
-            if not path:
-                continue
-            if path not in operations_by_path:
-                ordered_paths.append(path)
-            operations_by_path[path] = operation
-        merged["operations"] = [operations_by_path[path] for path in ordered_paths]
-        return merged
-
-    @staticmethod
-    def _ownership_for_parallel_worker_result(result: dict[str, Any]) -> list[str]:
-        payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
-        worker = str(result.get("worker") or "").strip()
-        if isinstance(payload, dict):
-            worker_payload = payload.get("worker")
-            if isinstance(worker_payload, dict) and isinstance(worker_payload.get("ownership"), list):
-                ownership = [str(item) for item in worker_payload.get("ownership") if str(item).strip()]
-                if ownership:
-                    return ownership
-        if worker == "backend_api":
-            return [
-                "miniapp/app/routes/**",
-                "miniapp/app/main.py",
-                "miniapp/app/db.py",
-                "miniapp/app/schemas.py",
-                "miniapp/app/generated/route_manifest.json",
-            ]
-        if worker == "generated_tests":
-            return ["miniapp/tests/**"]
-        for role in ROLE_ORDER:
-            if worker == f"{role}_ui":
-                return [f"miniapp/app/static/{role}/**"]
-        return []
-
-    @staticmethod
-    def _path_matches_any_ownership(path: str, ownership: list[str]) -> bool:
-        normalized = str(path or "").replace("\\", "/").lstrip("./")
-        for raw_pattern in ownership:
-            pattern = str(raw_pattern or "").replace("\\", "/").lstrip("./")
-            if not pattern:
-                continue
-            if pattern.endswith("/**") and normalized.startswith(pattern[:-3].rstrip("/") + "/"):
-                return True
-            if normalized == pattern:
-                return True
-        return False
 
     def _request_agent_turn(
         self,
@@ -2446,11 +1484,12 @@ class WorkspaceCodeAgentRuntime:
         repeated_no_progress: int,
         latest_execution: CheckExecutionRecord,
         latest_preview_details: dict[str, object],
-        seed_context: dict[str, str],
+        initial_context: dict[str, str],
         extra_file_context: dict[str, str],
         tool_results: list[dict[str, object]],
         last_turn_summary: str | None,
         latest_diff_summary: str | None,
+        agent_memory: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         turn_started_at = time.perf_counter()
         turn_started_iso = datetime.now(timezone.utc).isoformat()
@@ -2474,7 +1513,6 @@ class WorkspaceCodeAgentRuntime:
             create_repair_turn = create_turn and has_draft_diff
             workflow_slice_repair = create_repair_turn and self._workflow_slice_repair_needed(latest_execution)
             fast_create_turn = generation_mode == GenerationMode.FAST and create_turn
-            fast_first_create_patch = fast_create_turn and not has_draft_diff
             focused_edit_kind = self._focused_edit_kind(request)
             focused_visual_edit = focused_edit_kind == "visual_style_edit"
             edit_turn = intent_value in {"edit", "refine", "role_only_change"}
@@ -2494,10 +1532,10 @@ class WorkspaceCodeAgentRuntime:
             force_replace_only = bool(
                 create_repair_turn
                 and last_turn_summary
-                and "full-file replace operations for only the conflicted files" in str(last_turn_summary).lower()
+                and "full-file replace actions for only the conflicted files" in str(last_turn_summary).lower()
             )
-            operation_limit = (
-                FOCUSED_VISUAL_OPERATION_LIMIT
+            draft_action_limit = (
+                FOCUSED_VISUAL_DRAFT_ACTION_LIMIT
                 if focused_visual_edit
                 else 1 if force_replace_only
                 else 8 if workflow_slice_repair and generation_mode == GenerationMode.FAST
@@ -2506,9 +1544,9 @@ class WorkspaceCodeAgentRuntime:
                 else 2 if create_repair_turn and generation_mode == GenerationMode.FAST
                 else 2 if create_repair_turn and generation_mode == GenerationMode.BALANCED
                 else 3 if create_repair_turn
-                else AGENTIC_WORKFLOW_OPERATION_LIMIT if agentic_workflow_turn
+                else AGENTIC_WORKFLOW_DRAFT_ACTION_LIMIT if agentic_workflow_turn
                 else 8 if compact_edit_turn
-                else 20 if fast_create_turn else AGENT_TURN_OPERATION_LIMIT
+                else 20 if fast_create_turn else AGENT_TURN_DRAFT_ACTION_LIMIT
             )
             content_max_length = (
                 FOCUSED_VISUAL_CONTENT_MAX_LENGTH
@@ -2524,19 +1562,19 @@ class WorkspaceCodeAgentRuntime:
                 else 9000 if compact_edit_turn
                 else 9000 if fast_create_turn else 18000
             )
-            allow_tool_requests = False if focused_visual_edit else False if create_repair_turn else not fast_first_create_patch
+            allow_tool_requests = False if focused_visual_edit else False if create_repair_turn else True
             allowed_outcomes = (
                 ["patch_ready", "fatal_invalid_response"]
                 if focused_visual_edit
                 else ["patch_ready"] if create_repair_turn
-                else ["patch_ready"] if fast_first_create_patch else None
+                else None
             )
-            agent_schema = self._agent_turn_schema(
-                operation_limit=operation_limit,
+            agent_schema = self._agent_action_schema(
+                draft_action_limit=draft_action_limit,
                 content_max_length=content_max_length,
                 allow_tool_requests=allow_tool_requests,
                 allowed_outcomes=allowed_outcomes,
-                allowed_operations=["replace"] if force_replace_only else None,
+                allowed_draft_action_types=["replace"] if force_replace_only else None,
             )
             user_prompt = self._agent_user_prompt(
                 workspace_id=workspace_id,
@@ -2548,11 +1586,20 @@ class WorkspaceCodeAgentRuntime:
                 repeated_no_progress=repeated_no_progress,
                 latest_execution=latest_execution,
                 latest_preview_details=latest_preview_details,
-                seed_context=seed_context,
+                initial_context=initial_context,
                 extra_file_context=extra_file_context,
                 tool_results=tool_results,
                 last_turn_summary=last_turn_summary,
                 latest_diff_summary=latest_diff_summary,
+                agent_memory=agent_memory,
+            )
+            user_prompt = self._attach_context_pressure(
+                job=job,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                prompt_payload=user_prompt,
+                attempt=attempt,
+                tool_round=tool_round,
             )
             self._append_event(
                 job,
@@ -2571,7 +1618,7 @@ class WorkspaceCodeAgentRuntime:
             self._append_event(
                 job,
                 "agent_turn_started",
-                "Workspace code agent is generating the structured edit.",
+                "Workspace code agent is generating the next draft action.",
                 {
                     "attempt": attempt,
                     "tool_round": tool_round,
@@ -2583,7 +1630,7 @@ class WorkspaceCodeAgentRuntime:
                 },
             )
             response = self.openai_client.generate_agent_turn(
-                schema_name="workspace_code_agent_turn_v1",
+                schema_name="workspace_code_agent_action_v1",
                 schema=agent_schema,
                 system_prompt=self._agent_system_prompt(),
                 user_prompt=user_prompt,
@@ -2604,9 +1651,9 @@ class WorkspaceCodeAgentRuntime:
             if isinstance(payload, str):
                 payload = json.loads(payload)
             parsed_payload = payload if isinstance(payload, dict) else {}
-            raw_operations = parsed_payload.get("operations")
+            raw_draft_actions = parsed_payload.get("draft_actions")
             raw_tool_requests = parsed_payload.get("tool_requests")
-            operation_count = len(raw_operations) if isinstance(raw_operations, list) else 0
+            draft_action_count = len(raw_draft_actions) if isinstance(raw_draft_actions, list) else 0
             tool_request_count = len(raw_tool_requests) if isinstance(raw_tool_requests, list) else 0
             duration_ms = int((time.perf_counter() - turn_started_at) * 1000)
             self._append_agent_diagnostic(
@@ -2622,12 +1669,12 @@ class WorkspaceCodeAgentRuntime:
                     "status": "completed",
                     "model": job.llm_model,
                     "outcome": str(parsed_payload.get("outcome") or ""),
-                    "operation_count": operation_count,
-                    "operation_files": [
+                    "draft_action_count": draft_action_count,
+                    "draft_action_files": [
                         str(item.get("file_path") or "")
-                        for item in raw_operations
+                        for item in raw_draft_actions
                         if isinstance(item, dict) and str(item.get("file_path") or "").strip()
-                    ] if isinstance(raw_operations, list) else [],
+                    ] if isinstance(raw_draft_actions, list) else [],
                     "tool_request_count": tool_request_count,
                     "tool_requests": [
                         {
@@ -2649,12 +1696,12 @@ class WorkspaceCodeAgentRuntime:
             self._append_event(
                 job,
                 "iteration_ready",
-                "Workspace code agent returned a structured turn.",
+                "Workspace code agent returned an agent turn.",
                 {
                     "attempt": attempt,
                     "tool_round": tool_round,
                     "outcome": str(parsed_payload.get("outcome") or ""),
-                    "operation_count": operation_count,
+                    "draft_action_count": draft_action_count,
                     "tool_request_count": tool_request_count,
                     "model": job.llm_model,
                     "input_tokens": int(turn_cache_stats.get("input_tokens") or 0),
@@ -2710,17 +1757,17 @@ class WorkspaceCodeAgentRuntime:
         return "insufficient_quota" in lowered or "exceeded your current quota" in lowered
 
     @staticmethod
-    def _agent_turn_schema(
+    def _agent_action_schema(
         *,
-        operation_limit: int = AGENT_TURN_OPERATION_LIMIT,
+        draft_action_limit: int = AGENT_TURN_DRAFT_ACTION_LIMIT,
         content_max_length: int = 18000,
         allow_tool_requests: bool = True,
         allowed_outcomes: list[str] | None = None,
-        allowed_operations: list[str] | None = None,
-        min_operations: int = 0,
+        allowed_draft_action_types: list[str] | None = None,
+        min_draft_actions: int = 0,
     ) -> dict[str, Any]:
         outcome_values = allowed_outcomes or ["patch_ready", "tool_request", "no_progress", "fatal_invalid_response"]
-        operation_values = allowed_operations or ["create", "replace", "delete", "patch"]
+        draft_action_values = allowed_draft_action_types or ["create", "replace", "delete", "patch"]
         return {
             "type": "object",
             "additionalProperties": False,
@@ -2735,26 +1782,32 @@ class WorkspaceCodeAgentRuntime:
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
-                            "tool": {"type": "string", "enum": ["list_files", "read_files", "search_files", "inspect_diff", "run_checks", "run_command"]},
+                            "tool": {
+                                "type": "string",
+                                "enum": sorted(AgentToolRegistry.names()),
+                            },
                             "mode": {"type": "string", "enum": ["exact", "final"]},
                             "targets": {"type": "array", "items": {"type": "string"}},
+                            "file_path": {"type": "string"},
                             "pattern": {"type": "string"},
                             "command": {"type": "string"},
+                            "content": {"type": "string"},
+                            "diff": {"type": "string"},
                             "reason": {"type": "string"},
                         },
                         "required": ["tool", "targets", "reason"],
                     },
                 },
-                "operations": {
+                "draft_actions": {
                     "type": "array",
-                    "minItems": max(0, int(min_operations)),
-                    "maxItems": operation_limit,
+                    "minItems": max(0, int(min_draft_actions)),
+                    "maxItems": draft_action_limit,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
                             "file_path": {"type": "string", "maxLength": 220},
-                            "operation": {"type": "string", "enum": operation_values},
+                            "operation": {"type": "string", "enum": draft_action_values},
                             "content": {"type": ["string", "null"], "maxLength": content_max_length},
                             "diff": {"type": ["string", "null"], "maxLength": content_max_length},
                             "reason": {"type": "string", "maxLength": 600},
@@ -2771,7 +1824,7 @@ class WorkspaceCodeAgentRuntime:
                 "assistant_message",
                 "diagnosis",
                 "tool_requests",
-                "operations",
+                "draft_actions",
                 "expected_verification",
                 "rationale_by_file",
                 "acceptance_checks",
@@ -2780,53 +1833,7 @@ class WorkspaceCodeAgentRuntime:
 
     @staticmethod
     def _agent_system_prompt() -> str:
-        return (
-            "You are a universal workspace code agent for a Telegram mini-app platform. "
-            "Work like a coding agent: inspect files, return source edits as operations, request read-only validation checks, and converge to a working app. "
-            "The user's prompt is the only source of requested behavior. Do not impose any generic queue, ticketing, lifecycle, or CRUD business model unless the prompt explicitly asks for it. "
-            "Existing template docs and files are technical shell context only. They must not override the user's domain. "
-            "Preserve the FastAPI + static-file shell, preview bridge, and role-root routing unless the user asks otherwise. "
-            "Every generated HTML route page, including role roots and child pages such as static/client/details/index.html, must include <script src=\"/static/preview_bridge.js\" defer></script>. Role root pages must also keep the role app script. "
-            "Generate normal light-mode interfaces by default: light backgrounds, dark readable text, clear contrast, restrained neutral colors, and no dark theme unless the user explicitly asks for dark mode. Do not give roles different color palettes; use one consistent light visual system across client, specialist, and manager. "
-            "Preserve the top safe spacing from the template shell; generated role CSS must not collapse the top padding of .page-shell. Do not put plain .page-shell padding or padding-top in role CSS unless it keeps max(76px, calc(var(--telegram-top-safe-offset) + 12px)). Put role layout spacing on inner wrappers when possible. "
-            "Visible generated UI copy must use the user's language. Do not paste raw prompt excerpts into the interface, and do not show technical role labels such as Client app, Specialist app, Manager app, source request, or Workspace suffixes unless the user explicitly asks for them. "
-            "For create tasks, build three separate role apps inside one miniapp shell: client, specialist, and manager. They share backend state, but their UI logic, actions, text, CSS, and workflow focus must be visibly different. "
-            "For create tasks and workflow behavior edits, first satisfy the extracted acceptance contract: roles, data resources, buttons, forms, APIs, cross-role visibility, and refresh persistence must all be covered by generated tests. "
-            "When a prompt says a button, form, list loading, post-submit visibility, or cross-role flow is broken, repair the whole workflow instead of making a narrow local patch. "
-            "Role apps must be isolated inside the UI: do not add in-app links from client to specialist/manager, from specialist to client/manager, or from manager to client/specialist. The platform shell chooses the role entry; each role app may only link to its own child pages. "
-            "Each role app.js must query and initialize only that role's pages and controls; specialist code must not query client role roots/selectors, manager code must not depend on client/specialist DOM, and tests must not require cross-role scripts on the wrong role page. "
-            "Create tasks must be multi-page when the prompt or role workflow needs separate surfaces: each role root is a dashboard/hub and each role must expose at least one prompt-specific child page. Additional pages/resources should come from the implementation plan and user prompt, not from a fixed count. "
-            "Use miniapp/app/generated/route_manifest.json to declare role routes for generated child pages. Prefer a compact routes map, either top-level \"routes\": {\"/client/details\": \"static/client/details/index.html\"} or per-role \"routes\" maps. "
-            "Never declare a route_manifest route unless its target file already exists or is created/replaced in the same operations array. "
-            "The three role surfaces must be different but connected parts of one prompt-derived business context: client creates and reviews user-submitted state, specialist processes work and changes operational status, and manager sees dashboard metrics, workload, and oversight controls. "
-            "Never leave a role as a neutral starter, generic preview, blank page, or placeholder surface. "
-            "For create tasks, never ship static-only mockups. Every generated app must be usable: users can fill forms, submit actions, and see saved state through backend APIs. "
-            "When one role app.js is loaded by multiple pages for that role, page-specific DOM selectors must be null-safe: guard missing elements before property access/event listeners or split the code by page so one child page cannot break another page's list/form loading. "
-            "JavaScript optional chaining cannot be used on the left side of an assignment; never write `element?.textContent = value`. Assign through a guarded variable or helper function. "
-            "Do not add mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded business records to generated app source. Start with empty persistent state and prompt-specific empty states; generated tests may create their own test payloads. "
-            "Every create task must create or replace real per-role CSS files at static/client/styles.css, static/specialist/styles.css, and static/manager/styles.css; placeholder CSS or missing role CSS is invalid. Child pages must link the matching role CSS. "
-            "In Fast create mode, build a compact working product with three distinct role apps, prompt-derived persistence exposed through GET and POST APIs, a status/update endpoint, frontend fetch/form/status code, compact role CSS, and generated tests that prove create/read/update persistence. Keep it small, but do not drop an essential prompt workflow just to fit an artificial one-resource shape. "
-            "In Balanced create mode, build deeper separate client/specialist/manager role apps around the prompt-derived data model, with connected workflows and meaningfully stronger UI than Fast: polished light-mode product UI, clear hierarchy, responsive role dashboards, refined forms/lists/status badges, and real CSS classes for spacing, typography, buttons, cards, and states without decorative bloat. "
-            "In Quality create mode, build detailed separate client/specialist/manager role apps with several API endpoints, create/list/update behavior where useful, robust empty/error states, richer role-specific CSS, and broader generated acceptance tests. Quality design quality must be top-tier and product-ready: highly refined layout, typography, spacing, accessible form states, empty/loading/error/success states, responsive data presentation, role-specific dashboards, and cohesive light visual design implemented in CSS, not just described in text. "
-            "For every create task, write generated app tests for both backend and frontend surfaces: miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. "
-            "Create-task Python tests must verify backend API behavior: GET starts empty, POST creates user-provided state, and a later GET returns it. "
-            "Generated tests must validate the requested behavior, all role roots, and shared role content without relying on network calls or non-template dependencies. "
-            "For edit tasks, preserve existing selectors, ids, and data-testid attributes that generated tests assert unless the requested behavior intentionally replaces them; when behavior changes test expectations, update the generated test file in the same patch. "
-            "Python generated tests run through FastAPI TestClient and see server-rendered HTML before browser JavaScript executes; do not assert JS-rendered item text there unless the text is also present in HTML source. Use Python tests for route status, preview bridge/static shell, and backend APIs when present. "
-            "Python generated tests must trigger FastAPI lifespan: use `with TestClient(app) as client:` inside tests or explicitly create SQLAlchemy tables in setUp/tearDown. Plain `self.client = TestClient(app)` is not enough for apps whose tables are created in lifespan. "
-            "JS generated tests are responsible for frontend source/data assertions; read role HTML/JS/shared data files directly with node:test, node:assert, and fs/path. "
-            "node:test does not export expect; generated_app.test.mjs must use import test from \"node:test\" and import assert from \"node:assert\" with assert.ok/assert.equal/assert.match. "
-            "Before writing generated_app.test.mjs, ensure every exact phrase asserted by includes() or match() is literally present in the file being read; prefer stable headings, route links, app title, and real selectors over paraphrased expectations. Do not assert exact opening tags or exact class attributes like `<main class=\"page-shell\">` or `class=\"page-shell\"`; use a regex that checks the page-shell class token and allows extra attributes/classes. "
-            "Generated JS tests execute from the miniapp directory, so file paths inside those tests must start with app/static/... or be resolved from import.meta.url to ../app/static; do not use miniapp/app/... in generated tests. "
-            "In generated JS tests, path/fs APIs require string paths: use path.join(process.cwd(), 'app/static/...') or fileURLToPath(new URL('../app/static/...', import.meta.url)); never pass a URL object directly to path.resolve, path.join, or fs. "
-            "In Fast create mode, if the provided file_contexts already include the role HTML shells and tests directory context, return a compact patch_ready response immediately instead of planning an exhaustive app architecture. "
-            "Tools are diagnostic only. They cannot write files, execute arbitrary scripts, install packages, fetch networks, or apply changes. "
-            "run_checks is a read-only platform validation snapshot for the current draft; run_command is diagnostic-only and limited to safe test/search/read commands. Neither tool can rewrite files. "
-            "All code changes must be returned in the operations array of the same structured JSON response. "
-            "Use hunk patches when small edits are enough. Use full-file create/replace only when creating or substantially rewriting a file. "
-            "Do not edit generated app tests or generated manifests to hide failures. For edits, update tests only when the requested app behavior changes; for fixes, repair app code unless a test expectation is clearly stale because of the requested change. "
-            "Return only the structured JSON payload requested by the schema."
-        )
+        return agent_system_prompt()
 
     def _agent_user_prompt(
         self,
@@ -2840,11 +1847,12 @@ class WorkspaceCodeAgentRuntime:
         repeated_no_progress: int,
         latest_execution: CheckExecutionRecord,
         latest_preview_details: dict[str, object],
-        seed_context: dict[str, str],
+        initial_context: dict[str, str],
         extra_file_context: dict[str, str],
         tool_results: list[dict[str, object]],
         last_turn_summary: str | None,
         latest_diff_summary: str | None,
+        agent_memory: dict[str, Any] | None = None,
     ) -> str:
         file_tree = self.workspace_service.file_tree(workspace_id, run_id=run_id)
         generation_mode = self._generation_mode(request.generation_mode)
@@ -2882,7 +1890,7 @@ class WorkspaceCodeAgentRuntime:
             focused_rules.extend(
                 [
                     "Focused visual_style_edit lane: change only CSS/style files listed in focused_edit_files. Do not edit HTML, JavaScript, backend routes, route_manifest.json, generated tests, docs, or unrelated files.",
-                    f"Return one compact patch_ready response with at most {FOCUSED_VISUAL_OPERATION_LIMIT} operations and no tool requests. Prefer full-file replace for CSS if a hunk patch would be ambiguous or has already conflicted.",
+                    f"Return one compact patch_ready response with at most {FOCUSED_VISUAL_DRAFT_ACTION_LIMIT} draft actions and no tool requests. Prefer full-file replace for CSS if a hunk patch would be ambiguous or has already conflicted.",
                 "Do not add business behavior, data, tests, API calls, navigation, or role copy for a pure style/color/spacing prompt.",
                     "CSS may use hex/rgb/hsl values for requested colors; the literal user color word does not need to appear in generated CSS.",
                     "Keep the existing top safe spacing and existing selectors/data-testid hooks intact while changing the visual styling.",
@@ -2907,8 +1915,8 @@ class WorkspaceCodeAgentRuntime:
             if compact_repair_prompt
             else {
                 **self._compact_file_contexts(
-                    seed_context,
-                    max_files=8 if focused_visual_edit else 22 if context_mode == "full_bundle" else 14,
+                    initial_context,
+                    max_files=8 if focused_visual_edit else 14,
                     max_chars=9000 if focused_visual_edit else 6000,
                 ),
                 **self._compact_file_contexts(extra_file_context, max_files=4 if focused_visual_edit else 12),
@@ -2943,20 +1951,31 @@ class WorkspaceCodeAgentRuntime:
             "tool_round": tool_round,
             "context_mode": context_mode,
             "repeated_no_progress": repeated_no_progress,
+            "agent_memory": agent_memory or {},
+            "environment_snapshot": self._compact_jsonish(
+                self.environment_snapshots.get(run_id) or {},
+                max_chars=700,
+                max_items=6,
+            ),
+            "latest_turn_diff": self._compact_jsonish(
+                self.turn_diff_tracker.latest_summary(run_id),
+                max_chars=900,
+                max_items=6,
+            ),
+            "tool_registry": self._agent_tool_registry_payload(),
             "repair_focus": (
                 "Create or replace both missing generated test files now: miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. In the same coherent patch, also fix the first API/frontend schema mismatch from latest_checks if one is listed. Do not spend this turn only on CSS, copy, or a single frontend mismatch while generated tests are absent."
                 if missing_generated_tests_repair
                 else
-                "Repair the connected workflow slice from latest_checks in one coherent patch. Return 2-5 operations touching only the named backend/role/test files; keep selectors, payloads, routes, and generated tests aligned together."
+                "Repair the connected workflow slice from latest_checks in one coherent patch. Return 2-5 draft actions touching only the named backend/role/test files; keep selectors, payloads, routes, and generated tests aligned together."
                 if workflow_slice_repair
-                else "Patch only the first concrete blocking issue from latest_checks. Return 1-2 operations touching only the named file(s); do not repair all failures in one turn."
+                else "Patch only the first concrete blocking issue from latest_checks. Return 1-2 draft actions touching only the named file(s); do not repair all failures in one turn."
                 if compact_repair_prompt
                 else ""
             ),
             "user_prompt": request.prompt,
             "error_context": request.error_context.model_dump(mode="json") if request.error_context else None,
             "role_scope": list(request.target_role_scope or ROLE_ORDER),
-            "fast_create_required_file_set": [],
             "file_tree": file_tree[:80] if compact_repair_prompt else file_tree[:120] if focused_visual_edit else file_tree[:240],
             "file_contexts": file_context_payload,
             "context_pack": (
@@ -3003,73 +2022,62 @@ class WorkspaceCodeAgentRuntime:
                 )
                 if compact_repair_prompt
                 else [
-                *focused_rules,
-                f"Outside focused edit lanes, keep each turn applyable: return up to {AGENT_TURN_OPERATION_LIMIT} independent file operations together when they are part of the same coherent change.",
-                "For create and behavior_workflow_edit tasks, treat acceptance_contract as blocking app scope: every listed flow must have UI controls, JavaScript handlers, backend API persistence, cross-role visibility, refresh persistence, and generated tests.",
-                "If focused_edit_kind is behavior_workflow_edit, do not make a narrow one-file cosmetic fix. Repair the full user workflow across backend, client, specialist, manager, and generated tests so the scenario can run end to end.",
-                "For Balanced and Quality workflow runs, follow the orchestration ownership lanes: backend/API, client UI, specialist UI, manager UI, and generated tests should be reasoned as separate workstreams, then merged without overlapping ownership conflicts.",
-                "Implement the prompt-derived flow generically: one role creates/submits user-provided state, another processes or updates it, and manager reviews persisted state and summary information. Do not switch into a hard-coded domain template.",
-                "For Fast create tasks, the first model answer should usually be outcome=patch_ready, not tool_request or no_progress, because the template file_contexts already provide the shell.",
-                "For Fast create tasks, output one compact working product pass instead of a giant app: cover route_manifest.json, three role roots, at least one useful child page per role, role app.js files, role styles.css files, prompt-derived backend API persistence, main.py router registration, generated tests, and form/fetch/status code. Avoid verbose comments, inline styles, large fixtures, and repeated tool reads for files already shown in file_contexts.",
-                "Fast size guidance: keep the UI compact and focused, but do not remove a prompt-required entity, button, field, or workflow just to force a one-resource template. Use one consistent neutral light palette across roles.",
-                "For Fast create tasks, do not spend first-patch operations on miniapp/app/routes/role_routes.py, miniapp/app/generated/models.py, or miniapp/app/static/shared/base.css unless the existing shell truly requires it.",
-                "For Fast create tasks, include the smallest backend needed for the prompt-derived data model with GET, POST, and PATCH/status update; do not fall back to frontend-only/static-only pages.",
-                "For Balanced create tasks, include deeper separate client/specialist/manager apps around the prompt-derived entities and meaningful status/update endpoints, so roles share real saved state.",
-                "Balanced design quality: make the UI materially more polished than Fast with clean light-mode hierarchy, responsive dashboards, refined forms/lists/status badges, and meaningful CSS classes for spacing, typography, buttons, cards, and states.",
-                "For Quality create tasks, include detailed separate role workflows, prompt-derived backend endpoints, create/list/update behavior where useful, richer role-specific CSS, and broader generated Python/JS acceptance tests.",
-                "Quality design quality: make the app look production-ready with highly refined layout, typography, spacing, responsive data presentation, accessible interaction states, empty/loading/error/success states, and cohesive light visual design implemented in CSS.",
-                "For Fast create tasks, do not stop after only three role hub pages. Include one key child page per role in the same first create patch whenever possible.",
-                "For every create task, distribute the first create patch evenly: replace all three role roots, create required child pages for each role before adding extra pages to any one role, create route_manifest.json, and create both generated test files. A client-only first patch will be rejected.",
-                "Each role should have at least two routeable pages when creating from scratch: /<role> plus a prompt-derived /<role>/<slug> page. Additional pages are optional and should exist only when the extracted plan needs them.",
-                "Do not declare child/profile/settings routes unless you also create those exact files in the same response or they already exist. If staging the work, wait to add child routes until creating their files.",
-                "Do not copy a fixed page pattern such as profile/settings unless the user explicitly asked for it; child pages should come from the user's request.",
-                "Each role root should visibly link only to its own child pages and implement role-specific workflow rather than reusing the same list page for all roles. Do not include links between client, specialist, and manager role roots.",
-                "If a role app.js is shared across role child pages, initialize each page only when its DOM elements exist. Do not call render/list/form functions that dereference missing elements on another child page.",
-                "For create tasks, do not include mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded business records in generated app source.",
-                "For create tasks, app state starts empty. Use prompt-specific empty-state copy plus forms/buttons so users can add their own records.",
-                "For Fast create tasks, keep each generated HTML/JS/CSS/test file compact and use zero preloaded business records.",
-                "For Fast create tasks, create the required role CSS files for client, specialist, and manager, but keep them compact and consistent instead of building a large visual system.",
-                "Use light mode by default for all generated UI: light surfaces, dark text, accessible contrast, and no dark backgrounds unless the user explicitly requested dark mode.",
-                "For broad create tasks, batch independent backend/static/style files in one response when the changes are clear; otherwise patch the most important working slice first and continue after checks.",
-                "For create tasks, generate client, specialist, and manager role roots even if the prompt mentions only one audience.",
-                "Each role root must be prompt-specific, non-placeholder, and connected to the same user-requested context; specialist is required and cannot remain the starter screen.",
-                "For create tasks, include dependency-free generated tests in miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs.",
-                "For create tasks, generated Python tests must cover persistent API behavior: GET returns an empty list first, POST creates a user-supplied record, and a later GET returns the created record.",
-                "Python generated tests should use unittest plus FastAPI TestClient to verify role routes and backend/API behavior when backend state exists.",
-                "Python generated tests must trigger app lifespan with `with TestClient(app) as client:` or explicitly create SQLAlchemy tables before requests.",
-                "JS generated tests should use node:test plus node:assert plus fs/path only to verify role HTML/JS content, shared domain labels, role-specific selectors/actions, and absence of neutral template text; do not import or call expect.",
-                "In generated_app.test.mjs, only assert exact strings that literally appear in the file being read; do not paraphrase expected UI text, require unused button ids, or assert exact opening tags that may gain platform safe-area attributes.",
-                "Do not make Python TestClient tests assert text that is only rendered by browser JavaScript; either include the text in HTML source or move that assertion to generated_app.test.mjs.",
-                "When role content is populated from a shared JS data file, JS generated tests should read that data/source file directly and assert the shared item names there.",
-                "Generated JS tests run with cwd=miniapp, so read app/static/<role>/... paths or resolve from import.meta.url to ../app/static; never prefix paths with miniapp/app/ inside the test.",
-                "In generated_app.test.mjs, prefer path.join(process.cwd(), 'app/static/<role>/index.html') for fixture paths. If using import.meta.url, wrap new URL(...) with fileURLToPath(...) before passing it to path/fs APIs.",
-                "For edit/refine tasks, update generated tests when the requested behavior changes so the new behavior is covered.",
-                "For edit/refine tasks, preserve existing ids/selectors/data-testid values that tests or existing scripts rely on, unless you update the affected generated test in the same response.",
-                "For edit/refine/fix/repair tasks, use patch-first operations for existing files: return unified hunk diffs instead of whole-file replace whenever the target file already exists.",
-                "For edit/refine/fix/repair tasks, full-file replace is only acceptable for new files, tiny existing files, create-mode work, or one conflicted file after a patch apply conflict.",
-                "For edit/refine tasks, keep the patch focused on one visible slice in the requested role files and usually return 1-2 operations: one small app-code patch plus one generated-test patch when tests need new expectations.",
-                "For edit/refine tasks, keep the response compact; prefer a hunk patch under 200 changed lines over a whole-file rewrite for feature additions.",
-                "For edit/refine tasks, do not rewrite the whole app or unrelated files; make the smallest complete visible change that satisfies the prompt.",
-                "If generated_app_python_tests or generated_app_js_tests failed, read the failure logs in latest_checks and patch the app or generated tests so that exact failure changes on the next attempt; do not repeat app-only patches that leave the same generated test failure.",
-                "If role_scope contains only client, prioritize miniapp/app/static/client files and do not change backend unless the prompt explicitly asks for API/data changes.",
-                "If role_scope contains only manager, prioritize miniapp/app/static/manager files and do not change backend unless the prompt explicitly asks for API/data changes.",
-                "Every generated HTML route page must include /static/preview_bridge.js; role root pages should place it before the role app script. If a check reports page_missing_preview_bridge, patch only the missing script tag instead of rewriting the whole app.",
-                "If a check reports build.missing_static_page for route_manifest, either create that exact HTML file or remove the route from route_manifest; do not rewrite unrelated pages.",
-                "Prefer targeted patch operations over full-file replace when the file already exists; the runtime may convert large existing-file replaces into unified diffs.",
-                "If the latest turn reports a patch apply conflict, return a full-file replace for that conflicted file unless the exact corrected hunk is obvious.",
-                "If you need more context, request list_files/read_files/search_files/inspect_diff/run_checks/run_command.",
-                "Tools are read-only diagnostics. They cannot write files, install packages, fetch networks, or apply edits.",
-                "run_checks only returns a platform validation snapshot for the current draft. run_command can only run safe diagnostics such as python -m unittest, python -m py_compile, node --test, node --check, rg, sed, and ls.",
-                "If you have enough context, return outcome=patch_ready with operations.",
-                "All writes must be represented as operations. Never wait for a tool to write code for you.",
-                "Every create or replace operation must include full resulting file content.",
-                "Every patch operation must include a unified diff for exactly file_path.",
-                "Do not create generic queue, ticketing, lifecycle, or CRUD language unless the prompt asks for it.",
-                "Do not return no_progress unless you can explain the exact unresolved blocker.",
+                    *focused_rules,
+                    f"Keep each turn applyable: return up to {AGENT_TURN_DRAFT_ACTION_LIMIT} coherent draft actions, or request only the specific tools needed for the next patch.",
+                    "Use the implementation_plan and acceptance_contract as the product contract. Derive entities, fields, routes, labels, and role actions from the user's prompt and current code, not from platform templates.",
+                    "Create/workflow completion requires real UI controls, JavaScript handlers, backend persistence, generated tests, cross-role visibility, refresh persistence, and browser/mobile proof.",
+                    "Build three isolated role surfaces in the miniapp shell: client creates/submits the main prompt-derived state, specialist processes or updates it, manager reviews/control-checks the persisted state. Do not link role roots to each other.",
+                    "Fast should be compact and working; Balanced should add moderate workflow/design depth; Quality should first get the workflow green, then add a polished mobile design pass. Never add pages or resources just to satisfy a fixed count.",
+                    "Mobile-first: target Telegram widths around 360-430px, use light surfaces unless the user asked otherwise, preserve safe top spacing/preview bridge, and avoid horizontal scroll or overlapping cards/forms/actions.",
+                    "Generated source must start empty: no mock, seed, demo, sample, fixture, preloaded, or hard-coded business records. Empty states and validation test payloads are allowed.",
+                    "Generated tests must verify the actual app contract: persistent API create/list/update, real role HTML/JS selectors, role-specific actions, and no stale UI-only controls. Patch tests only when they are stale with the app contract.",
+                    "For edit/refine/fix/repair, patch existing files with small unified diffs. Use full-file replace only for new files, tiny files, create-mode work, or a file that repeatedly conflicts.",
+                    "If checks/browser proof fail, repair the concrete failing slice from latest_checks/tool_results: align selectors, payload fields, API routes, rendered state, and tests together. Do not rewrite unrelated files.",
+                    "Read-only tools never write files. Mutating tools are serialized through the draft edit validator. run_command is limited to safe diagnostics such as unittest, py_compile, node tests/checks, rg, sed, and ls.",
+                    "If you have enough context, return outcome=patch_ready with explicit draft_actions or mutating draft tool requests. Do not return no_progress unless the blocker is exact and external.",
                 ]
             ),
         }
         return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _agent_tool_registry_payload() -> dict[str, dict[str, object]]:
+        payload: dict[str, dict[str, object]] = {}
+        for name in sorted(AgentToolRegistry.names()):
+            spec = AgentToolRegistry.spec(name)
+            if spec is None:
+                continue
+            payload[name] = {
+                "kind": spec.kind,
+                "concurrency_safe": spec.concurrency_safe,
+                "timeout_seconds": spec.timeout_seconds,
+                "output_cap_chars": spec.output_cap_chars,
+                "activity": spec.activity,
+                "progress_label": spec.progress_label,
+            }
+        return payload
+
+    @staticmethod
+    def _worker_prefix_payload(
+        *,
+        implementation_plan: dict[str, Any],
+        acceptance_contract: dict[str, Any],
+        semantic_graph: dict[str, Any],
+        current_diff_summary: str,
+    ) -> dict[str, Any]:
+        return {
+            "system_contract": {
+                "agent_style": "plan, inspect, patch, verify, repair",
+                "source_of_truth": "user prompt, current code, validation, and browser proof",
+                "domain_binding": "none",
+                "completion_gate": "strict checks plus real browser/mobile proof",
+            },
+            "implementation_plan": WorkspaceCodeAgentRuntime._compact_jsonish(implementation_plan, max_chars=1400, max_items=10),
+            "acceptance_contract": WorkspaceCodeAgentRuntime._compact_acceptance_contract(acceptance_contract),
+            "semantic_graph": WorkspaceCodeAgentRuntime._compact_jsonish(semantic_graph.get("graph") if isinstance(semantic_graph, dict) else {}, max_chars=1400, max_items=10),
+            "current_diff_summary": current_diff_summary,
+            "worker_directive_slot": "<owned worker directive is appended separately>",
+        }
 
     def _context_pack_payload(
         self,
@@ -3138,9 +2146,9 @@ class WorkspaceCodeAgentRuntime:
     @staticmethod
     def _repair_context_paths(*, failed_paths: list[str], diff_paths: list[str]) -> list[str]:
         ordered: list[str] = []
-        seed_paths = failed_paths or diff_paths
+        context_paths = failed_paths or diff_paths
         supporting_paths: list[str] = []
-        if any(path.endswith("miniapp/tests/test_generated_app.py") or path == "miniapp/tests/test_generated_app.py" for path in seed_paths):
+        if any(path.endswith("miniapp/tests/test_generated_app.py") or path == "miniapp/tests/test_generated_app.py" for path in context_paths):
             supporting_paths.extend(["miniapp/app/routes/app_api.py", "miniapp/app/schemas.py", "miniapp/app/main.py", "miniapp/app/db.py"])
             supporting_paths.extend(
                 [
@@ -3150,13 +2158,13 @@ class WorkspaceCodeAgentRuntime:
                     and path.endswith((".html", ".js"))
                 ][:9]
             )
-        if any(path.endswith("miniapp/tests/generated_app.test.mjs") or path == "miniapp/tests/generated_app.test.mjs" for path in seed_paths):
+        if any(path.endswith("miniapp/tests/generated_app.test.mjs") or path == "miniapp/tests/generated_app.test.mjs" for path in context_paths):
             supporting_paths.extend([path for path in diff_paths if path.startswith("miniapp/app/static/") and path.endswith((".html", ".js"))][:4])
-        if any("/routes/" in path for path in seed_paths):
+        if any("/routes/" in path for path in context_paths):
             supporting_paths.extend(["miniapp/app/schemas.py", "miniapp/app/main.py", "miniapp/app/db.py", "miniapp/tests/test_generated_app.py"])
         for role in ROLE_ORDER:
             role_prefix = f"miniapp/app/static/{role}/"
-            if any(path.startswith(role_prefix) and path.endswith((".html", "app.js", "styles.css")) for path in seed_paths):
+            if any(path.startswith(role_prefix) and path.endswith((".html", "app.js", "styles.css")) for path in context_paths):
                 supporting_paths.extend(
                     [
                         path
@@ -3174,8 +2182,8 @@ class WorkspaceCodeAgentRuntime:
                         "miniapp/tests/generated_app.test.mjs",
                     ]
                 )
-        for path in [*seed_paths, *supporting_paths]:
-            normalized = str(path or "").strip().replace("\\", "/").lstrip("./")
+        for path in [*context_paths, *supporting_paths]:
+            normalized = self._strip_leading_dot_slash(path)
             if normalized and normalized.startswith("miniapp/") and normalized not in ordered:
                 ordered.append(normalized)
 
@@ -3219,6 +2227,7 @@ class WorkspaceCodeAgentRuntime:
             "mode": orchestration.get("mode"),
             "workflow_kind": orchestration.get("workflow_kind"),
             "execution_style": orchestration.get("execution_style"),
+            "isolated_worker_drafts": bool(orchestration.get("isolated_worker_drafts")),
             "phases": [
                 {
                     "id": item.get("id"),
@@ -3459,6 +2468,98 @@ class WorkspaceCodeAgentRuntime:
             return None
         return report_key
 
+    def _attach_context_pressure(
+        self,
+        *,
+        job: JobRecord,
+        workspace_id: str,
+        run_id: str,
+        prompt_payload: str,
+        attempt: int,
+        tool_round: int,
+    ) -> str:
+        try:
+            payload = json.loads(prompt_payload)
+        except json.JSONDecodeError:
+            payload = {"raw_prompt": prompt_payload}
+        pressure = self.context_pressure.analyze_payload(payload)
+        pressure.update({"attempt": attempt, "tool_round": tool_round, "created_at": datetime.now(timezone.utc).isoformat()})
+        artifact_run_id = run_id or job.job_id
+        self.context_pressure_history.setdefault(artifact_run_id, []).append(pressure)
+        job.context_pressure_ref = job.context_pressure_ref or f"context_pressure:{workspace_id}:{artifact_run_id}"
+        self._store_report(
+            job.context_pressure_ref,
+            {
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "items": self.context_pressure_history.get(artifact_run_id, [])[-200:],
+            },
+        )
+        payload["context_pressure"] = {
+            "total_tokens_estimate": pressure.get("total_tokens_estimate"),
+            "pressure_ratio": pressure.get("pressure_ratio"),
+            "compact_recommended": pressure.get("compact_recommended"),
+            "suggestions": pressure.get("suggestions"),
+        }
+        if pressure.get("compact_recommended"):
+            self._append_activity(
+                job,
+                "context_suggestion",
+                "Context pressure suggests compacting next turn",
+                {
+                    "phase": "compacting",
+                    "status": "recommended",
+                    "artifact_ref": job.context_pressure_ref,
+                    "summary": "Use failing files, current diff, and proof packet instead of broad context.",
+                    "total_tokens_estimate": pressure.get("total_tokens_estimate"),
+                    "pressure_ratio": pressure.get("pressure_ratio"),
+                },
+                save=False,
+            )
+            self.rollout_trace.append(artifact_run_id, "context_suggestion", pressure)
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _record_hook(
+        self,
+        *,
+        job: JobRecord,
+        hook: str,
+        status: str = "completed",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        artifact_run_id = job.linked_run_id or job.job_id
+        try:
+            event = self.hook_manager.record(artifact_run_id, hook, status=status, payload=payload or {})  # type: ignore[arg-type]
+        except Exception:
+            return
+        job.hook_trace_ref = job.hook_trace_ref or f"hook_trace:{job.workspace_id}:{artifact_run_id}"
+        self._store_report(
+            job.hook_trace_ref,
+            {
+                "workspace_id": job.workspace_id,
+                "run_id": job.linked_run_id,
+                **self.hook_manager.snapshot(artifact_run_id),
+                "activity_hooks": [
+                    item
+                    for item in job.agent_activity_events
+                    if str(item.get("type") or "") in {"hook_started", "hook_completed"}
+                ][-500:],
+            },
+        )
+        self._append_activity(
+            job,
+            "hook_completed" if status != "started" else "hook_started",
+            f"{hook.replace('_', ' ')} {status}",
+            {
+                "hook": hook,
+                "status": status,
+                "artifact_ref": job.hook_trace_ref,
+                **dict(payload or {}),
+            },
+            save=False,
+        )
+        self.rollout_trace.append(artifact_run_id, f"hook_{hook}", event)
+
     @staticmethod
     def _tool_result_json(item: dict[str, object]) -> str:
         try:
@@ -3479,92 +2580,25 @@ class WorkspaceCodeAgentRuntime:
         workflow_slice_repair: bool = False,
         missing_generated_tests_repair: bool = False,
     ) -> list[str]:
-        mode_value = str(getattr(generation_mode, "value", generation_mode) or "")
+        del generation_mode, focused_edit_kind
         rules = [
-            "This is a compact repair turn for an already generated draft. Do not rebuild the whole app.",
+            "This is a compact code-agent repair turn for the current draft. Do not rebuild the whole app unless the failing file is missing.",
+            "Read the latest check/browser diagnostics as the source of truth, patch the smallest connected slice, then let validation run again.",
+            "Prefer patch draft actions for existing files. Use full replace only for a new/missing/tiny file or after a repeated apply conflict on that same file.",
+            "Keep the app prompt-owned and prompt-derived: do not introduce platform templates, seed/demo/mock business records, or fixed resource/page names.",
+            "For create/workflow failures, keep HTML controls, JavaScript handlers, API routes/schemas, persistence, and generated tests aligned to one actual contract.",
+            "Browser-flow failures are product failures: make the UI action change persisted state, make other roles observe it, and make reload preserve it.",
+            "Generated tests should verify the actual app contract. Patch stale/brittle test expectations only when the app behavior is already correct.",
+            "Mobile layout fixes must target 360-430px width: no horizontal scroll, no overlapping critical cards/forms/actions, and readable wrapping.",
         ]
         if workflow_slice_repair:
-            rules.extend(
-                [
-                    "The latest checks describe one connected workflow slice, not independent cosmetic problems. Patch the named backend/API, role HTML/JS/CSS, and generated tests together so selectors, form fields, payloads, routes, and assertions agree.",
-                    "Use a small multi-file patch for the connected slice. Do not spend separate turns on each stale generated-test phrase when the test file can be made durable in one operation.",
-                ]
+            rules.append(
+                "Repair the complete connected workflow slice in one focused patch: relevant backend route/schema, one or more role HTML/JS/CSS files, and generated tests if they are stale."
             )
-            if missing_generated_tests_repair:
-                rules.append(
-                    "Generated app tests are missing. Create both miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs in this turn, using the actual current backend routes, schemas, selectors, and role files from file_contexts/latest_checks. Do not defer missing tests to another turn."
-                )
-        else:
-            rules.extend(
-                [
-                    "Patch the first concrete blocking issue only. One good 1-file patch is better than a broad partial rewrite.",
-                    "Repair only the highest-priority failed latest_checks in this turn; if several checks fail, touch the first 1-2 concrete locations from logs/diagnostics and let the next turn handle the rest.",
-                ]
+        if missing_generated_tests_repair:
+            rules.append(
+                "Create missing generated Python and JS tests from the actual current routes, selectors, schemas, and role files; do not invent a separate test-only contract."
             )
-        rules.extend([
-            "Prefer patch operations for existing files. Use full replace only when a file is tiny, newly created, or a previous patch conflict makes a hunk unsafe.",
-            "Keep create invariants intact: three isolated role apps, role CSS, preview_bridge on pages, no seed/mock/demo/preloaded business records, backend GET/POST/PATCH persistence, cross-role visibility, and generated Python/JS tests.",
-            "If generated Python/JS tests failed, patch the app and the exact stale/incorrect test expectation together when the requested behavior requires it.",
-            "Never satisfy a generated test by adding one role's app script to another role page. Role pages must load only their own role app script; stale cross-role generated-test assertions must be corrected.",
-            "If generated_app_python_tests reports NO TESTS RAN, rewrite miniapp/tests/test_generated_app.py as unittest-discoverable tests with a unittest.TestCase subclass and test_* methods.",
-            "If generated_app_python_tests reports AssertionError: 422 not found in [200, 201], the POST payload and Pydantic create schema are mismatched. Patch the API schema/routes and/or test payload together so required create fields are present and the request returns 200/201; do not keep retrying only the test file.",
-            "If generated_app_python_tests reports AssertionError: 422 != 200 or 422 != 201, treat it the same way: align backend create schema, frontend FormData/payload field names, and generated Python/JS test payloads in one connected patch. Prefer the actual backend field names when the app already works consistently.",
-            "If generated tests use prompt-derived aliases that do not exist in the backend schema, such as preferred_date/comment/visit_status while the API owns lesson_date/notes/attendance, patch both generated test files to the actual schema names or patch backend/frontend to a single consistent contract. Do not add duplicate alias fields unless the UI needs them.",
-            "If generated_app_python_tests reports that a path-id PATCH payload duplicates the id field, remove that id from the JSON body or add it to the patch schema only when the real frontend/backend workflow needs it. The endpoint path already identifies the record.",
-            "If generated_app_python_tests reports sqlite no such table, patch backend table creation or the tests: SQLAlchemy Base.metadata.create_all(bind=engine) must run before TestClient requests, and tests using lifespan-created tables must use `with TestClient(app) as client:`.",
-            "If generated_app_python_tests reports SQLAlchemy NoForeignKeysError, patch the model relationship and column definitions together: add the missing ForeignKey or remove relationship()/back_populates and query by id explicitly.",
-            "If generated_app_python_tests reports AttributeError for a missing ORM/model field, align the field names across the ORM model, schemas, route payload builder, frontend payload, and generated tests. Do not serialize fields that are not persisted.",
-            "If platform_invariants reports preflight.route_schema_contract, patch the backend route module and app/schemas.py together: either define the imported schema classes or rename the route imports/endpoints to use the schema classes that actually exist. Do not touch tests only.",
-            "If frontend_interaction_static_smoke reports a form without a handler or form fields not read by JavaScript payload, patch the role HTML form id/name attributes and that role app.js submit handler/payload together so every visible required control is wired to POST/PATCH and refreshes the list.",
-            "If frontend_interaction_static_smoke reports workflow_form_field_not_submitted, do not rename the backend blindly. First align the visible HTML `name=\"...\"` fields with the FormData.get(...) keys and JSON payload in that role app.js; then align backend schemas/tests only if the prompt-required field should be persisted.",
-            "If frontend_interaction_static_smoke reports workflow_button_without_handler for a concrete #button-id, patch that role app.js to reference the exact id string and attach a click handler, or change that HTML control into a plain link/remove it. Do not keep adding handlers for a different id.",
-            "If frontend_interaction_static_smoke reports workflow_frontend_backend_field_mismatch, patch the named role HTML/JS and the backend create/update schemas/routes together. Either make the frontend submit only fields accepted by the backend, or add those prompt-required fields to the ORM model, create schema, response schema, and GET persistence. For specialist/manager create forms, do not leave POST payloads that 422 because they omit client-only required fields.",
-            "If frontend_interaction_static_smoke reports workflow_frontend_backend_required_field_missing, patch the visible form, role JS payload, backend create schema, and generated tests to one contract. Either submit the required fields or make nonessential backend fields optional/defaulted.",
-            "If frontend_interaction_static_smoke reports workflow_patch_payload_field_mismatch, patch the role action and backend patch schema together so PATCH sends only accepted persisted fields, or add the prompt-required fields to the model, patch schema, output schema, and GET response.",
-            "If frontend_interaction_static_smoke reports workflow_api_envelope_not_unwrapped, either return a plain list from GET consistently or patch every role app.js list loader to read `payload.items` before calling array methods.",
-            "If platform_invariants reports role_route_manifest_incomplete, patch generated/route_manifest.json to include every generated role root and child page. Do not rely on implicit filesystem inference for role pages.",
-            "If generated_app_python_tests or generated_app_js_tests fail because they assert `<main class=\"page-shell\">`, exact `class=\"page-shell\"`, or exact `id=\"...\"` quote style, patch the generated tests to assert class/id tokens with regex allowing single or double quotes and extra attributes; do not remove platform safe-area style or rewrite working HTML only to satisfy brittle quote assertions.",
-            "If generated_app_python_tests fails with `AssertionError: '<phrase>' not found in '<!doctype html>` from a route-shell/title assertion, patch miniapp/tests/test_generated_app.py to remove the exact phrase assertion and keep durable route shell checks. Do not rewrite working UI copy only to satisfy a stale test phrase.",
-            "If generated_app_python_tests fails only because POST returned 201 while the test expected 200, patch the generated test to accept both 200 and 201. Do not change a semantically correct create endpoint just to satisfy a brittle test.",
-            "If generated_app_js_tests reports `.text is not a function` for `new URL(...)`, patch generated_app.test.mjs to use fs.readFileSync with a string path or fileURLToPath; URL objects do not have a .text() method in Node tests.",
-            "If generated_app_js_tests reports ENOENT for app/static/generated/route_manifest.json, patch generated_app.test.mjs to read app/generated/route_manifest.json from the miniapp working directory.",
-            "If generated_app_js_tests reports ENOENT for a path under `miniapp/static/<role>/...`, patch generated_app.test.mjs to prefix route_manifest targets with `app/` before reading source files. Do not change route_manifest browser targets to source-tree paths.",
-            "If generated app tests require selectors, route slugs, data attributes, or ids that do not exist in the generated source, patch the tests to the actual manifest/HTML/JS contract unless the UI itself is missing a required workflow.",
-            "If generated_app_js_tests fails with `missing href=\"/...\"`, patch miniapp/tests/generated_app.test.mjs to remove the exact back-link/navigation literal and verify route_manifest plus role assets/workflow controls instead. Do not add decorative links just to satisfy a brittle test.",
-            "If generated_app_js_tests asserts a quoted string containing `${...}`, patch generated_app.test.mjs to evaluate it as a template literal or precomputed expected string; do not assert the literal characters `${role}`.",
-            "If changed_files_static reports `Invalid left-hand side in assignment` for optional chaining, patch the exact JS line from `node --check`: replace `node?.textContent = value` with `if (node) node.textContent = value` or a safe helper.",
-            "If changed_files_static reports NameError for an undefined helper/import, patch the exact backend or test file that references it: define the helper before use, import it, or replace it with a standard expression such as datetime.now(timezone.utc). Do not retry unrelated frontend files.",
-            "If generated Python tests get 404 on PATCH /api/<resource>/{id}, add or align a path-id PATCH endpoint and update frontend/tests to use the same route shape.",
-            "If generated Python tests get 404 on GET or POST /api/<resource> while the route module exists, patch main.py to include the app API router, for example app.include_router(app_api.router) or app.include_router(app_api_router). Do not change working tests to hide an unregistered route.",
-            "If generated Python tests fail with an AssertionError for an unsupported or missing field, either add that exact field to the backend model/create/update/output schemas and persist it through GET, or remove the stale assertion from the generated test. The test and API schema must match exactly.",
-            "If changed_files_static reports FastAPI Invalid args for response field involving sqlalchemy.orm.session.Session, patch endpoint signatures so every Session parameter uses Depends(get_db_session) or Depends(get_db), never next(get_db_session())/SessionLocal() defaults, and make the dependency a normal yield function without @contextmanager.",
-            "If generated_app_js_tests fails because it expects a string missing from the file it reads, either add the real missing UI/JS control or update the test to assert a literal string that exists in the relevant generated source.",
-            "If generated_app_js_tests expects an optional refresh/filter button id that the current UI no longer contains, patch the test to verify the actual required workflow controls (form id, submit button, JS handler, fetch method, /api path) instead of reintroducing decorative controls.",
-            "If generated_app_js_tests compares HTML link/script tags, assert browser paths like `/static/<role>/styles.css` and `/static/<role>/app.js`; source files read from `app/static/...` will not appear literally in href/src attributes.",
-            "If generated_app_js_tests reports several stale literal includes()/match() assertions, replace or patch miniapp/tests/generated_app.test.mjs once so it verifies durable selectors, form ids, handlers, methods, and /api flows for all roles; do not spend one repair turn per text phrase.",
-            "If generated_app_js_tests expects a button id inside a script but the real app binds a parent form/data-selector handler, patch the test to verify the actual selector, addEventListener, method, and /api flow instead of requiring an unused id string.",
-            "If generated_app_js_tests expects a regex like /fetch\\(API_PATH/ or any exact API constant name, patch miniapp/tests/generated_app.test.mjs to assert semantic API wiring instead: fetch exists, /api/resource markers exist, the expected method exists, and the actual handler is bound.",
-            "If generated_app_js_tests reports `missing token <id>` on a role root page while the id exists on that role's child page, patch generated_app.test.mjs to assert the id only in the child page from route_manifest; do not duplicate workflow forms/buttons on every role page.",
-            "If generated_app_js_tests fails on `html.includes('id=\"...\"')` for one hard-coded role page, patch generated_app.test.mjs to search all actual HTML files for that role from route_manifest and pass when the control exists on any correct role surface; only add UI if no role page has the required control.",
-            "Generated JS tests should not require exact fetch('/api/...') literals when the app uses API_ROOT/API_BASE constants or template literals; assert /api, resource names, methods, and real controls instead.",
-            "Generated JS tests should not require a regex like /\\/api\\/records/ when app code uses `pathBase = '/api'` and `${pathBase}/records`; update the test to check both pieces instead of changing working app code.",
-            "Generated JS tests must respect role workflow split: client JS usually needs POST/create, while specialist or manager JS owns PATCH/status/update. Do not require every role script to contain every method.",
-            "If generated_app_js_tests fails because it expects PATCH/status/update in one specific role script, but another role script already owns the real update workflow, patch the generated test to assert the actual update-capable role script and real selectors instead of adding fake PATCH code to the read-only role.",
-            "If generated_app_js_tests shows an assertion like `assert.match(managerJs, /PATCH/)` and manager has no real update form/control in HTML, remove or relax that assertion in miniapp/tests/generated_app.test.mjs; assert manager GET/summary/refresh wiring instead and keep PATCH coverage on the actual specialist or manager script that owns the update flow.",
-            "Generated JS tests must look for forms and controls on the actual route where they live. If the client create form is on a child page such as /client/<resource>, do not require that form id in the /client root HTML.",
-            "If API connectivity failed, ensure frontend fetch paths and backend routes match and that POST/PATCH changes are visible through later GET.",
-            "If browser_flow_smoke failed, repair the real end-to-end slice: client-created state must POST and persist, specialist/manager update must PATCH/PUT and persist, later GET must show the updated state, and role UI must fit 360-430px without horizontal overflow.",
-            "If platform_invariants reports unchecked_page_dom_id, patch the role app.js with optional chaining or explicit guards for every page-specific DOM element before textContent/classList/addEventListener/property access.",
-            "If platform_invariants reports platform.insufficient_mode_design_depth, patch only the named role styles.css with real used classes for cards, metrics, badges, forms, lists, empty/loading/error/success/status states; for Quality add responsive and focus styling if it is missing.",
-            "If frontend interaction failed, patch exactly the named HTML/JS/CSS locations from the failed log. Do not rewrite unrelated pages.",
-            "Return outcome=patch_ready with a small coherent operations array; do not ask for tools in Fast repair unless the required file is missing from file_contexts.",
-        ])
-        if mode_value == GenerationMode.BALANCED.value:
-            rules.append("Balanced repair must preserve the richer UI/workflow depth already required for Balanced; do not simplify it down to Fast.")
-        if mode_value == GenerationMode.QUALITY.value:
-            rules.append("Quality repair must preserve the planning/design quality and richer workflow depth already required for Quality; do not simplify it down to Fast.")
-        if focused_edit_kind == "behavior_workflow_edit":
-            rules.append("For behavior_workflow_edit, repair the whole user flow across roles rather than a one-file cosmetic change.")
         return rules
 
     @staticmethod
@@ -3650,7 +2684,7 @@ class WorkspaceCodeAgentRuntime:
                 for match in re.finditer(r"(?:^|[/\\])(?P<path>miniapp[/\\][A-Za-z0-9_./\\-]+\.(?:py|js|mjs|html|css|json))", str(line or "")):
                     candidates.append(match.group("path"))
             for candidate in candidates:
-                path = str(candidate or "").strip().replace("\\", "/").lstrip("./")
+                path = self._strip_leading_dot_slash(candidate)
                 if path and path.startswith("miniapp/") and path not in paths:
                     paths.append(path)
         return paths[:16]
@@ -3663,92 +2697,37 @@ class WorkspaceCodeAgentRuntime:
         draft_source: Path,
         tool_requests: list[dict[str, Any]],
         execute_checks: Callable[[list[str]], tuple[CheckExecutionRecord, dict[str, Any]]],
+        job: JobRecord | None = None,
     ) -> tuple[dict[str, str], list[dict[str, object]]]:
-        loaded_context: dict[str, str] = {}
-        tool_results: list[dict[str, object]] = []
-        workspace_tree = self.workspace_service.file_tree(workspace_id, run_id=run_id)
-        for request_item in tool_requests:
-            tool_name = str(request_item.get("tool") or "").strip().lower()
-            targets = [str(item or "").strip().lstrip("./") for item in request_item.get("targets") or [] if str(item or "").strip()]
-            reason = str(request_item.get("reason") or "").strip()
-            if tool_name == "list_files":
-                tool_results.append({**list_workspace_files(workspace_tree=workspace_tree, targets=targets), "reason": reason})
-                continue
-            if tool_name == "read_files":
-                for target in targets[:16]:
-                    content = self.workspace_service.try_read_text_file(workspace_id, target, run_id=run_id)
-                    if content is not None:
-                        loaded_context[target] = content
-                tool_results.append(
+        def append_activity(kind: str, label: str, details: dict[str, Any] | None = None) -> None:
+            if job is None:
+                return
+            self._append_activity(job, kind, label, details or {}, save=False)
+
+        def append_batch_summary(summary: dict[str, object]) -> None:
+            artifact_run_id = run_id or (job.job_id if job is not None else run_id)
+            self.tool_batch_summaries.setdefault(artifact_run_id, []).append(summary)
+            if job is not None:
+                job.tool_batch_summaries_ref = f"tool_batch_summaries:{workspace_id}:{artifact_run_id}"
+                self._store_report(
+                    job.tool_batch_summaries_ref,
                     {
-                        "tool": "read_files",
-                        "targets": targets,
-                        "files": summarize_read_file_payloads(file_contents=loaded_context),
-                        "reason": reason,
-                    }
+                        "workspace_id": workspace_id,
+                        "run_id": run_id,
+                        "items": self.tool_batch_summaries.get(artifact_run_id, [])[-500:],
+                    },
                 )
-                continue
-            if tool_name == "search_files":
-                pattern = str(request_item.get("pattern") or "").strip()
-                tool_results.append(
-                    {
-                        **search_workspace_files(
-                            workspace_tree=workspace_tree,
-                            read_text_file=lambda relative_path: self.workspace_service.try_read_text_file(
-                                workspace_id,
-                                relative_path,
-                                run_id=run_id,
-                            ),
-                            pattern=pattern,
-                            targets=targets,
-                        ),
-                        "reason": reason,
-                    }
-                )
-                continue
-            if tool_name == "inspect_diff":
-                tool_results.append({**self._inspect_diff(workspace_id=workspace_id, run_id=run_id, targets=targets), "reason": reason})
-                continue
-            if tool_name == "run_checks":
-                mode = str(request_item.get("mode") or "exact").strip().lower()
-                execution, preview_details = execute_checks(targets or ["miniapp"])
-                failed_checks = [
-                    {
-                        "name": result.name,
-                        "details": result.details,
-                        "command": result.command,
-                        "logs": result.logs[-8:],
-                    }
-                    for result in execution.results
-                    if result.status == "failed"
-                ]
-                tool_results.append(
-                    {
-                        "tool": "run_checks",
-                        "contract": "read_only_validation_snapshot",
-                        "writes_files": False,
-                        "executes_arbitrary_commands": False,
-                        "mode": mode,
-                        "targets": targets or ["miniapp"],
-                        "failed_checks": failed_checks,
-                        "preview": preview_details,
-                        "reason": reason,
-                    }
-                )
-                continue
-            if tool_name == "run_command":
-                command = str(request_item.get("command") or "").strip()
-                tool_results.append(
-                    {
-                        **run_workspace_command(
-                            draft_source=draft_source,
-                            command=command,
-                            timeout_seconds=25,
-                        ),
-                        "reason": reason,
-                    }
-                )
-        return loaded_context, tool_results
+            self.rollout_trace.append(artifact_run_id, "tool_batch", dict(summary))
+
+        return self.tool_executor.execute(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            draft_source=draft_source,
+            tool_requests=tool_requests,
+            execute_checks=execute_checks,
+            append_activity=append_activity if job is not None else None,
+            append_batch_summary=append_batch_summary,
+        )
 
     @staticmethod
     def _agent_turn_tuning(
@@ -3803,13 +2782,13 @@ class WorkspaceCodeAgentRuntime:
             )
         else:
             next_action = (
-                "The previous answer was too large. Return outcome=patch_ready now with 1-2 focused operations for the requested edit. "
+                "The previous answer was too large. Return outcome=patch_ready now with 1-2 focused draft actions for the requested edit. "
                 "Prefer full-file replace for the single visible role file that needs the change instead of fragile multi-file hunks. "
                 "Do not request more context unless a required file is absent."
             )
         return {
             "tool": "output_cap_correction",
-            "contract": "The structured JSON response exceeded the model output cap; tools cannot recover this automatically.",
+            "contract": "The action payload exceeded the model output cap; tools cannot recover this automatically.",
             "required_next_action": next_action,
             "previous_error": str(payload.get("error") or "")[:1200],
         }
@@ -3819,12 +2798,12 @@ class WorkspaceCodeAgentRuntime:
         create_task = str(request.intent or "").strip().lower() == "create"
         return {
             "tool": "tool_budget_correction",
-            "contract": "Fast mode has enough template and validation context to start editing without additional diagnostic reads.",
+            "contract": "This agent turn has reached its diagnostic tool budget. Continue with the context and validation packet already provided.",
             "required_next_action": (
                 "Return outcome=patch_ready now. Do not request more tools in the next answer. "
                 "Use the file_contexts and latest_checks already provided. "
                 + (
-                    "For create, produce compact file operations now. If this is the first create patch, create the required role routes, prompt-derived backend GET/POST/PATCH persistence, main.py router registration, form/fetch frontend behavior, route_manifest.json, and generated tests. Keep HTML concise and do not include large inline style blocks or preloaded business records."
+                    "For create, produce compact draft actions that advance the prompt-derived app contract across backend, role UI, frontend behavior, route manifest when needed, and generated tests. Keep HTML concise and do not include large inline style blocks or preloaded business records."
                     if create_task
                     else "For edit/fix, patch the smallest complete set of files needed for the requested behavior."
                 )
@@ -3841,13 +2820,13 @@ class WorkspaceCodeAgentRuntime:
         }
 
     @staticmethod
-    def _operation_contract_correction_result(error: str, payload: dict[str, Any]) -> dict[str, object]:
-        raw_operations = payload.get("operations")
-        operation_summary: list[dict[str, str]] = []
-        if isinstance(raw_operations, list):
-            for item in raw_operations[:8]:
+    def _draft_action_contract_correction_result(error: str, payload: dict[str, Any]) -> dict[str, object]:
+        raw_draft_actions = payload.get("draft_actions")
+        draft_action_summary: list[dict[str, str]] = []
+        if isinstance(raw_draft_actions, list):
+            for item in raw_draft_actions[:8]:
                 if isinstance(item, dict):
-                    operation_summary.append(
+                    draft_action_summary.append(
                         {
                             "operation": str(item.get("operation") or ""),
                             "file_path": str(item.get("file_path") or ""),
@@ -3856,279 +2835,18 @@ class WorkspaceCodeAgentRuntime:
                         }
                     )
         return {
-            "tool": "operation_contract_correction",
+            "tool": "draft_action_contract_correction",
             "contract": (
-                "File operations must be directly applyable. create/replace require full resulting file content; "
-                "patch requires a unified diff; delete needs only file_path. Empty replace/create operations are invalid."
+                "Draft actions must be directly applyable. create/replace require full resulting file content; "
+                "patch requires a unified diff; delete needs only file_path. Empty replace/create draft actions are invalid."
             ),
             "required_next_action": (
-                "Return outcome=patch_ready again with corrected operations for only the failing files. "
+                "Return outcome=patch_ready again with corrected draft actions for only the failing files. "
                 "If you choose replace, include the full final file content. If you choose patch, include a valid unified diff. "
                 "Do not end the run because of this formatting error."
             ),
             "previous_error": str(error or "")[:1200],
-            "previous_operations": operation_summary,
-        }
-
-    def _create_coverage_existing_state(self, *, workspace_id: str, run_id: str) -> tuple[set[str], dict[str, str]]:
-        paths: set[str] = set()
-        text_by_path: dict[str, str] = {}
-        for item in self.workspace_service.file_tree(workspace_id, run_id=run_id):
-            path = str(item.get("path") or "").strip().replace("\\", "/").lstrip("./")
-            if not path or item.get("type") != "file":
-                continue
-            if not (
-                path.startswith("miniapp/app/static/")
-                or path.startswith("miniapp/app/routes/")
-                or path in {
-                    "miniapp/app/main.py",
-                    "miniapp/app/generated/route_manifest.json",
-                    "miniapp/tests/test_generated_app.py",
-                    "miniapp/tests/generated_app.test.mjs",
-                }
-            ):
-                continue
-            paths.add(path)
-            if path.endswith((".py", ".js", ".html", ".json", ".css", ".mjs")):
-                content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
-                if content is not None:
-                    text_by_path[path] = content
-        return paths, text_by_path
-
-    @staticmethod
-    def _create_patch_coverage_gap(
-        operations: list[DraftFileOperation],
-        *,
-        request: GenerateRequest,
-        existing_paths: set[str] | None = None,
-        existing_text_by_path: dict[str, str] | None = None,
-    ) -> list[str]:
-        if str(request.intent or "").strip().lower() != "create":
-            return []
-        existing_paths = {
-            str(path or "").strip().replace("\\", "/").lstrip("./")
-            for path in existing_paths or set()
-            if str(path or "").strip()
-        }
-        touched = {
-            *existing_paths,
-            *{str(operation.file_path or "").strip().replace("\\", "/").lstrip("./") for operation in operations},
-        }
-        operation_text_by_path = {
-            str(path or "").strip().replace("\\", "/").lstrip("./"): str(text or "")
-            for path, text in (existing_text_by_path or {}).items()
-            if str(path or "").strip()
-        }
-        for operation in operations:
-            normalized_path = str(operation.file_path or "").strip().replace("\\", "/").lstrip("./")
-            if not normalized_path:
-                continue
-            if operation.operation in {"create", "replace"}:
-                operation_text_by_path[normalized_path] = str(operation.content or operation.diff or "")
-                continue
-            if operation.operation == "patch":
-                existing_text = operation_text_by_path.get(normalized_path, "")
-                patch_context = "\n".join(part for part in (str(operation.diff or ""), str(operation.content or "")) if part)
-                operation_text_by_path[normalized_path] = "\n".join(part for part in (existing_text, patch_context) if part)
-                continue
-            operation_text_by_path[normalized_path] = "\n".join(
-                part
-                for part in (operation_text_by_path.get(normalized_path, ""), str(operation.content or ""), str(operation.diff or ""))
-                if part
-            )
-        missing: list[str] = []
-        required_files = [
-            "miniapp/app/static/client/index.html",
-            "miniapp/app/static/client/app.js",
-            "miniapp/app/static/client/styles.css",
-            "miniapp/app/static/specialist/index.html",
-            "miniapp/app/static/specialist/app.js",
-            "miniapp/app/static/specialist/styles.css",
-            "miniapp/app/static/manager/index.html",
-            "miniapp/app/static/manager/app.js",
-            "miniapp/app/static/manager/styles.css",
-            "miniapp/app/generated/route_manifest.json",
-            "miniapp/app/main.py",
-            "miniapp/tests/test_generated_app.py",
-            "miniapp/tests/generated_app.test.mjs",
-        ]
-        for path in required_files:
-            if path not in touched:
-                missing.append(path)
-        generation_mode = WorkspaceCodeAgentRuntime._generation_mode(request.generation_mode)
-        required_child_pages = 1
-        for role in ("client", "specialist", "manager"):
-            child_pages = {
-                path
-                for path in touched
-                if re.fullmatch(rf"miniapp/app/static/{role}/[^/]+/index\.html", path)
-            }
-            if len(child_pages) < required_child_pages:
-                child_marker = (
-                    "one-child-page"
-                    if required_child_pages == 1
-                    else "three-child-pages"
-                    if required_child_pages >= 3
-                    else "two-child-pages"
-                )
-                missing.append(
-                    f"miniapp/app/static/{role}/<{child_marker}>/index.html"
-                )
-            css_path = f"miniapp/app/static/{role}/styles.css"
-            css_text = operation_text_by_path.get(css_path, "")
-            if "generated " in css_text.lower() and "styles can replace this file" in css_text.lower():
-                missing.append(f"{css_path} real role CSS")
-            role_html_text = "\n".join(
-                operation_text_by_path.get(path, "")
-                for path in touched
-                if path.startswith(f"miniapp/app/static/{role}/") and path.endswith(".html")
-            )
-            if f"/static/{role}/styles.css" not in role_html_text:
-                missing.append(f"miniapp/app/static/{role}/html link to role CSS")
-        backend_route_paths = {
-            path
-            for path in touched
-            if re.fullmatch(r"miniapp/app/routes/[^/]+\.py", path)
-            and not path.endswith(("/__init__.py", "/health.py", "/role_pages.py", "/role_routes.py"))
-        }
-        backend_text = "\n".join(operation_text_by_path.get(path, "") for path in sorted(backend_route_paths))
-        if not backend_route_paths:
-            missing.append("miniapp/app/routes/app_api.py or prompt-derived API route")
-        if not WorkspaceCodeAgentRuntime._has_backend_api_method(backend_text, "get"):
-            missing.append("backend GET /api/<resource>")
-        if not WorkspaceCodeAgentRuntime._has_backend_api_method(backend_text, "post"):
-            missing.append("backend POST /api/<resource>")
-        backend_bootstrap_text = "\n".join(
-            operation_text_by_path.get(path, "")
-            for path in (
-                *sorted(backend_route_paths),
-                "miniapp/app/main.py",
-                "miniapp/app/db.py",
-                "miniapp/app/schemas.py",
-            )
-        )
-        if "__tablename__" in backend_text and "create_all" not in backend_bootstrap_text:
-            missing.append("backend SQLAlchemy table creation via Base.metadata.create_all")
-        for match in re.finditer(r"\b\w+\s*:\s*Session\s*=\s*(?P<default>[^,\)\n]+)", backend_text):
-            default_expression = str(match.group("default") or "").strip()
-            if not default_expression.startswith("Depends("):
-                missing.append("backend FastAPI SQLAlchemy Session dependency via Depends(get_db_session)")
-                break
-        if re.search(r"@contextmanager\s*\ndef\s+get_db", backend_text):
-            missing.append("backend FastAPI generator dependency without @contextmanager")
-        if re.search(r"\bItem\s*\(", backend_text) and not re.search(r"\b(class|import)\s+Item\b|from\s+\S+\s+import\s+[^;\n]*\bItem\b", backend_text):
-            missing.append("backend undefined ORM Item model")
-        if re.search(r"\.[A-Za-z0-9_]*items\b", backend_text) and "relationship(" not in backend_text and "JSON" not in backend_text and "Text" not in backend_text:
-            missing.append("backend nested item relationship or serialized items field")
-        has_update_api = any(
-            WorkspaceCodeAgentRuntime._has_backend_api_method(backend_text, method)
-            for method in ("put", "patch", "delete")
-        )
-        if not has_update_api:
-            missing.append("backend status/update endpoint")
-        frontend_text = "\n".join(
-            text
-            for path, text in operation_text_by_path.items()
-            if path.startswith("miniapp/app/static/") and path.endswith((".html", ".js"))
-        )
-        if "/api/" not in frontend_text or not re.search(r"method\s*:\s*['\"]POST['\"]", frontend_text, re.IGNORECASE):
-            missing.append("frontend form/fetch POST /api/<resource>")
-        if not re.search(r"method\s*:\s*['\"](?:PATCH|PUT|DELETE)['\"]", frontend_text, re.IGNORECASE):
-            missing.append("frontend specialist/manager status update action")
-        python_test_text = operation_text_by_path.get("miniapp/tests/test_generated_app.py", "")
-        if ".post(" not in python_test_text or ".get(" not in python_test_text:
-            missing.append("miniapp/tests/test_generated_app.py API persistence coverage")
-        if "unittest.TestCase" not in python_test_text:
-            missing.append("miniapp/tests/test_generated_app.py unittest.TestCase coverage")
-        if not any(token in python_test_text for token in (".patch(", ".put(", ".delete(")):
-            missing.append("miniapp/tests/test_generated_app.py API status/update coverage")
-        api_resources = WorkspaceCodeAgentRuntime._api_resource_stems(backend_text)
-        if generation_mode == GenerationMode.BALANCED and len(api_resources) < 2 and not has_update_api:
-            missing.append("balanced create: second API resource or update/status endpoint")
-        if generation_mode == GenerationMode.QUALITY and not has_update_api:
-            missing.append("quality create: rich update/status endpoint")
-        return missing
-
-    @staticmethod
-    def _api_resource_stems(source: str) -> set[str]:
-        stems: set[str] = set()
-        text = str(source or "")
-        api_prefixes = [
-            match.group("prefix").rstrip("/")
-            for match in re.finditer(
-                r"APIRouter\(\s*prefix\s*=\s*['\"](?P<prefix>/api(?:/[^'\"]*)?)['\"]",
-                text,
-            )
-        ]
-        for match in re.finditer(r"['\"](?P<path>/api/[A-Za-z0-9_/{}/-]+)", text):
-            segments = [segment for segment in match.group("path").strip("/").split("/") if segment]
-            if len(segments) >= 2 and segments[0] == "api":
-                stem = segments[1].strip("{}")
-                if stem:
-                    stems.add(stem)
-        for match in re.finditer(r"@(?:router|api)\.(?:get|post|put|patch|delete)\(\s*['\"](?P<path>[^'\"]*)['\"]", text, re.IGNORECASE):
-            route_path = str(match.group("path") or "").strip()
-            if not route_path or route_path.startswith("/api/"):
-                continue
-            for prefix in api_prefixes:
-                combined = f"{prefix}/{route_path.lstrip('/')}"
-                segments = [segment for segment in combined.strip("/").split("/") if segment]
-                if len(segments) >= 2 and segments[0] == "api":
-                    stem = segments[1].strip("{}")
-                    if stem:
-                        stems.add(stem)
-        return stems
-
-    @staticmethod
-    def _has_backend_api_method(source: str, method: str) -> bool:
-        text = str(source or "")
-        method_pattern = rf"@(?:router|api)\.{re.escape(method)}\(\s*['\"](?P<path>[^'\"]*)['\"]"
-        for match in re.finditer(method_pattern, text, flags=re.IGNORECASE):
-            route_path = str(match.group("path") or "")
-            if route_path.startswith("/api/"):
-                return True
-            prefix_match = re.search(r"APIRouter\(\s*prefix\s*=\s*['\"](?P<prefix>/api(?:/[^'\"]*)?)['\"]", text)
-            if prefix_match:
-                return True
-        return False
-
-    @staticmethod
-    def _create_patch_coverage_correction_result(missing: list[str]) -> dict[str, object]:
-        return {
-            "tool": "create_patch_coverage_correction",
-            "contract": (
-                "Create runs must not apply a partial app slice that leaves another role as the starter template "
-                "or omits generated tests. The first patch must cover the required app surface evenly."
-            ),
-            "required_next_action": (
-                "Return outcome=patch_ready now with one compact operations array that covers all required create surfaces. "
-                "Do not request more tools. Replace all three role roots, create prompt-derived child pages for every role before adding extra pages to any one role, "
-                "create/update route_manifest.json, create real app.js and styles.css files for each role, create backend routes with GET, POST, and status/update persistence for the prompt-derived data model, register them in main.py, add frontend form/fetch/status behavior that uses the API, and create both generated test files. "
-                "A client-only first patch is invalid; frontend-only or static-only first patches are invalid too. Keep pages concise, light-mode, and free of preloaded business records."
-            ),
-            "missing_required_coverage": list(missing),
-        }
-
-    @staticmethod
-    def _fast_create_budget_result() -> dict[str, object]:
-        return {
-            "tool": "fast_create_budget",
-            "contract": (
-                "Fast create should finish in one compact patch whenever possible. "
-                "It still must be a working app with backend persistence, not a frontend-only mockup."
-            ),
-            "required_next_action": (
-                "Return outcome=patch_ready in the first answer with a compact working product: route_manifest.json, three separate role root apps, prompt-derived child pages, role app.js files, role styles.css files, backend API persistence, main.py router registration, form/fetch/status code, and generated tests. "
-                "Final Fast success requires at least two routeable pages per role: /client and /client/<slug>; same for specialist and manager. "
-                "Final success also requires at least one POST-capable /api resource used by the frontend plus a status/update endpoint, with generated Python tests proving GET starts empty, POST creates a record, GET returns it, PATCH/status update changes it, and GET returns the updated state. "
-                "Choose child-page names and flows from the user's request instead of from a fixed profile/settings/page template. "
-                "Put enough prompt-derived text in the role HTML itself so backend TestClient can see meaningful requested content without browser JavaScript. "
-                "Keep /static/preview_bridge.js in every generated HTML route page, including every child page. Use app/static paths inside JS tests because tests run from cwd=miniapp. "
-                "Use string paths in JS tests, for example path.join(process.cwd(), 'app/static/client/index.html'); do not pass URL objects to path.resolve or fs. "
-                "Use node:assert in JS tests; node:test does not export expect. "
-                "Do not emit mock data, seed data, demo data, sample data, fixture records, preloaded records, hard-coded business records, long fixtures, or inline <style> blocks. Per-role CSS files are required and should be compact but real, using a consistent neutral light palette across roles. "
-                "If route_manifest.json is absent or empty, create it; do not request it via tools just to inspect it."
-            ),
+            "previous_draft_actions": draft_action_summary,
         }
 
     @staticmethod
@@ -4141,7 +2859,7 @@ class WorkspaceCodeAgentRuntime:
             ),
             "focused_edit_files": WorkspaceCodeAgentRuntime._focused_visual_css_paths(role_scope),
             "required_next_action": (
-                "Return outcome=patch_ready with 1-4 CSS-only operations. Prefer replace with the full resulting CSS file "
+                "Return outcome=patch_ready with 1-4 CSS-only draft actions. Prefer replace with the full resulting CSS file "
                 "when a hunk patch is ambiguous. Do not edit backend, JavaScript, HTML, route manifests, generated tests, "
                 "or docs. Do not request tools when the listed CSS files are already provided in file_contexts."
             ),
@@ -4151,7 +2869,7 @@ class WorkspaceCodeAgentRuntime:
     def _is_self_blocked_tool_contract_response(payload: dict[str, Any]) -> bool:
         if str(payload.get("outcome") or "").strip().lower() not in {"fatal_invalid_response", "no_progress"}:
             return False
-        if payload.get("operations"):
+        if payload.get("draft_actions"):
             return False
         text = " ".join(
             str(payload.get(key) or "")
@@ -4200,8 +2918,8 @@ class WorkspaceCodeAgentRuntime:
     def _tool_contract_correction_result(payload: dict[str, Any]) -> dict[str, object]:
         return {
             "tool": "tool_contract_correction",
-            "contract": "Tools are read-only diagnostics and cannot write files, run shell commands, execute Python scripts, or apply edits.",
-            "required_next_action": "Return outcome=patch_ready with operations that create/replace/patch/delete files, or request read-only context only if specific files are still missing.",
+            "contract": "Read-only tools inspect context/checks. Mutating draft tools are converted to DraftAction and validated before apply; they do not bypass the edit validator.",
+            "required_next_action": "Return outcome=patch_ready with draft_actions or apply_patch_to_draft/write_file requests for concrete files, or request read-only context only if specific files are still missing.",
             "previous_outcome": str(payload.get("outcome") or ""),
             "previous_diagnosis": str(payload.get("diagnosis") or payload.get("assistant_message") or "")[:1200],
         }
@@ -4210,7 +2928,7 @@ class WorkspaceCodeAgentRuntime:
     def _is_empty_fatal_agent_response(payload: dict[str, Any]) -> bool:
         if str(payload.get("outcome") or "").strip().lower() != "fatal_invalid_response":
             return False
-        if payload.get("operations") or payload.get("tool_requests"):
+        if payload.get("draft_actions") or payload.get("tool_requests"):
             return False
         text = " ".join(str(payload.get(key) or "") for key in ("assistant_message", "diagnosis")).strip().lower()
         return (
@@ -4237,63 +2955,92 @@ class WorkspaceCodeAgentRuntime:
         return {
             "tool": "fatal_response_correction",
             "contract": "The user is asking for ordinary workspace code generation/editing. This is allowed platform work.",
-            "required_next_action": "Do not return fatal_invalid_response without a concrete blocker. Return patch_ready operations or request read-only context.",
+            "required_next_action": "Do not return fatal_invalid_response without a concrete blocker. Return patch_ready draft_actions or request read-only context.",
             "previous_outcome": str(payload.get("outcome") or ""),
             "previous_message": str(payload.get("diagnosis") or payload.get("assistant_message") or "")[:1200],
         }
 
     @staticmethod
     def _agent_tool_requests(raw_tool_requests: list[Any]) -> list[dict[str, Any]]:
-        allowed_tools = {"list_files", "read_files", "search_files", "inspect_diff", "run_checks", "run_command"}
+        allowed_tools = {
+            "list_files",
+            "read_files",
+            "search_files",
+            "inspect_diff",
+            "semantic_scan",
+            "run_checks",
+            "run_command",
+            "apply_patch_to_draft",
+            "write_file",
+            "browser_verify",
+        }
         return [
             item
             for item in normalize_tool_requests(raw_tool_requests)
             if str(item.get("tool") or "").strip().lower() in allowed_tools
         ]
 
-    def _inspect_diff(self, *, workspace_id: str, run_id: str, targets: list[str]) -> dict[str, object]:
-        diff_text = self.workspace_service.diff(workspace_id, run_id=run_id)
-        paths = self._paths_from_diff(diff_text)
-        normalized_targets = [target.rstrip("/") for target in targets if target.strip()]
-        if normalized_targets:
-            selected_chunks: list[str] = []
-            current_chunk: list[str] = []
-            current_path = ""
-            for line in diff_text.splitlines():
-                if line.startswith("diff --git "):
-                    if current_chunk and self._path_matches_targets(current_path, normalized_targets):
-                        selected_chunks.append("\n".join(current_chunk))
-                    current_chunk = [line]
-                    current_path = ""
-                    match = re.match(r"^diff --git a/(.+?) b/(.+)$", line.strip())
-                    if match:
-                        current_path = match.group(2).strip().strip('"')
-                    continue
-                if current_chunk:
-                    current_chunk.append(line)
-            if current_chunk and self._path_matches_targets(current_path, normalized_targets):
-                selected_chunks.append("\n".join(current_chunk))
-            diff_text = "\n".join(selected_chunks)
-            paths = [path for path in paths if self._path_matches_targets(path, normalized_targets)]
-        return {
-            "tool": "inspect_diff",
-            "targets": targets,
-            "paths": paths,
-            "diff": truncate_tool_text(diff_text, max_chars=12000),
-        }
+    @staticmethod
+    def _is_mutating_agent_tool_request(request_item: dict[str, Any]) -> bool:
+        return str(request_item.get("tool") or "").strip().lower() in {"apply_patch_to_draft", "write_file"}
 
     @staticmethod
-    def _path_matches_targets(path: str, targets: list[str]) -> bool:
-        normalized = path.strip().lstrip("./")
-        return any(normalized == target or normalized.startswith(target.rstrip("/") + "/") for target in targets)
+    def _draft_actions_from_mutating_tool_requests(tool_requests: list[dict[str, Any]]) -> tuple[list[DraftAction], list[dict[str, object]]]:
+        draft_actions: list[DraftAction] = []
+        trace: list[dict[str, object]] = []
+        for request_item in tool_requests:
+            tool = str(request_item.get("tool") or "").strip().lower()
+            if tool not in {"apply_patch_to_draft", "write_file"}:
+                continue
+            targets = [
+                WorkspaceCodeAgentRuntime._strip_leading_dot_slash(target)
+                for target in request_item.get("targets") or []
+                if str(target or "").strip()
+            ]
+            file_path = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(request_item.get("file_path") or (targets[0] if targets else ""))
+            reason = str(request_item.get("reason") or f"{tool} requested by agent").strip()
+            if tool == "write_file":
+                draft_actions.append(
+                    DraftAction(
+                        file_path=file_path,
+                        operation="replace",
+                        content=str(request_item.get("content") or ""),
+                        reason=reason,
+                    )
+                )
+            else:
+                draft_actions.append(
+                    DraftAction(
+                        file_path=file_path,
+                        operation="patch",
+                        diff=str(request_item.get("diff") or request_item.get("content") or ""),
+                        reason=reason,
+                    )
+                )
+            trace.append(
+                {
+                    "tool": tool,
+                    "contract": "mutating tool request converted to a DraftAction for serialized draft apply",
+                    "file_path": file_path,
+                    "reason": reason,
+                }
+            )
+        return draft_actions, trace
 
-    def _coerce_operations(self, raw_operations: list[Any]) -> list[DraftFileOperation]:
-        operations: list[DraftFileOperation] = []
-        for item in raw_operations:
+    @staticmethod
+    def _strip_leading_dot_slash(raw_path: object) -> str:
+        path = str(raw_path or "").strip().replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        return path
+
+    def _coerce_draft_actions(self, raw_draft_actions: list[Any]) -> list[DraftAction]:
+        draft_actions: list[DraftAction] = []
+        for item in raw_draft_actions:
             if not isinstance(item, dict):
                 continue
-            operation = DraftFileOperation.model_validate(item)
-            file_path = operation.file_path.strip().replace("\\", "/").lstrip("./")
+            operation = DraftAction.model_validate(item)
+            file_path = self._strip_leading_dot_slash(operation.file_path)
             raw_patch = str(operation.diff or operation.content or "") if operation.operation == "patch" else ""
             codex_patch_paths = self._codex_update_patch_paths(raw_patch)
             if len(codex_patch_paths) == 1:
@@ -4306,8 +3053,8 @@ class WorkspaceCodeAgentRuntime:
                 diff_text = str(operation.diff or "").strip()
                 if diff_text:
                     if self._looks_like_unified_diff(diff_text):
-                        operations.append(
-                            DraftFileOperation(
+                        draft_actions.append(
+                            DraftAction(
                                 operation_id=operation.operation_id,
                                 file_path=file_path,
                                 operation="patch",
@@ -4317,8 +3064,8 @@ class WorkspaceCodeAgentRuntime:
                             )
                         )
                         continue
-                    operations.append(
-                        DraftFileOperation(
+                    draft_actions.append(
+                        DraftAction(
                             operation_id=operation.operation_id,
                             file_path=file_path,
                             operation=operation.operation,
@@ -4332,33 +3079,10 @@ class WorkspaceCodeAgentRuntime:
             if operation.operation == "patch" and not str(operation.diff or operation.content or "").strip():
                 raise ValueError(f"Agent returned patch for {file_path} without a unified diff.")
             if operation.operation == "patch":
-                raw_content = str(operation.content or "")
-                if operation.diff and raw_content.strip() and raw_content != str(operation.diff) and not self._looks_like_unified_diff(raw_content):
-                    operations.append(
-                        DraftFileOperation(
-                            operation_id=operation.operation_id,
-                            file_path=file_path,
-                            operation="replace",
-                            content=raw_content,
-                            diff=None,
-                            reason=operation.reason,
-                        )
-                    )
-                    continue
                 if not self._looks_like_unified_diff(raw_patch):
-                    operations.append(
-                        DraftFileOperation(
-                            operation_id=operation.operation_id,
-                            file_path=file_path,
-                            operation="replace",
-                            content=raw_patch,
-                            diff=None,
-                            reason=operation.reason,
-                        )
-                    )
-                    continue
-            operations.append(
-                DraftFileOperation(
+                    raise ValueError(f"Agent returned patch for {file_path} without a valid unified diff.")
+            draft_actions.append(
+                DraftAction(
                     operation_id=operation.operation_id,
                     file_path=file_path,
                     operation=operation.operation,
@@ -4367,7 +3091,7 @@ class WorkspaceCodeAgentRuntime:
                     reason=operation.reason,
                 )
             )
-        return operations
+        return draft_actions
 
     @staticmethod
     def _looks_like_unified_diff(text: str) -> bool:
@@ -4383,179 +3107,12 @@ class WorkspaceCodeAgentRuntime:
     def _codex_update_patch_paths(text: str) -> list[str]:
         paths: list[str] = []
         for match in re.finditer(r"^\*\*\* Update File:\s+(.+)$", str(text or ""), flags=re.MULTILINE):
-            path = match.group(1).strip().replace("\\", "/").lstrip("./")
+            path = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(match.group(1))
             if path:
                 paths.append(path)
         return list(dict.fromkeys(paths))
 
-    @staticmethod
-    def _prompt_semantic_tokens(prompt: str, *, limit: int = 10) -> list[str]:
-        stopwords = {
-            "a",
-            "an",
-            "and",
-            "app",
-            "application",
-            "build",
-            "create",
-            "for",
-            "make",
-            "mini",
-            "please",
-            "the",
-            "with",
-            "для",
-            "мини",
-            "миниприложение",
-            "приложение",
-            "сделай",
-            "создай",
-            "хочу",
-            "чтобы",
-        }
-        tokens = re.findall(r"[0-9A-Za-zА-Яа-яЁё_-]+", str(prompt or "").lower())
-        semantic = [token.strip("_-") for token in tokens if len(token.strip("_-")) >= 3 and token.strip("_-") not in stopwords]
-        return list(dict.fromkeys(token for token in semantic if token))[: max(1, int(limit or 10))]
-
-    @staticmethod
-    def _prompt_token_matches_text(token: str, text: str) -> bool:
-        value = str(token or "").strip().lower()
-        haystack = str(text or "").lower()
-        if not value:
-            return False
-        if value in haystack:
-            return True
-        stems = {value}
-        for suffix in (
-            "иями",
-            "ями",
-            "ами",
-            "ого",
-            "ему",
-            "ыми",
-            "ими",
-            "иях",
-            "ах",
-            "ях",
-            "ов",
-            "ев",
-            "ам",
-            "ям",
-            "ом",
-            "ем",
-            "ой",
-            "ый",
-            "ий",
-            "ая",
-            "ое",
-            "ые",
-            "ие",
-            "ки",
-            "а",
-            "у",
-            "е",
-            "ы",
-            "и",
-            "s",
-            "es",
-            "ing",
-            "ed",
-        ):
-            if value.endswith(suffix) and len(value) - len(suffix) >= 4:
-                stems.add(value[: -len(suffix)])
-        return any(stem and stem in haystack for stem in stems if len(stem) >= 4)
-
-    def _prompt_alignment_smoke(
-        self,
-        *,
-        workspace_id: str,
-        run_id: str,
-        prompt: str,
-        intent: str = "",
-        focused_edit_kind: str = "",
-    ) -> RunCheckResult:
-        diff_text = self.workspace_service.diff(workspace_id, run_id=run_id)
-        if not diff_text.strip():
-            return RunCheckResult(
-                name="prompt_alignment_smoke",
-                status="skipped",
-                details="Prompt alignment smoke skipped because the draft has no app changes yet.",
-                command="prompt alignment static smoke",
-                logs=[],
-            )
-        if focused_edit_kind == "visual_style_edit":
-            return RunCheckResult(
-                name="prompt_alignment_smoke",
-                status="skipped",
-                details="Prompt alignment smoke skipped for focused visual/style edits; CSS can encode requested colors as design values rather than literal prompt words.",
-                command="prompt alignment static smoke",
-                logs=[],
-            )
-        if str(intent or "").strip().lower() in {"edit", "refine", "role_only_change"}:
-            changed_paths = self._paths_from_diff(diff_text)
-            if changed_paths and all(path.startswith("miniapp/app/static/") and path.endswith(".css") for path in changed_paths):
-                return RunCheckResult(
-                    name="prompt_alignment_smoke",
-                    status="skipped",
-                    details="Prompt alignment smoke skipped for CSS-only edits.",
-                    command="prompt alignment static smoke",
-                    logs=[],
-                )
-        prompt_lower = prompt.lower()
-        targeted_fix_requested = any(
-            marker in prompt_lower
-            for marker in (
-                "fix",
-                "bug",
-                "error",
-                "404",
-                "crash",
-                "endpoint",
-                "route",
-                "not found",
-                "ошиб",
-                "почин",
-                "фикс",
-                "не работает",
-            )
-        )
-        if targeted_fix_requested:
-            return RunCheckResult(
-                name="prompt_alignment_smoke",
-                status="skipped",
-                details="Prompt alignment smoke skipped for targeted fix prompts.",
-                command="prompt alignment static smoke",
-                logs=[],
-            )
-        changed_paths = self._paths_from_diff(diff_text)
-        combined = []
-        for path in changed_paths:
-            if not path.startswith("miniapp/app/"):
-                continue
-            content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
-            if content:
-                combined.append(f"\n/* {path} */\n{content[:12000]}")
-        haystack = "\n".join(combined).lower()
-        issues: list[str] = []
-        prompt_tokens = self._prompt_semantic_tokens(prompt, limit=10)
-        if prompt_tokens:
-            matched_tokens = [token for token in prompt_tokens if self._prompt_token_matches_text(token, haystack)]
-            required_matches = 1 if len(prompt_tokens) < 4 else 2
-            if len(matched_tokens) < required_matches:
-                missing_tokens = [token for token in prompt_tokens if not self._prompt_token_matches_text(token, haystack)][:5]
-                issues.append(
-                    "Changed app files do not include enough prompt-specific language "
-                    f"(matched {len(matched_tokens)}/{required_matches}; missing examples: {', '.join(missing_tokens)})."
-                )
-        return RunCheckResult(
-            name="prompt_alignment_smoke",
-            status="failed" if issues else "passed",
-            details="Prompt alignment smoke checks that generated files reuse meaningful terms from the user prompt without assuming a predefined app category.",
-            command="prompt alignment static smoke",
-            logs=issues or ["Prompt alignment smoke passed."],
-        )
-
-    def _store_agent_quality_report(self, workspace_id: str, execution: CheckExecutionRecord) -> None:
+    def _store_agent_quality_report(self, workspace_id: str, run_id: str, execution: CheckExecutionRecord) -> None:
         role_coverage: dict[str, Any] = {}
         generated_tests: dict[str, Any] = {}
         neutral_template_findings: list[dict[str, Any]] = []
@@ -4575,6 +3132,17 @@ class WorkspaceCodeAgentRuntime:
             f"agent_quality:{workspace_id}",
             {
                 "workspace_id": workspace_id,
+                "run_id": run_id,
+                "role_coverage": role_coverage,
+                "generated_tests": generated_tests,
+                "neutral_template_findings": neutral_template_findings,
+            },
+        )
+        self._store_report(
+            f"agent_quality:{workspace_id}:{run_id}",
+            {
+                "workspace_id": workspace_id,
+                "run_id": run_id,
                 "role_coverage": role_coverage,
                 "generated_tests": generated_tests,
                 "neutral_template_findings": neutral_template_findings,
@@ -4618,7 +3186,7 @@ class WorkspaceCodeAgentRuntime:
         if no_app_diff:
             remaining_issues.append(
                 {
-                    "kind": "prompt_alignment",
+                    "kind": "meaningful_diff",
                     "check": "meaningful_diff",
                     "details": "Generation must create a prompt-specific draft diff before completion.",
                     "blocking": True,
@@ -4644,10 +3212,8 @@ class WorkspaceCodeAgentRuntime:
     def _validation_snapshot_from_execution(self, execution: CheckExecutionRecord) -> ValidationSnapshot:
         issues = [issue.model_dump(mode="json") for issue in CheckRunner.failing_issues(execution.results)]
         build_failed = any(item.status == "failed" for item in execution.results if item.name == "changed_files_static")
-        prompt_failed = any(item.status == "failed" for item in execution.results if item.name == "prompt_alignment_smoke")
         return ValidationSnapshot(
             platform_valid=not bool(issues),
-            prompt_alignment_valid=not prompt_failed,
             checks_valid=not bool(issues),
             build_valid=not build_failed,
             blocking=bool(issues),
@@ -4658,7 +3224,7 @@ class WorkspaceCodeAgentRuntime:
     def _fast_gate_passed(results: list[RunCheckResult]) -> bool:
         return not any(result.status == "failed" for result in results)
 
-    def _finalize_job(self, *, job: JobRecord, loop_result: WorkspaceLoopResult, elapsed_ms: int) -> JobRecord:
+    def _finalize_job(self, *, job: JobRecord, loop_result: AgentLoopResult, elapsed_ms: int) -> JobRecord:
         job.status = loop_result.status
         job.outcome_kind = loop_result.outcome_kind
         job.summary = loop_result.summary
@@ -4685,12 +3251,8 @@ class WorkspaceCodeAgentRuntime:
                 loop_result.latest_execution is not None
                 and any(result.status == "failed" for result in loop_result.latest_execution.results)
             )
-            if (
-                job.failure_class == "generation.parallel_build_exhausted"
-                and job.root_cause_summary
-                and not latest_has_failed_checks
-            ):
-                job.failure_reason = job.root_cause_summary
+            if job.root_cause_summary and not latest_has_failed_checks:
+                job.failure_reason = job.failure_reason or job.root_cause_summary
         job.repair_iterations = [item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item) for item in loop_result.repair_iterations]
         job.apply_result = loop_result.latest_apply_result
         if loop_result.latest_execution is not None:
@@ -4737,28 +3299,260 @@ class WorkspaceCodeAgentRuntime:
             job.root_cause_summary = None
             job.validation_snapshot = ValidationSnapshot(
                 platform_valid=True,
-                prompt_alignment_valid=True,
                 checks_valid=True,
                 build_valid=True,
                 blocking=False,
                 issues=[],
             )
-        job.fix_attempts = [
-            FixAttemptRecord(
-                run_id=job.linked_run_id or "",
-                attempt=int(turn.get("attempt") or 0),
-                diagnosis=str(turn.get("diagnosis") or turn.get("assistant_message") or ""),
-                files_changed=[str(path) for path in turn.get("files_changed") or []],
-                implicated_files=[str(path) for path in turn.get("fix_targets") or []],
-                failure_signature=str(turn.get("failure_signature") or "") or None,
-                result="patched" if str(turn.get("result")) == "patched" else "failed",
-            ).model_dump(mode="json")
-            for turn in loop_result.turn_history
+        job.agent_turns = list(loop_result.turn_history)
+        tool_trace_items: list[dict[str, Any]] = []
+        large_tool_output_refs: list[str] = []
+        process_output_items: list[dict[str, Any]] = []
+        semantic_graph_items: list[dict[str, Any]] = []
+        artifact_run_id = job.linked_run_id or job.job_id
+        for turn in loop_result.turn_history:
+            metadata = turn.get("metadata") if isinstance(turn, dict) else {}
+            for item in (metadata.get("tool_results") if isinstance(metadata, dict) else []) or []:
+                if isinstance(item, dict):
+                    if item.get("tool") == "run_command":
+                        process_output_items.append(
+                            {
+                                "tool_use_id": item.get("tool_use_id"),
+                                "command": item.get("command"),
+                                "argv": item.get("argv"),
+                                "cwd": item.get("cwd"),
+                                "exit_code": item.get("exit_code"),
+                                "semantic_status": item.get("semantic_status"),
+                                "success": item.get("success"),
+                                "duration_ms": item.get("duration_ms"),
+                                "stdout_head": item.get("stdout_head"),
+                                "stdout_tail": item.get("stdout_tail"),
+                                "stderr_head": item.get("stderr_head"),
+                                "stderr_tail": item.get("stderr_tail"),
+                                "stdout_omitted_chars": item.get("stdout_omitted_chars"),
+                                "stderr_omitted_chars": item.get("stderr_omitted_chars"),
+                                "policy_decision": item.get("policy_decision"),
+                            }
+                        )
+                    if item.get("tool") == "semantic_scan":
+                        semantic_graph_items.append(dict(item))
+                    compact_item = self._compact_tool_result(
+                        item,
+                        workspace_id=job.workspace_id,
+                        run_id=artifact_run_id,
+                    )
+                    ref = compact_item.get("persisted_output_ref") if isinstance(compact_item, dict) else None
+                    if ref:
+                        large_tool_output_refs.append(str(ref))
+                    tool_trace_items.append(compact_item)
+        patch_history = [
+            {
+                "file_path": operation.file_path,
+                "operation": operation.operation,
+                "reason": operation.reason,
+                "owner": self._worker_owner_for_path(operation.file_path),
+                "has_content": bool(operation.content),
+                "has_diff": bool(operation.diff),
+            }
+            for operation in loop_result.all_draft_actions
         ]
+        job.compaction_summaries = [
+            compact_agent_memory(
+                turn_history=loop_result.turn_history,
+                draft_action_count=len(loop_result.all_draft_actions),
+                last_assistant_message=truncate_tool_text(loop_result.last_assistant_message, max_chars=1200),
+            )
+        ]
+        job.tool_trace_ref = f"tool_trace:{job.workspace_id}:{artifact_run_id}"
+        job.draft_patch_history_ref = f"draft_patch_history:{job.workspace_id}:{artifact_run_id}"
+        job.large_tool_outputs_ref = f"large_tool_outputs:{job.workspace_id}:{artifact_run_id}" if large_tool_output_refs else None
+        job.browser_proof_ref = f"browser_proof:{job.workspace_id}:{artifact_run_id}" if job.browser_flow_proof else None
+        job.file_state_cache_ref = f"file_state_cache:{job.workspace_id}:{artifact_run_id}"
+        job.turn_diff_ref = job.turn_diff_ref or f"turn_diff:{job.workspace_id}:{artifact_run_id}"
+        job.environment_snapshot_ref = job.environment_snapshot_ref or f"environment_snapshot:{job.workspace_id}:{artifact_run_id}"
+        job.tool_batch_summaries_ref = job.tool_batch_summaries_ref or f"tool_batch_summaries:{job.workspace_id}:{artifact_run_id}"
+        job.worker_mailbox_ref = job.worker_mailbox_ref or f"worker_mailbox:{job.workspace_id}:{artifact_run_id}"
+        job.scratchpad_ref = job.scratchpad_ref or f"scratchpad:{job.workspace_id}:{artifact_run_id}"
+        job.memory_ref = job.memory_ref or f"agent_memory_store:{job.workspace_id}:{artifact_run_id}"
+        job.worker_drafts_ref = job.worker_drafts_ref or f"worker_drafts:{job.workspace_id}:{artifact_run_id}"
+        job.worker_merge_ref = job.worker_merge_ref or f"worker_merge:{job.workspace_id}:{artifact_run_id}"
+        job.trace_bundle_ref = f"trace_bundle:{job.workspace_id}:{artifact_run_id}"
+        job.trace_reducer_ref = f"trace_reducer:{job.workspace_id}:{artifact_run_id}"
+        job.exec_trace_ref = f"exec_trace:{job.workspace_id}:{artifact_run_id}" if process_output_items else None
+        job.process_outputs_ref = f"process_outputs:{job.workspace_id}:{artifact_run_id}" if process_output_items else None
+        job.context_pressure_ref = job.context_pressure_ref or f"context_pressure:{job.workspace_id}:{artifact_run_id}"
+        job.hook_trace_ref = job.hook_trace_ref or f"hook_trace:{job.workspace_id}:{artifact_run_id}"
+        job.semantic_graph_ref = job.semantic_graph_ref or f"semantic_graph:{job.workspace_id}:{artifact_run_id}"
+        job.worker_prefix_ref = job.worker_prefix_ref or f"worker_prefix:{job.workspace_id}:{artifact_run_id}"
+        job.replay_trace_ref = f"replay_trace:{job.workspace_id}:{artifact_run_id}"
+        job.command_policy_ref = job.command_policy_ref or f"command_policy:{job.workspace_id}:{artifact_run_id}"
+        job.verification_report_ref = job.verification_report_ref or f"verification_report:{job.workspace_id}:{artifact_run_id}"
+        job.rollout_trace_ref = f"rollout_trace:{job.workspace_id}:{artifact_run_id}"
+        self._store_report(job.tool_trace_ref, {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, "items": tool_trace_items})
+        self._store_report(job.draft_patch_history_ref, {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, "items": patch_history})
+        self._store_report(
+            job.file_state_cache_ref,
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **self.file_state_cache.snapshot(artifact_run_id)},
+        )
+        self._store_report(
+            job.turn_diff_ref,
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **self.turn_diff_tracker.snapshot(artifact_run_id)},
+        )
+        self._store_report(
+            job.environment_snapshot_ref,
+            {
+                "workspace_id": job.workspace_id,
+                "run_id": job.linked_run_id,
+                "snapshot": self.environment_snapshots.get(artifact_run_id, {}),
+            },
+        )
+        self._store_report(
+            job.tool_batch_summaries_ref,
+            {
+                "workspace_id": job.workspace_id,
+                "run_id": job.linked_run_id,
+                "items": self.tool_batch_summaries.get(artifact_run_id, []),
+            },
+        )
+        self._store_report(
+            job.verification_report_ref,
+            {
+                "workspace_id": job.workspace_id,
+                "run_id": job.linked_run_id,
+                "report": self.verification_reports.get(artifact_run_id, {}),
+            },
+        )
+        self._store_report(
+            job.scratchpad_ref,
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **self.scratchpads.get(artifact_run_id, AgentScratchpad(run_id=artifact_run_id)).snapshot()},
+        )
+        self._store_report(
+            job.memory_ref,
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **self.memory_store.snapshot(artifact_run_id)},
+        )
+        self._store_report(
+            job.worker_drafts_ref,
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **self.worker_runtime.snapshot(artifact_run_id)},
+        )
+        self._store_report(
+            job.worker_merge_ref,
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **self.worker_runtime.snapshot(artifact_run_id)},
+        )
+        self._store_report(
+            job.command_policy_ref,
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **command_policy_snapshot()},
+        )
+        trace_snapshot = self.rollout_trace.snapshot(artifact_run_id)
+        self._store_report(
+            job.rollout_trace_ref,
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **trace_snapshot},
+        )
+        self._store_report(
+            job.trace_bundle_ref,
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, "events": trace_snapshot.get("events", [])},
+        )
+        self._store_report(
+            job.trace_reducer_ref,
+            {
+                "workspace_id": job.workspace_id,
+                "run_id": job.linked_run_id,
+                "graph": trace_snapshot.get("graph", []),
+                "reducer": trace_snapshot.get("reducer", {}),
+            },
+        )
+        if job.exec_trace_ref:
+            self._store_report(
+                job.exec_trace_ref,
+                {
+                    "workspace_id": job.workspace_id,
+                    "run_id": job.linked_run_id,
+                    "items": process_output_items,
+                    "deterministic_env": ["NO_COLOR", "TERM", "PAGER", "GIT_PAGER", "PYTHONIOENCODING", "LC_ALL", "LANG"],
+                },
+            )
+        if job.process_outputs_ref:
+            self._store_report(
+                job.process_outputs_ref,
+                {
+                    "workspace_id": job.workspace_id,
+                    "run_id": job.linked_run_id,
+                    "items": process_output_items,
+                },
+            )
+        self._store_report(
+            job.context_pressure_ref,
+            {
+                "workspace_id": job.workspace_id,
+                "run_id": job.linked_run_id,
+                "items": self.context_pressure_history.get(artifact_run_id, []),
+            },
+        )
+        self._store_report(
+            job.hook_trace_ref,
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **self.hook_manager.snapshot(artifact_run_id)},
+        )
+        current_semantic_report = self.store.get("reports", job.semantic_graph_ref) if job.semantic_graph_ref else None
+        self._store_report(
+            job.semantic_graph_ref,
+            {
+                "workspace_id": job.workspace_id,
+                "run_id": job.linked_run_id,
+                "items": semantic_graph_items[-20:],
+                "latest": semantic_graph_items[-1]
+                if semantic_graph_items
+                else (current_semantic_report.get("graph") if isinstance(current_semantic_report, dict) else {}),
+            },
+        )
+        self._store_report(
+            job.worker_prefix_ref,
+            self.store.get("reports", job.worker_prefix_ref)
+            or {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, "prefix": {}},
+        )
+        self._store_report(
+            job.replay_trace_ref,
+            {
+                "workspace_id": job.workspace_id,
+                "run_id": job.linked_run_id,
+                "raw_event_ref": job.trace_bundle_ref,
+                "reducer_ref": job.trace_reducer_ref,
+                "graph": trace_snapshot.get("graph", []),
+                "summary": trace_snapshot.get("reducer", {}),
+            },
+        )
+        if job.large_tool_outputs_ref:
+            self._store_report(
+                job.large_tool_outputs_ref,
+                {
+                    "workspace_id": job.workspace_id,
+                    "run_id": job.linked_run_id,
+                    "refs": list(dict.fromkeys(large_tool_output_refs)),
+                },
+            )
+        if job.browser_proof_ref:
+            self._store_report(
+                job.browser_proof_ref,
+                {
+                    "workspace_id": job.workspace_id,
+                    "run_id": job.linked_run_id,
+                    "proof": job.browser_flow_proof,
+                    "mobile_layout_report": job.mobile_layout_report,
+                },
+            )
+        self._store_report(
+            f"agent_activity:{job.workspace_id}:{artifact_run_id}",
+            {
+                "workspace_id": job.workspace_id,
+                "run_id": job.linked_run_id,
+                "items": list(job.agent_activity_events),
+            },
+        )
+        self._store_report(
+            f"compaction_summaries:{job.workspace_id}:{artifact_run_id}",
+            {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, "items": job.compaction_summaries},
+        )
         job.latency_breakdown["agent_total_ms"] = elapsed_ms
         job.updated_at = datetime.now(timezone.utc)
         self._save_job(job)
-        self._store_report(f"fix_attempts:{job.workspace_id}", {"workspace_id": job.workspace_id, "items": job.fix_attempts})
         self._store_report(f"remaining_issues:{job.workspace_id}", {"workspace_id": job.workspace_id, "items": job.remaining_issues})
         if job.validation_snapshot is not None:
             self._store_report(f"validation:{job.workspace_id}", job.validation_snapshot.model_dump(mode="json"))
@@ -4767,6 +3561,25 @@ class WorkspaceCodeAgentRuntime:
         event_type = "job_completed" if job.status == "completed" else "job_failed"
         self._append_event(job, event_type, job.summary or ("Workspace code agent completed." if job.status == "completed" else "Workspace code agent failed."))
         return job
+
+    @staticmethod
+    def _worker_owner_for_path(path: str) -> str:
+        normalized = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(path)
+        if normalized.startswith("miniapp/app/static/client/"):
+            return "client_ui"
+        if normalized.startswith("miniapp/app/static/specialist/"):
+            return "specialist_ui"
+        if normalized.startswith("miniapp/app/static/manager/"):
+            return "manager_ui"
+        if normalized.startswith("miniapp/tests/"):
+            return "generated_tests"
+        if normalized.startswith("miniapp/app/routes/") or normalized in {
+            "miniapp/app/main.py",
+            "miniapp/app/db.py",
+            "miniapp/app/schemas.py",
+        }:
+            return "backend_api"
+        return "shared"
 
     @staticmethod
     def _specific_failure_reason(
@@ -4847,7 +3660,7 @@ class WorkspaceCodeAgentRuntime:
             return "checks:passed"
         return "|".join(parts[:4])
 
-    def _seed_file_context(self, workspace_id: str, run_id: str, *, role_scope: list[str] | None = None) -> dict[str, str]:
+    def _initial_file_context(self, workspace_id: str, run_id: str, *, role_scope: list[str] | None = None) -> dict[str, str]:
         contexts: dict[str, str] = {}
         role_paths: list[str] = []
         for role in role_scope or []:
@@ -4859,7 +3672,7 @@ class WorkspaceCodeAgentRuntime:
                         f"miniapp/app/static/{role}/styles.css",
                     ]
                 )
-        for path in [*role_paths, *SEED_CONTEXT_PATHS]:
+        for path in [*role_paths, *INITIAL_CONTEXT_PATHS]:
             if path in contexts:
                 continue
             content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
@@ -4911,7 +3724,7 @@ class WorkspaceCodeAgentRuntime:
                     "or update the generated test file in the same patch when the requested behavior intentionally changes the expectation."
                 ),
                 "required_next_action": (
-                    "Return operations that make the next generated test result different: restore missing selectors/ids in app code, "
+                    "Return draft actions that make the next generated test result different: restore missing selectors/ids in app code, "
                     "or patch miniapp/tests/test_generated_app.py / miniapp/tests/generated_app.test.mjs together with the app change. "
                     "Do not keep returning single app-file patches that leave the same generated test failure."
                 ),
@@ -4955,7 +3768,7 @@ class WorkspaceCodeAgentRuntime:
             syntax_error = diagnostics.get("static_js_syntax_error")
             if not isinstance(syntax_error, dict):
                 continue
-            file_path = str(syntax_error.get("file_path") or "").strip().lstrip("./")
+            file_path = self._strip_leading_dot_slash(syntax_error.get("file_path"))
             if file_path:
                 content = self.workspace_service.try_read_text_file(workspace_id, file_path, run_id=run_id)
                 if content is not None:
@@ -5003,7 +3816,6 @@ class WorkspaceCodeAgentRuntime:
             "build.page_missing_shell_style_link",
             "build.page_missing_shell_root",
             "platform.missing_generated_app_tests",
-            "platform.single_page_role_surface",
             "platform.missing_create_get_api",
             "platform.missing_create_post_api",
             "platform.frontend_missing_post_api",
@@ -5051,9 +3863,8 @@ class WorkspaceCodeAgentRuntime:
                     "<script src=\"/static/preview_bridge.js\" defer></script> to the exact page. "
                     "For build.broken_static_ref or build.missing_static_asset, either create the referenced asset or remove the script/link tag from the exact page. "
                     "For platform.missing_generated_app_tests, create miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. "
-                    "For platform.single_page_role_surface, create the missing child pages for that exact role and add them to route_manifest.json. "
                     "For platform.missing_create_get_api/platform.missing_create_post_api, create or register a backend /api route with persistent GET and POST behavior. "
-                    "For platform.frontend_missing_post_api, add form/fetch code that POSTs user-provided records to /api. "
+                    "For platform.frontend_missing_post_api, add form/fetch code that POSTs user-provided state to the matching /api route. "
                     "For platform.preloaded_business_data, remove hard-coded business records and start from empty persistent state. "
                     "For platform.missing_role_workflow_actions on manager, add a real manager dashboard control such as a review/refresh/filter/oversight button with a guarded JavaScript handler, or a PATCH/PUT oversight action if the requested flow needs manager mutation. "
                     "Do not rewrite unrelated role pages."
@@ -5105,11 +3916,10 @@ class WorkspaceCodeAgentRuntime:
             "candidate_diff",
             "patch",
             "fix_case",
-            "fix_attempts",
-            "scope_expansions",
             "fix_runtime",
             "remaining_issues",
             "agent_diagnostics",
+            "agent_activity",
         ):
             self.store.delete("reports", f"{key}:{workspace_id}")
 
@@ -5120,9 +3930,138 @@ class WorkspaceCodeAgentRuntime:
         items.append({**entry, "recorded_at": datetime.now(timezone.utc).isoformat()})
         self._store_report(report_key, {"workspace_id": workspace_id, "items": items[-80:]})
 
+    def _append_activity(
+        self,
+        job: JobRecord,
+        activity_type: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+        *,
+        save: bool = True,
+    ) -> None:
+        normalized_type = self._normalize_activity_type(activity_type)
+        payload = self._enriched_event_details(details or {})
+        event = {
+            "type": normalized_type,
+            "message": " ".join(str(message or "").split()).strip()[:220] or normalized_type.replace("_", " "),
+            "details": WorkspaceCodeAgentRuntime._compact_jsonish(payload, max_chars=900, max_items=8),
+            "sequence": len(job.agent_activity_events) + 1,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        for key in ("batch_id", "worker", "owner_scope", "summary", "duration_ms", "status"):
+            if key in payload:
+                event[key] = payload.get(key)
+        for key in ("tool_use_id", "worker_id", "phase", "elapsed_ms", "artifact_ref", "hook", "semantic_status"):
+            if key in payload:
+                event[key] = payload.get(key)
+        job.agent_activity_events.append(event)
+        job.agent_activity_events = job.agent_activity_events[-160:]
+        report_key = f"agent_activity:{job.workspace_id}:{job.linked_run_id or job.job_id}"
+        current = self.store.get("reports", report_key) or {
+            "workspace_id": job.workspace_id,
+            "run_id": job.linked_run_id,
+            "items": [],
+        }
+        items = list(current.get("items", [])) if isinstance(current, dict) else []
+        items.append(event)
+        self._store_report(
+            report_key,
+            {
+                "workspace_id": job.workspace_id,
+                "run_id": job.linked_run_id,
+                "items": items[-500:],
+            },
+        )
+        if save:
+            self._sync_activity_to_run(job)
+            self._save_job(job)
+
+    @staticmethod
+    def _normalize_activity_type(activity_type: str) -> str:
+        allowed = {
+            "planning",
+            "reading",
+            "searching",
+            "running_command",
+            "editing",
+            "applying_patch",
+            "checking",
+            "browser_verifying",
+            "repairing",
+            "compacting",
+            "compact_boundary",
+            "tool_progress",
+            "tool_use_summary",
+            "process_started",
+            "command_output_delta",
+            "process_completed",
+            "context_suggestion",
+            "hook_started",
+            "hook_completed",
+            "verifier_nudge",
+            "worker_started",
+            "worker_completed",
+            "worker_failed",
+            "completed",
+        }
+        value = str(activity_type or "").strip().lower()
+        return value if value in allowed else "planning"
+
+    def _activity_from_event(self, event_type: str, message: str, details: dict[str, Any]) -> tuple[str, str] | None:
+        if "check_step" in details:
+            step = str(details.get("check_step") or "")
+            if step in {"preview_boot_smoke", "preview_connectivity_smoke", "browser_flow_smoke"}:
+                return "browser_verifying", message
+            return "checking", message
+        phase = str(details.get("phase") or "").strip().lower()
+        if event_type == "spec_extract_started":
+            return "planning", message
+        if event_type == "agent_turn_started":
+            if phase == "context_ready":
+                return "reading", message
+            if phase == "model_request":
+                return "editing", message
+            return "planning", message
+        if event_type in {
+            "tool_progress",
+            "tool_use_summary",
+            "process_started",
+            "command_output_delta",
+            "process_completed",
+            "context_suggestion",
+            "hook_started",
+            "hook_completed",
+            "verifier_nudge",
+        }:
+            return event_type, message
+        if event_type in {"worker_started", "worker_completed", "worker_failed"}:
+            return event_type, message
+        if event_type == "compact_boundary":
+            return "compact_boundary", message
+        if event_type in {"running_checks", "build_started", "frontend_build_started", "backend_compile_started", "final_checks_started"}:
+            return "checking", message
+        if event_type == "preview_validation_started":
+            return "browser_verifying", message
+        if event_type in {"patch_apply_started", "patch_apply_completed"}:
+            return "applying_patch", message
+        if event_type == "repair_iteration":
+            return "repairing", message
+        if event_type in {"job_completed", "job_failed"}:
+            return "completed", message
+        return None
+
     def _append_event(self, job: JobRecord, event_type: str, message: str, details: dict[str, Any] | None = None) -> None:
         details = self._enriched_event_details(details or {})
+        self.rollout_trace.append(
+            job.linked_run_id or job.job_id,
+            event_type,
+            {"message": message, "details": WorkspaceCodeAgentRuntime._compact_jsonish(details, max_chars=900, max_items=8)},
+        )
         job.events.append(JobEvent(event_type=event_type, message=message, details=details))
+        activity = self._activity_from_event(event_type, message, details)
+        if activity is not None:
+            activity_type, activity_message = activity
+            self._append_activity(job, activity_type, activity_message, details, save=False)
         if event_type == "iteration_ready":
             job.token_usage = self._merge_run_token_usage(
                 job.token_usage if isinstance(job.token_usage, dict) else {},
@@ -5131,7 +4070,7 @@ class WorkspaceCodeAgentRuntime:
             if isinstance(job.budget_status, dict):
                 job.budget_status = {
                     **job.budget_status,
-                    "total_tokens": self._token_usage_total(job.token_usage),
+                    "total_tokens": token_usage_total(job.token_usage),
                 }
         job.updated_at = datetime.now(timezone.utc)
         noisy_check_event = self._is_noisy_check_progress_event(event_type, details)
@@ -5167,7 +4106,7 @@ class WorkspaceCodeAgentRuntime:
     @staticmethod
     def _enriched_event_details(details: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(details)
-        for key in ("files", "changed_files", "operation_files"):
+        for key in ("files", "changed_files", "draft_action_files"):
             raw_files = enriched.get(key)
             if isinstance(raw_files, list) and raw_files:
                 files = [str(path) for path in raw_files if str(path).strip()]
@@ -5181,7 +4120,7 @@ class WorkspaceCodeAgentRuntime:
     def _compact_file_list(files: list[str], *, limit: int = 4) -> str:
         compact: list[str] = []
         for path in files:
-            value = str(path or "").replace("\\", "/").lstrip("./")
+            value = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(path)
             for prefix in ("miniapp/app/", "miniapp/", "app/"):
                 if value.startswith(prefix):
                     value = value[len(prefix):]
@@ -5199,7 +4138,7 @@ class WorkspaceCodeAgentRuntime:
         groups = {"backend": 0, "client": 0, "specialist": 0, "manager": 0, "tests": 0, "styles": 0, "other": 0}
         seen = set()
         for raw_path in files:
-            path = str(raw_path or "").replace("\\", "/").lstrip("./")
+            path = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(raw_path)
             if not path or path in seen:
                 continue
             seen.add(path)
@@ -5287,6 +4226,16 @@ class WorkspaceCodeAgentRuntime:
         self._store_report(report_key, current)
         self.workspace_log_service.append(workspace_id, source=f"agent.trace.{stage}", message=message, payload=payload or {})
 
+    def _sync_activity_to_run(self, job: JobRecord) -> None:
+        if not job.linked_run_id:
+            return
+        payload = self.store.get("runs", job.linked_run_id)
+        if not payload:
+            return
+        payload["agent_activity_events"] = list(job.agent_activity_events)
+        payload["storage_version"] = StateStore.STORAGE_VERSION
+        self.store.upsert("runs", job.linked_run_id, payload)
+
     def _sync_run_progress(self, job: JobRecord, event_type: str, message: str, details: dict[str, Any]) -> None:
         if not job.linked_run_id:
             return
@@ -5331,6 +4280,35 @@ class WorkspaceCodeAgentRuntime:
         payload["current_fix_phase"] = job.current_fix_phase
         payload["orchestration_phases"] = list(job.orchestration_phases)
         payload["implementation_plan"] = dict(job.implementation_plan)
+        payload["agent_turns"] = list(job.agent_turns)
+        payload["agent_activity_events"] = list(job.agent_activity_events)
+        payload["agent_memory"] = dict(job.agent_memory)
+        payload["tool_trace_ref"] = job.tool_trace_ref
+        payload["draft_patch_history_ref"] = job.draft_patch_history_ref
+        payload["browser_proof_ref"] = job.browser_proof_ref
+        payload["large_tool_outputs_ref"] = job.large_tool_outputs_ref
+        payload["file_state_cache_ref"] = job.file_state_cache_ref
+        payload["turn_diff_ref"] = job.turn_diff_ref
+        payload["environment_snapshot_ref"] = job.environment_snapshot_ref
+        payload["tool_batch_summaries_ref"] = job.tool_batch_summaries_ref
+        payload["worker_mailbox_ref"] = job.worker_mailbox_ref
+        payload["scratchpad_ref"] = job.scratchpad_ref
+        payload["memory_ref"] = job.memory_ref
+        payload["worker_drafts_ref"] = job.worker_drafts_ref
+        payload["worker_merge_ref"] = job.worker_merge_ref
+        payload["trace_bundle_ref"] = job.trace_bundle_ref
+        payload["trace_reducer_ref"] = job.trace_reducer_ref
+        payload["command_policy_ref"] = job.command_policy_ref
+        payload["verification_report_ref"] = job.verification_report_ref
+        payload["rollout_trace_ref"] = job.rollout_trace_ref
+        payload["exec_trace_ref"] = job.exec_trace_ref
+        payload["process_outputs_ref"] = job.process_outputs_ref
+        payload["context_pressure_ref"] = job.context_pressure_ref
+        payload["hook_trace_ref"] = job.hook_trace_ref
+        payload["semantic_graph_ref"] = job.semantic_graph_ref
+        payload["worker_prefix_ref"] = job.worker_prefix_ref
+        payload["replay_trace_ref"] = job.replay_trace_ref
+        payload["compaction_summaries"] = list(job.compaction_summaries)
         payload["acceptance_contract"] = dict(job.acceptance_contract)
         payload["worker_summaries"] = list(job.worker_summaries)
         payload["flow_coverage"] = dict(job.flow_coverage)
@@ -5358,9 +4336,22 @@ class WorkspaceCodeAgentRuntime:
             return True
         if event_type in {
             "agent_turn_started",
-            "parallel_build_started",
-            "parallel_build_completed",
-            "parallel_build_failed",
+            "agent_build_started",
+            "agent_build_completed",
+            "agent_build_failed",
+            "tool_progress",
+            "tool_use_summary",
+            "process_started",
+            "command_output_delta",
+            "process_completed",
+            "context_suggestion",
+            "hook_started",
+            "hook_completed",
+            "verifier_nudge",
+            "compact_boundary",
+            "worker_started",
+            "worker_completed",
+            "worker_failed",
             "iteration_ready",
             "repair_iteration",
             "scope_expanded",
@@ -5421,12 +4412,25 @@ class WorkspaceCodeAgentRuntime:
         if details.get("check_step"):
             return cls._check_step_stage(details), cls._check_step_progress(details)
         progress_map = {
-            "job_started": ("Starting code agent", 4),
-            "spec_extract_started": ("Extracting workflow contract", 6),
-            "parallel_build_started": ("Running parallel role workers", 24),
-            "parallel_build_completed": ("Merged parallel role workers", 52),
-            "parallel_build_failed": ("Parallel role build repair", 38),
-            "draft_prepared": ("Prepared first create patch", 52),
+            "job_started": ("Starting code agent", 3),
+            "spec_extract_started": ("Planning workflow contract", 8),
+            "agent_build_started": ("Running code agent", 20),
+            "agent_build_completed": ("Merged agent patches", 52),
+            "agent_build_failed": ("Repairing agent patch", 38),
+            "worker_started": ("Worker draft started", 24),
+            "worker_completed": ("Worker draft completed", 48),
+            "worker_failed": ("Repairing worker draft", 39),
+            "process_started": ("Running diagnostic command", 31),
+            "command_output_delta": ("Reading command output", 33),
+            "process_completed": ("Diagnostic command completed", 35),
+            "tool_progress": ("Tool is running", 36),
+            "tool_use_summary": ("Tool batch completed", 34),
+            "context_suggestion": ("Compacting agent context", 37),
+            "hook_started": ("Preparing agent tool", 30),
+            "hook_completed": ("Agent tool lifecycle updated", 35),
+            "verifier_nudge": ("Preparing verification proof", 79),
+            "compact_boundary": ("Compacting repair context", 43),
+            "draft_prepared": ("Prepared draft patch", 52),
             "running_checks": ("Running validation checks" if is_after_patch else "Checking workspace shell", 59 if is_after_patch else cls._pre_patch_progress(attempt, 7)),
             "build_started": ("Checking schema and route manifest" if is_after_patch else "Validating workspace shell", 61 if is_after_patch else cls._pre_patch_progress(attempt, 9)),
             "frontend_build_started": ("Checking generated routes and API links" if is_after_patch else "Checking frontend baseline", 64 if is_after_patch else cls._pre_patch_progress(attempt, 11)),
@@ -5551,9 +4555,9 @@ class WorkspaceCodeAgentRuntime:
         tool_round = cls._safe_int(details.get("tool_round"), default=0)
         phase = str(details.get("phase") or "").strip().lower()
         if phase == "context_ready":
-            return f"Prepared edit context {attempt}"
+            return f"Reading context for edit {attempt}"
         if phase == "model_request":
-            return f"Generating code edit {attempt}"
+            return f"Editing draft {attempt}"
         if tool_round > 0:
             return f"Reading context for turn {attempt}"
         return f"Planning code edit {attempt}"
@@ -5569,20 +4573,20 @@ class WorkspaceCodeAgentRuntime:
             if phase == "model_request":
                 return min(93, 88 + max(0, attempt - 2) * 3 + tool_round)
             return min(93, 84 + max(0, attempt - 2) * 3 + tool_round)
-        base = 24 + (attempt - 1) * 6 + tool_round * 3
+        base = 10 + (attempt - 1) * 6 + tool_round * 3
         if phase == "context_ready":
-            return min(48, base + 6)
+            return min(48, base + 5)
         if phase == "model_request":
-            return min(49, base + 12)
+            return min(52, base + 12)
         return min(45, base)
 
     @classmethod
     def _iteration_ready_stage(cls, details: dict[str, Any]) -> str:
-        operation_count = cls._safe_int(details.get("operation_count"), default=0)
+        draft_action_count = cls._safe_int(details.get("draft_action_count"), default=0)
         tool_request_count = cls._safe_int(details.get("tool_request_count"), default=0)
         outcome = str(details.get("outcome") or "").strip().lower()
-        if operation_count > 0:
-            return f"Prepared {operation_count} file edit{'s' if operation_count != 1 else ''}"
+        if draft_action_count > 0:
+            return f"Prepared {draft_action_count} file edit{'s' if draft_action_count != 1 else ''}"
         if tool_request_count > 0:
             return f"Requested {tool_request_count} context read{'s' if tool_request_count != 1 else ''}"
         if outcome in {"no_progress", "no_op"}:
@@ -5593,16 +4597,16 @@ class WorkspaceCodeAgentRuntime:
     def _iteration_ready_progress(cls, details: dict[str, Any]) -> int:
         attempt = max(1, cls._safe_int(details.get("attempt"), default=1))
         tool_round = cls._safe_int(details.get("tool_round"), default=0)
-        operation_count = cls._safe_int(details.get("operation_count"), default=0)
+        draft_action_count = cls._safe_int(details.get("draft_action_count"), default=0)
         tool_request_count = cls._safe_int(details.get("tool_request_count"), default=0)
         if bool(details.get("has_draft_diff")):
-            if operation_count > 0:
+            if draft_action_count > 0:
                 return min(94, 87 + max(0, attempt - 2) * 3)
             if tool_request_count > 0:
                 return min(93, 85 + max(0, attempt - 2) * 3)
             return min(92, 84 + max(0, attempt - 2) * 3)
         base = 38 + max(0, attempt - 1) * 5 + tool_round * 2
-        if operation_count > 0:
+        if draft_action_count > 0:
             return min(51, base + 7)
         if tool_request_count > 0:
             return min(50, base + 3)
@@ -5612,7 +4616,7 @@ class WorkspaceCodeAgentRuntime:
     def _repair_stage(cls, details: dict[str, Any]) -> str:
         reason = str(details.get("reason") or "").strip()
         outcome = str(details.get("outcome") or "").strip()
-        if reason == "self_blocked_no_operations":
+        if reason == "self_blocked_no_draft_actions":
             return "Correcting edit contract"
         if outcome in {"needs_context", "no_op"}:
             return "No file edits yet; reading more context"
@@ -5679,62 +4683,6 @@ class WorkspaceCodeAgentRuntime:
             except Exception:
                 pass
         return GenerationMode.BALANCED
-
-    @staticmethod
-    def _max_attempts(generation_mode: GenerationMode) -> int:
-        budget = COMPLETION_BUDGETS.get(generation_mode) or COMPLETION_BUDGETS[GenerationMode.BALANCED]
-        return int(budget.get("safety_turn_cap") or 120)
-
-    @staticmethod
-    def _completion_budget_for_mode(generation_mode: GenerationMode | str | None) -> dict[str, Any]:
-        mode = WorkspaceCodeAgentRuntime._generation_mode(generation_mode)
-        budget = dict(COMPLETION_BUDGETS.get(mode) or COMPLETION_BUDGETS[GenerationMode.BALANCED])
-        budget["mode"] = mode.value
-        budget["policy"] = "time_or_token_budget"
-        return budget
-
-    @staticmethod
-    def _token_usage_total(usage: dict[str, Any] | None) -> int:
-        if not isinstance(usage, dict):
-            return 0
-        try:
-            return int(usage.get("total_tokens") or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    def _completion_budget_status(
-        self,
-        *,
-        job: JobRecord,
-        generation_mode: GenerationMode,
-        started_at: float,
-        attempt: int,
-    ) -> dict[str, Any]:
-        budget = dict(job.completion_budget or self._completion_budget_for_mode(generation_mode))
-        elapsed_ms = int(max(0.0, time.perf_counter() - started_at) * 1000)
-        token_limit = int(budget.get("token_limit") or 0)
-        time_limit_ms = int(budget.get("time_limit_ms") or 0)
-        total_tokens = self._token_usage_total(job.token_usage)
-        reason: str | None = None
-        if token_limit > 0 and total_tokens >= token_limit:
-            reason = "token_budget_exhausted"
-        elif time_limit_ms > 0 and elapsed_ms >= time_limit_ms:
-            reason = "time_budget_exhausted"
-        status = {
-            "mode": generation_mode.value,
-            "attempt": int(attempt or 0),
-            "elapsed_ms": elapsed_ms,
-            "time_limit_ms": time_limit_ms,
-            "total_tokens": total_tokens,
-            "token_limit": token_limit,
-            "exhausted": reason is not None,
-            "reason": reason,
-            "failure_class": "generation.budget_exhausted" if reason else None,
-            "failure_signature": f"generation.budget_exhausted:{reason}" if reason else None,
-            "current_phase": "blocked_budget_exhausted" if reason else "agent_loop",
-        }
-        job.budget_status = status
-        return status
 
     @staticmethod
     def _tool_round_limit(generation_mode: GenerationMode) -> int:

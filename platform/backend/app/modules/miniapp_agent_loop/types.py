@@ -6,7 +6,7 @@ from typing import Any, Callable, Literal
 from app.models.common import GenerationMode
 from app.models.domain import (
     CheckExecutionRecord,
-    DraftFileOperation,
+    DraftAction,
     JobRecord,
     RepairIterationRecord,
     RunIterationRecord,
@@ -15,15 +15,15 @@ from app.models.domain import (
 
 
 LoopOutcome = Literal["patch_ready", "no_op", "needs_context", "fatal_invalid_response"]
-LoopContextMode = Literal["minimal", "expanded", "full_bundle"]
+LoopContextMode = Literal["minimal", "expanded"]
 
 
 @dataclass
-class WorkspaceLoopTurnPlan:
+class AgentTurnPlan:
     outcome: LoopOutcome
     assistant_message: str = ""
     diagnosis: str | None = None
-    operations: list[DraftFileOperation] = field(default_factory=list)
+    draft_actions: list[DraftAction] = field(default_factory=list)
     files_read: list[str] = field(default_factory=list)
     failure_class: str | None = None
     failure_signature: str | None = None
@@ -48,7 +48,7 @@ class RepairTurnContext:
 
 
 @dataclass
-class WorkspaceLoopResult:
+class AgentLoopResult:
     status: Literal["completed", "failed", "blocked"]
     outcome_kind: str | None
     summary: str
@@ -63,23 +63,28 @@ class WorkspaceLoopResult:
     latest_apply_result: dict[str, Any] | None
     iterations: list[RunIterationRecord]
     repair_iterations: list[RepairIterationRecord]
-    all_operations: list[DraftFileOperation]
+    all_draft_actions: list[DraftAction]
     last_assistant_message: str
     turn_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
-class WorkspaceLoopCallbacks:
+class AgentLoopCallbacks:
     execute_checks: Callable[[list[str]], tuple[CheckExecutionRecord, dict[str, Any]]]
     build_validation_snapshot: Callable[[CheckExecutionRecord], ValidationSnapshot]
     completion_state: Callable[[list[Any], dict[str, Any], ValidationSnapshot | None], dict[str, Any]]
     has_tooling_failure: Callable[[list[Any]], bool]
-    plan_turn: Callable[..., WorkspaceLoopTurnPlan]
-    apply_contract_sync: Callable[[list[DraftFileOperation]], list[DraftFileOperation]]
+    plan_turn: Callable[..., AgentTurnPlan]
+    apply_contract_sync: Callable[[list[DraftAction]], list[DraftAction]]
+    verify_completion: Callable[[CheckExecutionRecord | None, dict[str, Any]], dict[str, Any]] | None
+    before_apply: Callable[[int, list[DraftAction]], None] | None
+    after_apply: Callable[[int, list[DraftAction], Any, list[str]], None] | None
     post_apply_stabilize: Callable[[str, str, Any, list[str]], list[str]] | None
     append_event: Callable[[JobRecord, str, str, dict[str, Any] | None], None]
+    append_activity: Callable[[JobRecord, str, str, dict[str, Any] | None], None] | None
     append_trace: Callable[[str, str, str, dict[str, Any] | None], None]
     store_report: Callable[[str, dict[str, Any]], None]
+    record_compact_boundary: Callable[[dict[str, Any]], None] | None = None
     allow_optimistic_completion: bool = False
     skip_initial_checks: bool = False
     stop_if_requested: Callable[[], bool] | None = None
@@ -90,8 +95,8 @@ __all__ = [
     "LoopContextMode",
     "LoopOutcome",
     "RepairTurnContext",
-    "WorkspaceLoopCallbacks",
-    "WorkspaceLoopResult",
-    "WorkspaceLoopTurnPlan",
+    "AgentLoopCallbacks",
+    "AgentLoopResult",
+    "AgentTurnPlan",
     "GenerationMode",
 ]

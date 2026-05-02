@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from app.models.common import GenerationMode
+from app.models.domain import DraftAction
+
+
+@dataclass(frozen=True)
+class AgentWorkerScope:
+    worker: str
+    owner_scope: str
+    path_prefixes: tuple[str, ...]
+
+    def owns(self, path: str) -> bool:
+        return any(path == prefix.rstrip("/") or path.startswith(prefix.rstrip("/") + "/") for prefix in self.path_prefixes)
+
+
+class AgentWorkerManager:
+    """Generic worker ownership and merge guard for role-separated draft work."""
+
+    SCOPES: tuple[AgentWorkerScope, ...] = (
+        AgentWorkerScope("backend_api", "backend/API", ("miniapp/app/routes", "miniapp/app/schemas.py", "miniapp/app/db.py", "miniapp/app/main.py")),
+        AgentWorkerScope("client_ui", "client UI", ("miniapp/app/static/client",)),
+        AgentWorkerScope("specialist_ui", "specialist UI", ("miniapp/app/static/specialist",)),
+        AgentWorkerScope("manager_ui", "manager UI", ("miniapp/app/static/manager",)),
+        AgentWorkerScope("generated_tests", "generated tests", ("miniapp/tests",)),
+    )
+
+    @classmethod
+    def owner_for_path(cls, path: str) -> str:
+        normalized = str(path or "").strip().replace("\\", "/")
+        for scope in cls.SCOPES:
+            if scope.owns(normalized):
+                return scope.worker
+        if normalized.startswith("miniapp/app/static/shared") or normalized.startswith("miniapp/app/generated"):
+            return "shared_runtime"
+        return "shared"
+
+    @classmethod
+    def mailbox_for_plan(
+        cls,
+        *,
+        generation_mode: GenerationMode,
+        implementation_plan: dict[str, Any],
+    ) -> dict[str, object]:
+        enabled = generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
+        workers = [
+            {
+                "worker": scope.worker,
+                "owner_scope": scope.owner_scope,
+                "path_prefixes": list(scope.path_prefixes),
+                "status": "pending" if enabled else "not_used_for_fast",
+            }
+            for scope in cls.SCOPES
+        ]
+        if generation_mode == GenerationMode.QUALITY:
+            workers.append(
+                {
+                    "worker": "design_verifier",
+                    "owner_scope": "mobile design and verification",
+                    "path_prefixes": ["miniapp/app/static", "miniapp/tests"],
+                    "status": "pending",
+                }
+            )
+        return {
+            "enabled": enabled,
+            "mode": str(getattr(generation_mode, "value", generation_mode) or ""),
+            "workers": workers,
+            "plan_entities": list(implementation_plan.get("primary_entities") or [])[:8],
+            "merge_policy": "accept non-conflicting owned diffs; return conflicts to the owning worker as a repair packet",
+        }
+
+    @classmethod
+    def validate_non_conflicting(cls, draft_actions: list[DraftAction]) -> dict[str, object]:
+        by_path: dict[str, list[dict[str, str]]] = {}
+        for action in draft_actions:
+            path = str(action.file_path or "").strip()
+            owner = cls.owner_for_path(path)
+            by_path.setdefault(path, []).append(
+                {
+                    "owner": owner,
+                    "operation": str(action.operation),
+                    "reason": str(action.reason or "")[:240],
+                }
+            )
+        conflicts = [
+            {
+                "path": path,
+                "edits": edits,
+                "owners": sorted({edit["owner"] for edit in edits}),
+            }
+            for path, edits in by_path.items()
+            if len(edits) > 1
+        ]
+        return {
+            "ok": not conflicts,
+            "conflicts": conflicts,
+            "owners": {path: edits[0]["owner"] for path, edits in by_path.items() if edits},
+        }

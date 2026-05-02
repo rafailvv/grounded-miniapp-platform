@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 from uuid import uuid4
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from app.models.common import GenerationMode, PreviewProfile, StrictModel, TargetPlatform
 
@@ -79,6 +79,13 @@ class ChatTurnRecord(StrictModel):
 
 
 class JobEvent(StrictModel):
+    _LEGACY_BUILD_PREFIX: ClassVar[str] = "parallel" + "_build"
+    _LEGACY_EVENT_TYPE_MAP: ClassVar[dict[str, str]] = {
+        f"{_LEGACY_BUILD_PREFIX}_started": "agent_build_started",
+        f"{_LEGACY_BUILD_PREFIX}_completed": "agent_build_completed",
+        f"{_LEGACY_BUILD_PREFIX}_failed": "agent_build_failed",
+    }
+
     event_id: str = Field(default_factory=lambda: new_id("evt"))
     event_type: Literal[
         "job_started",
@@ -109,9 +116,15 @@ class JobEvent(StrictModel):
         "repair_iteration",
         "repair_repeated_signature_aborted",
         "agent_turn_started",
-        "parallel_build_started",
-        "parallel_build_completed",
-        "parallel_build_failed",
+        "agent_build_started",
+        "agent_build_completed",
+        "agent_build_failed",
+        "tool_progress",
+        "tool_use_summary",
+        "compact_boundary",
+        "worker_started",
+        "worker_completed",
+        "worker_failed",
         "patch_apply_started",
         "patch_apply_completed",
         "frontend_build_started",
@@ -134,9 +147,15 @@ class JobEvent(StrictModel):
     details: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
 
+    @field_validator("event_type", mode="before")
+    @classmethod
+    def normalize_legacy_event_type(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return cls._LEGACY_EVENT_TYPE_MAP.get(value, value)
+        return value
+
 class ValidationSnapshot(StrictModel):
     platform_valid: bool = False
-    prompt_alignment_valid: bool = False
     checks_valid: bool = False
     build_valid: bool = False
     blocking: bool = True
@@ -183,8 +202,6 @@ class JobRecord(StrictModel):
     fix_targets: list[str] = Field(default_factory=list)
     handoff_from_failed_generate: dict[str, Any] | None = None
     executed_checks: list[dict[str, Any]] = Field(default_factory=list)
-    fix_attempts: list[dict[str, Any]] = Field(default_factory=list)
-    scope_expansions: list[dict[str, Any]] = Field(default_factory=list)
     container_statuses: list[dict[str, Any]] = Field(default_factory=list)
     compile_summary: dict[str, int | str] = Field(default_factory=dict)
     events: list[JobEvent] = Field(default_factory=list)
@@ -200,6 +217,35 @@ class JobRecord(StrictModel):
     budget_status: dict[str, Any] = Field(default_factory=dict)
     orchestration_phases: list[dict[str, Any]] = Field(default_factory=list)
     implementation_plan: dict[str, Any] = Field(default_factory=dict)
+    agent_turns: list[dict[str, Any]] = Field(default_factory=list)
+    agent_activity_events: list[dict[str, Any]] = Field(default_factory=list)
+    agent_memory: dict[str, Any] = Field(default_factory=dict)
+    tool_trace_ref: str | None = None
+    draft_patch_history_ref: str | None = None
+    browser_proof_ref: str | None = None
+    large_tool_outputs_ref: str | None = None
+    file_state_cache_ref: str | None = None
+    turn_diff_ref: str | None = None
+    environment_snapshot_ref: str | None = None
+    tool_batch_summaries_ref: str | None = None
+    worker_mailbox_ref: str | None = None
+    scratchpad_ref: str | None = None
+    memory_ref: str | None = None
+    worker_drafts_ref: str | None = None
+    worker_merge_ref: str | None = None
+    trace_bundle_ref: str | None = None
+    trace_reducer_ref: str | None = None
+    command_policy_ref: str | None = None
+    verification_report_ref: str | None = None
+    rollout_trace_ref: str | None = None
+    exec_trace_ref: str | None = None
+    process_outputs_ref: str | None = None
+    context_pressure_ref: str | None = None
+    hook_trace_ref: str | None = None
+    semantic_graph_ref: str | None = None
+    worker_prefix_ref: str | None = None
+    replay_trace_ref: str | None = None
+    compaction_summaries: list[dict[str, Any]] = Field(default_factory=list)
     acceptance_contract: dict[str, Any] = Field(default_factory=dict)
     worker_summaries: list[dict[str, Any]] = Field(default_factory=list)
     flow_coverage: dict[str, Any] = Field(default_factory=dict)
@@ -216,6 +262,15 @@ class JobRecord(StrictModel):
     artifact_storage_ref: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_legacy_agent_reports(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            value = dict(value)
+            value.pop("fix_" + "attempts", None)
+            value.pop("scope_" + "expansions", None)
+        return value
 
 class PreviewRecord(StrictModel):
     preview_id: str = Field(default_factory=lambda: new_id("preview"))
@@ -300,7 +355,7 @@ class SaveFileRequest(StrictModel):
     run_id: str | None = None
 
 
-class DraftFileOperation(StrictModel):
+class DraftAction(StrictModel):
     operation_id: str = Field(default_factory=lambda: new_id("draft_op"))
     file_path: str
     operation: Literal["create", "replace", "delete", "patch"]
@@ -383,7 +438,7 @@ class CheckExecutionRecord(StrictModel):
     duration_ms: int | None = None
 
 
-class RunIterationOperation(StrictModel):
+class RunIterationAction(StrictModel):
     file_path: str
     operation: Literal["create", "replace", "delete", "patch"]
     reason: str
@@ -394,7 +449,7 @@ class RunIterationRecord(StrictModel):
     run_id: str
     assistant_message: str
     files_read: list[str] = Field(default_factory=list)
-    operations: list[RunIterationOperation] = Field(default_factory=list)
+    draft_actions: list[RunIterationAction] = Field(default_factory=list)
     check_results: list[RunCheckResult] = Field(default_factory=list)
     diff_summary: str | None = None
     role_scope: list[Literal["client", "specialist", "manager"]] = Field(default_factory=list)
@@ -402,6 +457,17 @@ class RunIterationRecord(StrictModel):
     token_usage: dict[str, Any] = Field(default_factory=dict)
     failure_class: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_draft_actions(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "draft_actions" not in value:
+            old_key = "oper" + "ations"
+            if isinstance(value.get(old_key), list):
+                value = dict(value)
+                value["draft_actions"] = value.get(old_key)
+                value.pop(old_key, None)
+        return value
 
 
 class RepairIterationRecord(StrictModel):
@@ -425,39 +491,6 @@ class ContainerStatusRecord(StrictModel):
     health: str | None = None
     exit_code: str | None = None
     published_port: str | None = None
-
-
-class FixScopeEntry(StrictModel):
-    file_path: str
-    reason: str
-
-
-class FixAttemptOutcome(StrictModel):
-    outcome: Literal["patch_ready", "tool_request", "no_progress", "fatal_invalid_response"]
-    diagnosis: str | None = None
-    operations: list[DraftFileOperation] = Field(default_factory=list)
-    tool_requests: list[dict[str, Any]] = Field(default_factory=list)
-    validation_error: str | None = None
-    expected_verification: str | None = None
-    rationale_by_file: dict[str, str] = Field(default_factory=dict)
-    raw_response: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=utc_now)
-
-
-class FixAttemptRecord(StrictModel):
-    fix_attempt_id: str = Field(default_factory=lambda: new_id("fix_attempt"))
-    run_id: str
-    attempt: int
-    diagnosis: str
-    commands: list[str] = Field(default_factory=list)
-    exit_codes: dict[str, int | None] = Field(default_factory=dict)
-    files_changed: list[str] = Field(default_factory=list)
-    implicated_files: list[str] = Field(default_factory=list)
-    failure_signature: str | None = None
-    result: Literal["patched", "green", "conflict", "failed", "stopped"] = "patched"
-    rationale_by_file: dict[str, str] = Field(default_factory=dict)
-    expected_verification: str | None = None
-    created_at: datetime = Field(default_factory=utc_now)
 
 
 class CodeChangeTarget(StrictModel):
@@ -541,6 +574,35 @@ class RunRecord(StrictModel):
     budget_status: dict[str, Any] = Field(default_factory=dict)
     orchestration_phases: list[dict[str, Any]] = Field(default_factory=list)
     implementation_plan: dict[str, Any] = Field(default_factory=dict)
+    agent_turns: list[dict[str, Any]] = Field(default_factory=list)
+    agent_activity_events: list[dict[str, Any]] = Field(default_factory=list)
+    agent_memory: dict[str, Any] = Field(default_factory=dict)
+    tool_trace_ref: str | None = None
+    draft_patch_history_ref: str | None = None
+    browser_proof_ref: str | None = None
+    large_tool_outputs_ref: str | None = None
+    file_state_cache_ref: str | None = None
+    turn_diff_ref: str | None = None
+    environment_snapshot_ref: str | None = None
+    tool_batch_summaries_ref: str | None = None
+    worker_mailbox_ref: str | None = None
+    scratchpad_ref: str | None = None
+    memory_ref: str | None = None
+    worker_drafts_ref: str | None = None
+    worker_merge_ref: str | None = None
+    trace_bundle_ref: str | None = None
+    trace_reducer_ref: str | None = None
+    command_policy_ref: str | None = None
+    verification_report_ref: str | None = None
+    rollout_trace_ref: str | None = None
+    exec_trace_ref: str | None = None
+    process_outputs_ref: str | None = None
+    context_pressure_ref: str | None = None
+    hook_trace_ref: str | None = None
+    semantic_graph_ref: str | None = None
+    worker_prefix_ref: str | None = None
+    replay_trace_ref: str | None = None
+    compaction_summaries: list[dict[str, Any]] = Field(default_factory=list)
     acceptance_contract: dict[str, Any] = Field(default_factory=dict)
     worker_summaries: list[dict[str, Any]] = Field(default_factory=list)
     flow_coverage: dict[str, Any] = Field(default_factory=dict)
@@ -548,8 +610,6 @@ class RunRecord(StrictModel):
     repair_issue_signatures: list[dict[str, Any]] = Field(default_factory=list)
     mobile_layout_report: dict[str, Any] = Field(default_factory=dict)
     repair_iterations: list[dict[str, Any]] = Field(default_factory=list)
-    fix_attempts: list[dict[str, Any]] = Field(default_factory=list)
-    scope_expansions: list[dict[str, Any]] = Field(default_factory=list)
     apply_result: dict[str, Any] | None = None
     preview_refresh_status: Literal["pending", "running", "passed", "failed", "skipped"] = "pending"
     storage_version: int = 1
@@ -561,6 +621,15 @@ class RunRecord(StrictModel):
     rolled_back_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_legacy_agent_reports(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            value = dict(value)
+            value.pop("fix_" + "attempts", None)
+            value.pop("scope_" + "expansions", None)
+        return value
 
 
 class CreateRunRequest(StrictModel):

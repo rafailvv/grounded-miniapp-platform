@@ -13,7 +13,7 @@ from subprocess import CalledProcessError
 
 from app.core.config import Settings
 from app.models.artifacts import ApplyPatchResult, PatchEnvelope, PatchOperationModel
-from app.models.domain import DraftFileOperation, RevisionRecord, SaveFileRequest, WorkspaceRecord, utc_now
+from app.models.domain import DraftAction, RevisionRecord, SaveFileRequest, WorkspaceRecord, utc_now
 from app.repositories.state_store import StateStore
 from app.services.workspace.log_service import WorkspaceLogService
 
@@ -39,6 +39,13 @@ class WorkspaceService:
         self.settings = settings
         self.store = store
         self.workspace_log_service = workspace_log_service
+
+    @staticmethod
+    def _strip_leading_dot_slash(raw_path: object) -> str:
+        path = str(raw_path or "").strip().replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        return path
         self.code_index_service = None
 
     def attach_code_index_service(self, code_index_service) -> None:
@@ -326,18 +333,18 @@ class WorkspaceService:
         )
         return revision
 
-    def apply_patch_operations(self, workspace_id: str, operations: list[PatchOperationModel], message: str) -> RevisionRecord:
+    def apply_patch_actions(self, workspace_id: str, patch_actions: list[PatchOperationModel], message: str) -> RevisionRecord:
         workspace = self.get_workspace(workspace_id)
         envelope = PatchEnvelope(
             workspace_id=workspace_id,
             base_revision_id=workspace.current_revision_id,
             summary=message,
             risk_level="medium",
-            ops=operations,
+            ops=patch_actions,
         )
         result = self.apply_patch_envelope(workspace_id, envelope, message=message)
         if result.status != "applied" or not result.revision_id:
-            raise ValueError(result.conflict_reason or "Patch operations could not be applied.")
+            raise ValueError(result.conflict_reason or "Patch actions could not be applied.")
         workspace = self.get_workspace(workspace_id)
         revision = next(rev for rev in workspace.revisions if rev.revision_id == result.revision_id)
         return revision
@@ -373,11 +380,11 @@ class WorkspaceService:
         )
         return target_draft
 
-    def apply_draft_operations(self, workspace_id: str, run_id: str, operations: list[DraftFileOperation]) -> Path:
+    def apply_draft_actions(self, workspace_id: str, run_id: str, draft_actions: list[DraftAction]) -> Path:
         draft_source = self.draft_source_dir(workspace_id, run_id)
         if not draft_source.exists():
             self.prepare_draft(workspace_id, run_id)
-        envelope = self.build_patch_envelope_for_draft(workspace_id, run_id, operations)
+        envelope = self.build_patch_envelope_for_draft_actions(workspace_id, run_id, draft_actions)
         result = self.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
         if result.status != "applied":
             raise ValueError(result.conflict_reason or "Draft patch could not be applied.")
@@ -440,11 +447,11 @@ class WorkspaceService:
         )
         return revision
 
-    def build_patch_envelope_for_draft(self, workspace_id: str, run_id: str, operations: list[DraftFileOperation]) -> PatchEnvelope:
+    def build_patch_envelope_for_draft_actions(self, workspace_id: str, run_id: str, draft_actions: list[DraftAction]) -> PatchEnvelope:
         workspace = self.get_workspace(workspace_id)
         draft_source = self.draft_source_dir(workspace_id, run_id)
         prepared_ops: list[PatchOperationModel] = []
-        for operation in operations:
+        for operation in draft_actions:
             relative_path = self._safe_relative_path(operation.file_path)
             if self._is_ignored_workspace_path(relative_path):
                 raise ValueError(
@@ -489,7 +496,7 @@ class WorkspaceService:
             risk_level="medium",
             ops=prepared_ops,
             post_actions={"run": ["validators", "preview_smoke"]},
-            ui={"title": "Draft patch", "summary": f"{len(prepared_ops)} file operations"},
+            ui={"title": "Draft patch", "summary": f"{len(prepared_ops)} draft actions"},
         )
 
     def apply_patch_envelope(self, workspace_id: str, envelope: PatchEnvelope, *, message: str) -> ApplyPatchResult:
@@ -887,7 +894,7 @@ class WorkspaceService:
             return text
         if not re.search(r"^@@\s", text, flags=re.MULTILINE):
             return text
-        normalized_path = str(relative_path or "").strip().replace("\\", "/").lstrip("./")
+        normalized_path = cls._strip_leading_dot_slash(relative_path)
         if not normalized_path:
             return text
         body = text if text.endswith("\n") else f"{text}\n"
@@ -909,13 +916,13 @@ class WorkspaceService:
     @classmethod
     def _apply_codex_update_patch(cls, existing_content: str, patch_text: str, *, expected_path: str) -> str | None:
         lines = str(patch_text or "").splitlines()
-        expected = str(expected_path or "").strip().replace("\\", "/").lstrip("./")
+        expected = cls._strip_leading_dot_slash(expected_path)
         active = False
         hunks: list[list[str]] = []
         current: list[str] = []
         for line in lines:
             if line.startswith("*** Update File: "):
-                path = line.split(":", 1)[1].strip().replace("\\", "/").lstrip("./")
+                path = cls._strip_leading_dot_slash(line.split(":", 1)[1])
                 active = path == expected
                 continue
             if line.startswith("*** End Patch") or line.startswith("*** Update File: "):

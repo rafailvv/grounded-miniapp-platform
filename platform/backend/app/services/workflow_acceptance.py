@@ -1,18 +1,11 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from app.models.common import GenerationMode
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
-GENERIC_RESOURCE_DEFAULTS = ("records", "updates", "summaries")
-PROMPT_RESOURCE_HINT_PATTERNS: tuple[tuple[str, str], ...] = (
-    (r"\b(request|requests|application|applications|inquiry|inquiries)\b", "requests"),
-    (r"(заявк|обращен|запрос)", "requests"),
-    (r"(задач|таск|\btask|\btasks)", "tasks"),
-)
 
 WORKFLOW_EDIT_MARKERS = (
     "after adding",
@@ -28,7 +21,6 @@ WORKFLOW_EDIT_MARKERS = (
     "кнопк",
     "список",
     "форма",
-    "заказ",
     "после добавления",
     "должно появляться",
     "появлялось",
@@ -39,20 +31,14 @@ WORKFLOW_EDIT_MARKERS = (
 )
 
 def prompt_resource_candidates(prompt: str, *, limit: int = 3) -> list[str]:
-    """Extract high-confidence generic resource slugs without assuming a business domain.
+    """Compatibility shim for older callers.
 
-    This intentionally avoids turning arbitrary prompt nouns into API route names.
-    Detailed domain entities belong in the LLM implementation plan; the platform
-    contract should only provide stable generic anchors it can validate.
+    The platform must not derive API/resource/page names from prompt words. A
+    Claude/Codex-style code agent should infer concrete entities in its own
+    implementation plan and then validators verify the actual code it produced.
     """
-    candidates: list[str] = []
-    text = str(prompt or "").strip().lower().replace("ё", "е")
-    for pattern, slug in PROMPT_RESOURCE_HINT_PATTERNS:
-        if re.search(pattern, text) and slug not in candidates:
-            candidates.append(slug)
-        if len(candidates) >= limit:
-            return candidates
-    return candidates
+    del prompt, limit
+    return []
 
 def normalized_generation_mode(generation_mode: GenerationMode | str | None) -> str:
     return str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
@@ -95,7 +81,6 @@ def is_behavior_workflow_prompt(prompt: str) -> bool:
         "client",
         "specialist",
         "manager",
-        "customer",
         "worker",
         "клиент",
         "исполнитель",
@@ -164,12 +149,6 @@ def build_acceptance_contract(
             "test_requirements": [],
         }
 
-    resource_limit = 4 if mode_value == GenerationMode.QUALITY.value else 3
-    prompt_resources = prompt_resource_candidates(prompt, limit=resource_limit)
-    endpoint_resources = [
-        *prompt_resources,
-        *[resource for resource in GENERIC_RESOURCE_DEFAULTS if resource not in prompt_resources],
-    ][: max(1, len(prompt_resources) or 1)]
     flows: list[dict[str, Any]] = [
         {
             "id": "role_shared_persistence",
@@ -177,7 +156,7 @@ def build_acceptance_contract(
             "roles": list(ROLE_ORDER),
             "requirements": [
                 "Client role can submit a real form/action through a POST-capable backend API.",
-                "Specialist role can see saved client-created state and perform an operational status/action update.",
+                "Specialist role can see saved client-created state and perform the prompt-derived operational action.",
                 "Manager role can see persisted shared state, summary metrics, and an oversight action.",
                 "Saved data remains visible after a reload through GET APIs; app source starts with no seed/mock records.",
             ],
@@ -194,19 +173,15 @@ def build_acceptance_contract(
                 "title": "Related status, summary, and operational updates",
                 "roles": list(ROLE_ORDER),
                 "requirements": [
-                    "One prompt-derived shared resource supports create, process/update, review, and summary workflows.",
+                    "The LLM-selected shared state supports create, process/update, review, and summary workflows.",
                     "Role pages expose different actions for creating, processing, and reviewing saved state.",
-                    "Specialist or manager status/payment/attendance changes are visible to the other roles through later GET requests.",
+                    "Specialist or manager updates are visible to the other roles through later GET requests.",
                 ],
                 "required_tests": [
-                    "Generated tests cover the primary create/list/update flow and one related status, payment, attendance, or summary flow.",
+                    "Generated tests cover the primary create/list/update flow and one related prompt-derived update or summary flow.",
                 ],
             }
         )
-    required_endpoints = [
-        {"resource": resource, "path": f"/api/{resource}", "methods": ["GET", "POST", "PATCH"]}
-        for resource in endpoint_resources
-    ]
     return {
         "required": True,
         "intent": intent_value,
@@ -216,16 +191,17 @@ def build_acceptance_contract(
         "features": {
             "cross_role_persistence": True,
             "refresh_persistence": True,
-            "status_update": True,
-            "resource_count": len(endpoint_resources),
-            "prompt_resource_candidates": prompt_resources,
-            "resource_strategy": "prompt_derived_without_fixed_domain_template",
+            "workflow_update": True,
+            "resource_count": 0,
+            "prompt_resource_candidates": [],
+            "resource_strategy": "llm_plan_owned_no_platform_resource_template",
+            "api_discovery_required": True,
         },
-        "required_endpoints": required_endpoints,
+        "required_endpoints": [],
         "required_controls": [
-            {"role": "client", "action": "submit a prompt-derived create/request form through POST"},
-            {"role": "specialist", "action": "process or update saved work through POST/PATCH"},
-            {"role": "manager", "action": "review shared state and trigger an oversight/status action"},
+            {"role": "client", "action": "submit the user-facing prompt-derived create/select/save flow through UI and POST-capable API"},
+            {"role": "specialist", "action": "perform the prompt-derived operational action through POST/PATCH when the workflow needs persisted updates"},
+            {"role": "manager", "action": "review shared state and trigger the prompt-derived oversight/control action"},
         ],
         "flows": flows,
         "test_requirements": [item for flow in flows for item in flow.get("required_tests", [])],
@@ -242,7 +218,7 @@ def build_implementation_plan(
 ) -> dict[str, Any]:
     """Build a generic agent plan from prompt-derived contract data.
 
-    The plan intentionally avoids domain-specific templates. It describes the
+    The plan intentionally avoids fixed-category templates. It describes the
     workflow proof the agent must satisfy, while the concrete nouns/fields are
     still owned by the LLM-generated implementation.
     """
@@ -253,8 +229,7 @@ def build_implementation_plan(
     for endpoint in contract.get("required_endpoints") or []:
         if isinstance(endpoint, dict) and str(endpoint.get("resource") or "").strip():
             resources.append(str(endpoint.get("resource")).strip())
-    if not resources:
-        resources = prompt_resource_candidates(prompt, limit=3) or list(GENERIC_RESOURCE_DEFAULTS[:1])
+    resources = list(dict.fromkeys(resources))
     required_controls = [
         dict(item)
         for item in (contract.get("required_controls") or [])
@@ -269,14 +244,14 @@ def build_implementation_plan(
         "roles": list(contract.get("roles") or ROLE_ORDER),
         "primary_entities": resources,
         "role_actions": {
-            "client": "perform the prompt-derived customer/user create, submit, select, or save action through UI and POST API",
+            "client": "perform the prompt-derived user create, submit, select, or save action through UI and POST API",
             "specialist": "perform the prompt-derived operational processing/update action through UI and update API",
             "manager": "review or control shared state and summary information through manager UI",
         },
         "api_contract": {
             "required_endpoints": list(contract.get("required_endpoints") or []),
             "must_persist": True,
-            "must_support_update": bool((contract.get("features") or {}).get("status_update", True)),
+            "must_support_update": bool((contract.get("features") or {}).get("workflow_update", True)),
         },
         "ui_contract": {
             "required_controls": required_controls,
@@ -294,6 +269,13 @@ def build_implementation_plan(
                 "client_role_observes_update_after_refresh",
             ],
         },
+        "agent_todos": [
+            {"id": "plan", "status": "completed", "content": "Extract prompt-owned roles, entities, UI controls, APIs, tests, and mobile constraints."},
+            {"id": "inspect", "status": "pending", "content": "Read/search only the workspace files needed for the next patch."},
+            {"id": "build", "status": "pending", "content": "Patch backend, role UI, frontend behavior, and generated tests through validated draft actions."},
+            {"id": "verify", "status": "pending", "content": "Run static/API/generated/browser/mobile proof against the actual generated workflow."},
+            {"id": "repair", "status": "pending", "content": "Patch the concrete failed slice until strict green completion."},
+        ],
         "mobile_design_contract": {
             "target_viewports": ["360x740", "390x844", "430x932"],
             "no_horizontal_scroll": True,
@@ -303,7 +285,7 @@ def build_implementation_plan(
         "orchestration": {
             "execution_style": (orchestration or {}).get("execution_style"),
             "phases": list((orchestration or {}).get("phases") or []),
-            "worker_count": (orchestration or {}).get("parallel_worker_count", 0),
+            "worker_count": (orchestration or {}).get("agent_worker_count", 0),
         },
     }
 
@@ -318,10 +300,12 @@ def orchestration_metadata_for_contract(
     workflow_kind = str(focused_edit_kind or "").strip().lower()
     enabled = bool((contract or {}).get("required"))
     execution_style = (
-        "fast_parallel_workers"
+        "agent_query_loop"
         if enabled and mode_value == GenerationMode.FAST.value
-        else "deep_parallel_workers" if enabled else "none"
+        else "agent_query_loop_with_design_pass" if enabled and mode_value == GenerationMode.QUALITY.value
+        else "agent_query_loop" if enabled else "none"
     )
+    isolated_worker_drafts = enabled and mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
     phases = [
         {
             "id": "spec_extract",
@@ -329,9 +313,13 @@ def orchestration_metadata_for_contract(
             "description": "Extract role actions, data resources, buttons, APIs, and cross-role acceptance requirements.",
         },
         {
-            "id": "parallel_build",
+            "id": "build",
             "status": "planned" if enabled else "not_required",
-            "description": "Build backend/API, client UI, specialist UI, manager UI, and generated tests as separately owned lanes before merge.",
+            "description": (
+                "Use owned agent worker drafts for backend/API, role UI, and generated tests, then merge non-conflicting diffs."
+                if isolated_worker_drafts
+                else "Use tool-loop patches to build backend/API, role UI, and generated tests from the implementation plan."
+            ),
         },
         {
             "id": "merge",
@@ -353,12 +341,12 @@ def orchestration_metadata_for_contract(
         {
             "worker": "client_ui",
             "ownership": ["miniapp/app/static/client/**"],
-            "responsibility": "Customer-facing forms, saved-state controls, and client-side API calls.",
+            "responsibility": "User-facing forms, saved-state controls, and client-side API calls.",
         },
         {
             "worker": "specialist_ui",
             "ownership": ["miniapp/app/static/specialist/**"],
-            "responsibility": "Operational queue, status actions, and saved-state visibility.",
+            "responsibility": "Prompt-derived specialist workflow, role actions, and saved-state visibility.",
         },
         {
             "worker": "manager_ui",
@@ -376,7 +364,8 @@ def orchestration_metadata_for_contract(
         "mode": mode_value,
         "workflow_kind": workflow_kind,
         "execution_style": execution_style,
-        "parallel_worker_count": len(worker_summaries) if enabled else 0,
+        "isolated_worker_drafts": isolated_worker_drafts,
+        "agent_worker_count": len(worker_summaries) if enabled else 0,
         "phases": phases,
         "worker_summaries": worker_summaries if enabled else [],
     }

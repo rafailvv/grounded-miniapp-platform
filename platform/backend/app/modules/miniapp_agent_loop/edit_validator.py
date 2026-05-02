@@ -1,29 +1,145 @@
 from __future__ import annotations
 
-from app.modules.miniapp_agent_loop.types import WorkspaceLoopTurnPlan
+import re
+
+from app.models.domain import DraftAction
+from app.modules.miniapp_agent_loop.types import AgentTurnPlan
 
 
-class WorkspaceLoopEditValidator:
+class AgentEditValidator:
     PATCH_ENVELOPE_MARKERS = ("*** Begin Patch", "*** End Patch", "*** Add File:", "*** Delete File:", "*** Update File:")
+    MAX_DRAFT_ACTION_COUNT = 80
+    MAX_SINGLE_CONTENT_CHARS = 260_000
+    MAX_TOTAL_CONTENT_CHARS = 900_000
+    PROTECTED_PATHS = (
+        ".git/",
+        "node_modules/",
+        "__pycache__/",
+        ".venv/",
+        "venv/",
+        "platform-state.json",
+    )
 
     @staticmethod
-    def normalize_plan(plan: WorkspaceLoopTurnPlan) -> WorkspaceLoopTurnPlan:
-        if plan.outcome == "patch_ready" and not plan.operations:
+    def normalize_plan(plan: AgentTurnPlan) -> AgentTurnPlan:
+        if plan.outcome == "patch_ready" and not plan.draft_actions:
             plan.outcome = "no_op"
         if plan.outcome == "patch_ready":
-            for operation in plan.operations:
-                content = str(getattr(operation, "content", None) or "")
-                if getattr(operation, "operation", "") in {"create", "replace"} and any(
-                    marker in content for marker in WorkspaceLoopEditValidator.PATCH_ENVELOPE_MARKERS
-                ):
-                    plan.outcome = "fatal_invalid_response"
-                    plan.diagnosis = (
-                        f"{operation.file_path} was returned as {operation.operation} content containing patch envelope markers. "
-                        "Return structured DraftFileOperation content only, or use operation='patch' with a diff."
-                    )
-                    plan.failure_class = "generation.invalid_patch_operation"
-                    plan.failure_signature = "generation.invalid_patch_operation:patch_envelope_in_content"
-                    plan.root_cause_summary = "The model returned an apply_patch envelope as file content."
-                    plan.operations = []
-                    break
+            issue = AgentEditValidator._first_invalid_draft_action(plan.draft_actions)
+            if issue:
+                code, message = issue
+                plan.outcome = "fatal_invalid_response"
+                plan.diagnosis = message
+                plan.failure_class = "generation.invalid_edit_operation"
+                plan.failure_signature = f"generation.invalid_edit_operation:{code}"
+                plan.root_cause_summary = message
+                plan.draft_actions = []
         return plan
+
+    @classmethod
+    def _first_invalid_draft_action(cls, draft_actions: list[DraftAction]) -> tuple[str, str] | None:
+        if len(draft_actions) > cls.MAX_DRAFT_ACTION_COUNT:
+            return (
+                "too_many_draft_actions",
+                f"Turn returned {len(draft_actions)} draft actions; split the edit into smaller patch-first turns.",
+            )
+        total_chars = 0
+        seen_paths: set[str] = set()
+        for operation in draft_actions:
+            normalized_path = cls._normalize_path(getattr(operation, "file_path", ""))
+            if not normalized_path:
+                return ("unsafe_path", "Every draft action must target a relative path inside miniapp/.")
+            if normalized_path in seen_paths:
+                return ("duplicate_path", f"{normalized_path} was edited more than once in the same turn; merge it into one operation.")
+            seen_paths.add(normalized_path)
+            op = str(getattr(operation, "operation", "") or "").strip().lower()
+            if op not in {"create", "replace", "delete", "patch"}:
+                return ("unknown_operation", f"{normalized_path} uses unsupported operation '{op}'.")
+            content = getattr(operation, "content", None)
+            diff = getattr(operation, "diff", None)
+            if op in {"create", "replace"}:
+                text = "" if content is None else str(content)
+                if not text:
+                    return ("missing_content", f"{normalized_path} {op} operation must include file content.")
+                if any(marker in text for marker in cls.PATCH_ENVELOPE_MARKERS):
+                    return (
+                        "patch_envelope_in_content",
+                        f"{normalized_path} was returned as {op} content containing patch envelope markers. Return raw file content, or use operation='patch' with a diff.",
+                    )
+                issue = cls._validate_size(normalized_path, text)
+                if issue:
+                    return issue
+                total_chars += len(text)
+            elif op == "patch":
+                patch_text = str(diff or content or "")
+                if not patch_text.strip():
+                    return ("missing_patch_diff", f"{normalized_path} patch operation must include a unified diff.")
+                if any(marker in patch_text for marker in ("*** Begin Patch", "*** End Patch")):
+                    return (
+                        "apply_patch_envelope_in_diff",
+                        f"{normalized_path} patch operation must contain only the file diff, not an apply_patch envelope.",
+                    )
+                if not cls._looks_like_unified_diff(patch_text):
+                    return (
+                        "invalid_patch_diff",
+                        f"{normalized_path} patch operation must include unified-diff hunks with @@ context and +/- lines.",
+                    )
+                issue = cls._validate_size(normalized_path, patch_text)
+                if issue:
+                    return issue
+                total_chars += len(patch_text)
+            elif op == "delete" and cls._is_protected_path(normalized_path):
+                return ("protected_delete", f"{normalized_path} is protected and cannot be deleted by the agent loop.")
+        if total_chars > cls.MAX_TOTAL_CONTENT_CHARS:
+            return (
+                "oversized_turn",
+                f"Turn returned {total_chars} characters of edits; use compact patch-first changes and continue in another turn.",
+            )
+        return None
+
+    @classmethod
+    def _normalize_path(cls, raw_path: object) -> str:
+        path = cls._strip_leading_dot_slash(raw_path)
+        if not path or path.startswith("/") or path.startswith("~"):
+            return ""
+        if "\x00" in path or ".." in path.split("/"):
+            return ""
+        if not path.startswith("miniapp/"):
+            return ""
+        if cls._is_protected_path(path):
+            return ""
+        return path
+
+    @classmethod
+    def _is_protected_path(cls, path: str) -> bool:
+        normalized = cls._strip_leading_dot_slash(path)
+        parts = set(normalized.split("/"))
+        protected_dirs = {item.strip("/") for item in cls.PROTECTED_PATHS if item.endswith("/")}
+        if parts.intersection(protected_dirs):
+            return True
+        return any(not item.endswith("/") and (normalized == item or normalized.endswith(f"/{item}")) for item in cls.PROTECTED_PATHS)
+
+    @staticmethod
+    def _strip_leading_dot_slash(raw_path: object) -> str:
+        path = str(raw_path or "").strip().replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        return path
+
+    @classmethod
+    def _validate_size(cls, path: str, text: str) -> tuple[str, str] | None:
+        if len(text) > cls.MAX_SINGLE_CONTENT_CHARS:
+            return (
+                "oversized_file_operation",
+                f"{path} operation is {len(text)} characters; split it into smaller files or patch hunks.",
+            )
+        return None
+
+    @staticmethod
+    def _looks_like_unified_diff(diff: str) -> bool:
+        text = str(diff or "")
+        if "@@" not in text:
+            return False
+        has_removed_or_context = bool(re.search(r"(?m)^[- ][^\n]*", text))
+        has_added_or_context = bool(re.search(r"(?m)^[+ ][^\n]*", text))
+        return has_removed_or_context and has_added_or_context

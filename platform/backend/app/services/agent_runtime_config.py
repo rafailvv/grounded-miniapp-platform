@@ -66,7 +66,7 @@ class TimeoutProfile:
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    max_attempts: int
+    max_provider_attempts: int
     base_delay_ms: int
     max_delay_ms: int
 
@@ -117,7 +117,14 @@ class RetryPolicy:
     @classmethod
     def from_env(cls) -> "RetryPolicy":
         return cls(
-            max_attempts=max(1, _env_int("LLM_RETRY_MAX_ATTEMPTS", 2)),
+            max_provider_attempts=max(
+                1,
+                _env_int(
+                    "LLM_PROVIDER_RETRY_MAX_ATTEMPTS",
+                    2,
+                    aliases=("LLM_RETRY_MAX_ATTEMPTS",),
+                ),
+            ),
             base_delay_ms=max(100, _env_int("LLM_RETRY_BASE_DELAY_MS", 250)),
             max_delay_ms=max(500, _env_int("LLM_RETRY_MAX_DELAY_MS", 2000)),
         )
@@ -153,7 +160,7 @@ class RetryPolicy:
         return "unknown"
 
     def should_retry(self, error: Exception | str, attempt: int) -> bool:
-        if attempt >= self.max_attempts:
+        if attempt >= self.max_provider_attempts:
             return False
         classification = self.classify_error(error)
         if classification in {"quota_or_budget", "auth_or_config", "invalid_request"}:
@@ -161,7 +168,7 @@ class RetryPolicy:
         if classification == "scope_mismatch":
             return attempt <= 1
         if classification in {"empty_model_output", "tool_budget_exhausted"}:
-            return attempt <= min(self.max_attempts, 3)
+            return attempt <= min(self.max_provider_attempts, 3)
         return classification in {"transient_provider", "network_transport", "unknown"}
 
     def backoff_seconds(self, attempt: int) -> float:

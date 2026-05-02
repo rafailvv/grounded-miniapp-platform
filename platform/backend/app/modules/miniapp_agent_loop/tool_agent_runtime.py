@@ -1,85 +1,15 @@
 from __future__ import annotations
 
-import re
-import shutil
-import shlex
-import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
+from app.modules.miniapp_agent_loop.agent_command_policy import DEFAULT_COMMAND_POLICY, decide_workspace_command
+from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
+from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
+
 
 MAX_TOOL_OUTPUT_CHARS = 6000
-
-_BLOCKED_COMMAND_PATTERNS: tuple[tuple[str, str], ...] = (
-    (r"(^|\s)rm\s+-rf(\s|$)", "Destructive file deletion is blocked."),
-    (r"(^|\s)git\s+reset(\s|$)", "Git reset is blocked."),
-    (r"(^|\s)git\s+checkout\s+--(\s|$)", "Discarding tracked changes is blocked."),
-    (r"(^|\s)git\s+clean(\s|$)", "Git clean is blocked."),
-    (r"(^|\s)curl(\s|$)", "Network fetch commands are blocked."),
-    (r"(^|\s)wget(\s|$)", "Network fetch commands are blocked."),
-    (r"\|\s*sh(\s|$)", "Piping remote or generated shell into sh is blocked."),
-    (r"\|\s*bash(\s|$)", "Piping remote or generated shell into bash is blocked."),
-    (r"(^|\s)pip(\d+)?\s+install(\s|$)", "Package installation commands are blocked."),
-    (r"(^|\s)python(\d+(\.\d+)?)?\s+-m\s+pip\s+install(\s|$)", "Package installation commands are blocked."),
-    (r"(^|\s)npm\s+(install|i)(\s|$)", "Package installation commands are blocked."),
-    (r"(^|\s)pnpm\s+(install|add)(\s|$)", "Package installation commands are blocked."),
-    (r"(^|\s)yarn\s+(add|install)(\s|$)", "Package installation commands are blocked."),
-    (r"(^|\s)uv\s+pip\s+install(\s|$)", "Package installation commands are blocked."),
-    (r"(^|\s)poetry\s+add(\s|$)", "Package installation commands are blocked."),
-    (r"(^|\s)docker\s+(build|pull|run)(\s|$)", "Docker image or container mutation is blocked."),
-    (r"(^|\s)docker\s+compose\s+(build|pull|up|run)(\s|$)", "Docker rebuild commands are blocked."),
-    (r"(^|\s)docker-compose\s+(build|pull|up|run)(\s|$)", "Docker rebuild commands are blocked."),
-    (r"(^|\s)(apt|apt-get|brew)\s+(install|update|upgrade)(\s|$)", "System package management commands are blocked."),
-)
-
-
-def tool_patch_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "outcome": {
-                "type": "string",
-                "enum": ["patch_ready", "tool_request", "no_progress", "fatal_invalid_response"],
-            },
-            "diagnosis": {"type": "string"},
-            "tool_requests": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "tool": {"type": "string", "enum": ["list_files", "read_files", "run_checks", "search_files", "inspect_diff", "run_command"]},
-                        "mode": {"type": "string", "enum": ["exact", "final"]},
-                        "targets": {"type": "array", "items": {"type": "string"}},
-                        "pattern": {"type": "string"},
-                        "command": {"type": "string"},
-                        "reason": {"type": "string"},
-                    },
-                    "required": ["tool", "targets", "reason"],
-                },
-            },
-            "expected_verification": {"type": "string"},
-            "rationale_by_file": {"type": "object", "additionalProperties": {"type": "string"}},
-            "operations": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "file_path": {"type": "string"},
-                        "operation": {"type": "string", "enum": ["create", "replace", "delete", "patch"]},
-                        "content": {"type": ["string", "null"]},
-                        "diff": {"type": ["string", "null"]},
-                        "reason": {"type": "string"},
-                    },
-                    "required": ["file_path", "operation", "reason"],
-                },
-            },
-        },
-        "required": ["diagnosis", "tool_requests", "expected_verification", "rationale_by_file", "operations"],
-    }
-
 
 def normalize_tool_requests(raw_tool_requests: list[Any]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
@@ -89,14 +19,14 @@ def normalize_tool_requests(raw_tool_requests: list[Any]) -> list[dict[str, Any]
         if not isinstance(item, dict):
             continue
         tool = str(item.get("tool") or "").strip().lower()
-        if tool not in {"list_files", "read_files", "run_checks", "search_files", "inspect_diff", "run_command"}:
+        if tool not in AgentToolRegistry.names():
             continue
         raw_targets = item.get("targets") or []
         if not isinstance(raw_targets, list):
             raw_targets = []
         targets: list[str] = []
         for target in raw_targets:
-            value = str(target or "").strip().lstrip("./")
+            value = _strip_leading_dot_slash(target)
             if not value or value in targets:
                 continue
             targets.append(value)
@@ -108,12 +38,22 @@ def normalize_tool_requests(raw_tool_requests: list[Any]) -> list[dict[str, Any]
                 "tool": tool,
                 "mode": mode,
                 "targets": targets[:12],
+                "file_path": _strip_leading_dot_slash(item.get("file_path") or ""),
                 "pattern": str(item.get("pattern") or "").strip(),
                 "command": str(item.get("command") or "").strip(),
+                "content": str(item.get("content") or ""),
+                "diff": str(item.get("diff") or ""),
                 "reason": str(item.get("reason") or "").strip(),
             }
         )
     return normalized
+
+
+def _strip_leading_dot_slash(raw_path: object) -> str:
+    path = str(raw_path or "").strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
 
 
 def truncate_tool_text(value: str, *, max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> str:
@@ -208,50 +148,8 @@ def search_workspace_files(
 
 
 def validate_workspace_command(command: str) -> str | None:
-    stripped = str(command or "").strip()
-    if not stripped:
-        return "Empty command."
-    lowered = stripped.lower()
-    for pattern, message in _BLOCKED_COMMAND_PATTERNS:
-        if re.search(pattern, lowered):
-            return message
-    if re.search(r"[`$<>|;]", stripped):
-        return "Shell metacharacters other than a single safe 'cd miniapp && ...' prefix are blocked."
-    normalized = re.sub(r"\s+", " ", stripped)
-    normalized_lower = normalized.lower()
-    if "&&" in normalized_lower:
-        if not normalized_lower.startswith("cd miniapp && "):
-            return "Command chaining is blocked except for 'cd miniapp && ...'."
-        normalized = normalized.split("&&", 1)[1].strip()
-        normalized_lower = normalized.lower()
-        if "&&" in normalized_lower:
-            return "Command chaining is blocked except for 'cd miniapp && ...'."
-    try:
-        args = shlex.split(normalized)
-    except ValueError as exc:
-        return f"Command could not be parsed safely: {exc}."
-    if not args:
-        return "Empty command."
-    if any(arg == ".." or arg.startswith("../") or "/../" in arg for arg in args):
-        return "Parent-directory paths are blocked."
-    program = Path(args[0]).name.lower()
-    if program in {"python", "python3"} or re.fullmatch(r"python3?\.\d+", program):
-        if len(args) >= 4 and args[1] == "-m" and args[2] in {"unittest", "py_compile"}:
-            return None
-        return "Only 'python -m unittest' and 'python -m py_compile' diagnostics are allowed."
-    if program == "node":
-        if len(args) >= 2 and args[1] in {"--test", "--check"}:
-            return None
-        return "Only 'node --test' and 'node --check' diagnostics are allowed."
-    if program == "rg":
-        return None
-    if program == "sed":
-        if any(arg == "-i" or arg.startswith("-i") for arg in args[1:]):
-            return "In-place sed edits are blocked."
-        return None
-    if program == "ls":
-        return None
-    return "Only diagnostic commands are allowed: python -m unittest, python -m py_compile, node --test, node --check, rg, sed, and ls."
+    decision = decide_workspace_command(command)
+    return None if decision.allowed else decision.reason
 
 
 def run_workspace_command(
@@ -260,55 +158,21 @@ def run_workspace_command(
     command: str,
     timeout_seconds: int,
     max_output_chars: int = MAX_TOOL_OUTPUT_CHARS,
+    progress_callback=None,
 ) -> dict[str, object]:
-    policy_error = validate_workspace_command(command)
-    if policy_error:
-        return {
-            "tool": "run_command",
-            "command": command,
-            "error": policy_error,
-            "cwd": str(draft_source),
-        }
-    shell_candidates = ["/bin/zsh", shutil.which("zsh"), "/bin/sh", shutil.which("sh")]
-    shell_path = next(
-        (
-            candidate
-            for candidate in shell_candidates
-            if candidate and Path(candidate).exists()
-        ),
-        None,
-    )
-    if not shell_path:
-        return {
-            "tool": "run_command",
-            "command": command,
-            "error": "No compatible shell was found for diagnostic command execution.",
-            "cwd": str(draft_source),
-        }
-    try:
-        completed = subprocess.run(
-            [shell_path, "-lc", command],
-            cwd=draft_source,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        return {
-            "tool": "run_command",
-            "command": command,
-            "shell": shell_path,
-            "exit_code": completed.returncode,
-            "stdout": truncate_tool_text(completed.stdout, max_chars=max_output_chars),
-            "stderr": truncate_tool_text(completed.stderr, max_chars=max_output_chars),
-            "cwd": str(draft_source),
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "tool": "run_command",
-            "command": command,
-            "shell": shell_path,
-            "error": f"Command timed out after {timeout_seconds}s.",
-            "stdout": truncate_tool_text(exc.stdout or "", max_chars=max_output_chars),
-            "stderr": truncate_tool_text(exc.stderr or "", max_chars=max_output_chars),
-            "cwd": str(draft_source),
-        }
+    started_at = time.perf_counter()
+    decision = decide_workspace_command(command)
+    result = AgentProcessManager().run(
+        draft_source=draft_source,
+        command=command,
+        decision=decision,
+        timeout_seconds=timeout_seconds,
+        max_output_chars=max_output_chars,
+        progress_callback=progress_callback,
+    ).as_dict()
+    result.setdefault("duration_ms", int((time.perf_counter() - started_at) * 1000))
+    return result
+
+
+def command_policy_snapshot() -> dict[str, object]:
+    return DEFAULT_COMMAND_POLICY.snapshot()

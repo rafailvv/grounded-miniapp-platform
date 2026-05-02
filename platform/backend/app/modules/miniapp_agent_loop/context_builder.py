@@ -5,12 +5,12 @@ from app.repositories.state_store import StateStore
 from app.services.workspace.service import WorkspaceService
 
 
-class WorkspaceLoopContextBuilder:
+class AgentContextBuilder:
     def __init__(self, *, store: StateStore, workspace_service: WorkspaceService) -> None:
         self.store = store
         self.workspace_service = workspace_service
 
-    def store_loop_reports(
+    def store_agent_reports(
         self,
         *,
         callbacks,

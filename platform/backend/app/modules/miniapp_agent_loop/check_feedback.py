@@ -5,7 +5,7 @@ from typing import Any
 from app.models.domain import ValidationSnapshot
 
 
-class WorkspaceLoopCheckFeedback:
+class AgentCheckFeedback:
     @staticmethod
     def progress_snapshot(
         results: list[Any],
@@ -49,5 +49,5 @@ class WorkspaceLoopCheckFeedback:
     @staticmethod
     def progress_signature(snapshot: dict[str, Any]) -> str:
         signature = "|".join(snapshot.get("details_markers") or snapshot.get("failed_checks") or [])
-        return signature or "workspace_loop_failure"
+        return signature or "agent_loop_failure"
 

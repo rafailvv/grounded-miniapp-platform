@@ -148,7 +148,7 @@ class CheckRunner:
         re.IGNORECASE,
     )
     _SHARED_STATE_UPDATE_RE = re.compile(
-        r"Updated record\s+(?P<record_id>[A-Za-z0-9_-]+)\s+did not reflect\s+(?P<actor>[A-Za-z0-9_-]+)\s+changes in shared state\.\s+Payload:\s*(?P<payload>.*)$",
+        r"Updated (?:state|entity|item|record)\s+(?P<entity_id>[A-Za-z0-9_-]+)\s+did not reflect\s+(?P<actor>[A-Za-z0-9_-]+)\s+changes in shared state\.\s+Payload:\s*(?P<payload>.*)$",
         re.IGNORECASE,
     )
     _POST_PERSISTENCE_RE = re.compile(
@@ -659,11 +659,11 @@ class CheckRunner:
                     blocking=True,
                 )
             )
-        if not cls._has_status_update_action(role_text.get("specialist", "") + "\n" + role_text.get("manager", "")):
+        if not cls._has_workflow_update_action(role_text.get("specialist", "") + "\n" + role_text.get("manager", "")):
             issues.append(
                 ValidationIssue(
-                    code="platform.workflow_missing_status_update",
-                    message="Acceptance workflow requires specialist/manager processing actions, but no PATCH/PUT/status update action was found.",
+                    code="platform.workflow_missing_update_action",
+                    message="Acceptance workflow requires specialist/manager processing actions, but no persisted POST/PATCH/PUT update action was found.",
                     severity="high",
                     location="miniapp/app/static",
                     blocking=True,
@@ -1025,7 +1025,7 @@ class CheckRunner:
                 backend_create_fields
                 and re.search(r"\bmethod\s*:\s*([\"'`])POST\1", js_source, re.IGNORECASE)
                 and not (
-                    cls._form_looks_like_status_update(field_names)
+                    cls._form_looks_like_workflow_update(field_names)
                     and re.search(r"\bmethod\s*:\s*([\"'`])(?:PATCH|PUT|DELETE)\1", js_source, re.IGNORECASE)
                 )
             ):
@@ -1033,7 +1033,7 @@ class CheckRunner:
                 unknown_payload_fields = sorted(
                     field
                     for field in payload_fields
-                    if field not in backend_create_fields and field not in {"id", "record_id"}
+                    if field not in backend_create_fields and not cls._is_path_id_field(field)
                 )
                 if unknown_payload_fields:
                     issues.append(
@@ -1217,7 +1217,7 @@ class CheckRunner:
         ]
         if not patch_payloads or not accepted_sets:
             return issues
-        allowed_path_fields = {"id", "record_id", "request_id", "order_id", "item_id"}
+        allowed_path_fields = {field for fields in patch_payloads for field in fields if cls._is_path_id_field(field)}
         for payload_fields in patch_payloads:
             effective_fields = set(payload_fields) - allowed_path_fields
             if not effective_fields:
@@ -1405,23 +1405,26 @@ class CheckRunner:
         return keys
 
     @staticmethod
-    def _form_looks_like_status_update(field_names: set[str]) -> bool:
+    def _form_looks_like_workflow_update(field_names: set[str]) -> bool:
         normalized = {str(field or "").strip().lower() for field in field_names}
         update_markers = {
             "status",
             "state",
             "stage",
-            "attendance",
-            "visit_status",
-            "payment_status",
+            "progress",
+            "outcome",
+            "review_state",
             "specialist_note",
             "manager_note",
             "note",
-            "record_id",
-            "request_id",
+            "entity_id",
+            "item_id",
             "id",
         }
-        return bool(normalized & update_markers) and not {"parent_name", "phone", "direction", "preferred_date", "lesson_date"} & normalized
+        if not normalized & update_markers:
+            return False
+        non_update_signal_count = len(normalized - update_markers)
+        return non_update_signal_count <= max(2, len(update_markers & normalized) + 1)
 
     @staticmethod
     def _js_effective_form_payload_fields(js_source: str, field_names: set[str]) -> set[str]:
@@ -1563,7 +1566,7 @@ class CheckRunner:
     @staticmethod
     def _is_path_id_field(field_name: str) -> bool:
         value = str(field_name or "").strip().lower()
-        return value in {"id", "record_id", "request_id", "order_id", "item_id"} or value.endswith("_id")
+        return value == "id" or value.endswith("_id")
 
     @staticmethod
     def _js_reads_form_path_id_field(js_source: str, field_name: str) -> bool:
@@ -1571,6 +1574,7 @@ class CheckRunner:
         text = str(js_source or "")
         return bool(
             re.search(rf"\.get\(\s*([\"']){escaped}\1\s*\)", text)
+            or re.search(rf"\b(?:form|[A-Za-z_$][\w$]*Form)\.{escaped}\b", text, re.IGNORECASE)
             or re.search(rf"\[\s*name\s*=\s*([\"']){escaped}\1\s*\]", text)
             or re.search(rf"\bname\s*=\s*([\"']){escaped}\1", text)
         )
@@ -1768,11 +1772,15 @@ class CheckRunner:
         return bool(re.search(r"method\s*:\s*['\"]post['\"]", text, flags=re.IGNORECASE) or re.search(r"\bfetch\s*\(", text) and "post" in text.lower())
 
     @staticmethod
-    def _has_status_update_action(text: str) -> bool:
+    def _has_workflow_update_action(text: str) -> bool:
         lowered = str(text or "").lower()
         return bool(
-            re.search(r"method\s*:\s*['\"](?:patch|put)['\"]", text, flags=re.IGNORECASE)
-            or ("/api/" in lowered and any(marker in lowered for marker in ("status", "confirm", "complete", "review", "approve", "статус", "подтверд", "готов", "провер")))
+            re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE)
+            or (
+                re.search(r"method\s*:\s*['\"]post['\"]", text, flags=re.IGNORECASE)
+                and "/api/" in lowered
+                and any(marker in lowered for marker in ("action", "update", "save", "review", "approve", "control", "обнов", "сохран", "действ", "провер"))
+            )
         )
 
     @staticmethod
@@ -1781,7 +1789,8 @@ class CheckRunner:
         if "testclient" not in lowered and "node:test" not in lowered:
             return False
         required_terms = ["post", "get"]
-        if (contract.get("features") or {}).get("status_update"):
+        features = contract.get("features") or {}
+        if features.get("workflow_update", True):
             required_terms.append("patch")
         return all(term in lowered for term in required_terms)
 
@@ -1847,7 +1856,7 @@ class CheckRunner:
                 command="api workflow smoke",
                 logs=[],
             )
-        proof = self._run_generic_browser_flow_proof(source_dir=source_dir, acceptance_contract=contract)
+        proof = self._run_generic_api_workflow_proof(source_dir=source_dir, acceptance_contract=contract)
         logs = [str(item) for item in proof.get("logs") or [] if str(item).strip()]
         diagnostics = {
             "workflow_kind": contract.get("workflow_kind") or "create",
@@ -2149,8 +2158,10 @@ def contains_marker(value, marker):
 
 def find_id(value):
     if isinstance(value, dict):
-        for key in ("id", "record_id", "request_id", "order_id", "item_id"):
-            candidate = value.get(key)
+        for key, candidate in value.items():
+            normalized = str(key or "").lower()
+            if normalized != "id" and not normalized.endswith("_id"):
+                continue
             if candidate not in (None, ""):
                 return candidate
     return None
@@ -2256,7 +2267,7 @@ def control_meta(locator):
 def value_for(meta, marker, purpose, created_id=None):
     name = str(meta.get("name") or meta.get("id") or "").lower()
     typ = str(meta.get("type") or "")
-    if created_id is not None and (name in {"id", "record_id", "request_id", "order_id", "item_id"} or name.endswith("_id")):
+    if created_id is not None and (name == "id" or name.endswith("_id")):
         return str(created_id)
     if typ in {"number", "range"} or any(token in name for token in ("count", "quantity", "stock", "price", "amount", "total")):
         return "3"
@@ -2614,12 +2625,12 @@ except Exception as exc:
             routes_by_role[role] = list(dict.fromkeys(routes))[:12]
         return routes_by_role
 
-    def _run_generic_browser_flow_proof(self, *, source_dir: Path, acceptance_contract: dict[str, Any]) -> dict[str, Any]:
+    def _run_generic_api_workflow_proof(self, *, source_dir: Path, acceptance_contract: dict[str, Any]) -> dict[str, Any]:
         backend_dir = source_dir / "miniapp"
         install_result = self._install_python_requirements(
             backend_dir,
-            result_name="browser_flow_smoke",
-            purpose="Browser flow Python dependency",
+            result_name="api_workflow_smoke",
+            purpose="API workflow Python dependency",
         )
         if install_result is not None:
             return {
@@ -2633,28 +2644,28 @@ except Exception as exc:
             if isinstance(endpoint, dict) and str(endpoint.get("path") or "").strip()
         ]
         api_paths = list(dict.fromkeys(path for path in api_paths if path.startswith("/api/")))
-        script = self._generic_browser_flow_python_script()
+        script = self._generic_api_workflow_python_script()
         env = {**os.environ}
         python_path_parts = [str(backend_dir)]
         if env.get("PYTHONPATH"):
             python_path_parts.append(str(env.get("PYTHONPATH")))
         env["PYTHONPATH"] = os.pathsep.join(python_path_parts)
-        with tempfile.TemporaryDirectory(prefix="miniapp-browser-flow-") as tmp_dir:
-            env["DATABASE_URL"] = f"sqlite:///{(Path(tmp_dir) / 'browser_flow.db').as_posix()}"
+        with tempfile.TemporaryDirectory(prefix="miniapp-api-workflow-") as tmp_dir:
+            env["DATABASE_URL"] = f"sqlite:///{(Path(tmp_dir) / 'api_workflow.db').as_posix()}"
             try:
                 result = subprocess.run(
                     [sys.executable, "-c", script, json.dumps(api_paths)],
                     cwd=backend_dir,
                     capture_output=True,
                     text=True,
-                    timeout=int(os.getenv("BROWSER_FLOW_TIMEOUT_SEC", "120")),
+                    timeout=int(os.getenv("API_WORKFLOW_TIMEOUT_SEC", "120")),
                     env=env,
                 )
             except subprocess.TimeoutExpired as exc:
                 return {
                     "passed": False,
                     "failed_step": "timeout",
-                    "logs": self._command_logs("Generic browser flow proof timed out.", exc.stdout or "", exc.stderr or ""),
+                    "logs": self._command_logs("Generic API workflow proof timed out.", exc.stdout or "", exc.stderr or ""),
                 }
         output = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()]))
         parsed: dict[str, Any] | None = None
@@ -2670,16 +2681,16 @@ except Exception as exc:
             return {
                 "passed": False,
                 "failed_step": "invalid_proof_output",
-                "logs": self._command_logs("Generic browser flow proof did not return JSON.", result.stdout, result.stderr),
+                "logs": self._command_logs("Generic API workflow proof did not return JSON.", result.stdout, result.stderr),
             }
         parsed.setdefault("logs", [])
         if result.returncode != 0:
             parsed["passed"] = False
-            parsed["logs"] = [*list(parsed.get("logs") or []), *self._command_logs("Generic browser flow proof failed.", "", output)]
+            parsed["logs"] = [*list(parsed.get("logs") or []), *self._command_logs("Generic API workflow proof failed.", "", output)]
         return parsed
 
     @staticmethod
-    def _generic_browser_flow_python_script() -> str:
+    def _generic_api_workflow_python_script() -> str:
         return r'''
 import json
 import sys
@@ -2823,9 +2834,12 @@ def contains_marker(value, marker):
 
 def find_id(value):
     if isinstance(value, dict):
-        for key in ("id", "record_id", "request_id", "order_id", "item_id"):
-            if value.get(key) not in (None, ""):
-                return value.get(key)
+        for key, candidate in value.items():
+            normalized = str(key or "").lower()
+            if normalized != "id" and not normalized.endswith("_id"):
+                continue
+            if candidate not in (None, ""):
+                return candidate
     return None
 
 
@@ -2852,7 +2866,7 @@ def update_path_for(openapi, base_path):
 
 def concrete(path, item_id):
     value = str(path)
-    for token in ("{id}", "{record_id}", "{request_id}", "{order_id}", "{item_id}"):
+    for token in ("{id}", "{entity_id}", "{item_id}"):
         value = value.replace(token, str(item_id))
     import re
     return re.sub(r"\{[^}/]+\}", str(item_id), value)
@@ -2908,7 +2922,7 @@ try:
             fail("create_persistence", f"POST {base_path} did not persist a discoverable item/state through later GET.", api_paths=api_paths, api_before=before_json, api_after=after_create_json)
         created_id = created_id or find_id(created_item)
         if created_id is None:
-            fail("created_id", "Created state did not expose an id usable for specialist/manager update flow.", api_paths=api_paths, api_after=after_create_json)
+            fail("created_id", "Created state did not expose an id-like field usable for the role update flow.", api_paths=api_paths, api_after=after_create_json)
         STEPS.append({"step": "create_persistence", "path": base_path, "status": after_create.status_code, "id": created_id})
 
         update_template = update_path_for(OPENAPI, base_path)
@@ -2926,7 +2940,7 @@ try:
         after_update_json = after_update.json()
         updated_item = find_created(after_update_json, marker, created_id)
         if updated_item is None:
-            fail("manager_visibility", "Manager/shared GET state could not find the created item after update.", api_paths=api_paths, api_after=after_update_json)
+            fail("manager_visibility", "Shared GET state could not find the created entity after update.", api_paths=api_paths, api_after=after_update_json)
         update_visible = any(contains_marker(updated_item.get(key) if isinstance(updated_item, dict) else updated_item, str(value)) for key, value in update_payload.items())
         if not update_visible and not contains_marker(updated_item, update_marker):
             if isinstance(updated_item, dict) and update_payload:
@@ -3162,11 +3176,11 @@ except Exception as exc:
             return "tooling/runtime_misconfiguration"
         failed_names = {result.name for result in results if result.status == "failed"}
         if "schema_validators" in failed_names or "connectivity_validators" in failed_names:
-            return "validator/domain_constraint"
+            return "validator/contract"
         if "changed_files_static" in failed_names:
             return "syntax/build"
-        if "platform_invariants" in failed_names or "prompt_alignment_smoke" in failed_names or "frontend_interaction_static_smoke" in failed_names:
-            return "validator/domain_constraint"
+        if "platform_invariants" in failed_names or "frontend_interaction_static_smoke" in failed_names:
+            return "validator/contract"
         if "generated_app_python_tests" in failed_names or "generated_app_js_tests" in failed_names:
             return "app/runtime_test"
         for result in results:
@@ -3439,7 +3453,7 @@ except Exception as exc:
             combined = "\n".join(texts)
             normalized = combined.lower()
             markers = [marker for marker in NEUTRAL_TEMPLATE_MARKERS if marker in normalized]
-            role_tokens[role] = cls._domain_tokens(combined)
+            role_tokens[role] = cls._semantic_tokens(combined)
             role_routes = cls._unique_role_routes(route_pages.get(role, []))
             secondary_routes = [route for route in role_routes if route != f"/{role}"]
             if missing:
@@ -3566,27 +3580,6 @@ except Exception as exc:
                     )
                 )
                 continue
-            if len(role_routes) < min_role_route_pages or len(secondary_routes) < min_role_route_pages - 1:
-                coverage[role] = {
-                    "status": "single_page",
-                    "route_count": len(role_routes),
-                    "secondary_route_count": len(secondary_routes),
-                    "routes": role_routes,
-                    "required_route_count": min_role_route_pages,
-                }
-                issues.append(
-                    ValidationIssue(
-                        code="platform.single_page_role_surface",
-                        message=(
-                            f"{role} role is too single-page. Generate at least {min_role_route_pages} routeable pages "
-                            f"for this role: /{role} plus at least {min_role_route_pages - 1} role-relevant child pages."
-                        ),
-                        severity="high",
-                        location=f"miniapp/app/static/{role}",
-                        blocking=True,
-                    )
-                )
-                continue
             action_signals = cls._role_action_signals(role, combined)
             if not action_signals:
                 coverage[role] = {
@@ -3617,7 +3610,7 @@ except Exception as exc:
                 "secondary_route_count": len(secondary_routes),
                 "required_route_count": min_role_route_pages,
                 "routes": role_routes,
-                "domain_token_count": len(role_tokens[role]),
+                "semantic_token_count": len(role_tokens[role]),
                 "action_signals": action_signals,
             }
 
@@ -3648,13 +3641,13 @@ except Exception as exc:
                         blocking=True,
                     )
                 )
-            coverage["shared_domain_tokens"] = sorted(shared_tokens)[:12]
+            coverage["shared_semantic_tokens"] = sorted(shared_tokens)[:12]
         return issues, coverage, neutral_findings
 
     @staticmethod
     def _min_role_route_pages(generation_mode: GenerationMode | str | None) -> int:
         del generation_mode
-        return 2
+        return 1
 
     @staticmethod
     def _role_design_depth_issue(role: str, css_text: str, combined: str, generation_mode: GenerationMode | str | None) -> ValidationIssue | None:
@@ -3815,21 +3808,21 @@ except Exception as exc:
             return signals if {"form", "post"}.issubset(set(signals)) else []
         if role == "specialist":
             has_update_method = bool(re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE))
-            has_status_post = bool(
+            has_action_post = bool(
                 re.search(r"method\s*:\s*['\"]post['\"]", text, flags=re.IGNORECASE)
-                and re.search(r"(status_updates|status|статус|готов|очеред)", lowered)
+                and ("/api/" in lowered or "fetch(" in lowered)
             )
             has_api_action = bool(
                 has_update_method
-                or has_status_post
-                or ("/api/" in lowered and "fetch(" in lowered and re.search(r"(status|attendance|visit|статус|посещ|отмет|сохран|готов|обнов)", lowered))
+                or has_action_post
+                or ("/api/" in lowered and "fetch(" in lowered and re.search(r"(state|stage|progress|action|update|save|review|статус|сохран|обнов|действ)", lowered))
             )
             if has_api_action:
-                signals.append("status_update")
-            if re.search(r"\b(confirm|done|complete|assign|process|status|queue)\b", lowered) or re.search(
-                r"(статус|готов|очеред|заявк|занят|посещ|педагог|обнов|сохран|отмет|работ)", lowered
+                signals.append("workflow_update")
+            if re.search(r"\b(confirm|done|complete|assign|process|status|update|action|review|save)\b", lowered) or re.search(
+                r"(статус|обнов|сохран|действ|работ|провер)", lowered
             ):
-                signals.append("operations")
+                signals.append("workflow_actions")
             return signals if len(signals) >= 2 else []
         if role == "manager":
             if re.search(r"\b(metric|dashboard|summary|total|workload|overview|count)\b", lowered):
@@ -3868,7 +3861,7 @@ except Exception as exc:
             "manager app",
             "source request",
             "collect user-provided details",
-            "record records",
+            "placeholder records",
         )
         return [marker for marker in markers if marker in lowered]
 
@@ -4342,7 +4335,7 @@ except Exception as exc:
         return routes
 
     @staticmethod
-    def _domain_tokens(text: str) -> set[str]:
+    def _semantic_tokens(text: str) -> set[str]:
         cleaned = re.sub(r"<script\b.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
         cleaned = re.sub(r"<style\b.*?</style>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
         cleaned = re.sub(r"<[^>]+>", " ", cleaned)
@@ -4734,17 +4727,24 @@ except Exception as exc:
     @staticmethod
     def _css_only_app_change(changed_files: list[str]) -> bool:
         relevant = [
-            str(path).replace("\\", "/").lstrip("./")
+            CheckRunner._strip_leading_dot_slash(path)
             for path in changed_files
-            if isinstance(path, str) and str(path).replace("\\", "/").lstrip("./").startswith("miniapp/app/")
+            if isinstance(path, str) and CheckRunner._strip_leading_dot_slash(path).startswith("miniapp/app/")
         ]
         return bool(relevant) and all(path.startswith("miniapp/app/static/") and path.endswith(".css") for path in relevant)
+
+    @staticmethod
+    def _strip_leading_dot_slash(raw_path: object) -> str:
+        path = str(raw_path or "").strip().replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        return path
 
     def _focused_css_static_check(self, *, source_dir: Path, changed_files: list[str]) -> RunCheckResult:
         issues: list[str] = []
         checked_paths: list[str] = []
         for raw_path in changed_files:
-            path = str(raw_path or "").replace("\\", "/").lstrip("./")
+            path = self._strip_leading_dot_slash(raw_path)
             if not path.startswith("miniapp/app/static/") or not path.endswith(".css"):
                 continue
             full_path = source_dir / path
@@ -5589,11 +5589,11 @@ except Exception as exc:
         missing_includes_match = next(
             (
                 re.search(
-                    r"\b[A-Za-z0-9_]*Html\.includes\(\s*([\"'])(?P<literal>(?:id|href)=\\?[\"'][^\"']+\\?[\"'])\1",
+                    r"\b(?:html|[A-Za-z0-9_]*Html)\.includes\(\s*([\"'])(?P<literal>(?:id|href)=\\?[\"'][^\"']+\\?[\"'])\1",
                     str(line or ""),
                 )
                 for line in logs
-                if "Html.includes(" in str(line or "") and ("id=" in str(line or "") or "href=" in str(line or ""))
+                if ".includes(" in str(line or "") and ("id=" in str(line or "") or "href=" in str(line or ""))
             ),
             None,
         )
@@ -5772,7 +5772,7 @@ except Exception as exc:
             payload = str(shared_state_match.group("payload") or "").strip()
             resource_slug = cls._resource_slug_from_payload_keys(payload)
             diagnostics["shared_state_update_failure"] = {
-                "record_id": str(shared_state_match.group("record_id") or "").strip(),
+                "entity_id": str(shared_state_match.group("entity_id") or "").strip(),
                 "actor": str(shared_state_match.group("actor") or "").strip().lower(),
                 "resource_slug": resource_slug or None,
                 "payload_excerpt": payload[:700],

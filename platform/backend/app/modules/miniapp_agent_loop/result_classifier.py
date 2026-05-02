@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from app.modules.miniapp_agent_loop.types import WorkspaceLoopResult
+from app.modules.miniapp_agent_loop.types import AgentLoopResult
 
 
-class WorkspaceLoopResultFactory:
+class AgentLoopResultFactory:
     @staticmethod
     def failed(
         *,
@@ -20,11 +20,11 @@ class WorkspaceLoopResultFactory:
         latest_apply_result,
         iterations,
         repair_iterations,
-        all_operations,
+        all_draft_actions,
         last_assistant_message: str,
         turn_history,
-    ) -> WorkspaceLoopResult:
-        return WorkspaceLoopResult(
+    ) -> AgentLoopResult:
+        return AgentLoopResult(
             status="failed",
             outcome_kind=outcome_kind,
             summary=summary,
@@ -39,7 +39,7 @@ class WorkspaceLoopResultFactory:
             latest_apply_result=latest_apply_result,
             iterations=iterations,
             repair_iterations=repair_iterations,
-            all_operations=all_operations,
+            all_draft_actions=all_draft_actions,
             last_assistant_message=last_assistant_message,
             turn_history=turn_history,
         )
@@ -58,11 +58,11 @@ class WorkspaceLoopResultFactory:
         latest_apply_result,
         iterations,
         repair_iterations,
-        all_operations,
+        all_draft_actions,
         last_assistant_message: str,
         turn_history,
-    ) -> WorkspaceLoopResult:
-        return WorkspaceLoopResult(
+    ) -> AgentLoopResult:
+        return AgentLoopResult(
             status="blocked",
             outcome_kind="blocked_generation",
             summary=summary,
@@ -77,7 +77,7 @@ class WorkspaceLoopResultFactory:
             latest_apply_result=latest_apply_result,
             iterations=iterations,
             repair_iterations=repair_iterations,
-            all_operations=all_operations,
+            all_draft_actions=all_draft_actions,
             last_assistant_message=last_assistant_message,
             turn_history=turn_history,
         )
@@ -90,14 +90,14 @@ class WorkspaceLoopResultFactory:
         latest_apply_result,
         iterations,
         repair_iterations,
-        all_operations,
+        all_draft_actions,
         last_assistant_message: str,
         turn_history,
-    ) -> WorkspaceLoopResult:
-        return WorkspaceLoopResult(
+    ) -> AgentLoopResult:
+        return AgentLoopResult(
             status="completed",
             outcome_kind="applied",
-            summary="Workspace loop completed successfully.",
+            summary="Workspace code agent completed successfully.",
             failure_reason=None,
             failure_class=None,
             failure_signature=None,
@@ -109,8 +109,7 @@ class WorkspaceLoopResultFactory:
             latest_apply_result=latest_apply_result,
             iterations=iterations,
             repair_iterations=repair_iterations,
-            all_operations=all_operations,
+            all_draft_actions=all_draft_actions,
             last_assistant_message=last_assistant_message,
             turn_history=turn_history,
         )
-
