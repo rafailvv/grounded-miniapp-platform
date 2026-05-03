@@ -30,9 +30,11 @@ def file_changes_from_mutating_tool_calls(
             for target in request_item.get("targets") or []
             if str(target or "").strip()
         ]
-        file_path = _strip_leading_dot_slash(request_item.get("file_path") or (targets[0] if targets else ""))
+        raw_file_path = request_item.get("file_path") or (targets[0] if targets else "")
+        raw_worker_id = str(request_item.get("worker_id") or default_worker_id or "").strip()
+        file_path = _normalize_agent_file_path(raw_file_path, worker_id=raw_worker_id)
         reason = str(request_item.get("reason") or f"{tool} requested by agent").strip()
-        worker_id = str(request_item.get("worker_id") or default_worker_id or AgentWorkerManager.owner_for_path(file_path)).strip()
+        worker_id = str(raw_worker_id or AgentWorkerManager.owner_for_path(file_path)).strip()
         owner_scope = str(request_item.get("owner_scope") or default_owner_scope or "").strip()
         if worker_id:
             reason = f"[{worker_id}] {reason}"
@@ -72,4 +74,36 @@ def _strip_leading_dot_slash(raw_path: object) -> str:
     path = str(raw_path or "").strip().replace("\\", "/")
     while path.startswith("./"):
         path = path[2:]
+    return path
+
+
+def _normalize_agent_file_path(raw_path: object, *, worker_id: str | None = None) -> str:
+    path = _strip_leading_dot_slash(raw_path)
+    if not path:
+        return path
+    if path.startswith("source/"):
+        path = path[len("source/") :]
+    if path.startswith("miniapp/"):
+        return path
+    worker = str(worker_id or "").strip()
+    if worker in {"client_ui", "specialist_ui", "manager_ui"}:
+        role = worker.removesuffix("_ui")
+        if path in {"index.html", "app.js", "styles.css"}:
+            return f"miniapp/app/static/{role}/{path}"
+    if worker == "generated_tests":
+        if path in {"test_generated_app.py", "generated_app.test.mjs"}:
+            return f"miniapp/tests/{path}"
+    if worker == "backend_api":
+        if path in {"main.py", "db.py", "schemas.py"}:
+            return f"miniapp/app/{path}"
+        if path.endswith(".py") and "/" not in path:
+            return f"miniapp/app/routes/{path}"
+    if path.startswith(("app/", "tests/")) or path in {"Dockerfile", "requirements.txt"}:
+        return f"miniapp/{path}"
+    if path.startswith("static/"):
+        return f"miniapp/app/{path}"
+    if path.startswith("routes/"):
+        return f"miniapp/app/{path}"
+    if path.startswith("generated/"):
+        return f"miniapp/app/{path}"
     return path

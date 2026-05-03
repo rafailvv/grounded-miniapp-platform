@@ -5,9 +5,11 @@ import difflib
 import hashlib
 import json
 import logging
+import os
+import queue
 import re
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -44,6 +46,7 @@ from app.modules.miniapp_agent_loop.agent_kernel import compact_agent_memory
 from app.modules.miniapp_agent_loop.agent_memory_store import AgentMemoryStore
 from app.modules.miniapp_agent_loop.agent_scratchpad import AgentScratchpad
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
+from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.context_pressure import AgentContextPressureAnalyzer
 from app.modules.miniapp_agent_loop.environment_snapshot import AgentEnvironmentSnapshot
 from app.modules.miniapp_agent_loop.rollout_trace import RolloutTraceRecorder
@@ -81,6 +84,7 @@ from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.runtime_manager import PreviewRuntimeManager
 from app.services.workspace.service import WorkspaceService
+from app.validators.static_analysis import extract_declared_routes
 
 logger = logging.getLogger(__name__)
 
@@ -582,6 +586,15 @@ class WorkspaceCodeAgentRuntime:
 
         static_root = source_dir / "miniapp/app/static"
         if static_root.exists():
+            for css_path in sorted(static_root.glob("*/styles.css")):
+                try:
+                    original = css_path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                updated = self._ensure_role_shell_safe_spacing(original)
+                if updated != original:
+                    css_path.write_text(updated, encoding="utf-8")
+                    stabilized.append(css_path.relative_to(source_dir).as_posix())
             for html_path in sorted(static_root.rglob("index.html")):
                 try:
                     original = html_path.read_text(encoding="utf-8")
@@ -590,6 +603,7 @@ class WorkspaceCodeAgentRuntime:
                 if "page-shell" not in original:
                     continue
                 updated = self._ensure_page_shell_inline_safe_spacing(original)
+                updated = self._ensure_preview_bridge_script(updated)
                 if updated != original:
                     html_path.write_text(updated, encoding="utf-8")
                     stabilized.append(html_path.relative_to(source_dir).as_posix())
@@ -678,6 +692,26 @@ class WorkspaceCodeAgentRuntime:
         return text.rstrip() + guard
 
     @staticmethod
+    def _ensure_role_shell_safe_spacing(content: str) -> str:
+        text = str(content or "")
+        safe_top = "padding-top: max(76px, calc(var(--telegram-top-safe-offset) + 12px)) !important;"
+
+        def rewrite(match: re.Match[str]) -> str:
+            selectors = match.group("selectors")
+            body = match.group("body")
+            if ".page-shell" not in selectors:
+                return match.group(0)
+            if "telegram-top-safe-offset" in body:
+                return match.group(0)
+            if not re.search(r"\bpadding(?:-top)?\s*:", body, re.IGNORECASE):
+                return match.group(0)
+            body_text = body.rstrip()
+            separator = "\n  " if "\n" in body_text else " "
+            return f"{selectors}{{{body_text.rstrip(';')};{separator}{safe_top} }}"
+
+        return re.sub(r"(?P<selectors>[^{}]+)\{(?P<body>[^{}]*)\}", rewrite, text, flags=re.MULTILINE)
+
+    @staticmethod
     def _ensure_page_shell_inline_safe_spacing(content: str) -> str:
         def update_tag(match: re.Match[str]) -> str:
             tag = match.group(1)
@@ -706,6 +740,20 @@ class WorkspaceCodeAgentRuntime:
             str(content or ""),
             flags=re.IGNORECASE,
         )
+
+    @staticmethod
+    def _ensure_preview_bridge_script(content: str) -> str:
+        text = str(content or "")
+        if "/static/preview_bridge.js" in text:
+            return text
+        script = '    <script src="/static/preview_bridge.js" defer></script>\n'
+        app_script = re.search(r"^[ \t]*<script\b[^>]+src=[\"']/static/[^\"']+/app\.js[\"'][^>]*></script>\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
+        if app_script:
+            return text[: app_script.start()] + script + text[app_script.start() :]
+        body_close = re.search(r"</body\s*>", text, flags=re.IGNORECASE)
+        if body_close:
+            return text[: body_close.start()] + script + text[body_close.start() :]
+        return text.rstrip() + "\n" + script
 
     def _run_loop(
         self,
@@ -1069,7 +1117,9 @@ class WorkspaceCodeAgentRuntime:
             self_blocked_correction_sent = False
             generic_fatal_correction_sent = False
             output_cap_correction_sent = False
+            context_length_correction_sent = False
             tool_budget_correction_sent = False
+            invalid_mutation_correction_sent = False
             create_repair_turn = create_intent and bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
             self._add_failed_generated_test_context(
                 workspace_id=workspace_id,
@@ -1145,6 +1195,32 @@ class WorkspaceCodeAgentRuntime:
                             files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
                             metadata={"error": str(llm_payload.get("error") or ""), "retry_reason": "max_output_tokens"},
                         )
+                    if self._is_context_length_error(str(llm_payload.get("error") or "")):
+                        if not context_length_correction_sent:
+                            correction = self._context_length_correction_result(llm_payload, request=request)
+                            local_tool_results = [correction]
+                            tool_results.append(correction)
+                            context_length_correction_sent = True
+                            context_mode = "minimal"
+                            extra_file_context = {}
+                            self.transcript_store.clear_model_context(artifact_run_id)
+                            self._append_event(
+                                job,
+                                "compact_boundary",
+                                "Agent context exceeded the model window. Retrying with compact repair context only.",
+                                {"attempt": attempt, "tool_round": tool_round, "reason": "context_length_exceeded"},
+                            )
+                            continue
+                        return AgentTurnPlan(
+                            outcome="needs_context",
+                            assistant_message="Agent context exceeded the model window.",
+                            diagnosis=(
+                                "The previous model request exceeded the context window. Continue with one compact tool call "
+                                "against the current failing packet; do not request broad file bundles."
+                            ),
+                            files_read=list({*initial_context.keys(), *extra_file_context.keys()}),
+                            metadata={"error": str(llm_payload.get("error") or ""), "retry_reason": "context_length_exceeded"},
+                        )
                     return AgentTurnPlan(
                         outcome="fatal_invalid_response",
                         assistant_message=str(llm_payload.get("error") or ""),
@@ -1157,6 +1233,47 @@ class WorkspaceCodeAgentRuntime:
                 raw_tool_calls = self._agent_tool_calls(llm_payload.get("tool_calls") or [])
                 mutating_file_changes, mutating_tool_trace = self._file_changes_from_mutating_tool_calls(raw_tool_calls)
                 if mutating_file_changes:
+                    invalid_mutation = AgentEditValidator._first_invalid_file_change(mutating_file_changes)
+                    if invalid_mutation and not invalid_mutation_correction_sent:
+                        code, message = invalid_mutation
+                        failed_tool_results = [
+                            {
+                                "tool": "mutating_tool_validation",
+                                "tool_use_id": str(item.get("tool_use_id") or f"mutating_tool_validation_{index}"),
+                                "status": "failed",
+                                "error_code": code,
+                                "message": message,
+                                "file_path": str(item.get("file_path") or ""),
+                                "required_next_action": (
+                                    "Retry the same concrete fix with valid mutating tool calls. "
+                                    "apply_patch_to_draft requires file_path + a unified diff in `diff`; "
+                                    "write_file requires file_path + complete file `content`; "
+                                    "merge duplicate edits for the same file into one tool call. "
+                                    "Do not use pattern-only edits."
+                                ),
+                            }
+                            for index, item in enumerate(mutating_tool_trace)
+                        ] or [
+                            {
+                                "tool": "mutating_tool_validation",
+                                "tool_use_id": "mutating_tool_validation",
+                                "status": "failed",
+                                "error_code": code,
+                                "message": message,
+                            }
+                        ]
+                        local_tool_results.extend(failed_tool_results)
+                        tool_results.extend(failed_tool_results)
+                        self.transcript_store.append_tool_results(artifact_run_id, failed_tool_results)
+                        self._store_transcript_snapshot(job, artifact_run_id)
+                        invalid_mutation_correction_sent = True
+                        self._append_event(
+                            job,
+                            "repair_iteration",
+                            "Agent write tool call was invalid; retrying inside the same tool loop with exact write-tool contract.",
+                            {"attempt": attempt, "tool_round": tool_round, "error_code": code, "message": message},
+                        )
+                        continue
                     raw_tool_calls = [
                         item for item in raw_tool_calls if not self._is_mutating_agent_tool_call(item)
                     ]
@@ -1365,7 +1482,8 @@ class WorkspaceCodeAgentRuntime:
             apply_result: Any,
             paths: list[str],
         ) -> list[str]:
-            changed = self._stabilize_platform_shell(stabilize_workspace_id, stabilize_run_id, apply_result, paths)
+            del apply_result
+            changed = self._stabilize_platform_shell(stabilize_workspace_id, stabilize_run_id, draft_source, paths)
             self.file_state_cache.invalidate(stabilize_run_id, changed)
             return changed
 
@@ -1497,6 +1615,7 @@ class WorkspaceCodeAgentRuntime:
                 failed_signatures=failed_signatures,
                 next_action="repair the smallest failing workflow slice and rerun exact proof",
             )
+            self.transcript_store.clear_model_context(artifact_run_id)
             signature = str(payload.get("latest_failure_signature") or "").strip()
             if signature:
                 self.memory_store.record_failure(
@@ -1600,6 +1719,61 @@ class WorkspaceCodeAgentRuntime:
         ]
         if not tasks:
             return [], [], "Workspace code agent initialized."
+        backend_tasks = [task for task in tasks if str(task.get("worker_id") or "").strip() == "backend_api"]
+        remaining_tasks = [task for task in tasks if str(task.get("worker_id") or "").strip() != "backend_api"]
+        if backend_tasks and remaining_tasks:
+            backend_changes, backend_changed_files, backend_message = self._run_parallel_worker_branches(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                request=request,
+                job=job,
+                generation_mode=generation_mode,
+                worker_tasks=backend_tasks,
+                worker_drafts=worker_drafts,
+                worker_prefix=worker_prefix,
+            )
+            updated_worker_prefix = dict(worker_prefix)
+            updated_worker_prefix["backend_contract"] = self._backend_contract_snapshot(
+                self.workspace_service.draft_source_dir(workspace_id, run_id)
+            )
+            refreshed_workers: list[dict[str, Any]] = []
+            for task in remaining_tasks:
+                worker_id = str(task.get("worker_id") or "").strip()
+                existing = dict(workers_by_id.get(worker_id) or {})
+                branch_run_id = str(existing.get("branch_run_id") or f"{artifact_run_id}__worker__{worker_id}")
+                try:
+                    source_dir = self.workspace_service.clone_draft(workspace_id, run_id, branch_run_id)
+                    existing["source_dir"] = str(source_dir)
+                except Exception as exc:
+                    self._append_event(
+                        job,
+                        "worker_failed",
+                        f"Worker {worker_id} could not refresh its branch after backend/API merge.",
+                        {"worker_id": worker_id, "branch_run_id": branch_run_id, "error": str(exc)},
+                    )
+                existing.setdefault("worker_id", worker_id)
+                existing.setdefault("branch_run_id", branch_run_id)
+                existing.setdefault("owner_scope", str(task.get("owner_scope") or worker_id))
+                refreshed_workers.append(existing)
+            remaining_changes, remaining_changed_files, remaining_message = self._run_parallel_worker_branches(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                artifact_run_id=artifact_run_id,
+                request=request,
+                job=job,
+                generation_mode=generation_mode,
+                worker_tasks=remaining_tasks,
+                worker_drafts={"enabled": True, "workers": refreshed_workers},
+                worker_prefix=updated_worker_prefix,
+            )
+            combined_changes = [*backend_changes, *remaining_changes]
+            combined_changed_files = list(dict.fromkeys([*backend_changed_files, *remaining_changed_files]))
+            message = (
+                "Backend/API worker established the contract first; role/test workers forked from the updated draft. "
+                f"{backend_message} {remaining_message}"
+            ).strip()
+            return combined_changes, combined_changed_files, message
         self._append_activity(
             job,
             "worker_started",
@@ -1620,74 +1794,120 @@ class WorkspaceCodeAgentRuntime:
                 },
             )
         results: list[WorkerBranchResult] = []
-        max_workers = min(5, len(tasks))
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="agent-worker") as executor:
-            futures = {}
-            for task in tasks:
-                worker_id = str(task.get("worker_id") or "").strip()
-                worker = workers_by_id[worker_id]
-                futures[
-                    executor.submit(
-                        self.worker_branch_loop.run,
-                        workspace_id=workspace_id,
-                        parent_run_id=artifact_run_id,
-                        branch_run_id=str(worker.get("branch_run_id") or ""),
-                        branch_source=Path(str(worker.get("source_dir") or "")),
-                        generation_mode=generation_mode,
-                        model_profile=request.model_profile,
-                        user_prompt=request.prompt,
-                        worker_task=task,
-                        worker_prefix=worker_prefix,
-                        max_steps=4 if generation_mode == GenerationMode.QUALITY else 3,
-                    )
-                ] = worker_id
-            for future in as_completed(futures):
-                worker_id = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    result = WorkerBranchResult(
-                        worker_id=worker_id,
-                        owner_scope=str(workers_by_id.get(worker_id, {}).get("owner_scope") or worker_id),
-                        branch_run_id=str(workers_by_id.get(worker_id, {}).get("branch_run_id") or ""),
-                        source_dir=str(workers_by_id.get(worker_id, {}).get("source_dir") or ""),
-                        status="failed",
-                        error=str(exc),
-                    )
-                results.append(result)
-                ref = f"worker_branch:{workspace_id}:{artifact_run_id}:{worker_id}"
-                job.worker_branch_refs = list(dict.fromkeys([*job.worker_branch_refs, ref]))
-                self._store_report(ref, {"workspace_id": workspace_id, "run_id": run_id, "branch": result.as_dict()})
-                if result.token_usage:
-                    job.token_usage = self._merge_run_token_usage(
-                        job.token_usage if isinstance(job.token_usage, dict) else {},
-                        result.token_usage,
-                    )
-                    job.cache_stats = self._merge_cache_stats(job.cache_stats, result.token_usage)
-                event_type = "worker_completed" if result.status == "changes_ready" else "worker_failed" if result.status == "failed" else "worker_completed"
-                message = (
-                    f"Worker {worker_id} produced branch changes."
-                    if result.status == "changes_ready"
-                    else f"Worker {worker_id} finished without branch changes."
-                    if result.status == "no_changes"
-                    else f"Worker {worker_id} failed its branch loop."
+        result_queue: queue.Queue[WorkerBranchResult] = queue.Queue()
+        timeout_seconds = self._worker_branch_timeout_seconds(generation_mode)
+        started_at = time.monotonic()
+        threads: dict[str, threading.Thread] = {}
+
+        def run_worker(worker_id: str, task: dict[str, Any], worker: dict[str, Any]) -> None:
+            try:
+                result = self.worker_branch_loop.run(
+                    workspace_id=workspace_id,
+                    parent_run_id=artifact_run_id,
+                    branch_run_id=str(worker.get("branch_run_id") or ""),
+                    branch_source=Path(str(worker.get("source_dir") or "")),
+                    generation_mode=generation_mode,
+                    model_profile=request.model_profile,
+                    user_prompt=request.prompt,
+                    worker_task=task,
+                    worker_prefix=worker_prefix,
+                    max_steps=6 if generation_mode == GenerationMode.FAST else 6 if generation_mode == GenerationMode.BALANCED else 8,
                 )
-                self._append_event(
+            except Exception as exc:
+                result = WorkerBranchResult(
+                    worker_id=worker_id,
+                    owner_scope=str(workers_by_id.get(worker_id, {}).get("owner_scope") or worker_id),
+                    branch_run_id=str(workers_by_id.get(worker_id, {}).get("branch_run_id") or ""),
+                    source_dir=str(workers_by_id.get(worker_id, {}).get("source_dir") or ""),
+                    status="failed",
+                    error=str(exc),
+                )
+            result_queue.put(result)
+
+        def record_result(result: WorkerBranchResult) -> None:
+            results.append(result)
+            worker_id = result.worker_id
+            ref = f"worker_branch:{workspace_id}:{artifact_run_id}:{worker_id}"
+            job.worker_branch_refs = list(dict.fromkeys([*job.worker_branch_refs, ref]))
+            self._store_report(ref, {"workspace_id": workspace_id, "run_id": run_id, "branch": result.as_dict()})
+            if result.token_usage:
+                job.token_usage = self._merge_run_token_usage(
+                    job.token_usage if isinstance(job.token_usage, dict) else {},
+                    result.token_usage,
+                )
+                job.cache_stats = self._merge_cache_stats(job.cache_stats, result.token_usage)
+            event_type = "worker_completed" if result.status == "changes_ready" else "worker_failed" if result.status == "failed" else "worker_completed"
+            message = (
+                f"Worker {worker_id} produced branch changes."
+                if result.status == "changes_ready"
+                else f"Worker {worker_id} finished without branch changes."
+                if result.status == "no_changes"
+                else f"Worker {worker_id} failed its branch loop."
+            )
+            self._append_event(
+                job,
+                event_type,
+                message,
+                {
+                    "worker_id": worker_id,
+                    "branch_run_id": result.branch_run_id,
+                    "status": result.status,
+                    "changed_files": list(result.changed_files),
+                    "file_change_count": len(result.file_changes),
+                    "token_usage": dict(result.token_usage),
+                    "model": result.model,
+                    "error": result.error,
+                    "artifact_ref": ref,
+                },
+            )
+
+        for task in tasks:
+            worker_id = str(task.get("worker_id") or "").strip()
+            worker = workers_by_id[worker_id]
+            thread = threading.Thread(
+                target=run_worker,
+                args=(worker_id, task, worker),
+                name=f"agent-worker-{worker_id}",
+                daemon=True,
+            )
+            threads[worker_id] = thread
+            thread.start()
+
+        pending = set(threads)
+        while pending:
+            remaining = max(0.0, timeout_seconds - (time.monotonic() - started_at))
+            if remaining <= 0:
+                break
+            try:
+                result = result_queue.get(timeout=min(5.0, remaining))
+            except queue.Empty:
+                self._append_activity(
                     job,
-                    event_type,
-                    message,
+                    "worker_started",
+                    "Waiting for isolated worker branches",
                     {
-                        "worker_id": worker_id,
-                        "branch_run_id": result.branch_run_id,
-                        "status": result.status,
-                        "changed_files": list(result.changed_files),
-                        "file_change_count": len(result.file_changes),
-                        "token_usage": dict(result.token_usage),
-                        "model": result.model,
-                        "error": result.error,
-                        "artifact_ref": ref,
+                        "worker_count": len(tasks),
+                        "pending_workers": sorted(pending),
+                        "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+                        "status": "running",
                     },
+                    save=False,
                 )
+                continue
+            pending.discard(result.worker_id)
+            record_result(result)
+
+        for worker_id in sorted(pending):
+            worker = workers_by_id.get(worker_id, {})
+            result = WorkerBranchResult(
+                worker_id=worker_id,
+                owner_scope=str(worker.get("owner_scope") or worker_id),
+                branch_run_id=str(worker.get("branch_run_id") or ""),
+                source_dir=str(worker.get("source_dir") or ""),
+                status="failed",
+                error=f"Worker branch timed out after {timeout_seconds} seconds; coordinator will continue with available diffs and repair the missing slice.",
+            )
+            record_result(result)
         file_changes = [change for result in results if result.status == "changes_ready" for change in result.file_changes]
         if not file_changes:
             self._store_report(
@@ -1698,6 +1918,51 @@ class WorkspaceCodeAgentRuntime:
         merge_report = self.worker_runtime.merge_report(artifact_run_id, file_changes)
         job.worker_merge_ref = job.worker_merge_ref or f"worker_merge:{workspace_id}:{artifact_run_id}"
         if not bool((merge_report.get("ownership") if isinstance(merge_report.get("ownership"), dict) else {}).get("ok")):
+            conflict_paths = {
+                str(conflict.get("path") or "")
+                for conflict in (merge_report.get("ownership") if isinstance(merge_report.get("ownership"), dict) else {}).get("conflicts", [])
+                if isinstance(conflict, dict) and str(conflict.get("path") or "").strip()
+            }
+            mergeable_changes = [
+                change
+                for change in file_changes
+                if str(change.file_path or "").strip() not in conflict_paths
+            ]
+            if mergeable_changes:
+                mergeable_report = self.worker_runtime.merge_report(artifact_run_id, mergeable_changes)
+                envelope = self.workspace_service.build_patch_envelope_for_file_changes(workspace_id, run_id, mergeable_changes)
+                apply_result = self.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
+                merge_payload = {
+                    "merge_report": merge_report,
+                    "mergeable_report": mergeable_report,
+                    "partial_apply_result": apply_result.model_dump(mode="json"),
+                    "conflict_paths": sorted(conflict_paths),
+                    "branch_results": [result.as_dict() for result in results],
+                }
+                self._store_report(job.worker_merge_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.worker_runtime.snapshot(artifact_run_id), **merge_payload})
+                if apply_result.status == "applied":
+                    branch_results = self.worker_runtime.record_branch_results(artifact_run_id, mergeable_changes)
+                    for branch in branch_results:
+                        ref = f"worker_branch_merge:{workspace_id}:{artifact_run_id}:{branch.get('worker_id')}"
+                        job.worker_branch_refs = list(dict.fromkeys([*job.worker_branch_refs, ref]))
+                        self._store_report(ref, {"workspace_id": workspace_id, "run_id": run_id, "branch": branch})
+                    changed_files = list(dict.fromkeys([change.file_path for change in mergeable_changes if change.file_path]))
+                    self._append_event(
+                        job,
+                        "worker_failed",
+                        "Worker branch merge had conflicts; applied non-conflicting worker diffs and queued conflicting files for coordinator repair.",
+                        {
+                            "worker_id": "merge",
+                            "changed_files": changed_files,
+                            "conflict_paths": sorted(conflict_paths),
+                            "artifact_ref": job.worker_merge_ref,
+                        },
+                    )
+                    return (
+                        mergeable_changes,
+                        changed_files,
+                        "Applied non-conflicting worker branch diffs; coordinator must repair conflicting files.",
+                    )
             self._store_report(job.worker_merge_ref, {"workspace_id": workspace_id, "run_id": run_id, **self.worker_runtime.snapshot(artifact_run_id)})
             self._append_event(
                 job,
@@ -1783,7 +2048,10 @@ class WorkspaceCodeAgentRuntime:
             has_draft_diff = bool(current_draft_diff)
             create_turn = intent_value == "create"
             create_repair_turn = create_turn and has_draft_diff
-            workflow_slice_repair = create_repair_turn and self._workflow_slice_repair_needed(latest_execution)
+            generated_tests_repair = create_repair_turn and self._generated_tests_repair_needed(latest_execution)
+            workflow_slice_repair = create_repair_turn and not generated_tests_repair and self._workflow_slice_repair_needed(latest_execution)
+            browser_step_repair = create_repair_turn and not generated_tests_repair and self._browser_step_repair_needed(latest_execution)
+            isolate_compact_repair = create_repair_turn and (generated_tests_repair or browser_step_repair or repeated_no_progress > 0)
             fast_create_turn = generation_mode == GenerationMode.FAST and create_turn
             focused_edit_kind = self._focused_edit_kind(request)
             focused_visual_edit = focused_edit_kind == "visual_style_edit"
@@ -1810,6 +2078,8 @@ class WorkspaceCodeAgentRuntime:
                 FOCUSED_VISUAL_CONTENT_MAX_LENGTH
                 if focused_visual_edit
                 else 18000 if force_replace_only
+                else 9000 if generated_tests_repair
+                else 7000 if browser_step_repair
                 else 18000 if workflow_slice_repair and generation_mode == GenerationMode.FAST
                 else 22000 if workflow_slice_repair and generation_mode == GenerationMode.BALANCED
                 else 26000 if workflow_slice_repair
@@ -1856,7 +2126,7 @@ class WorkspaceCodeAgentRuntime:
                     "context_mode": context_mode,
                     "phase": "context_ready",
                     "has_draft_diff": has_draft_diff,
-                    "prompt_payload_mode": "compact_repair" if create_repair_turn else "standard",
+                    "prompt_payload_mode": "compact_generated_test_repair" if generated_tests_repair else "compact_browser_repair" if browser_step_repair else "compact_repair" if create_repair_turn else "standard",
                     "force_replace_only": force_replace_only,
                 },
             )
@@ -1870,15 +2140,37 @@ class WorkspaceCodeAgentRuntime:
                     "context_mode": context_mode,
                     "phase": "model_request",
                     "has_draft_diff": has_draft_diff,
-                    "prompt_payload_mode": "compact_repair" if create_repair_turn else "standard",
+                    "prompt_payload_mode": "compact_generated_test_repair" if generated_tests_repair else "compact_browser_repair" if browser_step_repair else "compact_repair" if create_repair_turn else "standard",
                     "force_replace_only": force_replace_only,
                 },
             )
             artifact_run_id = run_id or job.job_id
             transcript_context = self.transcript_store.next_model_context(artifact_run_id)
+            if isolate_compact_repair and (
+                transcript_context.get("previous_response_id")
+                or transcript_context.get("tool_result_messages")
+            ):
+                self.transcript_store.clear_model_context(artifact_run_id)
+                self._append_event(
+                    job,
+                    "compact_boundary",
+                    "Compact repair is isolated from the previous model transcript to reduce token load.",
+                    {
+                        "attempt": attempt,
+                        "tool_round": tool_round,
+                        "reason": "generated_test_repair" if generated_tests_repair else "browser_step_repair" if browser_step_repair else "repeated_no_progress_repair",
+                    },
+                )
+                transcript_context = self.transcript_store.next_model_context(artifact_run_id)
             pending_tool_results = list(transcript_context.get("tool_result_messages") or [])
+            available_tools = AgentToolRegistry.openai_tools()
+            if generated_tests_repair or browser_step_repair or (
+                create_repair_turn
+                and (tool_round > self._tool_round_limit(generation_mode) or repeated_no_progress > 0)
+            ):
+                available_tools = AgentToolRegistry.openai_tools({"apply_patch_to_draft", "write_file"})
             response = self.openai_client.generate_agent_tool_step(
-                tools=AgentToolRegistry.openai_tools(),
+                tools=available_tools,
                 system_prompt=self._agent_system_prompt(),
                 user_prompt=user_prompt,
                 prompt_cache_key=self._prompt_cache_key(workspace_id, run_id, request.prompt),
@@ -1889,6 +2181,8 @@ class WorkspaceCodeAgentRuntime:
                     intent=str(request.intent or ""),
                     focused_edit_kind=focused_edit_kind,
                     repair_turn=create_repair_turn,
+                    generated_tests_repair=generated_tests_repair,
+                    browser_step_repair=browser_step_repair,
                 ),
                 previous_response_id=str(transcript_context.get("previous_response_id") or "") or None,
                 tool_result_messages=pending_tool_results,
@@ -2065,8 +2359,11 @@ class WorkspaceCodeAgentRuntime:
         compact_repair_prompt = has_draft_diff and (
             intent_value == "create" or focused_edit_kind == "behavior_workflow_edit"
         )
-        workflow_slice_repair = compact_repair_prompt and self._workflow_slice_repair_needed(latest_execution)
         missing_generated_tests_repair = compact_repair_prompt and self._missing_generated_tests_repair_needed(latest_execution)
+        stale_generated_tests_repair = compact_repair_prompt and self._stale_generated_tests_repair_needed(latest_execution)
+        generated_tests_repair = missing_generated_tests_repair or stale_generated_tests_repair
+        workflow_slice_repair = compact_repair_prompt and not generated_tests_repair and self._workflow_slice_repair_needed(latest_execution)
+        browser_step_repair = compact_repair_prompt and not generated_tests_repair and self._browser_step_repair_needed(latest_execution)
         acceptance_contract = build_acceptance_contract(
             prompt=request.prompt,
             intent=intent_value,
@@ -2098,19 +2395,31 @@ class WorkspaceCodeAgentRuntime:
             )
         repair_context: dict[str, str] = {}
         if compact_repair_prompt:
-            repair_context_paths = self._repair_context_paths(
-                failed_paths=self._target_files_from_execution(latest_execution),
-                diff_paths=self._paths_from_diff(current_draft_diff) or self._paths_from_diff(str(latest_diff_summary or "")),
+            diff_paths = self._paths_from_diff(current_draft_diff) or self._paths_from_diff(str(latest_diff_summary or ""))
+            repair_context_paths = (
+                self._generated_test_repair_paths(latest_execution, diff_paths=diff_paths)
+                if generated_tests_repair
+                else self._browser_step_repair_paths(latest_execution, diff_paths=diff_paths)
+                if browser_step_repair
+                else self._repair_context_paths(
+                    failed_paths=self._target_files_from_execution(latest_execution),
+                    diff_paths=diff_paths,
+                )
             )
             for path in repair_context_paths:
                 content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
                 if content is not None:
                     repair_context[path] = content
+            if generated_tests_repair:
+                for path, content in extra_file_context.items():
+                    normalized = self._strip_leading_dot_slash(path)
+                    if normalized.startswith("miniapp/") and normalized not in repair_context:
+                        repair_context[normalized] = content
         file_context_payload = (
             self._compact_file_contexts(
                 repair_context,
-                max_files=10 if repeated_no_progress else 14 if workflow_slice_repair else 8,
-                max_chars=2200 if repeated_no_progress else 3200 if workflow_slice_repair else 2200,
+                max_files=12 if generated_tests_repair else 5 if browser_step_repair else 10 if repeated_no_progress else 14 if workflow_slice_repair else 8,
+                max_chars=2600 if generated_tests_repair else 1800 if browser_step_repair else 2200 if repeated_no_progress else 3200 if workflow_slice_repair else 2200,
             )
             if compact_repair_prompt
             else {
@@ -2126,7 +2435,7 @@ class WorkspaceCodeAgentRuntime:
             "task": "Edit the draft workspace to satisfy the user prompt and pass platform invariant checks.",
             "workspace_id": workspace_id,
             "run_id": run_id,
-            "prompt_payload_mode": "compact_repair" if compact_repair_prompt else "focused_visual" if focused_visual_edit else "standard",
+            "prompt_payload_mode": "compact_generated_test_repair" if generated_tests_repair else "compact_browser_repair" if browser_step_repair else "compact_repair" if compact_repair_prompt else "focused_visual" if focused_visual_edit else "standard",
             "mode": request.mode,
             "intent": request.intent,
             "generation_mode": str(getattr(request.generation_mode, "value", request.generation_mode) or ""),
@@ -2143,6 +2452,12 @@ class WorkspaceCodeAgentRuntime:
                 else implementation_plan
             ),
             "worker_branching": (
+                {
+                    "enabled": False,
+                    "reason": "focused_generated_test_repair" if generated_tests_repair else "focused_browser_step_repair" if browser_step_repair else "compact_repair_after_no_progress",
+                }
+                if generated_tests_repair or browser_step_repair or (compact_repair_prompt and repeated_no_progress > 0)
+                else
                 self._compact_jsonish(
                     {
                         "mailbox": AgentWorkerManager.mailbox_for_plan(
@@ -2169,7 +2484,11 @@ class WorkspaceCodeAgentRuntime:
             "tool_round": tool_round,
             "context_mode": context_mode,
             "repeated_no_progress": repeated_no_progress,
-            "agent_memory": agent_memory or {},
+            "agent_memory": (
+                self._compact_jsonish(agent_memory or {}, max_chars=700, max_items=5)
+                if browser_step_repair or generated_tests_repair
+                else agent_memory or {}
+            ),
             "environment_snapshot": self._compact_jsonish(
                 self.environment_snapshots.get(run_id) or {},
                 max_chars=700,
@@ -2180,8 +2499,18 @@ class WorkspaceCodeAgentRuntime:
                 max_chars=900,
                 max_items=6,
             ),
-            "tool_registry": self._agent_tool_registry_payload(),
+            "tool_registry": self._agent_tool_registry_payload(
+                {"apply_patch_to_draft", "write_file"}
+                if generated_tests_repair or browser_step_repair or (compact_repair_prompt and repeated_no_progress > 0)
+                else None
+            ),
             "repair_focus": (
+                self._browser_step_repair_focus(latest_execution)
+                if browser_step_repair
+                else
+                self._generated_test_repair_focus(latest_execution, missing=missing_generated_tests_repair)
+                if generated_tests_repair
+                else
                 "Create or replace both missing generated test files now: miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. In the same coherent patch, also fix the first API/frontend schema mismatch from latest_checks if one is listed. Do not spend this turn only on CSS, copy, or a single frontend mismatch while generated tests are absent."
                 if missing_generated_tests_repair
                 else
@@ -2194,7 +2523,7 @@ class WorkspaceCodeAgentRuntime:
             "user_prompt": request.prompt,
             "error_context": request.error_context.model_dump(mode="json") if request.error_context else None,
             "role_scope": list(request.target_role_scope or ROLE_ORDER),
-            "file_tree": file_tree[:80] if compact_repair_prompt else file_tree[:120] if focused_visual_edit else file_tree[:240],
+            "file_tree": file_tree[:30] if generated_tests_repair else file_tree[:25] if browser_step_repair else file_tree[:40] if compact_repair_prompt and repeated_no_progress > 0 else file_tree[:80] if compact_repair_prompt else file_tree[:120] if focused_visual_edit else file_tree[:240],
             "file_contexts": file_context_payload,
             "context_pack": (
                 {}
@@ -2210,18 +2539,30 @@ class WorkspaceCodeAgentRuntime:
                 )
             ),
             "latest_checks": (
-                self._compact_repair_checks(latest_execution)
+                self._compact_generated_test_repair_checks(latest_execution)
+                if generated_tests_repair
+                else self._compact_repair_checks(latest_execution)
                 if compact_repair_prompt
                 else self._compact_checks(latest_execution)
             ),
+            "browser_repair_packet": (
+                self._browser_step_repair_packet(latest_execution)
+                if browser_step_repair
+                else {}
+            ),
+            "generated_test_repair_packet": (
+                self._generated_test_repair_packet(latest_execution)
+                if generated_tests_repair
+                else {}
+            ),
             "preview": self._compact_preview_details(latest_preview_details) if compact_repair_prompt else latest_preview_details,
             "latest_diff_summary": (
-                truncate_tool_text(str(latest_diff_summary or ""), max_chars=4000)
+                truncate_tool_text(str(latest_diff_summary or ""), max_chars=1400 if generated_tests_repair else 1200 if browser_step_repair else 4000)
                 if compact_repair_prompt
                 else latest_diff_summary
             ),
             "last_turn_summary": (
-                truncate_tool_text(str(last_turn_summary or ""), max_chars=1800)
+                truncate_tool_text(str(last_turn_summary or ""), max_chars=900 if generated_tests_repair else 700 if browser_step_repair else 1800)
                 if compact_repair_prompt
                 else last_turn_summary
             ),
@@ -2229,7 +2570,7 @@ class WorkspaceCodeAgentRuntime:
                 tool_results,
                 workspace_id=workspace_id,
                 run_id=run_id,
-                max_items=4 if compact_repair_prompt else 8,
+                max_items=2 if generated_tests_repair else 1 if browser_step_repair else 4 if compact_repair_prompt else 8,
             ),
             "rules": (
                 self._compact_repair_rules(
@@ -2237,6 +2578,8 @@ class WorkspaceCodeAgentRuntime:
                     focused_edit_kind=focused_edit_kind,
                     workflow_slice_repair=workflow_slice_repair,
                     missing_generated_tests_repair=missing_generated_tests_repair,
+                    stale_generated_tests_repair=stale_generated_tests_repair,
+                    browser_step_repair=browser_step_repair,
                 )
                 if compact_repair_prompt
                 else [
@@ -2245,10 +2588,13 @@ class WorkspaceCodeAgentRuntime:
                     "Use the implementation_plan and acceptance_contract as the product contract. Derive entities, fields, routes, labels, and role actions from the user's prompt and current code, not from platform templates.",
                     "Create/workflow completion requires real UI controls, JavaScript handlers, backend persistence, generated tests, cross-role visibility, refresh persistence, and browser/mobile proof.",
                     "Build three isolated role surfaces in the miniapp shell: client creates/submits the main prompt-derived state, specialist processes or updates it, manager reviews/control-checks the persisted state. Do not link role roots to each other.",
+                    "The client/source role must display both its original submitted state and the persisted progress/update fields changed by specialist or manager roles after reload.",
+                    "User-facing UI copy must be polished business language: do not render raw API paths, HTTP methods, internal route names, role slugs, or enum codes like `new`/`preparing`; map persisted values to human-readable labels and keep label/value pairs visually separated.",
+                    "In async JavaScript form handlers, capture DOM nodes before any await, for example `const form = event.currentTarget`, then use `form.reset()` after awaited API calls. Do not read `event.currentTarget` after await because browsers clear it after dispatch.",
                     "Fast should be compact and working; Balanced should add moderate workflow/design depth; Quality should first get the workflow green, then add a polished mobile design pass. Never add pages or resources just to satisfy a fixed count.",
-                    "Mobile-first: target Telegram widths around 360-430px, use light surfaces unless the user asked otherwise, preserve safe top spacing/preview bridge, and avoid horizontal scroll or overlapping cards/forms/actions.",
+                    "Mobile-first: target Telegram widths around 360-430px, use one consistent light neutral product visual system across all roles unless the user explicitly asks for a dark theme, preserve safe top spacing/preview bridge, and avoid horizontal scroll or overlapping cards/forms/actions.",
                     "Generated source must start empty: no mock, seed, demo, sample, fixture, preloaded, or hard-coded business records. Empty states and validation test payloads are allowed.",
-                    "Generated tests must verify the actual app contract: persistent API create/list/update, real role HTML/JS selectors, role-specific actions, and no stale UI-only controls. Patch tests only when they are stale with the app contract.",
+                    "Generated tests must verify the actual app contract: persistent API create/list/update, real role HTML/JS selectors, role-specific actions, and no stale UI-only controls. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods. FastAPI generated tests should use `with TestClient(app) as client:` so lifespan/table setup runs, or explicitly create tables after generated ORM models are imported. JS generated tests run from cwd=miniapp, so read app/static/... and app/generated/... paths, not miniapp/app/... paths. Do not write pytest-only top-level test functions. Patch tests only when they are stale with the app contract.",
                     "For edit/refine/fix/repair, patch existing files with small unified diffs. Use full-file replace only for new files, tiny files, create-mode work, or a file that repeatedly conflicts.",
                     "If checks/browser proof fail, repair the concrete failing slice from latest_checks/tool_results: align selectors, payload fields, API routes, rendered state, and tests together. Do not rewrite unrelated files.",
                     "Read-only tools never write files. Mutating tools are serialized through the draft edit validator. run_command is limited to safe diagnostics such as unittest, py_compile, node tests/checks, rg, sed, and ls.",
@@ -2259,9 +2605,11 @@ class WorkspaceCodeAgentRuntime:
         return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
-    def _agent_tool_registry_payload() -> dict[str, dict[str, object]]:
+    def _agent_tool_registry_payload(allowed: set[str] | None = None) -> dict[str, dict[str, object]]:
         payload: dict[str, dict[str, object]] = {}
         for name in sorted(AgentToolRegistry.names()):
+            if allowed is not None and name not in allowed:
+                continue
             spec = AgentToolRegistry.spec(name)
             if spec is None:
                 continue
@@ -2365,9 +2713,15 @@ class WorkspaceCodeAgentRuntime:
     def _repair_context_paths(*, failed_paths: list[str], diff_paths: list[str]) -> list[str]:
         ordered: list[str] = []
         context_paths = failed_paths or diff_paths
+        route_paths = [
+            path
+            for path in diff_paths
+            if path.startswith("miniapp/app/routes/")
+            and path.endswith(".py")
+        ]
         supporting_paths: list[str] = []
         if any(path.endswith("miniapp/tests/test_generated_app.py") or path == "miniapp/tests/test_generated_app.py" for path in context_paths):
-            supporting_paths.extend(["miniapp/app/routes/app_api.py", "miniapp/app/schemas.py", "miniapp/app/main.py", "miniapp/app/db.py"])
+            supporting_paths.extend([*route_paths, "miniapp/app/routes/app_api.py", "miniapp/app/schemas.py", "miniapp/app/main.py", "miniapp/app/db.py"])
             supporting_paths.extend(
                 [
                     path
@@ -2379,7 +2733,7 @@ class WorkspaceCodeAgentRuntime:
         if any(path.endswith("miniapp/tests/generated_app.test.mjs") or path == "miniapp/tests/generated_app.test.mjs" for path in context_paths):
             supporting_paths.extend([path for path in diff_paths if path.startswith("miniapp/app/static/") and path.endswith((".html", ".js"))][:4])
         if any("/routes/" in path for path in context_paths):
-            supporting_paths.extend(["miniapp/app/schemas.py", "miniapp/app/main.py", "miniapp/app/db.py", "miniapp/tests/test_generated_app.py"])
+            supporting_paths.extend([*route_paths, "miniapp/app/schemas.py", "miniapp/app/main.py", "miniapp/app/db.py", "miniapp/tests/test_generated_app.py"])
         for role in ROLE_ORDER:
             role_prefix = f"miniapp/app/static/{role}/"
             if any(path.startswith(role_prefix) and path.endswith((".html", "app.js", "styles.css")) for path in context_paths):
@@ -2394,6 +2748,7 @@ class WorkspaceCodeAgentRuntime:
                     [
                         f"{role_prefix}app.js",
                         f"{role_prefix}styles.css",
+                        *route_paths,
                         "miniapp/app/routes/app_api.py",
                         "miniapp/app/schemas.py",
                         "miniapp/tests/test_generated_app.py",
@@ -2401,7 +2756,7 @@ class WorkspaceCodeAgentRuntime:
                     ]
                 )
         for path in [*context_paths, *supporting_paths]:
-            normalized = self._strip_leading_dot_slash(path)
+            normalized = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(path)
             if normalized and normalized.startswith("miniapp/") and normalized not in ordered:
                 ordered.append(normalized)
 
@@ -2496,6 +2851,247 @@ class WorkspaceCodeAgentRuntime:
         return truncate_tool_text(str(value), max_chars=max_chars)
 
     @staticmethod
+    def _browser_step_repair_needed(execution: CheckExecutionRecord) -> bool:
+        return any(
+            result.name == "browser_flow_smoke" and result.status == "failed"
+            for result in execution.results
+        )
+
+    @staticmethod
+    def _browser_step_repair_packet(execution: CheckExecutionRecord) -> dict[str, object]:
+        for result in execution.results:
+            if result.name != "browser_flow_smoke" or result.status != "failed":
+                continue
+            diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+            packet = {
+                key: WorkspaceCodeAgentRuntime._compact_jsonish(diagnostics.get(key), max_chars=700, max_items=5)
+                for key in (
+                    "failed_step",
+                    "failed_role",
+                    "failed_route",
+                    "failed_selector",
+                    "action",
+                    "console_errors",
+                    "visible_errors",
+                    "api_before",
+                    "api_after",
+                    "ui_steps",
+                    "mobile_overflow",
+                    "screenshots",
+                )
+                if key in diagnostics
+            }
+            packet["details"] = truncate_tool_text(str(result.details or ""), max_chars=500)
+            packet["logs"] = [truncate_tool_text(str(line), max_chars=500) for line in result.logs[-3:]]
+            packet["repair_scope"] = (
+                "Repair the real UI workflow step that failed in browser proof. "
+                "Prefer the failed role HTML/JS/CSS files; touch backend only when the packet shows API state did not change."
+            )
+            return packet
+        return {}
+
+    @staticmethod
+    def _browser_step_repair_focus(execution: CheckExecutionRecord) -> str:
+        packet = WorkspaceCodeAgentRuntime._browser_step_repair_packet(execution)
+        failed_step = packet.get("failed_step") or "unknown_step"
+        failed_role = packet.get("failed_role") or "unknown_role"
+        failed_route = packet.get("failed_route") or "unknown_route"
+        failed_selector = packet.get("failed_selector") or "unknown_selector"
+        return (
+            "Focused browser-proof repair: fix only the failing real UI step "
+            f"{failed_step!r} for role {failed_role!r} on route {failed_route!r} selector {failed_selector!r}. "
+            "Patch the smallest relevant role UI/JS/CSS slice so the browser action changes persisted state, "
+            "the affected role renders it after reload, and downstream roles observe it. "
+            "Do not rebuild worker branches, add domain templates, or rewrite unrelated files."
+        )
+
+    @staticmethod
+    def _browser_step_repair_paths(execution: CheckExecutionRecord, *, diff_paths: list[str]) -> list[str]:
+        failed_names = {str(result.name or "") for result in execution.results if result.status == "failed"}
+        diagnostics: dict[str, Any] = {}
+        details_blob = ""
+        for result in execution.results:
+            if result.name != "browser_flow_smoke" or result.status != "failed":
+                continue
+            diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+            details_blob = " ".join(
+                [
+                    str(result.details or ""),
+                    " ".join(str(line or "") for line in result.logs[-3:]),
+                    json.dumps(diagnostics, ensure_ascii=False, default=str)[:1200],
+                ]
+            ).lower()
+            break
+        role = str(diagnostics.get("failed_role") or "").strip()
+        route = str(diagnostics.get("failed_route") or "").strip()
+        route_role_match = re.search(r"/(client|specialist|manager)(?:/|$)", route)
+        if role not in ROLE_ORDER and route_role_match:
+            role = route_role_match.group(1)
+        roles: list[str] = [role] if role in ROLE_ORDER else []
+        if not roles:
+            for path in diff_paths:
+                match = re.search(r"miniapp/app/static/(client|specialist|manager)/", str(path or ""))
+                if match and match.group(1) not in roles:
+                    roles.append(match.group(1))
+            roles = roles[:1] or ["client"]
+
+        ordered: list[str] = []
+        for item_role in roles:
+            ordered.extend(
+                [
+                    f"miniapp/app/static/{item_role}/index.html",
+                    f"miniapp/app/static/{item_role}/app.js",
+                    f"miniapp/app/static/{item_role}/styles.css",
+                ]
+            )
+
+        api_failed = bool({"api_workflow_smoke", "connectivity_validators"} & failed_names)
+        api_signal = any(term in details_blob for term in (" api", "/api", "fetch", "post", "patch", "put", "state did not", "state unchanged"))
+        if api_failed or api_signal:
+            ordered.extend(
+                [
+                    path
+                    for path in diff_paths
+                    if path.startswith("miniapp/app/routes/") and path.endswith(".py")
+                ]
+            )
+            ordered.extend(["miniapp/app/routes/app_api.py", "miniapp/app/schemas.py"])
+        if "generated_app_js_tests" in failed_names:
+            ordered.append("miniapp/tests/generated_app.test.mjs")
+        if "generated_app_python_tests" in failed_names or api_failed:
+            ordered.append("miniapp/tests/test_generated_app.py")
+
+        for path in diff_paths:
+            normalized = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(path)
+            if normalized.startswith("miniapp/app/static/") and normalized.endswith((".html", ".js", ".css")):
+                match = re.search(r"miniapp/app/static/(client|specialist|manager)/", normalized)
+                if match and match.group(1) in roles:
+                    ordered.append(normalized)
+
+        compact: list[str] = []
+        for path in ordered:
+            normalized = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(path)
+            if normalized.startswith("miniapp/") and normalized not in compact:
+                compact.append(normalized)
+        return compact[:7]
+
+    @staticmethod
+    def _generated_tests_repair_needed(execution: CheckExecutionRecord) -> bool:
+        return (
+            WorkspaceCodeAgentRuntime._missing_generated_tests_repair_needed(execution)
+            or WorkspaceCodeAgentRuntime._stale_generated_tests_repair_needed(execution)
+        )
+
+    @staticmethod
+    def _stale_generated_tests_repair_needed(execution: CheckExecutionRecord) -> bool:
+        for result in execution.results:
+            if result.status != "failed" or result.name not in {"generated_app_python_tests", "generated_app_js_tests"}:
+                continue
+            details = str(result.details or "").lower()
+            logs_blob = "\n".join(str(line or "") for line in result.logs or []).lower()
+            if (
+                "required" in details
+                or "not present" in details
+                or "missing_generated_app_tests" in logs_blob
+                or not result.logs
+            ):
+                continue
+            diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+            if diagnostics.get("assertion_failures") or diagnostics.get("failing_test_location") or diagnostics.get("assertion_source"):
+                return True
+            stale_markers = (
+                "assertionerror",
+                "expected:",
+                "actual:",
+                "operator:",
+                "diff:",
+                "test failed",
+                "fail:",
+                "✖ failing tests",
+            )
+            if any(marker in logs_blob for marker in stale_markers):
+                return True
+        return False
+
+    @staticmethod
+    def _generated_test_repair_packet(execution: CheckExecutionRecord) -> dict[str, object]:
+        failed: list[dict[str, object]] = []
+        for result in execution.results:
+            if result.status != "failed" or result.name not in {"generated_app_python_tests", "generated_app_js_tests"}:
+                continue
+            diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+            failed.append(
+                {
+                    "name": result.name,
+                    "details": truncate_tool_text(str(result.details or ""), max_chars=500),
+                    "command": truncate_tool_text(str(result.command or ""), max_chars=220),
+                    "exit_code": result.exit_code,
+                    "diagnostics": WorkspaceCodeAgentRuntime._compact_jsonish(diagnostics, max_chars=900, max_items=6),
+                    "logs": [truncate_tool_text(str(line), max_chars=700) for line in result.logs[-10:]],
+                }
+            )
+        return {
+            "failed_generated_tests": failed,
+            "repair_scope": (
+                "Generated acceptance tests must match the actual current app contract. "
+                "Patch generated tests when their selectors/HTML expectations are stale; patch app code only when the failed assertion reveals a real behavior/API bug."
+            ),
+        }
+
+    @staticmethod
+    def _generated_test_repair_focus(execution: CheckExecutionRecord, *, missing: bool = False) -> str:
+        failed_names = [
+            str(result.name or "")
+            for result in execution.results
+            if result.status == "failed" and result.name in {"generated_app_python_tests", "generated_app_js_tests"}
+        ]
+        if missing:
+            return (
+                "Generated-test repair: create the missing generated Python and JS acceptance tests from the actual current routes, schemas, "
+                "role HTML, and role JS. Do not invent a separate test-only contract."
+            )
+        return (
+            "Generated-test repair: fix stale generated acceptance tests before returning to browser proof. "
+            f"Failed checks: {', '.join(failed_names) or 'generated tests'}. "
+            "Compare the test expectations with the current app files in file_contexts. Prefer patching only miniapp/tests/* when tests assert old selectors, old class names, old labels, or old routes. "
+            "Patch app code only if the assertion proves the actual workflow contract is broken. Keep browser-flow repair for the next validation round."
+        )
+
+    @staticmethod
+    def _generated_test_repair_paths(execution: CheckExecutionRecord, *, diff_paths: list[str]) -> list[str]:
+        failed_names = {str(result.name or "") for result in execution.results if result.status == "failed"}
+        ordered: list[str] = []
+        if "generated_app_js_tests" in failed_names:
+            ordered.append("miniapp/tests/generated_app.test.mjs")
+        if "generated_app_python_tests" in failed_names:
+            ordered.append("miniapp/tests/test_generated_app.py")
+
+        static_paths = [
+            path
+            for path in diff_paths
+            if path.startswith("miniapp/app/static/")
+            and path.endswith((".html", ".js"))
+        ]
+        route_paths = [
+            path
+            for path in diff_paths
+            if path.startswith("miniapp/app/routes/")
+            and path.endswith(".py")
+        ]
+        ordered.extend(static_paths[:9])
+        ordered.extend(route_paths[:6])
+        if "generated_app_python_tests" in failed_names or route_paths:
+            ordered.extend(["miniapp/app/schemas.py", "miniapp/app/main.py", "miniapp/app/db.py"])
+        ordered.append("miniapp/app/generated/route_manifest.json")
+
+        compact: list[str] = []
+        for path in ordered:
+            normalized = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(path)
+            if normalized.startswith("miniapp/") and normalized not in compact:
+                compact.append(normalized)
+        return compact[:18]
+
+    @staticmethod
     def _workflow_slice_repair_needed(execution: CheckExecutionRecord) -> bool:
         failed_results = [result for result in execution.results if result.status == "failed"]
         failed_names = {str(result.name or "") for result in failed_results}
@@ -2509,11 +3105,14 @@ class WorkspaceCodeAgentRuntime:
         frontend_issue_count = 0
         route_schema_issue = False
         schema_payload_issue = False
+        role_update_issue = False
         for result in failed_results:
             if result.name == "frontend_interaction_static_smoke":
                 frontend_issue_count = len(result.logs or [])
             if result.name == "platform_invariants" and any("preflight.route_schema_contract" in str(line or "") for line in result.logs or []):
                 route_schema_issue = True
+            if result.name == "platform_invariants" and any("platform.frontend_missing_update_api" in str(line or "") for line in result.logs or []):
+                role_update_issue = True
             if result.name == "generated_app_python_tests" and any(" 422" in str(line or "") or "422 !=" in str(line or "") or "!= 422" in str(line or "") for line in result.logs or []):
                 schema_payload_issue = True
         return (
@@ -2521,6 +3120,7 @@ class WorkspaceCodeAgentRuntime:
             or (has_route_or_static_contract and has_generated_check)
             or generated_tests_disagree
             or route_schema_issue
+            or role_update_issue
             or schema_payload_issue
             or {"connectivity_validators", "frontend_interaction_static_smoke"}.issubset(failed_names)
             or "browser_flow_smoke" in failed_names
@@ -2563,6 +3163,28 @@ class WorkspaceCodeAgentRuntime:
         )
         payload: list[dict[str, object]] = []
         for result in source_results[:5]:
+            browser_failure_packet = {}
+            if result.name == "browser_flow_smoke" and isinstance(result.diagnostics, dict):
+                browser_failure_packet = {
+                    key: WorkspaceCodeAgentRuntime._compact_jsonish(result.diagnostics.get(key), max_chars=900, max_items=6)
+                    for key in (
+                        "failed_step",
+                        "failed_role",
+                        "failed_route",
+                        "failed_selector",
+                        "action",
+                        "console_errors",
+                        "visible_errors",
+                        "screenshots",
+                        "api_before",
+                        "api_after",
+                        "ui_steps",
+                    )
+                    if key in result.diagnostics
+                }
+                diagnostics = browser_failure_packet
+            else:
+                diagnostics = WorkspaceCodeAgentRuntime._compact_jsonish(result.diagnostics, max_chars=900, max_items=6)
             payload.append(
                 {
                     "name": result.name,
@@ -2571,7 +3193,32 @@ class WorkspaceCodeAgentRuntime:
                     "command": truncate_tool_text(str(result.command or ""), max_chars=180),
                     "exit_code": result.exit_code,
                     "logs": [truncate_tool_text(str(line), max_chars=700) for line in result.logs[-5:]],
-                    "diagnostics": WorkspaceCodeAgentRuntime._compact_jsonish(result.diagnostics, max_chars=900, max_items=6),
+                    "diagnostics": diagnostics,
+                    "browser_failure_packet": browser_failure_packet,
+                }
+            )
+        return payload
+
+    @staticmethod
+    def _compact_generated_test_repair_checks(execution: CheckExecutionRecord) -> list[dict[str, object]]:
+        payload: list[dict[str, object]] = []
+        for result in execution.results:
+            if result.status != "failed" or result.name not in {"generated_app_python_tests", "generated_app_js_tests"}:
+                continue
+            diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+            payload.append(
+                {
+                    "name": result.name,
+                    "status": result.status,
+                    "details": truncate_tool_text(str(result.details or ""), max_chars=500),
+                    "command": truncate_tool_text(str(result.command or ""), max_chars=220),
+                    "exit_code": result.exit_code,
+                    "logs": [truncate_tool_text(str(line), max_chars=1000) for line in result.logs[-12:]],
+                    "diagnostics": WorkspaceCodeAgentRuntime._compact_jsonish(diagnostics, max_chars=1200, max_items=8),
+                    "repair_boundary": (
+                        "Only generated test failures are included in this turn. "
+                        "Other API/browser failures are intentionally withheld until generated tests pass, so do not infer or chase them now."
+                    ),
                 }
             )
         return payload
@@ -2797,6 +3444,8 @@ class WorkspaceCodeAgentRuntime:
         focused_edit_kind: str,
         workflow_slice_repair: bool = False,
         missing_generated_tests_repair: bool = False,
+        stale_generated_tests_repair: bool = False,
+        browser_step_repair: bool = False,
     ) -> list[str]:
         del generation_mode, focused_edit_kind
         rules = [
@@ -2806,16 +3455,25 @@ class WorkspaceCodeAgentRuntime:
             "Keep the app prompt-owned and prompt-derived: do not introduce platform templates, seed/demo/mock business records, or fixed resource/page names.",
             "For create/workflow failures, keep HTML controls, JavaScript handlers, API routes/schemas, persistence, and generated tests aligned to one actual contract.",
             "Browser-flow failures are product failures: make the UI action change persisted state, make other roles observe it, and make reload preserve it.",
-            "Generated tests should verify the actual app contract. Patch stale/brittle test expectations only when the app behavior is already correct.",
+            "The source/user-facing role must render the persisted fields that operational roles can update, such as status, notes, comments, assignment, payment, or other prompt-derived progress fields. It is not enough to show only the fields originally submitted by the user.",
+            "Generated tests should verify the actual app contract. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods; use FastAPI TestClient as a context manager when app lifespan creates tables; never replace tests with pytest-only top-level functions. JS generated tests run from cwd=miniapp, so path reads should be app/static/... and app/generated/.... Patch stale/brittle test expectations only when the app behavior is already correct.",
             "Mobile layout fixes must target 360-430px width: no horizontal scroll, no overlapping critical cards/forms/actions, and readable wrapping.",
         ]
-        if workflow_slice_repair:
+        if workflow_slice_repair and not browser_step_repair:
             rules.append(
                 "Repair the complete connected workflow slice in one focused patch: relevant backend route/schema, one or more role HTML/JS/CSS files, and generated tests if they are stale."
             )
+        if browser_step_repair:
+            rules.append(
+                "This is a browser-step repair, not a rebuild. Use one small patch for the failed role UI/JS/CSS; only touch backend/schema when the browser packet shows API state did not change. Do not patch generated tests unless they are stale relative to working app behavior."
+            )
         if missing_generated_tests_repair:
             rules.append(
-                "Create missing generated Python and JS tests from the actual current routes, selectors, schemas, and role files; do not invent a separate test-only contract."
+                "Create missing generated Python and JS tests from the actual current routes, selectors, schemas, and role files; Python tests must be unittest-discoverable with a unittest.TestCase subclass, not pytest-only top-level functions, and use TestClient context manager when lifespan initializes tables. JS tests run from cwd=miniapp and must use app/... relative paths. Do not invent a separate test-only contract."
+            )
+        if stale_generated_tests_repair:
+            rules.append(
+                "This turn is for stale generated acceptance tests. Compare miniapp/tests/* expectations against current role HTML/JS and backend routes. Prefer patching only generated tests when they assert old selectors, class names, labels, paths, or API shapes; patch app code only if the test failure proves a real workflow bug. Do not chase browser proof in the same turn."
             )
         return rules
 
@@ -2879,6 +3537,24 @@ class WorkspaceCodeAgentRuntime:
                     candidates.extend([payload.get("location"), payload.get("path"), payload.get("file_path")])
                     code = str(payload.get("code") or "")
                     location = str(payload.get("location") or payload.get("path") or payload.get("file_path") or "").replace("\\", "/")
+                    if code == "platform.frontend_missing_update_api" or location.rstrip("/") == "miniapp/app/static":
+                        for role in ("specialist", "manager"):
+                            candidates.extend(
+                                [
+                                    f"miniapp/app/static/{role}/index.html",
+                                    f"miniapp/app/static/{role}/app.js",
+                                    f"miniapp/app/static/{role}/styles.css",
+                                ]
+                            )
+                        candidates.extend(
+                            [
+                                "miniapp/app/routes/app_api.py",
+                                "miniapp/app/routes/api.py",
+                                "miniapp/app/schemas.py",
+                                "miniapp/tests/test_generated_app.py",
+                                "miniapp/tests/generated_app.test.mjs",
+                            ]
+                        )
                     role_match_from_location = re.search(r"miniapp/app/static/(?P<role>client|specialist|manager)/", location)
                     if code.startswith("platform.workflow_") and role_match_from_location:
                         role = role_match_from_location.group("role")
@@ -2902,7 +3578,7 @@ class WorkspaceCodeAgentRuntime:
                 for match in re.finditer(r"(?:^|[/\\])(?P<path>miniapp[/\\][A-Za-z0-9_./\\-]+\.(?:py|js|mjs|html|css|json))", str(line or "")):
                     candidates.append(match.group("path"))
             for candidate in candidates:
-                path = self._strip_leading_dot_slash(candidate)
+                path = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(candidate)
                 if path and path.startswith("miniapp/") and path not in paths:
                     paths.append(path)
         return paths[:16]
@@ -2985,7 +3661,7 @@ class WorkspaceCodeAgentRuntime:
             "job_id": job.job_id,
             "phase": phase,
             "status": job.status,
-            "current_stage": job.current_stage,
+            "current_stage": getattr(job, "current_stage", None) or job.current_fix_phase,
             "agent_transcript_ref": job.agent_transcript_ref,
             "tool_result_messages_ref": job.tool_result_messages_ref,
             "scratchpad_ref": job.scratchpad_ref,
@@ -3059,7 +3735,13 @@ class WorkspaceCodeAgentRuntime:
         intent: str = "",
         focused_edit_kind: str = "",
         repair_turn: bool = False,
+        generated_tests_repair: bool = False,
+        browser_step_repair: bool = False,
     ) -> dict[str, Any]:
+        if generated_tests_repair:
+            return {"reasoning": {"effort": "low"}, "max_output_tokens": 12000}
+        if browser_step_repair:
+            return {"reasoning": {"effort": "low"}, "max_output_tokens": 7000}
         if focused_edit_kind == "visual_style_edit":
             return {"reasoning": {"effort": "low"}, "max_output_tokens": FOCUSED_VISUAL_CONTENT_MAX_LENGTH}
         if focused_edit_kind in {"small_copy_edit", "behavior_edit"}:
@@ -3091,6 +3773,26 @@ class WorkspaceCodeAgentRuntime:
     def _is_output_cap_error(error: str) -> bool:
         text = str(error or "").lower()
         return "max_output_token" in text or "max_output_tokens" in text or "output cap" in text or "too large to return as valid json" in text
+
+    @staticmethod
+    def _is_context_length_error(error: str) -> bool:
+        text = str(error or "").lower()
+        return "context_length_exceeded" in text or "exceeds the context window" in text or "context window" in text
+
+    @staticmethod
+    def _context_length_correction_result(payload: dict[str, Any], *, request: GenerateRequest) -> dict[str, object]:
+        return {
+            "tool": "context_length_correction",
+            "tool_use_id": "context_length_correction",
+            "status": "failed",
+            "previous_error": str(payload.get("error") or "")[:1200],
+            "required_next_action": (
+                "The previous request exceeded the context window. Use only the compact failure packet, current diff summary, "
+                "and exact failing files. Call one small read_files/search_files or one small apply_patch_to_draft/write_file; "
+                "do not request broad workspace context or rewrite unrelated app slices."
+            ),
+            "intent": str(request.intent or ""),
+        }
 
     @staticmethod
     def _output_cap_correction_result(payload: dict[str, Any], *, request: GenerateRequest) -> dict[str, object]:
@@ -4890,6 +5592,52 @@ class WorkspaceCodeAgentRuntime:
         if generation_mode == GenerationMode.QUALITY:
             return 4
         return 3
+
+    @staticmethod
+    def _worker_branch_timeout_seconds(generation_mode: GenerationMode) -> float:
+        env_value = os.getenv("WORKSPACE_AGENT_WORKER_TIMEOUT_SECONDS")
+        if env_value:
+            try:
+                return max(60.0, float(env_value))
+            except ValueError:
+                pass
+        if generation_mode == GenerationMode.FAST:
+            return 300.0
+        if generation_mode == GenerationMode.QUALITY:
+            return 720.0
+        return 480.0
+
+    @staticmethod
+    def _backend_contract_snapshot(source_dir: Path) -> dict[str, Any]:
+        routes_root = source_dir / "miniapp/app/routes"
+        declared_routes = [
+            {"method": method, "path": path}
+            for method, path in sorted(extract_declared_routes(routes_root, api_only=True))
+        ]
+        excerpts: dict[str, str] = {}
+        route_relatives: list[str] = []
+        for path in sorted(routes_root.glob("*.py")) if routes_root.exists() else []:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if "/api" in text or "@router." in text:
+                route_relatives.append(str(path.relative_to(source_dir)).replace("\\", "/"))
+        for relative in [*route_relatives, "miniapp/app/routes/api.py", "miniapp/app/routes/app_api.py", "miniapp/app/schemas.py"]:
+            path = source_dir / relative
+            if not path.exists():
+                continue
+            if relative in excerpts:
+                continue
+            try:
+                excerpts[relative] = truncate_tool_text(path.read_text(encoding="utf-8"), max_chars=5000)
+            except OSError:
+                continue
+        return {
+            "declared_api_routes": declared_routes,
+            "source_excerpts": excerpts,
+            "instruction": "UI and generated-test workers must use these actual backend routes and schema field names exactly; do not invent alternate /api paths.",
+        }
 
     @staticmethod
     def _prompt_cache_key(workspace_id: str, run_id: str, prompt: str) -> str:

@@ -18,6 +18,8 @@ class AgentEditValidator:
         ".venv/",
         "venv/",
         "platform-state.json",
+        "miniapp/app/routes/role_pages.py",
+        "miniapp/app/routes/role_routes.py",
     )
 
     @staticmethod
@@ -61,6 +63,11 @@ class AgentEditValidator:
                 text = "" if content is None else str(content)
                 if not text:
                     return ("missing_content", f"{normalized_path} {op} operation must include file content.")
+                if cls._role_page_neutral_template_issue(normalized_path, text):
+                    return (
+                        "neutral_role_template_write",
+                        f"{normalized_path} writes the platform neutral starter page back into a generated role app. Patch the prompt-derived workflow UI instead.",
+                    )
                 if any(marker in text for marker in cls.PATCH_ENVELOPE_MARKERS):
                     return (
                         "patch_envelope_in_content",
@@ -74,10 +81,21 @@ class AgentEditValidator:
                 patch_text = str(diff or content or "")
                 if not patch_text.strip():
                     return ("missing_patch_diff", f"{normalized_path} patch operation must include a unified diff.")
-                if any(marker in patch_text for marker in ("*** Begin Patch", "*** End Patch")):
+                if cls._role_page_neutral_template_issue(normalized_path, patch_text):
                     return (
-                        "apply_patch_envelope_in_diff",
-                        f"{normalized_path} patch operation must contain only the file diff, not an apply_patch envelope.",
+                        "neutral_role_template_patch",
+                        f"{normalized_path} patch would restore neutral starter role content. Patch the prompt-derived workflow UI instead.",
+                    )
+                if patch_text.lstrip().startswith("*** Begin Patch"):
+                    issue = cls._validate_size(normalized_path, patch_text)
+                    if issue:
+                        return issue
+                    total_chars += len(patch_text)
+                    continue
+                if any(marker in patch_text for marker in cls.PATCH_ENVELOPE_MARKERS):
+                    return (
+                        "invalid_patch_envelope_position",
+                        f"{normalized_path} patch operation contains patch envelope markers outside a Codex-style update patch.",
                     )
                 if not cls._looks_like_unified_diff(patch_text):
                     return (
@@ -134,6 +152,22 @@ class AgentEditValidator:
                 f"{path} operation is {len(text)} characters; split it into smaller files or patch hunks.",
             )
         return None
+
+    @staticmethod
+    def _role_page_neutral_template_issue(path: str, text: str) -> bool:
+        normalized = str(path or "").replace("\\", "/")
+        if not re.fullmatch(r"miniapp/app/static/(client|specialist|manager)/index\.html", normalized):
+            return False
+        lowered = str(text or "").lower()
+        markers = (
+            "neutral starter",
+            "should be replaced by the generated app",
+            "client surface",
+            "specialist surface",
+            "manager surface",
+            "preview entry",
+        )
+        return sum(1 for marker in markers if marker in lowered) >= 2
 
     @staticmethod
     def _looks_like_unified_diff(diff: str) -> bool:

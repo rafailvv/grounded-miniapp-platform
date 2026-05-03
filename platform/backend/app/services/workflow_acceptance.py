@@ -1,11 +1,180 @@
 from __future__ import annotations
 
 from typing import Any
+import re
 
 from app.models.common import GenerationMode
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
+PROMPT_PLAN_STOPWORDS = {
+    "and",
+    "app",
+    "application",
+    "business",
+    "create",
+    "for",
+    "from",
+    "mini",
+    "miniapp",
+    "need",
+    "that",
+    "the",
+    "this",
+    "want",
+    "with",
+    "без",
+    "будет",
+    "вести",
+    "видеть",
+    "всё",
+    "для",
+    "должен",
+    "должна",
+    "должны",
+    "есть",
+    "каждый",
+    "как",
+    "маленький",
+    "мне",
+    "может",
+    "нужно",
+    "помогало",
+    "приложение",
+    "современно",
+    "таблиц",
+    "удобно",
+    "удобным",
+    "хочу",
+    "чтобы",
+}
+
+
+def _clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def extract_prompt_planning_hints(prompt: str) -> dict[str, Any]:
+    """Extract prompt-owned planning hints without domain templates.
+
+    The platform does not invent routes/resources from these hints. They are a
+    compact scratchpad for the LLM workers so the first build turn is anchored
+    to the user's nouns, role language, fields, and actions instead of generic
+    placeholder records.
+    """
+    text = _clean_text(prompt)
+    sentences = [
+        sentence.strip(" .!?\t")
+        for sentence in re.split(r"[\n.!?]+", text)
+        if sentence.strip(" .!?\t")
+    ]
+    lowered_sentences = [(sentence, sentence.lower()) for sentence in sentences]
+    actor_hints: dict[str, list[str]] = {role: [] for role in ROLE_ORDER}
+    actor_patterns = {
+        "client": (
+            "клиент",
+            "пользователь",
+            "ученик",
+            "посетитель",
+            "покупатель",
+            "заказчик",
+            "пациент",
+            "родитель",
+            "user",
+            "customer",
+            "client",
+        ),
+        "specialist": (
+            "специалист",
+            "исполнитель",
+            "мастер",
+            "сотрудник",
+            "преподаватель",
+            "тренер",
+            "оператор",
+            "worker",
+            "specialist",
+            "staff",
+            "teacher",
+        ),
+        "manager": (
+            "менеджер",
+            "администратор",
+            "управля",
+            "руководитель",
+            "manager",
+            "admin",
+            "administrator",
+            "owner",
+        ),
+    }
+    action_markers = (
+        "долж",
+        "может",
+        "видит",
+        "видеть",
+        "выбира",
+        "оформ",
+        "добав",
+        "меня",
+        "отмеч",
+        "контрол",
+        "create",
+        "choose",
+        "add",
+        "update",
+        "see",
+        "manage",
+    )
+    action_sentences = [sentence for sentence, lowered in lowered_sentences if any(marker in lowered for marker in action_markers)]
+    for sentence, lowered in lowered_sentences:
+        for role, patterns in actor_patterns.items():
+            if any(pattern in lowered for pattern in patterns):
+                actor_hints[role].append(sentence)
+    # If the entrepreneur wrote actor/action sentences without platform role
+    # names, preserve the sentence order as role hints instead of inventing a
+    # business template.
+    for role, sentence in zip(ROLE_ORDER, action_sentences):
+        if not actor_hints[role]:
+            actor_hints[role].append(sentence)
+
+    words = [
+        item.lower()
+        for item in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{3,}", text)
+        if item.lower() not in PROMPT_PLAN_STOPWORDS
+    ]
+    frequency: dict[str, int] = {}
+    for word in words:
+        frequency[word] = frequency.get(word, 0) + 1
+    prompt_terms = [
+        term
+        for term, _count in sorted(frequency.items(), key=lambda item: (-item[1], item[0]))[:16]
+    ]
+    field_hints: list[str] = []
+    for marker in ("выбирает", "выбрать", "указывает", "указать", "добавляет", "добавить", "заполняет", "заполнить", "chooses", "adds", "fills"):
+        pattern = re.compile(rf"{marker}\s+(?P<tail>[^.!?\n]+)", re.IGNORECASE)
+        for match in pattern.finditer(text):
+            tail = match.group("tail")
+            for part in re.split(r"[,;]|\s+и\s+|\s+and\s+", tail):
+                cleaned = _clean_text(part).strip(" .")
+                if 2 < len(cleaned) <= 80 and cleaned not in field_hints:
+                    field_hints.append(cleaned)
+                if len(field_hints) >= 12:
+                    break
+            if len(field_hints) >= 12:
+                break
+        if len(field_hints) >= 12:
+            break
+    return {
+        "prompt_summary": text[:1200],
+        "prompt_sentences": sentences[:10],
+        "prompt_terms": prompt_terms,
+        "field_hints": field_hints[:12],
+        "role_action_prompts": {
+            role: hints[:4]
+            for role, hints in actor_hints.items()
+        },
+    }
 
 def normalized_generation_mode(generation_mode: GenerationMode | str | None) -> str:
     return str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
@@ -189,6 +358,7 @@ def build_implementation_plan(
     intent_value = str(intent or "").strip().lower()
     mode_value = normalized_generation_mode(generation_mode)
     contract = dict(acceptance_contract or {})
+    prompt_hints = extract_prompt_planning_hints(prompt)
     required_controls = [
         dict(item)
         for item in (contract.get("required_controls") or [])
@@ -201,22 +371,25 @@ def build_implementation_plan(
         "generation_mode": mode_value,
         "principle": "plan_inspect_build_verify_repair_final_browser_proof",
         "roles": list(contract.get("roles") or ROLE_ORDER),
-        "primary_entities": [],
+        "prompt_hints": prompt_hints,
+        "primary_entities": list(prompt_hints.get("prompt_terms") or [])[:8],
         "role_actions": {
-            "client": "perform the prompt-derived user create, submit, select, or save action through UI and POST API",
-            "specialist": "perform the prompt-derived operational processing/update action through UI and update API",
-            "manager": "review or control shared state and summary information through manager UI",
+            "client": (prompt_hints.get("role_action_prompts") or {}).get("client") or ["perform the prompt-derived user create, submit, select, or save action through UI and POST API"],
+            "specialist": (prompt_hints.get("role_action_prompts") or {}).get("specialist") or ["perform the prompt-derived operational processing/update action through UI and update API"],
+            "manager": (prompt_hints.get("role_action_prompts") or {}).get("manager") or ["review or control shared state and summary information through manager UI"],
         },
         "api_contract": {
             "required_endpoints": list(contract.get("required_endpoints") or []),
             "must_persist": True,
             "must_support_update": bool((contract.get("features") or {}).get("workflow_update", True)),
+            "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
         },
         "ui_contract": {
             "required_controls": required_controls,
             "three_separate_role_apps": True,
             "no_cross_role_navigation": True,
             "role_specific_actions": True,
+            "business_copy_quality": "Do not expose API paths, HTTP methods, route slugs, role slugs, raw enum codes, or internal implementation labels in normal role UI; render readable business labels with clear spacing between label and value.",
             "role_independence": {
                 "client": "user-facing mobile app for the primary prompt-derived create/select/save flow; no links to specialist or manager surfaces",
                 "specialist": "operational mobile app for processing/updating shared state; no client-only duplicate page",
@@ -251,6 +424,8 @@ def build_implementation_plan(
             "no_horizontal_scroll": True,
             "responsive_cards_forms_lists": True,
             "safe_top_spacing_required": True,
+            "consistent_light_visual_system_by_default": True,
+            "role_differentiation": "Differentiate roles by workflow, layout hierarchy, and subtle accents, not by switching one role to a separate dark/digital theme.",
             "no_fixed_width_tables_or_panels": True,
             "touch_targets_min_height": "44px where practical",
             "states_required": ["empty", "loading", "success", "error"],
@@ -284,7 +459,11 @@ def orchestration_metadata_for_contract(
         else "agent_tool_call_loop_with_design_pass" if enabled and mode_value == GenerationMode.QUALITY.value
         else "agent_tool_call_loop" if enabled else "none"
     )
-    isolated_worker_drafts = enabled and mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
+    isolated_worker_drafts = enabled and mode_value in {
+        GenerationMode.FAST.value,
+        GenerationMode.BALANCED.value,
+        GenerationMode.QUALITY.value,
+    }
     phases = [
         {
             "id": "spec_extract",

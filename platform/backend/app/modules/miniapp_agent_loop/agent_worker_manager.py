@@ -31,6 +31,8 @@ class AgentWorkerManager:
     @classmethod
     def owner_for_path(cls, path: str) -> str:
         normalized = str(path or "").strip().replace("\\", "/")
+        if normalized in {"miniapp/app/routes/role_pages.py", "miniapp/app/routes/role_routes.py"}:
+            return "platform_shell"
         for scope in cls.SCOPES:
             if scope.owns(normalized):
                 return scope.worker
@@ -45,13 +47,13 @@ class AgentWorkerManager:
         generation_mode: GenerationMode,
         implementation_plan: dict[str, Any],
     ) -> dict[str, object]:
-        enabled = generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
+        enabled = generation_mode in {GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY}
         workers = [
             {
                 "worker": scope.worker,
                 "owner_scope": scope.owner_scope,
                 "path_prefixes": list(scope.path_prefixes),
-                "status": "pending" if enabled else "not_used_for_fast",
+                "status": "pending" if enabled else "not_used",
             }
             for scope in cls.SCOPES
         ]

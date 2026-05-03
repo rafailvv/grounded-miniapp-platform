@@ -53,9 +53,6 @@ class AgentWorkerRuntime:
         draft_source: Path,
         worker_specs: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        if generation_mode == GenerationMode.FAST:
-            self._drafts[run_id] = []
-            return {"enabled": False, "mode": "single_loop", "workers": []}
         worker_root = draft_source.parent / f"{draft_source.name}_workers"
         worker_root.mkdir(parents=True, exist_ok=True)
         drafts: list[WorkerDraft] = []
@@ -90,9 +87,6 @@ class AgentWorkerRuntime:
         workspace_service: Any,
         worker_specs: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        if generation_mode == GenerationMode.FAST:
-            self._drafts[run_id] = []
-            return {"enabled": False, "mode": "single_loop", "workers": []}
         drafts: list[WorkerDraft] = []
         for spec in worker_specs:
             worker_id = str(spec.get("worker_id") or "").strip()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -7,26 +8,33 @@ from app.models.common import GenerationMode
 from app.models.domain import JobRecord
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 COMPLETION_BUDGETS = {
     GenerationMode.FAST: {
-        "time_limit_ms": 18 * 60 * 1000,
-        "token_limit": 600_000,
-        "turn_budget_cap": 180,
+        "time_limit_ms": _env_int("CODE_AGENT_FAST_TIME_LIMIT_MS", 16 * 60 * 1000),
+        "token_limit": _env_int("CODE_AGENT_FAST_TOKEN_LIMIT", 1_200_000),
+        "turn_budget_cap": 120,
     },
     GenerationMode.BALANCED: {
-        "time_limit_ms": 25 * 60 * 1000,
-        "token_limit": 1_200_000,
-        "turn_budget_cap": 300,
+        "time_limit_ms": _env_int("CODE_AGENT_BALANCED_TIME_LIMIT_MS", 20 * 60 * 1000),
+        "token_limit": _env_int("CODE_AGENT_BALANCED_TOKEN_LIMIT", 1_200_000),
+        "turn_budget_cap": 180,
     },
     GenerationMode.QUALITY: {
-        "time_limit_ms": 45 * 60 * 1000,
-        "token_limit": 2_500_000,
-        "turn_budget_cap": 500,
+        "time_limit_ms": _env_int("CODE_AGENT_QUALITY_TIME_LIMIT_MS", 40 * 60 * 1000),
+        "token_limit": _env_int("CODE_AGENT_QUALITY_TOKEN_LIMIT", 2_200_000),
+        "turn_budget_cap": 280,
     },
     GenerationMode.BASIC: {
-        "time_limit_ms": 18 * 60 * 1000,
-        "token_limit": 600_000,
-        "turn_budget_cap": 180,
+        "time_limit_ms": _env_int("CODE_AGENT_FAST_TIME_LIMIT_MS", 16 * 60 * 1000),
+        "token_limit": _env_int("CODE_AGENT_FAST_TOKEN_LIMIT", 1_200_000),
+        "turn_budget_cap": 120,
     },
 }
 

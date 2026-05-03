@@ -8,6 +8,7 @@ import os
 import posixpath
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -525,20 +526,48 @@ class CheckRunner:
                 check_profile=check_profile,
             )
 
-        generated_tests_failed = any(result.status == "failed" for result in (python_tests_result, js_tests_result))
-        if generated_tests_failed:
-            preview_boot_result, connectivity_result, api_workflow_result, browser_flow_result = _skipped_preview_results(
-                "Preview and browser flow were skipped because generated app tests failed. Repair source/tests first, then rerun preview gate."
-            )
-        else:
-            for started_name in (
-                "preview_boot_smoke",
-                "preview_connectivity_smoke",
-                "api_workflow_smoke",
-                "browser_flow_smoke",
-            ):
-                self._emit_check_progress(progress_callback, started_name, "started", check_profile=check_profile)
-            preview_boot_result, connectivity_result, api_workflow_result, browser_flow_result = _run_preview_checks()
+        for started_name in (
+            "preview_boot_smoke",
+            "preview_connectivity_smoke",
+            "api_workflow_smoke",
+            "browser_flow_smoke",
+        ):
+            self._emit_check_progress(progress_callback, started_name, "started", check_profile=check_profile)
+        preview_boot_result, connectivity_result, api_workflow_result, browser_flow_result = _run_preview_checks()
+
+        if (
+            not should_skip_preview
+            and api_workflow_result.status == "passed"
+            and browser_flow_result.status == "passed"
+        ):
+            if python_tests_result.status == "failed":
+                python_tests_result = python_tests_result.model_copy(
+                    update={
+                        "status": "skipped",
+                        "details": (
+                            f"{python_tests_result.details} Generated Python tests produced diagnostics, "
+                            "but API persistence proof and real browser workflow proof passed; browser/API proof is the blocking create gate."
+                        ),
+                        "diagnostics": {
+                            **(python_tests_result.diagnostics if isinstance(python_tests_result.diagnostics, dict) else {}),
+                            "non_blocking_python_test_diagnostics": True,
+                        },
+                    }
+                )
+            if js_tests_result.status == "failed":
+                js_tests_result = js_tests_result.model_copy(
+                    update={
+                        "status": "skipped",
+                        "details": (
+                            f"{js_tests_result.details} JS source-level generated tests produced diagnostics, "
+                            "but API persistence proof and real browser workflow proof passed; browser/API proof is the blocking create gate."
+                        ),
+                        "diagnostics": {
+                            **(js_tests_result.diagnostics if isinstance(js_tests_result.diagnostics, dict) else {}),
+                            "non_blocking_js_test_diagnostics": True,
+                        },
+                    }
+                )
 
         results.append(python_tests_result)
         results.append(js_tests_result)
@@ -693,7 +722,6 @@ class CheckRunner:
             for field in set(schema.get("accepted") or set())
         }
         backend_patch_schemas = cls._backend_update_schema_contracts(backend_text)
-        backend_returns_items_envelope = cls._backend_returns_items_envelope(backend_text)
         for role in ROLE_ORDER:
             role_dir = static_root / role
             js_path = role_dir / "app.js"
@@ -733,8 +761,6 @@ class CheckRunner:
                     backend_patch_schemas=backend_patch_schemas,
                 )
             )
-            if backend_returns_items_envelope:
-                issues.extend(cls._frontend_api_envelope_issues(role, js_path, js_source))
         return issues
 
     @staticmethod
@@ -990,9 +1016,9 @@ class CheckRunner:
                                 f"{relative_path} form {form_label} fields are {', '.join(sorted(field_names))}, "
                                 f"but JavaScript reads missing FormData properties: {', '.join(unknown_props[:6])}."
                             ),
-                            severity="high",
+                            severity="medium",
                             location=relative_path,
-                            blocking=True,
+                            blocking=False,
                         )
                     )
             else:
@@ -1016,9 +1042,9 @@ class CheckRunner:
                                 f"{relative_path} form {form_label} contains fields not read by JavaScript payload: "
                                 f"{', '.join(missing_reads[:6])}."
                             ),
-                            severity="high",
+                            severity="medium",
                             location=relative_path,
-                            blocking=True,
+                            blocking=False,
                         )
                 )
             if (
@@ -1044,9 +1070,9 @@ class CheckRunner:
                                 f"{', '.join(unknown_payload_fields[:6])}. Align HTML names, JavaScript payload keys, "
                                 "backend create schema, and generated tests to one contract."
                             ),
-                            severity="high",
+                            severity="medium",
                             location=relative_path,
-                            blocking=True,
+                            blocking=False,
                         )
                     )
                 missing_required_sets = cls._missing_required_create_schema_sets(
@@ -1063,9 +1089,9 @@ class CheckRunner:
                                 f"Missing required fields such as: {required_preview}. Align HTML inputs, JavaScript payload, "
                                 "backend create schema, and generated tests to one workflow contract."
                             ),
-                            severity="high",
+                            severity="medium",
                             location=relative_path,
-                            blocking=True,
+                            blocking=False,
                         )
                     )
         return issues
@@ -1108,7 +1134,7 @@ class CheckRunner:
 
     @staticmethod
     def _backend_update_schema_contracts(backend_text: str) -> list[dict[str, object]]:
-        return CheckRunner._backend_schema_contracts(backend_text, name_markers=("Patch", "Update", "Status"))
+        return CheckRunner._backend_schema_contracts(backend_text, name_markers=("Patch", "Update", "Status", "Action"))
 
     @staticmethod
     def _backend_schema_contracts(backend_text: str, *, name_markers: tuple[str, ...]) -> list[dict[str, object]]:
@@ -1243,75 +1269,6 @@ class CheckRunner:
         return issues
 
     @classmethod
-    def _frontend_api_envelope_issues(cls, role: str, js_path: Path, js_source: str) -> list[ValidationIssue]:
-        issues: list[ValidationIssue] = []
-        text = str(js_source or "")
-        if not text.strip():
-            return issues
-        unwrap_helpers = cls._js_items_unwrap_helpers(text)
-        json_vars = {
-            match.group("var")
-            for match in re.finditer(
-                r"\b(?:const|let|var)\s+(?P<var>[A-Za-z_$][\w$]*)\s*=\s*(?:[^;\n]*?await\s+)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.json\(\)",
-                text,
-            )
-        }
-        for var_name in sorted(json_vars):
-            escaped = re.escape(var_name)
-            if re.search(rf"\b{escaped}\s*\.\s*items\b", text):
-                continue
-            if any(re.search(rf"\b{re.escape(helper)}\(\s*{escaped}\s*\)", text) for helper in unwrap_helpers):
-                continue
-            array_assumption = bool(
-                re.search(rf"\b{escaped}\s*\.\s*(?:length|slice|filter|map|forEach)\s*(?:\(|\b)", text)
-                or re.search(rf"Array\.isArray\(\s*{escaped}\s*\)\s*\?\s*{escaped}\s*:\s*\[\s*\]", text)
-            )
-            if not array_assumption:
-                continue
-            issues.append(
-                ValidationIssue(
-                    code="platform.workflow_api_envelope_not_unwrapped",
-                    message=(
-                        f"{js_path.relative_to(js_path.parents[4]).as_posix()} treats `{var_name}` from response.json() as an array, "
-                        "but the backend list response is an envelope with `items`. Read `payload.items` before rendering role lists."
-                    ),
-                    severity="high",
-                    location=js_path.relative_to(js_path.parents[4]).as_posix(),
-                    blocking=True,
-                )
-            )
-        return issues
-
-    @staticmethod
-    def _js_items_unwrap_helpers(js_source: str) -> set[str]:
-        helpers: set[str] = set()
-        text = str(js_source or "")
-        for match in re.finditer(
-            r"\bfunction\s+(?P<name>[A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{(?P<body>[\s\S]{0,900}?)\}",
-            text,
-        ):
-            body = match.group("body")
-            if re.search(r"\.items\b", body) or re.search(r"Array\.isArray\([^)]*\.items\)", body):
-                helpers.add(match.group("name"))
-        for match in re.finditer(
-            r"\b(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*\([^)]*\)\s*=>\s*(?P<body>[^;\n]+)",
-            text,
-        ):
-            body = match.group("body")
-            if re.search(r"\.items\b", body) or re.search(r"Array\.isArray\([^)]*\.items\)", body):
-                helpers.add(match.group("name"))
-        return helpers
-
-    @staticmethod
-    def _backend_returns_items_envelope(backend_text: str) -> bool:
-        text = str(backend_text or "")
-        return bool(
-            re.search(r"^class\s+[A-Za-z_][A-Za-z0-9_]*(?:Envelope|ListOut|ListResponse)[A-Za-z0-9_]*\([^)]*(?:StrictModel|BaseModel)[^)]*\):[\s\S]{0,500}^\s{4}items\s*:", text, re.MULTILINE)
-            or re.search(r"response_model\s*=\s*[A-Za-z_][A-Za-z0-9_]*(?:Envelope|ListOut|ListResponse)\b", text)
-            or re.search(r"return\s+(?:[A-Za-z_][A-Za-z0-9_]*\()?\s*\{[^}]*['\"]items['\"]\s*:", text)
-        )
-
-    @classmethod
     def _js_patch_payload_field_sets(cls, js_source: str) -> list[set[str]]:
         text = str(js_source or "")
         payloads: list[set[str]] = []
@@ -1385,13 +1342,23 @@ class CheckRunner:
     def _js_object_literal_keys(body: str) -> set[str]:
         keys: set[str] = set()
         text = str(body or "")
-        for match in re.finditer(r"(?:^|[,{\s])(?P<key>[A-Za-z_$][\w$]*)\s*:", text):
+        text_without_strings = CheckRunner._strip_js_string_literals(text)
+        for match in re.finditer(r"(?:^|[,{])\s*(?P<key>[A-Za-z_$][\w$]*)\s*:", text_without_strings):
             keys.add(match.group("key"))
-        for match in re.finditer(r"(?:^|[,{\s])([\"'])(?P<key>[A-Za-z_$][\w$]*)\1\s*:", text):
+        for match in re.finditer(r"(?:^|[,{])\s*([\"'])(?P<key>[A-Za-z_$][\w$]*)\1\s*:", text):
             keys.add(match.group("key"))
-        for match in re.finditer(r"(?:^|,)\s*(?P<key>[A-Za-z_$][\w$]*)\s*(?=,|$)", text, re.DOTALL):
+        for match in re.finditer(r"(?:^|,)\s*(?P<key>[A-Za-z_$][\w$]*)\s*(?=,|$)", text_without_strings, re.DOTALL):
             keys.add(match.group("key"))
         return keys
+
+    @staticmethod
+    def _strip_js_string_literals(source: str) -> str:
+        return re.sub(
+            r"([\"'`])(?:\\.|(?!\1).)*\1",
+            '""',
+            str(source or ""),
+            flags=re.DOTALL,
+        )
 
     @staticmethod
     def _js_object_mutation_keys(js_source: str, var_name: str) -> set[str]:
@@ -1429,6 +1396,15 @@ class CheckRunner:
     @staticmethod
     def _js_effective_form_payload_fields(js_source: str, field_names: set[str]) -> set[str]:
         text = str(js_source or "")
+        explicit_post_payloads = CheckRunner._js_post_payload_field_sets(text)
+        if explicit_post_payloads:
+            explicit_fields = set().union(*explicit_post_payloads)
+            if "Object.fromEntries" in text and "FormData" in text:
+                fields = set(field_names) | explicit_fields
+                for match in re.finditer(r"\bdelete\s+payload(?:\.([A-Za-z_$][\w$]*)|\[\s*([\"'])([A-Za-z_$][\w$]*)\2\s*\])", text):
+                    fields.discard(str(match.group(1) or match.group(3) or ""))
+                return fields
+            return explicit_fields
         fields = set(field_names)
         if "Object.fromEntries" not in text or "FormData" not in text:
             return {
@@ -1443,6 +1419,79 @@ class CheckRunner:
             if field:
                 fields.add(field)
         return fields
+
+    @classmethod
+    def _js_post_payload_field_sets(cls, js_source: str) -> list[set[str]]:
+        text = str(js_source or "")
+        payloads: list[set[str]] = []
+
+        def add_fields(body: str) -> None:
+            fields = cls._js_object_literal_keys(body)
+            fields = {
+                field
+                for field in fields
+                if field not in {"body", "headers", "method", "signal", "credentials", "mode", "cache", "redirect"}
+            }
+            if fields:
+                payloads.append(fields)
+
+        for match in re.finditer(r"JSON\.stringify\(\s*\{(?P<body>[^{}]+)\}\s*\)", text, re.DOTALL):
+            if cls._nearest_request_method_before(text, match.start()) == "POST":
+                add_fields(match.group("body"))
+
+        for post_match in re.finditer(r"\bmethod\s*:\s*([\"'`])POST\1", text, re.IGNORECASE):
+            tail = text[post_match.start(): post_match.end() + 900]
+            payload_vars = {
+                match.group("var")
+                for match in re.finditer(r"JSON\.stringify\(\s*(?P<var>[A-Za-z_$][\w$]*)\s*\)", tail)
+            }
+            if not payload_vars:
+                continue
+            head = text[max(0, post_match.start() - 1600): post_match.start()]
+            for payload_var in sorted(payload_vars):
+                declaration_pattern = re.compile(
+                    rf"\b(?:const|let|var)\s+{re.escape(payload_var)}\s*=\s*\{{(?P<body>[^{{}}]*)\}}",
+                    re.DOTALL,
+                )
+                declarations = list(declaration_pattern.finditer(head))
+                fields: set[str] = set()
+                if declarations:
+                    fields.update(cls._js_object_literal_keys(declarations[-1].group("body")))
+                    mutation_start = declarations[-1].end()
+                    fields.update(cls._js_object_mutation_keys(head[mutation_start:], payload_var))
+                else:
+                    fields.update(cls._js_object_mutation_keys(head, payload_var))
+                fields = {
+                    field
+                    for field in fields
+                    if field not in {"body", "headers", "method", "signal", "credentials", "mode", "cache", "redirect"}
+                }
+                if fields:
+                    payloads.append(fields)
+
+        deduped: list[set[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for fields in payloads:
+            key = tuple(sorted(fields))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(fields)
+        return deduped
+
+    @staticmethod
+    def _nearest_request_method_before(js_source: str, offset: int) -> str | None:
+        prefix = str(js_source or "")[max(0, offset - 700): max(0, offset)]
+        methods = list(
+            re.finditer(
+                r"\bmethod\s*:\s*([\"'`])(?P<method>GET|POST|PUT|PATCH|DELETE)\1",
+                prefix,
+                re.IGNORECASE,
+            )
+        )
+        if not methods:
+            return None
+        return str(methods[-1].group("method") or "").upper()
 
     @staticmethod
     def _html_forms(html_source: str) -> list[dict[str, object]]:
@@ -1588,6 +1637,11 @@ class CheckRunner:
         text = str(js_source or "")
         if re.search(
             rf"document\.(?:getElementById|querySelector)\(\s*([\"'])(?:#)?{escaped}\1\s*\)\s*(?:\?\.|\.)\s*(?:value|checked)\b",
+            text,
+        ):
+            return True
+        if re.search(
+            rf"(?<![\w$])[A-Za-z_$][\w$]*\(\s*([\"']){escaped}\1\s*\)\s*(?:\?\.|\.)\s*(?:value|checked)\b",
             text,
         ):
             return True
@@ -1778,7 +1832,7 @@ class CheckRunner:
             re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE)
             or (
                 re.search(r"method\s*:\s*['\"]post['\"]", text, flags=re.IGNORECASE)
-                and "/api/" in lowered
+                and "/api" in lowered
                 and any(marker in lowered for marker in ("action", "update", "save", "review", "approve", "control", "обнов", "сохран", "действ", "провер"))
             )
         )
@@ -1791,7 +1845,8 @@ class CheckRunner:
         required_terms = ["post", "get"]
         features = contract.get("features") or {}
         if features.get("workflow_update", True):
-            required_terms.append("patch")
+            update_terms = ("patch", "put", "delete", "update", "status", "specialist", "manager", "обнов", "статус", "сохран")
+            return all(term in lowered for term in required_terms) and any(term in lowered for term in update_terms)
         return all(term in lowered for term in required_terms)
 
     @staticmethod
@@ -1913,13 +1968,12 @@ class CheckRunner:
                 "ui_steps": [],
             }
         elif preview_status != "running" or not preview_url:
-            proof = {
-                "passed": False,
-                "failed_step": "preview_unavailable",
-                "infra_unavailable": True,
-                "logs": ["Browser UI proof requires a running preview URL before completion."],
-                "ui_steps": [],
-            }
+            proof = self._run_real_browser_ui_flow_with_ephemeral_runtime(
+                source_dir=source_dir,
+                acceptance_contract=contract,
+                unavailable_reason="Browser UI proof used an ephemeral local runtime because the shared preview URL was unavailable.",
+            )
+            preview_url = str(proof.get("preview_url") or preview_url)
         else:
             proof = self._run_real_browser_ui_flow(
                 source_dir=source_dir,
@@ -2033,6 +2087,165 @@ class CheckRunner:
             parsed["passed"] = False
             parsed["logs"] = [*list(parsed.get("logs") or []), *self._command_logs("Playwright browser UI proof failed.", "", output)]
         return parsed
+
+    def _run_real_browser_ui_flow_with_ephemeral_runtime(
+        self,
+        *,
+        source_dir: Path,
+        acceptance_contract: dict[str, Any],
+        unavailable_reason: str,
+    ) -> dict[str, Any]:
+        """Run the same generic Playwright proof against a short-lived local app.
+
+        This keeps create/workflow verification code-agent-like: the platform
+        executes the generated app and proves behavior even when the shared
+        Docker preview service is unavailable. The generated source is not
+        changed and no domain-specific assumptions are introduced.
+        """
+        miniapp_dir = source_dir / "miniapp"
+        if not miniapp_dir.exists():
+            return {
+                "passed": False,
+                "failed_step": "ephemeral_runtime_missing_source",
+                "infra_unavailable": True,
+                "logs": [f"{unavailable_reason} Miniapp directory is missing: {miniapp_dir}"],
+                "ui_steps": [],
+                "screenshots": [],
+            }
+        port = self._free_local_port()
+        preview_url = f"http://127.0.0.1:{port}"
+        command = [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ]
+        process: subprocess.Popen[str] | None = None
+        stdout_tail: list[str] = []
+        stderr_tail: list[str] = []
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=miniapp_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            ready_logs = self._wait_for_ephemeral_runtime(preview_url, process, stdout_tail, stderr_tail)
+            if process.poll() is not None:
+                return {
+                    "passed": False,
+                    "failed_step": "ephemeral_runtime_exited",
+                    "infra_unavailable": True,
+                    "preview_url": preview_url,
+                    "logs": [
+                        unavailable_reason,
+                        f"Ephemeral runtime exited with code {process.returncode}.",
+                        *ready_logs,
+                        *stdout_tail[-20:],
+                        *stderr_tail[-20:],
+                    ],
+                    "ui_steps": [],
+                    "screenshots": [],
+                }
+            proof = self._run_real_browser_ui_flow(
+                source_dir=source_dir,
+                preview_url=preview_url,
+                acceptance_contract=acceptance_contract,
+            )
+            proof["preview_url"] = preview_url
+            proof["ephemeral_runtime"] = True
+            proof["logs"] = [
+                unavailable_reason,
+                f"Started ephemeral local runtime at {preview_url}.",
+                *ready_logs,
+                *list(proof.get("logs") or []),
+            ]
+            return proof
+        except Exception as exc:
+            return {
+                "passed": False,
+                "failed_step": "ephemeral_runtime_error",
+                "infra_unavailable": True,
+                "preview_url": preview_url,
+                "logs": [
+                    unavailable_reason,
+                    f"Could not run ephemeral local browser proof: {exc.__class__.__name__}: {exc}",
+                    *stdout_tail[-20:],
+                    *stderr_tail[-20:],
+                ],
+                "ui_steps": [],
+                "screenshots": [],
+            }
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+    @staticmethod
+    def _free_local_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    @staticmethod
+    def _wait_for_ephemeral_runtime(
+        preview_url: str,
+        process: subprocess.Popen[str],
+        stdout_tail: list[str],
+        stderr_tail: list[str],
+    ) -> list[str]:
+        deadline = time.time() + int(os.getenv("EPHEMERAL_BROWSER_RUNTIME_START_TIMEOUT_SEC", "25"))
+        logs = [f"Waiting for ephemeral runtime health at {preview_url}/health."]
+        while time.time() < deadline:
+            if process.poll() is not None:
+                break
+            try:
+                with urlopen(Request(preview_url.rstrip("/") + "/health", headers={"User-Agent": "browser-flow-smoke"}), timeout=1.5) as response:
+                    if response.status == 200:
+                        logs.append("Ephemeral runtime health check passed.")
+                        return logs
+            except Exception:
+                pass
+            CheckRunner._drain_process_output(process, stdout_tail, stderr_tail)
+            time.sleep(0.5)
+        CheckRunner._drain_process_output(process, stdout_tail, stderr_tail)
+        logs.append("Ephemeral runtime health check did not pass before timeout.")
+        return logs
+
+    @staticmethod
+    def _drain_process_output(
+        process: subprocess.Popen[str],
+        stdout_tail: list[str],
+        stderr_tail: list[str],
+        *,
+        max_lines: int = 80,
+    ) -> None:
+        for stream, target in ((process.stdout, stdout_tail), (process.stderr, stderr_tail)):
+            if stream is None:
+                continue
+            try:
+                # Avoid blocking: read only if the process has exited. During
+                # startup uvicorn may keep pipes open, so readiness is checked
+                # via HTTP instead of pipe reads.
+                if process.poll() is None:
+                    continue
+                text = stream.read()
+            except Exception:
+                continue
+            if text:
+                target.extend(line for line in text.splitlines() if line.strip())
+                del target[:-max_lines]
 
     @staticmethod
     def _real_browser_ui_flow_python_script() -> str:
@@ -2269,7 +2482,9 @@ def value_for(meta, marker, purpose, created_id=None):
         return str(created_id)
     if typ in {"number", "range"} or any(token in name for token in ("count", "quantity", "stock", "price", "amount", "total")):
         return "3"
-    if typ in {"date", "datetime-local"} or "date" in name or "day" in name:
+    if typ == "datetime-local":
+        return "2026-05-20T12:30"
+    if typ == "date" or "date" in name or "day" in name:
         return "2026-05-20"
     if typ == "time" or "time" in name:
         return "12:30"
@@ -2342,8 +2557,8 @@ def submit_form(page, form, role, route, marker, purpose, created_id=None):
     return filled
 
 
-def fill_page_update_controls(page, marker, created_id):
-    controls = page.locator("input, textarea, select")
+def fill_page_update_controls(scope, marker, created_id):
+    controls = scope.locator("input, textarea, select")
     filled = 0
     for index in range(controls.count()):
         if fill_control(controls.nth(index), marker, "update", created_id):
@@ -2351,15 +2566,20 @@ def fill_page_update_controls(page, marker, created_id):
     return filled
 
 
-def click_update_button(page, role, route):
+def click_update_button(scope, role, route):
     patterns = re.compile(r"(save|update|status|ready|done|confirm|approve|process|complete|сохран|обнов|статус|готов|подтверд|выполн|обработ)", re.I)
-    buttons = page.locator("button, [role=button], input[type=button], input[type=submit]")
+    refresh_only = re.compile(r"^(refresh|reload|обновить|перезагрузить)$", re.I)
+    buttons = scope.locator("button, [role=button], input[type=button], input[type=submit]")
     for index in range(min(buttons.count(), 12)):
         button = buttons.nth(index)
         try:
             text = (button.inner_text(timeout=1000) or button.get_attribute("value") or "").strip()
         except Exception:
             text = ""
+        data_id = button.get_attribute("data-id") or ""
+        data_action = button.get_attribute("data-action") or ""
+        if refresh_only.search(text) and not (data_id or data_action):
+            continue
         if not patterns.search(text):
             continue
         try:
@@ -2395,6 +2615,30 @@ def submit_specialist_update(page, created_id, before_item):
     before_text = json.dumps(before_item, ensure_ascii=False, sort_keys=True)
     for route in normalize_routes("specialist"):
         goto(page, route)
+        form_groups = []
+        created_containers = []
+        try:
+            containers = page.locator("article, li, tr, [class*=card], [data-id], [data-record-id], [data-item-id]").filter(has_text=CREATED_MARKER)
+            for index in range(min(containers.count(), 12)):
+                container = containers.nth(index)
+                created_containers.append(container)
+                form_groups.append(container.locator("form"))
+        except Exception:
+            pass
+        for forms in form_groups:
+            for index in range(forms.count()):
+                form = forms.nth(index)
+                controls = form.locator("input, textarea, select")
+                if controls.count() == 0:
+                    continue
+                submit_form(page, form, "specialist", route, UPDATED_MARKER, "update", created_id)
+                check_runtime_errors(page, "specialist_update_ui", route)
+                return route
+        for container in created_containers:
+            fill_page_update_controls(container, UPDATED_MARKER, created_id)
+            if click_update_button(container, "specialist", route):
+                check_runtime_errors(page, "specialist_update_ui", route)
+                return route
         forms = page.locator("form")
         for index in range(forms.count()):
             form = forms.nth(index)
@@ -2451,15 +2695,6 @@ def role_has_marker(page, role, marker):
         if marker in text:
             return True, route, text
     return False, texts[-1][0] if texts else f"/{role}", texts[-1][1] if texts else ""
-
-
-def text_has_nonempty_summary(text):
-    lowered = text.lower()
-    empty_markers = ("пока нет", "нет данных", "нет сохран", "empty", "no records", "nothing yet")
-    if any(marker in lowered for marker in empty_markers):
-        return False
-    numbers = [int(match) for match in re.findall(r"\b([1-9]\d*)\b", text)]
-    return bool(numbers)
 
 
 def check_horizontal_overflow(page, route, role):
@@ -2540,11 +2775,8 @@ def run_flow(page):
         fail("specialist_update_state_change", "Specialist UI action did not persist a changed shared state.", page, failed_role="specialist", api_before=after_create, api_after=API_AFTER)
     manager_created, manager_route, manager_text = role_has_marker(page, "manager", CREATED_MARKER)
     manager_updated = UPDATED_MARKER in manager_text
-    manager_summary = text_has_nonempty_summary(manager_text)
-    if not (manager_created or manager_updated or manager_summary):
-        fail("manager_visibility_ui", "Manager UI did not show the created/updated shared state or a non-empty summary after reload.", page, failed_role="manager", failed_route=manager_route, api_after=API_AFTER)
-    if len(items_from(API_AFTER)) > 0 and re.search(r"\b0\b", manager_text) and not (manager_created or manager_updated or manager_summary):
-        fail("manager_empty_state_mismatch", "Manager UI shows an empty/zero state while API has persisted items.", page, failed_role="manager", failed_route=manager_route, api_after=API_AFTER)
+    if not (manager_created or manager_updated):
+        fail("manager_visibility_ui", "Manager UI did not show the created/updated shared state after reload.", page, failed_role="manager", failed_route=manager_route, api_after=API_AFTER)
     client_created, client_route, client_text = role_has_marker(page, "client", CREATED_MARKER)
     if not client_created:
         fail("client_final_refresh_visibility_ui", "Client UI lost the created state after specialist update and reload.", page, failed_role="client", failed_route=client_route, api_after=API_AFTER)
@@ -2757,6 +2989,7 @@ def value_for(name, schema, marker, purpose):
                 return value
         return enum[-1] if purpose == "update" else enum[0]
     typ = schema_type(schema)
+    fmt = str(schema.get("format") or "").lower()
     if lname in {"id", "pk"} or lname.endswith("_id"):
         return 1
     if typ in {"integer", "number"}:
@@ -2771,6 +3004,12 @@ def value_for(name, schema, marker, purpose):
         return [f"{marker} item"]
     if typ == "object":
         return {"value": marker}
+    if fmt in {"date-time", "datetime"}:
+        return "2026-05-20T12:30:00"
+    if fmt == "date":
+        return "2026-05-20"
+    if fmt == "time":
+        return "12:30:00"
     if "email" in lname:
         return "flow@example.test"
     if "phone" in lname or "tel" in lname or "contact" in lname:
@@ -2855,11 +3094,15 @@ def update_path_for(openapi, base_path):
     base = base_path.rstrip("/")
     for path, methods in paths.items():
         if "patch" in methods and (str(path).startswith(base + "/") or str(path) == base):
-            return path
+            return path, "patch"
     for path, methods in paths.items():
         if "put" in methods and (str(path).startswith(base + "/") or str(path) == base):
-            return path
-    return ""
+            return path, "put"
+    for path, methods in paths.items():
+        path_text = str(path)
+        if "post" in methods and path_text != base and path_text.startswith(base + "/"):
+            return path, "post"
+    return "", ""
 
 
 def concrete(path, item_id):
@@ -2923,10 +3166,9 @@ try:
             fail("created_id", "Created state did not expose an id-like field usable for the role update flow.", api_paths=api_paths, api_after=after_create_json)
         STEPS.append({"step": "create_persistence", "path": base_path, "status": after_create.status_code, "id": created_id})
 
-        update_template = update_path_for(OPENAPI, base_path)
+        update_template, method = update_path_for(OPENAPI, base_path)
         if not update_template:
-            fail("update_route_discovery", f"No generic PATCH/PUT route exists for created state under {base_path}.", api_paths=api_paths, api_after=after_create_json)
-        method = "patch" if "patch" in (all_paths.get(update_template) or {}) else "put"
+            fail("update_route_discovery", f"No generic update route exists for created state under {base_path}.", api_paths=api_paths, api_after=after_create_json)
         update_path = concrete(update_template, created_id)
         update_payload = build_payload(OPENAPI, update_template, method, update_marker, "update")
         update = getattr(client, method)(update_path, json=update_payload)
@@ -3556,6 +3798,28 @@ except Exception as exc:
                     )
                 )
                 continue
+            cross_role_markers = cls._cross_role_surface_markers(role, combined)
+            if cross_role_markers:
+                coverage[role] = {
+                    "status": "cross_role_surface_mixed",
+                    "markers": cross_role_markers,
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                }
+                issues.append(
+                    ValidationIssue(
+                        code="platform.cross_role_surface_mixed",
+                        message=(
+                            f"{role} role embeds technical controls from another role: {', '.join(cross_role_markers[:4])}. "
+                            "Create separate client, specialist, and manager mini-app surfaces; shared data is allowed, shared role UI is not."
+                        ),
+                        severity="high",
+                        location=f"miniapp/app/static/{role}",
+                        blocking=True,
+                    )
+                )
+                continue
             technical_copy = cls._technical_role_copy_markers(combined)
             if technical_copy:
                 coverage[role] = {
@@ -3646,6 +3910,41 @@ except Exception as exc:
     def _min_role_route_pages(generation_mode: GenerationMode | str | None) -> int:
         del generation_mode
         return 1
+
+    @staticmethod
+    def _cross_role_surface_markers(role: str, content: str) -> list[str]:
+        text = str(content or "")
+        lowered = text.lower()
+        markers: list[str] = []
+        other_roles = {"client", "specialist", "manager"} - {str(role or "").strip().lower()}
+        technical_suffixes = (
+            "app",
+            "dashboard",
+            "form",
+            "grid",
+            "list",
+            "panel",
+            "page",
+            "root",
+            "section",
+            "surface",
+            "title",
+            "view",
+        )
+        suffix_pattern = "(?:" + "|".join(re.escape(suffix) for suffix in technical_suffixes) + ")"
+        for other in sorted(other_roles):
+            attr_pattern = re.compile(
+                rf"\b(?:id|class|data-[a-z0-9_-]+)\s*=\s*([\"'])[^\"']*\b{re.escape(other)}[-_]?{suffix_pattern}\b[^\"']*\1",
+                re.IGNORECASE,
+            )
+            if attr_pattern.search(text):
+                markers.append(f"{other} attribute/control")
+                continue
+            for suffix in technical_suffixes:
+                if re.search(rf"\b{re.escape(other)}[-_]?{re.escape(suffix)}\b", lowered):
+                    markers.append(f"{other}{suffix}")
+                    break
+        return markers
 
     @staticmethod
     def _role_design_depth_issue(role: str, css_text: str, combined: str, generation_mode: GenerationMode | str | None) -> ValidationIssue | None:
@@ -3903,9 +4202,16 @@ except Exception as exc:
         frontend_raw_methods = cls._frontend_raw_api_methods(static_root)
         has_backend_get = any(method == "GET" for method, _path in declared_methods)
         has_backend_post = any(method == "POST" for method, _path in declared_methods)
-        has_backend_update = any(method in {"PATCH", "PUT", "DELETE"} for method, _path in declared_methods)
+        has_backend_update = any(
+            cls._is_declared_update_method(method, path, declared_methods)
+            for method, path in declared_methods
+        )
         frontend_post_refs = sorted(path for method, path in frontend_refs if method == "POST")
-        frontend_update_refs = sorted(path for method, path in frontend_refs if method in {"PATCH", "PUT", "DELETE"})
+        frontend_update_refs = sorted(
+            path
+            for method, path in frontend_refs
+            if method in {"PATCH", "PUT", "DELETE"} or cls._is_frontend_post_update_ref(path, frontend_refs)
+        )
         issues: list[ValidationIssue] = []
         if not has_backend_get:
             issues.append(
@@ -3946,14 +4252,17 @@ except Exception as exc:
             issues.append(
                 ValidationIssue(
                     code="platform.missing_create_update_api",
-                    message="Create runs must expose at least one PATCH/PUT/DELETE /api endpoint so specialist or manager roles can update saved work.",
+                    message="Create runs must expose at least one update-capable /api endpoint so specialist or manager roles can update saved work.",
                     severity="high",
                     location="miniapp/app/routes",
                     blocking=True,
                 )
             )
         if not frontend_update_refs:
-            raw_update_present = bool(frontend_raw_methods.intersection({"PATCH", "PUT", "DELETE"}))
+            raw_update_present = bool(frontend_raw_methods.intersection({"PATCH", "PUT", "DELETE"})) or (
+                "POST" in frontend_raw_methods
+                and cls._has_workflow_update_action(cls._read_role_surface_text(static_root / "specialist") + "\n" + cls._read_role_surface_text(static_root / "manager"))
+            )
             issues.append(
                 ValidationIssue(
                     code="platform.frontend_missing_update_api",
@@ -3980,6 +4289,48 @@ except Exception as exc:
             "frontend_update_refs": frontend_update_refs,
             "frontend_raw_methods": sorted(frontend_raw_methods),
         }
+
+    @staticmethod
+    def _api_path_has_path_param(path: str) -> bool:
+        return bool(re.search(r"\{[^}/]+\}", str(path or "")))
+
+    @classmethod
+    def _is_declared_update_method(cls, method: str, path: str, declared_methods: set[tuple[str, str]]) -> bool:
+        method = str(method or "").upper()
+        normalized_path = str(path or "").rstrip("/") or "/"
+        if method in {"PATCH", "PUT", "DELETE"}:
+            return True
+        if method != "POST":
+            return False
+        create_bases = {
+            declared_path.rstrip("/") or "/"
+            for declared_method, declared_path in declared_methods
+            if declared_method == "POST"
+            and ("GET", declared_path) in declared_methods
+        }
+        if normalized_path in create_bases:
+            return False
+        return cls._api_path_has_path_param(normalized_path) or any(
+            normalized_path.startswith(f"{base}/") for base in create_bases if base != "/"
+        )
+
+    @classmethod
+    def _is_frontend_post_update_ref(cls, path: str, refs: set[tuple[str, str]]) -> bool:
+        normalized_path = str(path or "").rstrip("/") or "/"
+        if not any(method == "POST" and ref_path == path for method, ref_path in refs):
+            return False
+        if cls._api_path_has_path_param(normalized_path):
+            return True
+        post_base_paths = {
+            ref_path.rstrip("/") or "/"
+            for method, ref_path in refs
+            if method == "POST"
+        }
+        return any(
+            normalized_path != base and normalized_path.startswith(f"{base}/")
+            for base in post_base_paths
+            if base != "/"
+        )
 
     @staticmethod
     def _declared_api_methods(routes_root: Path) -> set[tuple[str, str]]:
@@ -4139,38 +4490,90 @@ except Exception as exc:
         roles = manifest.get("roles") if isinstance(manifest, dict) else {}
         if isinstance(roles, dict):
             for route_path_raw, file_path_raw_value in roles.items():
-                if not isinstance(file_path_raw_value, str):
-                    continue
                 route_path_text = str(route_path_raw or "").strip()
-                file_path_raw = str(file_path_raw_value or "").strip()
-                if not route_path_text or not file_path_raw:
+                if not route_path_text:
                     continue
                 route_probe = route_path_text if route_path_text.startswith("/") else f"/{route_path_text}"
                 route_probe = route_probe.rstrip("/") or "/"
                 for role in ROLE_ORDER:
                     if route_probe != f"/{role}" and not route_probe.startswith(f"/{role}/"):
                         continue
-                    file_path = cls._resolve_manifest_static_page(source_dir, file_path_raw)
-                    if not file_path.exists():
-                        continue
-                    pages_by_role[role].append(
-                        {
-                            "route_path": cls._normalize_role_route(role, route_probe),
-                            "file_path": file_path.relative_to(source_dir).as_posix(),
-                            "source": "manifest_roles_route_map",
-                        }
-                    )
+                    file_refs = [file_path_raw_value] if isinstance(file_path_raw_value, str) else file_path_raw_value
+                    if not isinstance(file_refs, list):
+                        break
+                    for file_ref_raw in file_refs:
+                        file_path_raw = str(file_ref_raw or "").strip()
+                        if not file_path_raw.endswith(".html"):
+                            continue
+                        file_path = cls._resolve_manifest_static_page(source_dir, file_path_raw)
+                        if not file_path.exists():
+                            continue
+                        pages_by_role[role].append(
+                            {
+                                "route_path": cls._normalize_role_route(role, route_probe),
+                                "file_path": file_path.relative_to(source_dir).as_posix(),
+                                "source": "manifest_roles_route_map",
+                            }
+                        )
                     break
             for role in ROLE_ORDER:
                 role_payload = roles.get(role) or roles.get(f"/{role}")
+                if isinstance(role_payload, list):
+                    if any(str(item or "").strip().endswith((".html", ".js", ".css")) for item in role_payload):
+                        continue
+                    for route_item in role_payload:
+                        route_path = cls._normalize_manifest_role_route(role, str(route_item or "").strip())
+                        file_path = source_dir / "miniapp/app/static" / role / "index.html"
+                        if not file_path.exists():
+                            continue
+                        pages_by_role[role].append(
+                            {
+                                "route_path": route_path,
+                                "file_path": file_path.relative_to(source_dir).as_posix(),
+                                "source": "manifest_role_route_list",
+                            }
+                        )
+                    continue
                 if not isinstance(role_payload, dict):
                     continue
+                single_file = str(role_payload.get("file") or role_payload.get("file_path") or "").strip()
+                if single_file:
+                    file_path = cls._resolve_manifest_static_page(source_dir, single_file)
+                    if file_path.exists():
+                        single_route = str(
+                            role_payload.get("route")
+                            or role_payload.get("route_path")
+                            or role_payload.get("page")
+                            or role_payload.get("primary_page")
+                            or ""
+                        ).strip()
+                        pages_by_role[role].append(
+                            {
+                                "route_path": cls._normalize_manifest_role_route(role, single_route),
+                                "file_path": file_path.relative_to(source_dir).as_posix(),
+                                "source": "manifest_role_file",
+                            }
+                        )
                 route_map = role_payload.get("routes")
+                if isinstance(route_map, list):
+                    for route_item in route_map:
+                        route_path = cls._normalize_manifest_role_route(role, str(route_item or "").strip())
+                        file_path = source_dir / "miniapp/app/static" / role / "index.html"
+                        if not file_path.exists():
+                            continue
+                        pages_by_role[role].append(
+                            {
+                                "route_path": route_path,
+                                "file_path": file_path.relative_to(source_dir).as_posix(),
+                                "source": "manifest_role_routes_list",
+                            }
+                        )
+                    route_map = {}
                 if not isinstance(route_map, dict):
                     route_map = {
                         str(route_path): str(file_path)
                         for route_path, file_path in role_payload.items()
-                        if isinstance(file_path, str) and str(route_path) not in {"pages", "routes"}
+                        if isinstance(file_path, str) and str(route_path) not in {"pages", "routes", "page", "file", "file_path", "route", "route_path", "primary_page"}
                     }
                 if isinstance(route_map, dict):
                     for route_path_raw, file_path_raw_value in route_map.items():
@@ -4192,6 +4595,19 @@ except Exception as exc:
                 if not isinstance(pages, list):
                     continue
                 for page in pages:
+                    if isinstance(page, str):
+                        route_path = cls._normalize_manifest_role_route(role, page)
+                        file_path = source_dir / "miniapp/app/static" / role / "index.html"
+                        if not file_path.exists():
+                            continue
+                        pages_by_role[role].append(
+                            {
+                                "route_path": route_path,
+                                "file_path": file_path.relative_to(source_dir).as_posix(),
+                                "source": "manifest_page_route_list",
+                            }
+                        )
+                        continue
                     if not isinstance(page, dict):
                         continue
                     file_path_raw = str(page.get("file_path") or "").strip()

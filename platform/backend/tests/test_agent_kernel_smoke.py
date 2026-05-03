@@ -148,6 +148,17 @@ def test_agent_transcript_tracks_pending_tool_results_and_reduced_graph() -> Non
     assert snapshot["reduced_graph"][0]["event_type"] == "model_turn"
 
 
+def test_agent_transcript_does_not_feed_unlinked_internal_results_to_model() -> None:
+    transcript = AgentTranscriptStore()
+
+    transcript.append_tool_results("run_1", [{"tool": "internal_repair_packet", "output": {"next": "patch"}}])
+    context = transcript.next_model_context("run_1")
+    snapshot = transcript.snapshot("run_1")
+
+    assert context["tool_result_messages"] == []
+    assert snapshot["counts"]["tool_result_unlinked"] == 1
+
+
 def test_agent_transcript_persists_and_restores_pending_tool_results() -> None:
     writes: list[dict[str, object]] = []
     transcript = AgentTranscriptStore()

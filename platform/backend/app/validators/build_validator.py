@@ -93,22 +93,43 @@ class BuildValidator:
                     pages.append({"route_path": route, "file_path": file_ref})
         roles = manifest.get("roles") if isinstance(manifest.get("roles"), dict) else {}
         for route_path, file_path in roles.items():
-            if not isinstance(file_path, str):
-                continue
             route = str(route_path or "").strip()
-            file_ref = str(file_path or "").strip()
-            if route and file_ref:
-                pages.append({"route_path": route, "file_path": file_ref})
+            if isinstance(file_path, str):
+                file_ref = str(file_path or "").strip()
+                if route and file_ref:
+                    pages.append({"route_path": route, "file_path": file_ref})
+                continue
+            if isinstance(file_path, list):
+                for file_ref_raw in file_path:
+                    file_ref = str(file_ref_raw or "").strip()
+                    if route and file_ref.endswith(".html"):
+                        pages.append({"route_path": route, "file_path": file_ref})
         for role_raw, payload in roles.items():
             if not isinstance(payload, dict):
                 continue
             role = cls._normalize_manifest_role_key(str(role_raw or ""))
+            single_file = str(payload.get("file") or payload.get("file_path") or "").strip()
+            if single_file:
+                single_route = str(payload.get("route") or payload.get("route_path") or payload.get("page") or payload.get("primary_page") or "").strip()
+                pages.append(
+                    {
+                        "role": role,
+                        "route_path": cls._normalize_manifest_role_route(role, single_route),
+                        "file_path": single_file,
+                    }
+                )
             route_map = payload.get("routes")
+            if isinstance(route_map, list):
+                for route_item in route_map:
+                    route = cls._normalize_manifest_role_route(role, str(route_item or "").strip())
+                    if route:
+                        pages.append({"role": role, "route_path": route, "file_path": f"static/{role}/index.html"})
+                route_map = {}
             if not isinstance(route_map, dict):
                 route_map = {
                     str(route_path): str(file_path)
                     for route_path, file_path in payload.items()
-                    if isinstance(file_path, str) and str(route_path) not in {"pages", "routes"}
+                    if isinstance(file_path, str) and str(route_path) not in {"pages", "routes", "page", "file", "file_path", "route", "route_path", "primary_page"}
                 }
             if isinstance(route_map, dict):
                 for route_path, file_path in route_map.items():
@@ -117,6 +138,15 @@ class BuildValidator:
                     if route and file_ref:
                         pages.append({"role": role, "route_path": route, "file_path": file_ref})
             for page in payload.get("pages") or []:
+                if isinstance(page, str):
+                    pages.append(
+                        {
+                            "role": role,
+                            "route_path": cls._normalize_manifest_role_route(role, page),
+                            "file_path": f"static/{role}/index.html",
+                        }
+                    )
+                    continue
                 if isinstance(page, dict):
                     pages.append({"role": role, **page})
         shared = manifest.get("shared")
@@ -228,6 +258,8 @@ class BuildValidator:
         normalized = str(path or "").strip().replace("\\", "/").lstrip("/")
         if normalized.startswith("miniapp/app/"):
             return normalized
+        if normalized.startswith("app/static/"):
+            return f"miniapp/{normalized}"
         if normalized.startswith("static/"):
             return f"miniapp/app/{normalized}"
         return normalized

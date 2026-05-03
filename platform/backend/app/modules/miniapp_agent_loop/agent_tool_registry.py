@@ -154,14 +154,14 @@ class AgentToolRegistry:
             kind="mutating",
             concurrency_safe=False,
             activity="applying_patch",
-            progress_label="Applying draft patch",
+            progress_label="Applying one draft file patch",
         ),
         "write_file": AgentToolSpec(
             name="write_file",
             kind="mutating",
             concurrency_safe=False,
             activity="editing",
-            progress_label="Writing draft file",
+            progress_label="Writing one draft file",
         ),
     }
 
@@ -222,36 +222,65 @@ class AgentToolRegistry:
         )
 
     @classmethod
-    def openai_tools(cls) -> list[dict[str, Any]]:
+    def openai_tools(cls, allowed_names: set[str] | None = None) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         for name in sorted(cls._SPECS):
+            if allowed_names is not None and name not in allowed_names:
+                continue
             spec = cls._SPECS[name]
+            if name == "apply_patch_to_draft":
+                properties = {
+                    "file_path": {"type": "string"},
+                    "diff": {
+                        "type": "string",
+                        "description": "A unified diff for this one file. It must include @@ hunks with context and +/- lines.",
+                    },
+                    "worker_id": {"type": "string"},
+                    "owner_scope": {"type": "string"},
+                    "reason": {"type": "string"},
+                }
+                required = ["file_path", "diff", "reason"]
+            elif name == "write_file":
+                properties = {
+                    "file_path": {"type": "string"},
+                    "content": {
+                        "type": "string",
+                        "description": "The complete resulting file content for this one file.",
+                    },
+                    "worker_id": {"type": "string"},
+                    "owner_scope": {"type": "string"},
+                    "reason": {"type": "string"},
+                }
+                required = ["file_path", "content", "reason"]
+            else:
+                properties = {
+                    "mode": {"type": "string", "enum": ["exact", "final"]},
+                    "targets": {"type": "array", "items": {"type": "string"}},
+                    "pattern": {"type": "string"},
+                    "command": {"type": "string"},
+                    "process_id": {"type": "string"},
+                    "artifact_ref": {"type": "string"},
+                    "reason": {"type": "string"},
+                }
+                required = ["reason"]
             tools.append(
                 {
                     "type": "function",
                     "name": name,
                     "description": (
                         f"{spec.progress_label}. Kind: {spec.kind}. "
-                        "Use this generic code-agent tool only when it directly advances the current plan."
+                        "Use this generic code-agent tool only when it directly advances the current plan. "
+                        + (
+                            "This mutating tool applies exactly one file_path per call; for multiple files, call the tool once per file with that file's own content or diff."
+                            if spec.kind == "mutating"
+                            else ""
+                        )
                     ),
                     "parameters": {
                         "type": "object",
                         "additionalProperties": False,
-                        "properties": {
-                            "mode": {"type": "string", "enum": ["exact", "final"]},
-                            "targets": {"type": "array", "items": {"type": "string"}},
-                            "file_path": {"type": "string"},
-                            "pattern": {"type": "string"},
-                            "command": {"type": "string"},
-                            "process_id": {"type": "string"},
-                            "artifact_ref": {"type": "string"},
-                            "content": {"type": "string"},
-                            "diff": {"type": "string"},
-                            "worker_id": {"type": "string"},
-                            "owner_scope": {"type": "string"},
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["reason"],
+                        "properties": properties,
+                        "required": required,
                     },
                 }
             )

@@ -17,7 +17,7 @@ class StateStore:
     DEFAULT_SHARD_THRESHOLD_BYTES = 16 * 1024
     JOB_EVENT_TAIL_LIMIT = 40
     JOB_EVENT_SHARD_MIN_COUNT = 20
-    _SHARDABLE_COLLECTIONS = {"reports", "code_chunks"}
+    _SHARDABLE_COLLECTIONS = {"jobs", "runs", "reports", "code_chunks"}
     _HEAVY_REPORT_PREFIXES = (
         "run_artifacts:",
         "check_results:",
@@ -117,11 +117,11 @@ class StateStore:
     def _write(self, payload: dict[str, Any]) -> None:
         temp_path = self.path.with_suffix(f".{uuid.uuid4().hex}.tmp")
         with temp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"), default=str)
         temp_path.replace(self.path)
         backup_path = self.path.with_suffix(f".{uuid.uuid4().hex}.bak.tmp")
         with backup_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"), default=str)
         backup_path.replace(self.backup_path)
 
     def list(self, collection: str) -> list[dict[str, Any]]:
@@ -160,7 +160,12 @@ class StateStore:
     def upsert(self, collection: str, key: str, value: dict[str, Any]) -> None:
         with self.lock, self._interprocess_lock():
             state = self._read()
-            state.setdefault(collection, {})[key] = self._prepare_collection_value(collection, key, value)
+            bucket = state.setdefault(collection, {})
+            existing = bucket.get(key)
+            prepared = self._prepare_collection_value(collection, key, value)
+            bucket[key] = prepared
+            if self._can_skip_index_write(collection, existing, prepared):
+                return
             self._write(state)
 
     def upsert_many(self, collection: str, values: dict[str, dict[str, Any]]) -> None:
@@ -169,9 +174,15 @@ class StateStore:
         with self.lock, self._interprocess_lock():
             state = self._read()
             bucket = state.setdefault(collection, {})
+            needs_index_write = False
             for key, value in values.items():
-                bucket[key] = self._prepare_collection_value(collection, key, value)
-            self._write(state)
+                existing = bucket.get(key)
+                prepared = self._prepare_collection_value(collection, key, value)
+                bucket[key] = prepared
+                if not self._can_skip_index_write(collection, existing, prepared):
+                    needs_index_write = True
+            if needs_index_write:
+                self._write(state)
 
     def delete(self, collection: str, key: str) -> None:
         with self.lock, self._interprocess_lock():
@@ -207,9 +218,9 @@ class StateStore:
     def shard_large_runtime_payloads(self) -> dict[str, int]:
         with self.lock, self._interprocess_lock():
             state = self._read()
-            counters = {"jobs_sharded": 0, "reports_sharded": 0, "code_chunks_sharded": 0}
+            counters = {"jobs_sharded": 0, "runs_sharded": 0, "reports_sharded": 0, "code_chunks_sharded": 0}
             changed = False
-            for collection in ("jobs", "reports", "code_chunks"):
+            for collection in ("jobs", "runs", "reports", "code_chunks"):
                 bucket = state.setdefault(collection, {})
                 for key, value in list(bucket.items()):
                     if not isinstance(value, dict):
@@ -219,6 +230,7 @@ class StateStore:
                         bucket[key] = prepared
                         counter_key = {
                             "jobs": "jobs_sharded",
+                            "runs": "runs_sharded",
                             "reports": "reports_sharded",
                             "code_chunks": "code_chunks_sharded",
                         }[collection]
@@ -231,10 +243,55 @@ class StateStore:
     def _prepare_collection_value(self, collection: str, key: str, value: dict[str, Any]) -> dict[str, Any]:
         payload = dict(value or {})
         if collection == "jobs":
-            return self._prepare_job_value(key, payload)
+            prepared = self._prepare_runtime_index_value(collection, key, self._prepare_job_value(key, payload))
+            if self._should_shard_payload(collection, key, prepared):
+                return self._write_payload_shard(collection, key, prepared)
+            return prepared
+        if collection == "runs":
+            prepared = self._prepare_runtime_index_value(collection, key, payload)
+            if self._should_shard_payload(collection, key, prepared):
+                return self._write_payload_shard(collection, key, prepared)
+            return prepared
         if collection in self._SHARDABLE_COLLECTIONS and self._should_shard_payload(collection, key, payload):
             return self._write_payload_shard(collection, key, payload)
         return payload
+
+    def _prepare_runtime_index_value(self, collection: str, key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        compact = dict(payload or {})
+        if compact.get("agent_transcript_ref") and isinstance(compact.get("agent_turns"), list):
+            compact["agent_turns"] = self._tail_index_list(compact.get("agent_turns"), limit=3)
+        if compact.get("memory_ref") and isinstance(compact.get("agent_memory"), dict):
+            compact["agent_memory"] = self._compact_index_mapping(compact.get("agent_memory") or {}, max_items=8, max_value_chars=700)
+        if isinstance(compact.get("compaction_summaries"), list):
+            compact["compaction_summaries"] = self._tail_index_list(compact.get("compaction_summaries"), limit=6)
+        if isinstance(compact.get("repair_iterations"), list):
+            compact["repair_iterations"] = self._tail_index_list(compact.get("repair_iterations"), limit=8)
+        if isinstance(compact.get("agent_activity_events"), list):
+            compact["agent_activity_events"] = self._tail_index_list(compact.get("agent_activity_events"), limit=40)
+        if collection == "jobs" and isinstance(compact.get("executed_checks"), list):
+            compact["executed_checks"] = self._tail_index_list(compact.get("executed_checks"), limit=20)
+        return compact
+
+    def _tail_index_list(self, raw_items: Any, *, limit: int) -> list[Any]:
+        items = list(raw_items or []) if isinstance(raw_items, list) else []
+        return [self._compact_index_value(item) for item in items[-limit:]]
+
+    def _compact_index_mapping(self, raw: dict[str, Any], *, max_items: int, max_value_chars: int) -> dict[str, Any]:
+        compact: dict[str, Any] = {}
+        for key, value in list(raw.items())[:max_items]:
+            compact[str(key)] = self._compact_index_value(value, max_chars=max_value_chars)
+        if len(raw) > max_items:
+            compact["_omitted_keys"] = len(raw) - max_items
+        return compact
+
+    def _compact_index_value(self, value: Any, *, max_chars: int = 1200) -> Any:
+        if isinstance(value, dict):
+            return self._compact_index_mapping(value, max_items=10, max_value_chars=max_chars)
+        if isinstance(value, list):
+            return [self._compact_index_value(item, max_chars=max_chars) for item in value[:12]]
+        if isinstance(value, str) and len(value) > max_chars:
+            return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
+        return value
 
     def _prepare_job_value(self, key: str, payload: dict[str, Any]) -> dict[str, Any]:
         events = payload.get("events")
@@ -290,9 +347,45 @@ class StateStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
         with temp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"), default=str)
         temp_path.replace(path)
         return self._compact_shard_ref(collection, key, payload, path)
+
+    def _can_skip_index_write(self, collection: str, existing: Any, prepared: dict[str, Any]) -> bool:
+        """Avoid rewriting the main state index for stable shard updates.
+
+        Report/tool artifacts are append-heavy and can be much larger than the run
+        index. Their shard path is deterministic by collection/key, so once the
+        index already points at that shard, later payload updates only need to
+        replace the shard file. This keeps the agent loop from blocking on a full
+        platform-state rewrite after every tool result.
+        """
+
+        if collection not in self._SHARDABLE_COLLECTIONS:
+            return False
+        if not isinstance(existing, dict) or not self._is_shard_ref(existing) or not self._is_shard_ref(prepared):
+            return False
+        if existing.get("storage_ref") != prepared.get("storage_ref"):
+            return False
+        stable_fields = (
+            "collection",
+            "key",
+            "workspace_id",
+            "run_id",
+            "job_id",
+            "report_type",
+            "path",
+            "language",
+            "kind",
+            "start_line",
+            "end_line",
+            "chunk_hash",
+            "summary",
+        )
+        for field in stable_fields:
+            if existing.get(field) != prepared.get(field):
+                return False
+        return True
 
     def _compact_shard_ref(self, collection: str, key: str, payload: dict[str, Any], path: Path) -> dict[str, Any]:
         ref: dict[str, Any] = {
@@ -305,8 +398,21 @@ class StateStore:
         }
         for field in (
             "workspace_id",
+            "linked_run_id",
             "run_id",
             "job_id",
+            "linked_job_id",
+            "status",
+            "apply_status",
+            "current_stage",
+            "progress_percent",
+            "generation_mode",
+            "mode",
+            "intent",
+            "llm_model",
+            "token_usage",
+            "failure_reason",
+            "created_at",
             "revision_id",
             "path",
             "language",

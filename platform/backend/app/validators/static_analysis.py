@@ -132,7 +132,7 @@ def extract_declared_routes(routes_root: Path, *, api_only: bool = True) -> set[
 def _api_path_constants(content: str) -> dict[str, str]:
     constants: dict[str, str] = {}
     for match in re.finditer(
-        r"(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*(?P<quote>['\"`])(?P<path>/api/[^'\"`]+)(?P=quote)",
+        r"(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*(?P<quote>['\"`])(?P<path>/api(?:/[^'\"`]*)?)(?P=quote)",
         content,
     ):
         constants[match.group("name")] = normalize_api_path(match.group("path"))
@@ -170,7 +170,13 @@ def _method_near_api_reference(content: str, start: int, end: int) -> str | None
     if axios_method:
         return axios_method.group("method").upper()
     tail = str(content or "")[end:end + 900].split(";", 1)[0]
-    return _method_from_options(tail) or _method_from_name(call_name)
+    explicit_method = _method_from_options(tail)
+    if explicit_method:
+        return explicit_method
+    literal = str(content or "")[start:end]
+    if "${" in literal and re.search(r"\.\.\.\s*(?:options|opts|init)\b", tail):
+        return None
+    return _method_from_name(call_name)
 
 
 def _method_from_options(text: str) -> str | None:

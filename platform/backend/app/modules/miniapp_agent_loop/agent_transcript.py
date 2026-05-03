@@ -9,7 +9,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _compact_payload(value: Any, *, max_chars: int = 12000) -> str:
+def _compact_payload(value: Any, *, max_chars: int = 4500) -> str:
     try:
         text = json.dumps(value, ensure_ascii=False, default=str)
     except TypeError:
@@ -90,6 +90,12 @@ class AgentTranscriptStore:
             "tool_result_messages": list(self._pending_tool_results.get(run_key, [])),
         }
 
+    def clear_model_context(self, run_key: str) -> None:
+        """Start the next model step from compact prompt context only."""
+        self._last_response_id.pop(run_key, None)
+        self._pending_tool_results[run_key] = []
+        self.append(run_key, "compact_model_context_reset", {"reason": "context_window_pressure"})
+
     def append_model_turn(
         self,
         run_key: str,
@@ -114,7 +120,7 @@ class AgentTranscriptStore:
                 "attempt": attempt,
                 "tool_round": tool_round,
                 "response_id": response_id,
-                "assistant_message": assistant_message[:4000],
+                "assistant_message": assistant_message[:2000],
                 "tool_calls": [
                     {
                         "tool_use_id": str(item.get("tool_use_id") or ""),
@@ -155,8 +161,19 @@ class AgentTranscriptStore:
         for result in tool_results:
             if not isinstance(result, dict):
                 continue
-            tool_use_id = str(result.get("tool_use_id") or result.get("id") or f"tool_result_{len(pending) + 1}")
+            tool_use_id = str(result.get("tool_use_id") or result.get("call_id") or result.get("id") or "").strip()
             output = _compact_payload(result)
+            if not tool_use_id:
+                self.append(
+                    run_key,
+                    "tool_result_unlinked",
+                    {
+                        "tool": str(result.get("tool") or ""),
+                        "output": output,
+                        "pending": False,
+                    },
+                )
+                continue
             message = {
                 "tool_use_id": tool_use_id,
                 "tool": str(result.get("tool") or ""),

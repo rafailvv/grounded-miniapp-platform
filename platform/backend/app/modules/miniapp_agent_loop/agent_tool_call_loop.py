@@ -327,6 +327,26 @@ class AgentToolCallLoop:
                         turn_history=turn_history,
                     )
 
+            if self._has_browser_infra_failure(latest_execution.results if latest_execution else []):
+                return self.results.failed(
+                    outcome_kind="blocked_preview_infra",
+                    summary="Required browser verification infrastructure is unavailable.",
+                    failure_reason="Playwright browser proof could not run; this is platform infrastructure, not generated app code.",
+                    failure_class="blocked_preview_infra",
+                    failure_signature=self.feedback.progress_signature(progress_snapshot),
+                    root_cause_summary="Browser proof infrastructure is unavailable; install/configure Playwright before retrying create/workflow completion.",
+                    current_phase="blocked_preview_infra",
+                    remaining_issues=[],
+                    latest_execution=latest_execution,
+                    latest_preview_details=latest_preview_details,
+                    latest_apply_result=latest_apply_result,
+                    iterations=iterations,
+                    repair_iterations=repair_iterations,
+                    all_file_changes=all_file_changes,
+                    last_assistant_message=latest_assistant_message,
+                    turn_history=turn_history,
+                )
+
             if callbacks.has_tooling_failure(latest_execution.results if latest_execution else []):
                 return self.results.failed(
                     outcome_kind="blocked_preview_infra",
@@ -610,3 +630,13 @@ class AgentToolCallLoop:
                 )
             previous_snapshot = progress_snapshot
             turn += 1
+
+    @staticmethod
+    def _has_browser_infra_failure(results: list[RunCheckResult]) -> bool:
+        for result in results:
+            if result.name != "browser_flow_smoke" or result.status != "failed":
+                continue
+            diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+            if diagnostics.get("infra_unavailable"):
+                return True
+        return False

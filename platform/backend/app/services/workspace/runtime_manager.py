@@ -55,7 +55,13 @@ class PreviewRuntimeManager:
                 capture_output=True,
                 text=True,
                 env=env,
+                timeout=self._compose_timeout_seconds(),
             )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Docker compose preview start timed out after {exc.timeout}s. "
+                + "\n".join(self._command_output_logs(exc.stdout or "", exc.stderr or ""))
+            ) from exc
         finally:
             compose_file.unlink(missing_ok=True)
         logs = [
@@ -86,7 +92,13 @@ class PreviewRuntimeManager:
                 capture_output=True,
                 text=True,
                 env=env,
+                timeout=self._compose_timeout_seconds(),
             )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Docker compose preview rebuild timed out after {exc.timeout}s. "
+                + "\n".join(self._command_output_logs(exc.stdout or "", exc.stderr or ""))
+            ) from exc
         finally:
             compose_file.unlink(missing_ok=True)
         if result.returncode != 0:
@@ -324,13 +336,17 @@ class PreviewRuntimeManager:
     @staticmethod
     def _compose_command() -> list[str] | None:
         try:
-            result = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True)
+            result = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True, timeout=8)
+        except subprocess.TimeoutExpired:
+            result = None
         except FileNotFoundError:
             result = None
         if result is not None and result.returncode == 0:
             return ["docker", "compose"]
         try:
-            compose_v1_result = subprocess.run(["docker-compose", "version"], capture_output=True, text=True)
+            compose_v1_result = subprocess.run(["docker-compose", "version"], capture_output=True, text=True, timeout=8)
+        except subprocess.TimeoutExpired:
+            compose_v1_result = None
         except FileNotFoundError:
             compose_v1_result = None
         if compose_v1_result is not None and compose_v1_result.returncode == 0:
@@ -352,6 +368,13 @@ class PreviewRuntimeManager:
     @classmethod
     def _missing_containers(cls) -> list[dict[str, str | None]]:
         return [cls._missing_container(service) for service in cls.PREVIEW_SERVICES]
+
+    @staticmethod
+    def _compose_timeout_seconds() -> int:
+        try:
+            return max(5, int(os.getenv("PREVIEW_COMPOSE_TIMEOUT_SEC", "120")))
+        except ValueError:
+            return 120
 
     @staticmethod
     def _command_output_logs(stdout: str, stderr: str, *, tail_lines: int = 40) -> list[str]:

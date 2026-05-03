@@ -397,7 +397,7 @@ class OpenAIClient:
         tool_result_messages: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         tuning = self._responses_tuning(role=role, schema_name="agent_tool_step")
-        prior_tool_items = self._responses_tool_result_items(tool_result_messages or [])
+        prior_tool_items = self._responses_tool_result_items(tool_result_messages or []) if previous_response_id else []
         payload = {
             "model": model,
             "input": [

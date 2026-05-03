@@ -15,20 +15,20 @@ class AgentWorkerTaskPlanner:
             return {
                 "depth": "compact",
                 "passes": ["green_workflow"],
-                "design_bar": "clean mobile UI, minimal but usable",
+                "design_bar": "clean mobile UI, minimal but usable, with one consistent light neutral visual system across roles",
                 "workflow_bar": "one complete prompt-derived flow across all roles",
             }
         if generation_mode == GenerationMode.QUALITY:
             return {
                 "depth": "deep",
                 "passes": ["green_workflow", "role_consistency", "mobile_design_polish", "fresh_verifier"],
-                "design_bar": "modern mobile product UI with polished spacing, states, responsive cards/forms/lists, no horizontal overflow",
+                "design_bar": "modern mobile product UI with polished spacing, states, responsive cards/forms/lists, no horizontal overflow, and consistent light theme across role apps unless explicitly requested otherwise",
                 "workflow_bar": "multiple prompt-derived role actions where useful, with create/list/update/summary proof and refresh persistence",
             }
         return {
             "depth": "balanced",
             "passes": ["green_workflow", "role_consistency"],
-            "design_bar": "noticeably polished mobile UI without excessive pages or token-heavy decoration",
+            "design_bar": "noticeably polished mobile UI without excessive pages or token-heavy decoration, using a consistent light role system",
             "workflow_bar": "one primary flow plus one related prompt-derived update/summary flow",
         }
 
@@ -91,5 +91,7 @@ class AgentWorkerTaskPlanner:
             f"Use the implementation plan ({plan_summary}) and the user's prompt-derived entities/actions as source of truth. "
             f"Mode depth is {mode_contract.get('depth')}: {mode_contract.get('workflow_bar')}; design bar: {mode_contract.get('design_bar')}. "
             "Read the files you need, patch the smallest complete owned slice, run or request the relevant checks, and report exact changed paths and self-check result. "
-            "Do not create templates, seed records, mock records, domain-specific shortcuts, or cross-role navigation links."
+            "Do not create templates, seed records, mock records, domain-specific shortcuts, or cross-role navigation links. "
+            "Do not copy another role's primary workflow into this role surface: client UI creates the user-provided state, specialist UI operates on existing shared state, manager UI reviews and controls shared state unless the user's prompt explicitly assigns a different action. "
+            "Do not expose raw API paths, HTTP methods, route slugs, role slugs, or enum codes in normal user-facing UI; use readable labels and keep label/value pairs visually separated."
         )
