@@ -380,6 +380,66 @@ export type AgentItem = {
   created_at: string;
 };
 
+export type RunTimeline = {
+  run_id: string;
+  tool_protocol_version: string;
+  items: Array<{
+    sequence: number;
+    kind: string;
+    status: string;
+    title: string;
+    payload: Record<string, unknown>;
+    created_at: string;
+  }>;
+};
+
+export type DoctorReport = {
+  status: string;
+  checks: Array<{
+    name: string;
+    status: string;
+    details?: string;
+    command?: string;
+    required?: boolean;
+  }>;
+  created_at?: string;
+};
+
+export type WorkerReport = {
+  run_id: string;
+  workers: Array<{
+    worker_id: string;
+    status: string;
+    owner_scope: string;
+    changed_files: string[];
+    summaries?: Array<Record<string, unknown>>;
+    merge_reports?: Array<Record<string, unknown>>;
+  }>;
+  worker_branch_refs?: string[];
+};
+
+export type ReviewReport = {
+  run_id: string;
+  status: string;
+  findings: Array<Record<string, unknown>>;
+  evidence?: Record<string, unknown>;
+};
+
+export type WorkspaceMemory = {
+  workspace_id: string;
+  items: Array<{
+    memory_id?: string;
+    kind: string;
+    text: string;
+    citation?: Record<string, unknown> | null;
+    created_at?: string;
+  }>;
+  project_rules?: string[];
+  user_preferences?: string[];
+  platform_constraints?: string[];
+  repeated_fixes?: string[];
+};
+
 type RpcEnvelope = {
   id?: number;
   method?: string;
@@ -578,6 +638,26 @@ export async function getRunArtifacts(runId: string): Promise<RunArtifacts> {
 
 export async function getRun(runId: string): Promise<Run> {
   return request<Run>(`/runs/${runId}`);
+}
+
+export async function getRunTimeline(runId: string): Promise<RunTimeline> {
+  return request<RunTimeline>(`/runs/${runId}/timeline`);
+}
+
+export async function getDoctorReport(): Promise<DoctorReport> {
+  return request<DoctorReport>("/doctor");
+}
+
+export async function getRunWorkers(runId: string): Promise<WorkerReport> {
+  return request<WorkerReport>(`/runs/${runId}/workers`);
+}
+
+export async function getRunReview(runId: string): Promise<ReviewReport> {
+  return request<ReviewReport>(`/runs/${runId}/review`);
+}
+
+export async function getWorkspaceMemory(workspaceId: string): Promise<WorkspaceMemory> {
+  return request<WorkspaceMemory>(`/workspaces/${workspaceId}/memory`);
 }
 
 export async function stopRun(runId: string): Promise<Run> {

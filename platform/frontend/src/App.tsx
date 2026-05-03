@@ -13,6 +13,11 @@ import {
   getRun,
   ensureWorkspace,
   getRunArtifacts,
+  getRunTimeline,
+  getDoctorReport,
+  getRunWorkers,
+  getRunReview,
+  getWorkspaceMemory,
   getWorkspaceLogs,
   listRuns,
   listWorkspaces,
@@ -24,6 +29,11 @@ import {
   request,
   Run,
   RunArtifacts,
+  RunTimeline,
+  DoctorReport,
+  WorkerReport,
+  ReviewReport,
+  WorkspaceMemory,
   SystemConfiguration,
   WorkspaceLogs,
   Workspace,
@@ -1114,7 +1124,12 @@ export default function App() {
   const [secondaryDiffSource, setSecondaryDiffSource] = useState<"" | "run" | "workspace">("");
   const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
   const [selectedLogSection, setSelectedLogSection] = useState<"mini-app" | "workspace">("mini-app");
-  const [activeTab, setActiveTab] = useState<"preview" | "code" | "diff" | "logs">("preview");
+  const [activeTab, setActiveTab] = useState<"preview" | "timeline" | "code" | "diff" | "logs" | "workers" | "review" | "doctor" | "memory">("preview");
+  const [runTimeline, setRunTimeline] = useState<RunTimeline | null>(null);
+  const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+  const [workerReport, setWorkerReport] = useState<WorkerReport | null>(null);
+  const [reviewReport, setReviewReport] = useState<ReviewReport | null>(null);
+  const [workspaceMemory, setWorkspaceMemory] = useState<WorkspaceMemory | null>(null);
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
   const [fileContent, setFileContent] = useState("");
@@ -1380,6 +1395,73 @@ export default function App() {
       cancelled = true;
     };
   }, [runs, runArtifacts?.diff, selectedRunId, workspace?.workspace_id]);
+
+  useEffect(() => {
+    const activeRunId = selectedRunId || runs[0]?.run_id || "";
+    if (!activeRunId) {
+      setRunTimeline(null);
+      setWorkerReport(null);
+      setReviewReport(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [timeline, workers, review] = await Promise.all([
+          getRunTimeline(activeRunId),
+          getRunWorkers(activeRunId),
+          getRunReview(activeRunId),
+        ]);
+        if (!cancelled) {
+          setRunTimeline(timeline);
+          setWorkerReport(workers);
+          setReviewReport(review);
+        }
+      } catch {
+        if (!cancelled) {
+          setRunTimeline(null);
+          setWorkerReport(null);
+          setReviewReport(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [runs, selectedRunId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (activeTab === "doctor") {
+      void getDoctorReport()
+        .then((report) => {
+          if (!cancelled) {
+            setDoctorReport(report);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setDoctorReport(null);
+          }
+        });
+    }
+    if (activeTab === "memory" && workspace?.workspace_id) {
+      void getWorkspaceMemory(workspace.workspace_id)
+        .then((memory) => {
+          if (!cancelled) {
+            setWorkspaceMemory(memory);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setWorkspaceMemory(null);
+          }
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, workspace?.workspace_id]);
 
   useEffect(() => {
     if (!workspace) {
@@ -2997,7 +3079,7 @@ export default function App() {
                 </p>
               </header>
               <div className="tabs">
-                {(["preview", "code", "diff", "logs"] as const).map((tab) => (
+                {(["preview", "timeline", "code", "diff", "logs", "workers", "review", "doctor", "memory"] as const).map((tab) => (
                   <button key={tab} type="button" className={tab === activeTab ? "active" : ""} onClick={() => setActiveTab(tab)}>
                     {tab}
                   </button>
@@ -3069,6 +3151,32 @@ export default function App() {
 
           {activeTab === "diff" ? (
             <DiffViewer text={diffText || ""} sourceLabel={diffSourceLabel} isLoading={diffLoading} />
+          ) : null}
+
+          {activeTab === "timeline" ? (
+            <div className="workbench-panel">
+              <div className="workbench-panel-header">
+                <strong>Replay timeline</strong>
+                <span>{runTimeline?.items.length ?? 0} events</span>
+              </div>
+              <div className="timeline-list">
+                {runTimeline?.items.length ? (
+                  runTimeline.items.map((item) => (
+                    <details key={`${item.sequence}-${item.kind}`} className={`timeline-event timeline-${item.kind}`}>
+                      <summary>
+                        <span className="timeline-sequence">{item.sequence}</span>
+                        <span className="timeline-kind">{item.kind}</span>
+                        <strong>{item.title}</strong>
+                        <span className={`run-status ${item.status}`}>{item.status}</span>
+                      </summary>
+                      <pre className="json-block">{JSON.stringify(item.payload, null, 2)}</pre>
+                    </details>
+                  ))
+                ) : (
+                  <p className="muted">No replay timeline is available for this run yet.</p>
+                )}
+              </div>
+            </div>
           ) : null}
 
           {activeTab === "preview" ? (
@@ -3263,6 +3371,94 @@ export default function App() {
                   </div>
                   <pre>{activeLogLines.join("\n")}</pre>
                 </div>
+              </div>
+            </div>
+          ) : null}
+
+          {activeTab === "workers" ? (
+            <div className="workbench-panel">
+              <div className="workbench-panel-header">
+                <strong>Worker lanes</strong>
+                <span>{workerReport?.workers.length ?? 0} lanes</span>
+              </div>
+              <div className="worker-lanes">
+                {workerReport?.workers.map((worker) => (
+                  <div key={worker.worker_id} className="worker-lane">
+                    <div className="worker-lane-head">
+                      <strong>{worker.worker_id}</strong>
+                      <span className={`run-status ${worker.status}`}>{worker.status}</span>
+                    </div>
+                    <p>{worker.owner_scope}</p>
+                    <small>{worker.changed_files.length ? worker.changed_files.join(", ") : "No owned file changes recorded."}</small>
+                  </div>
+                )) ?? <p className="muted">No worker report is available.</p>}
+              </div>
+            </div>
+          ) : null}
+
+          {activeTab === "review" ? (
+            <div className="workbench-panel">
+              <div className="workbench-panel-header">
+                <strong>Code review mode</strong>
+                <span>{reviewReport?.status ?? "not loaded"}</span>
+              </div>
+              {reviewReport?.findings.length ? (
+                <div className="run-detail-list">
+                  {reviewReport.findings.map((finding, index) => (
+                    <div key={index} className="run-detail-item">
+                      <strong>{String(finding.code ?? finding.severity ?? "finding")}</strong>
+                      <p>{String(finding.message ?? "Review finding")}</p>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">No review findings recorded for the selected run.</p>
+              )}
+              {reviewReport?.evidence ? <pre className="json-block">{JSON.stringify(reviewReport.evidence, null, 2)}</pre> : null}
+            </div>
+          ) : null}
+
+          {activeTab === "doctor" ? (
+            <div className="workbench-panel">
+              <div className="workbench-panel-header">
+                <strong>Doctor</strong>
+                <span>{doctorReport?.status ?? "not loaded"}</span>
+              </div>
+              <div className="doctor-grid">
+                {doctorReport?.checks.map((check) => (
+                  <div key={check.name} className="doctor-check">
+                    <div className="worker-lane-head">
+                      <strong>{check.name}</strong>
+                      <span className={`run-status ${check.status}`}>{check.status}</span>
+                    </div>
+                    <p>{check.details ?? ""}</p>
+                    {check.command ? <small>{check.command}</small> : null}
+                  </div>
+                )) ?? <p className="muted">Open this tab to run platform diagnostics.</p>}
+              </div>
+            </div>
+          ) : null}
+
+          {activeTab === "memory" ? (
+            <div className="workbench-panel">
+              <div className="workbench-panel-header">
+                <strong>Workspace memory</strong>
+                <span>{workspaceMemory?.items.length ?? 0} notes</span>
+              </div>
+              <div className="run-detail-list">
+                {workspaceMemory?.items.length ? (
+                  workspaceMemory.items.map((item) => (
+                    <div key={item.memory_id ?? item.text} className="run-detail-item">
+                      <div className="run-detail-item-top">
+                        <strong>{item.kind}</strong>
+                        <span>{formatTimestamp(item.created_at)}</span>
+                      </div>
+                      <p>{item.text}</p>
+                    </div>
+                  ))
+                ) : (
+                  <p className="muted">No workspace memory has been saved yet.</p>
+                )}
               </div>
             </div>
           ) : null}

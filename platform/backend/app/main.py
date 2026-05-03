@@ -17,6 +17,7 @@ from app.api import (
     routes_rpc,
     routes_runs,
     routes_validation,
+    routes_workbench,
     routes_workspaces,
 )
 from app.services.container import build_container
@@ -82,6 +83,7 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
     app.include_router(routes_preview.router)
     app.include_router(routes_rpc.router)
     app.include_router(routes_export.router)
+    app.include_router(routes_workbench.router)
     return app
 
 
