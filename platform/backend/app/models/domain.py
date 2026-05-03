@@ -287,7 +287,7 @@ class PreviewRecord(StrictModel):
 class ExportRecord(StrictModel):
     export_id: str = Field(default_factory=lambda: new_id("export"))
     workspace_id: str
-    export_type: Literal["zip", "git_patch"]
+    export_type: Literal["zip", "git_patch", "deploy_bundle", "docker_validation_report", "manifest", "browser_proof_bundle"]
     file_path: str
     created_at: datetime = Field(default_factory=utc_now)
 

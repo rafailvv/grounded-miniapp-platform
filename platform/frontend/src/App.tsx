@@ -14,9 +14,12 @@ import {
   ensureWorkspace,
   getRunArtifacts,
   getRunTimeline,
+  getRunApprovals,
   getDoctorReport,
   getRunWorkers,
   getRunReview,
+  getRunTestMatrix,
+  getRunPromptContract,
   getWorkspaceMemory,
   getWorkspaceLogs,
   listRuns,
@@ -26,10 +29,20 @@ import {
   rollbackRun,
   ensurePreview,
   stopRun,
+  approveRunApproval,
+  rejectRunApproval,
+  applyStagedRun,
+  compactRun,
+  searchWorkspaceFiles,
   request,
   Run,
   RunArtifacts,
   RunTimeline,
+  ApprovalRecord,
+  FileSearchResult,
+  CommandPaletteAction,
+  TestMatrixReport,
+  PromptContractReport,
   DoctorReport,
   WorkerReport,
   ReviewReport,
@@ -38,6 +51,16 @@ import {
   WorkspaceLogs,
   Workspace,
 } from "./lib/api";
+import { ApprovalCenter } from "./components/ApprovalCenter";
+import { CommandPalette } from "./components/CommandPalette";
+import { ChecksPanel } from "./components/ChecksPanel";
+import { DoctorPanel } from "./components/DoctorPanel";
+import { FileSearchPanel } from "./components/FileSearchPanel";
+import { MemoryPanel } from "./components/MemoryPanel";
+import { ReviewPanel } from "./components/ReviewPanel";
+import { TimelinePanel } from "./components/TimelinePanel";
+import { WorkbenchTabs } from "./components/WorkbenchTabs";
+import { WorkerLanesPanel } from "./components/WorkerLanesPanel";
 import "./styles/app.css";
 
 type FileEntry = {
@@ -72,6 +95,7 @@ type PreviewHistoryState = {
 
 type RunComposerMode = "generate" | "fix";
 type UserGenerationMode = "fast" | "balanced" | "quality";
+type WorkbenchTab = "preview" | "timeline" | "code" | "diff" | "logs" | "workers" | "review" | "checks" | "doctor" | "memory" | "search";
 
 type FixErrorContext = {
   raw_error: string;
@@ -1124,12 +1148,18 @@ export default function App() {
   const [secondaryDiffSource, setSecondaryDiffSource] = useState<"" | "run" | "workspace">("");
   const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
   const [selectedLogSection, setSelectedLogSection] = useState<"mini-app" | "workspace">("mini-app");
-  const [activeTab, setActiveTab] = useState<"preview" | "timeline" | "code" | "diff" | "logs" | "workers" | "review" | "doctor" | "memory">("preview");
+  const [activeTab, setActiveTab] = useState<WorkbenchTab>("preview");
   const [runTimeline, setRunTimeline] = useState<RunTimeline | null>(null);
+  const [runApprovals, setRunApprovals] = useState<ApprovalRecord[]>([]);
   const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
   const [workerReport, setWorkerReport] = useState<WorkerReport | null>(null);
   const [reviewReport, setReviewReport] = useState<ReviewReport | null>(null);
+  const [testMatrixReport, setTestMatrixReport] = useState<TestMatrixReport | null>(null);
+  const [promptContractReport, setPromptContractReport] = useState<PromptContractReport | null>(null);
   const [workspaceMemory, setWorkspaceMemory] = useState<WorkspaceMemory | null>(null);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [fileSearchQuery, setFileSearchQuery] = useState("");
+  const [fileSearchResult, setFileSearchResult] = useState<FileSearchResult | null>(null);
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
   const [fileContent, setFileContent] = useState("");
@@ -1400,28 +1430,40 @@ export default function App() {
     const activeRunId = selectedRunId || runs[0]?.run_id || "";
     if (!activeRunId) {
       setRunTimeline(null);
+      setRunApprovals([]);
       setWorkerReport(null);
       setReviewReport(null);
+      setTestMatrixReport(null);
+      setPromptContractReport(null);
       return;
     }
     let cancelled = false;
     void (async () => {
       try {
-        const [timeline, workers, review] = await Promise.all([
+        const [timeline, approvals, workers, review, matrix, contract] = await Promise.all([
           getRunTimeline(activeRunId),
+          getRunApprovals(activeRunId),
           getRunWorkers(activeRunId),
           getRunReview(activeRunId),
+          getRunTestMatrix(activeRunId),
+          getRunPromptContract(activeRunId),
         ]);
         if (!cancelled) {
           setRunTimeline(timeline);
+          setRunApprovals(approvals.items);
           setWorkerReport(workers);
           setReviewReport(review);
+          setTestMatrixReport(matrix);
+          setPromptContractReport(contract);
         }
       } catch {
         if (!cancelled) {
           setRunTimeline(null);
+          setRunApprovals([]);
           setWorkerReport(null);
           setReviewReport(null);
+          setTestMatrixReport(null);
+          setPromptContractReport(null);
         }
       }
     })();
@@ -1462,6 +1504,64 @@ export default function App() {
       cancelled = true;
     };
   }, [activeTab, workspace?.workspace_id]);
+
+  useEffect(() => {
+    if (activeTab !== "search" || !workspace?.workspace_id || !fileSearchQuery.trim()) {
+      setFileSearchResult(null);
+      return;
+    }
+    const activeRun = runs.find((item) => item.run_id === selectedRunId);
+    const runId = activeRun?.draft_ready || activeRun?.status === "awaiting_approval" ? activeRun.run_id : "";
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void searchWorkspaceFiles(workspace.workspace_id, fileSearchQuery, runId || undefined)
+        .then((result) => {
+          if (!cancelled) {
+            setFileSearchResult(result);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setFileSearchResult(null);
+          }
+        });
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [activeTab, fileSearchQuery, runs, selectedRunId, workspace?.workspace_id]);
+
+  useEffect(() => {
+    function handleWorkbenchKeydown(event: KeyboardEvent) {
+      const modifier = event.metaKey || event.ctrlKey;
+      if (!modifier) {
+        return;
+      }
+      const key = event.key.toLowerCase();
+      if (key === "k") {
+        event.preventDefault();
+        setCommandPaletteOpen(true);
+      } else if (key === "s") {
+        event.preventDefault();
+        void handleSaveFile();
+      } else if (key === "r") {
+        event.preventDefault();
+        void handleRefreshPreview();
+      } else if (key === "d") {
+        event.preventDefault();
+        setActiveTab("diff");
+      } else if (key === "t") {
+        event.preventDefault();
+        setActiveTab("timeline");
+      } else if (key === "p") {
+        event.preventDefault();
+        setActiveTab("search");
+      }
+    }
+    window.addEventListener("keydown", handleWorkbenchKeydown);
+    return () => window.removeEventListener("keydown", handleWorkbenchKeydown);
+  }, [selectedPath, fileContent, originalFileContent, workspace?.workspace_id, previewBooting]);
 
   useEffect(() => {
     if (!workspace) {
@@ -1588,6 +1688,23 @@ export default function App() {
     [runs],
   );
   const draftContextRunId = selectedRun?.draft_ready || selectedRun?.status === "awaiting_approval" ? selectedRun.run_id : "";
+  const commandPaletteActions = useMemo<CommandPaletteAction[]>(
+    () => [
+      { id: "generate", label: "Generate", description: "Run the current prompt", disabled: loading || !workspace || !prompt.trim() },
+      { id: "fix", label: "Fix selected run", description: "Start a repair run from the active run", disabled: loading || !workspace || !selectedRun },
+      { id: "rebuild-preview", label: "Rebuild preview", description: "Restart the live preview", disabled: !workspace || previewBooting },
+      { id: "rollback", label: "Rollback", description: "Rollback the selected run", disabled: !selectedRun || selectedRun.rolled_back },
+      { id: "export-zip", label: "Export zip", description: "Download a workspace archive", disabled: !workspace },
+      { id: "export-patch", label: "Export patch", description: "Open the diff for export", disabled: !selectedRun },
+      { id: "inspect-diff", label: "Inspect diff", description: "Open the diff tab", disabled: !selectedRun },
+      { id: "run-checks", label: "Run checks", description: "Open test matrix and prompt contract", disabled: !selectedRun },
+      { id: "run-doctor", label: "Run doctor", description: "Open diagnostics", disabled: false },
+      { id: "compact", label: "Compact", description: "Compact selected run context", disabled: !selectedRun },
+      { id: "review", label: "Review", description: "Open code review mode", disabled: !selectedRun },
+      { id: "file-search", label: "File search", description: "Search files and content", disabled: !workspace },
+    ],
+    [loading, previewBooting, prompt, selectedRun, workspace],
+  );
   const primaryDiffText = runArtifacts?.diff ?? "";
   const diffText = primaryDiffText || secondaryDiffText;
   const diffSourceLabel = !primaryDiffText.trim()
@@ -2150,6 +2267,113 @@ export default function App() {
     }
   }
 
+  async function refreshWorkbenchPanels(runId: string) {
+    try {
+      const [timeline, approvals, workers, review] = await Promise.all([
+        getRunTimeline(runId),
+        getRunApprovals(runId),
+        getRunWorkers(runId),
+        getRunReview(runId),
+      ]);
+      setRunTimeline(timeline);
+      setRunApprovals(approvals.items);
+      setWorkerReport(workers);
+      setReviewReport(review);
+      setTestMatrixReport(await getRunTestMatrix(runId));
+      setPromptContractReport(await getRunPromptContract(runId));
+    } catch {
+      // Keep the current panel data if one derived endpoint is temporarily unavailable.
+    }
+  }
+
+  async function handleApprovalDecision(approvalId: string, approved: boolean) {
+    const runId = selectedRun?.run_id || selectedRunId;
+    if (!runId) {
+      return;
+    }
+    try {
+      const next = approved ? await approveRunApproval(runId, approvalId) : await rejectRunApproval(runId, approvalId);
+      setRunApprovals((current) => current.map((item) => (item.approval_id === approvalId ? next : item)));
+      await refreshWorkbenchPanels(runId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update approval.");
+    }
+  }
+
+  async function handleApplyStagedRun() {
+    if (!workspace || !selectedRun) {
+      return;
+    }
+    try {
+      const updatedRun = await applyStagedRun(selectedRun.run_id);
+      setRuns((current) => current.map((item) => (item.run_id === updatedRun.run_id ? updatedRun : item)));
+      await refreshWorkspaceState(workspace.workspace_id, updatedRun.run_id);
+      await refreshWorkbenchPanels(updatedRun.run_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to apply staged files.");
+    }
+  }
+
+  async function handleCommandPaletteAction(actionId: string) {
+    setCommandPaletteOpen(false);
+    if (actionId === "generate") {
+      const form = document.querySelector<HTMLFormElement>(".composer-form");
+      form?.requestSubmit();
+      return;
+    }
+    if (actionId === "fix" && selectedRun) {
+      await handleRunFix(selectedRun);
+      return;
+    }
+    if (actionId === "rebuild-preview") {
+      await handleRefreshPreview();
+      return;
+    }
+    if (actionId === "rollback" && selectedRun) {
+      await handleRollbackRun(selectedRun.run_id);
+      return;
+    }
+    if (actionId === "export-zip" && workspace) {
+      const exportRef = await request<{ export_id: string }>(`/workspaces/${workspace.workspace_id}/export/zip`, { method: "POST" });
+      window.location.href = `/api/exports/${exportRef.export_id}/download`;
+      return;
+    }
+    if (actionId === "export-patch" && workspace) {
+      const exportRef = await request<{ export_id: string }>(`/workspaces/${workspace.workspace_id}/export/git-patch`, { method: "POST" });
+      window.location.href = `/api/exports/${exportRef.export_id}/download`;
+      return;
+    }
+    if (actionId === "inspect-diff") {
+      setActiveTab("diff");
+      return;
+    }
+    if (actionId === "run-checks" && selectedRun) {
+      setTestMatrixReport(await getRunTestMatrix(selectedRun.run_id));
+      setPromptContractReport(await getRunPromptContract(selectedRun.run_id));
+      setActiveTab("checks");
+      return;
+    }
+    if (actionId === "run-doctor") {
+      setActiveTab("doctor");
+      setDoctorReport(await getDoctorReport());
+      return;
+    }
+    if (actionId === "compact" && selectedRun) {
+      await compactRun(selectedRun.run_id);
+      await refreshWorkbenchPanels(selectedRun.run_id);
+      setActiveTab("timeline");
+      return;
+    }
+    if (actionId === "review" && selectedRun) {
+      setReviewReport(await getRunReview(selectedRun.run_id));
+      setActiveTab("review");
+      return;
+    }
+    if (actionId === "file-search") {
+      setActiveTab("search");
+    }
+  }
+
   async function refreshWorkspaceList(activeWorkspaceId?: string) {
     const listed = await listWorkspaces();
     setWorkspaces(listed);
@@ -2512,6 +2736,12 @@ export default function App() {
       <div
         className={`run-details-backdrop ${runDetailsOpen ? "is-open" : ""}`}
         onClick={() => setRunDetailsOpen(false)}
+      />
+      <CommandPalette
+        open={commandPaletteOpen}
+        actions={commandPaletteActions}
+        onRun={(actionId) => void handleCommandPaletteAction(actionId)}
+        onClose={() => setCommandPaletteOpen(false)}
       />
       <aside className={`workspace-drawer ${workspaceDrawerOpen ? "is-open" : ""}`} aria-hidden={!workspaceDrawerOpen}>
         <div className="workspace-drawer-head">
@@ -3078,13 +3308,11 @@ export default function App() {
                   Preview stays live while each run exposes a draft diff, editable files, and logs.
                 </p>
               </header>
-              <div className="tabs">
-                {(["preview", "timeline", "code", "diff", "logs", "workers", "review", "doctor", "memory"] as const).map((tab) => (
-                  <button key={tab} type="button" className={tab === activeTab ? "active" : ""} onClick={() => setActiveTab(tab)}>
-                    {tab}
-                  </button>
-                ))}
-              </div>
+              <WorkbenchTabs
+                tabs={["preview", "timeline", "code", "diff", "logs", "workers", "review", "checks", "doctor", "memory", "search"] as const}
+                activeTab={activeTab}
+                onChange={setActiveTab}
+              />
             </div>
             <div className="preview-toolbar-actions">
               <button type="button" className="ghost-action" onClick={handleRefreshPreview} disabled={!workspace || previewBooting}>
@@ -3154,28 +3382,25 @@ export default function App() {
           ) : null}
 
           {activeTab === "timeline" ? (
-            <div className="workbench-panel">
-              <div className="workbench-panel-header">
-                <strong>Replay timeline</strong>
-                <span>{runTimeline?.items.length ?? 0} events</span>
-              </div>
-              <div className="timeline-list">
-                {runTimeline?.items.length ? (
-                  runTimeline.items.map((item) => (
-                    <details key={`${item.sequence}-${item.kind}`} className={`timeline-event timeline-${item.kind}`}>
-                      <summary>
-                        <span className="timeline-sequence">{item.sequence}</span>
-                        <span className="timeline-kind">{item.kind}</span>
-                        <strong>{item.title}</strong>
-                        <span className={`run-status ${item.status}`}>{item.status}</span>
-                      </summary>
-                      <pre className="json-block">{JSON.stringify(item.payload, null, 2)}</pre>
-                    </details>
-                  ))
-                ) : (
-                  <p className="muted">No replay timeline is available for this run yet.</p>
-                )}
-              </div>
+            <div className="workbench-stack">
+              <TimelinePanel timeline={runTimeline} />
+              <ApprovalCenter
+                approvals={runApprovals}
+                onApprove={(approvalId) => void handleApprovalDecision(approvalId, true)}
+                onReject={(approvalId) => void handleApprovalDecision(approvalId, false)}
+              />
+              {selectedRun?.status === "awaiting_approval" ? (
+                <div className="workbench-panel staged-apply-panel">
+                  <div className="workbench-panel-header">
+                    <strong>Staged apply</strong>
+                    <span>{selectedRun.touched_files.length} files</span>
+                  </div>
+                  <p className="muted">Apply currently staged files for this run. Whole-run approval remains available in the run card.</p>
+                  <button type="button" className="ghost-action" onClick={() => void handleApplyStagedRun()}>
+                    Apply staged
+                  </button>
+                </div>
+              ) : null}
             </div>
           ) : null}
 
@@ -3376,91 +3601,32 @@ export default function App() {
           ) : null}
 
           {activeTab === "workers" ? (
-            <div className="workbench-panel">
-              <div className="workbench-panel-header">
-                <strong>Worker lanes</strong>
-                <span>{workerReport?.workers.length ?? 0} lanes</span>
-              </div>
-              <div className="worker-lanes">
-                {workerReport?.workers.map((worker) => (
-                  <div key={worker.worker_id} className="worker-lane">
-                    <div className="worker-lane-head">
-                      <strong>{worker.worker_id}</strong>
-                      <span className={`run-status ${worker.status}`}>{worker.status}</span>
-                    </div>
-                    <p>{worker.owner_scope}</p>
-                    <small>{worker.changed_files.length ? worker.changed_files.join(", ") : "No owned file changes recorded."}</small>
-                  </div>
-                )) ?? <p className="muted">No worker report is available.</p>}
-              </div>
-            </div>
+            <WorkerLanesPanel workerReport={workerReport} />
           ) : null}
 
           {activeTab === "review" ? (
-            <div className="workbench-panel">
-              <div className="workbench-panel-header">
-                <strong>Code review mode</strong>
-                <span>{reviewReport?.status ?? "not loaded"}</span>
-              </div>
-              {reviewReport?.findings.length ? (
-                <div className="run-detail-list">
-                  {reviewReport.findings.map((finding, index) => (
-                    <div key={index} className="run-detail-item">
-                      <strong>{String(finding.code ?? finding.severity ?? "finding")}</strong>
-                      <p>{String(finding.message ?? "Review finding")}</p>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="muted">No review findings recorded for the selected run.</p>
-              )}
-              {reviewReport?.evidence ? <pre className="json-block">{JSON.stringify(reviewReport.evidence, null, 2)}</pre> : null}
-            </div>
+            <ReviewPanel review={reviewReport} />
+          ) : null}
+
+          {activeTab === "checks" ? (
+            <ChecksPanel matrix={testMatrixReport} promptContract={promptContractReport} />
           ) : null}
 
           {activeTab === "doctor" ? (
-            <div className="workbench-panel">
-              <div className="workbench-panel-header">
-                <strong>Doctor</strong>
-                <span>{doctorReport?.status ?? "not loaded"}</span>
-              </div>
-              <div className="doctor-grid">
-                {doctorReport?.checks.map((check) => (
-                  <div key={check.name} className="doctor-check">
-                    <div className="worker-lane-head">
-                      <strong>{check.name}</strong>
-                      <span className={`run-status ${check.status}`}>{check.status}</span>
-                    </div>
-                    <p>{check.details ?? ""}</p>
-                    {check.command ? <small>{check.command}</small> : null}
-                  </div>
-                )) ?? <p className="muted">Open this tab to run platform diagnostics.</p>}
-              </div>
-            </div>
+            <DoctorPanel report={doctorReport} />
           ) : null}
 
           {activeTab === "memory" ? (
-            <div className="workbench-panel">
-              <div className="workbench-panel-header">
-                <strong>Workspace memory</strong>
-                <span>{workspaceMemory?.items.length ?? 0} notes</span>
-              </div>
-              <div className="run-detail-list">
-                {workspaceMemory?.items.length ? (
-                  workspaceMemory.items.map((item) => (
-                    <div key={item.memory_id ?? item.text} className="run-detail-item">
-                      <div className="run-detail-item-top">
-                        <strong>{item.kind}</strong>
-                        <span>{formatTimestamp(item.created_at)}</span>
-                      </div>
-                      <p>{item.text}</p>
-                    </div>
-                  ))
-                ) : (
-                  <p className="muted">No workspace memory has been saved yet.</p>
-                )}
-              </div>
-            </div>
+            <MemoryPanel memory={workspaceMemory} formatTimestamp={formatTimestamp} />
+          ) : null}
+
+          {activeTab === "search" ? (
+            <FileSearchPanel
+              query={fileSearchQuery}
+              result={fileSearchResult}
+              onQueryChange={setFileSearchQuery}
+              onSelectFile={(path) => void handleSelectFile(path)}
+            />
           ) : null}
         </section>
         </div>

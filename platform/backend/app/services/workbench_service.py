@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import http.client
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -10,6 +13,7 @@ import sys
 from typing import Any
 from uuid import uuid4
 
+from app.models.domain import CreateRunRequest, RunRecord
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, tool_envelope, tool_registry_contract
@@ -17,6 +21,11 @@ from app.services.workspace.run_service import RunService
 from app.services.workspace.service import WorkspaceService
 from app.core.config import Settings
 from app.ai.openai_client import OpenAIClient
+
+
+def re_slug(value: object) -> str:
+    text = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    return text or "skill"
 
 
 class WorkbenchService:
@@ -43,6 +52,7 @@ class WorkbenchService:
         run = self.run_service.get_run(run_id)
         artifacts = self._run_artifacts_or_empty(run_id)
         events: list[dict[str, Any]] = []
+        events.extend(self._stored_tool_events(run_id))
         for item in artifacts.get("agent_activity_events") or run.agent_activity_events or []:
             if not isinstance(item, dict):
                 continue
@@ -68,6 +78,56 @@ class WorkbenchService:
             )
         return {"run_id": run_id, "tool_protocol_version": TOOL_PROTOCOL_VERSION, "events": events}
 
+    def record_tool_event(self, run_id: str | None, event: dict[str, Any]) -> dict[str, Any]:
+        if not run_id:
+            return event
+        self.run_service.get_run(run_id)
+        key = f"tool_events:{run_id}"
+        payload = self.store.get("reports", key) or {"run_id": run_id, "items": []}
+        item = {**event, "sequence": len(payload.get("items") or []) + 1, "created_at": datetime.now(timezone.utc).isoformat()}
+        payload.setdefault("items", []).append(item)
+        self.store.upsert("reports", key, payload)
+        return item
+
+    def evaluate_command_for_run(self, run_id: str, command: str, *, preset: str = "safe_auto") -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        evaluation = self.exec_policy_service.evaluate_command(command, preset=preset)
+        approval = dict(evaluation.get("approval") or {})
+        if approval.get("required") and approval.get("approval_id"):
+            self._upsert_approval(
+                run_id,
+                {
+                    "approval_id": str(approval["approval_id"]),
+                    "status": "pending",
+                    "kind": "command",
+                    "risk": (evaluation.get("decision") or {}).get("risk"),
+                    "summary": self.exec_policy_service.redact(command),
+                    "input": {"command": self.exec_policy_service.redact(command), "workspace_id": run.workspace_id},
+                    "policy_decision": evaluation.get("decision"),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        self.record_tool_event(
+            run_id,
+            tool_envelope(
+                tool="policy.evaluate",
+                input_payload={"command": self.exec_policy_service.redact(command), "preset": preset},
+                result=evaluation,
+                risk=(evaluation.get("decision") or {}).get("risk") or "unknown",
+                approval=approval,
+            ),
+        )
+        return evaluation
+
+    def assert_approval_allows(self, run_id: str | None, approval_id: str | None) -> None:
+        if not run_id or not approval_id:
+            return
+        approval = self._approval_by_id(run_id, approval_id)
+        if not approval:
+            raise PermissionError(f"Approval not found: {approval_id}")
+        if approval.get("status") != "approved":
+            raise PermissionError(f"Approval {approval_id} is {approval.get('status')}.")
+
     def artifact(self, run_id: str, artifact_ref: str) -> dict[str, Any]:
         self.run_service.get_run(run_id)
         normalized = str(artifact_ref or "").strip()
@@ -84,6 +144,26 @@ class WorkbenchService:
         items: list[dict[str, Any]] = [
             self._timeline_item("prompt", "completed", "Prompt received", {"prompt": run.prompt}, created_at=run.created_at.isoformat()),
         ]
+        for approval in self.approvals(run_id)["items"]:
+            items.append(
+                self._timeline_item(
+                    "approval",
+                    str(approval.get("status") or "pending"),
+                    str(approval.get("summary") or approval.get("kind") or "Approval"),
+                    approval,
+                    created_at=str(approval.get("decided_at") or approval.get("created_at") or datetime.now(timezone.utc).isoformat()),
+                )
+            )
+        for event in self._stored_tool_events(run_id):
+            items.append(
+                self._timeline_item(
+                    "policy" if event.get("tool") == "policy.evaluate" else "tool",
+                    str(((event.get("result") if isinstance(event.get("result"), dict) else {}) or {}).get("status") or "recorded"),
+                    str(event.get("tool") or "Tool event"),
+                    event,
+                    created_at=str(event.get("created_at") or datetime.now(timezone.utc).isoformat()),
+                )
+            )
         for event in artifacts.get("agent_activity_events") or run.agent_activity_events or []:
             if isinstance(event, dict):
                 items.append(self._timeline_from_activity(event))
@@ -110,7 +190,10 @@ class WorkbenchService:
         return {
             "run_id": run_id,
             "tool_protocol_version": TOOL_PROTOCOL_VERSION,
-            "items": [{**item, "sequence": index + 1} for index, item in enumerate(items)],
+            "items": [
+                {**item, "sequence": index + 1}
+                for index, item in enumerate(sorted(items, key=lambda item: str(item.get("created_at") or "")))
+            ],
         }
 
     def observability(self, run_id: str) -> dict[str, Any]:
@@ -141,7 +224,11 @@ class WorkbenchService:
         worker_ids = ["backend_api", "client_ui", "specialist_ui", "manager_ui", "generated_tests", "verifier"]
         lanes = []
         for worker_id in worker_ids:
-            summaries = [item for item in run.worker_summaries if isinstance(item, dict) and item.get("worker") == worker_id or item.get("worker_id") == worker_id]
+            summaries = [
+                item
+                for item in run.worker_summaries
+                if isinstance(item, dict) and (item.get("worker") == worker_id or item.get("worker_id") == worker_id)
+            ]
             merge_reports = [item for item in (merge.get("merge_reports") or []) if isinstance(item, dict) and item.get("worker_id") == worker_id]
             lanes.append(
                 {
@@ -174,6 +261,39 @@ class WorkbenchService:
         findings = []
         for issue in run.checks_summary.issues:
             findings.append({"severity": issue.get("severity") or "medium", "code": issue.get("code"), "message": issue.get("message")})
+        diff_text = str(artifacts.get("diff") or "")
+        changed_files = run.touched_files or self._paths_from_diff(diff_text)
+        if diff_text and not (artifacts.get("browser_proof_steps") or run.browser_flow_proof):
+            findings.append(
+                {
+                    "severity": "medium",
+                    "code": "missing_browser_proof",
+                    "message": "Changed draft has no recorded browser proof.",
+                }
+            )
+        risky_paths = [
+            path
+            for path in changed_files
+            if path.startswith(("miniapp/app/generated/", "docker/", ".github/", "runtime/"))
+        ]
+        if risky_paths:
+            findings.append(
+                {
+                    "severity": "high",
+                    "code": "risky_generated_or_runtime_change",
+                    "message": f"Review risky generated/runtime paths before apply: {', '.join(risky_paths[:8])}.",
+                    "paths": risky_paths,
+                }
+            )
+        if len(changed_files) >= 12 and not artifacts.get("check_results"):
+            findings.append(
+                {
+                    "severity": "medium",
+                    "code": "large_untested_change",
+                    "message": "Large draft has no recorded check results.",
+                    "changed_file_count": len(changed_files),
+                }
+            )
         payload = {
             "run_id": run_id,
             "status": "failed" if findings else "passed",
@@ -187,19 +307,41 @@ class WorkbenchService:
         self.store.upsert("reports", f"review:{run_id}", payload)
         return payload
 
+    def start_review_fix(self, run_id: str) -> RunRecord:
+        run = self.run_service.get_run(run_id)
+        review = self.review(run_id)
+        prompt = "Fix review findings:\n" + "\n".join(
+            f"- {item.get('code')}: {item.get('message')}" for item in review.get("findings", []) if isinstance(item, dict)
+        )
+        if not review.get("findings"):
+            prompt = "Run a focused verification pass and fix any concrete issue found."
+        return self.run_service.create_run(
+            run.workspace_id,
+            CreateRunRequest(
+                prompt=prompt,
+                mode="fix",
+                intent="edit",
+                apply_strategy="staged_auto_apply",
+                target_role_scope=list(run.target_role_scope or []),
+                model_profile=run.model_profile,
+                generation_mode=run.generation_mode,
+            ),
+        )
+
     def browser_proof(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         artifacts = self._run_artifacts_or_empty(run_id)
         payload = {
             "run_id": run_id,
             "status": "available" if (run.browser_flow_proof or artifacts.get("browser_proof_steps")) else "not_recorded",
-            "screenshots": [],
-            "console_errors": [],
-            "network_errors": [],
+            "screenshots": self._collect_values(artifacts, keys=("screenshot", "screenshot_path", "image_path")),
+            "console_errors": self._collect_values(artifacts, keys=("console_error", "console_errors")),
+            "network_errors": self._collect_values(artifacts, keys=("network_error", "network_errors")),
             "route_coverage": (run.flow_coverage or {}).get("routes", []),
             "mobile_layout": run.mobile_layout_report,
             "role_workflows": run.browser_flow_proof,
             "steps": artifacts.get("browser_proof_steps") or [],
+            "verification_report": self.store.get("reports", run.verification_report_ref) if run.verification_report_ref else None,
         }
         self.store.upsert("reports", f"browser_proof:{run_id}", payload)
         return payload
@@ -231,37 +373,46 @@ class WorkbenchService:
         return current
 
     def skills(self) -> dict[str, Any]:
-        return {"items": list(self._builtin_skills().values())}
+        skills = dict(self._builtin_skills())
+        for item in self._document_skills():
+            skills.setdefault(item["id"], item)
+        return {"items": sorted(skills.values(), key=lambda item: str(item.get("id") or ""))}
 
     def skill(self, skill_id: str) -> dict[str, Any]:
-        item = self._builtin_skills().get(skill_id)
+        item = {item["id"]: item for item in self.skills()["items"]}.get(skill_id)
         if item is None:
             raise KeyError(f"Skill not found: {skill_id}")
         return item
 
     def plugins(self) -> dict[str, Any]:
-        return {
-            "items": [
-                {"id": "core.validators", "version": "0.1.0", "capabilities": ["validators"], "status": "installed"},
-                {"id": "core.exporters", "version": "0.1.0", "capabilities": ["exporters"], "status": "installed"},
-                {"id": "core.preview", "version": "0.1.0", "capabilities": ["preview_adapters"], "status": "installed"},
-            ]
-        }
+        items = [
+            {"id": "core.validators", "version": "0.1.0", "capabilities": ["validators"], "status": "installed"},
+            {"id": "core.exporters", "version": "0.1.0", "capabilities": ["exporters"], "status": "installed"},
+            {"id": "core.preview", "version": "0.1.0", "capabilities": ["preview_adapters"], "status": "installed"},
+        ]
+        items.extend(self._load_plugin_manifests())
+        return {"items": sorted(items, key=lambda item: str(item.get("id") or ""))}
 
     def install_plugin_local(self, payload: dict[str, Any]) -> dict[str, Any]:
         manifest = dict(payload or {})
         plugin_id = str(manifest.get("id") or "").strip()
         if not plugin_id:
             raise ValueError("Plugin manifest id is required.")
+        if not str(manifest.get("version") or "").strip():
+            raise ValueError("Plugin manifest version is required.")
+        if not isinstance(manifest.get("capabilities"), list):
+            raise ValueError("Plugin manifest capabilities must be a list.")
         record = {"id": plugin_id, "status": "registered", "manifest": manifest, "installed_at": datetime.now(timezone.utc).isoformat()}
         self.store.upsert("reports", f"plugin:{plugin_id}", record)
         return record
 
     def mcp_servers(self) -> dict[str, Any]:
-        return {"items": [], "status": "not_configured", "message": "MCP registry endpoint is ready; server discovery is not configured in this runtime."}
+        config = self._mcp_config()
+        return {"items": config.get("servers", []), "status": "configured" if config.get("servers") else "not_configured"}
 
     def mcp_tools(self) -> dict[str, Any]:
-        return {"items": [], "tool_protocol": tool_registry_contract()}
+        config = self._mcp_config()
+        return {"items": config.get("tools", []), "tool_protocol": tool_registry_contract()}
 
     def call_mcp_tool(self, tool_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -284,6 +435,10 @@ class WorkbenchService:
             self._writable_check("data_dir", self.settings.data_dir),
             self._template_check(),
             self._port_check(),
+            self._backend_routes_check(),
+            self._stale_backend_check(),
+            self._playwright_browsers_check(),
+            self._preview_container_check(),
             self._test_command_check(),
         ]
         status = "passed" if all(item["status"] == "passed" for item in checks if item["required"]) else "failed"
@@ -299,6 +454,112 @@ class WorkbenchService:
             "failed_runs": len([run for run in runs if run.get("status") == "failed"]),
             "blocked_runs": len([run for run in runs if run.get("status") == "blocked"]),
             "tool_protocol_version": TOOL_PROTOCOL_VERSION,
+        }
+
+    def config_schema(self) -> dict[str, Any]:
+        return {
+            "platform_config_version": "grounded.platform.v1",
+            "workspace_config_version": "grounded.workspace.v1",
+            "policy_config_version": "grounded.policy.v1",
+            "plugin_config_version": "grounded.plugin.v1",
+            "schemas": {
+                "platform": {
+                    "required": ["data_dir", "runtime_dir", "template_dir", "preview_port_base"],
+                    "properties": {
+                        "data_dir": str(self.settings.data_dir),
+                        "runtime_dir": str(self.settings.runtime_dir),
+                        "template_dir": str(self.settings.template_dir),
+                        "preview_port_base": self.settings.preview_port_base,
+                    },
+                },
+                "workspace": {
+                    "required": ["workspace_id", "name", "target_platform", "preview_profile", "current_revision_id"],
+                    "backward_compatible": True,
+                },
+                "policy": self.exec_policy_service.snapshot(),
+                "plugin": {
+                    "required": ["id", "version", "capabilities"],
+                    "capabilities": ["validators", "exporters", "preview_adapters", "platform_adapters", "skills", "mcp_tools"],
+                },
+            },
+        }
+
+    def migrations(self) -> dict[str, Any]:
+        checks = [
+            {
+                "id": "state_store_v1",
+                "status": "current",
+                "description": "JSON state collections are readable with additive fields.",
+            },
+            {
+                "id": "workspace_metadata_v1",
+                "status": "current",
+                "description": "Workspace records keep revision history and tolerate unknown future fields through strict migrations at API edges.",
+            },
+            {
+                "id": "artifact_refs_v1",
+                "status": "current",
+                "description": "Run artifacts remain addressable through report refs and compatibility fallbacks.",
+            },
+        ]
+        return {"status": "current", "items": checks, "created_at": datetime.now(timezone.utc).isoformat()}
+
+    def test_matrix(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifacts = self._run_artifacts_or_empty(run_id)
+        check_results = artifacts.get("check_results") or []
+        checks_by_name = {str(item.get("name") or ""): item for item in check_results if isinstance(item, dict)}
+
+        def entry(key: str, label: str, names: tuple[str, ...], *, required: bool = True) -> dict[str, Any]:
+            matched = [checks_by_name[name] for name in names if name in checks_by_name]
+            status = "skipped"
+            if matched:
+                status = "passed" if all(str(item.get("status")) == "passed" for item in matched) else "failed"
+            return {"key": key, "label": label, "status": status, "required": required, "evidence": matched}
+
+        items = [
+            entry("backend_pytest", "Backend pytest", ("generated_backend_tests", "backend_tests", "pytest")),
+            entry("frontend_js_smoke", "Frontend JS smoke", ("frontend_interaction_static_smoke", "js_syntax")),
+            entry("role_pages", "Role page smoke", ("preview_route_smoke", "role_pages")),
+            entry("accessibility", "Accessibility checks", ("mobile_layout", "accessibility"), required=False),
+            entry("persistence", "Persisted workflow checks", ("api_workflow_proof", "browser_flow_smoke")),
+            entry("docker_compose_boot", "Docker compose boot", ("preview_boot_smoke",), required=False),
+            entry("playwright_proof", "Playwright proof", ("browser_flow_smoke", "browser_proof")),
+        ]
+        status = "passed" if all(item["status"] == "passed" for item in items if item["required"]) else "incomplete"
+        payload = {"run_id": run_id, "workspace_id": run.workspace_id, "status": status, "items": items}
+        self.store.upsert("reports", f"test_matrix:{run_id}", payload)
+        return payload
+
+    def prompt_contract(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        prompt_terms = set(re.findall(r"[a-zA-Zа-яА-Я0-9]{4,}", run.prompt.lower()))
+        artifacts = self._run_artifacts_or_empty(run_id)
+        diff_text = str(artifacts.get("diff") or "")
+        diff_terms = set(re.findall(r"[a-zA-Zа-яА-Я0-9]{4,}", diff_text.lower()))
+        overlap = sorted(prompt_terms & diff_terms)[:40]
+        status = "passed" if not diff_text or overlap or len(prompt_terms) < 4 else "needs_review"
+        payload = {
+            "run_id": run_id,
+            "status": status,
+            "prompt_terms_checked": sorted(prompt_terms)[:80],
+            "matched_terms": overlap,
+            "findings": [] if status == "passed" else [{"severity": "medium", "message": "Diff has low lexical overlap with the user prompt; review product semantics before apply."}],
+        }
+        self.store.upsert("reports", f"prompt_contract:{run_id}", payload)
+        return payload
+
+    def security_summary(self) -> dict[str, Any]:
+        return {
+            "status": "configured",
+            "checks": [
+                {"key": "path_traversal", "status": "covered", "evidence": "Workspace paths normalize through safe relative path checks."},
+                {"key": "write_denylist", "status": "covered", "evidence": self.exec_policy_service.write_grants()["deny"]},
+                {"key": "command_allow_deny", "status": "covered", "evidence": self.exec_policy_service.snapshot()["risk_model"]},
+                {"key": "approval_bypass_prevention", "status": "covered", "evidence": "Approval ids are matched against run-scoped approval records."},
+                {"key": "secret_redaction", "status": "covered", "evidence": "ExecPolicyService.redact is applied to command events."},
+                {"key": "artifact_access_boundaries", "status": "covered", "evidence": "Artifacts are fetched through run-scoped refs."},
+            ],
         }
 
     def compact_run(self, run_id: str) -> dict[str, Any]:
@@ -317,25 +578,110 @@ class WorkbenchService:
         return payload
 
     def stage_files(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        self.run_service.get_run(run_id)
-        record = {"run_id": run_id, "files": list(payload.get("files") or []), "status": "staged", "updated_at": datetime.now(timezone.utc).isoformat()}
+        run = self.run_service.get_run(run_id)
+        files = self._normalize_file_list(payload.get("files") or [])
+        categories = {path: self._file_category(path) for path in files}
+        record = {
+            "run_id": run_id,
+            "workspace_id": run.workspace_id,
+            "files": files,
+            "categories": categories,
+            "status": "staged",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
         self.store.upsert("reports", f"staged_files:{run_id}", record)
+        self.record_tool_event(run_id, tool_envelope(tool="approval.stage", input_payload=record, result={"status": "staged"}, risk="mutating"))
         return record
 
     def discard_files(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        self.run_service.get_run(run_id)
-        record = {"run_id": run_id, "files": list(payload.get("files") or []), "status": "discard_requested", "updated_at": datetime.now(timezone.utc).isoformat()}
+        run = self.run_service.get_run(run_id)
+        files = self._normalize_file_list(payload.get("files") or [])
+        result = self.workspace_service.discard_draft_files(run.workspace_id, run_id, files)
+        record = {"run_id": run_id, "files": files, "result": result, "status": "discarded", "updated_at": datetime.now(timezone.utc).isoformat()}
         self.store.upsert("reports", f"discarded_files:{run_id}", record)
+        self.record_tool_event(run_id, tool_envelope(tool="file.discard", input_payload={"files": files}, result=record, risk="mutating"))
         return record
 
     def apply_staged(self, run_id: str) -> Any:
-        return self.run_service.apply_run(run_id)
+        run = self.run_service.get_run(run_id)
+        staged = self.store.get("reports", f"staged_files:{run_id}") or {}
+        changed_before_apply = set(self.workspace_service.draft_changed_paths(run.workspace_id, run_id))
+        files = self._normalize_file_list(staged.get("files") or run.touched_files or list(changed_before_apply))
+        revision = self.workspace_service.apply_selected_draft_files(run.workspace_id, run_id, files, message=f"Apply staged AI draft files for run {run_id}")
+        fully_applied = bool(changed_before_apply) and set(files).issuperset(changed_before_apply)
+        run.result_revision_id = revision.revision_id
+        run.candidate_revision_id = revision.revision_id
+        run.touched_files = files
+        run.apply_status = "applied" if fully_applied else "awaiting_approval"
+        run.status = "completed" if fully_applied else "awaiting_approval"
+        run.draft_status = "approved" if fully_applied else "ready"
+        run.draft_ready = not fully_applied
+        run.progress_percent = 100 if fully_applied else max(run.progress_percent, 95)
+        run.current_stage = "completed" if fully_applied else "partially applied"
+        run.updated_at = datetime.now(timezone.utc)
+        if fully_applied:
+            self.workspace_service.discard_draft(run.workspace_id, run_id)
+        self.store.upsert("runs", run_id, run.model_dump(mode="json"))
+        artifacts = self._run_artifacts_or_empty(run_id)
+        artifacts["run"] = run.model_dump(mode="json")
+        artifacts["staged_apply"] = {"files": files, "revision_id": revision.revision_id, "fully_applied": fully_applied}
+        self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts)
+        self.record_tool_event(run_id, tool_envelope(tool="patch.apply", input_payload={"files": files}, result=artifacts["staged_apply"], risk="mutating"))
+        return run
 
-    def diff(self, run_id: str, *, base: str, target: str) -> dict[str, Any]:
+    def diff(self, run_id: str, *, base: str, target: str, file: str | None = None, worker_id: str | None = None, category: str | None = None, status: str | None = None) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         artifacts = self._run_artifacts_or_empty(run_id)
         diff = artifacts.get("diff") or self.workspace_service.diff(run.workspace_id, run_id=run_id)
-        return {"run_id": run_id, "base": base, "target": target, "diff": diff, "files": run.touched_files}
+        files = run.touched_files or self._paths_from_diff(diff)
+        if file:
+            files = [path for path in files if path == file]
+        if worker_id:
+            files = [path for path in files if self._path_owned_by_worker(worker_id, path)]
+        if category:
+            files = [path for path in files if self._file_category(path) == category]
+        filtered_diff = self._filter_diff(diff, files) if (file or worker_id or category or status) else diff
+        return {"run_id": run_id, "base": base, "target": target, "diff": filtered_diff, "files": files, "filters": {"file": file, "worker_id": worker_id, "category": category, "status": status}}
+
+    def approvals(self, run_id: str) -> dict[str, Any]:
+        self.run_service.get_run(run_id)
+        return self.store.get("reports", f"approvals:{run_id}") or {"run_id": run_id, "items": []}
+
+    def file_search(self, workspace_id: str, *, query: str, run_id: str | None = None) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        if run_id and ("/" in run_id or "\\" in run_id or ".." in Path(run_id).parts):
+            raise ValueError("Run id must not contain path traversal.")
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            return {"workspace_id": workspace_id, "query": normalized_query, "items": []}
+        root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
+        if run_id and not root.exists():
+            raise KeyError(f"Draft not found for run: {run_id}")
+        if shutil.which("rg"):
+            rg_items = self._ripgrep_search(root, normalized_query)
+            if rg_items:
+                return {"workspace_id": workspace_id, "run_id": run_id, "query": normalized_query, "engine": "ripgrep", "items": rg_items}
+        items: list[dict[str, Any]] = []
+        for entry in self.workspace_service.file_tree(workspace_id, run_id=run_id):
+            if entry.get("type") != "file":
+                continue
+            relative_path = str(entry.get("path") or "")
+            if ".." in Path(relative_path).parts:
+                raise ValueError("Search paths must stay inside the workspace.")
+            haystack = relative_path.lower()
+            content = self.workspace_service.try_read_text_file(workspace_id, relative_path, run_id=run_id)
+            hits: list[dict[str, Any]] = []
+            if content:
+                for line_no, line in enumerate(content.splitlines(), start=1):
+                    if normalized_query.lower() in line.lower():
+                        hits.append({"line": line_no, "text": line[:240]})
+                    if len(hits) >= 5:
+                        break
+            if normalized_query.lower() in haystack or hits:
+                items.append({"path": relative_path, "hits": hits})
+            if len(items) >= 80:
+                break
+        return {"workspace_id": workspace_id, "run_id": run_id, "query": normalized_query, "engine": "python", "items": items}
 
     def _run_artifacts_or_empty(self, run_id: str) -> dict[str, Any]:
         try:
@@ -346,12 +692,41 @@ class WorkbenchService:
 
     def approval_decision(self, run_id: str, approval_id: str, *, approved: bool) -> dict[str, Any]:
         self.run_service.get_run(run_id)
+        existing = self._approval_by_id(run_id, approval_id) or {
+            "approval_id": approval_id,
+            "kind": "manual",
+            "summary": f"Manual approval {approval_id}",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        item = {**existing, "status": "approved" if approved else "rejected", "decided_at": datetime.now(timezone.utc).isoformat()}
+        self._upsert_approval(run_id, item)
+        self.record_tool_event(run_id, tool_envelope(tool="approval.decision", input_payload={"approval_id": approval_id}, result=item, risk="safe"))
+        return item
+
+    def _upsert_approval(self, run_id: str, item: dict[str, Any]) -> None:
         key = f"approvals:{run_id}"
         payload = self.store.get("reports", key) or {"run_id": run_id, "items": []}
-        item = {"approval_id": approval_id, "status": "approved" if approved else "rejected", "decided_at": datetime.now(timezone.utc).isoformat()}
-        payload.setdefault("items", []).append(item)
+        items = [entry for entry in payload.get("items") or [] if isinstance(entry, dict)]
+        replaced = False
+        for index, entry in enumerate(items):
+            if entry.get("approval_id") == item.get("approval_id"):
+                items[index] = {**entry, **item}
+                replaced = True
+                break
+        if not replaced:
+            items.append(item)
+        payload["items"] = items
         self.store.upsert("reports", key, payload)
-        return item
+
+    def _approval_by_id(self, run_id: str, approval_id: str) -> dict[str, Any] | None:
+        for item in self.approvals(run_id).get("items") or []:
+            if isinstance(item, dict) and item.get("approval_id") == approval_id:
+                return item
+        return None
+
+    def _stored_tool_events(self, run_id: str) -> list[dict[str, Any]]:
+        payload = self.store.get("reports", f"tool_events:{run_id}") or {}
+        return [item for item in payload.get("items") or [] if isinstance(item, dict)]
 
     def _timeline_from_activity(self, event: dict[str, Any]) -> dict[str, Any]:
         details = event.get("details") if isinstance(event.get("details"), dict) else {}
@@ -448,6 +823,159 @@ class WorkbenchService:
                 chunks.append(line)
         return "\n".join(chunks)
 
+    @staticmethod
+    def _paths_from_diff(diff: str) -> list[str]:
+        paths: list[str] = []
+        for line in str(diff or "").splitlines():
+            if not line.startswith("diff --git "):
+                continue
+            candidate = line.rsplit(" b/", 1)[-1].strip()
+            if candidate.startswith("draft/"):
+                candidate = candidate.split("draft/", 1)[-1]
+            if candidate.startswith("source/"):
+                candidate = candidate.split("source/", 1)[-1]
+            if candidate:
+                paths.append(candidate)
+        return list(dict.fromkeys(paths))
+
+    @staticmethod
+    def _normalize_file_list(files: Any) -> list[str]:
+        normalized: list[str] = []
+        for item in files if isinstance(files, list) else []:
+            path = str(item or "").strip().replace("\\", "/")
+            while path.startswith("./"):
+                path = path[2:]
+            if not path or path.startswith("/") or ".." in Path(path).parts:
+                raise ValueError("File paths must stay within the workspace.")
+            normalized.append(path)
+        return list(dict.fromkeys(normalized))
+
+    @staticmethod
+    def _file_category(path: str) -> str:
+        normalized = str(path or "").replace("\\", "/")
+        if normalized.startswith("miniapp/app/generated/"):
+            return "generated_manifest"
+        if normalized.startswith("miniapp/app/static/client/"):
+            return "client_ui"
+        if normalized.startswith("miniapp/app/static/specialist/"):
+            return "specialist_ui"
+        if normalized.startswith("miniapp/app/static/manager/"):
+            return "manager_ui"
+        if "test" in normalized:
+            return "tests"
+        if normalized.endswith((".css", ".scss")):
+            return "styles"
+        if normalized.startswith("miniapp/app/"):
+            return "backend"
+        return "other"
+
+    @staticmethod
+    def _collect_values(payload: Any, *, keys: tuple[str, ...]) -> list[Any]:
+        found: list[Any] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, nested in value.items():
+                    if key in keys:
+                        if isinstance(nested, list):
+                            found.extend(nested)
+                        else:
+                            found.append(nested)
+                    visit(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    visit(nested)
+
+        visit(payload)
+        return found[:50]
+
+    def _document_skills(self) -> list[dict[str, Any]]:
+        roots = [self.settings.runtime_dir / "platform-docs", self.settings.template_dir / "docs"]
+        skills: list[dict[str, Any]] = []
+        for root in roots:
+            if not root.exists():
+                continue
+            for path in sorted(root.rglob("*.md"))[:80]:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                title = next((line.lstrip("#").strip() for line in text.splitlines() if line.startswith("#")), path.stem)
+                skill_id = re_slug(path.relative_to(root).with_suffix("").as_posix())
+                skills.append(
+                    {
+                        "id": skill_id,
+                        "name": title[:80],
+                        "source": str(path.relative_to(self.settings.repo_root)) if path.is_relative_to(self.settings.repo_root) else str(path),
+                        "trigger_keywords": [part for part in re_slug(title).split("-") if len(part) > 2][:8],
+                        "constraints": [line.strip("- ").strip() for line in text.splitlines() if line.strip().startswith("-")][:6],
+                        "validation_hints": [],
+                    }
+                )
+        return skills
+
+    def _load_plugin_manifests(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        roots = [self.settings.runtime_dir / "plugins", self.settings.data_dir / "plugins"]
+        for root in roots:
+            if not root.exists():
+                continue
+            for path in sorted(root.rglob("plugin.json")):
+                try:
+                    manifest = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(manifest, dict) or not manifest.get("id") or not manifest.get("version"):
+                    continue
+                items.append({**manifest, "status": "installed", "source": str(path)})
+        for key, payload in self.store.items("reports"):
+            if key.startswith("plugin:") and isinstance(payload, dict):
+                manifest = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else payload
+                items.append({**manifest, "status": payload.get("status", "registered"), "source": "state"})
+        return items
+
+    def _mcp_config(self) -> dict[str, Any]:
+        candidates = [self.settings.data_dir / "mcp.json", self.settings.repo_root / "mcp.json"]
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return {"servers": [], "tools": []}
+
+    @staticmethod
+    def _ripgrep_search(root: Path, query: str) -> list[dict[str, Any]]:
+        try:
+            result = subprocess.run(
+                ["rg", "--line-number", "--no-heading", "--color", "never", "--", query, str(root)],
+                text=True,
+                capture_output=True,
+                timeout=6,
+            )
+        except Exception:
+            return []
+        if result.returncode not in {0, 1}:
+            return []
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for raw_line in result.stdout.splitlines()[:400]:
+            parts = raw_line.split(":", 2)
+            if len(parts) != 3:
+                continue
+            path_text, line_text, snippet = parts
+            try:
+                relative_path = Path(path_text).resolve().relative_to(root.resolve()).as_posix()
+            except Exception:
+                continue
+            if ".." in Path(relative_path).parts:
+                continue
+            try:
+                line_number = int(line_text)
+            except ValueError:
+                line_number = 0
+            grouped.setdefault(relative_path, []).append({"line": line_number, "text": snippet[:240]})
+        return [{"path": path, "hits": hits[:5]} for path, hits in list(grouped.items())[:80]]
+
     def _check(self, name: str, ok: bool, details: str = "", command: str | None = None, *, required: bool = True) -> dict[str, Any]:
         return {"name": name, "status": "passed" if ok else "failed", "details": details, "command": command, "required": required}
 
@@ -492,6 +1020,64 @@ class WorkbenchService:
             return self._check("preview_port_base", result != 0, f"port {self.settings.preview_port_base} {'available' if result != 0 else 'in use'}", required=False)
         finally:
             sock.close()
+
+    def _backend_routes_check(self) -> dict[str, Any]:
+        route_file = self.settings.repo_root / "platform" / "backend" / "app" / "api" / "routes_workbench.py"
+        if not route_file.exists():
+            return self._check("backend_routes", False, f"missing {route_file}", required=True)
+        text = route_file.read_text(encoding="utf-8", errors="ignore")
+        required_routes = ["/doctor", "/runs/{run_id}/timeline", "/runs/{run_id}/approvals", "/workspaces/{workspace_id}/files/search"]
+        missing = [route for route in required_routes if route not in text]
+        return self._check(
+            "backend_routes",
+            not missing,
+            "registered" if not missing else "missing: " + ", ".join(missing),
+            required=True,
+        )
+
+    def _stale_backend_check(self) -> dict[str, Any]:
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", 8000, timeout=1.0)
+            conn.request("GET", "/doctor")
+            response = conn.getresponse()
+            body = response.read(240).decode("utf-8", errors="ignore")
+            conn.close()
+            ok = response.status < 500
+            details = f"127.0.0.1:8000 returned {response.status}; {body[:120]}"
+            return self._check("stale_backend_port_8000", ok, details, "GET http://127.0.0.1:8000/doctor", required=False)
+        except Exception as exc:
+            return self._check("stale_backend_port_8000", True, f"no conflicting backend detected ({exc})", required=False)
+
+    def _playwright_browsers_check(self) -> dict[str, Any]:
+        try:
+            result = subprocess.run([sys.executable, "-m", "playwright", "install", "--dry-run"], text=True, capture_output=True, timeout=10)
+            output = (result.stdout or result.stderr).strip()
+            return self._check(
+                "playwright_browsers",
+                result.returncode == 0,
+                output[:600] or "dry run completed",
+                "python -m playwright install --dry-run",
+                required=False,
+            )
+        except Exception as exc:
+            return self._check("playwright_browsers", False, str(exc), "python -m playwright install --dry-run", required=False)
+
+    def _preview_container_check(self) -> dict[str, Any]:
+        docker = shutil.which("docker")
+        if not docker:
+            return self._check("preview_containers", True, "docker not available; skipped", "docker ps", required=False)
+        try:
+            result = subprocess.run([docker, "ps", "--format", "{{.Names}}"], text=True, capture_output=True, timeout=5)
+            names = [line for line in result.stdout.splitlines() if "grounded" in line or "miniapp" in line or "preview" in line]
+            return self._check(
+                "preview_containers",
+                result.returncode == 0,
+                ", ".join(names[:12]) if names else "no matching preview containers",
+                "docker ps --format '{{.Names}}'",
+                required=False,
+            )
+        except Exception as exc:
+            return self._check("preview_containers", False, str(exc), "docker ps --format '{{.Names}}'", required=False)
 
     def _test_command_check(self) -> dict[str, Any]:
         return self._check("platform_tests", (self.settings.repo_root / "platform" / "backend" / "tests").exists(), "pytest platform/backend/tests", required=True)

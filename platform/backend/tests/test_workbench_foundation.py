@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from fastapi.testclient import TestClient
 
@@ -79,3 +80,163 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert any(item["id"] == "crm" for item in skills["items"])
     assert any(item["id"] == "reservation" for item in skills["items"])
     assert any(item["worker_id"] == "backend_api" for item in workers["workers"])
+
+
+def _workspace_with_run(tmp_path: Path) -> tuple[Any, TestClient, dict, RunRecord]:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Workbench Behavior",
+            "description": "Second pass behavior test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Improve internal dashboard",
+        intent="edit",
+        apply_strategy="manual_approve",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="awaiting_approval",
+        apply_status="awaiting_approval",
+        draft_status="ready",
+        draft_ready=True,
+        approval_required=True,
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    return app, client, workspace, run
+
+
+def test_approval_rejection_blocks_and_appears_in_timeline(tmp_path: Path) -> None:
+    _app, client, workspace, run = _workspace_with_run(tmp_path)
+
+    evaluation = client.post(
+        f"/workspaces/{workspace['workspace_id']}/policy/evaluate-command",
+        json={"command": "rg FastAPI miniapp/app", "preset": "strict_manual", "run_id": run.run_id},
+    ).json()
+    approval_id = evaluation["approval"]["approval_id"]
+
+    approvals = client.get(f"/runs/{run.run_id}/approvals").json()
+    rejected = client.post(f"/runs/{run.run_id}/approvals/{approval_id}/reject").json()
+    events = client.get(f"/runs/{run.run_id}/tool-events").json()
+    timeline = client.get(f"/runs/{run.run_id}/timeline").json()
+
+    assert approvals["items"][0]["status"] == "pending"
+    assert rejected["status"] == "rejected"
+    assert any(item["tool"] == "policy.evaluate" for item in events["events"])
+    assert any(item["kind"] == "approval" and item["status"] == "rejected" for item in timeline["items"])
+
+
+def test_staged_apply_commits_only_selected_files_and_discard_restores_draft(tmp_path: Path) -> None:
+    app, client, workspace, run = _workspace_with_run(tmp_path)
+    workspace_id = workspace["workspace_id"]
+    service = app.state.container.workspace_service
+    draft = service.prepare_draft(workspace_id, run.run_id)
+    source = service.source_dir(workspace_id)
+    backend_path = "miniapp/app/main.py"
+    ui_path = "miniapp/app/static/client/index.html"
+    original_backend = (source / backend_path).read_text(encoding="utf-8")
+    original_ui = (source / ui_path).read_text(encoding="utf-8")
+    (draft / backend_path).write_text(original_backend + "\n# staged behavior marker\n", encoding="utf-8")
+    (draft / ui_path).write_text(original_ui.replace("</body>", "<!-- draft marker --></body>"), encoding="utf-8")
+
+    staged = client.post(f"/runs/{run.run_id}/stage/files", json={"files": [backend_path]}).json()
+    applied = client.post(f"/runs/{run.run_id}/apply/staged").json()
+    discarded = client.post(f"/runs/{run.run_id}/discard/files", json={"files": [ui_path]}).json()
+
+    assert staged["files"] == [backend_path]
+    assert "staged behavior marker" in (source / backend_path).read_text(encoding="utf-8")
+    assert (source / ui_path).read_text(encoding="utf-8") == original_ui
+    assert applied["status"] == "awaiting_approval"
+    assert ui_path in discarded["result"]["discarded_files"]
+    assert (draft / ui_path).read_text(encoding="utf-8") == original_ui
+
+
+def test_file_search_and_plugin_validation(tmp_path: Path) -> None:
+    _app, client, workspace, _run = _workspace_with_run(tmp_path)
+
+    search = client.get(f"/workspaces/{workspace['workspace_id']}/files/search", params={"q": "FastAPI"}).json()
+    traversal = client.get(
+        f"/workspaces/{workspace['workspace_id']}/files/search",
+        params={"q": "FastAPI", "run_id": "../escape"},
+    )
+    invalid_plugin = client.post("/plugins/install-local", json={"id": "local.validator", "capabilities": ["validators"]})
+    valid_plugin = client.post(
+        "/plugins/install-local",
+        json={"id": "local.validator", "version": "0.1.0", "capabilities": ["validators"]},
+    ).json()
+
+    assert search["items"]
+    assert traversal.status_code == 400
+    assert invalid_plugin.status_code == 400
+    assert valid_plugin["status"] == "registered"
+
+
+def test_config_security_test_matrix_prompt_contract_and_exports(tmp_path: Path) -> None:
+    app, client, workspace, run = _workspace_with_run(tmp_path)
+    workspace_id = workspace["workspace_id"]
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "diff --git a/miniapp/app/main.py b/miniapp/app/main.py\n+internal dashboard FastAPI workflow\n",
+            "check_results": [
+                {"name": "frontend_interaction_static_smoke", "status": "passed"},
+                {"name": "api_workflow_proof", "status": "passed"},
+            ],
+        },
+    )
+
+    schema = client.get("/system/config/schema").json()
+    migrations = client.get("/system/migrations").json()
+    security = client.get("/system/security/summary").json()
+    matrix = client.get(f"/runs/{run.run_id}/test-matrix").json()
+    contract = client.get(f"/runs/{run.run_id}/prompt-contract").json()
+    manifest_export = client.post(f"/workspaces/{workspace_id}/export/manifest").json()
+    deploy_export = client.post(f"/workspaces/{workspace_id}/export/deploy-bundle").json()
+    docker_export = client.post(f"/workspaces/{workspace_id}/export/docker-validation-report").json()
+
+    assert schema["platform_config_version"] == "grounded.platform.v1"
+    assert migrations["status"] == "current"
+    assert security["status"] == "configured"
+    assert any(item["key"] == "frontend_js_smoke" and item["status"] == "passed" for item in matrix["items"])
+    assert contract["status"] == "passed"
+    assert Path(manifest_export["file_path"]).exists()
+    assert Path(deploy_export["file_path"]).exists()
+    assert Path(docker_export["file_path"]).exists()
+
+
+def test_structured_thread_compaction_contains_workbench_fields(tmp_path: Path) -> None:
+    app, _client, workspace, run = _workspace_with_run(tmp_path)
+    thread = app.state.container.thread_service.start_thread(workspace_id=workspace["workspace_id"], title="Compaction")
+    turn = app.state.container.thread_service.start_turn(
+        thread.thread_id,
+        {
+            "prompt": "Refine dense operations UI",
+            "mode": "fix",
+            "apply_strategy": "manual_approve",
+            "target_role_scope": ["client"],
+            "model_profile": "test",
+        },
+    )
+    created_run = app.state.container.run_service.get_run(turn.linked_run_id)
+    created_run.touched_files = ["miniapp/app/main.py"]
+    created_run.failure_reason = "example verification failure"
+    app.state.container.store.upsert("runs", created_run.run_id, created_run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"approvals:{created_run.run_id}",
+        {"run_id": created_run.run_id, "items": [{"approval_id": "appr_test", "status": "pending"}]},
+    )
+
+    compacted = app.state.container.thread_service.compact_thread(thread.thread_id)
+    summary = compacted.metadata["compaction"]
+
+    assert summary["linked_runs"]
+    assert summary["current_file_focus"] == ["miniapp/app/main.py"]
+    assert summary["known_failures"] == ["example verification failure"]
+    assert summary["unresolved_approvals"][0]["approval_id"] == "appr_test"

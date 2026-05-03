@@ -423,6 +423,86 @@ class WorkspaceService:
                 payload={"run_id": run_id},
             )
 
+    def draft_changed_paths(self, workspace_id: str, run_id: str) -> list[str]:
+        diff_text = self.diff(workspace_id, run_id=run_id)
+        paths: list[str] = []
+        for match in re.finditer(r"^diff --git a/.+ b/(.+)$", diff_text, flags=re.MULTILINE):
+            candidate = match.group(1).strip().replace("\\", "/")
+            if candidate.startswith("draft/"):
+                candidate = candidate.split("draft/", 1)[-1]
+            if candidate.startswith("source/"):
+                candidate = candidate.split("source/", 1)[-1]
+            if candidate and not self._is_ignored_workspace_path(Path(candidate)):
+                paths.append(candidate)
+        return list(dict.fromkeys(paths))
+
+    def apply_selected_draft_files(self, workspace_id: str, run_id: str, files: list[str], *, message: str) -> RevisionRecord:
+        source_dir = self.source_dir(workspace_id)
+        draft_source = self.draft_source_dir(workspace_id, run_id)
+        if not draft_source.exists():
+            raise KeyError(f"Draft not found for run: {run_id}")
+        selected = [self._safe_relative_path(path) for path in files if str(path or "").strip()]
+        if not selected:
+            raise ValueError("At least one staged file is required.")
+        for relative_path in selected:
+            if self._is_ignored_workspace_path(relative_path):
+                raise ValueError(f"Refusing to apply ignored workspace path: {relative_path}")
+            source_path = source_dir / relative_path
+            draft_path = draft_source / relative_path
+            if draft_path.exists() and draft_path.is_file():
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(draft_path, source_path)
+            elif source_path.exists():
+                if source_path.is_dir():
+                    shutil.rmtree(source_path)
+                else:
+                    source_path.unlink()
+        commit_sha = self._git_commit(source_dir, message)
+        revision = RevisionRecord(commit_sha=commit_sha, message=message, source="ai_patch")
+        workspace = self.get_workspace(workspace_id)
+        workspace.current_revision_id = revision.revision_id
+        workspace.revisions.append(revision)
+        workspace.updated_at = revision.created_at
+        self.store.upsert("workspaces", workspace_id, workspace.model_dump(mode="json"))
+        self._refresh_indexes_async(workspace)
+        self.workspace_log_service.append(
+            workspace_id,
+            source="workspace",
+            message="Selected draft files applied to source.",
+            payload={"run_id": run_id, "revision_id": revision.revision_id, "files": [str(path) for path in selected]},
+        )
+        return revision
+
+    def discard_draft_files(self, workspace_id: str, run_id: str, files: list[str]) -> dict[str, object]:
+        source_dir = self.source_dir(workspace_id)
+        draft_source = self.draft_source_dir(workspace_id, run_id)
+        if not draft_source.exists():
+            raise KeyError(f"Draft not found for run: {run_id}")
+        discarded: list[str] = []
+        for raw_path in files:
+            relative_path = self._safe_relative_path(raw_path)
+            if self._is_ignored_workspace_path(relative_path):
+                raise ValueError(f"Refusing to discard ignored workspace path: {relative_path}")
+            source_path = source_dir / relative_path
+            draft_path = draft_source / relative_path
+            if source_path.exists() and source_path.is_file():
+                draft_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, draft_path)
+                discarded.append(str(relative_path))
+            elif draft_path.exists():
+                if draft_path.is_dir():
+                    shutil.rmtree(draft_path)
+                else:
+                    draft_path.unlink()
+                discarded.append(str(relative_path))
+        self.workspace_log_service.append(
+            workspace_id,
+            source="workspace",
+            message="Selected draft files discarded.",
+            payload={"run_id": run_id, "files": discarded},
+        )
+        return {"run_id": run_id, "discarded_files": discarded}
+
     def save_file(self, workspace_id: str, request: SaveFileRequest) -> RevisionRecord | None:
         source_dir = self.source_dir(workspace_id) if not request.run_id else self.draft_source_dir(workspace_id, request.run_id)
         relative_path = self._safe_relative_path(request.relative_path)

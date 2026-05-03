@@ -94,7 +94,14 @@ class ServiceContainer:
             openai_client=self.openai_client,
             exec_policy_service=self.exec_policy_service,
         )
-        self.thread_service = ThreadService(self.platform_db, self.run_service, self.workspace_service, self.rpc_event_hub)
+        self.thread_service = ThreadService(
+            self.platform_db,
+            self.run_service,
+            self.workspace_service,
+            self.rpc_event_hub,
+            store=self.store,
+            exec_policy_service=self.exec_policy_service,
+        )
         self.export_service = ExportService(self.settings, self.store, self.workspace_service)
 
 

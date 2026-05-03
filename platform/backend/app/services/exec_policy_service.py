@@ -11,8 +11,8 @@ from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, ToolRisk
 
 APPROVAL_PRESETS: dict[str, dict[str, Any]] = {
     "strict_manual": {
-        "description": "Prompt for every mutating, network, destructive, or unknown operation.",
-        "auto_approve_risks": ["safe", "read_only"],
+        "description": "Prompt for every permitted operation; forbidden commands remain blocked.",
+        "auto_approve_risks": [],
     },
     "safe_auto": {
         "description": "Auto-approve safe read-only diagnostics; require approval for mutations and network.",

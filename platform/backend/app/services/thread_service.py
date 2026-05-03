@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from app.models.domain import CreateRunRequest, new_id
-from app.modules.miniapp_agent_loop.agent_command_policy import decide_workspace_command
 from app.models.threads import ItemRecord, RolloutEventRecord, ThreadRecord, ThreadSnapshot, TurnRecord
 from app.repositories.platform_db import PlatformDb
+from app.repositories.state_store import StateStore
+from app.services.exec_policy_service import ExecPolicyService
 from app.services.rpc_event_hub import RpcEventHub
+from app.services.tool_protocol import tool_envelope
 from app.services.workspace.run_service import RunService
 from app.services.workspace.service import WorkspaceService
 
@@ -20,11 +22,22 @@ TERMINAL_RUN_STATUSES = {"completed", "failed", "blocked"}
 
 
 class ThreadService:
-    def __init__(self, db: PlatformDb, run_service: RunService, workspace_service: WorkspaceService, event_hub: RpcEventHub) -> None:
+    def __init__(
+        self,
+        db: PlatformDb,
+        run_service: RunService,
+        workspace_service: WorkspaceService,
+        event_hub: RpcEventHub,
+        *,
+        store: StateStore | None = None,
+        exec_policy_service: ExecPolicyService | None = None,
+    ) -> None:
         self.db = db
         self.run_service = run_service
         self.workspace_service = workspace_service
         self.event_hub = event_hub
+        self.store = store or run_service.store
+        self.exec_policy_service = exec_policy_service or ExecPolicyService()
         self._monitors: dict[str, threading.Thread] = {}
 
     def start_thread(self, *, workspace_id: str, title: str | None = None, metadata: dict[str, Any] | None = None) -> ThreadRecord:
@@ -158,12 +171,55 @@ class ThreadService:
 
     def compact_thread(self, thread_id: str) -> TurnRecord:
         thread = self._get_thread(thread_id)
+        turns = self.db.list_turns(thread_id, limit=500)
         items = self.db.list_items(thread_id, limit=1000)
+        linked_runs = []
+        known_failures = []
+        active_files: list[str] = []
+        accepted_decisions: list[str] = []
+        active_constraints: list[str] = []
+        unresolved_approvals: list[dict[str, Any]] = []
+        for turn in turns:
+            if not turn.linked_run_id:
+                continue
+            try:
+                run = self.run_service.get_run(turn.linked_run_id)
+            except Exception:
+                continue
+            linked_runs.append(
+                {
+                    "run_id": run.run_id,
+                    "status": run.status,
+                    "apply_status": run.apply_status,
+                    "summary": run.summary,
+                    "created_at": run.created_at.isoformat(),
+                }
+            )
+            if run.failure_reason:
+                known_failures.append(run.failure_reason)
+            active_files.extend(run.touched_files[:20])
+            active_constraints.extend(str(item) for item in (run.acceptance_contract or {}).get("constraints") or [])
+            accepted_decisions.extend(str(item) for item in (run.implementation_plan or {}).get("decisions") or [])
+            approvals = self.run_service.store.get("reports", f"approvals:{run.run_id}") or {}
+            unresolved_approvals.extend(
+                item
+                for item in approvals.get("items") or []
+                if isinstance(item, dict) and item.get("status") == "pending"
+            )
         summary = {
             "item_count": len(items),
+            "turn_count": len(turns),
+            "short_summary": f"{len(turns)} turns, {len(linked_runs)} linked runs, {len(set(active_files))} active files.",
             "latest_items": [item.payload for item in items[-8:]],
+            "linked_runs": linked_runs[-12:],
+            "active_constraints": list(dict.fromkeys(active_constraints))[:20],
+            "accepted_decisions": list(dict.fromkeys(accepted_decisions))[:20],
+            "known_failures": list(dict.fromkeys(known_failures))[:12],
+            "current_file_focus": list(dict.fromkeys(active_files))[:24],
+            "unresolved_approvals": unresolved_approvals[:20],
         }
         turn = TurnRecord(thread_id=thread_id, workspace_id=thread.workspace_id, kind="compaction", status="completed", prompt="Compact thread history.", completed_at=self._now())
+        turn.metadata["compaction"] = summary
         self.db.insert_turn(turn)
         self._append_item(thread_id, turn.turn_id, "thread.compaction_summary", summary)
         self._append_event(thread_id, turn.turn_id, "thread.compacted", summary)
@@ -191,14 +247,45 @@ class ThreadService:
             entries = [entry for entry in entries if str(entry.get("path") or "").startswith(prefix)]
         return {"entries": entries}
 
-    def exec_command(self, *, workspace_id: str, command: str, thread_id: str | None = None, turn_id: str | None = None, timeout: int = 30) -> dict[str, Any]:
-        decision = decide_workspace_command(command)
-        if decision.action != "allow":
-            raise ValueError(f"Command rejected by policy: {decision.reason}")
+    def exec_command(self, *, workspace_id: str, command: str, thread_id: str | None = None, turn_id: str | None = None, timeout: int = 30, approval_id: str | None = None, preset: str = "safe_auto") -> dict[str, Any]:
+        linked_run_id = self._get_turn(turn_id).linked_run_id if turn_id else None
+        evaluation = self.exec_policy_service.evaluate_command(command, preset=preset)
+        decision = evaluation.get("decision") if isinstance(evaluation.get("decision"), dict) else {}
+        approval = evaluation.get("approval") if isinstance(evaluation.get("approval"), dict) else {}
+        if linked_run_id:
+            self._record_run_tool_event(
+                linked_run_id,
+                tool_envelope(
+                    tool="policy.evaluate",
+                    input_payload={"command": self.exec_policy_service.redact(command), "preset": preset},
+                    result=evaluation,
+                    risk=decision.get("risk") or "unknown",
+                    approval=approval,
+                ),
+            )
+            if approval.get("required") and approval.get("approval_id"):
+                self._upsert_run_approval(
+                    linked_run_id,
+                    {
+                        "approval_id": str(approval["approval_id"]),
+                        "status": "pending",
+                        "kind": "command",
+                        "risk": decision.get("risk"),
+                        "summary": self.exec_policy_service.redact(command),
+                        "input": {"command": self.exec_policy_service.redact(command), "workspace_id": workspace_id},
+                        "policy_decision": decision,
+                        "created_at": self._now().isoformat(),
+                    },
+                )
+        if decision.get("action") != "allow":
+            raise ValueError(f"Command rejected by policy: {decision.get('reason')}")
+        if approval.get("required"):
+            if not approval_id or not linked_run_id or not self._run_approval_status(linked_run_id, approval_id) == "approved":
+                raise ValueError(f"Command requires approval: {approval.get('approval_id')}")
         process_id = new_id("proc")
         cwd = self.workspace_service.source_dir(workspace_id)
         started = time.perf_counter()
-        result = subprocess.run(command, cwd=cwd, shell=True, text=True, capture_output=True, timeout=max(1, min(timeout, 120)))
+        result = subprocess.run(list(decision.get("argv") or []), cwd=cwd, shell=False, text=True, capture_output=True, timeout=max(1, min(timeout, 120)))
         payload = {
             "process_id": process_id,
             "thread_id": thread_id,
@@ -210,11 +297,47 @@ class ThreadService:
             "stdout": result.stdout[-12000:],
             "stderr": result.stderr[-12000:],
             "duration_ms": int((time.perf_counter() - started) * 1000),
+            "policy_decision": decision,
         }
         self.db.record_exec_process(process_id, payload)
+        if linked_run_id:
+            self._record_run_tool_event(
+                linked_run_id,
+                tool_envelope(
+                    tool="shell.exec",
+                    input_payload={"command": self.exec_policy_service.redact(command)},
+                    result={key: payload[key] for key in ("status", "exit_code", "duration_ms")},
+                    risk=decision.get("risk") or "read_only",
+                    approval={"required": False, "status": "approved" if approval_id else "not_required", "approval_id": approval_id},
+                    timing={"duration_ms": payload["duration_ms"]},
+                ),
+            )
         if thread_id:
             self._append_item(thread_id, turn_id, "command.exec.completed", payload)
         return payload
+
+    def _record_run_tool_event(self, run_id: str, event: dict[str, Any]) -> None:
+        key = f"tool_events:{run_id}"
+        payload = self.store.get("reports", key) or {"run_id": run_id, "items": []}
+        item = {**event, "sequence": len(payload.get("items") or []) + 1, "created_at": self._now().isoformat()}
+        payload.setdefault("items", []).append(item)
+        self.store.upsert("reports", key, payload)
+
+    def _upsert_run_approval(self, run_id: str, item: dict[str, Any]) -> None:
+        key = f"approvals:{run_id}"
+        payload = self.store.get("reports", key) or {"run_id": run_id, "items": []}
+        items = [entry for entry in payload.get("items") or [] if isinstance(entry, dict)]
+        if not any(entry.get("approval_id") == item.get("approval_id") for entry in items):
+            items.append(item)
+        payload["items"] = items
+        self.store.upsert("reports", key, payload)
+
+    def _run_approval_status(self, run_id: str, approval_id: str) -> str | None:
+        payload = self.store.get("reports", f"approvals:{run_id}") or {}
+        for item in payload.get("items") or []:
+            if isinstance(item, dict) and item.get("approval_id") == approval_id:
+                return str(item.get("status") or "")
+        return None
 
     def _ensure_monitor(self, thread_id: str, turn_id: str, run_id: str) -> None:
         if turn_id in self._monitors:

@@ -1058,6 +1058,23 @@ button:disabled {
   padding: 16px;
 }
 
+.workbench-stack {
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  gap: 12px;
+  overflow: auto;
+}
+
+.approval-center,
+.staged-apply-panel {
+  border: 1px solid rgba(86, 102, 168, 0.16);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.86);
+  padding: 14px;
+}
+
 .workbench-panel-header,
 .worker-lane-head {
   display: flex;
@@ -1094,6 +1111,50 @@ button:disabled {
   border-radius: 12px;
   background: #fff;
   padding: 12px;
+}
+
+.command-palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: start center;
+  padding-top: 12vh;
+  background: rgba(12, 18, 34, 0.28);
+}
+
+.command-palette {
+  width: min(680px, calc(100vw - 32px));
+  max-height: 72vh;
+  overflow: auto;
+  border: 1px solid rgba(86, 102, 168, 0.2);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.96);
+  padding: 16px;
+  box-shadow: 0 30px 80px rgba(20, 28, 60, 0.22);
+}
+
+.command-palette-action {
+  width: 100%;
+  display: grid;
+  gap: 4px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #fff;
+  padding: 12px;
+  color: var(--text);
+}
+
+.command-palette-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.command-palette-action span,
+.file-search-input span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .timeline-event summary {

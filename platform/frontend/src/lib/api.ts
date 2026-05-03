@@ -425,6 +425,27 @@ export type ReviewReport = {
   evidence?: Record<string, unknown>;
 };
 
+export type TestMatrixReport = {
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  items: Array<{
+    key: string;
+    label: string;
+    status: string;
+    required: boolean;
+    evidence?: Array<Record<string, unknown>>;
+  }>;
+};
+
+export type PromptContractReport = {
+  run_id: string;
+  status: string;
+  prompt_terms_checked: string[];
+  matched_terms: string[];
+  findings: Array<Record<string, unknown>>;
+};
+
 export type WorkspaceMemory = {
   workspace_id: string;
   items: Array<{
@@ -438,6 +459,57 @@ export type WorkspaceMemory = {
   user_preferences?: string[];
   platform_constraints?: string[];
   repeated_fixes?: string[];
+};
+
+export type ApprovalRecord = {
+  approval_id: string;
+  status: "pending" | "approved" | "rejected" | string;
+  kind?: string;
+  risk?: string;
+  summary?: string;
+  input?: Record<string, unknown>;
+  policy_decision?: Record<string, unknown>;
+  created_at?: string;
+  decided_at?: string;
+};
+
+export type ToolEventEnvelope = {
+  tool_call_id: string;
+  tool: string;
+  version: string;
+  input: Record<string, unknown>;
+  risk: string;
+  approval: Record<string, unknown>;
+  result: Record<string, unknown>;
+  artifacts: Array<Record<string, unknown>>;
+  timing: Record<string, unknown>;
+  error?: Record<string, unknown> | null;
+  created_at?: string;
+};
+
+export type StagedApplyState = {
+  run_id: string;
+  files: string[];
+  categories?: Record<string, string>;
+  status: string;
+  updated_at?: string;
+};
+
+export type FileSearchResult = {
+  workspace_id: string;
+  run_id?: string | null;
+  query: string;
+  items: Array<{
+    path: string;
+    hits: Array<{ line: number; text: string }>;
+  }>;
+};
+
+export type CommandPaletteAction = {
+  id: string;
+  label: string;
+  description?: string;
+  disabled?: boolean;
 };
 
 type RpcEnvelope = {
@@ -644,6 +716,44 @@ export async function getRunTimeline(runId: string): Promise<RunTimeline> {
   return request<RunTimeline>(`/runs/${runId}/timeline`);
 }
 
+export async function getRunApprovals(runId: string): Promise<{ run_id: string; items: ApprovalRecord[] }> {
+  return request<{ run_id: string; items: ApprovalRecord[] }>(`/runs/${runId}/approvals`);
+}
+
+export async function approveRunApproval(runId: string, approvalId: string): Promise<ApprovalRecord> {
+  return request<ApprovalRecord>(`/runs/${runId}/approvals/${approvalId}/approve`, { method: "POST" });
+}
+
+export async function rejectRunApproval(runId: string, approvalId: string): Promise<ApprovalRecord> {
+  return request<ApprovalRecord>(`/runs/${runId}/approvals/${approvalId}/reject`, { method: "POST" });
+}
+
+export async function stageRunFiles(runId: string, files: string[]): Promise<StagedApplyState> {
+  return request<StagedApplyState>(`/runs/${runId}/stage/files`, {
+    method: "POST",
+    body: JSON.stringify({ files }),
+  });
+}
+
+export async function discardRunFiles(runId: string, files: string[]): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/discard/files`, {
+    method: "POST",
+    body: JSON.stringify({ files }),
+  });
+}
+
+export async function applyStagedRun(runId: string): Promise<Run> {
+  return request<Run>(`/runs/${runId}/apply/staged`, { method: "POST" });
+}
+
+export async function compactRun(runId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/runs/${runId}/compact`, { method: "POST" });
+}
+
+export async function startReviewFix(runId: string): Promise<Run> {
+  return request<Run>(`/runs/${runId}/review/fix`, { method: "POST" });
+}
+
 export async function getDoctorReport(): Promise<DoctorReport> {
   return request<DoctorReport>("/doctor");
 }
@@ -656,8 +766,24 @@ export async function getRunReview(runId: string): Promise<ReviewReport> {
   return request<ReviewReport>(`/runs/${runId}/review`);
 }
 
+export async function getRunTestMatrix(runId: string): Promise<TestMatrixReport> {
+  return request<TestMatrixReport>(`/runs/${runId}/test-matrix`);
+}
+
+export async function getRunPromptContract(runId: string): Promise<PromptContractReport> {
+  return request<PromptContractReport>(`/runs/${runId}/prompt-contract`);
+}
+
 export async function getWorkspaceMemory(workspaceId: string): Promise<WorkspaceMemory> {
   return request<WorkspaceMemory>(`/workspaces/${workspaceId}/memory`);
+}
+
+export async function searchWorkspaceFiles(workspaceId: string, query: string, runId?: string): Promise<FileSearchResult> {
+  const params = new URLSearchParams({ q: query });
+  if (runId) {
+    params.set("run_id", runId);
+  }
+  return request<FileSearchResult>(`/workspaces/${workspaceId}/files/search?${params.toString()}`);
 }
 
 export async function stopRun(runId: string): Promise<Run> {

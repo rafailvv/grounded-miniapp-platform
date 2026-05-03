@@ -16,6 +16,7 @@ router = APIRouter(tags=["workbench"])
 class CommandPolicyRequest(BaseModel):
     command: str
     preset: str = "safe_auto"
+    run_id: str | None = None
 
 
 class MemoryRequest(BaseModel):
@@ -44,7 +45,17 @@ def evaluate_workspace_command(
 ) -> dict[str, Any]:
     try:
         container.workspace_service.get_workspace(workspace_id)
+        if request.run_id:
+            return {"workspace_id": workspace_id, **container.workbench_service.evaluate_command_for_run(request.run_id, request.command, preset=request.preset)}
         return {"workspace_id": workspace_id, **container.exec_policy_service.evaluate_command(request.command, preset=request.preset)}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/approvals")
+def list_run_approvals(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.approvals(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -120,9 +131,18 @@ def compact_thread(thread_id: str, container: ServiceContainer = Depends(get_con
 
 
 @router.get("/runs/{run_id}/diff")
-def get_run_diff(run_id: str, base: str = "source", target: str = "draft", container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+def get_run_diff(
+    run_id: str,
+    base: str = "source",
+    target: str = "draft",
+    file: str | None = None,
+    worker_id: str | None = None,
+    category: str | None = None,
+    status: str | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
     try:
-        return container.workbench_service.diff(run_id, base=base, target=target)
+        return container.workbench_service.diff(run_id, base=base, target=target, file=file, worker_id=worker_id, category=category, status=status)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -133,6 +153,8 @@ def stage_run_files(run_id: str, request: FilesRequest, container: ServiceContai
         return container.workbench_service.stage_files(run_id, request.model_dump())
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/runs/{run_id}/discard/files")
@@ -141,6 +163,8 @@ def discard_run_files(run_id: str, request: FilesRequest, container: ServiceCont
         return container.workbench_service.discard_files(run_id, request.model_dump())
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/runs/{run_id}/apply/staged", response_model=RunRecord)
@@ -149,6 +173,23 @@ def apply_staged_run(run_id: str, container: ServiceContainer = Depends(get_cont
         return container.workbench_service.apply_staged(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/workspaces/{workspace_id}/files/search")
+def search_workspace_files(
+    workspace_id: str,
+    q: str = "",
+    run_id: str | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.file_search(workspace_id, query=q, run_id=run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/doctor")
@@ -172,6 +213,21 @@ def get_run_observability(run_id: str, container: ServiceContainer = Depends(get
 @router.get("/system/metrics/summary")
 def get_metrics_summary(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return container.workbench_service.metrics_summary()
+
+
+@router.get("/system/config/schema")
+def get_config_schema(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.config_schema()
+
+
+@router.get("/system/migrations")
+def get_migrations(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.migrations()
+
+
+@router.get("/system/security/summary")
+def get_security_summary(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.security_summary()
 
 
 @router.get("/workspaces/{workspace_id}/memory")
@@ -273,10 +329,34 @@ def start_run_review(run_id: str, container: ServiceContainer = Depends(get_cont
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/runs/{run_id}/review/fix", response_model=RunRecord)
+def start_run_review_fix(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunRecord:
+    try:
+        return container.workbench_service.start_review_fix(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/runs/{run_id}/review")
 def get_run_review(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.store.get("reports", f"review:{run_id}") or container.workbench_service.review(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/test-matrix")
+def get_run_test_matrix(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.test_matrix(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/prompt-contract")
+def get_run_prompt_contract(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.prompt_contract(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
