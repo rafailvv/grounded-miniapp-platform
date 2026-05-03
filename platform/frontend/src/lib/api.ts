@@ -345,6 +345,149 @@ export type SystemConfiguration = {
   research_artifacts_enabled: boolean;
 };
 
+export type AgentThread = {
+  thread_id: string;
+  workspace_id: string;
+  title: string;
+  status: "active" | "running" | "idle" | "archived" | "failed";
+  archived: boolean;
+  current_turn_id?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AgentTurn = {
+  turn_id: string;
+  thread_id: string;
+  workspace_id: string;
+  kind: "user" | "agent" | "review" | "compaction" | "repair";
+  status: "queued" | "running" | "completed" | "failed" | "interrupted";
+  prompt: string;
+  linked_run_id?: string | null;
+  metadata?: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AgentItem = {
+  item_id: string;
+  thread_id: string;
+  turn_id?: string | null;
+  item_type: string;
+  status: "started" | "completed" | "failed";
+  sequence: number;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+type RpcEnvelope = {
+  id?: number;
+  method?: string;
+  params?: Record<string, unknown>;
+  result?: unknown;
+  error?: { code: number; message: string; data?: unknown };
+};
+
+type RpcNotificationHandler = (message: RpcEnvelope) => void;
+
+class JsonRpcClient {
+  private socket: WebSocket | null = null;
+  private nextId = 1;
+  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  private connected: Promise<void> | null = null;
+  private handlers = new Set<RpcNotificationHandler>();
+
+  async call<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+    await this.ensureConnected();
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error("RPC socket is not open.");
+    }
+    const id = this.nextId++;
+    const result = new Promise<T>((resolve, reject) => {
+      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
+    });
+    socket.send(JSON.stringify({ id, method, params }));
+    return result;
+  }
+
+  subscribe(handler: RpcNotificationHandler): () => void {
+    this.handlers.add(handler);
+    void this.ensureConnected().catch(() => undefined);
+    return () => {
+      this.handlers.delete(handler);
+    };
+  }
+
+  private async ensureConnected(): Promise<void> {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      return;
+    }
+    if (this.connected) {
+      return this.connected;
+    }
+    this.connected = new Promise<void>((resolve, reject) => {
+      const socket = new WebSocket(this.rpcUrl());
+      this.socket = socket;
+      socket.addEventListener("open", async () => {
+        try {
+          await this.callRaw("initialize", { clientInfo: { name: "grounded-miniapp-frontend" } });
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+      socket.addEventListener("message", (event) => {
+        const message = JSON.parse(String(event.data)) as RpcEnvelope;
+        if (typeof message.id === "number") {
+          const pending = this.pending.get(message.id);
+          if (!pending) {
+            return;
+          }
+          this.pending.delete(message.id);
+          if (message.error) {
+            pending.reject(new Error(message.error.message));
+          } else {
+            pending.resolve(message.result);
+          }
+          return;
+        }
+        this.handlers.forEach((handler) => handler(message));
+      });
+      socket.addEventListener("close", () => {
+        this.socket = null;
+        this.connected = null;
+      });
+      socket.addEventListener("error", () => {
+        reject(new Error("RPC socket connection failed."));
+      });
+    });
+    return this.connected;
+  }
+
+  private async callRaw<T>(method: string, params: Record<string, unknown>): Promise<T> {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error("RPC socket is not open.");
+    }
+    const id = this.nextId++;
+    const result = new Promise<T>((resolve, reject) => {
+      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
+    });
+    socket.send(JSON.stringify({ id, method, params }));
+    return result;
+  }
+
+  private rpcUrl(): string {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}/rpc`;
+  }
+}
+
+const rpcClient = new JsonRpcClient();
+const workspaceThreadIds = new Map<string, string>();
+const runTurnRefs = new Map<string, { threadId: string; turnId: string }>();
+
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, {
     headers: {
@@ -409,19 +552,24 @@ export async function createRun(
     };
   },
 ): Promise<Run> {
-  return request<Run>(`/workspaces/${workspaceId}/runs`, {
-    method: "POST",
-    body: JSON.stringify({
-      mode: "generate",
-      intent: "auto",
-      apply_strategy: "staged_auto_apply",
-      target_role_scope: [],
-      generation_mode: "balanced",
-      target_platform: "telegram_mini_app",
-      preview_profile: "telegram_mock",
-      ...payload,
-    }),
+  const threadId = await getOrCreateWorkspaceThread(workspaceId);
+  const turn = await rpcClient.call<AgentTurn>("turn/start", {
+    thread_id: threadId,
+    mode: "generate",
+    intent: "auto",
+    apply_strategy: "staged_auto_apply",
+    target_role_scope: [],
+    generation_mode: "balanced",
+    target_platform: "telegram_mini_app",
+    preview_profile: "telegram_mock",
+    ...payload,
   });
+  const run = turn.metadata?.run as Run | undefined;
+  if (!run?.run_id) {
+    throw new Error("RPC turn did not return a linked run.");
+  }
+  runTurnRefs.set(run.run_id, { threadId, turnId: turn.turn_id });
+  return run;
 }
 
 export async function getRunArtifacts(runId: string): Promise<RunArtifacts> {
@@ -433,6 +581,10 @@ export async function getRun(runId: string): Promise<Run> {
 }
 
 export async function stopRun(runId: string): Promise<Run> {
+  const ref = runTurnRefs.get(runId);
+  if (ref) {
+    await rpcClient.call("turn/interrupt", { thread_id: ref.threadId, turn_id: ref.turnId });
+  }
   return request<Run>(`/runs/${runId}/stop`, {
     method: "POST",
   });
@@ -480,4 +632,31 @@ export async function rollbackRun(runId: string): Promise<Run> {
 
 export async function getWorkspaceLogs(workspaceId: string): Promise<WorkspaceLogs> {
   return request<WorkspaceLogs>(`/workspaces/${workspaceId}/logs`);
+}
+
+export function subscribeRpcNotifications(handler: RpcNotificationHandler): () => void {
+  return rpcClient.subscribe(handler);
+}
+
+export async function listThreads(workspaceId: string): Promise<AgentThread[]> {
+  const page = await rpcClient.call<{ items: AgentThread[]; next_cursor?: string | null }>("thread/list", { workspace_id: workspaceId });
+  return page.items;
+}
+
+export async function readThread(threadId: string): Promise<{ thread: AgentThread; turns: AgentTurn[]; items: AgentItem[] }> {
+  return rpcClient.call("thread/read", { thread_id: threadId });
+}
+
+async function getOrCreateWorkspaceThread(workspaceId: string): Promise<string> {
+  const cached = workspaceThreadIds.get(workspaceId);
+  if (cached) {
+    return cached;
+  }
+  const existing = await listThreads(workspaceId);
+  const thread = existing[0] ?? await rpcClient.call<AgentThread>("thread/start", {
+    workspace_id: workspaceId,
+    title: "Mini-app generation",
+  });
+  workspaceThreadIds.set(workspaceId, thread.thread_id);
+  return thread.thread_id;
 }

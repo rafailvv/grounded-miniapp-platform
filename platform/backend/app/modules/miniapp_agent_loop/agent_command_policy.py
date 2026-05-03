@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import shlex
-from typing import Literal
+from typing import Any, Literal
 
 
 CommandPolicyAction = Literal["allow", "prompt", "forbidden"]
@@ -53,6 +53,48 @@ class AgentCommandPolicy:
 
     def __init__(self, rules: list[CommandPolicyRule] | None = None) -> None:
         self.rules = list(rules or self.default_rules())
+
+    @classmethod
+    def from_rule_payload(cls, payload: dict[str, Any]) -> "AgentCommandPolicy":
+        rules: list[CommandPolicyRule] = []
+        for raw_rule in payload.get("rules", []) if isinstance(payload, dict) else []:
+            if not isinstance(raw_rule, dict):
+                continue
+            prefixes: list[tuple[str, ...]] = []
+            for raw_prefix in raw_rule.get("prefixes", []):
+                if isinstance(raw_prefix, str):
+                    try:
+                        prefixes.append(tuple(item.lower() for item in shlex.split(raw_prefix)))
+                    except ValueError:
+                        continue
+                elif isinstance(raw_prefix, list):
+                    prefixes.append(tuple(str(item).lower() for item in raw_prefix))
+            action = str(raw_rule.get("action") or "allow")
+            if action not in {"allow", "prompt", "forbidden"}:
+                continue
+            examples: list[CommandPolicyExample] = []
+            for raw_example in raw_rule.get("examples", []):
+                if not isinstance(raw_example, dict):
+                    continue
+                expected = str(raw_example.get("action") or action)
+                if expected in {"allow", "prompt", "forbidden"}:
+                    examples.append(CommandPolicyExample(str(raw_example.get("command") or ""), expected))  # type: ignore[arg-type]
+            if prefixes:
+                rules.append(
+                    CommandPolicyRule(
+                        prefixes=tuple(prefixes),
+                        action=action,  # type: ignore[arg-type]
+                        reason=str(raw_rule.get("reason") or "Rule-file command policy decision."),
+                        examples=tuple(examples),
+                    )
+                )
+        return cls(rules or None)
+
+    @classmethod
+    def from_rule_file(cls, path: Path) -> "AgentCommandPolicy":
+        import json
+
+        return cls.from_rule_payload(json.loads(path.read_text(encoding="utf-8")))
 
     @staticmethod
     def default_rules() -> list[CommandPolicyRule]:
@@ -155,13 +197,18 @@ class AgentCommandPolicy:
             normalized_args[0] = "python3"
         if normalized_args[0] == "sed" and any(arg == "-i" or arg.startswith("-i") for arg in normalized_args[1:]):
             return CommandPolicyDecision("forbidden", "In-place sed edits are blocked.", command, normalized, tuple(args), ("sed",), cwd_policy)
+        matched_rules: list[CommandPolicyRule] = []
         for rule in self.rules:
             if rule.matches(normalized_args):
-                matched = next(
-                    (prefix for prefix in rule.prefixes if tuple(normalized_args[: len(prefix)]) == prefix),
-                    (),
-                )
-                return CommandPolicyDecision(rule.action, rule.reason, command, normalized, tuple(args), matched, cwd_policy)
+                matched_rules.append(rule)
+        if matched_rules:
+            severity = {"allow": 0, "prompt": 1, "forbidden": 2}
+            selected = max(matched_rules, key=lambda rule: severity[rule.action])
+            matched = next(
+                (prefix for prefix in selected.prefixes if tuple(normalized_args[: len(prefix)]) == prefix),
+                (),
+            )
+            return CommandPolicyDecision(selected.action, selected.reason, command, normalized, tuple(args), matched, cwd_policy)
         return CommandPolicyDecision(
             "forbidden",
             "Only diagnostic commands are allowed: python -m unittest, python -m py_compile, node --test, node --check, rg, sed, and ls.",

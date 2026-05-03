@@ -19,6 +19,11 @@ export default defineConfig(({ mode }) => {
           target: proxyTarget,
           changeOrigin: true,
         },
+        "/rpc": {
+          target: proxyTarget,
+          changeOrigin: true,
+          ws: true,
+        },
       },
     },
   };

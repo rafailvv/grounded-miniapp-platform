@@ -4,6 +4,9 @@ from pathlib import Path
 
 from app.core.config import Settings, get_settings
 from app.repositories.state_store import StateStore
+from app.repositories.platform_db import PlatformDb
+from app.services.rpc_event_hub import RpcEventHub
+from app.services.thread_service import ThreadService
 from app.services.check_runner import CheckRunner
 from app.services.code_index_service import CodeIndexService
 from app.services.context_pack_builder import ContextPackBuilder
@@ -30,6 +33,8 @@ class ServiceContainer:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self.store = StateStore(self.settings.data_dir / "platform-state.json")
+        self.platform_db = PlatformDb(self.settings.data_dir / "platform.db")
+        self.rpc_event_hub = RpcEventHub()
         self.store.shard_large_runtime_payloads()
         self.workspace_log_service = WorkspaceLogService(self.settings)
         self.workspace_service = WorkspaceService(self.settings, self.store, self.workspace_log_service)
@@ -78,6 +83,7 @@ class ServiceContainer:
             self.openai_client,
             self.workspace_log_service,
         )
+        self.thread_service = ThreadService(self.platform_db, self.run_service, self.workspace_service, self.rpc_event_hub)
         self.export_service = ExportService(self.settings, self.store, self.workspace_service)
 
 

@@ -14,6 +14,7 @@ from app.api import (
     routes_export,
     routes_files,
     routes_preview,
+    routes_rpc,
     routes_runs,
     routes_validation,
     routes_workspaces,
@@ -79,6 +80,7 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
     app.include_router(routes_validation.router)
     app.include_router(routes_files.router)
     app.include_router(routes_preview.router)
+    app.include_router(routes_rpc.router)
     app.include_router(routes_export.router)
     return app
 
