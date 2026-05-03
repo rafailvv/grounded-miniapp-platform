@@ -88,7 +88,7 @@ class AgentWorkerManager:
             by_path.setdefault(path, []).append(
                 {
                     "owner": owner,
-                    "operation": str(action.operation),
+                    "change_type": str(action.operation),
                     "reason": str(action.reason or "")[:240],
                 }
             )

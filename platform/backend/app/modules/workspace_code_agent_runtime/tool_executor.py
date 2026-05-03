@@ -13,7 +13,7 @@ from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessMan
 from app.modules.miniapp_agent_loop.agent_kernel import plan_agent_tool_batches
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
-from app.modules.miniapp_agent_loop.tool_agent_runtime import (
+from app.modules.miniapp_agent_loop.agent_tool_runtime import (
     list_workspace_files,
     run_workspace_command,
     search_workspace_files,

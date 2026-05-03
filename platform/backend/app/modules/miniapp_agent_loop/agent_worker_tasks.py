@@ -17,6 +17,7 @@ class AgentWorkerTaskPlanner:
                 "passes": ["green_workflow"],
                 "design_bar": "clean mobile UI, minimal but usable, with one consistent light neutral visual system across roles",
                 "workflow_bar": "one complete prompt-derived flow across all roles",
+                "page_bar": "prompt-derived role pages only where they make the mobile workflow clearer",
             }
         if generation_mode == GenerationMode.QUALITY:
             return {
@@ -24,12 +25,14 @@ class AgentWorkerTaskPlanner:
                 "passes": ["green_workflow", "role_consistency", "mobile_design_polish", "fresh_verifier"],
                 "design_bar": "modern mobile product UI with polished spacing, states, responsive cards/forms/lists, no horizontal overflow, and consistent light theme across role apps unless explicitly requested otherwise",
                 "workflow_bar": "multiple prompt-derived role actions where useful, with create/list/update/summary proof and refresh persistence",
+                "page_bar": "well-organized prompt-derived role pages with no long dashboard-only scrolls",
             }
         return {
             "depth": "balanced",
             "passes": ["green_workflow", "role_consistency"],
             "design_bar": "noticeably polished mobile UI without excessive pages or token-heavy decoration, using a consistent light role system",
             "workflow_bar": "one primary flow plus one related prompt-derived update/summary flow",
+            "page_bar": "enough prompt-derived role pages to keep each mobile workflow focused",
         }
 
     @classmethod
@@ -89,9 +92,13 @@ class AgentWorkerTaskPlanner:
             f"You are worker `{worker_id}` responsible for {owner_scope}. "
             f"Own only these paths unless the coordinator explicitly asks for shared files: {', '.join(path_prefixes) or 'shared workspace slice'}. "
             f"Use the implementation plan ({plan_summary}) and the user's prompt-derived entities/actions as source of truth. "
-            f"Mode depth is {mode_contract.get('depth')}: {mode_contract.get('workflow_bar')}; design bar: {mode_contract.get('design_bar')}. "
+            f"Mode depth is {mode_contract.get('depth')}: {mode_contract.get('workflow_bar')}; page organization: {mode_contract.get('page_bar')}; design bar: {mode_contract.get('design_bar')}. "
+            "Use implementation_plan.routeable_screen_plan for screen intent guidance; choose concrete route names from the prompt and keep only screens that clarify the mobile workflow. "
             "Read the files you need, patch the smallest complete owned slice, run or request the relevant checks, and report exact changed paths and self-check result. "
-            "Do not create templates, seed records, mock records, domain-specific shortcuts, or cross-role navigation links. "
+            "Do not create templates, seed records, mock records, business-category shortcuts, or cross-role navigation links. "
             "Do not copy another role's primary workflow into this role surface: client UI creates the user-provided state, specialist UI operates on existing shared state, manager UI reviews and controls shared state unless the user's prompt explicitly assigns a different action. "
+            "If the prompt assigns shared-state creation to manager or specialist, that role must own the creation form and the client role must load and use that persisted state. "
+            "Role UI workers must split long workflows into routeable child pages under their owned static/<role>/ directory rather than stacking every section on index.html. "
+            "When a role has child pages, its shared app.js must be view-aware: detect body[data-view] or route, guard optional DOM from other pages, and bind every visible form/button/control on root and child pages. "
             "Do not expose raw API paths, HTTP methods, route slugs, role slugs, or enum codes in normal user-facing UI; use readable labels and keep label/value pairs visually separated."
         )

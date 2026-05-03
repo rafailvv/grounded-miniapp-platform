@@ -18,37 +18,6 @@ class AgentStaticValidation:
             imported_names.update(part.split(" as ", 1)[0].strip() for part in parts)
         return imported_names
 
-    @staticmethod
-    def profile_schema_issues(draft_root: Path) -> list[ValidationIssue]:
-        profiles_path = draft_root / "miniapp/app/routes/profiles.py"
-        schemas_path = draft_root / "miniapp/app/schemas.py"
-        if not profiles_path.exists() or not schemas_path.exists():
-            return []
-        profiles_content = profiles_path.read_text(encoding="utf-8")
-        schemas_content = schemas_path.read_text(encoding="utf-8")
-        issues: list[ValidationIssue] = []
-        if "from app.schemas import" in profiles_content and "RoleProfile" in profiles_content and "class RoleProfile" not in schemas_content:
-            issues.append(
-                ValidationIssue(
-                    code="agent_static.profile_schema_contract",
-                    message="routes/profiles.py imports RoleProfile, but schemas.py does not define it.",
-                    severity="high",
-                    location="miniapp/app/schemas.py",
-                    blocking=True,
-                )
-            )
-        if "from app.schemas import" in profiles_content and "AppRole" in profiles_content and "AppRole =" not in schemas_content:
-            issues.append(
-                ValidationIssue(
-                    code="agent_static.profile_schema_contract",
-                    message="routes/profiles.py imports AppRole, but schemas.py does not define it.",
-                    severity="high",
-                    location="miniapp/app/schemas.py",
-                    blocking=True,
-                )
-            )
-        return issues
-
     @classmethod
     def route_schema_issues(cls, draft_root: Path) -> list[ValidationIssue]:
         routes_dir = draft_root / "miniapp/app/routes"

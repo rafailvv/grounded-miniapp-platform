@@ -27,7 +27,7 @@ from app.modules.miniapp_agent_loop.context_pressure import AgentContextPressure
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.rollout_trace import RolloutTraceRecorder
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
-from app.modules.miniapp_agent_loop.tool_agent_runtime import validate_workspace_command
+from app.modules.miniapp_agent_loop.agent_tool_runtime import validate_workspace_command
 from app.modules.miniapp_agent_loop.turn_diff_tracker import AgentTurnDiffTracker
 from app.modules.miniapp_agent_loop.types import AgentTurnPlan
 from app.modules.miniapp_agent_loop.verification_worker import VerificationWorker
@@ -35,6 +35,8 @@ from app.modules.workspace_code_agent_runtime.browser_replay import BrowserProof
 from app.modules.workspace_code_agent_runtime.check_orchestrator import WorkspaceAgentCheckOrchestrator
 from app.modules.workspace_code_agent_runtime.process_recovery import AgentProcessRecovery
 from app.modules.workspace_code_agent_runtime.prompt_contract import agent_system_prompt
+from app.modules.workspace_code_agent_runtime.runtime import WorkspaceCodeAgentRuntime
+from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan
 
 
 def test_code_agent_defaults_to_mini_for_all_generation_modes() -> None:
@@ -49,8 +51,64 @@ def test_agent_prompt_is_tool_loop_contract_not_domain_template() -> None:
 
     assert "plan, inspect, patch the draft, run checks/browser proof" in prompt
     assert "The user prompt is the only product source" in prompt
-    assert "three separate role apps" in prompt
+    assert "three separate multi-page role apps" in prompt
     assert "Do not add mock data, seed data, demo data, sample data" in prompt
+
+
+def test_implementation_plan_has_prompt_derived_routeable_screen_intents() -> None:
+    prompt = (
+        "Я владелец пространства для мероприятий. Клиент должен выбрать формат, дату, "
+        "количество гостей и дополнительные услуги, специалист должен подготовить план, "
+        "обновлять статус подготовки и оставлять комментарии, менеджер должен видеть "
+        "загрузку команды, выручку и позиции, где есть задержки."
+    )
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.BALANCED)
+    plan = build_implementation_plan(
+        prompt=prompt,
+        intent="create",
+        generation_mode=GenerationMode.BALANCED,
+        acceptance_contract=contract,
+    )
+
+    screen_plan = plan["routeable_screen_plan"]
+
+    assert screen_plan["multi_page_recommended"] is True
+    assert screen_plan["no_fixed_page_count"] is True
+    assert screen_plan["route_names_owned_by_agent"] is True
+    assert any(item["intent"] == "create_or_configure" for item in screen_plan["roles"]["client"])
+    assert any(item["intent"] == "detail_or_update" for item in screen_plan["roles"]["specialist"])
+    assert any(item["intent"] == "summary_or_insight" for item in screen_plan["roles"]["manager"])
+
+
+def test_platform_shell_stabilizer_adds_shell_assets_to_plain_html() -> None:
+    html = (
+        "<!doctype html><html><head>"
+        '<link rel="stylesheet" href="/static/client/styles.css">'
+        "</head><body><section>Content</section>"
+        '<script defer src="/static/client/app.js"></script>'
+        "</body></html>"
+    )
+
+    updated = WorkspaceCodeAgentRuntime._ensure_html_platform_shell(html)
+
+    assert '/static/shared/base.css' in updated
+    assert '/static/preview_bridge.js' in updated
+    assert 'class="page-shell"' in updated
+    assert "telegram-top-safe-offset" in updated
+
+
+def test_tool_round_limits_allow_real_agent_inspection_cycles(monkeypatch) -> None:
+    monkeypatch.delenv("WORKSPACE_AGENT_TOOL_ROUND_LIMIT", raising=False)
+    monkeypatch.delenv("WORKSPACE_AGENT_FAST_TOOL_ROUND_LIMIT", raising=False)
+    monkeypatch.delenv("WORKSPACE_AGENT_BALANCED_TOOL_ROUND_LIMIT", raising=False)
+    monkeypatch.delenv("WORKSPACE_AGENT_QUALITY_TOOL_ROUND_LIMIT", raising=False)
+
+    assert WorkspaceCodeAgentRuntime._tool_round_limit(GenerationMode.FAST) >= 2
+    assert WorkspaceCodeAgentRuntime._tool_round_limit(GenerationMode.BALANCED) >= 4
+    assert WorkspaceCodeAgentRuntime._tool_round_limit(GenerationMode.QUALITY) >= 6
+
+    monkeypatch.setenv("WORKSPACE_AGENT_FAST_TOOL_ROUND_LIMIT", "3")
+    assert WorkspaceCodeAgentRuntime._tool_round_limit(GenerationMode.FAST) == 3
 
 
 def test_agent_tools_batch_reads_and_serialize_mutations() -> None:
@@ -301,6 +359,45 @@ def test_context_pressure_recommends_compaction_for_large_payload() -> None:
     assert {item["kind"] for item in pressure["suggestions"]} & {"narrow_file_context", "spill_tool_results", "compact_memory"}
 
 
+def test_context_pressure_detects_duplicate_reads_from_transcript() -> None:
+    transcript = {
+        "events": [
+            {
+                "event_type": "model_turn",
+                "payload": {
+                    "tool_calls": [
+                        {"tool_use_id": "read_1", "tool": "read_files", "targets": ["miniapp/app/main.py"]},
+                    ]
+                },
+            },
+            {
+                "event_type": "tool_call",
+                "payload": {
+                    "tool_use_id": "read_2",
+                    "tool": "read_files",
+                    "arguments": {"targets": ["miniapp/app/main.py"]},
+                },
+            },
+            {
+                "event_type": "tool_call",
+                "payload": {
+                    "tool_use_id": "read_3",
+                    "tool": "read_files",
+                    "arguments": {"targets": ["miniapp/app/static/client/app.js"]},
+                },
+            },
+        ]
+    }
+    pressure = AgentContextPressureAnalyzer().analyze_transcript(
+        transcript,
+        current_file_contexts={"miniapp/app/main.py": "x" * 20_000, "miniapp/app/static/client/app.js": "y" * 80},
+    )
+
+    assert pressure["compact_recommended"] is True
+    assert pressure["duplicate_file_reads"][0]["path"] == "miniapp/app/main.py"
+    assert pressure["suggestions"][0]["kind"] == "avoid_duplicate_reads"
+
+
 def test_hook_manager_records_lifecycle_events() -> None:
     hooks = AgentHookManager()
     hooks.record("run_1", "pre_tool_use", status="started", payload={"tool": "read_files"})
@@ -541,6 +638,18 @@ def test_worker_branch_loop_runs_own_tool_transcript_and_patch(tmp_path: Path) -
     branch_source = tmp_path / "branch"
     (branch_source / "miniapp/app/static/client").mkdir(parents=True)
     (branch_source / "miniapp/app/static/client/app.js").write_text("console.log('base');\n", encoding="utf-8")
+    (branch_source / "miniapp/app/static/client/index.html").write_text(
+        "<main><form id='main-form'><button type='submit'>Save</button></form></main>",
+        encoding="utf-8",
+    )
+    (branch_source / "miniapp/app/static/client/styles.css").write_text(
+        ".page{display:block}.card{padding:12px}.button{min-height:44px}\n",
+        encoding="utf-8",
+    )
+    for slug in ("list", "detail"):
+        page_dir = branch_source / "miniapp/app/static/client" / slug
+        page_dir.mkdir(parents=True)
+        (page_dir / "index.html").write_text("<main><button>Open</button></main>", encoding="utf-8")
 
     class OpenAIStub:
         def generate_agent_tool_step(self, **_: object) -> dict[str, object]:
@@ -554,7 +663,10 @@ def test_worker_branch_loop_runs_own_tool_transcript_and_patch(tmp_path: Path) -
                             "tool": "write_file",
                             "tool_use_id": "call_1",
                             "file_path": "miniapp/app/static/client/app.js",
-                            "content": "console.log('client branch');\n",
+                            "content": (
+                                "document.querySelector('#main-form')?.addEventListener('submit', event => {"
+                                "event.preventDefault(); fetch('/api/entities', { method: 'POST', body: '{}' }); });\n"
+                            ),
                             "reason": "create owned client behavior",
                         }
                     ],
@@ -598,7 +710,7 @@ def test_worker_branch_loop_runs_own_tool_transcript_and_patch(tmp_path: Path) -
         parent_run_id="run_main",
         branch_run_id="run_main__worker__client_ui",
         branch_source=branch_source,
-        generation_mode=GenerationMode.BALANCED,
+        generation_mode=GenerationMode.FAST,
         model_profile="",
         user_prompt="Build a role-separated mobile mini-app.",
         worker_task={"worker_id": "client_ui", "owner_scope": "client role app"},
@@ -610,7 +722,7 @@ def test_worker_branch_loop_runs_own_tool_transcript_and_patch(tmp_path: Path) -
     assert result.transcript["counts"]["model_turn"] == 1
     assert result.transcript["counts"]["file_change"] == 1
     assert result.changed_files == ["miniapp/app/static/client/app.js"]
-    assert "client branch" in (branch_source / "miniapp/app/static/client/app.js").read_text(encoding="utf-8")
+    assert "method: 'POST'" in (branch_source / "miniapp/app/static/client/app.js").read_text(encoding="utf-8")
 
 
 def test_verification_worker_requires_real_browser_proof() -> None:

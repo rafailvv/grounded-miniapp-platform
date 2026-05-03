@@ -575,7 +575,7 @@ class AgentToolCallLoop:
                     "file_changes": [
                         {
                             "file_path": operation.file_path,
-                            "operation": operation.operation,
+                            "change_type": operation.operation,
                             "reason": operation.reason,
                         }
                         for operation in synced_file_changes

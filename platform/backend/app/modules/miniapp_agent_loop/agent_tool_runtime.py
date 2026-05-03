@@ -11,6 +11,7 @@ from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 
 MAX_TOOL_OUTPUT_CHARS = 6000
 
+
 def normalize_tool_calls(raw_tool_calls: list[Any]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     if not isinstance(raw_tool_calls, list):

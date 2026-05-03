@@ -17,7 +17,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from app.models.common import GenerationMode
@@ -82,7 +82,6 @@ ROLE_LINK_STOPWORDS = {
     "экран",
     "приложение",
 }
-MIN_ROLE_ROUTE_PAGES = 3
 PRELOADED_BUSINESS_DATA_MARKERS = (
     "mock data",
     "mock-data",
@@ -961,6 +960,11 @@ class CheckRunner:
                 (form_id and cls._js_has_submit_handler_for_id(js_source, form_id))
                 or any(cls._js_has_submit_handler_for_selector(js_source, selector) for selector in form_selectors)
             )
+            form_has_field_event_handler = bool(
+                (form_id and cls._js_has_field_event_handler_for_id(js_source, form_id))
+                or any(cls._js_has_field_event_handler_for_selector(js_source, selector) for selector in form_selectors)
+            )
+            form_requires_submit_handler = bool(form.get("has_submit_control"))
             if not form_referenced:
                 issues.append(
                     ValidationIssue(
@@ -972,11 +976,11 @@ class CheckRunner:
                     )
                 )
                 continue
-            if not form_has_submit_handler:
+            if not form_has_submit_handler and not (form_has_field_event_handler and not form_requires_submit_handler):
                 issues.append(
                     ValidationIssue(
                         code="platform.workflow_form_without_submit_handler",
-                        message=f"{relative_path} form {form_label} is referenced by JavaScript but no submit handler is wired for it.",
+                        message=f"{relative_path} form {form_label} is referenced by JavaScript but no submit/change handler is wired for it.",
                         severity="high",
                         location=relative_path,
                         blocking=True,
@@ -1515,6 +1519,11 @@ class CheckRunner:
                 name_match.group("name")
                 for name_match in re.finditer(r"\bname\s*=\s*([\"'])(?P<name>[A-Za-z0-9_-]+)\1", body, re.IGNORECASE)
             }
+            has_submit_control = bool(
+                re.search(r"<input\b(?=[^>]*\btype\s*=\s*([\"'])submit\1)", body, re.IGNORECASE | re.DOTALL)
+                or re.search(r"<button\b(?=[^>]*\btype\s*=\s*([\"'])submit\1)", body, re.IGNORECASE | re.DOTALL)
+                or re.search(r"<button\b(?![^>]*\btype\s*=)", body, re.IGNORECASE | re.DOTALL)
+            )
             field_ids_by_name: dict[str, str] = {}
             for field_match in re.finditer(r"<(?:input|select|textarea)\b(?P<attrs>[^>]*)>", body, re.IGNORECASE | re.DOTALL):
                 field_attrs = field_match.group("attrs") or ""
@@ -1528,6 +1537,7 @@ class CheckRunner:
                     "selectors": selectors,
                     "field_names": sorted(names),
                     "field_ids_by_name": field_ids_by_name,
+                    "has_submit_control": has_submit_control,
                 }
             )
         return forms
@@ -1593,6 +1603,20 @@ class CheckRunner:
             return False
         text = str(js_source or "")
         return bool(re.search(r"\.addEventListener\(\s*([\"'])submit\1", text) or re.search(r"\bonsubmit\s*=", text))
+
+    @staticmethod
+    def _js_has_field_event_handler_for_id(js_source: str, dom_id: str) -> bool:
+        if not CheckRunner._js_references_dom_id(js_source, dom_id):
+            return False
+        text = str(js_source or "")
+        return bool(re.search(r"\.addEventListener\(\s*([\"'])(?:change|input)\1", text))
+
+    @staticmethod
+    def _js_has_field_event_handler_for_selector(js_source: str, selector: str) -> bool:
+        if not CheckRunner._js_references_selector(js_source, selector):
+            return False
+        text = str(js_source or "")
+        return bool(re.search(r"\.addEventListener\(\s*([\"'])(?:change|input)\1", text))
 
     @staticmethod
     def _js_reads_form_field(js_source: str, field_name: str) -> bool:
@@ -1975,6 +1999,7 @@ class CheckRunner:
             )
             preview_url = str(proof.get("preview_url") or preview_url)
         else:
+            preview_url = self._reachable_preview_base_url(preview_url)
             proof = self._run_real_browser_ui_flow(
                 source_dir=source_dir,
                 preview_url=preview_url,
@@ -2100,7 +2125,7 @@ class CheckRunner:
         This keeps create/workflow verification code-agent-like: the platform
         executes the generated app and proves behavior even when the shared
         Docker preview service is unavailable. The generated source is not
-        changed and no domain-specific assumptions are introduced.
+        changed and no business-category assumptions are introduced.
         """
         miniapp_dir = source_dir / "miniapp"
         if not miniapp_dir.exists():
@@ -3520,8 +3545,9 @@ except Exception as exc:
             )
         failures: list[str] = []
         logs: list[str] = []
+        preview_base_url = self._reachable_preview_base_url(str(preview.url or ""))
         for route in routes:
-            target = urljoin(preview.url.rstrip("/") + "/", route.lstrip("/"))
+            target = urljoin(preview_base_url.rstrip("/") + "/", route.lstrip("/"))
             final_failure: str | None = None
             for attempt in range(1, 4):
                 try:
@@ -3556,6 +3582,36 @@ except Exception as exc:
             logs=failures or logs,
             diagnostics={"routes_checked": routes},
         )
+
+    @classmethod
+    def _reachable_preview_base_url(cls, preview_url: str) -> str:
+        original = str(preview_url or "").strip().rstrip("/")
+        if not original:
+            return original
+        for candidate in cls._preview_base_url_candidates(original):
+            try:
+                request = Request(candidate.rstrip("/") + "/health", headers={"User-Agent": "preview-url-probe"})
+                with urlopen(request, timeout=1.2) as response:
+                    status_code = response.status if hasattr(response, "status") else response.getcode()
+                if status_code < 400:
+                    return candidate.rstrip("/")
+            except (TimeoutError, URLError, OSError):
+                continue
+        return original
+
+    @staticmethod
+    def _preview_base_url_candidates(preview_url: str) -> list[str]:
+        parsed = urlparse(str(preview_url or "").strip())
+        if not parsed.scheme or not parsed.netloc:
+            return [str(preview_url or "").rstrip("/")]
+        host = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        candidates: list[str] = []
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            for candidate_host in ("host.docker.internal", "127.0.0.1", "localhost"):
+                candidates.append(urlunparse((parsed.scheme, f"{candidate_host}{port}", "", "", "", "")))
+        candidates.append(urlunparse((parsed.scheme, parsed.netloc, "", "", "", "")))
+        return list(dict.fromkeys(candidate.rstrip("/") for candidate in candidates if candidate))
 
     @staticmethod
     def _root_preview_routes(source_dir: Path) -> list[str]:
@@ -3607,7 +3663,6 @@ except Exception as exc:
             or path.startswith("miniapp/app/generated/")
             for path in relevant_changed
         ):
-            issues.extend(AgentStaticValidation.profile_schema_issues(source_dir))
             issues.extend(AgentStaticValidation.route_schema_issues(source_dir))
         if agentic_scope:
             role_issues, role_coverage, neutral_template_findings = self._role_surface_issues(
@@ -3663,7 +3718,7 @@ except Exception as exc:
         role_tokens: dict[str, set[str]] = {}
         role_surface_text: dict[str, str] = {}
         route_pages = cls._routeable_role_pages(source_dir)
-        min_role_route_pages = cls._min_role_route_pages(generation_mode)
+        del generation_mode
 
         for role in ROLE_ORDER:
             role_dir = source_dir / "miniapp" / "app" / "static" / role
@@ -3848,7 +3903,6 @@ except Exception as exc:
                     "status": "missing_role_actions",
                     "route_count": len(role_routes),
                     "secondary_route_count": len(secondary_routes),
-                    "required_route_count": min_role_route_pages,
                     "routes": role_routes,
                 }
                 issues.append(
@@ -3870,7 +3924,6 @@ except Exception as exc:
                 "files": [path.relative_to(source_dir).as_posix() for path in expected_files.values()],
                 "route_count": len(role_routes),
                 "secondary_route_count": len(secondary_routes),
-                "required_route_count": min_role_route_pages,
                 "routes": role_routes,
                 "semantic_token_count": len(role_tokens[role]),
                 "action_signals": action_signals,
@@ -3905,11 +3958,6 @@ except Exception as exc:
                 )
             coverage["shared_semantic_tokens"] = sorted(shared_tokens)[:12]
         return issues, coverage, neutral_findings
-
-    @staticmethod
-    def _min_role_route_pages(generation_mode: GenerationMode | str | None) -> int:
-        del generation_mode
-        return 1
 
     @staticmethod
     def _cross_role_surface_markers(role: str, content: str) -> list[str]:
@@ -4450,7 +4498,6 @@ except Exception as exc:
                 "status": payload.get("status"),
                 "route_count": payload.get("route_count"),
                 "secondary_route_count": payload.get("secondary_route_count"),
-                "required_route_count": payload.get("required_route_count") or MIN_ROLE_ROUTE_PAGES,
                 "routes": payload.get("routes") or [],
             }
         return coverage

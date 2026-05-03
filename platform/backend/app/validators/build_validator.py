@@ -64,22 +64,38 @@ class BuildValidator:
         if not pages:
             pages = self._filesystem_static_pages(workspace_path)
         issues: list[ValidationIssue] = []
-        seen_routes: set[str] = set()
+        seen_routes: dict[str, str] = {}
         for page in pages:
             route_path = str(page.get("route_path") or "").strip() or "/"
             route_key = route_path.rstrip("/") or "/"
-            if route_key in seen_routes:
+            file_key = self._canonical_manifest_file_ref(str(page.get("file_path") or ""))
+            existing_file = seen_routes.get(route_key)
+            if existing_file is not None and existing_file != file_key:
                 issues.append(
                     ValidationIssue(
                         code="build.duplicate_static_route",
-                        message=f"Duplicate static route declared: {route_path}",
+                        message=(
+                            f"Duplicate static route declared: {route_path} maps to both "
+                            f"{existing_file or '<missing>'} and {file_key or '<missing>'}"
+                        ),
                         severity="high",
                         location="miniapp/app/generated/route_manifest.json",
                     )
                 )
-            seen_routes.add(route_key)
+                continue
+            if existing_file is not None:
+                continue
+            seen_routes[route_key] = file_key
             issues.extend(self._static_page_issues(workspace_path, page))
         return issues
+
+    @staticmethod
+    def _canonical_manifest_file_ref(file_ref: str) -> str:
+        normalized = str(file_ref or "").strip().replace("\\", "/").lstrip("/")
+        for prefix in ("miniapp/app/", "app/"):
+            if normalized.startswith(prefix):
+                normalized = normalized.removeprefix(prefix)
+        return posixpath.normpath(normalized) if normalized else ""
 
     @classmethod
     def _manifest_pages(cls, workspace_path: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:

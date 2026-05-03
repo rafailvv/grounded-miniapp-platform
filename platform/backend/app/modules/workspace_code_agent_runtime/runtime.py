@@ -51,7 +51,7 @@ from app.modules.miniapp_agent_loop.context_pressure import AgentContextPressure
 from app.modules.miniapp_agent_loop.environment_snapshot import AgentEnvironmentSnapshot
 from app.modules.miniapp_agent_loop.rollout_trace import RolloutTraceRecorder
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
-from app.modules.miniapp_agent_loop.tool_agent_runtime import (
+from app.modules.miniapp_agent_loop.agent_tool_runtime import (
     normalize_tool_calls,
     truncate_tool_text,
     validate_workspace_command,
@@ -73,7 +73,7 @@ from app.modules.workspace_code_agent_runtime.process_recovery import AgentProce
 from app.modules.workspace_code_agent_runtime.tool_executor import AgentToolExecutor
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
-from app.services.platform_shell import BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
+from app.services.platform_shell import BASE_STYLESHEET_HREF, BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
 from app.services.workflow_acceptance import (
     build_acceptance_contract,
     build_implementation_plan,
@@ -600,14 +600,91 @@ class WorkspaceCodeAgentRuntime:
                     original = html_path.read_text(encoding="utf-8")
                 except OSError:
                     continue
-                if "page-shell" not in original:
-                    continue
-                updated = self._ensure_page_shell_inline_safe_spacing(original)
-                updated = self._ensure_preview_bridge_script(updated)
+                updated = self._ensure_html_platform_shell(original)
                 if updated != original:
                     html_path.write_text(updated, encoding="utf-8")
                     stabilized.append(html_path.relative_to(source_dir).as_posix())
+            if self._sync_route_manifest_from_static_pages(source_dir):
+                stabilized.append("miniapp/app/generated/route_manifest.json")
         return list(dict.fromkeys(stabilized))
+
+    @staticmethod
+    def _sync_route_manifest_from_static_pages(source_dir: Path) -> bool:
+        """Keep platform routing metadata aligned with generated role pages.
+
+        This does not generate product UI or business data. It only makes every
+        existing static role page reachable through the mini-app shell so
+        tests, preview, and browser proof operate on the same route graph.
+        """
+        static_root = source_dir / "miniapp/app/static"
+        if not static_root.exists():
+            return False
+        generated_dir = source_dir / "miniapp/app/generated"
+        manifest_path = generated_dir / "route_manifest.json"
+        existing: dict[str, Any] = {}
+        if manifest_path.exists():
+            try:
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (OSError, ValueError):
+                existing = {}
+        roles_payload: dict[str, Any] = {}
+        for role in ROLE_ORDER:
+            role_root = static_root / role
+            if not role_root.exists():
+                continue
+            pages: list[dict[str, str]] = []
+            routes: dict[str, str] = {}
+            for html_path in sorted(role_root.rglob("index.html")):
+                if not html_path.is_file():
+                    continue
+                rel_to_role = html_path.relative_to(role_root).as_posix()
+                if rel_to_role == "index.html":
+                    route_path = f"/{role}"
+                    page_id = "root"
+                    label = "Главная"
+                else:
+                    slug = rel_to_role.removesuffix("/index.html").strip("/")
+                    route_path = f"/{role}/{slug}".rstrip("/")
+                    page_id = slug.replace("/", "-") or "page"
+                    label = slug.replace("_", " ").replace("-", " ").title() or "Page"
+                file_ref = html_path.relative_to(source_dir / "miniapp/app").as_posix()
+                page = {
+                    "id": page_id,
+                    "route_path": route_path,
+                    "file_path": file_ref,
+                    "navigation_label": label,
+                }
+                script_ref = html_path.with_name("app.js")
+                style_ref = html_path.with_name("styles.css")
+                if script_ref.exists():
+                    page["script_path"] = script_ref.relative_to(source_dir / "miniapp/app").as_posix()
+                if style_ref.exists():
+                    page["style_path"] = style_ref.relative_to(source_dir / "miniapp/app").as_posix()
+                pages.append(page)
+                routes[route_path] = file_ref
+            if pages:
+                roles_payload[role] = {"pages": pages, "routes": routes}
+        if not roles_payload:
+            return False
+        updated = {
+            **existing,
+            "roles": roles_payload,
+            "shared": existing.get("shared") if isinstance(existing.get("shared"), dict) else {},
+        }
+        rendered = json.dumps(updated, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        original = ""
+        if manifest_path.exists():
+            try:
+                original = manifest_path.read_text(encoding="utf-8")
+            except OSError:
+                original = ""
+        if rendered == original:
+            return False
+        generated_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(rendered, encoding="utf-8")
+        return True
 
     def _enforce_patch_first_file_changes(
         self,
@@ -739,6 +816,67 @@ class WorkspaceCodeAgentRuntime:
             update_tag,
             str(content or ""),
             flags=re.IGNORECASE,
+        )
+
+    @classmethod
+    def _ensure_html_platform_shell(cls, content: str) -> str:
+        text = cls._ensure_base_stylesheet_link(str(content or ""))
+        text = cls._ensure_page_shell_root(text)
+        return cls._ensure_preview_bridge_script(text)
+
+    @staticmethod
+    def _ensure_base_stylesheet_link(content: str) -> str:
+        text = str(content or "")
+        if BASE_STYLESHEET_HREF in text:
+            return text
+        link = f'    <link rel="stylesheet" href="{BASE_STYLESHEET_HREF}" />\n'
+        role_style = re.search(
+            r"^[ \t]*<link\b[^>]+href=[\"']/static/(?:client|specialist|manager)/styles\.css[\"'][^>]*>\s*$",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if role_style:
+            return text[: role_style.start()] + link + text[role_style.start() :]
+        head_close = re.search(r"</head\s*>", text, flags=re.IGNORECASE)
+        if head_close:
+            return text[: head_close.start()] + link + text[head_close.start() :]
+        return link + text
+
+    @classmethod
+    def _ensure_page_shell_root(cls, content: str) -> str:
+        text = str(content or "")
+        if "page-shell" in text:
+            return cls._ensure_page_shell_inline_safe_spacing(text)
+
+        def update_main(match: re.Match[str]) -> str:
+            tag = match.group(0)
+            class_match = re.search(r"""\bclass=(?P<quote>["'])(?P<value>.*?)(?P=quote)""", tag, flags=re.IGNORECASE | re.DOTALL)
+            if class_match:
+                class_value = class_match.group("value").strip()
+                updated_class = f"{class_value} page-shell".strip()
+                start, end = class_match.span("value")
+                tag = f"{tag[:start]}{updated_class}{tag[end:]}"
+            else:
+                tag = tag[:-1].rstrip() + ' class="page-shell">'
+            return tag
+
+        if re.search(r"<main\b", text, flags=re.IGNORECASE):
+            updated = re.sub(r"<main\b[^>]*>", update_main, text, count=1, flags=re.IGNORECASE | re.DOTALL)
+            return cls._ensure_page_shell_inline_safe_spacing(updated)
+
+        body_match = re.search(r"<body\b[^>]*>", text, flags=re.IGNORECASE)
+        body_close = re.search(r"</body\s*>", text, flags=re.IGNORECASE)
+        if body_match and body_close and body_close.start() >= body_match.end():
+            inner = text[body_match.end() : body_close.start()]
+            wrapped = (
+                f'\n    <main class="page-shell" style="{PAGE_SHELL_INLINE_STYLE}">'
+                f"{inner.rstrip()}\n    </main>\n  "
+            )
+            return text[: body_match.end()] + wrapped + text[body_close.start() :]
+        return (
+            f'<main class="page-shell" style="{PAGE_SHELL_INLINE_STYLE}">\n'
+            f"{text.rstrip()}\n"
+            "</main>\n"
         )
 
     @staticmethod
@@ -1005,6 +1143,10 @@ class WorkspaceCodeAgentRuntime:
                 worker_prefix=worker_prefix,
             )
             if branch_changed_files:
+                stabilized = self._stabilize_platform_shell(workspace_id, run_id, draft_source, branch_changed_files)
+                if stabilized:
+                    self.file_state_cache.invalidate(run_id, stabilized)
+                    branch_changed_files = list(dict.fromkeys([*branch_changed_files, *stabilized]))
                 last_changed_files = branch_changed_files
                 branch_initial_message = branch_message
 
@@ -2048,9 +2190,18 @@ class WorkspaceCodeAgentRuntime:
             has_draft_diff = bool(current_draft_diff)
             create_turn = intent_value == "create"
             create_repair_turn = create_turn and has_draft_diff
-            generated_tests_repair = create_repair_turn and self._generated_tests_repair_needed(latest_execution)
-            workflow_slice_repair = create_repair_turn and not generated_tests_repair and self._workflow_slice_repair_needed(latest_execution)
-            browser_step_repair = create_repair_turn and not generated_tests_repair and self._browser_step_repair_needed(latest_execution)
+            browser_step_repair = create_repair_turn and self._browser_step_repair_needed(latest_execution)
+            workflow_slice_repair = (
+                create_repair_turn
+                and not browser_step_repair
+                and self._workflow_slice_repair_needed(latest_execution)
+            )
+            generated_tests_repair = (
+                create_repair_turn
+                and not browser_step_repair
+                and not workflow_slice_repair
+                and self._generated_tests_repair_needed(latest_execution)
+            )
             isolate_compact_repair = create_repair_turn and (generated_tests_repair or browser_step_repair or repeated_no_progress > 0)
             fast_create_turn = generation_mode == GenerationMode.FAST and create_turn
             focused_edit_kind = self._focused_edit_kind(request)
@@ -2359,11 +2510,25 @@ class WorkspaceCodeAgentRuntime:
         compact_repair_prompt = has_draft_diff and (
             intent_value == "create" or focused_edit_kind == "behavior_workflow_edit"
         )
-        missing_generated_tests_repair = compact_repair_prompt and self._missing_generated_tests_repair_needed(latest_execution)
-        stale_generated_tests_repair = compact_repair_prompt and self._stale_generated_tests_repair_needed(latest_execution)
+        browser_step_repair = compact_repair_prompt and self._browser_step_repair_needed(latest_execution)
+        workflow_slice_repair = (
+            compact_repair_prompt
+            and not browser_step_repair
+            and self._workflow_slice_repair_needed(latest_execution)
+        )
+        missing_generated_tests_repair = (
+            compact_repair_prompt
+            and not browser_step_repair
+            and not workflow_slice_repair
+            and self._missing_generated_tests_repair_needed(latest_execution)
+        )
+        stale_generated_tests_repair = (
+            compact_repair_prompt
+            and not browser_step_repair
+            and not workflow_slice_repair
+            and self._stale_generated_tests_repair_needed(latest_execution)
+        )
         generated_tests_repair = missing_generated_tests_repair or stale_generated_tests_repair
-        workflow_slice_repair = compact_repair_prompt and not generated_tests_repair and self._workflow_slice_repair_needed(latest_execution)
-        browser_step_repair = compact_repair_prompt and not generated_tests_repair and self._browser_step_repair_needed(latest_execution)
         acceptance_contract = build_acceptance_contract(
             prompt=request.prompt,
             intent=intent_value,
@@ -2499,6 +2664,11 @@ class WorkspaceCodeAgentRuntime:
                 max_chars=900,
                 max_items=6,
             ),
+            "first_blocking_issue": (
+                self._first_blocking_issue_from_execution(latest_execution)
+                if compact_repair_prompt
+                else {}
+            ),
             "tool_registry": self._agent_tool_registry_payload(
                 {"apply_patch_to_draft", "write_file"}
                 if generated_tests_repair or browser_step_repair or (compact_repair_prompt and repeated_no_progress > 0)
@@ -2513,6 +2683,9 @@ class WorkspaceCodeAgentRuntime:
                 else
                 "Create or replace both missing generated test files now: miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. In the same coherent patch, also fix the first API/frontend schema mismatch from latest_checks if one is listed. Do not spend this turn only on CSS, copy, or a single frontend mismatch while generated tests are absent."
                 if missing_generated_tests_repair
+                else
+                "Repeated no-progress repair: patch only first_blocking_issue in source files. Do not edit generated tests unless first_blocking_issue itself is a generated test. For role child-page form/control issues, update the role app.js to be view-aware and bind that child page's visible controls."
+                if compact_repair_prompt and repeated_no_progress > 0
                 else
                 "Repair the connected workflow slice from latest_checks in one coherent mutating tool batch touching only the named backend/role/test files; keep selectors, payloads, routes, and generated tests aligned together."
                 if workflow_slice_repair
@@ -2580,6 +2753,7 @@ class WorkspaceCodeAgentRuntime:
                     missing_generated_tests_repair=missing_generated_tests_repair,
                     stale_generated_tests_repair=stale_generated_tests_repair,
                     browser_step_repair=browser_step_repair,
+                    repeated_no_progress=repeated_no_progress,
                 )
                 if compact_repair_prompt
                 else [
@@ -2588,6 +2762,7 @@ class WorkspaceCodeAgentRuntime:
                     "Use the implementation_plan and acceptance_contract as the product contract. Derive entities, fields, routes, labels, and role actions from the user's prompt and current code, not from platform templates.",
                     "Create/workflow completion requires real UI controls, JavaScript handlers, backend persistence, generated tests, cross-role visibility, refresh persistence, and browser/mobile proof.",
                     "Build three isolated role surfaces in the miniapp shell: client creates/submits the main prompt-derived state, specialist processes or updates it, manager reviews/control-checks the persisted state. Do not link role roots to each other.",
+                    "For multi-page role apps, shared static/<role>/app.js must initialize per page: use body[data-view] or route, guard optional DOM nodes from other pages, and bind every visible child-page form/button/control to persisted API behavior.",
                     "The client/source role must display both its original submitted state and the persisted progress/update fields changed by specialist or manager roles after reload.",
                     "User-facing UI copy must be polished business language: do not render raw API paths, HTTP methods, internal route names, role slugs, or enum codes like `new`/`preparing`; map persisted values to human-readable labels and keep label/value pairs visually separated.",
                     "In async JavaScript form handlers, capture DOM nodes before any await, for example `const form = event.currentTarget`, then use `form.reset()` after awaited API calls. Do not read `event.currentTarget` after await because browsers clear it after dispatch.",
@@ -3347,9 +3522,25 @@ class WorkspaceCodeAgentRuntime:
             payload = json.loads(prompt_payload)
         except json.JSONDecodeError:
             payload = {"raw_prompt": prompt_payload}
-        pressure = self.context_pressure.analyze_payload(payload)
-        pressure.update({"attempt": attempt, "tool_round": tool_round, "created_at": datetime.now(timezone.utc).isoformat()})
         artifact_run_id = run_id or job.job_id
+        pressure = self.context_pressure.analyze_payload(payload)
+        transcript_pressure = self.context_pressure.analyze_transcript(
+            self.transcript_store.snapshot(artifact_run_id),
+            current_file_contexts=payload.get("file_contexts") if isinstance(payload.get("file_contexts"), dict) else {},
+        )
+        if transcript_pressure.get("duplicate_file_reads"):
+            pressure["duplicate_file_reads"] = transcript_pressure.get("duplicate_file_reads")
+            pressure["duplicate_read_token_estimate"] = transcript_pressure.get("duplicate_read_token_estimate")
+        transcript_suggestions = [
+            item for item in transcript_pressure.get("suggestions") or [] if isinstance(item, dict)
+        ]
+        if transcript_suggestions:
+            pressure["suggestions"] = [
+                *[item for item in pressure.get("suggestions") or [] if isinstance(item, dict)],
+                *transcript_suggestions,
+            ]
+            pressure["compact_recommended"] = True
+        pressure.update({"attempt": attempt, "tool_round": tool_round, "created_at": datetime.now(timezone.utc).isoformat()})
         self.context_pressure_history.setdefault(artifact_run_id, []).append(pressure)
         job.context_pressure_ref = job.context_pressure_ref or f"context_pressure:{workspace_id}:{artifact_run_id}"
         self._store_report(
@@ -3365,7 +3556,17 @@ class WorkspaceCodeAgentRuntime:
             "pressure_ratio": pressure.get("pressure_ratio"),
             "compact_recommended": pressure.get("compact_recommended"),
             "suggestions": pressure.get("suggestions"),
+            "duplicate_file_reads": pressure.get("duplicate_file_reads"),
         }
+        if pressure.get("duplicate_file_reads"):
+            payload["read_cache_hints"] = {
+                "avoid_re_reading": [
+                    item.get("path")
+                    for item in pressure.get("duplicate_file_reads") or []
+                    if isinstance(item, dict) and item.get("path")
+                ][:8],
+                "rule": "Use cached file_contexts/current diff for these paths unless they were mutated after the last read or a precise missing line range is required.",
+            }
         if pressure.get("compact_recommended"):
             self._append_activity(
                 job,
@@ -3446,6 +3647,7 @@ class WorkspaceCodeAgentRuntime:
         missing_generated_tests_repair: bool = False,
         stale_generated_tests_repair: bool = False,
         browser_step_repair: bool = False,
+        repeated_no_progress: int = 0,
     ) -> list[str]:
         del generation_mode, focused_edit_kind
         rules = [
@@ -3458,7 +3660,12 @@ class WorkspaceCodeAgentRuntime:
             "The source/user-facing role must render the persisted fields that operational roles can update, such as status, notes, comments, assignment, payment, or other prompt-derived progress fields. It is not enough to show only the fields originally submitted by the user.",
             "Generated tests should verify the actual app contract. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods; use FastAPI TestClient as a context manager when app lifespan creates tables; never replace tests with pytest-only top-level functions. JS generated tests run from cwd=miniapp, so path reads should be app/static/... and app/generated/.... Patch stale/brittle test expectations only when the app behavior is already correct.",
             "Mobile layout fixes must target 360-430px width: no horizontal scroll, no overlapping critical cards/forms/actions, and readable wrapping.",
+            "For multi-page role apps, a shared static/<role>/app.js must be view-aware: branch by body[data-view] or route, guard optional DOM nodes that exist only on other pages, and bind every visible form/button/control on root and child pages.",
         ]
+        if repeated_no_progress > 0:
+            rules.append(
+                "This failure signature repeated. Do not patch broad slices or generated tests first. Patch only the first blocking source issue from first_blocking_issue, preferably by replacing the one failing role app.js or child-page HTML file when a hunk patch keeps missing the handler."
+            )
         if workflow_slice_repair and not browser_step_repair:
             rules.append(
                 "Repair the complete connected workflow slice in one focused patch: relevant backend route/schema, one or more role HTML/JS/CSS files, and generated tests if they are stale."
@@ -3476,6 +3683,64 @@ class WorkspaceCodeAgentRuntime:
                 "This turn is for stale generated acceptance tests. Compare miniapp/tests/* expectations against current role HTML/JS and backend routes. Prefer patching only generated tests when they assert old selectors, class names, labels, paths, or API shapes; patch app code only if the test failure proves a real workflow bug. Do not chase browser proof in the same turn."
             )
         return rules
+
+    @staticmethod
+    def _first_blocking_issue_from_execution(execution: CheckExecutionRecord) -> dict[str, object]:
+        priority = {
+            "changed_files_static": 0,
+            "platform_invariants": 1,
+            "frontend_interaction_static_smoke": 2,
+            "browser_flow_smoke": 3,
+            "generated_app_python_tests": 4,
+            "generated_app_js_tests": 5,
+            "connectivity_validators": 6,
+        }
+        for result in sorted(
+            [item for item in execution.results if item.status == "failed"],
+            key=lambda item: priority.get(str(item.name), 20),
+        ):
+            for line in result.logs or []:
+                try:
+                    issue = json.loads(str(line))
+                except ValueError:
+                    issue = None
+                if not isinstance(issue, dict):
+                    continue
+                blocking = bool(issue.get("blocking")) or str(issue.get("severity") or "").lower() in {"high", "critical"}
+                if not blocking:
+                    continue
+                location = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(
+                    str(issue.get("location") or issue.get("path") or issue.get("file_path") or "")
+                )
+                role_match = re.search(r"miniapp/app/static/(?P<role>client|specialist|manager)/", location)
+                role = role_match.group("role") if role_match else ""
+                code = str(issue.get("code") or "")
+                next_action = (
+                    "Patch the named role UI source, not generated tests: make the role app.js page-aware, reference the visible form/control from the child page, attach the needed submit/click/change handler, send the persisted API payload, refresh rendered state, and guard optional DOM nodes from other pages."
+                    if code.startswith("platform.workflow_")
+                    else "Patch the named source file or directly connected source file before changing generated tests."
+                )
+                return {
+                    "check": result.name,
+                    "code": code,
+                    "message": str(issue.get("message") or "")[:1000],
+                    "location": location,
+                    "role": role,
+                    "required_next_action": next_action,
+                }
+            diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+            location = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(
+                str(diagnostics.get("location") or diagnostics.get("path") or diagnostics.get("file_path") or "")
+            )
+            if location:
+                return {
+                    "check": result.name,
+                    "code": str(diagnostics.get("code") or result.name),
+                    "message": str(result.details or "")[:1000],
+                    "location": location,
+                    "required_next_action": "Patch the named source file and the smallest connected workflow slice.",
+                }
+        return {}
 
     @staticmethod
     def _target_files_from_execution(execution: CheckExecutionRecord) -> list[str]:
@@ -4189,7 +4454,7 @@ class WorkspaceCodeAgentRuntime:
         patch_history = [
             {
                 "file_path": operation.file_path,
-                "operation": operation.operation,
+                "change_type": operation.operation,
                 "reason": operation.reason,
                 "owner": self._worker_owner_for_path(operation.file_path),
                 "has_content": bool(operation.content),
@@ -4453,6 +4718,8 @@ class WorkspaceCodeAgentRuntime:
             "miniapp/app/schemas.py",
         }:
             return "backend_api"
+        if normalized.startswith("miniapp/app/generated/") or normalized.startswith("miniapp/app/static/shared/"):
+            return "shared_runtime"
         return "shared"
 
     @staticmethod
@@ -4505,6 +4772,13 @@ class WorkspaceCodeAgentRuntime:
             if message:
                 return f"{check}: {message[:320]}"
         if latest_execution is not None:
+            for result in latest_execution.results:
+                diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+                if result.name == "browser_flow_smoke" and result.status == "failed" and diagnostics.get("infra_unavailable"):
+                    return (
+                        "browser_flow_smoke: Playwright browser proof could not run because browser "
+                        "verification infrastructure is unavailable."
+                    )
             for result in latest_execution.results:
                 if result.status != "failed":
                     continue
@@ -4683,6 +4957,7 @@ class WorkspaceCodeAgentRuntime:
         tool_results: list[dict[str, object]],
     ) -> None:
         actionable_codes = {
+            "build.duplicate_static_route",
             "build.broken_static_ref",
             "build.missing_static_asset",
             "build.missing_static_page",
@@ -4735,6 +5010,7 @@ class WorkspaceCodeAgentRuntime:
                     "Patch only the exact failing route/page contract. For build.missing_static_page, either create the exact missing HTML file "
                     "or remove that exact route_manifest entry. For build.page_missing_preview_bridge, add "
                     "<script src=\"/static/preview_bridge.js\" defer></script> to the exact page. "
+                    "For build.duplicate_static_route, keep one canonical route_manifest entry per route and make it point to the static page that should serve that route. "
                     "For build.broken_static_ref or build.missing_static_asset, either create the referenced asset or remove the script/link tag from the exact page. "
                     "For platform.missing_generated_app_tests, create miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. "
                     "For platform.missing_create_get_api/platform.missing_create_post_api, create or register a backend /api route with persistent GET and POST behavior. "
@@ -5587,11 +5863,22 @@ class WorkspaceCodeAgentRuntime:
 
     @staticmethod
     def _tool_round_limit(generation_mode: GenerationMode) -> int:
+        env_name = {
+            GenerationMode.FAST: "WORKSPACE_AGENT_FAST_TOOL_ROUND_LIMIT",
+            GenerationMode.BALANCED: "WORKSPACE_AGENT_BALANCED_TOOL_ROUND_LIMIT",
+            GenerationMode.QUALITY: "WORKSPACE_AGENT_QUALITY_TOOL_ROUND_LIMIT",
+        }.get(generation_mode, "WORKSPACE_AGENT_BALANCED_TOOL_ROUND_LIMIT")
+        env_value = os.getenv(env_name) or os.getenv("WORKSPACE_AGENT_TOOL_ROUND_LIMIT")
+        if env_value:
+            try:
+                return max(1, min(10, int(env_value)))
+            except ValueError:
+                pass
         if generation_mode == GenerationMode.FAST:
-            return 1
+            return 2
         if generation_mode == GenerationMode.QUALITY:
-            return 4
-        return 3
+            return 6
+        return 4
 
     @staticmethod
     def _worker_branch_timeout_seconds(generation_mode: GenerationMode) -> float:

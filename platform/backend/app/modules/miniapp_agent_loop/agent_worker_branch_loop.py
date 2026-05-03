@@ -23,8 +23,8 @@ from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
-from app.modules.miniapp_agent_loop.tool_agent_runtime import normalize_tool_calls
-from app.modules.miniapp_agent_loop.tool_agent_runtime import (
+from app.modules.miniapp_agent_loop.agent_tool_runtime import normalize_tool_calls
+from app.modules.miniapp_agent_loop.agent_tool_runtime import (
     list_workspace_files,
     run_workspace_command,
     search_workspace_files,
@@ -819,10 +819,13 @@ class AgentWorkerBranchLoop:
                 "Use shared_prefix.implementation_plan.prompt_hints as the source for nouns, fields, labels, and role actions. If prompt_hints has concrete terms, do not build a generic 'record/request' UI.",
                 "This branch must produce actual file changes; do not finish with read-only tool calls only.",
                 "Keep each role surface independent and mobile-first. Do not include another role's primary workflow controls in this role just to make verification easier.",
-                "Default role split: client creates/submits the user-provided state; specialist processes/updates existing shared state; manager reviews, summarizes, and controls shared state. Deviate only when the user's prompt explicitly assigns a different action.",
+                "Default role split: client creates/submits the user-provided state; specialist processes/updates existing shared state; manager reviews, summarizes, and controls shared state. If the user's prompt assigns shared-state creation to manager or specialist, that role must own that creation flow and client must consume the persisted state.",
+                "Split role workflows into routeable mobile pages when that makes the product clearer; avoid one long dashboard-only page, but do not add pages just to satisfy a fixed count. Child pages must live under static/<role>/<page>/index.html and be reachable through route_manifest.json or filesystem role routing.",
+                "Use shared_prefix.implementation_plan.routeable_screen_plan for screen intent guidance; concrete route names are still owned by this worker and must come from the prompt/product vocabulary.",
                 "If you work on UI or generated tests, read the current backend route/schema files first and use their actual endpoint paths and field names exactly.",
                 "If shared_prefix.backend_contract is present, treat it as the active API contract and do not invent a different /api route or field casing.",
                 "In async JavaScript form handlers, store DOM references before awaited calls, e.g. `const form = event.currentTarget`; do not read `event.currentTarget` after await.",
+                "For multi-page role apps, the shared static/<role>/app.js must initialize per page: branch by body[data-view] or route, guard optional DOM nodes from other pages, and bind every visible form/button/control on every child page to a real handler.",
                 "Use read/search tools first if you need context; otherwise patch directly.",
                 "Use apply_patch_to_draft for existing files and write_file for new or full owned files.",
                 "Mutating tools write exactly one file_path per tool call. If your owned slice needs index.html, app.js, and styles.css, call write_file/apply_patch_to_draft separately for each file.",
@@ -835,14 +838,15 @@ class AgentWorkerBranchLoop:
             ),
             "worker_feedback": list(worker_feedback or [])[-4:],
             "owned_slice_completion": {
-                "client_ui": ["index.html", "app.js", "styles.css with a POST submit flow"],
-                "specialist_ui": ["index.html", "app.js", "styles.css with a POST/PATCH/PUT update flow"],
-                "manager_ui": ["index.html", "app.js", "styles.css with shared-state visibility"],
+                "client_ui": ["index.html", "child page index.html files", "app.js", "styles.css with the prompt-derived client/source flow"],
+                "specialist_ui": ["index.html", "child page index.html files", "app.js", "styles.css with a POST/PATCH/PUT update flow when the prompt requires persisted changes"],
+                "manager_ui": ["index.html", "child page index.html files", "app.js", "styles.css with shared-state visibility and any manager-owned creation/control flow from the prompt"],
                 "generated_tests": [
                     "test_generated_app.py as import unittest + unittest.TestCase test_* methods",
                     "FastAPI tests must use `with TestClient(app) as client:` or explicitly create tables after importing generated ORM models before requests",
                     "generated_app.test.mjs as node:test",
                     "JS tests run with cwd=miniapp; read app/static/... and app/generated/... paths, not miniapp/app/... paths",
+                    "JS tests must derive role pages from app/generated/route_manifest.json and search the actual role HTML files; never assert that the manifest is empty",
                     "tests must import/run cleanly; do not write pytest-only top-level functions for Python",
                     "Python helpers must be valid code, for example '\\n'.join([a, b, c]) not str.join(a, b, c)",
                 ],

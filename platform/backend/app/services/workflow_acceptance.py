@@ -176,6 +176,176 @@ def extract_prompt_planning_hints(prompt: str) -> dict[str, Any]:
         },
     }
 
+
+def _role_screen_plan(
+    *,
+    prompt_hints: dict[str, Any],
+    generation_mode: GenerationMode | str | None,
+) -> dict[str, Any]:
+    """Suggest routeable screen intents from prompt-owned role actions.
+
+    This intentionally does not create route names, resource names, or a fixed
+    page count. The LLM still owns concrete pages. The platform only gives a
+    Claude/Codex-style planning nudge so complex mobile workflows do not get
+    collapsed into one long dashboard.
+    """
+    mode_value = normalized_generation_mode(generation_mode)
+    role_prompts = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints, dict) else {}
+    field_hints = prompt_hints.get("field_hints") if isinstance(prompt_hints, dict) else []
+    sentences = prompt_hints.get("prompt_sentences") if isinstance(prompt_hints, dict) else []
+
+    intent_markers: tuple[tuple[str, tuple[str, ...]], ...] = (
+        (
+            "create_or_configure",
+            (
+                "add",
+                "create",
+                "fill",
+                "submit",
+                "choose",
+                "save",
+                "добав",
+                "созда",
+                "заполн",
+                "оформ",
+                "выбира",
+                "выбрат",
+                "сохран",
+                "указывает",
+                "указать",
+            ),
+        ),
+        (
+            "list_or_queue",
+            (
+                "list",
+                "queue",
+                "see",
+                "view",
+                "track",
+                "видит",
+                "видеть",
+                "очеред",
+                "спис",
+                "отслеж",
+                "смотр",
+            ),
+        ),
+        (
+            "detail_or_update",
+            (
+                "update",
+                "change",
+                "process",
+                "mark",
+                "control",
+                "меня",
+                "обнов",
+                "обработ",
+                "отмеч",
+                "контрол",
+                "управ",
+            ),
+        ),
+        (
+            "summary_or_insight",
+            (
+                "summary",
+                "metrics",
+                "analytics",
+                "overview",
+                "report",
+                "свод",
+                "метрик",
+                "аналит",
+                "отчет",
+                "отчёт",
+                "загруз",
+            ),
+        ),
+        (
+            "settings_or_availability",
+            (
+                "setting",
+                "available",
+                "availability",
+                "status",
+                "настрой",
+                "доступ",
+                "статус",
+                "остат",
+                "график",
+            ),
+        ),
+    )
+
+    role_screens: dict[str, list[dict[str, Any]]] = {}
+    for role in ROLE_ORDER:
+        source_phrases = [
+            _clean_text(item)
+            for item in (role_prompts.get(role) if isinstance(role_prompts, dict) else []) or []
+            if _clean_text(str(item))
+        ]
+        detected: list[dict[str, Any]] = [
+            {
+                "intent": "overview",
+                "purpose": "mobile entry screen with the role's next important action and current shared state",
+                "source": source_phrases[:1],
+            }
+        ]
+        combined = " ".join(source_phrases).lower()
+        for intent, markers in intent_markers:
+            if any(marker in combined for marker in markers):
+                detected.append(
+                    {
+                        "intent": intent,
+                        "purpose": "separate routeable screen when this task would make the role root too long or mix unrelated controls",
+                        "source": source_phrases[:3],
+                    }
+                )
+        if role == "client" and field_hints and not any(item["intent"] == "create_or_configure" for item in detected):
+            detected.append(
+                {
+                    "intent": "create_or_configure",
+                    "purpose": "form/select screen for the prompt-provided fields",
+                    "source": list(field_hints)[:6],
+                }
+            )
+        if role == "manager" and mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
+            if not any(item["intent"] == "summary_or_insight" for item in detected):
+                detected.append(
+                    {
+                        "intent": "summary_or_insight",
+                        "purpose": "management summary screen when the prompt asks for oversight or the mode adds deeper review",
+                        "source": source_phrases[:3],
+                    }
+                )
+        # De-duplicate while preserving order.
+        unique: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in detected:
+            intent = str(item.get("intent") or "")
+            if not intent or intent in seen:
+                continue
+            seen.add(intent)
+            unique.append(item)
+        role_screens[role] = unique[:5]
+
+    complexity_signals = sum(max(0, len(items) - 1) for items in role_screens.values())
+    prompt_sentence_count = len(sentences) if isinstance(sentences, list) else 0
+    multi_page_recommended = (
+        complexity_signals >= 2
+        or prompt_sentence_count >= 3
+        or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
+    )
+    return {
+        "multi_page_recommended": bool(multi_page_recommended),
+        "route_names_owned_by_agent": True,
+        "no_fixed_page_count": True,
+        "roles": role_screens,
+    }
+
+
 def normalized_generation_mode(generation_mode: GenerationMode | str | None) -> str:
     return str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
 
@@ -284,7 +454,6 @@ def build_acceptance_contract(
             "flows": [],
             "test_requirements": [],
         }
-
     flows: list[dict[str, Any]] = [
         {
             "id": "role_shared_persistence",
@@ -293,7 +462,8 @@ def build_acceptance_contract(
             "requirements": [
                 "Client role can submit a real form/action through a POST-capable backend API.",
                 "Specialist role can see saved client-created state and perform the prompt-derived operational action.",
-                "Manager role can see persisted shared state, summary metrics, and an oversight action.",
+                "Manager role can see persisted shared state, summary metrics, and the prompt-derived oversight or control action.",
+                "If the prompt assigns creation of shared source state to manager or specialist, that role owns the creation flow and client consumes the persisted state.",
                 "Saved data remains visible after a reload through GET APIs; app source starts with no seed/mock records.",
             ],
             "required_tests": [
@@ -336,6 +506,11 @@ def build_acceptance_contract(
             {"role": "specialist", "action": "perform the prompt-derived operational action through POST/PATCH when the workflow needs persisted updates"},
             {"role": "manager", "action": "review shared state and trigger the prompt-derived oversight/control action"},
         ],
+        "page_contract": {
+            "multi_page_role_apps": True,
+            "route_manifest_required": True,
+            "child_pages_must_be_reachable": True,
+        },
         "flows": flows,
         "test_requirements": [item for flow in flows for item in flow.get("required_tests", [])],
     }
@@ -359,11 +534,13 @@ def build_implementation_plan(
     mode_value = normalized_generation_mode(generation_mode)
     contract = dict(acceptance_contract or {})
     prompt_hints = extract_prompt_planning_hints(prompt)
+    screen_plan = _role_screen_plan(prompt_hints=prompt_hints, generation_mode=generation_mode)
     required_controls = [
         dict(item)
         for item in (contract.get("required_controls") or [])
         if isinstance(item, dict)
     ]
+    page_contract = dict(contract.get("page_contract") or {})
     return {
         "version": 1,
         "required": bool(contract.get("required")),
@@ -387,16 +564,19 @@ def build_implementation_plan(
         "ui_contract": {
             "required_controls": required_controls,
             "three_separate_role_apps": True,
+            "multi_page_role_apps": True,
+            "routeable_screen_plan": screen_plan,
+            "route_manifest_required": True,
             "no_cross_role_navigation": True,
             "role_specific_actions": True,
             "business_copy_quality": "Do not expose API paths, HTTP methods, route slugs, role slugs, raw enum codes, or internal implementation labels in normal role UI; render readable business labels with clear spacing between label and value.",
             "role_independence": {
                 "client": "user-facing mobile app for the primary prompt-derived create/select/save flow; no links to specialist or manager surfaces",
                 "specialist": "operational mobile app for processing/updating shared state; no client-only duplicate page",
-                "manager": "oversight mobile app for summary, control, status, and workload visibility; no specialist-only duplicate page",
+                "manager": "oversight mobile app for summary, control, status, workload visibility, and any prompt-assigned shared-state creation flow; no specialist-only duplicate page",
             },
             "shared_state_contract": [
-                "client-created state is stored through backend persistence",
+                "the prompt-assigned source role creates or selects persisted shared state through UI",
                 "specialist can load the same state and persist an update",
                 "manager can load the updated state and summary",
                 "client can reload and see the update through UI",
@@ -410,6 +590,7 @@ def build_implementation_plan(
                 "specialist_ui_action_updates_same_state",
                 "manager_role_observes_updated_state",
                 "client_role_observes_update_after_refresh",
+                "browser_proof_visits_routeable_screens_used_by_the_workflow",
             ],
         },
         "agent_todos": [
@@ -432,10 +613,11 @@ def build_implementation_plan(
             "quality_runs_require_post_green_design_pass": mode_value == GenerationMode.QUALITY.value,
         },
         "mode_quality_contract": {
-            "fast": "smallest complete mobile product: one shared persisted flow, compact CSS, all roles functional",
-            "balanced": "moderate mobile product: richer layout, one related update/summary flow, clear role separation",
-            "quality": "product-ready mobile mini-app: polished UI, refined states, stronger validation, post-green design pass",
+            "fast": "smallest complete mobile product: one shared persisted flow, compact CSS, all roles functional, with prompt-derived role pages only where they clarify the workflow",
+            "balanced": "moderate mobile product: richer layout, one related update/summary flow, clear role separation, and enough role pages to keep mobile workflows focused",
+            "quality": "product-ready mobile mini-app: polished UI, refined states, stronger validation, post-green design pass, and well-organized prompt-derived role pages",
         },
+        "routeable_screen_plan": screen_plan,
         "orchestration": {
             "execution_style": (orchestration or {}).get("execution_style"),
             "phases": list((orchestration or {}).get("phases") or []),

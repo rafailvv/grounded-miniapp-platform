@@ -191,7 +191,7 @@ class AgentTranscriptStore:
                 "changes": [
                     {
                         "file_path": getattr(item, "file_path", ""),
-                        "operation": getattr(item, "operation", ""),
+                        "change_type": getattr(item, "operation", ""),
                         "reason": getattr(item, "reason", ""),
                         "has_content": bool(getattr(item, "content", None)),
                         "has_diff": bool(getattr(item, "diff", None)),

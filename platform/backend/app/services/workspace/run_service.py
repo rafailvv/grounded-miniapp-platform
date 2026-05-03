@@ -942,6 +942,13 @@ class RunService:
             if message:
                 return f"{check}: {message[:320]}"
         for check in job.executed_checks:
+            diagnostics = check.get("diagnostics") if isinstance(check.get("diagnostics"), dict) else {}
+            if check.get("name") == "browser_flow_smoke" and check.get("status") == "failed" and diagnostics.get("infra_unavailable"):
+                return (
+                    "browser_flow_smoke: Playwright browser proof could not run because browser "
+                    "verification infrastructure is unavailable."
+                )
+        for check in job.executed_checks:
             if check.get("status") != "failed":
                 continue
             line = important_line(list(check.get("logs") or []))
@@ -1511,9 +1518,7 @@ class RunService:
             if not patch_paths:
                 patch_paths = [target.file_path for target in change_plan.targets if target.file_path]
             patch_payload = {
-                "envelope": {
-                    "ops": [{"file_path": path, "operation": "replace"} for path in patch_paths],
-                },
+                "file_changes": [{"file_path": path, "change_type": "modified"} for path in patch_paths],
                 "apply_result": job.apply_result,
             }
         agent_transcript = self.store.get("reports", run.agent_transcript_ref) if run.agent_transcript_ref else None

@@ -1,3 +1,0 @@
-from app.modules.miniapp_contract.runtime_contract_normalization import MiniappRuntimeContractNormalization
-
-__all__ = ["MiniappRuntimeContractNormalization"]
