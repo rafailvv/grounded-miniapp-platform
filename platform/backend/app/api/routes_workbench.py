@@ -264,6 +264,38 @@ def get_run_observability(run_id: str, container: ServiceContainer = Depends(get
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/gate")
+def get_run_gate(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.gate(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/final-report")
+def get_run_final_report(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.final_report(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/repair-signatures")
+def get_run_repair_signatures(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.repair_signatures(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/resume", response_model=RunRecord)
+def resume_run(run_id: str, container: ServiceContainer = Depends(get_container)) -> RunRecord:
+    try:
+        return container.workbench_service.resume_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/system/metrics/summary")
 def get_metrics_summary(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return container.workbench_service.metrics_summary()

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.models.domain import RunRecord
+from app.services.repair_catalog import RepairCatalog
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, canonical_tool_name, tool_envelope
 
@@ -18,7 +19,10 @@ def test_tool_protocol_normalizes_aliases() -> None:
 
     assert envelope["version"] == TOOL_PROTOCOL_VERSION
     assert envelope["tool"] == "patch.apply"
+    assert envelope["status"] == "started"
     assert envelope["risk"] == "mutating"
+    assert envelope["sandbox_profile"] == "agent_draft"
+    assert "changed_files" in envelope
     assert envelope["approval"]["status"] == "not_required"
 
 
@@ -28,11 +32,16 @@ def test_exec_policy_classifies_and_redacts_commands() -> None:
     allowed = service.evaluate_command("rg api miniapp/app")
     blocked = service.evaluate_command("rm -rf miniapp")
     redacted = service.evaluate_command("rg api_key=sk-secretvalue miniapp/app")
+    redirection = service.evaluate_command("rg api miniapp/app > out.txt")
+    git_internal = service.evaluate_command("ls .git")
 
     assert allowed["decision"]["action"] == "allow"
     assert allowed["decision"]["risk"] == "read_only"
+    assert allowed["sandbox_summary"]["profile"] == "analysis_only"
     assert blocked["decision"]["action"] == "forbidden"
     assert blocked["approval"]["status"] == "blocked"
+    assert redirection["decision"]["action"] == "forbidden"
+    assert git_internal["decision"]["action"] == "forbidden"
     assert "sk-secretvalue" not in redacted["command"]
 
 
@@ -104,6 +113,128 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert patch_preflight["status"] == "passed"
 
 
+def test_reliability_gate_final_report_and_repair_catalog(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Gate Workspace",
+            "description": "Reliability gate test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build an intake workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        touched_files=["miniapp/app/static/client/app.js"],
+        acceptance_contract={"required": True, "flows": [{"id": "create_intake"}]},
+        browser_flow_proof={"steps": [{"status": "passed", "route": "/client"}]},
+        mobile_layout_report={"status": "passed"},
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js\n",
+            "check_results": [
+                {"name": "api_workflow_smoke", "status": "passed", "details": "ok", "logs": []},
+                {"name": "browser_flow_smoke", "status": "passed", "details": "ok", "logs": [], "diagnostics": {"mobile_layout": {"status": "passed"}}},
+            ],
+            "preview": {"url": "http://127.0.0.1:18000", "role_urls": {"/client": "/client"}, "status": "running"},
+        },
+    )
+
+    gate = client.get(f"/runs/{run.run_id}/gate").json()
+    final_report = client.get(f"/runs/{run.run_id}/final-report").json()
+    repair = client.get(f"/runs/{run.run_id}/repair-signatures").json()
+
+    assert gate["status"] == "passed"
+    assert gate["blocking"] is False
+    assert final_report["status"] == "passed"
+    assert final_report["diff_summary"]["diff_available"] is True
+    assert repair["status"] == "empty"
+    assert any(item["signature"] == "backend.missing_route" for item in RepairCatalog.entries())
+
+
+def test_reliability_gate_blocks_missing_browser_proof(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Blocked Gate Workspace",
+            "description": "Reliability gate failure test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a CRM workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="blocked",
+        apply_status="blocked",
+        touched_files=["miniapp/app/static/client/app.js"],
+        acceptance_contract={"required": True},
+        repair_issue_signatures=[{"signature": "browser_flow_smoke: failed click", "check": "browser_flow_smoke"}],
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "diff": "diff --git a/miniapp/app/static/client/app.js b/miniapp/app/static/client/app.js\n",
+            "check_results": [{"name": "api_workflow_smoke", "status": "passed", "details": "ok", "logs": []}],
+        },
+    )
+
+    gate = client.get(f"/runs/{run.run_id}/gate").json()
+    repair = client.get(f"/runs/{run.run_id}/repair-signatures").json()
+
+    assert gate["status"] == "blocked"
+    assert any(issue["check"] == "browser_flow_smoke" for issue in gate["issues"])
+    assert any(item["signature"] == "preview.browser_flow_failed" for item in repair["items"])
+
+
+def test_repair_catalog_extracts_nested_workflow_evidence() -> None:
+    packets = RepairCatalog.classify_many(
+        [
+            {
+                "kind": "check_failure",
+                "check": "platform_invariants",
+                "evidence": {
+                    "logs": [
+                        '{"code":"platform.missing_role_workflow_actions","message":"manager role lacks its own workflow actions."}'
+                    ]
+                },
+            },
+            {
+                "kind": "check_failure",
+                "check": "frontend_interaction_static_smoke",
+                "evidence": {
+                    "logs": [
+                        '{"code":"platform.workflow_patch_payload_field_mismatch","message":"manager sends PATCH fields not accepted by the backend update schema: assigned_to."}'
+                    ]
+                },
+            },
+        ]
+    )
+
+    signatures = {item["signature"] for item in packets}
+    assert "workflow.missing_role_actions" in signatures
+    assert "workflow.payload_schema_mismatch" in signatures
+
+
 def test_thread_snapshots_are_persistent(tmp_path: Path) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
@@ -144,8 +275,11 @@ def test_exec_runtime_streams_and_blocks_workspace_escape(tmp_path: Path) -> Non
     output = _wait_for_exec_output(service, process_id)
     resized = service.resize_exec(process_id, cols=100, rows=32)
 
-    escaped = service.exec_command(workspace_id=workspace["workspace_id"], command="ls /tmp", timeout=5)
-    escaped_session = _wait_for_exec_session(app, escaped["process_id"])
+    escaped_error = ""
+    try:
+        service.exec_command(workspace_id=workspace["workspace_id"], command="ls /tmp", timeout=5)
+    except ValueError as exc:
+        escaped_error = str(exc)
     source_dir = app.state.container.workspace_service.source_dir(workspace["workspace_id"])
     outside_link = source_dir / "miniapp" / "outside"
     try:
@@ -161,8 +295,7 @@ def test_exec_runtime_streams_and_blocks_workspace_escape(tmp_path: Path) -> Non
     assert output["status"] == "completed"
     assert "app" in output["content"]
     assert resized["ok"] is True
-    assert escaped_session["result"]["semantic_status"] == "blocked_by_sandbox"
-    assert escaped_session["result"]["success"] is False
+    assert "Absolute and home-relative paths are blocked" in escaped_error
     if symlink_session is not None:
         assert symlink_session["result"]["semantic_status"] == "blocked_by_sandbox"
 

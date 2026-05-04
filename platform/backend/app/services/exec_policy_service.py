@@ -28,6 +28,29 @@ APPROVAL_PRESETS: dict[str, dict[str, Any]] = {
     },
 }
 
+SANDBOX_PROFILES: dict[str, dict[str, Any]] = {
+    "analysis_only": {
+        "description": "Read-only diagnostics and workspace inspection.",
+        "writes": "none",
+        "network": False,
+    },
+    "agent_draft": {
+        "description": "Default agent mode; writes are restricted to the draft workspace.",
+        "writes": "draft_workspace",
+        "network": False,
+    },
+    "apply_gate": {
+        "description": "Apply reviewed draft after strict-green checks or manual approval.",
+        "writes": "source_workspace",
+        "network": False,
+    },
+    "developer_bypass": {
+        "description": "Local development bypass; forbidden commands still remain blocked.",
+        "writes": "workspace",
+        "network": True,
+    },
+}
+
 
 SECRET_PATTERNS = (
     re.compile(r"(api[_-]?key|token|secret|password)=([^\s]+)", re.I),
@@ -46,8 +69,9 @@ class ExecPolicyService:
         payload.update(
             {
                 "tool_protocol_version": TOOL_PROTOCOL_VERSION,
-                "risk_model": ["safe", "read_only", "mutating", "network", "destructive", "forbidden", "unknown"],
+                "risk_model": ["safe", "read_only", "draft_write", "workspace_write", "network_limited", "dangerous_requires_approval", "forbidden", "unknown"],
                 "approval_presets": APPROVAL_PRESETS,
+                "sandbox_profiles": SANDBOX_PROFILES,
                 "sandbox": {
                     "cwd": "draft workspace or miniapp subdirectory",
                     "network": "blocked unless a future connector policy grants it",
@@ -68,7 +92,7 @@ class ExecPolicyService:
             "command": self.redact(command),
             "decision": self._decision_payload(decision, risk=risk),
             "approval": approval,
-            "sandbox_summary": self.sandbox_summary(decision),
+            "sandbox_summary": self.sandbox_summary(decision, risk=risk, preset=preset),
         }
 
     def validate_workspace_path(self, path: str, *, operation: str) -> dict[str, Any]:
@@ -111,12 +135,15 @@ class ExecPolicyService:
             ],
         }
 
-    def sandbox_summary(self, decision: CommandPolicyDecision | None = None) -> dict[str, Any]:
+    def sandbox_summary(self, decision: CommandPolicyDecision | None = None, *, risk: ToolRisk | None = None, preset: str = "safe_auto") -> dict[str, Any]:
+        profile = self._sandbox_profile_for(risk or "unknown", preset=preset)
         return {
+            "profile": profile,
+            "profile_description": SANDBOX_PROFILES[profile]["description"],
             "cwd_policy": decision.cwd_policy if decision else "draft_workspace",
             "argv": list(decision.argv) if decision else [],
             "matched_prefix": list(decision.matched_prefix) if decision else [],
-            "network_allowed": False,
+            "network_allowed": bool(SANDBOX_PROFILES[profile]["network"]),
             "path_traversal_blocked": True,
             "shell_metacharacters_blocked": True,
         }
@@ -165,6 +192,16 @@ class ExecPolicyService:
         if executable in {"rm", "mv", "cp", "docker"} or any(arg in {"--force", "-rf", "-fr"} for arg in args):
             return "destructive"
         return "unknown"
+
+    @staticmethod
+    def _sandbox_profile_for(risk: ToolRisk | str, *, preset: str) -> str:
+        if preset == "developer_bypass":
+            return "developer_bypass"
+        if risk in {"safe", "read_only"}:
+            return "analysis_only"
+        if risk == "mutating":
+            return "agent_draft"
+        return "analysis_only"
 
     @staticmethod
     def _normalize_path(path: str) -> str:

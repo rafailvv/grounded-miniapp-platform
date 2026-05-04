@@ -65,6 +65,28 @@ def main(argv: list[str] | None = None) -> int:
     doctor = sub.add_parser("doctor")
     doctor.add_argument("--run", action="store_true")
 
+    generate = sub.add_parser("generate")
+    generate.add_argument("prompt")
+    generate.add_argument("--workspace-id", default="")
+    generate.add_argument("--workspace-name", default="Generated App")
+    generate.add_argument("--quality", action="store_true")
+    generate.add_argument("--export", action="store_true")
+
+    fix = sub.add_parser("fix")
+    fix.add_argument("workspace_id")
+    fix.add_argument("--from-run", required=True)
+    fix.add_argument("--prompt", default="Resume and repair the failed run using its checkpoint and repair signatures.")
+
+    checks = sub.add_parser("checks")
+    checks.add_argument("run_id")
+
+    export_cmd = sub.add_parser("export")
+    export_cmd.add_argument("workspace_id")
+    export_cmd.add_argument("--kind", choices=["zip", "git-patch", "deploy-bundle", "docker-validation-report", "manifest", "browser-proof-bundle"], default="zip")
+
+    final_report = sub.add_parser("final-report")
+    final_report.add_argument("run_id")
+
     args = parser.parse_args(argv)
     if args.command == "create-workspace":
         result = _request(
@@ -103,6 +125,52 @@ def main(argv: list[str] | None = None) -> int:
         result = _request(args.base_url, "POST", f"/runs/{urllib.parse.quote(args.run_id)}/rollback", {})
     elif args.command == "doctor":
         result = _request(args.base_url, "POST" if args.run else "GET", "/doctor/run" if args.run else "/doctor", {} if args.run else None)
+    elif args.command == "generate":
+        workspace_id = args.workspace_id
+        if not workspace_id:
+            workspace = _request(
+                args.base_url,
+                "POST",
+                "/workspaces",
+                {
+                    "name": args.workspace_name,
+                    "description": "Created by grounded generate.",
+                    "target_platform": "telegram_mini_app",
+                    "preview_profile": "telegram_mock",
+                },
+            )
+            workspace_id = workspace["workspace_id"]
+        run_result = _request(
+            args.base_url,
+            "POST",
+            f"/workspaces/{urllib.parse.quote(workspace_id)}/runs",
+            {
+                "prompt": args.prompt,
+                "mode": "generate",
+                "generation_mode": "quality" if args.quality else "balanced",
+            },
+        )
+        result = {"workspace_id": workspace_id, "run": run_result}
+        if args.export:
+            result["export"] = _request(args.base_url, "POST", f"/workspaces/{urllib.parse.quote(workspace_id)}/export/zip", {})
+    elif args.command == "fix":
+        result = _request(
+            args.base_url,
+            "POST",
+            f"/workspaces/{urllib.parse.quote(args.workspace_id)}/runs",
+            {
+                "prompt": args.prompt,
+                "mode": "fix",
+                "intent": "edit",
+                "resume_from_run_id": args.from_run,
+            },
+        )
+    elif args.command == "checks":
+        result = _request(args.base_url, "GET", f"/runs/{urllib.parse.quote(args.run_id)}/gate")
+    elif args.command == "export":
+        result = _request(args.base_url, "POST", f"/workspaces/{urllib.parse.quote(args.workspace_id)}/export/{args.kind}", {})
+    elif args.command == "final-report":
+        result = _request(args.base_url, "GET", f"/runs/{urllib.parse.quote(args.run_id)}/final-report")
     else:
         parser.error("unknown command")
         return 2

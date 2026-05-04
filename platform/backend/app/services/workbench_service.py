@@ -17,6 +17,7 @@ from app.models.domain import CreateRunRequest, RunRecord
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer, MiniAppRouteRegistry
+from app.services.repair_catalog import RepairCatalog
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, tool_envelope, tool_registry_contract
 from app.services.workspace.run_service import RunService
 from app.services.workspace.service import WorkspaceService
@@ -426,16 +427,165 @@ class WorkbenchService:
         self.store.upsert("reports", f"browser_proof:{run_id}", payload)
         return payload
 
+    def gate(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifacts = self._run_artifacts_or_empty(run_id)
+        diff_text = str(artifacts.get("diff") or "")
+        check_results = [item for item in artifacts.get("check_results") or [] if isinstance(item, dict)]
+        checks_by_name = {str(item.get("name") or ""): item for item in check_results}
+        mode_value = str(getattr(run.generation_mode, "value", run.generation_mode) or "").lower()
+        acceptance_required = bool((run.acceptance_contract or {}).get("required")) or run.mode == "generate" or mode_value in {"quality", "balanced"}
+        browser = checks_by_name.get("browser_flow_smoke") or {}
+        api = checks_by_name.get("api_workflow_smoke") or {}
+        mobile = run.mobile_layout_report or (browser.get("diagnostics") or {}).get("mobile_layout") if isinstance(browser, dict) else {}
+        issues: list[dict[str, Any]] = []
+
+        def add_issue(kind: str, check: str, details: str, *, blocking: bool = True, evidence: dict[str, Any] | None = None) -> None:
+            issues.append({"kind": kind, "check": check, "details": details, "blocking": blocking, "evidence": evidence or {}})
+
+        if run.mode in {"generate", "fix"} and not diff_text.strip() and not run.touched_files:
+            add_issue("meaningful_diff", "meaningful_diff", "Run has no meaningful draft/source diff.")
+        for item in check_results:
+            if str(item.get("status")) in {"failed", "blocked"}:
+                add_issue("check_failure", str(item.get("name") or "check"), str(item.get("details") or "Check failed."), evidence=item)
+        if acceptance_required:
+            if api.get("status") != "passed":
+                add_issue("required_product_proof", "api_workflow_smoke", "API workflow proof must pass before completion.", evidence=api)
+            if browser.get("status") != "passed":
+                add_issue("required_product_proof", "browser_flow_smoke", "Browser workflow proof must pass before completion.", evidence=browser)
+        if isinstance(mobile, dict) and mobile.get("status") == "failed":
+            add_issue("mobile_layout", "browser_flow_smoke", "Mobile layout report contains blocking issues.", evidence=mobile)
+        for signature in run.repair_issue_signatures:
+            if isinstance(signature, dict) and not signature.get("resolved"):
+                add_issue("unresolved_repair_signature", str(signature.get("check") or "repair"), str(signature.get("signature") or "Unresolved repair signature."), evidence=signature)
+        if run.outcome_kind == "blocked_preview_infra":
+            add_issue("preview_infra", "browser_flow_smoke", run.failure_reason or "Browser/preview infrastructure blocked product proof.", evidence=artifacts.get("preview_infra_diagnostics") or {})
+        apply_ok = run.apply_status == "applied" or (
+            run.apply_strategy == "manual_approve" and run.status == "awaiting_approval" and run.apply_status == "awaiting_approval"
+        )
+        if run.status in {"completed", "awaiting_approval", "blocked", "failed"} and not apply_ok:
+            add_issue("apply_gate", "apply_status", "Run must be applied or awaiting manual approval after green checks.", evidence={"apply_status": run.apply_status, "status": run.status})
+
+        repair_packets = RepairCatalog.classify_many(issues)
+        blocking = any(item.get("blocking", True) for item in issues)
+        status = "passed" if not blocking and apply_ok else "blocked" if blocking else "pending"
+        payload = {
+            "run_id": run_id,
+            "workspace_id": run.workspace_id,
+            "status": status,
+            "blocking": blocking,
+            "issues": issues,
+            "repair_packets": repair_packets,
+            "requirements": {
+                "acceptance_required": acceptance_required,
+                "meaningful_diff": True,
+                "api_workflow_smoke": acceptance_required,
+                "browser_flow_smoke": acceptance_required,
+                "mobile_layout_non_blocking": True,
+                "apply_status": "applied_or_awaiting_approval",
+            },
+            "artifact_refs": {
+                "run_artifacts": f"run_artifacts:{run_id}",
+                "browser_proof": run.browser_proof_ref,
+                "repair_recipes": run.repair_recipes_ref,
+                "final_report": f"final_report:{run_id}",
+            },
+        }
+        self.store.upsert("reports", f"gate:{run_id}", payload)
+        return payload
+
+    def repair_signatures(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        gate = self.gate(run_id)
+        explicit = [item for item in run.repair_issue_signatures if isinstance(item, dict)]
+        packets = RepairCatalog.classify_many([*explicit, *gate.get("issues", [])])
+        payload = {
+            "run_id": run_id,
+            "status": "available" if packets else "empty",
+            "blocking": bool(gate.get("blocking")),
+            "items": packets,
+            "catalog": RepairCatalog.entries(),
+        }
+        self.store.upsert("reports", f"repair_signatures:{run_id}", payload)
+        return payload
+
+    def final_report(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifacts = self._run_artifacts_or_empty(run_id)
+        preview = artifacts.get("preview") or {}
+        gate = self.gate(run_id)
+        report = {
+            "run_id": run_id,
+            "workspace_id": run.workspace_id,
+            "status": "passed" if gate.get("status") == "passed" else "blocked" if gate.get("blocking") else run.status,
+            "blocking": bool(gate.get("blocking")),
+            "prompt": run.prompt,
+            "summary": run.summary,
+            "acceptance_contract": run.acceptance_contract,
+            "diff_summary": {
+                "changed_files": run.touched_files or self._paths_from_diff(str(artifacts.get("diff") or "")),
+                "diff_available": bool(str(artifacts.get("diff") or "").strip()),
+            },
+            "checks": artifacts.get("check_results") or [],
+            "browser_proof": run.browser_flow_proof or artifacts.get("browser_flow_proof") or {},
+            "repair_signatures": self.repair_signatures(run_id).get("items", []),
+            "preview": {
+                "url": preview.get("url"),
+                "role_urls": preview.get("role_urls") or {},
+                "status": preview.get("status"),
+            },
+            "artifact_refs": {
+                "run_artifacts": f"run_artifacts:{run_id}",
+                "gate": f"gate:{run_id}",
+                "browser_proof": run.browser_proof_ref,
+                "repair_recipes": run.repair_recipes_ref,
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.store.upsert("reports", f"final_report:{run_id}", report)
+        return report
+
+    def resume_run(self, run_id: str) -> RunRecord:
+        run = self.run_service.get_run(run_id)
+        checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
+        prompt = (
+            "Resume the retained run from its checkpoint. Use the existing acceptance contract, "
+            "repair signatures, and draft evidence; do not restart diagnosis from scratch."
+        )
+        if isinstance(checkpoint, dict) and checkpoint.get("reason"):
+            prompt = f"{prompt}\nCheckpoint reason: {checkpoint.get('reason')}"
+        return self.run_service.create_run(
+            run.workspace_id,
+            CreateRunRequest(
+                prompt=prompt,
+                mode="fix",
+                intent="edit",
+                apply_strategy=run.apply_strategy,
+                target_role_scope=list(run.target_role_scope or []),
+                model_profile=run.model_profile,
+                generation_mode=run.generation_mode,
+                resume_from_run_id=run.run_id,
+            ),
+        )
+
     def memory(self, workspace_id: str) -> dict[str, Any]:
         self.workspace_service.get_workspace(workspace_id)
-        return self.store.get("reports", f"workspace_memory:{workspace_id}") or {
+        current = self.store.get("reports", f"workspace_memory:{workspace_id}") or {
             "workspace_id": workspace_id,
             "items": [],
             "project_rules": [],
             "user_preferences": [],
+            "product_decisions": [],
+            "accepted_ux_rules": [],
+            "architecture_summary": [],
+            "known_failures": [],
+            "rejected_approaches": [],
+            "do_not_change": [],
             "platform_constraints": [],
             "repeated_fixes": [],
         }
+        current["stale_check"] = self._memory_stale_check(workspace_id, current)
+        return current
 
     def upsert_memory(self, workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.memory(workspace_id)
@@ -449,6 +599,21 @@ class WorkbenchService:
         if not item["text"]:
             raise ValueError("Memory text is required.")
         current.setdefault("items", []).append(item)
+        bucket_map = {
+            "user_preference": "user_preferences",
+            "project_rule": "project_rules",
+            "product_decision": "product_decisions",
+            "ux_rule": "accepted_ux_rules",
+            "architecture": "architecture_summary",
+            "known_failure": "known_failures",
+            "rejected_approach": "rejected_approaches",
+            "do_not_change": "do_not_change",
+            "repeated_fix": "repeated_fixes",
+        }
+        bucket = bucket_map.get(item["kind"])
+        if bucket:
+            current.setdefault(bucket, []).append(item)
+        current["stale_check"] = self._memory_stale_check(workspace_id, current)
         self.store.upsert("reports", f"workspace_memory:{workspace_id}", current)
         return current
 
@@ -1149,6 +1314,52 @@ class WorkbenchService:
 
         visit(payload)
         return found[:50]
+
+    def _memory_stale_check(self, workspace_id: str, memory: dict[str, Any]) -> dict[str, Any]:
+        try:
+            source_dir = self.workspace_service.source_dir(workspace_id)
+        except Exception:
+            return {"status": "unknown", "items": []}
+        items: list[dict[str, Any]] = []
+        stale = False
+        for item in memory.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "")
+            paths = sorted(set(re.findall(r"\bminiapp/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+\b", text)))[:12]
+            routes = sorted(set(re.findall(r"(?<![A-Za-z0-9_])/(?:client|specialist|manager|api)[A-Za-z0-9_./{}:-]*", text)))[:12]
+            path_checks = [{"path": path, "exists": (source_dir / path).exists()} for path in paths]
+            route_checks = [{"route": route, "present_in_source": self._text_exists_in_workspace(source_dir, route)} for route in routes]
+            item_stale = any(not check["exists"] for check in path_checks) or (
+                bool(route_checks) and not any(check["present_in_source"] for check in route_checks)
+            )
+            stale = stale or item_stale
+            items.append(
+                {
+                    "memory_id": item.get("memory_id"),
+                    "status": "stale" if item_stale else "fresh_or_unreferenced",
+                    "paths": path_checks,
+                    "routes": route_checks,
+                }
+            )
+        return {"status": "stale" if stale else "fresh", "items": items}
+
+    @staticmethod
+    def _text_exists_in_workspace(source_dir: Path, needle: str) -> bool:
+        if not needle:
+            return False
+        root = source_dir / "miniapp"
+        if not root.exists():
+            return False
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in {".py", ".js", ".mjs", ".html", ".css", ".json"}:
+                continue
+            try:
+                if needle in path.read_text(encoding="utf-8", errors="ignore"):
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _document_skills(self) -> list[dict[str, Any]]:
         roots = [self.settings.runtime_dir / "platform-docs", self.settings.template_dir / "docs"]

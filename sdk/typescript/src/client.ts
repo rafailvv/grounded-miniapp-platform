@@ -16,6 +16,13 @@ export class GroundedClient {
     return this.request<T>("/workspaces");
   }
 
+  async createWorkspace<T = unknown>(payload: Record<string, unknown>): Promise<T> {
+    return this.request<T>("/workspaces", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
   async createRun<T = unknown>(workspaceId: string, payload: Record<string, unknown>): Promise<T> {
     return this.request<T>(`/workspaces/${encodeURIComponent(workspaceId)}/runs`, {
       method: "POST",
@@ -33,6 +40,26 @@ export class GroundedClient {
 
   async getTraceView<T = unknown>(runId: string): Promise<T> {
     return this.request<T>(`/runs/${encodeURIComponent(runId)}/trace-view`);
+  }
+
+  async getGate<T = unknown>(runId: string): Promise<T> {
+    return this.request<T>(`/runs/${encodeURIComponent(runId)}/gate`);
+  }
+
+  async getFinalReport<T = unknown>(runId: string): Promise<T> {
+    return this.request<T>(`/runs/${encodeURIComponent(runId)}/final-report`);
+  }
+
+  async getRepairSignatures<T = unknown>(runId: string): Promise<T> {
+    return this.request<T>(`/runs/${encodeURIComponent(runId)}/repair-signatures`);
+  }
+
+  async resumeRun<T = unknown>(runId: string): Promise<T> {
+    return this.request<T>(`/runs/${encodeURIComponent(runId)}/resume`, { method: "POST" });
+  }
+
+  async getArtifacts<T = unknown>(runId: string): Promise<T> {
+    return this.request<T>(`/runs/${encodeURIComponent(runId)}/artifacts`);
   }
 
   async getApprovals<T = unknown>(runId: string): Promise<T> {

@@ -50,6 +50,7 @@ class AgentCommandPolicy:
     """Prefix-rule shell policy for agent diagnostic commands."""
 
     _BLOCKED_META_CHARS = re.compile(r"[`$<>|;]")
+    _BLOCKED_EXPANSION = re.compile(r"\$\(|\${|%[A-Za-z_][A-Za-z0-9_]*%")
 
     def __init__(self, rules: list[CommandPolicyRule] | None = None) -> None:
         self.rules = list(rules or self.default_rules())
@@ -168,10 +169,12 @@ class AgentCommandPolicy:
         if self._BLOCKED_META_CHARS.search(stripped):
             return CommandPolicyDecision(
                 "forbidden",
-                "Shell metacharacters are blocked except for a single safe 'cd miniapp && ...' prefix.",
+                "Shell redirection, pipes, variable expansion, command substitution, and command separators are blocked.",
                 command,
                 stripped,
             )
+        if self._BLOCKED_EXPANSION.search(stripped):
+            return CommandPolicyDecision("forbidden", "Shell expansion syntax is blocked.", command, stripped)
         normalized = re.sub(r"\s+", " ", stripped)
         normalized_lower = normalized.lower()
         cwd_policy = "draft_workspace"
@@ -192,11 +195,17 @@ class AgentCommandPolicy:
             return CommandPolicyDecision("forbidden", "Empty command.", command, normalized)
         if any(arg == ".." or arg.startswith("../") or "/../" in arg for arg in args):
             return CommandPolicyDecision("forbidden", "Parent-directory paths are blocked.", command, normalized, tuple(args))
+        if any(str(arg).startswith(("/", "~")) for arg in args[1:]):
+            return CommandPolicyDecision("forbidden", "Absolute and home-relative paths are blocked.", command, normalized, tuple(args))
+        if any(arg == ".git" or arg.startswith(".git/") or "/.git/" in arg for arg in args[1:]):
+            return CommandPolicyDecision("forbidden", "Git internals are blocked.", command, normalized, tuple(args))
         normalized_args = [Path(args[0]).name.lower(), *[str(arg).lower() for arg in args[1:]]]
         if normalized_args[0] in {"python3.10", "python3.11", "python3.12"}:
             normalized_args[0] = "python3"
         if normalized_args[0] == "sed" and any(arg == "-i" or arg.startswith("-i") for arg in normalized_args[1:]):
             return CommandPolicyDecision("forbidden", "In-place sed edits are blocked.", command, normalized, tuple(args), ("sed",), cwd_policy)
+        if normalized_args[0] in {"rm", "mv", "cp", "chmod", "chown", "curl", "wget"}:
+            return CommandPolicyDecision("forbidden", "Mutating filesystem and direct network commands are blocked.", command, normalized, tuple(args), (normalized_args[0],), cwd_policy)
         matched_rules: list[CommandPolicyRule] = []
         for rule in self.rules:
             if rule.matches(normalized_args):

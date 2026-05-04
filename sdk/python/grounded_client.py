@@ -16,6 +16,9 @@ class GroundedClient:
     def create_run(self, workspace_id: str, payload: dict[str, Any]) -> Any:
         return self._json("POST", f"/workspaces/{parse.quote(workspace_id)}/runs", payload)
 
+    def create_workspace(self, payload: dict[str, Any]) -> Any:
+        return self._json("POST", "/workspaces", payload)
+
     def get_run(self, run_id: str) -> Any:
         return self._json("GET", f"/runs/{parse.quote(run_id)}")
 
@@ -24,6 +27,21 @@ class GroundedClient:
 
     def trace_view(self, run_id: str) -> Any:
         return self._json("GET", f"/runs/{parse.quote(run_id)}/trace-view")
+
+    def gate(self, run_id: str) -> Any:
+        return self._json("GET", f"/runs/{parse.quote(run_id)}/gate")
+
+    def final_report(self, run_id: str) -> Any:
+        return self._json("GET", f"/runs/{parse.quote(run_id)}/final-report")
+
+    def repair_signatures(self, run_id: str) -> Any:
+        return self._json("GET", f"/runs/{parse.quote(run_id)}/repair-signatures")
+
+    def resume_run(self, run_id: str) -> Any:
+        return self._json("POST", f"/runs/{parse.quote(run_id)}/resume")
+
+    def artifacts(self, run_id: str) -> Any:
+        return self._json("GET", f"/runs/{parse.quote(run_id)}/artifacts")
 
     def approvals(self, run_id: str) -> Any:
         return self._json("GET", f"/runs/{parse.quote(run_id)}/approvals")

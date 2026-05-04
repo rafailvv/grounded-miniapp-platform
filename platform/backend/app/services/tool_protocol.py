@@ -8,6 +8,7 @@ from uuid import uuid4
 TOOL_PROTOCOL_VERSION = "grounded.tool.v2"
 
 ToolRisk = Literal["safe", "read_only", "mutating", "network", "destructive", "forbidden", "unknown"]
+SandboxProfile = Literal["analysis_only", "agent_draft", "apply_gate", "developer_bypass"]
 
 
 CANONICAL_TOOL_ALIASES: dict[str, str] = {
@@ -86,13 +87,24 @@ def tool_registry_contract() -> dict[str, Any]:
             "tool_call_id",
             "tool",
             "version",
+            "status",
             "input",
             "risk",
             "approval",
+            "sandbox_profile",
             "progress",
             "result",
             "artifacts",
             "timing",
+            "started_at",
+            "completed_at",
+            "duration_ms",
+            "stdout_ref",
+            "stderr_ref",
+            "changed_files",
+            "failure_class",
+            "failure_signature",
+            "repair_recipe_ids",
             "retry",
             "truncation",
             "error",
@@ -188,8 +200,24 @@ def tool_envelope(
     retry: dict[str, Any] | None = None,
     truncation: dict[str, Any] | None = None,
     tool_call_id: str | None = None,
+    status: str | None = None,
+    sandbox_profile: SandboxProfile | str | None = None,
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    duration_ms: int | None = None,
+    stdout_ref: str | None = None,
+    stderr_ref: str | None = None,
+    changed_files: list[str] | None = None,
+    failure_class: str | None = None,
+    failure_signature: str | None = None,
+    repair_recipe_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     canonical = canonical_tool_name(tool)
+    created_at = datetime.now(timezone.utc).isoformat()
+    resolved_status = status or ("failed" if error else "completed" if result is not None else "started")
+    resolved_timing = dict(timing or {})
+    if duration_ms is not None:
+        resolved_timing["duration_ms"] = duration_ms
     normalized_error = None
     if error:
         normalized_error = {
@@ -202,17 +230,29 @@ def tool_envelope(
         "tool_call_id": tool_call_id or f"tool_{uuid4().hex}",
         "tool": canonical,
         "version": TOOL_PROTOCOL_VERSION,
+        "status": resolved_status,
         "input": input_payload or {},
         "risk": risk or default_tool_risk(canonical),
         "approval": approval or {"required": False, "status": "not_required"},
+        "approval_id": (approval or {}).get("approval_id") if isinstance(approval, dict) else None,
+        "sandbox_profile": sandbox_profile or ("agent_draft" if default_tool_risk(canonical) == "mutating" else "analysis_only"),
         "progress": progress or [],
         "result": result or {},
         "artifacts": artifacts or [],
-        "timing": timing or {},
+        "timing": resolved_timing,
+        "started_at": started_at or created_at,
+        "completed_at": completed_at if completed_at is not None else (created_at if resolved_status in {"completed", "failed"} else None),
+        "duration_ms": duration_ms if duration_ms is not None else resolved_timing.get("duration_ms"),
+        "stdout_ref": stdout_ref,
+        "stderr_ref": stderr_ref,
+        "changed_files": changed_files or [],
+        "failure_class": failure_class,
+        "failure_signature": failure_signature,
+        "repair_recipe_ids": repair_recipe_ids or [],
         "retry": retry or {"retryable": bool(normalized_error and normalized_error.get("retryable")), "attempt": 1},
         "truncation": truncation or {"truncated": False},
         "error": normalized_error,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": created_at,
     }
 
 

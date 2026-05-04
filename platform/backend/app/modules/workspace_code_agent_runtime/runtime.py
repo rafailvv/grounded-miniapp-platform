@@ -4395,6 +4395,10 @@ class WorkspaceCodeAgentRuntime:
             request_mode=request.mode,
             results=results,
             validation_snapshot=validation_snapshot,
+            generation_mode=str(getattr(request.generation_mode, "value", request.generation_mode)),
+            intent=request.intent,
+            acceptance_contract=getattr(request, "acceptance_contract", None),
+            focused_visual_edit=self._focused_edit_kind(request) == "css_only_visual",
         )
 
     def _validation_snapshot_from_execution(self, execution: CheckExecutionRecord) -> ValidationSnapshot:

@@ -22,8 +22,10 @@ from app.models.domain import (
     GenerateRequest,
     JobEvent,
     JobRecord,
+    RunCheckResult,
     RunChecksSummary,
     RunRecord,
+    ValidationSnapshot,
     WorkspaceRecord,
 )
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
@@ -1453,6 +1455,8 @@ class RunService:
             run.current_stage = "completed"
             run.progress_percent = 100
             run.preview_refresh_status = "passed"
+            if wait and reason == "run completion":
+                self._run_post_apply_source_proof(run=run, source_dir=source_dir, preview=preview)
         elif wait:
             run.status = "blocked"
             run.outcome_kind = "blocked_preview_infra"
@@ -1475,6 +1479,122 @@ class RunService:
             }
             self.store.upsert("reports", f"run_artifacts:{run.run_id}", artifacts_payload)
         return preview
+
+    def _run_post_apply_source_proof(self, *, run: RunRecord, source_dir: Any, preview: Any) -> None:
+        """Re-run product proof against the applied source workspace.
+
+        Draft checks prove the candidate can work before apply. This second pass
+        proves that the final served app still matches the applied source after
+        draft cleanup and preview rebuild.
+        """
+        execution = self.check_runner.run(
+            workspace_id=run.workspace_id,
+            run_id=run.run_id,
+            source_dir=source_dir,
+            changed_files=list(run.touched_files or []),
+            preview_run_id=None,
+            scope_mode="full_build",
+            check_profile="full",
+            intent=run.intent,
+            generation_mode=run.generation_mode,
+            acceptance_contract=run.acceptance_contract,
+        )
+        report_ref = f"post_apply_checks:{run.workspace_id}:{run.run_id}"
+        self.store.upsert(
+            "reports",
+            report_ref,
+            {
+                "workspace_id": run.workspace_id,
+                "run_id": run.run_id,
+                "phase": "post_apply_source_proof",
+                "results": [item.model_dump(mode="json") for item in execution.results],
+            },
+        )
+        browser_result = next((item for item in execution.results if item.name == "browser_flow_smoke"), None)
+        if browser_result is not None:
+            run.browser_flow_proof = dict(browser_result.diagnostics or {})
+            if isinstance(run.browser_flow_proof.get("mobile_layout"), dict):
+                run.mobile_layout_report = dict(run.browser_flow_proof.get("mobile_layout") or {})
+            if run.browser_flow_proof:
+                run.browser_proof_ref = f"browser_proof:{run.workspace_id}:{run.run_id}"
+                self.store.upsert(
+                    "reports",
+                    run.browser_proof_ref,
+                    {
+                        "workspace_id": run.workspace_id,
+                        "run_id": run.run_id,
+                        "phase": "post_apply_source_proof",
+                        "proof": run.browser_flow_proof,
+                        "mobile_layout_report": run.mobile_layout_report,
+                    },
+                )
+        failures = [item for item in execution.results if item.status in {"failed", "blocked"}]
+        if failures:
+            issues = [issue.model_dump(mode="json") for issue in CheckRunner.failing_issues(execution.results)]
+            validation_snapshot = ValidationSnapshot(
+                platform_valid=False,
+                checks_valid=False,
+                build_valid=not any(item.name in {"schema_validators", "changed_files_static"} for item in failures),
+                blocking=True,
+                issues=issues
+                or [
+                    {
+                        "kind": "post_apply_check_failure",
+                        "check": item.name,
+                        "details": item.details,
+                        "logs": list(item.logs or [])[-8:],
+                        "blocking": True,
+                    }
+                    for item in failures
+                ],
+            )
+            run.status = "blocked"
+            run.apply_status = "applied"
+            run.outcome_kind = "blocked_preview_infra" if self.check_runner.classify_failure(execution.results) == "blocked_preview_infra" else "blocked_generation"
+            run.current_stage = "post-apply proof failed"
+            run.failure_reason = self._specific_failure_reason_from_results(execution.results) or "Post-apply source proof failed."
+            run.failure_class = "post_apply.source_proof_failed"
+            run.failure_signature = f"{run.failure_class}:{failures[0].name}"
+            run.remaining_issues = [
+                {
+                    "kind": "post_apply_check_failure",
+                    "check": item.name,
+                    "details": item.details,
+                    "logs": list(item.logs or [])[-8:],
+                    "blocking": True,
+                }
+                for item in failures
+            ]
+            run.checks_summary = self._build_checks_summary(validation_snapshot, getattr(preview, "status", "running"), gate_status="blocked")
+            self.store.upsert("reports", f"validation:{run.workspace_id}", validation_snapshot.model_dump(mode="json"))
+            self._append_job_event(
+                run.linked_job_id,
+                "job_failed",
+                run.failure_reason,
+                {"reason": "post_apply_source_proof_failed", "run_id": run.run_id, "report_ref": report_ref},
+            )
+        else:
+            validation_snapshot = ValidationSnapshot(platform_valid=True, checks_valid=True, build_valid=True, blocking=False, issues=[])
+            run.checks_summary = self._build_checks_summary(validation_snapshot, getattr(preview, "status", "running"), gate_status="passed")
+            self.store.upsert("reports", f"validation:{run.workspace_id}", validation_snapshot.model_dump(mode="json"))
+            self._append_job_event(
+                run.linked_job_id,
+                "preview_ready",
+                "Applied source preview passed post-apply product proof.",
+                {"reason": "post_apply_source_proof", "run_id": run.run_id, "report_ref": report_ref},
+            )
+
+    @staticmethod
+    def _specific_failure_reason_from_results(results: list[RunCheckResult]) -> str | None:
+        for result in results:
+            if result.status not in {"failed", "blocked"}:
+                continue
+            logs = [" ".join(str(line or "").split()).strip() for line in list(result.logs or []) if str(line or "").strip()]
+            if logs:
+                return f"{result.name}: {logs[-1][:320]}"
+            if result.details:
+                return f"{result.name}: {result.details[:320]}"
+        return None
 
     def _queue_resume_generation_from_checkpoint_if_needed(self, run: RunRecord, request: CreateRunRequest) -> None:
         if request.mode != "fix":
@@ -1557,6 +1677,12 @@ class RunService:
             effective_diff = self.workspace_service.diff(workspace_id)
         preview_payload = self._preview_snapshot(workspace_id, preview)
         patch_payload = self.code_agent_runtime.current_report(workspace_id, "patch")
+        post_apply_checks = self.store.get("reports", f"post_apply_checks:{workspace_id}:{run.run_id}")
+        check_results_payload = (
+            {"items": list(post_apply_checks.get("results") or [])}
+            if isinstance(post_apply_checks, dict) and post_apply_checks.get("results")
+            else self.code_agent_runtime.current_report(workspace_id, "check_results")
+        )
         if not patch_payload and effective_diff.strip():
             patch_paths = self._paths_from_diff(effective_diff)
             if not patch_paths:
@@ -1575,8 +1701,8 @@ class RunService:
             "trace": self.code_agent_runtime.current_report(workspace_id, "trace"),
             "agent_diagnostics": self.code_agent_runtime.current_report(workspace_id, "agent_diagnostics"),
             "iterations": iterations,
-            "check_results": (self.code_agent_runtime.current_report(workspace_id, "check_results") or {}).get("items", []),
-            "checks": self.code_agent_runtime.current_report(workspace_id, "check_results"),
+            "check_results": (check_results_payload or {}).get("items", []),
+            "checks": check_results_payload,
             "patch": patch_payload,
             "diff": effective_diff,
             "role_coverage": run.role_coverage,

@@ -509,17 +509,65 @@ export type ToolEventEnvelope = {
   tool_call_id: string;
   tool: string;
   version: string;
+  status?: string;
   input: Record<string, unknown>;
   risk: string;
   approval: Record<string, unknown>;
+  approval_id?: string | null;
+  sandbox_profile?: string;
   progress?: Array<Record<string, unknown>>;
   result: Record<string, unknown>;
   artifacts: Array<Record<string, unknown>>;
   timing: Record<string, unknown>;
+  started_at?: string | null;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  stdout_ref?: string | null;
+  stderr_ref?: string | null;
+  changed_files?: string[];
+  failure_class?: string | null;
+  failure_signature?: string | null;
+  repair_recipe_ids?: string[];
   retry?: Record<string, unknown>;
   truncation?: Record<string, unknown>;
   error?: Record<string, unknown> | null;
   created_at?: string;
+};
+
+export type RunGateReport = {
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  blocking: boolean;
+  issues: Array<Record<string, unknown>>;
+  repair_packets: Array<Record<string, unknown>>;
+  requirements: Record<string, unknown>;
+  artifact_refs: Record<string, string | null | undefined>;
+};
+
+export type RunRepairSignatures = {
+  run_id: string;
+  status: string;
+  blocking: boolean;
+  items: Array<Record<string, unknown>>;
+  catalog: Array<Record<string, unknown>>;
+};
+
+export type RunFinalReport = {
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  blocking: boolean;
+  prompt: string;
+  summary?: string | null;
+  acceptance_contract: Record<string, unknown>;
+  diff_summary: Record<string, unknown>;
+  checks: Array<Record<string, unknown>>;
+  browser_proof: Record<string, unknown>;
+  repair_signatures: Array<Record<string, unknown>>;
+  preview: Record<string, unknown>;
+  artifact_refs: Record<string, string | null | undefined>;
+  created_at: string;
 };
 
 export type StagedApplyState = {
@@ -765,6 +813,22 @@ export async function getRunTimeline(runId: string): Promise<RunTimeline> {
 
 export async function getRunTraceView(runId: string): Promise<RunTraceView> {
   return request<RunTraceView>(`/runs/${runId}/trace-view`);
+}
+
+export async function getRunGate(runId: string): Promise<RunGateReport> {
+  return request<RunGateReport>(`/runs/${runId}/gate`);
+}
+
+export async function getRunFinalReport(runId: string): Promise<RunFinalReport> {
+  return request<RunFinalReport>(`/runs/${runId}/final-report`);
+}
+
+export async function getRunRepairSignatures(runId: string): Promise<RunRepairSignatures> {
+  return request<RunRepairSignatures>(`/runs/${runId}/repair-signatures`);
+}
+
+export async function resumeRun(runId: string): Promise<Run> {
+  return request<Run>(`/runs/${runId}/resume`, { method: "POST" });
 }
 
 export async function getRunApprovals(runId: string): Promise<{ run_id: string; items: ApprovalRecord[] }> {
