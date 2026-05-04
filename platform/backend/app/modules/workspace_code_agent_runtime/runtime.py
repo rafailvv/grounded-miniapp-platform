@@ -1330,6 +1330,9 @@ class WorkspaceCodeAgentRuntime:
             last_turn_summary: str | None,
             latest_diff_summary: str | None,
             agent_memory: dict[str, Any] | None = None,
+            repair_packets: list[dict[str, Any]] | None = None,
+            next_forced_action: dict[str, Any] | None = None,
+            diagnostics_delta: dict[str, Any] | None = None,
         ) -> AgentTurnPlan:
             del validation_snapshot
             extra_file_context: dict[str, str] = {}
@@ -1381,6 +1384,9 @@ class WorkspaceCodeAgentRuntime:
                     last_turn_summary=last_turn_summary,
                     latest_diff_summary=latest_diff_summary,
                     agent_memory=agent_memory,
+                    repair_packets=repair_packets or [],
+                    next_forced_action=next_forced_action or {},
+                    diagnostics_delta=diagnostics_delta or {},
                 )
                 if "error" in llm_payload:
                     if self._is_provider_quota_error(str(llm_payload.get("error") or "")):
@@ -1457,14 +1463,24 @@ class WorkspaceCodeAgentRuntime:
                     invalid_mutation = AgentEditValidator._first_invalid_file_change(mutating_file_changes)
                     if invalid_mutation and not invalid_mutation_correction_sent:
                         code, message = invalid_mutation
+                        repair_packet = AgentEditValidator.repair_packet_for_issue(
+                            code=code,
+                            message=message,
+                            file_changes=mutating_file_changes,
+                            attempt=attempt,
+                            evidence={"tool_round": tool_round, "tool_trace": mutating_tool_trace},
+                        )
                         failed_tool_results = [
                             {
                                 "tool": "mutating_tool_validation",
                                 "tool_use_id": str(item.get("tool_use_id") or f"mutating_tool_validation_{index}"),
                                 "status": "failed",
+                                "failure_class": repair_packet.get("failure_class"),
+                                "failure_signature": repair_packet.get("failure_signature"),
                                 "error_code": code,
                                 "message": message,
                                 "file_path": str(item.get("file_path") or ""),
+                                "repair_packet": repair_packet,
                                 "required_next_action": (
                                     "Retry the same concrete fix with valid mutating tool calls. "
                                     "apply_patch_to_draft requires file_path + a unified diff in `diff`; "
@@ -1479,8 +1495,11 @@ class WorkspaceCodeAgentRuntime:
                                 "tool": "mutating_tool_validation",
                                 "tool_use_id": "mutating_tool_validation",
                                 "status": "failed",
+                                "failure_class": repair_packet.get("failure_class"),
+                                "failure_signature": repair_packet.get("failure_signature"),
                                 "error_code": code,
                                 "message": message,
+                                "repair_packet": repair_packet,
                             }
                         ]
                         local_tool_results.extend(failed_tool_results)
@@ -1492,9 +1511,32 @@ class WorkspaceCodeAgentRuntime:
                             job,
                             "repair_iteration",
                             "Agent write tool call was invalid; retrying inside the same tool loop with exact write-tool contract.",
-                            {"attempt": attempt, "tool_round": tool_round, "error_code": code, "message": message},
+                            {"attempt": attempt, "tool_round": tool_round, "error_code": code, "message": message, "repair_packet": repair_packet},
                         )
                         continue
+                    read_state_packets = self._read_state_repair_packets(
+                        run_id=run_id,
+                        draft_source=draft_source,
+                        file_changes=mutating_file_changes,
+                        attempt=attempt,
+                    )
+                    if read_state_packets:
+                        read_state_results = [
+                            {
+                                "tool": "mutating_tool_read_state",
+                                "tool_use_id": f"read_state_{attempt}_{index}",
+                                "status": "warning",
+                                "failure_class": packet.get("failure_class"),
+                                "failure_signature": packet.get("failure_signature"),
+                                "file_path": packet.get("file_path"),
+                                "repair_packet": packet,
+                                "required_next_action": "If this edit fails or repeats, read the target file before the next write.",
+                            }
+                            for index, packet in enumerate(read_state_packets, start=1)
+                        ]
+                        local_tool_results.extend(read_state_results)
+                        tool_results.extend(read_state_results)
+                        self.transcript_store.append_tool_results(artifact_run_id, read_state_results)
                     raw_tool_calls = [
                         item for item in raw_tool_calls if not self._is_mutating_agent_tool_call(item)
                     ]
@@ -1530,6 +1572,7 @@ class WorkspaceCodeAgentRuntime:
                             "tool_results": list(local_tool_results),
                             "acceptance_checks": list(llm_payload.get("acceptance_checks") or []),
                             "tool_call_contract": "mutating tool calls are converted to internal draft changes before apply",
+                            "repair_packets": read_state_packets,
                         },
                     )
                 if raw_tool_calls:
@@ -2248,6 +2291,9 @@ class WorkspaceCodeAgentRuntime:
         last_turn_summary: str | None,
         latest_diff_summary: str | None,
         agent_memory: dict[str, Any] | None = None,
+        repair_packets: list[dict[str, Any]] | None = None,
+        next_forced_action: dict[str, Any] | None = None,
+        diagnostics_delta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         turn_started_at = time.perf_counter()
         turn_started_iso = datetime.now(timezone.utc).isoformat()
@@ -2337,6 +2383,9 @@ class WorkspaceCodeAgentRuntime:
                 last_turn_summary=last_turn_summary,
                 latest_diff_summary=latest_diff_summary,
                 agent_memory=agent_memory,
+                repair_packets=repair_packets or [],
+                next_forced_action=next_forced_action or {},
+                diagnostics_delta=diagnostics_delta or {},
             )
             user_prompt = self._attach_context_pressure(
                 job=job,
@@ -2394,11 +2443,26 @@ class WorkspaceCodeAgentRuntime:
                 transcript_context = self.transcript_store.next_model_context(artifact_run_id)
             pending_tool_results = list(transcript_context.get("tool_result_messages") or [])
             available_tools = AgentToolRegistry.openai_tools()
+            forced_tool_names = {
+                str(item)
+                for item in (next_forced_action or {}).get("forced_tool_names", [])
+                if str(item).strip()
+            }
+            if not forced_tool_names:
+                nested_forced = (next_forced_action or {}).get("next_forced_action")
+                if isinstance(nested_forced, dict):
+                    forced_tool_names = {
+                        str(item)
+                        for item in nested_forced.get("allowed_tools", [])
+                        if str(item).strip()
+                    }
+            if forced_tool_names:
+                available_tools = AgentToolRegistry.openai_tools(forced_tool_names)
             if generated_tests_repair or browser_step_repair or (
                 create_repair_turn
                 and (tool_round > self._tool_round_limit(generation_mode) or repeated_no_progress > 0)
             ):
-                available_tools = AgentToolRegistry.openai_tools({"apply_patch_to_draft", "write_file"})
+                available_tools = AgentToolRegistry.openai_tools(forced_tool_names or {"apply_patch_to_draft", "write_file"})
             response = self.openai_client.generate_agent_tool_step(
                 tools=available_tools,
                 system_prompt=self._agent_system_prompt(),
@@ -2577,6 +2641,9 @@ class WorkspaceCodeAgentRuntime:
         last_turn_summary: str | None,
         latest_diff_summary: str | None,
         agent_memory: dict[str, Any] | None = None,
+        repair_packets: list[dict[str, Any]] | None = None,
+        next_forced_action: dict[str, Any] | None = None,
+        diagnostics_delta: dict[str, Any] | None = None,
     ) -> str:
         file_tree = self.workspace_service.file_tree(workspace_id, run_id=run_id)
         generation_mode = self._generation_mode(request.generation_mode)
@@ -2733,6 +2800,21 @@ class WorkspaceCodeAgentRuntime:
                 if browser_step_repair or generated_tests_repair
                 else agent_memory or {}
             ),
+            "repair_packets": self._compact_jsonish(
+                repair_packets or [],
+                max_chars=2400 if compact_repair_prompt else 3600,
+                max_items=6,
+            ),
+            "next_forced_action": self._compact_jsonish(
+                next_forced_action or {},
+                max_chars=1200,
+                max_items=8,
+            ),
+            "diagnostics_delta": self._compact_jsonish(
+                diagnostics_delta or {},
+                max_chars=2200 if compact_repair_prompt else 3200,
+                max_items=8,
+            ),
             "environment_snapshot": self._compact_jsonish(
                 self.environment_snapshots.get(run_id) or {},
                 max_chars=700,
@@ -2754,6 +2836,9 @@ class WorkspaceCodeAgentRuntime:
                 else None
             ),
             "repair_focus": (
+                str((next_forced_action or {}).get("repair_focus") or "")
+                if isinstance(next_forced_action, dict) and next_forced_action.get("active")
+                else
                 self._browser_step_repair_focus(latest_execution)
                 if browser_step_repair
                 else
@@ -3999,6 +4084,18 @@ class WorkspaceCodeAgentRuntime:
         job.resume_checkpoint_ref = job.resume_checkpoint_ref or f"resume_checkpoint:{job.workspace_id}:{artifact_run_id}"
         coordinator = self.coordinators.get(artifact_run_id)
         scratchpad = self.scratchpads.get(artifact_run_id)
+        repair_state_ref = f"repair_state:{job.workspace_id}:{artifact_run_id}"
+        diagnostics_delta_ref = f"diagnostics_delta:{job.workspace_id}:{artifact_run_id}"
+        repair_state = self.store.get("reports", repair_state_ref)
+        repair_packets = [
+            item
+            for item in (list((repair_state or {}).get("latest_repair_packets") or []) if isinstance(repair_state, dict) else [])
+            if isinstance(item, dict)
+        ]
+        try:
+            latest_diff_summary = self.workspace_service.diff(job.workspace_id, run_id=artifact_run_id)[:4000]
+        except Exception:
+            latest_diff_summary = ""
         checkpoint = {
             "workspace_id": job.workspace_id,
             "run_id": job.linked_run_id,
@@ -4014,6 +4111,28 @@ class WorkspaceCodeAgentRuntime:
             "todo_plan": coordinator.snapshot().get("todo_plan", []) if coordinator else [],
             "scratchpad": scratchpad.snapshot() if scratchpad else {},
             "process_summary": self.process_recovery.checkpoint(self.process_manager.snapshot()),
+            "repair_state_ref": repair_state_ref,
+            "repair_packets": repair_packets,
+            "last_edit_failure_packets": [
+                item
+                for item in repair_packets
+                if str(item.get("failure_class") or "").startswith("generation.invalid_edit_operation")
+            ],
+            "next_forced_action": dict((repair_state or {}).get("next_forced_action") or {}) if isinstance(repair_state, dict) else {},
+            "failure_signatures": [
+                str(item.get("failure_signature") or item.get("signature") or "")
+                for item in repair_packets
+            ],
+            "repair_attempts": int(
+                max(
+                    [int(item.get("repeated_count") or 0) for item in repair_packets]
+                    or [0]
+                )
+            ),
+            "latest_diff_summary": latest_diff_summary,
+            "diagnostics_delta_ref": diagnostics_delta_ref,
+            "diagnostics_delta": self.store.get("reports", diagnostics_delta_ref),
+            "file_state_cache_ref": job.file_state_cache_ref,
             "stored_at": datetime.now(timezone.utc).isoformat(),
         }
         checkpoint.update(extra or {})
@@ -4323,6 +4442,39 @@ class WorkspaceCodeAgentRuntime:
     @staticmethod
     def _file_changes_from_mutating_tool_calls(tool_calls: list[dict[str, Any]]) -> tuple[list[DraftAction], list[dict[str, object]]]:
         return file_changes_from_mutating_tool_calls(tool_calls)
+
+    def _read_state_repair_packets(
+        self,
+        *,
+        run_id: str,
+        draft_source: Path,
+        file_changes: list[DraftAction],
+        attempt: int,
+    ) -> list[dict[str, object]]:
+        packets: list[dict[str, object]] = []
+        for change in file_changes[:8]:
+            path = self._strip_leading_dot_slash(change.file_path)
+            if not path or str(change.operation) == "create":
+                continue
+            freshness = self.file_state_cache.freshness(run_id=run_id, root=draft_source, path=path)
+            status = str(freshness.get("status") or "")
+            if status not in {"unread", "stale"}:
+                continue
+            message = (
+                f"{path} changed after the last read; read it again before patching."
+                if status == "stale"
+                else f"{path} was not read in this run before the edit; read it before repeating this repair."
+            )
+            packets.append(
+                AgentEditValidator.repair_packet_for_read_state(
+                    status=status,
+                    file_path=path,
+                    message=message,
+                    attempt=attempt,
+                    evidence={"freshness": freshness, "operation": change.operation},
+                )
+            )
+        return packets
 
     @staticmethod
     def _strip_leading_dot_slash(raw_path: object) -> str:

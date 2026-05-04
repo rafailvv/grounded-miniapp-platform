@@ -15,19 +15,41 @@ class RepairCatalogEntry:
     verification_check: str
     instruction: str
     auto_fixable: bool = True
+    required_next_tool: str = "read_files"
+    suggested_tool_after_read: str = "apply_patch_to_draft_or_write_file"
+    verification_command: str = "run_checks"
+    retry_policy: str = "deterministic_repair"
+    deterministic: bool = True
     patterns: tuple[re.Pattern[str], ...] = field(default_factory=tuple)
 
     def packet(self, *, evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+        evidence_payload = evidence or {}
         return {
             "signature": self.signature,
             "issue_code": self.issue_code,
+            "code": self.issue_code,
             "severity": self.severity,
             "likely_root_cause": self.likely_root_cause,
             "target_files": list(self.target_files),
             "verification_check": self.verification_check,
+            "verification_command": self.verification_command,
             "instruction": self.instruction,
             "auto_fixable": self.auto_fixable,
-            "evidence": evidence or {},
+            "required_next_tool": self.required_next_tool,
+            "suggested_tool_after_read": self.suggested_tool_after_read,
+            "retry_policy": self.retry_policy,
+            "retryable": self.auto_fixable,
+            "deterministic": self.deterministic,
+            "failure_class": str(evidence_payload.get("failure_class") or self.verification_check),
+            "failure_signature": str(evidence_payload.get("failure_signature") or self.signature),
+            "repair_recipe_id": f"catalog.{self.issue_code}",
+            "forbidden_tools_once": [],
+            "next_forced_action": {
+                "required_next_tool": self.required_next_tool,
+                "target_files": list(self.target_files),
+                "verification_check": self.verification_check,
+            },
+            "evidence": evidence_payload,
         }
 
 
@@ -44,6 +66,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/static/**/app.js",),
         verification_check="changed_files_static",
         instruction="Open the failing JS file, fix the syntax at the reported line, then rerun static checks.",
+        required_next_tool="read_files",
+        verification_command="run_checks changed_files_static",
         patterns=(_rx(r"\bsyntaxerror\b"), _rx(r"node --check"), _rx(r"unexpected token")),
     ),
     RepairCatalogEntry(
@@ -54,6 +78,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/static/**/index.html", "miniapp/app/static/**/app.js"),
         verification_check="frontend_interaction_static_smoke",
         instruction="Align HTML ids/form names and JS selectors. Prefer preserving the intended user workflow over deleting handlers.",
+        required_next_tool="read_files",
+        verification_command="run_checks frontend_interaction_static_smoke",
         patterns=(_rx(r"missing.*(?:dom|html).*id"), _rx(r"queryselector"), _rx(r"form_field")),
     ),
     RepairCatalogEntry(
@@ -64,6 +90,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/routes/**", "miniapp/app/static/**/app.js"),
         verification_check="connectivity_validators",
         instruction="Add the missing backend route or update the frontend API reference so both sides use one route contract.",
+        required_next_tool="read_files",
+        verification_command="run_checks connectivity_validators",
         patterns=(_rx(r"missing_backend_route"), _rx(r"frontend.*api.*missing"), _rx(r"404")),
     ),
     RepairCatalogEntry(
@@ -74,6 +102,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/routes/**", "miniapp/app/schemas.py", "miniapp/app/db.py"),
         verification_check="preview_boot_smoke",
         instruction="Move DB sessions to Depends/get_db patterns and keep response payloads Pydantic/JSON serializable.",
+        required_next_tool="read_files",
+        verification_command="run_checks preview_boot_smoke",
         patterns=(_rx(r"invalid args for response field"), _rx(r"sqlalchemy\.orm\.session\.session"), _rx(r"fastapi")),
     ),
     RepairCatalogEntry(
@@ -84,6 +114,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/db.py", "miniapp/app/routes/**", "miniapp/app/schemas.py"),
         verification_check="api_workflow_smoke",
         instruction="Update schema initialization and route SQL together, then verify create/list/update persistence.",
+        required_next_tool="read_files",
+        verification_command="run_checks api_workflow_smoke",
         patterns=(_rx(r"no such table"), _rx(r"has no column named"), _rx(r"operationalerror")),
     ),
     RepairCatalogEntry(
@@ -94,6 +126,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/generated/route_manifest.json", "miniapp/app/static/**/index.html"),
         verification_check="schema_validators",
         instruction="Regenerate or repair route manifest entries so each role route maps to the actual static page.",
+        required_next_tool="read_files",
+        verification_command="run_checks schema_validators",
         patterns=(_rx(r"route_manifest"), _rx(r"duplicate_static_route"), _rx(r"declared routes")),
     ),
     RepairCatalogEntry(
@@ -104,6 +138,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/static/**/index.html", "miniapp/app/static/**/app.js", "miniapp/app/static/**/styles.css"),
         verification_check="browser_flow_smoke",
         instruction="Restore visible role UI, remove template-only content, and verify each role route renders non-empty product content.",
+        required_next_tool="read_files",
+        verification_command="browser_verify",
         patterns=(_rx(r"blank"), _rx(r"empty preview"), _rx(r"template placeholder")),
     ),
     RepairCatalogEntry(
@@ -114,6 +150,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/static/client/**", "miniapp/app/static/specialist/**", "miniapp/app/static/manager/**"),
         verification_check="browser_flow_smoke",
         instruction="Create or route all required role pages and keep role navigation consistent with the manifest.",
+        required_next_tool="read_files",
+        verification_command="browser_verify",
         patterns=(_rx(r"no(?: declared)? pages?.*role"), _rx(r"missing_role_page"), _rx(r"missing.*role.*page"), _rx(r"/(?:client|specialist|manager)")),
     ),
     RepairCatalogEntry(
@@ -124,6 +162,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/static/**", "miniapp/app/routes/**", "miniapp/app/db.py"),
         verification_check="browser_flow_smoke",
         instruction="Use the failed browser step evidence to fix the exact create/update/list/reload interaction, then rerun browser proof.",
+        required_next_tool="read_files",
+        verification_command="browser_verify",
         patterns=(_rx(r"browser_flow_smoke"), _rx(r"workflow_flow_failed"), _rx(r"browser proof")),
     ),
     RepairCatalogEntry(
@@ -134,6 +174,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/routes/**", "miniapp/app/db.py", "miniapp/app/static/**/app.js"),
         verification_check="api_workflow_smoke",
         instruction="Fix the API persistence path first, then verify the frontend reads the same shared state.",
+        required_next_tool="read_files",
+        verification_command="browser_verify",
         patterns=(_rx(r"did not persist"), _rx(r"not reflect.*shared state"), _rx(r"api_workflow")),
     ),
     RepairCatalogEntry(
@@ -144,6 +186,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/static/manager/index.html", "miniapp/app/static/manager/app.js", "miniapp/app/static/manager/styles.css"),
         verification_check="platform_invariants",
         instruction="Add the missing role-specific controls and JS handlers. For manager, expose dashboard/oversight actions that mutate shared workflow state through the accepted API.",
+        required_next_tool="read_files",
+        verification_command="run_checks platform_invariants",
         patterns=(_rx(r"missing_role_workflow_actions"), _rx(r"lacks its own workflow actions"), _rx(r"missing_role_actions")),
     ),
     RepairCatalogEntry(
@@ -154,6 +198,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/routes/generated_contract.py", "miniapp/app/static/**/app.js", "miniapp/tests/test_generated_app.py", "miniapp/tests/generated_app.test.mjs"),
         verification_check="frontend_interaction_static_smoke",
         instruction="Align the backend Pydantic update/create schemas, frontend JSON payloads, and generated tests so every prompt-required field is accepted and persisted.",
+        required_next_tool="read_files",
+        verification_command="run_checks frontend_interaction_static_smoke",
         patterns=(_rx(r"workflow_patch_payload_field_mismatch"), _rx(r"sends PATCH fields not accepted"), _rx(r"payload.*field.*mismatch")),
     ),
     RepairCatalogEntry(
@@ -164,6 +210,8 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/static/**/styles.css", "miniapp/app/static/shared/base.css", "miniapp/app/static/**/index.html"),
         verification_check="browser_flow_smoke",
         instruction="Fix overflow/overlap using responsive layout constraints, then rerun mobile browser proof.",
+        required_next_tool="read_files",
+        verification_command="browser_verify mobile",
         patterns=(_rx(r"mobile_layout"), _rx(r"overflow"), _rx(r"overlap")),
     ),
     RepairCatalogEntry(
@@ -175,6 +223,9 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         verification_check="repair_loop",
         instruction="Stop broad retries. Inspect the latest failure signature, target only implicated files, and make a different concrete patch.",
         auto_fixable=False,
+        required_next_tool="read_files",
+        verification_command="run_checks",
+        retry_policy="do_not_retry_same_patch",
         patterns=(_rx(r"repeated"), _rx(r"no progress"), _rx(r"same failure")),
     ),
 )
@@ -189,17 +240,36 @@ class RepairCatalog:
     def classify_issue(issue: dict[str, Any]) -> dict[str, Any]:
         text = RepairCatalog._issue_text(issue)
         for entry in REPAIR_CATALOG:
-            if entry.signature in text or any(pattern.search(text) for pattern in entry.patterns):
+            if entry.signature in text or entry.issue_code in text:
+                return entry.packet(evidence=issue)
+        for entry in REPAIR_CATALOG:
+            if any(pattern.search(text) for pattern in entry.patterns):
                 return entry.packet(evidence=issue)
         return {
             "signature": str(issue.get("signature") or issue.get("failure_signature") or "generation.unknown_failure"),
             "issue_code": str(issue.get("code") or issue.get("check") or "unknown_failure"),
+            "code": str(issue.get("code") or issue.get("check") or "unknown_failure"),
             "severity": str(issue.get("severity") or "medium"),
             "likely_root_cause": str(issue.get("details") or issue.get("message") or "The run failed without a catalogued signature."),
             "target_files": list(issue.get("paths") or []),
             "verification_check": str(issue.get("check") or "checks.run"),
+            "verification_command": str(issue.get("verification_command") or "run_checks"),
             "instruction": "Inspect the concrete check logs, patch the implicated files, and rerun the failing check.",
             "auto_fixable": False,
+            "required_next_tool": str(issue.get("required_next_tool") or "read_files"),
+            "suggested_tool_after_read": str(issue.get("suggested_tool_after_read") or "apply_patch_to_draft_or_write_file"),
+            "retry_policy": str(issue.get("retry_policy") or "manual_triage"),
+            "retryable": bool(issue.get("retryable", False)),
+            "deterministic": bool(issue.get("deterministic", True)),
+            "failure_class": str(issue.get("failure_class") or issue.get("check") or "checks.run"),
+            "failure_signature": str(issue.get("failure_signature") or issue.get("signature") or "generation.unknown_failure"),
+            "repair_recipe_id": str(issue.get("repair_recipe_id") or f"catalog.{issue.get('code') or issue.get('check') or 'unknown_failure'}"),
+            "forbidden_tools_once": list(issue.get("forbidden_tools_once") or []),
+            "next_forced_action": {
+                "required_next_tool": str(issue.get("required_next_tool") or "read_files"),
+                "target_files": list(issue.get("paths") or []),
+                "verification_check": str(issue.get("check") or "checks.run"),
+            },
             "evidence": issue,
         }
 

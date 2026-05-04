@@ -455,6 +455,9 @@ class RepairIterationRecord(StrictModel):
     files_read: list[str] = Field(default_factory=list)
     files_changed: list[str] = Field(default_factory=list)
     failure_class: str | None = None
+    repair_packets: list[dict[str, Any]] = Field(default_factory=list)
+    repair_packet_ids: list[str] = Field(default_factory=list)
+    diagnostics_delta_ref: str | None = None
     check_results: list[RunCheckResult] = Field(default_factory=list)
     latency_breakdown: dict[str, float | int] = Field(default_factory=dict)
     token_usage: dict[str, Any] = Field(default_factory=dict)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from app.models.domain import DraftAction
+from app.modules.miniapp_agent_loop.repair_packets import EditFailurePacket
 from app.modules.miniapp_agent_loop.types import AgentTurnPlan
 
 
@@ -37,13 +38,114 @@ class AgentEditValidator:
             issue = AgentEditValidator._first_invalid_file_change(plan.file_changes)
             if issue:
                 code, message = issue
+                packet = AgentEditValidator.repair_packet_for_issue(
+                    code=code,
+                    message=message,
+                    file_changes=plan.file_changes,
+                )
                 plan.outcome = "fatal_invalid_response"
                 plan.diagnosis = message
                 plan.failure_class = "generation.invalid_edit_operation"
                 plan.failure_signature = f"generation.invalid_edit_operation:{code}"
                 plan.root_cause_summary = message
+                plan.fix_targets = list(packet.get("target_files") or [])
+                plan.metadata = {
+                    **dict(plan.metadata or {}),
+                    "repair_packets": [packet],
+                    "invalid_edit_code": code,
+                }
                 plan.file_changes = []
         return plan
+
+    @classmethod
+    def repair_packet_for_issue(
+        cls,
+        *,
+        code: str,
+        message: str,
+        file_changes: list[DraftAction],
+        attempt: int = 0,
+        repeated_count: int = 0,
+        evidence: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        file_path = cls._best_issue_path(code, file_changes)
+        payload = {
+            "operation_count": len(file_changes),
+            "operations": [
+                {
+                    "file_path": cls._strip_leading_dot_slash(getattr(item, "file_path", "")),
+                    "operation": str(getattr(item, "operation", "") or ""),
+                    "has_content": bool(getattr(item, "content", None)),
+                    "has_diff": bool(getattr(item, "diff", None)),
+                }
+                for item in file_changes[:8]
+            ],
+        }
+        if evidence:
+            payload.update(evidence)
+        return EditFailurePacket.from_edit_issue(
+            code=code,
+            message=message,
+            file_path=file_path,
+            evidence=payload,
+            attempt=attempt,
+            repeated_count=repeated_count,
+        ).as_dict()
+
+    @classmethod
+    def repair_packet_for_apply_conflict(
+        cls,
+        *,
+        conflict_reason: str,
+        file_changes: list[DraftAction],
+        attempt: int = 0,
+        repeated_count: int = 0,
+    ) -> dict[str, object]:
+        return cls.repair_packet_for_issue(
+            code="patch_conflict",
+            message=conflict_reason or "Patch did not apply to the current draft.",
+            file_changes=file_changes,
+            attempt=attempt,
+            repeated_count=repeated_count,
+            evidence={"conflict_reason": conflict_reason or ""},
+        )
+
+    @classmethod
+    def repair_packet_for_read_state(
+        cls,
+        *,
+        status: str,
+        file_path: str,
+        message: str,
+        attempt: int = 0,
+        repeated_count: int = 0,
+        evidence: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        code = "stale_file" if status == "stale" else "file_not_read" if status == "unread" else status
+        return EditFailurePacket.from_edit_issue(
+            code=code,
+            message=message,
+            file_path=file_path,
+            evidence=evidence or {"freshness": status},
+            attempt=attempt,
+            repeated_count=repeated_count,
+        ).as_dict()
+
+    @classmethod
+    def _best_issue_path(cls, code: str, file_changes: list[DraftAction]) -> str:
+        seen: set[str] = set()
+        for operation in file_changes:
+            raw_path = cls._strip_leading_dot_slash(getattr(operation, "file_path", ""))
+            normalized = cls._normalize_path(raw_path)
+            path = normalized or raw_path
+            if code == "duplicate_path":
+                if path in seen:
+                    return path
+                seen.add(path)
+                continue
+            if path:
+                return path
+        return ""
 
     @classmethod
     def _first_invalid_file_change(cls, file_changes: list[DraftAction]) -> tuple[str, str] | None:

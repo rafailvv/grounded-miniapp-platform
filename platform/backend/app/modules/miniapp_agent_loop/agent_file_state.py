@@ -103,9 +103,41 @@ class AgentFileStateCache:
             if cached_run_id == run_id and cached_path in normalized_paths:
                 self._entries.pop(key, None)
 
-    def snapshot(self, run_id: str) -> dict[str, object]:
+    def freshness(self, *, run_id: str, root: Path, path: str) -> dict[str, object]:
+        normalized = self._normalize_path(path)
+        if not normalized:
+            return {"path": "", "status": "unsafe_path", "fresh": False}
+        mtime_ns, size = self._stat(root, normalized)
+        key = (run_id, normalized)
+        cached = self._entries.get(key)
+        exists = mtime_ns is not None and size is not None
+        if cached is None:
+            return {
+                "path": normalized,
+                "status": "unread" if exists else "missing",
+                "fresh": False,
+                "exists": exists,
+            }
+        fresh = cached.mtime_ns == mtime_ns and cached.size == size
+        return {
+            **cached.summary(),
+            "status": "fresh" if fresh else "stale",
+            "fresh": fresh,
+            "exists": exists,
+            "current_mtime_ns": mtime_ns,
+            "current_size": size,
+        }
+
+    def snapshot(self, run_id: str, *, root: Path | None = None) -> dict[str, object]:
         entries = [
-            entry.summary()
+            (
+                {
+                    **entry.summary(),
+                    "freshness": self.freshness(run_id=run_id, root=root, path=entry.path) if root is not None else {"status": "unknown_without_root"},
+                }
+                if root is not None
+                else entry.summary()
+            )
             for (entry_run_id, _), entry in sorted(self._entries.items(), key=lambda item: item[0][1])
             if entry_run_id == run_id
         ]
@@ -114,4 +146,5 @@ class AgentFileStateCache:
             "entry_count": len(entries),
             "total_cache_hits": sum(int(entry.get("cache_hits") or 0) for entry in entries),
             "entries": entries,
+            "freshness_available": root is not None,
         }

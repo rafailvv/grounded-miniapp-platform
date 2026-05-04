@@ -18,6 +18,7 @@ from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessMan
 from app.modules.miniapp_agent_loop.agent_scratchpad import AgentScratchpad
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
+from app.modules.miniapp_agent_loop.diagnostics_delta import AgentDiagnosticsDelta
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
 from app.modules.miniapp_agent_loop.agent_worker_branch_loop import AgentWorkerBranchLoop
 from app.modules.miniapp_agent_loop.agent_worker_runtime import AgentWorkerRuntime
@@ -25,6 +26,7 @@ from app.modules.miniapp_agent_loop.agent_worker_tasks import AgentWorkerTaskPla
 from app.models.artifacts import ApplyPatchResult
 from app.modules.miniapp_agent_loop.context_pressure import AgentContextPressureAnalyzer
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
+from app.modules.miniapp_agent_loop.repair_packets import RepairTransitionPolicy
 from app.modules.miniapp_agent_loop.rollout_trace import RolloutTraceRecorder
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.agent_tool_runtime import validate_workspace_command
@@ -37,6 +39,7 @@ from app.modules.workspace_code_agent_runtime.process_recovery import AgentProce
 from app.modules.workspace_code_agent_runtime.prompt_contract import agent_system_prompt
 from app.modules.workspace_code_agent_runtime.runtime import WorkspaceCodeAgentRuntime
 from app.services.check_runner import CheckRunner
+from app.services.repair_catalog import RepairCatalog
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan
 
 
@@ -301,6 +304,90 @@ def test_agent_edit_validator_rejects_unsafe_or_invalid_file_changes() -> None:
 
     assert unsafe.failure_signature == "generation.invalid_edit_operation:unsafe_path"
     assert invalid_patch.failure_signature == "generation.invalid_edit_operation:invalid_patch_diff"
+    assert unsafe.metadata["repair_packets"][0]["code"] == "unsafe_path"
+    assert invalid_patch.metadata["repair_packets"][0]["required_next_tool"] in {"read_files", "write_file"}
+
+
+def test_agent_file_state_cache_reports_freshness(tmp_path: Path) -> None:
+    root = tmp_path
+    target = root / "miniapp/app/static/client/app.js"
+    target.parent.mkdir(parents=True)
+    target.write_text("console.log('a');\n", encoding="utf-8")
+    cache = AgentFileStateCache()
+
+    assert cache.freshness(run_id="run_1", root=root, path="miniapp/app/static/client/app.js")["status"] == "unread"
+    assert cache.read(run_id="run_1", root=root, path="miniapp/app/static/client/app.js", read_text=lambda path: (root / path).read_text(encoding="utf-8"))
+    assert cache.freshness(run_id="run_1", root=root, path="miniapp/app/static/client/app.js")["status"] == "fresh"
+    target.write_text("console.log('b');\n", encoding="utf-8")
+    assert cache.freshness(run_id="run_1", root=root, path="miniapp/app/static/client/app.js")["status"] == "stale"
+
+
+def test_repair_transition_policy_forces_read_then_write() -> None:
+    packet = AgentEditValidator.repair_packet_for_issue(
+        code="invalid_patch_diff",
+        message="bad patch",
+        file_changes=[
+            DraftAction(
+                file_path="miniapp/app/static/client/app.js",
+                operation="patch",
+                diff="bad",
+                reason="test",
+            )
+        ],
+        repeated_count=2,
+    )
+
+    read_decision = RepairTransitionPolicy.decide(
+        repair_packets=[packet],
+        repeated_failure_signatures={str(packet["failure_signature"]): 2},
+        latest_files_read=[],
+    )
+    write_decision = RepairTransitionPolicy.decide(
+        repair_packets=[packet],
+        repeated_failure_signatures={str(packet["failure_signature"]): 2},
+        latest_files_read=["miniapp/app/static/client/app.js"],
+    )
+
+    assert read_decision.active is True
+    assert read_decision.forced_tool_names == ["read_files"]
+    assert write_decision.forced_tool_names == ["write_file", "apply_patch_to_draft"]
+
+
+def test_repair_catalog_returns_operational_packets() -> None:
+    packet = RepairCatalog.classify_issue(
+        {
+            "check": "frontend_interaction_static_smoke",
+            "details": "workflow_patch_payload_field_mismatch: frontend sends PATCH fields not accepted",
+            "paths": ["miniapp/app/static/manager/app.js"],
+        }
+    )
+
+    assert packet["signature"] == "workflow.payload_schema_mismatch"
+    assert packet["required_next_tool"] == "read_files"
+    assert packet["verification_command"]
+    assert packet["deterministic"] is True
+
+
+def test_diagnostics_delta_only_reports_changed_failures() -> None:
+    previous = AgentDiagnosticsDelta.snapshot(
+        [
+            RunCheckResult(name="changed_files_static", status="failed", details="old", logs=["old"]),
+            RunCheckResult(name="api_workflow_smoke", status="failed", details="same", logs=["same"]),
+        ]
+    )
+    current = AgentDiagnosticsDelta.snapshot(
+        [
+            RunCheckResult(name="changed_files_static", status="failed", details="new", logs=["new"]),
+            RunCheckResult(name="browser_flow_smoke", status="failed", details="added", logs=["added"]),
+            RunCheckResult(name="api_workflow_smoke", status="failed", details="same", logs=["same"]),
+        ]
+    )
+
+    delta = AgentDiagnosticsDelta.delta(previous, current)
+
+    assert delta["status"] == "changed"
+    assert [item["name"] for item in delta["added"]] == ["browser_flow_smoke"]
+    assert delta["changed"][0]["current"]["name"] == "changed_files_static"
 
 
 def test_safe_diagnostic_commands_are_scoped() -> None:

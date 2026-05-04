@@ -467,6 +467,11 @@ class WorkbenchService:
             add_issue("apply_gate", "apply_status", "Run must be applied or awaiting manual approval after green checks.", evidence={"apply_status": run.apply_status, "status": run.status})
 
         repair_packets = RepairCatalog.classify_many(issues)
+        checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
+        checkpoint_packets = list((checkpoint or {}).get("repair_packets") or []) if isinstance(checkpoint, dict) else []
+        if checkpoint_packets:
+            repair_packets = [*checkpoint_packets, *repair_packets]
+        next_forced_action = dict((checkpoint or {}).get("next_forced_action") or {}) if isinstance(checkpoint, dict) else {}
         blocking = any(item.get("blocking", True) for item in issues)
         status = "passed" if not blocking and apply_ok else "blocked" if blocking else "pending"
         payload = {
@@ -476,6 +481,8 @@ class WorkbenchService:
             "blocking": blocking,
             "issues": issues,
             "repair_packets": repair_packets,
+            "next_forced_action": next_forced_action,
+            "blocking_repair_packet": repair_packets[0] if blocking and repair_packets else {},
             "requirements": {
                 "acceptance_required": acceptance_required,
                 "meaningful_diff": True,
@@ -489,6 +496,8 @@ class WorkbenchService:
                 "browser_proof": run.browser_proof_ref,
                 "repair_recipes": run.repair_recipes_ref,
                 "final_report": f"final_report:{run_id}",
+                "resume_checkpoint": run.resume_checkpoint_ref,
+                "diagnostics_delta": (checkpoint or {}).get("diagnostics_delta_ref") if isinstance(checkpoint, dict) else None,
             },
         }
         self.store.upsert("reports", f"gate:{run_id}", payload)
@@ -499,11 +508,16 @@ class WorkbenchService:
         gate = self.gate(run_id)
         explicit = [item for item in run.repair_issue_signatures if isinstance(item, dict)]
         packets = RepairCatalog.classify_many([*explicit, *gate.get("issues", [])])
+        checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
+        checkpoint_packets = list((checkpoint or {}).get("repair_packets") or []) if isinstance(checkpoint, dict) else []
+        if checkpoint_packets:
+            packets = [*checkpoint_packets, *packets]
         payload = {
             "run_id": run_id,
             "status": "available" if packets else "empty",
             "blocking": bool(gate.get("blocking")),
             "items": packets,
+            "next_forced_action": dict((checkpoint or {}).get("next_forced_action") or {}) if isinstance(checkpoint, dict) else {},
             "catalog": RepairCatalog.entries(),
         }
         self.store.upsert("reports", f"repair_signatures:{run_id}", payload)
@@ -514,6 +528,9 @@ class WorkbenchService:
         artifacts = self._run_artifacts_or_empty(run_id)
         preview = artifacts.get("preview") or {}
         gate = self.gate(run_id)
+        checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
+        diagnostics_delta_ref = (checkpoint or {}).get("diagnostics_delta_ref") if isinstance(checkpoint, dict) else None
+        diagnostics_delta = self.store.get("reports", diagnostics_delta_ref) if diagnostics_delta_ref else None
         report = {
             "run_id": run_id,
             "workspace_id": run.workspace_id,
@@ -529,6 +546,9 @@ class WorkbenchService:
             "checks": artifacts.get("check_results") or [],
             "browser_proof": run.browser_flow_proof or artifacts.get("browser_flow_proof") or {},
             "repair_signatures": self.repair_signatures(run_id).get("items", []),
+            "repair_packets": gate.get("repair_packets", []),
+            "next_forced_action": gate.get("next_forced_action", {}),
+            "diagnostics_delta": diagnostics_delta,
             "preview": {
                 "url": preview.get("url"),
                 "role_urls": preview.get("role_urls") or {},
@@ -539,6 +559,7 @@ class WorkbenchService:
                 "gate": f"gate:{run_id}",
                 "browser_proof": run.browser_proof_ref,
                 "repair_recipes": run.repair_recipes_ref,
+                "resume_checkpoint": run.resume_checkpoint_ref,
             },
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -554,6 +575,16 @@ class WorkbenchService:
         )
         if isinstance(checkpoint, dict) and checkpoint.get("reason"):
             prompt = f"{prompt}\nCheckpoint reason: {checkpoint.get('reason')}"
+        if isinstance(checkpoint, dict) and checkpoint.get("repair_packets"):
+            prompt = (
+                f"{prompt}\nResume repair packet: "
+                f"{json.dumps(checkpoint.get('repair_packets'), ensure_ascii=False, default=str)[:2400]}"
+            )
+        if isinstance(checkpoint, dict) and checkpoint.get("next_forced_action"):
+            prompt = (
+                f"{prompt}\nNext forced repair action: "
+                f"{json.dumps(checkpoint.get('next_forced_action'), ensure_ascii=False, default=str)[:1200]}"
+            )
         return self.run_service.create_run(
             run.workspace_id,
             CreateRunRequest(

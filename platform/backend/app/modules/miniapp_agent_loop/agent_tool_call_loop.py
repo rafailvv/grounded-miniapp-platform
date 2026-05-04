@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
 from app.models.artifacts import ApplyPatchResult
@@ -17,9 +18,12 @@ from app.models.domain import (
 from app.modules.miniapp_agent_loop.agent_kernel import compact_agent_memory
 from app.modules.miniapp_agent_loop.check_feedback import AgentCheckFeedback
 from app.modules.miniapp_agent_loop.context_builder import AgentContextBuilder
+from app.modules.miniapp_agent_loop.diagnostics_delta import AgentDiagnosticsDelta
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
+from app.modules.miniapp_agent_loop.repair_packets import RepairTransitionPolicy
 from app.modules.miniapp_agent_loop.result_classifier import AgentLoopResultFactory
 from app.modules.miniapp_agent_loop.types import AgentLoopCallbacks, AgentLoopResult
+from app.services.repair_catalog import RepairCatalog
 
 
 class AgentToolCallLoop:
@@ -85,6 +89,65 @@ class AgentToolCallLoop:
     def _phase_for_budget_state(state: dict[str, object]) -> str:
         return str(state.get("current_phase") or "blocked_budget_exhausted")
 
+    @staticmethod
+    def _repair_packets_from_plan(plan: Any) -> list[dict[str, Any]]:
+        metadata = getattr(plan, "metadata", {}) if plan is not None else {}
+        packets = metadata.get("repair_packets") if isinstance(metadata, dict) else None
+        return [dict(item) for item in packets if isinstance(item, dict)] if isinstance(packets, list) else []
+
+    @staticmethod
+    def _repair_packets_from_execution(execution: CheckExecutionRecord | None) -> list[dict[str, Any]]:
+        if execution is None:
+            return []
+        issues: list[dict[str, Any]] = []
+        for result in execution.results:
+            if result.status not in {"failed", "blocked"}:
+                continue
+            issues.append(
+                {
+                    "check": result.name,
+                    "details": result.details or "",
+                    "logs": list(result.logs or [])[-8:],
+                    "diagnostics": dict(result.diagnostics or {}),
+                    "failure_class": result.name,
+                    "failure_signature": f"{result.name}:{str(result.details or '')[:160]}",
+                    "paths": AgentToolCallLoop._paths_from_check_result(result),
+                }
+            )
+        return RepairCatalog.classify_many(issues)
+
+    @staticmethod
+    def _paths_from_check_result(result: RunCheckResult) -> list[str]:
+        paths: list[str] = []
+        diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+        for key in ("paths", "target_files", "changed_files", "files"):
+            value = diagnostics.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    path = str(item or "").strip().replace("\\", "/")
+                    if path.startswith("./"):
+                        path = path[2:]
+                    if path.startswith("miniapp/") and path not in paths:
+                        paths.append(path)
+        for text in [result.details or "", *list(result.logs or [])[-8:]]:
+            for match in re.finditer(r"(?:^|[/\\])(?P<path>miniapp[/\\][A-Za-z0-9_./\\-]+\.(?:py|js|mjs|html|css|json))", str(text or "")):
+                path = match.group("path").replace("\\", "/")
+                if path not in paths:
+                    paths.append(path)
+        return paths[:8]
+
+    @staticmethod
+    def _with_repeated_counts(
+        packets: list[dict[str, Any]],
+        counts: dict[str, int],
+    ) -> list[dict[str, Any]]:
+        updated: list[dict[str, Any]] = []
+        for packet in packets:
+            signature = str(packet.get("failure_signature") or packet.get("signature") or packet.get("code") or "repair_packet")
+            counts[signature] = counts.get(signature, 0) + 1
+            updated.append({**packet, "repeated_count": counts[signature]})
+        return updated
+
     def run(
         self,
         *,
@@ -117,6 +180,11 @@ class AgentToolCallLoop:
         context_mode = "minimal"
         previous_snapshot: dict[str, Any] | None = None
         repeated_failure_signatures: dict[str, int] = {}
+        repair_packet_counts: dict[str, int] = {}
+        latest_repair_packets: list[dict[str, Any]] = []
+        latest_repair_transition: dict[str, Any] = {}
+        previous_diagnostics_snapshot: dict[str, dict[str, Any]] | None = None
+        latest_diagnostics_delta: dict[str, Any] = {"status": "unchanged", "added": [], "changed": [], "resolved": []}
 
         turn = 0
         while True:
@@ -228,6 +296,32 @@ class AgentToolCallLoop:
                     validation_snapshot=validation_snapshot,
                 )
                 progress_snapshot = self.feedback.progress_snapshot(latest_execution.results, latest_preview_details, validation_snapshot)
+                current_diagnostics_snapshot = AgentDiagnosticsDelta.snapshot(latest_execution.results)
+                latest_diagnostics_delta = AgentDiagnosticsDelta.delta(previous_diagnostics_snapshot, current_diagnostics_snapshot)
+                previous_diagnostics_snapshot = current_diagnostics_snapshot
+                check_packets = self._repair_packets_from_execution(latest_execution)
+                if check_packets:
+                    latest_repair_packets = check_packets
+                    callbacks.store_report(
+                        f"repair_state:{workspace_id}:{run_id}",
+                        {
+                            "workspace_id": workspace_id,
+                            "run_id": run_id,
+                            "latest_repair_packets": latest_repair_packets,
+                            "diagnostics_delta": latest_diagnostics_delta,
+                            "updated_at": utc_now().isoformat(),
+                        },
+                    )
+                callbacks.store_report(
+                    f"diagnostics_delta:{workspace_id}:{run_id}",
+                    {
+                        "workspace_id": workspace_id,
+                        "run_id": run_id,
+                        "delta": latest_diagnostics_delta,
+                        "current_snapshot": current_diagnostics_snapshot,
+                        "updated_at": utc_now().isoformat(),
+                    },
+                )
                 iterations.append(
                     RunIterationRecord(
                         run_id=run_id,
@@ -420,6 +514,38 @@ class AgentToolCallLoop:
                 },
             )
 
+            transition = RepairTransitionPolicy.decide(
+                repair_packets=latest_repair_packets,
+                repeated_failure_signatures={**repeated_failure_signatures, **repair_packet_counts},
+                latest_files_read=latest_files_read,
+            )
+            latest_repair_transition = transition.as_dict()
+            if transition.active:
+                context_mode = transition.context_mode
+                callbacks.store_report(
+                    f"repair_state:{workspace_id}:{run_id}",
+                    {
+                        "workspace_id": workspace_id,
+                        "run_id": run_id,
+                        "latest_repair_packets": latest_repair_packets,
+                        "next_forced_action": transition.next_forced_action,
+                        "repair_transition": latest_repair_transition,
+                        "diagnostics_delta": latest_diagnostics_delta,
+                        "updated_at": utc_now().isoformat(),
+                    },
+                )
+                callbacks.append_event(
+                    job,
+                    "repair_iteration",
+                    "Repair transition policy forced the next tool strategy.",
+                    {
+                        "turn": turn + 1,
+                        "forced_tool_names": transition.forced_tool_names,
+                        "forced_targets": transition.forced_targets,
+                        "reason": transition.reason,
+                    },
+                )
+
             if callbacks.append_activity:
                 callbacks.append_activity(
                     job,
@@ -442,8 +568,29 @@ class AgentToolCallLoop:
                     last_turn_summary=last_turn_summary,
                     latest_diff_summary=self.context_builder.current_diff_summary(workspace_id, run_id),
                     agent_memory=memory,
+                    repair_packets=latest_repair_packets,
+                    next_forced_action=latest_repair_transition,
+                    diagnostics_delta=latest_diagnostics_delta,
                 )
             )
+            plan_repair_packets = self._repair_packets_from_plan(plan)
+            if plan_repair_packets:
+                latest_repair_packets = self._with_repeated_counts(plan_repair_packets, repair_packet_counts)
+                plan.metadata = {
+                    **dict(plan.metadata or {}),
+                    "repair_packets": latest_repair_packets,
+                }
+                callbacks.store_report(
+                    f"repair_state:{workspace_id}:{run_id}",
+                    {
+                        "workspace_id": workspace_id,
+                        "run_id": run_id,
+                        "latest_repair_packets": latest_repair_packets,
+                        "next_forced_action": latest_repair_transition.get("next_forced_action") if isinstance(latest_repair_transition, dict) else {},
+                        "diagnostics_delta": latest_diagnostics_delta,
+                        "updated_at": utc_now().isoformat(),
+                    },
+                )
             latest_files_read = list(plan.files_read)
             latest_assistant_message = plan.assistant_message or plan.diagnosis or latest_assistant_message
             last_turn_summary = plan.diagnosis or latest_assistant_message or last_turn_summary
@@ -457,6 +604,8 @@ class AgentToolCallLoop:
                     "failure_class": plan.failure_class,
                     "failure_signature": plan.failure_signature,
                     "metadata": dict(plan.metadata),
+                    "repair_packets": latest_repair_packets if plan_repair_packets else [],
+                    "next_forced_action": latest_repair_transition.get("next_forced_action") if isinstance(latest_repair_transition, dict) else {},
                     "created_at": utc_now().isoformat(),
                 }
             )
@@ -498,7 +647,12 @@ class AgentToolCallLoop:
                     job,
                     "repair_iteration",
                     "Agent returned an invalid response; continuing with compact failure memory.",
-                    {"turn": turn + 1, "diagnosis": plan.diagnosis, "failure_signature": plan.failure_signature},
+                    {
+                        "turn": turn + 1,
+                        "diagnosis": plan.diagnosis,
+                        "failure_signature": plan.failure_signature,
+                        "repair_packets": latest_repair_packets,
+                    },
                 )
                 previous_snapshot = progress_snapshot
                 turn += 1
@@ -585,13 +739,35 @@ class AgentToolCallLoop:
             )
             latest_file_changes = list(synced_file_changes)
             if apply_result.status != "applied":
+                conflict_packet = AgentEditValidator.repair_packet_for_apply_conflict(
+                    conflict_reason=apply_result.conflict_reason or apply_result.status,
+                    file_changes=synced_file_changes,
+                    attempt=turn + 1,
+                    repeated_count=0,
+                )
+                latest_repair_packets = self._with_repeated_counts([conflict_packet], repair_packet_counts)
+                callbacks.store_report(
+                    f"repair_state:{workspace_id}:{run_id}",
+                    {
+                        "workspace_id": workspace_id,
+                        "run_id": run_id,
+                        "latest_repair_packets": latest_repair_packets,
+                        "diagnostics_delta": latest_diagnostics_delta,
+                        "updated_at": utc_now().isoformat(),
+                    },
+                )
                 turn_history[-1]["result"] = "apply_conflict"
                 turn_history[-1]["apply_error"] = apply_result.conflict_reason or apply_result.status
+                turn_history[-1]["repair_packets"] = latest_repair_packets
                 callbacks.append_event(
                     job,
                     "repair_iteration",
                     "Agent patch did not apply; continuing with conflict packet.",
-                    {"turn": turn + 1, "conflict_reason": apply_result.conflict_reason or apply_result.status},
+                    {
+                        "turn": turn + 1,
+                        "conflict_reason": apply_result.conflict_reason or apply_result.status,
+                        "repair_packets": latest_repair_packets,
+                    },
                 )
                 if callbacks.append_activity:
                     callbacks.append_activity(
@@ -623,6 +799,13 @@ class AgentToolCallLoop:
                         files_read=list(latest_files_read),
                         files_changed=list(changed_files),
                         failure_class=progress_snapshot.get("failure_class"),
+                        repair_packets=latest_repair_packets,
+                        repair_packet_ids=[
+                            str(item.get("failure_signature") or item.get("signature") or item.get("code") or "")
+                            for item in latest_repair_packets
+                            if isinstance(item, dict)
+                        ],
+                        diagnostics_delta_ref=f"diagnostics_delta:{workspace_id}:{run_id}",
                         check_results=latest_execution.results if latest_execution else [],
                         latency_breakdown={},
                         token_usage={},
