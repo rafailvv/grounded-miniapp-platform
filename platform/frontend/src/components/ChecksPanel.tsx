@@ -1,11 +1,16 @@
-import type { PromptContractReport, TestMatrixReport } from "../lib/api";
+import type { MiniAppContractReport, PromptContractReport, TestMatrixReport } from "../lib/api";
 
 type ChecksPanelProps = {
   matrix: TestMatrixReport | null;
   promptContract: PromptContractReport | null;
+  miniappContract: MiniAppContractReport | null;
+  previewRuntimeMode?: string;
 };
 
-export function ChecksPanel({ matrix, promptContract }: ChecksPanelProps) {
+export function ChecksPanel({ matrix, promptContract, miniappContract, previewRuntimeMode }: ChecksPanelProps) {
+  const registry = miniappContract?.registry_snapshot ?? {};
+  const contractRoutes = Array.isArray(registry.contract_routes) ? registry.contract_routes : [];
+  const regenerated = Array.isArray(registry.regenerated_files) ? registry.regenerated_files : [];
   return (
     <div className="workbench-stack">
       <div className="workbench-panel">
@@ -43,6 +48,41 @@ export function ChecksPanel({ matrix, promptContract }: ChecksPanelProps) {
           <p className="muted">Prompt terms match the available change evidence or no diff has been recorded.</p>
         )}
         {promptContract ? <small>{promptContract.matched_terms.slice(0, 16).join(", ")}</small> : null}
+      </div>
+      <div className="workbench-panel">
+        <div className="workbench-panel-header">
+          <strong>MiniApp contract</strong>
+          <span>{miniappContract?.status ?? "not loaded"}</span>
+        </div>
+        <div className="run-detail-list">
+          <div className="run-detail-item">
+            <strong>Runtime</strong>
+            <p>{previewRuntimeMode || "not loaded"}</p>
+          </div>
+          <div className="run-detail-item">
+            <strong>Contract routes</strong>
+            <p>{contractRoutes.length ? contractRoutes.slice(0, 6).join(", ") : "No contract routes loaded."}</p>
+          </div>
+          <div className="run-detail-item">
+            <strong>Generated sync</strong>
+            <p>{regenerated.length ? regenerated.slice(0, 6).join(", ") : "No regenerated files in latest snapshot."}</p>
+          </div>
+        </div>
+        {miniappContract?.drift_issues.length ? (
+          <div className="run-detail-list">
+            {miniappContract.drift_issues.slice(0, 6).map((issue, index) => (
+              <div key={index} className="run-detail-item">
+                <strong>{String(issue.code ?? "contract drift")}</strong>
+                <p>{String(issue.expected ?? issue.frontend_ref ?? issue.location ?? "Review generated contract drift.")}</p>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="muted">Generated files, route registry, and contract routes are aligned.</p>
+        )}
+        {miniappContract?.repair_recipes.length ? (
+          <small>{miniappContract.repair_recipes.slice(0, 3).map((recipe) => String(recipe.suggested_patch_target ?? recipe.issue_code ?? "repair")).join(", ")}</small>
+        ) : null}
       </div>
     </div>
   );

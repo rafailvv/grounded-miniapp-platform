@@ -443,6 +443,14 @@ def get_run_prompt_contract(run_id: str, container: ServiceContainer = Depends(g
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/miniapp-contract")
+def get_run_miniapp_contract(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.miniapp_contract(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/runs/{run_id}/browser-proof")
 def start_browser_proof(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:

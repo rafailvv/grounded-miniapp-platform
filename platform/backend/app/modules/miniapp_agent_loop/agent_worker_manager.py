@@ -48,6 +48,8 @@ class AgentWorkerManager:
         implementation_plan: dict[str, Any],
     ) -> dict[str, object]:
         enabled = generation_mode in {GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY}
+        contract_runtime = implementation_plan.get("contract_runtime_v1") if isinstance(implementation_plan, dict) else {}
+        materialized_tests = bool(isinstance(contract_runtime, dict) and contract_runtime.get("materialized_tests"))
         workers = [
             {
                 "worker": scope.worker,
@@ -56,6 +58,7 @@ class AgentWorkerManager:
                 "status": "pending" if enabled else "not_used",
             }
             for scope in cls.SCOPES
+            if not (materialized_tests and scope.worker == "generated_tests")
         ]
         if generation_mode == GenerationMode.QUALITY:
             workers.append(

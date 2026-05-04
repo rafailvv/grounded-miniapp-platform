@@ -132,6 +132,10 @@ export type Run = {
   semantic_graph_ref?: string | null;
   worker_prefix_ref?: string | null;
   replay_trace_ref?: string | null;
+  miniapp_contract_ref?: string | null;
+  route_registry_ref?: string | null;
+  contract_compile_ref?: string | null;
+  repair_recipes_ref?: string | null;
   repair_issue_signatures?: Array<Record<string, unknown>>;
   mobile_layout_report?: Record<string, unknown>;
   artifacts: Record<string, string>;
@@ -461,6 +465,17 @@ export type PromptContractReport = {
   prompt_terms_checked: string[];
   matched_terms: string[];
   findings: Array<Record<string, unknown>>;
+};
+
+export type MiniAppContractReport = {
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  contract: Record<string, unknown>;
+  registry_snapshot: Record<string, unknown>;
+  drift_issues: Array<Record<string, unknown>>;
+  repair_recipes: Array<Record<string, unknown>>;
+  artifact_refs: Record<string, string | null>;
 };
 
 export type WorkspaceMemory = {
@@ -808,6 +823,10 @@ export async function getRunTestMatrix(runId: string): Promise<TestMatrixReport>
 
 export async function getRunPromptContract(runId: string): Promise<PromptContractReport> {
   return request<PromptContractReport>(`/runs/${runId}/prompt-contract`);
+}
+
+export async function getRunMiniAppContract(runId: string): Promise<MiniAppContractReport> {
+  return request<MiniAppContractReport>(`/runs/${runId}/miniapp-contract`);
 }
 
 export async function getWorkspaceMemory(workspaceId: string): Promise<WorkspaceMemory> {

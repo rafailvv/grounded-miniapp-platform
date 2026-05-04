@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from urllib.error import URLError
@@ -19,12 +21,77 @@ class PreviewRuntimeManager:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._local_processes: dict[str, subprocess.Popen] = {}
 
     def preferred_mode(self) -> str:
         configured = str(self.settings.preview_runtime_mode or "auto").strip().lower()
+        if configured == "local":
+            return "local"
         if configured == "docker":
             return "docker"
         return "docker"
+
+    def start_local(self, workspace_id: str, source_dir: Path, proxy_port: int) -> tuple[str, list[str]]:
+        project_name = self.project_name(workspace_id)
+        self.reset_local(workspace_id)
+        miniapp_dir = source_dir / "miniapp"
+        if not miniapp_dir.exists():
+            raise RuntimeError(f"Miniapp directory is missing: {miniapp_dir}")
+        env = os.environ.copy()
+        env.update(self._compose_env(proxy_port))
+        env["PYTHONPATH"] = str(miniapp_dir)
+        command = [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(proxy_port),
+        ]
+        started_at = time.perf_counter()
+        process = subprocess.Popen(
+            command,
+            cwd=miniapp_dir,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            text=True,
+        )
+        self._local_processes[workspace_id] = process
+        try:
+            wait_logs = self.wait_until_ready(proxy_port)
+        except Exception:
+            self.reset_local(workspace_id)
+            raise
+        logs = [
+            f"[runtime] starting local uvicorn preview for workspace {workspace_id} on port {proxy_port}",
+            f"[runtime] command: {' '.join(command)}",
+            *wait_logs,
+            f"[runtime] local preview started in {int((time.perf_counter() - started_at) * 1000)}ms",
+        ]
+        return project_name, logs
+
+    def rebuild_local(self, workspace_id: str, source_dir: Path, proxy_port: int) -> list[str]:
+        project_name, logs = self.start_local(workspace_id, source_dir, proxy_port)
+        return [*logs, f"[runtime] local preview project={project_name}"]
+
+    def reset_local(self, workspace_id: str) -> list[str]:
+        process = self._local_processes.pop(workspace_id, None)
+        if process is None:
+            return []
+        logs = [f"[runtime] stopping local preview for workspace {workspace_id}"]
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except Exception:
+                pass
+        return logs
 
     def allocate_port(self, workspace_id: str, reserved_ports: set[int] | None = None) -> int:
         reserved_ports = reserved_ports or set()

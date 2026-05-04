@@ -223,6 +223,20 @@ class AgentToolRegistry:
             activity="applying_patch",
             progress_label="Applying a strict patch through the unified tool protocol",
         ),
+        "contract.compile": AgentToolSpec(
+            name="contract.compile",
+            kind="read_only",
+            concurrency_safe=False,
+            activity="planning",
+            progress_label="Compiling the typed mini-app contract",
+        ),
+        "registry.sync": AgentToolSpec(
+            name="registry.sync",
+            kind="mutating",
+            concurrency_safe=False,
+            activity="checking",
+            progress_label="Synchronizing contract-owned generated files",
+        ),
         "ask_user": AgentToolSpec(
             name="ask_user",
             kind="read_only",

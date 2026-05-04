@@ -29,6 +29,7 @@ from app.models.domain import (
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
+from app.services.miniapp_contract import MiniAppContractCompiler
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, orchestration_metadata_for_contract
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
@@ -218,6 +219,37 @@ class RunService:
             current_stage="queued",
             progress_percent=2,
             storage_version=2,
+        )
+        miniapp_contract = MiniAppContractCompiler.compile(
+            workspace_id=workspace_id,
+            run_id=run.run_id,
+            prompt=request.prompt,
+            intent=resolved_intent,
+            generation_mode=effective_generation_mode,
+            acceptance_contract=acceptance_contract,
+            implementation_plan=implementation_plan,
+        )
+        run.acceptance_contract = miniapp_contract.acceptance_summary
+        run.implementation_plan = implementation_plan
+        run.miniapp_contract_ref = f"miniapp_contract:{workspace_id}:{run.run_id}"
+        run.contract_compile_ref = f"contract_compile:{workspace_id}:{run.run_id}"
+        run.route_registry_ref = f"route_registry:{workspace_id}:{run.run_id}"
+        run.repair_recipes_ref = f"repair_recipes:{workspace_id}:{run.run_id}"
+        self.store.upsert(
+            "reports",
+            run.miniapp_contract_ref,
+            {"workspace_id": workspace_id, "run_id": run.run_id, "contract": miniapp_contract.model_dump(mode="json")},
+        )
+        self.store.upsert(
+            "reports",
+            run.contract_compile_ref,
+            {
+                "workspace_id": workspace_id,
+                "run_id": run.run_id,
+                "status": "compiled",
+                "contract_id": miniapp_contract.contract_id,
+                "contract_owned_paths": miniapp_contract.allowed_file_graph.contract_owned_paths,
+            },
         )
         self._save_run(run)
         self.store.delete("reports", f"run_stop_request:{run.run_id}")
@@ -686,6 +718,10 @@ class RunService:
                 "semantic_graph_ref",
                 "worker_prefix_ref",
                 "replay_trace_ref",
+                "miniapp_contract_ref",
+                "route_registry_ref",
+                "contract_compile_ref",
+                "repair_recipes_ref",
             ):
                 if not getattr(run, attr, None) and existing.get(attr):
                     setattr(run, attr, str(existing.get(attr) or ""))
@@ -842,6 +878,10 @@ class RunService:
                 "semantic_graph_ref",
                 "worker_prefix_ref",
                 "replay_trace_ref",
+                "miniapp_contract_ref",
+                "route_registry_ref",
+                "contract_compile_ref",
+                "repair_recipes_ref",
             ):
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, str(getattr(job, attr) or ""))
@@ -1091,6 +1131,10 @@ class RunService:
             run.semantic_graph_ref = getattr(job, "semantic_graph_ref", None) or run.semantic_graph_ref
             run.worker_prefix_ref = getattr(job, "worker_prefix_ref", None) or run.worker_prefix_ref
             run.replay_trace_ref = getattr(job, "replay_trace_ref", None) or run.replay_trace_ref
+            run.miniapp_contract_ref = getattr(job, "miniapp_contract_ref", None) or run.miniapp_contract_ref
+            run.route_registry_ref = getattr(job, "route_registry_ref", None) or run.route_registry_ref
+            run.contract_compile_ref = getattr(job, "contract_compile_ref", None) or run.contract_compile_ref
+            run.repair_recipes_ref = getattr(job, "repair_recipes_ref", None) or run.repair_recipes_ref
             run.acceptance_contract = dict(getattr(job, "acceptance_contract", {}) or run.acceptance_contract)
             run.worker_summaries = list(getattr(job, "worker_summaries", []) or run.worker_summaries)
             run.flow_coverage = dict(getattr(job, "flow_coverage", {}) or run.flow_coverage)
@@ -1580,6 +1624,13 @@ class RunService:
             "semantic_graph_ref": run.semantic_graph_ref,
             "worker_prefix_ref": run.worker_prefix_ref,
             "replay_trace_ref": run.replay_trace_ref,
+            "miniapp_contract_ref": run.miniapp_contract_ref,
+            "route_registry_ref": run.route_registry_ref,
+            "contract_compile_ref": run.contract_compile_ref,
+            "repair_recipes_ref": run.repair_recipes_ref,
+            "miniapp_contract": self.store.get("reports", run.miniapp_contract_ref) if run.miniapp_contract_ref else None,
+            "route_registry": self.store.get("reports", run.route_registry_ref) if run.route_registry_ref else None,
+            "repair_recipes": self.store.get("reports", run.repair_recipes_ref) if run.repair_recipes_ref else None,
             "process_outputs": process_outputs,
             "tool_result_messages": self.store.get("reports", run.tool_result_messages_ref) if run.tool_result_messages_ref else None,
             "agent_transcript": agent_transcript,

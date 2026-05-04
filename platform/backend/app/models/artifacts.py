@@ -19,6 +19,7 @@ class ValidationIssue(StrictModel):
     severity: Literal["low", "medium", "high", "critical"]
     location: str
     blocking: bool = True
+    repair_recipe: dict[str, Any] | None = None
 
 
 class PatchOperationModel(StrictModel):

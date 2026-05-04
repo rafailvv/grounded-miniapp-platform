@@ -20,6 +20,13 @@ class AgentEditValidator:
         "platform-state.json",
         "miniapp/app/routes/role_pages.py",
         "miniapp/app/routes/role_routes.py",
+        "miniapp/app/routes/generated_contract.py",
+        "miniapp/app/generated/miniapp_contract.json",
+        "miniapp/app/generated/api_client.js",
+        "miniapp/app/generated/route_manifest.json",
+        "miniapp/app/generated/contract_validator.json",
+        "miniapp/tests/test_generated_app.py",
+        "miniapp/tests/generated_app.test.mjs",
     )
 
     @staticmethod

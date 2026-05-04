@@ -73,6 +73,7 @@ from app.modules.workspace_code_agent_runtime.process_recovery import AgentProce
 from app.modules.workspace_code_agent_runtime.tool_executor import AgentToolExecutor
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
+from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.platform_shell import BASE_STYLESHEET_HREF, BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
 from app.services.workflow_acceptance import (
     build_acceptance_contract,
@@ -927,6 +928,16 @@ class WorkspaceCodeAgentRuntime:
             acceptance_contract=acceptance_contract,
             orchestration=orchestration,
         )
+        miniapp_contract = MiniAppContractCompiler.compile(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            prompt=request.prompt,
+            intent=str(request.intent or ""),
+            generation_mode=generation_mode,
+            acceptance_contract=acceptance_contract,
+            implementation_plan=implementation_plan,
+        )
+        acceptance_contract = miniapp_contract.acceptance_summary
         job.acceptance_contract = acceptance_contract
         job.implementation_plan = implementation_plan
         job.orchestration_phases = list(orchestration.get("phases") or [])
@@ -962,6 +973,51 @@ class WorkspaceCodeAgentRuntime:
         job.hook_trace_ref = f"hook_trace:{workspace_id}:{artifact_run_id}"
         job.semantic_graph_ref = f"semantic_graph:{workspace_id}:{artifact_run_id}"
         job.worker_prefix_ref = f"worker_prefix:{workspace_id}:{artifact_run_id}"
+        job.miniapp_contract_ref = f"miniapp_contract:{workspace_id}:{artifact_run_id}"
+        job.contract_compile_ref = f"contract_compile:{workspace_id}:{artifact_run_id}"
+        job.route_registry_ref = f"route_registry:{workspace_id}:{artifact_run_id}"
+        job.repair_recipes_ref = f"repair_recipes:{workspace_id}:{artifact_run_id}"
+        contract_materialized_paths = MiniAppContractMaterializer.materialize(
+            draft_source,
+            miniapp_contract,
+            include_role_shell=create_intent,
+        )
+        contract_runtime_fast_path = (
+            create_intent
+            and generation_mode == GenerationMode.FAST
+            and bool(contract_materialized_paths)
+        )
+        route_registry_snapshot = MiniAppRouteRegistry.snapshot(
+            draft_source,
+            miniapp_contract,
+            regenerated_files=contract_materialized_paths,
+        )
+        self._store_report(
+            job.miniapp_contract_ref,
+            {"workspace_id": workspace_id, "run_id": run_id, "contract": miniapp_contract.model_dump(mode="json")},
+        )
+        self._store_report(
+            job.contract_compile_ref,
+            {
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "status": "compiled_and_materialized",
+                "contract_id": miniapp_contract.contract_id,
+                "materialized_paths": contract_materialized_paths,
+            },
+        )
+        self._store_report(
+            job.route_registry_ref,
+            {"workspace_id": workspace_id, "run_id": run_id, "snapshot": route_registry_snapshot.model_dump(mode="json")},
+        )
+        self._store_report(
+            job.repair_recipes_ref,
+            {
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "items": [item.model_dump(mode="json") for item in route_registry_snapshot.repair_recipes],
+            },
+        )
         restored_process_view = self.process_recovery.restore_view(self.store.get("reports", job.resume_checkpoint_ref))
         if restored_process_view.get("stale_processes"):
             self._store_report(
@@ -1120,7 +1176,9 @@ class WorkspaceCodeAgentRuntime:
         if focused_visual_edit:
             tool_results.append(self._focused_visual_edit_budget_result(role_scope=role_scope))
         last_changed_files: list[str] = (
-            self._focused_visual_css_paths(role_scope) if focused_visual_edit else ["miniapp", "docs", "README.md"]
+            self._focused_visual_css_paths(role_scope)
+            if focused_visual_edit
+            else (contract_materialized_paths or ["miniapp", "docs", "README.md"])
         )
         cached_no_diff_checks: tuple[CheckExecutionRecord, dict[str, Any]] | None = None
         branch_initial_file_changes: list[DraftAction] = []
@@ -1128,6 +1186,7 @@ class WorkspaceCodeAgentRuntime:
         if (
             worker_drafts.get("enabled")
             and bool(acceptance_contract.get("required"))
+            and not contract_runtime_fast_path
             and not focused_visual_edit
             and writer_worker_tasks
         ):
@@ -1153,6 +1212,27 @@ class WorkspaceCodeAgentRuntime:
         def _execute_checks(changed_files: list[str]) -> tuple[CheckExecutionRecord, dict[str, Any]]:
             nonlocal last_changed_files, cached_no_diff_checks
             last_changed_files = list(changed_files or last_changed_files)
+            registry_regenerated = MiniAppRouteRegistry.sync_contract_owned_files(draft_source, miniapp_contract)
+            if registry_regenerated:
+                self.file_state_cache.invalidate(run_id, registry_regenerated)
+                last_changed_files = list(dict.fromkeys([*last_changed_files, *registry_regenerated]))
+            registry_snapshot = MiniAppRouteRegistry.snapshot(
+                draft_source,
+                miniapp_contract,
+                regenerated_files=registry_regenerated,
+            )
+            self._store_report(
+                job.route_registry_ref,
+                {"workspace_id": workspace_id, "run_id": run_id, "snapshot": registry_snapshot.model_dump(mode="json")},
+            )
+            self._store_report(
+                job.repair_recipes_ref,
+                {
+                    "workspace_id": workspace_id,
+                    "run_id": run_id,
+                    "items": [item.model_dump(mode="json") for item in registry_snapshot.repair_recipes],
+                },
+            )
             has_draft_diff = bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
             self._append_event(
                 job,
@@ -1813,7 +1893,7 @@ class WorkspaceCodeAgentRuntime:
             store_report=self._store_report,
             record_compact_boundary=_record_compact_boundary,
             allow_optimistic_completion=False,
-            skip_initial_checks=focused_visual_edit or create_intent,
+            skip_initial_checks=focused_visual_edit or (create_intent and not contract_runtime_fast_path),
             stop_if_requested=should_stop,
             budget_status=lambda attempt: completion_budget_status(
                 job=job,

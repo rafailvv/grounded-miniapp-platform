@@ -30,6 +30,15 @@ class ConnectivityValidator:
                                 message=f"{relative} references {method} {normalized_endpoint} but the matching backend route is missing.",
                                 severity="high",
                                 location="miniapp/app/routes",
+                                repair_recipe={
+                                    "frontend_ref": f"{relative}: {method} {normalized_endpoint}",
+                                    "expected_route": f"{method} {normalized_endpoint}",
+                                    "declared_routes": [f"{declared_method} {declared_path}" for declared_method, declared_path in sorted(api_route_paths)],
+                                    "why_mismatch": "Frontend fetch reference has no matching FastAPI route by method/path.",
+                                    "suggested_patch_target": "miniapp/app/routes/generated_contract.py",
+                                    "auto_fixable": False,
+                                    "validator_may_be_stale": False,
+                                },
                             )
                         )
                 for asset_path in self._extract_static_asset_refs(content, source_path=relative):

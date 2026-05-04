@@ -21,6 +21,7 @@ import {
   getRunReview,
   getRunTestMatrix,
   getRunPromptContract,
+  getRunMiniAppContract,
   getWorkspaceMemory,
   getWorkspaceLogs,
   listRuns,
@@ -46,6 +47,7 @@ import {
   CommandPaletteAction,
   TestMatrixReport,
   PromptContractReport,
+  MiniAppContractReport,
   DoctorReport,
   WorkerReport,
   ReviewReport,
@@ -1162,6 +1164,7 @@ export default function App() {
   const [reviewReport, setReviewReport] = useState<ReviewReport | null>(null);
   const [testMatrixReport, setTestMatrixReport] = useState<TestMatrixReport | null>(null);
   const [promptContractReport, setPromptContractReport] = useState<PromptContractReport | null>(null);
+  const [miniAppContractReport, setMiniAppContractReport] = useState<MiniAppContractReport | null>(null);
   const [workspaceMemory, setWorkspaceMemory] = useState<WorkspaceMemory | null>(null);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [fileSearchQuery, setFileSearchQuery] = useState("");
@@ -1442,12 +1445,13 @@ export default function App() {
       setReviewReport(null);
       setTestMatrixReport(null);
       setPromptContractReport(null);
+      setMiniAppContractReport(null);
       return;
     }
     let cancelled = false;
     void (async () => {
       try {
-        const [timeline, traceView, approvals, workers, review, matrix, contract] = await Promise.all([
+        const [timeline, traceView, approvals, workers, review, matrix, contract, miniappContract] = await Promise.all([
           getRunTimeline(activeRunId),
           getRunTraceView(activeRunId),
           getRunApprovals(activeRunId),
@@ -1455,6 +1459,7 @@ export default function App() {
           getRunReview(activeRunId),
           getRunTestMatrix(activeRunId),
           getRunPromptContract(activeRunId),
+          getRunMiniAppContract(activeRunId),
         ]);
         if (!cancelled) {
           setRunTimeline(timeline);
@@ -1464,6 +1469,7 @@ export default function App() {
           setReviewReport(review);
           setTestMatrixReport(matrix);
           setPromptContractReport(contract);
+          setMiniAppContractReport(miniappContract);
         }
       } catch {
         if (!cancelled) {
@@ -1474,6 +1480,7 @@ export default function App() {
           setReviewReport(null);
           setTestMatrixReport(null);
           setPromptContractReport(null);
+          setMiniAppContractReport(null);
         }
       }
     })();
@@ -2312,6 +2319,7 @@ export default function App() {
       setReviewReport(review);
       setTestMatrixReport(await getRunTestMatrix(runId));
       setPromptContractReport(await getRunPromptContract(runId));
+      setMiniAppContractReport(await getRunMiniAppContract(runId));
     } catch {
       // Keep the current panel data if one derived endpoint is temporarily unavailable.
     }
@@ -2381,6 +2389,7 @@ export default function App() {
     if (actionId === "run-checks" && selectedRun) {
       setTestMatrixReport(await getRunTestMatrix(selectedRun.run_id));
       setPromptContractReport(await getRunPromptContract(selectedRun.run_id));
+      setMiniAppContractReport(await getRunMiniAppContract(selectedRun.run_id));
       setActiveTab("checks");
       return;
     }
@@ -3644,7 +3653,7 @@ export default function App() {
           ) : null}
 
           {activeTab === "checks" ? (
-            <ChecksPanel matrix={testMatrixReport} promptContract={promptContractReport} />
+            <ChecksPanel matrix={testMatrixReport} promptContract={promptContractReport} miniappContract={miniAppContractReport} previewRuntimeMode={previewRuntimeMode} />
           ) : null}
 
           {activeTab === "doctor" ? (

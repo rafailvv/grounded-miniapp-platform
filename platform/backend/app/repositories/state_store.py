@@ -56,6 +56,10 @@ class StateStore:
         "semantic_graph:",
         "worker_prefix:",
         "replay_trace:",
+        "miniapp_contract:",
+        "route_registry:",
+        "contract_compile:",
+        "repair_recipes:",
     )
 
     def __init__(self, path: Path) -> None:

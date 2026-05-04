@@ -262,6 +262,28 @@ def test_staged_apply_commits_only_selected_files_and_discard_restores_draft(tmp
     assert (draft / ui_path).read_text(encoding="utf-8") == original_ui
 
 
+def test_staged_apply_uses_actual_diff_for_generated_manifest(tmp_path: Path) -> None:
+    app, client, workspace, run = _workspace_with_run(tmp_path)
+    workspace_id = workspace["workspace_id"]
+    service = app.state.container.workspace_service
+    draft = service.prepare_draft(workspace_id, run.run_id)
+    source = service.source_dir(workspace_id)
+    backend_path = "miniapp/app/main.py"
+    manifest_path = "miniapp/app/generated/route_manifest.json"
+    original_backend = (source / backend_path).read_text(encoding="utf-8")
+    original_manifest = (source / manifest_path).read_text(encoding="utf-8")
+    (draft / backend_path).write_text(original_backend + "\n# touched only marker\n", encoding="utf-8")
+    (draft / manifest_path).write_text(original_manifest.replace('"shared": {}', '"shared": {}, "diffGraphMarker": true'), encoding="utf-8")
+    run.touched_files = [backend_path]
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+
+    applied = client.post(f"/runs/{run.run_id}/apply/staged").json()
+
+    assert applied["status"] == "completed"
+    assert "touched only marker" in (source / backend_path).read_text(encoding="utf-8")
+    assert "diffGraphMarker" in (source / manifest_path).read_text(encoding="utf-8")
+
+
 def test_file_search_and_plugin_validation(tmp_path: Path) -> None:
     _app, client, workspace, _run = _workspace_with_run(tmp_path)
 

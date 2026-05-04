@@ -241,6 +241,10 @@ class JobRecord(StrictModel):
     worker_prefix_ref: str | None = None
     replay_trace_ref: str | None = None
     compaction_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    miniapp_contract_ref: str | None = None
+    route_registry_ref: str | None = None
+    contract_compile_ref: str | None = None
+    repair_recipes_ref: str | None = None
     acceptance_contract: dict[str, Any] = Field(default_factory=dict)
     worker_summaries: list[dict[str, Any]] = Field(default_factory=list)
     flow_coverage: dict[str, Any] = Field(default_factory=dict)
@@ -268,7 +272,7 @@ class PreviewRecord(StrictModel):
     frontend_url: str | None = None
     backend_url: str | None = None
     proxy_port: int | None = None
-    runtime_mode: Literal["inline", "docker"] = "docker"
+    runtime_mode: Literal["inline", "docker", "local"] = "docker"
     project_name: str | None = None
     draft_run_id: str | None = None
     logs: list[str] = Field(default_factory=list)
@@ -586,6 +590,10 @@ class RunRecord(StrictModel):
     worker_prefix_ref: str | None = None
     replay_trace_ref: str | None = None
     compaction_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    miniapp_contract_ref: str | None = None
+    route_registry_ref: str | None = None
+    contract_compile_ref: str | None = None
+    repair_recipes_ref: str | None = None
     acceptance_contract: dict[str, Any] = Field(default_factory=dict)
     worker_summaries: list[dict[str, Any]] = Field(default_factory=list)
     flow_coverage: dict[str, Any] = Field(default_factory=dict)

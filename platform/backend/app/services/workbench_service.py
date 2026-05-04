@@ -16,6 +16,7 @@ from uuid import uuid4
 from app.models.domain import CreateRunRequest, RunRecord
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
+from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, tool_envelope, tool_registry_contract
 from app.services.workspace.run_service import RunService
 from app.services.workspace.service import WorkspaceService
@@ -630,6 +631,66 @@ class WorkbenchService:
         self.store.upsert("reports", f"prompt_contract:{run_id}", payload)
         return payload
 
+    def miniapp_contract(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifacts = self._run_artifacts_or_empty(run_id)
+        contract_report = self.store.get("reports", run.miniapp_contract_ref) if run.miniapp_contract_ref else None
+        if not isinstance(contract_report, dict):
+            contract_report = artifacts.get("miniapp_contract") if isinstance(artifacts.get("miniapp_contract"), dict) else None
+        contract_payload = (contract_report or {}).get("contract") if isinstance(contract_report, dict) else None
+        source_dir = (
+            self.workspace_service.draft_source_dir(run.workspace_id, run_id)
+            if self.workspace_service.draft_exists(run.workspace_id, run_id)
+            else self.workspace_service.source_dir(run.workspace_id)
+        )
+        contract = MiniAppRouteRegistry.load_contract(source_dir)
+        if contract is None and isinstance(contract_payload, dict):
+            try:
+                from app.services.miniapp_contract import MiniAppContract
+
+                contract = MiniAppContract.model_validate(contract_payload)
+            except Exception:
+                contract = None
+        if contract is None:
+            contract = MiniAppContractCompiler.compile(
+                workspace_id=run.workspace_id,
+                run_id=run.run_id,
+                prompt=run.prompt,
+                intent=run.intent,
+                generation_mode=run.generation_mode,
+                acceptance_contract=run.acceptance_contract,
+                implementation_plan=run.implementation_plan,
+            )
+        registry_report = self.store.get("reports", run.route_registry_ref) if run.route_registry_ref else None
+        registry_snapshot = None
+        if isinstance(registry_report, dict) and isinstance(registry_report.get("snapshot"), dict):
+            registry_snapshot = registry_report["snapshot"]
+        if registry_snapshot is None:
+            registry_snapshot = MiniAppRouteRegistry.snapshot(source_dir, contract).model_dump(mode="json")
+        repair_report = self.store.get("reports", run.repair_recipes_ref) if run.repair_recipes_ref else None
+        repair_recipes = (
+            repair_report.get("items")
+            if isinstance(repair_report, dict) and isinstance(repair_report.get("items"), list)
+            else registry_snapshot.get("repair_recipes", [])
+        )
+        payload = {
+            "run_id": run_id,
+            "workspace_id": run.workspace_id,
+            "status": registry_snapshot.get("status") or "passed",
+            "contract": contract.model_dump(mode="json"),
+            "registry_snapshot": registry_snapshot,
+            "drift_issues": registry_snapshot.get("drift_issues", []),
+            "repair_recipes": repair_recipes,
+            "artifact_refs": {
+                "miniapp_contract": run.miniapp_contract_ref,
+                "route_registry": run.route_registry_ref,
+                "contract_compile": run.contract_compile_ref,
+                "repair_recipes": run.repair_recipes_ref,
+            },
+        }
+        self.store.upsert("reports", f"miniapp_contract_view:{run_id}", payload)
+        return payload
+
     def security_summary(self) -> dict[str, Any]:
         return {
             "status": "configured",
@@ -742,7 +803,15 @@ class WorkbenchService:
         run = self.run_service.get_run(run_id)
         staged = self.store.get("reports", f"staged_files:{run_id}") or {}
         changed_before_apply = set(self.workspace_service.draft_changed_paths(run.workspace_id, run_id))
-        files = self._normalize_file_list(staged.get("files") or run.touched_files or list(changed_before_apply))
+        staged_files = staged.get("files") if isinstance(staged.get("files"), list) else None
+        files = self._normalize_file_list(staged_files if staged_files is not None else list(changed_before_apply))
+        contract_owned = set(MiniAppContractMaterializer.contract_owned_paths())
+        blocking_required = sorted(
+            path
+            for path in changed_before_apply
+            if path in contract_owned or path.startswith("miniapp/app/generated/")
+        )
+        files = list(dict.fromkeys([*files, *blocking_required]))
         revision = self.workspace_service.apply_selected_draft_files(run.workspace_id, run_id, files, message=f"Apply staged AI draft files for run {run_id}")
         fully_applied = bool(changed_before_apply) and set(files).issuperset(changed_before_apply)
         run.result_revision_id = revision.revision_id

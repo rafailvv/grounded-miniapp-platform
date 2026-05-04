@@ -30,6 +30,8 @@ CANONICAL_TOOL_ALIASES: dict[str, str] = {
     "shell.exec": "shell.exec",
     "browser.verify": "browser.verify",
     "patch.apply": "patch.apply",
+    "contract.compile": "contract.compile",
+    "registry.sync": "registry.sync",
     "todo.write": "todo.write",
     "ask_user": "user.ask",
     "review.start": "review.start",
@@ -48,6 +50,8 @@ TOOL_RISK_DEFAULTS: dict[str, ToolRisk] = {
     "file.write": "mutating",
     "file.edit": "mutating",
     "patch.apply": "mutating",
+    "contract.compile": "safe",
+    "registry.sync": "mutating",
     "todo.write": "safe",
     "user.ask": "safe",
     "review.start": "read_only",
@@ -72,6 +76,8 @@ def tool_registry_contract() -> dict[str, Any]:
                 "canonical": canonical,
                 "version": TOOL_PROTOCOL_VERSION,
                 "risk": TOOL_RISK_DEFAULTS.get(canonical, "unknown"),
+                "input_schema": TOOL_INPUT_SCHEMAS.get(canonical, {}),
+                "output_schema": TOOL_OUTPUT_SCHEMAS.get(canonical, {}),
             }
         )
     return {
@@ -106,6 +112,66 @@ def tool_registry_contract() -> dict[str, Any]:
         },
         "tools": tools,
     }
+
+
+TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "contract.compile": {
+        "type": "object",
+        "required": ["workspace_id", "run_id", "prompt", "generation_mode"],
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "prompt": {"type": "string"},
+            "generation_mode": {"type": "string", "enum": ["fast", "balanced", "quality", "basic"]},
+        },
+    },
+    "registry.sync": {
+        "type": "object",
+        "required": ["workspace_id", "run_id", "contract_id"],
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "contract_id": {"type": "string"},
+            "allowed_file_graph": {"type": "object"},
+        },
+    },
+    "checks.run": {
+        "type": "object",
+        "required": ["workspace_id", "run_id"],
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "targets": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "patch.apply": {
+        "type": "object",
+        "required": ["file_path"],
+        "properties": {
+            "file_path": {"type": "string"},
+            "diff": {"type": "string"},
+            "content": {"type": "string"},
+            "allowed_file_graph": {"type": "object"},
+        },
+    },
+    "file.write": {
+        "type": "object",
+        "required": ["file_path", "content"],
+        "properties": {
+            "file_path": {"type": "string"},
+            "content": {"type": "string"},
+            "allowed_file_graph": {"type": "object"},
+        },
+    },
+}
+
+TOOL_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "contract.compile": {"type": "object", "required": ["contract", "allowed_file_graph"]},
+    "registry.sync": {"type": "object", "required": ["snapshot", "regenerated_files", "repair_recipes"]},
+    "checks.run": {"type": "object", "required": ["status", "results"]},
+    "patch.apply": {"type": "object", "required": ["status", "changed_files"]},
+    "file.write": {"type": "object", "required": ["status", "file_path"]},
+}
 
 
 def tool_envelope(

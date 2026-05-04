@@ -4438,7 +4438,13 @@ except Exception as exc:
             if path.suffix.lower() not in scan_suffixes:
                 continue
             relative_path = path.relative_to(source_dir).as_posix()
-            if relative_path in {"miniapp/app/static/preview_bridge.js", "miniapp/app/generated/route_manifest.json"}:
+            if relative_path in {
+                "miniapp/app/static/preview_bridge.js",
+                "miniapp/app/generated/route_manifest.json",
+                "miniapp/app/generated/miniapp_contract.json",
+                "miniapp/app/generated/contract_validator.json",
+                "miniapp/app/generated/api_client.js",
+            }:
                 continue
             try:
                 content = path.read_text(encoding="utf-8")

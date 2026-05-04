@@ -78,7 +78,10 @@ class PreviewService:
             self._append_log(preview, f"Selected preview port {proxy_port}.")
             preview.progress_percent = max(preview.progress_percent, 24)
             self._persist(preview)
-            project_name, logs = self.runtime_manager.start(workspace_id, source_dir, proxy_port)
+            if runtime_mode == "local":
+                project_name, logs = self.runtime_manager.start_local(workspace_id, source_dir, proxy_port)
+            else:
+                project_name, logs = self.runtime_manager.start(workspace_id, source_dir, proxy_port)
             preview.proxy_port = proxy_port
             preview.project_name = project_name
             preview.url = self.runtime_manager.preview_url(proxy_port)
@@ -179,7 +182,10 @@ class PreviewService:
             self._append_log(preview, f"Using preview port {proxy_port} for rebuild.")
             preview.progress_percent = max(preview.progress_percent, 28)
             self._persist(preview)
-            logs = self.runtime_manager.rebuild(workspace_id, source_dir, proxy_port)
+            if runtime_mode == "local":
+                logs = self.runtime_manager.rebuild_local(workspace_id, source_dir, proxy_port)
+            else:
+                logs = self.runtime_manager.rebuild(workspace_id, source_dir, proxy_port)
             preview.proxy_port = proxy_port
             preview.project_name = self.runtime_manager.project_name(workspace_id)
             preview.url = self.runtime_manager.preview_url(proxy_port)
@@ -315,6 +321,25 @@ class PreviewService:
                 preview.project_name = None
                 preview.last_error = None
                 self._append_log(preview, "Preview runtime stopped.")
+        elif preview.runtime_mode == "local":
+            try:
+                logs = self.runtime_manager.reset_local(workspace_id)
+                preview.logs.extend(logs or ["Local preview stopped."])
+                preview.logs = preview.logs[-240:]
+            except Exception as exc:
+                self._append_log(preview, f"Local preview reset failed: {exc}")
+                preview.status = "error"
+            else:
+                preview.status = "stopped"
+                preview.stage = "idle"
+                preview.progress_percent = 0
+                preview.url = None
+                preview.frontend_url = None
+                preview.backend_url = None
+                preview.proxy_port = None
+                preview.project_name = None
+                preview.last_error = None
+                self._append_log(preview, "Local preview runtime stopped.")
         else:
             preview.status = "stopped"
             preview.stage = "idle"
@@ -552,6 +577,33 @@ class PreviewService:
                     preview.preview_cooldown_until = None
                     preview.last_failure_signature = None
                     self._append_log(preview, "Preview start recovered after cleanup of stale docker runtime.")
+                    self._persist(preview)
+                    return True
+            if failure_kind == "address_pool_exhausted" and preview.proxy_port is not None:
+                try:
+                    project_name, local_logs = self.runtime_manager.start_local(workspace_id, source_dir, preview.proxy_port)
+                except Exception as local_exc:
+                    self._append_log(preview, f"Local preview fallback failed after docker address-pool exhaustion: {local_exc}")
+                else:
+                    preview.runtime_mode = "local"
+                    preview.project_name = project_name
+                    preview.url = self.runtime_manager.preview_url(preview.proxy_port)
+                    preview.frontend_url = preview.url
+                    preview.backend_url = self.runtime_manager.backend_url(preview.proxy_port)
+                    preview.logs.extend(local_logs or [f"Local preview started on port {preview.proxy_port}."])
+                    preview.logs = preview.logs[-240:]
+                    preview.status = "running"
+                    preview.stage = "running"
+                    preview.progress_percent = 100
+                    preview.started_at = preview.started_at or datetime.now(timezone.utc)
+                    preview.last_error = None
+                    preview.preview_failure_kind = failure_kind  # type: ignore[assignment]
+                    preview.preview_retry_count = 0
+                    preview.preview_cleanup_attempted = cleanup_attempted
+                    preview.preview_reused_existing_runtime = False
+                    preview.preview_cooldown_until = None
+                    preview.last_failure_signature = None
+                    self._append_log(preview, "Docker address-pool exhaustion detected; local uvicorn preview fallback is running.")
                     self._persist(preview)
                     return True
         self._record_preview_failure(preview, error=error, failure_kind=failure_kind, cleanup_attempted=cleanup_attempted)
