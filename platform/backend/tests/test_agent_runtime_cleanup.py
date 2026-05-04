@@ -3,6 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def _chars(*codes: int) -> str:
+    return "".join(chr(code) for code in codes)
+
+
 def test_removed_generation_runtime_packages_do_not_exist() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     deleted_paths = [
@@ -80,12 +84,12 @@ def test_active_sources_do_not_reference_retired_generation_tokens() -> None:
         "scope_" + "expansions",
         "draft_" + "actions",
         "draft_" + "patch_history_ref",
-        "com" + "merce",
-        "bak" + "ery",
-        "ca" + "rt",
-        "book" + "ing",
-        "les" + "son",
-        "appoint" + "ment",
+        _chars(99, 111, 109, 109, 101, 114, 99, 101),
+        _chars(98, 97, 107, 101, 114, 121),
+        _chars(99, 97, 114, 116),
+        _chars(98, 111, 111, 107, 105, 110, 103),
+        _chars(108, 101, 115, 115, 111, 110),
+        _chars(97, 112, 112, 111, 105, 110, 116, 109, 101, 110, 116),
     ]
 
     matches: list[str] = []

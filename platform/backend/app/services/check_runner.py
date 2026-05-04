@@ -82,7 +82,7 @@ ROLE_LINK_STOPWORDS = {
     "экран",
     "приложение",
 }
-PRELOADED_BUSINESS_DATA_MARKERS = (
+PRELOADED_DOMAIN_DATA_MARKERS = (
     "mock data",
     "mock-data",
     "demo data",
@@ -4473,7 +4473,7 @@ except Exception as exc:
         text = str(content or "")
         lowered = text.lower()
         compact = re.sub(r"[\s_\-]+", "", lowered)
-        for marker in PRELOADED_BUSINESS_DATA_MARKERS:
+        for marker in PRELOADED_DOMAIN_DATA_MARKERS:
             normalized_marker = marker.lower()
             compact_marker = re.sub(r"[\s_\-]+", "", normalized_marker)
             if normalized_marker in lowered or compact_marker in compact:
