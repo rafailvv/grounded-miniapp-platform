@@ -4,6 +4,7 @@ from pathlib import Path
 
 from app.services.check_runner import CheckRunner
 from app.validators.build_validator import BuildValidator
+from app.validators.connectivity_validator import ConnectivityValidator
 
 
 def test_form_wiring_accepts_form_property_reads(tmp_path: Path) -> None:
@@ -81,6 +82,32 @@ def test_frontend_api_refs_are_generic() -> None:
 
     assert ("POST", "/api/entities") in refs
     assert ("PATCH", "/api/entities/{param}/state") in refs
+
+
+def test_connectivity_accepts_api_root_router_prefix(tmp_path: Path) -> None:
+    routes_dir = tmp_path / "miniapp/app/routes"
+    routes_dir.mkdir(parents=True)
+    (routes_dir / "api.py").write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter(prefix='/api')\n"
+        "@router.get('')\n"
+        "def list_items(): return []\n"
+        "@router.post('')\n"
+        "def create_item(): return {}\n",
+        encoding="utf-8",
+    )
+    client_dir = tmp_path / "miniapp/app/static/client"
+    client_dir.mkdir(parents=True)
+    (client_dir / "app.js").write_text(
+        "const API_BASE = '/api';\n"
+        "fetch(API_BASE);\n"
+        "fetch(API_BASE, { method: 'POST', body: '{}' });\n",
+        encoding="utf-8",
+    )
+
+    issues = ConnectivityValidator().validate(tmp_path)
+
+    assert not any(issue.code == "connectivity.missing_backend_route" for issue in issues)
 
 
 def test_preview_url_candidates_allow_container_to_reach_host_preview() -> None:

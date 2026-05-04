@@ -55,6 +55,45 @@ TASK_PROFILES = {
     },
 }
 
+MODEL_CAPABILITIES = {
+    CODEX_MINI_MODEL: {
+        "provider": "openai",
+        "context_window": int(os.getenv("OPENAI_CODE_MINI_CONTEXT_WINDOW", "1000000")),
+        "supports_tools": True,
+        "supports_structured_output": True,
+        "supports_reasoning": True,
+        "cost_tier": "low",
+        "roles": ["agent_turn", "code_edit", "repair", "summarize", "cheap_task"],
+    },
+    CODEX_MAX_MODEL: {
+        "provider": "openai",
+        "context_window": int(os.getenv("OPENAI_CODE_MAX_CONTEXT_WINDOW", "1000000")),
+        "supports_tools": True,
+        "supports_structured_output": True,
+        "supports_reasoning": True,
+        "cost_tier": "high",
+        "roles": ["agent_turn", "code_edit", "repair"],
+    },
+    "text-embedding-3-large": {
+        "provider": "openai",
+        "context_window": 8191,
+        "supports_tools": False,
+        "supports_structured_output": False,
+        "supports_reasoning": False,
+        "cost_tier": "embedding",
+        "roles": ["embedding"],
+    },
+}
+
+PROVIDER_REGISTRY = {
+    "openai": {
+        "enabled_env": "OPENAI_API_KEY",
+        "base_url_env": "OPENAI_BASE_URL",
+        "supports_fallback": True,
+        "models": sorted(MODEL_CAPABILITIES),
+    },
+}
+
 MODEL_REGISTRY = {
     "agent_turn": {
         "primary": TASK_PROFILES["research_balanced"]["routing"]["agent_turn"],
@@ -112,6 +151,41 @@ def routing_for_profile(*, model_profile: str | None, generation_mode: Generatio
     profile_name = resolve_model_profile(model_profile, generation_mode)
     profile = TASK_PROFILES.get(profile_name) or TASK_PROFILES[default_profile_for_generation_mode(generation_mode)]
     return dict(profile.get("routing") or {})
+
+
+def model_capabilities(model: str) -> dict[str, object]:
+    name = str(model or "").strip()
+    capabilities = dict(MODEL_CAPABILITIES.get(name) or {})
+    if not capabilities:
+        capabilities = {
+            "provider": "openai",
+            "context_window": 128000,
+            "supports_tools": name.startswith("gpt-"),
+            "supports_structured_output": name.startswith("gpt-"),
+            "supports_reasoning": name.startswith("gpt-5"),
+            "cost_tier": "unknown",
+            "roles": [],
+        }
+    capabilities["model"] = name
+    return capabilities
+
+
+def provider_routing_table() -> dict[str, object]:
+    profiles = {}
+    for profile_name, profile in TASK_PROFILES.items():
+        routing = dict(profile.get("routing") or {})
+        profiles[profile_name] = {
+            "label": profile.get("label"),
+            "provider": profile.get("provider"),
+            "default": profile.get("default"),
+            "routing": routing,
+            "capabilities": {role: model_capabilities(model) for role, model in routing.items()},
+        }
+    return {
+        "providers": PROVIDER_REGISTRY,
+        "profiles": profiles,
+        "fallback_order": ["openai_code_fast", "research_balanced", "openai_code_quality"],
+    }
 
 
 def models_for_role(

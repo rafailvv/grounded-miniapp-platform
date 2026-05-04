@@ -123,6 +123,20 @@ class PlatformDb:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS thread_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT,
+                    reason TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(thread_id) REFERENCES threads(thread_id)
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_thread_created ON thread_snapshots(thread_id, created_at, snapshot_id)")
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS exec_processes (
                     process_id TEXT PRIMARY KEY,
                     thread_id TEXT,
@@ -336,6 +350,34 @@ class PlatformDb:
                 ),
             )
 
+    def insert_thread_snapshot(self, *, snapshot_id: str, thread_id: str, turn_id: str | None, reason: str, payload: dict[str, Any]) -> dict[str, Any]:
+        created_at = _utc_iso()
+        record = {
+            "snapshot_id": snapshot_id,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "reason": reason,
+            "payload": payload,
+            "created_at": created_at,
+        }
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO thread_snapshots(snapshot_id, thread_id, turn_id, reason, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (snapshot_id, thread_id, turn_id, reason, json.dumps(record, ensure_ascii=False, separators=(",", ":")), created_at),
+            )
+        return record
+
+    def list_thread_snapshots(self, thread_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM thread_snapshots WHERE thread_id = ? ORDER BY created_at DESC, snapshot_id DESC LIMIT ?",
+                (thread_id, max(1, min(limit, 200))),
+            ).fetchall()
+        return [json.loads(str(row["payload_json"])) for row in rows]
+
     def _next_sequence(self, table: str, thread_id: str) -> int:
         with self._lock, self._connect() as conn:
             row = conn.execute(f"SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM {table} WHERE thread_id = ?", (thread_id,)).fetchone()
@@ -351,4 +393,3 @@ class PlatformDb:
             return cursor, ""
         created_at, item_id = cursor.split("|", 1)
         return created_at, item_id
-

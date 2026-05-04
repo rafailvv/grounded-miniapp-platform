@@ -393,6 +393,23 @@ export type RunTimeline = {
   }>;
 };
 
+export type RunTraceView = {
+  run_id: string;
+  trace_id: string;
+  status: string;
+  apply_status: string;
+  timeline: RunTimeline["items"];
+  reducer: {
+    why?: string;
+    failed_checks?: RunTimeline["items"];
+    patches?: RunTimeline["items"];
+    browser_proofs?: RunTimeline["items"];
+    failures?: RunTimeline["items"];
+    fixes?: RunTimeline["items"];
+  };
+  artifact_refs?: Record<string, string | null | undefined>;
+};
+
 export type DoctorReport = {
   status: string;
   checks: Array<{
@@ -480,9 +497,12 @@ export type ToolEventEnvelope = {
   input: Record<string, unknown>;
   risk: string;
   approval: Record<string, unknown>;
+  progress?: Array<Record<string, unknown>>;
   result: Record<string, unknown>;
   artifacts: Array<Record<string, unknown>>;
   timing: Record<string, unknown>;
+  retry?: Record<string, unknown>;
+  truncation?: Record<string, unknown>;
   error?: Record<string, unknown> | null;
   created_at?: string;
 };
@@ -502,7 +522,19 @@ export type FileSearchResult = {
   items: Array<{
     path: string;
     hits: Array<{ line: number; text: string }>;
+    score?: number;
+    language?: string;
+    symbols?: Array<{ kind: string; name: string; line: number }>;
   }>;
+  symbols?: Array<{ path: string; kind: string; name: string; line: number }>;
+};
+
+export type LspDiagnosticsReport = {
+  workspace_id: string;
+  run_id?: string | null;
+  status: string;
+  items: Array<{ path: string; severity: string; message: string; source: string }>;
+  symbols?: Array<{ path: string; kind: string; name: string; line: number }>;
 };
 
 export type CommandPaletteAction = {
@@ -716,6 +748,10 @@ export async function getRunTimeline(runId: string): Promise<RunTimeline> {
   return request<RunTimeline>(`/runs/${runId}/timeline`);
 }
 
+export async function getRunTraceView(runId: string): Promise<RunTraceView> {
+  return request<RunTraceView>(`/runs/${runId}/trace-view`);
+}
+
 export async function getRunApprovals(runId: string): Promise<{ run_id: string; items: ApprovalRecord[] }> {
   return request<{ run_id: string; items: ApprovalRecord[] }>(`/runs/${runId}/approvals`);
 }
@@ -786,6 +822,15 @@ export async function searchWorkspaceFiles(workspaceId: string, query: string, r
   return request<FileSearchResult>(`/workspaces/${workspaceId}/files/search?${params.toString()}`);
 }
 
+export async function getLspDiagnostics(workspaceId: string, runId?: string): Promise<LspDiagnosticsReport> {
+  const params = new URLSearchParams();
+  if (runId) {
+    params.set("run_id", runId);
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request<LspDiagnosticsReport>(`/workspaces/${workspaceId}/diagnostics/lsp${suffix}`);
+}
+
 export async function stopRun(runId: string): Promise<Run> {
   const ref = runTurnRefs.get(runId);
   if (ref) {
@@ -842,6 +887,34 @@ export async function getWorkspaceLogs(workspaceId: string): Promise<WorkspaceLo
 
 export function subscribeRpcNotifications(handler: RpcNotificationHandler): () => void {
   return rpcClient.subscribe(handler);
+}
+
+export async function execWorkspaceCommand(payload: {
+  workspace_id: string;
+  command: string;
+  thread_id?: string;
+  turn_id?: string;
+  timeout?: number;
+  approval_id?: string;
+  preset?: string;
+}): Promise<Record<string, unknown>> {
+  return rpcClient.call("command/exec", payload);
+}
+
+export async function writeExecStdin(processId: string, data: string): Promise<Record<string, unknown>> {
+  return rpcClient.call("command/exec/write", { process_id: processId, data });
+}
+
+export async function resizeExec(processId: string, cols: number, rows: number): Promise<Record<string, unknown>> {
+  return rpcClient.call("command/exec/resize", { process_id: processId, cols, rows });
+}
+
+export async function terminateExec(processId: string): Promise<Record<string, unknown>> {
+  return rpcClient.call("command/exec/terminate", { process_id: processId });
+}
+
+export async function readExecOutput(processId: string, stream: "stdout" | "stderr" = "stdout"): Promise<Record<string, unknown>> {
+  return rpcClient.call("command/exec/read", { process_id: processId, stream });
 }
 
 export async function listThreads(workspaceId: string): Promise<AgentThread[]> {

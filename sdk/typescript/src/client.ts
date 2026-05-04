@@ -31,6 +31,10 @@ export class GroundedClient {
     return this.request<T>(`/runs/${encodeURIComponent(runId)}/timeline`);
   }
 
+  async getTraceView<T = unknown>(runId: string): Promise<T> {
+    return this.request<T>(`/runs/${encodeURIComponent(runId)}/trace-view`);
+  }
+
   async getApprovals<T = unknown>(runId: string): Promise<T> {
     return this.request<T>(`/runs/${encodeURIComponent(runId)}/approvals`);
   }
@@ -43,6 +47,36 @@ export class GroundedClient {
     const params = new URLSearchParams({ q: query });
     if (runId) params.set("run_id", runId);
     return this.request<T>(`/workspaces/${encodeURIComponent(workspaceId)}/files/search?${params.toString()}`);
+  }
+
+  async diagnostics<T = unknown>(workspaceId: string, runId?: string): Promise<T> {
+    const params = new URLSearchParams();
+    if (runId) params.set("run_id", runId);
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    return this.request<T>(`/workspaces/${encodeURIComponent(workspaceId)}/diagnostics/lsp${suffix}`);
+  }
+
+  async patchPreflight<T = unknown>(workspaceId: string, payload: Record<string, unknown>): Promise<T> {
+    return this.request<T>(`/workspaces/${encodeURIComponent(workspaceId)}/patch/preflight`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async doctor<T = unknown>(): Promise<T> {
+    return this.request<T>("/doctor");
+  }
+
+  async metrics<T = unknown>(): Promise<T> {
+    return this.request<T>("/system/metrics/summary");
+  }
+
+  async securitySummary<T = unknown>(): Promise<T> {
+    return this.request<T>("/system/security/summary");
+  }
+
+  async permissionRules<T = unknown>(): Promise<T> {
+    return this.request<T>("/system/permissions/rules");
   }
 
   async export(workspaceId: string, kind: "zip" | "git-patch" | "deploy-bundle" | "docker-validation-report" | "manifest" | "browser-proof-bundle"): Promise<unknown> {

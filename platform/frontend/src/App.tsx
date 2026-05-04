@@ -14,6 +14,7 @@ import {
   ensureWorkspace,
   getRunArtifacts,
   getRunTimeline,
+  getRunTraceView,
   getRunApprovals,
   getDoctorReport,
   getRunWorkers,
@@ -34,10 +35,12 @@ import {
   applyStagedRun,
   compactRun,
   searchWorkspaceFiles,
+  subscribeRpcNotifications,
   request,
   Run,
   RunArtifacts,
   RunTimeline,
+  RunTraceView,
   ApprovalRecord,
   FileSearchResult,
   CommandPaletteAction,
@@ -59,6 +62,7 @@ import { FileSearchPanel } from "./components/FileSearchPanel";
 import { MemoryPanel } from "./components/MemoryPanel";
 import { ReviewPanel } from "./components/ReviewPanel";
 import { TimelinePanel } from "./components/TimelinePanel";
+import { TracePanel } from "./components/TracePanel";
 import { WorkbenchTabs } from "./components/WorkbenchTabs";
 import { WorkerLanesPanel } from "./components/WorkerLanesPanel";
 import "./styles/app.css";
@@ -95,7 +99,7 @@ type PreviewHistoryState = {
 
 type RunComposerMode = "generate" | "fix";
 type UserGenerationMode = "fast" | "balanced" | "quality";
-type WorkbenchTab = "preview" | "timeline" | "code" | "diff" | "logs" | "workers" | "review" | "checks" | "doctor" | "memory" | "search";
+type WorkbenchTab = "preview" | "timeline" | "trace" | "code" | "diff" | "logs" | "workers" | "review" | "checks" | "doctor" | "memory" | "search";
 
 type FixErrorContext = {
   raw_error: string;
@@ -1147,9 +1151,11 @@ export default function App() {
   const [secondaryDiffRunId, setSecondaryDiffRunId] = useState("");
   const [secondaryDiffSource, setSecondaryDiffSource] = useState<"" | "run" | "workspace">("");
   const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLogs | null>(null);
+  const [execStreamLines, setExecStreamLines] = useState<string[]>([]);
   const [selectedLogSection, setSelectedLogSection] = useState<"mini-app" | "workspace">("mini-app");
   const [activeTab, setActiveTab] = useState<WorkbenchTab>("preview");
   const [runTimeline, setRunTimeline] = useState<RunTimeline | null>(null);
+  const [runTraceView, setRunTraceView] = useState<RunTraceView | null>(null);
   const [runApprovals, setRunApprovals] = useState<ApprovalRecord[]>([]);
   const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
   const [workerReport, setWorkerReport] = useState<WorkerReport | null>(null);
@@ -1430,6 +1436,7 @@ export default function App() {
     const activeRunId = selectedRunId || runs[0]?.run_id || "";
     if (!activeRunId) {
       setRunTimeline(null);
+      setRunTraceView(null);
       setRunApprovals([]);
       setWorkerReport(null);
       setReviewReport(null);
@@ -1440,8 +1447,9 @@ export default function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [timeline, approvals, workers, review, matrix, contract] = await Promise.all([
+        const [timeline, traceView, approvals, workers, review, matrix, contract] = await Promise.all([
           getRunTimeline(activeRunId),
+          getRunTraceView(activeRunId),
           getRunApprovals(activeRunId),
           getRunWorkers(activeRunId),
           getRunReview(activeRunId),
@@ -1450,6 +1458,7 @@ export default function App() {
         ]);
         if (!cancelled) {
           setRunTimeline(timeline);
+          setRunTraceView(traceView);
           setRunApprovals(approvals.items);
           setWorkerReport(workers);
           setReviewReport(review);
@@ -1459,6 +1468,7 @@ export default function App() {
       } catch {
         if (!cancelled) {
           setRunTimeline(null);
+          setRunTraceView(null);
           setRunApprovals([]);
           setWorkerReport(null);
           setReviewReport(null);
@@ -1766,9 +1776,28 @@ export default function App() {
   }, [workspaceLogs?.preview?.mini_app_logs]);
   const workspaceLogLines = useMemo(() => {
     const lines = workspaceLogs?.workspace_logs ?? [];
-    return lines.length ? lines : ["No workspace logs yet."];
-  }, [workspaceLogs?.workspace_logs]);
+    const combined = [...lines, ...execStreamLines];
+    return combined.length ? combined : ["No workspace logs yet."];
+  }, [execStreamLines, workspaceLogs?.workspace_logs]);
   const activeLogLines = selectedLogSection === "mini-app" ? miniAppLogLines : workspaceLogLines;
+
+  useEffect(() => {
+    return subscribeRpcNotifications((message) => {
+      const method = String(message.method || "");
+      if (!method.startsWith("command/exec/")) {
+        return;
+      }
+      const payload = (message.params || {}) as Record<string, unknown>;
+      const processId = String(payload.process_id || "");
+      const status = String(payload.status || method.split("/").pop() || "event");
+      const stream = String(payload.stream || "");
+      const text = typeof payload.text === "string" ? payload.text : "";
+      const line = text
+        ? `[exec ${processId} ${stream}] ${text.replace(/\n$/, "")}`
+        : `[exec ${processId}] ${status}`;
+      setExecStreamLines((current) => [...current.slice(-199), line]);
+    });
+  }, []);
 
   useEffect(() => {
     if (!workspace || activeRunIds.length === 0) {
@@ -2269,13 +2298,15 @@ export default function App() {
 
   async function refreshWorkbenchPanels(runId: string) {
     try {
-      const [timeline, approvals, workers, review] = await Promise.all([
+      const [timeline, traceView, approvals, workers, review] = await Promise.all([
         getRunTimeline(runId),
+        getRunTraceView(runId),
         getRunApprovals(runId),
         getRunWorkers(runId),
         getRunReview(runId),
       ]);
       setRunTimeline(timeline);
+      setRunTraceView(traceView);
       setRunApprovals(approvals.items);
       setWorkerReport(workers);
       setReviewReport(review);
@@ -3309,7 +3340,7 @@ export default function App() {
                 </p>
               </header>
               <WorkbenchTabs
-                tabs={["preview", "timeline", "code", "diff", "logs", "workers", "review", "checks", "doctor", "memory", "search"] as const}
+                tabs={["preview", "timeline", "trace", "code", "diff", "logs", "workers", "review", "checks", "doctor", "memory", "search"] as const}
                 activeTab={activeTab}
                 onChange={setActiveTab}
               />
@@ -3402,6 +3433,10 @@ export default function App() {
                 </div>
               ) : null}
             </div>
+          ) : null}
+
+          {activeTab === "trace" ? (
+            <TracePanel trace={runTraceView} />
           ) : null}
 
           {activeTab === "preview" ? (

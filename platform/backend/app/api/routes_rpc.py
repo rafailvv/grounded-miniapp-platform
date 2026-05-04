@@ -88,6 +88,17 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
     if method == "thread/read":
         snapshot = service.read_thread(str(params.get("thread_id") or params.get("threadId") or ""))
         return _snapshot_payload(snapshot)
+    if method == "thread/snapshot":
+        return service.create_snapshot(
+            str(params.get("thread_id") or params.get("threadId") or ""),
+            reason=str(params.get("reason") or "manual"),
+            turn_id=params.get("turn_id") or params.get("turnId"),
+        )
+    if method == "thread/snapshot/list":
+        return service.list_snapshots(
+            str(params.get("thread_id") or params.get("threadId") or ""),
+            limit=int(params.get("limit") or 50),
+        )
     if method == "thread/resume":
         return service.resume_thread(str(params.get("thread_id") or params.get("threadId") or "")).model_dump(mode="json")
     if method == "thread/fork":
@@ -128,8 +139,28 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
             approval_id=params.get("approval_id") or params.get("approvalId"),
             preset=str(params.get("preset") or "safe_auto"),
         )
-    if method in {"command/exec/write", "command/exec/resize", "command/exec/terminate"}:
-        return {"status": "unsupported", "message": "Long-running exec process controls are reserved for the next implementation slice."}
+    if method == "command/exec/write":
+        return service.write_exec(
+            str(params.get("process_id") or params.get("processId") or ""),
+            str(params.get("data") or params.get("chars") or ""),
+        )
+    if method == "command/exec/resize":
+        return service.resize_exec(
+            str(params.get("process_id") or params.get("processId") or ""),
+            cols=int(params.get("cols") or 80),
+            rows=int(params.get("rows") or 24),
+        )
+    if method == "command/exec/terminate":
+        return service.terminate_exec(str(params.get("process_id") or params.get("processId") or ""))
+    if method == "command/exec/read":
+        start = params.get("start")
+        end = params.get("end")
+        return service.read_exec_output(
+            str(params.get("process_id") or params.get("processId") or ""),
+            stream=str(params.get("stream") or "stdout"),
+            start=int(start) if start is not None else None,
+            end=int(end) if end is not None else None,
+        )
     if method == "model/list":
         return container.openai_client.configuration()
     if method == "skills/list":

@@ -29,6 +29,14 @@ class FilesRequest(BaseModel):
     files: list[str] = []
 
 
+class PermissionRuleRequest(BaseModel):
+    rule_id: str | None = None
+    scope: str = "workspace"
+    risk: str = "unknown"
+    action: str = "prompt"
+    pattern: str = ""
+
+
 @router.get("/system/policies/exec")
 def get_exec_policy(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return {
@@ -92,6 +100,14 @@ def get_run_timeline(run_id: str, container: ServiceContainer = Depends(get_cont
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/trace-view")
+def get_run_trace_view(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.trace_view(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/runs/{run_id}/artifacts/{artifact_ref:path}")
 def get_run_artifact(run_id: str, artifact_ref: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
@@ -110,6 +126,22 @@ def get_thread_snapshot(thread_id: str, container: ServiceContainer = Depends(ge
             "items": [item.model_dump(mode="json") for item in snapshot.items],
             "events": [event.model_dump(mode="json") for event in snapshot.events],
         }
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/threads/{thread_id}/snapshots")
+def create_thread_snapshot(thread_id: str, payload: dict[str, Any] | None = None, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.thread_service.create_snapshot(thread_id, reason=str((payload or {}).get("reason") or "manual"))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/threads/{thread_id}/snapshots")
+def list_thread_snapshots(thread_id: str, limit: int = 50, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.thread_service.list_snapshots(thread_id, limit=limit)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -192,6 +224,28 @@ def search_workspace_files(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/workspaces/{workspace_id}/diagnostics/lsp")
+def get_lsp_diagnostics(
+    workspace_id: str,
+    run_id: str | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.lsp_diagnostics(workspace_id, run_id=run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/workspaces/{workspace_id}/patch/preflight")
+def preflight_patch(workspace_id: str, payload: dict[str, Any], container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.patch_preflight(workspace_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/doctor")
 def get_doctor(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return container.workbench_service.doctor()
@@ -215,6 +269,14 @@ def get_metrics_summary(container: ServiceContainer = Depends(get_container)) ->
     return container.workbench_service.metrics_summary()
 
 
+@router.get("/workspaces/{workspace_id}/git/status")
+def get_workspace_git_status(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.git_status(workspace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/system/config/schema")
 def get_config_schema(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return container.workbench_service.config_schema()
@@ -228,6 +290,26 @@ def get_migrations(container: ServiceContainer = Depends(get_container)) -> dict
 @router.get("/system/security/summary")
 def get_security_summary(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     return container.workbench_service.security_summary()
+
+
+@router.get("/system/exec/sessions")
+def get_exec_sessions(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.exec_runtime_service.snapshot()
+
+
+@router.get("/system/permissions/rules")
+def get_permission_rules(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.permission_rules()
+
+
+@router.post("/system/permissions/rules")
+def upsert_permission_rule(request: PermissionRuleRequest, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.upsert_permission_rule(request.model_dump())
+
+
+@router.get("/system/permissions/recent-denials")
+def get_recent_denials(container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    return container.workbench_service.recent_denials()
 
 
 @router.get("/workspaces/{workspace_id}/memory")

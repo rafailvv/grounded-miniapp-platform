@@ -36,6 +36,7 @@ from app.modules.workspace_code_agent_runtime.check_orchestrator import Workspac
 from app.modules.workspace_code_agent_runtime.process_recovery import AgentProcessRecovery
 from app.modules.workspace_code_agent_runtime.prompt_contract import agent_system_prompt
 from app.modules.workspace_code_agent_runtime.runtime import WorkspaceCodeAgentRuntime
+from app.services.check_runner import CheckRunner
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan
 
 
@@ -53,6 +54,12 @@ def test_agent_prompt_is_tool_loop_contract_not_domain_template() -> None:
     assert "The user prompt is the only product source" in prompt
     assert "three separate multi-page role apps" in prompt
     assert "Do not add mock data, seed data, demo data, sample data" in prompt
+    assert "never create mapped attributes named metadata" in prompt
+    assert "do not assert brittle implementation literals" in prompt
+    assert "Never use visible technical placeholders" in prompt
+    assert "Do not leave empty static/<role>/<child>/ directories" in prompt
+    assert "role entries must include a root field" in prompt
+    assert "return the persisted fields at the top level" in prompt
 
 
 def test_implementation_plan_has_prompt_derived_routeable_screen_intents() -> None:
@@ -139,11 +146,41 @@ def test_agent_tools_batch_reads_and_serialize_mutations() -> None:
 def test_agent_registry_exposes_real_openai_tool_contract() -> None:
     tools = AgentToolRegistry.openai_tools()
     encoded = json.dumps(tools)
+    names = {str(tool["name"]) for tool in tools}
 
     assert any(tool["name"] == "apply_patch_to_draft" for tool in tools)
-    assert any(tool["name"] == "browser_verify" for tool in tools)
+    assert AgentToolRegistry.spec("browser_verify") is not None
+    assert "browser_verify" not in names
+    assert all("." not in name and name != "browser_verify" for name in names)
     assert ("tool_" + "requests") not in encoded
     assert all(tool["type"] == "function" for tool in tools)
+
+
+def test_role_surface_issues_accepts_generation_mode(tmp_path: Path) -> None:
+    css = """
+    .dashboard { display: grid; }
+    .card { padding: 12px; }
+    .button { min-height: 44px; }
+    .form { display: grid; }
+    .input { border: 1px solid #ccd; }
+    .list { display: grid; }
+    .status { font-weight: 700; }
+    .metric { font-variant-numeric: tabular-nums; }
+    """
+    for role in ("client", "specialist", "manager"):
+        role_dir = tmp_path / "miniapp" / "app" / "static" / role
+        role_dir.mkdir(parents=True)
+        (role_dir / "index.html").write_text(
+            f"<main><section class='dashboard'><h1>{role} coffee app</h1><button class='button'>Save</button></section></main>",
+            encoding="utf-8",
+        )
+        (role_dir / "app.js").write_text("document.body.dataset.ready = 'true';\n", encoding="utf-8")
+        (role_dir / "styles.css").write_text(css, encoding="utf-8")
+
+    issues, coverage, _neutral = CheckRunner._role_surface_issues(tmp_path, generation_mode=GenerationMode.BALANCED)
+
+    assert isinstance(issues, list)
+    assert set(coverage) == {"client", "specialist", "manager"}
 
 
 def test_openai_tool_step_extracts_response_function_calls() -> None:

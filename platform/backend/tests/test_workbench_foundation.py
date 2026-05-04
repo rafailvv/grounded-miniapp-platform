@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -64,6 +65,7 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
         json={"command": "rg CRM miniapp/app"},
     ).json()
     timeline = client.get(f"/runs/{run.run_id}/timeline").json()
+    trace = client.get(f"/runs/{run.run_id}/trace-view").json()
     doctor = client.get("/doctor").json()
     memory = client.post(
         f"/workspaces/{workspace['workspace_id']}/memory",
@@ -71,15 +73,98 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     ).json()
     skills = client.get("/skills").json()
     workers = client.get(f"/runs/{run.run_id}/workers").json()
+    permissions = client.get("/system/permissions/rules").json()
+    lsp = client.get(f"/workspaces/{workspace['workspace_id']}/diagnostics/lsp").json()
+    patch_preflight = client.post(
+        f"/workspaces/{workspace['workspace_id']}/patch/preflight",
+        json={
+            "ops": [
+                {
+                    "operation_id": "op_1",
+                    "op": "update",
+                    "file_path": "README.md",
+                    "content": "# Updated\n",
+                    "explanation": "test",
+                }
+            ]
+        },
+    ).json()
 
     assert policy["tool_protocol_version"] == TOOL_PROTOCOL_VERSION
     assert evaluation["decision"]["action"] == "allow"
     assert timeline["items"][0]["kind"] == "prompt"
+    assert trace["reducer"]["why"] == "Build a CRM"
     assert doctor["checks"]
     assert memory["items"][0]["text"] == "Use dense operational UI."
     assert any(item["id"] == "crm" for item in skills["items"])
     assert any(item["id"] == "reservation" for item in skills["items"])
     assert any(item["worker_id"] == "backend_api" for item in workers["workers"])
+    assert any(item["rule_id"] == "block_destructive" for item in permissions["items"])
+    assert lsp["status"] in {"passed", "failed"}
+    assert patch_preflight["status"] == "passed"
+
+
+def test_thread_snapshots_are_persistent(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Snapshot Workspace",
+            "description": "snapshot test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    thread = app.state.container.thread_service.start_thread(workspace_id=workspace["workspace_id"], title="Snapshot thread")
+
+    created = client.post(f"/threads/{thread.thread_id}/snapshots", json={"reason": "test"}).json()
+    snapshots = client.get(f"/threads/{thread.thread_id}/snapshots").json()
+
+    assert created["reason"] == "test"
+    assert snapshots["items"][0]["snapshot_id"] == created["snapshot_id"]
+
+
+def test_exec_runtime_streams_and_blocks_workspace_escape(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Exec Workspace",
+            "description": "exec runtime test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    service = app.state.container.thread_service
+
+    started = service.exec_command(workspace_id=workspace["workspace_id"], command="ls miniapp", timeout=5)
+    process_id = started["process_id"]
+    output = _wait_for_exec_output(service, process_id)
+    resized = service.resize_exec(process_id, cols=100, rows=32)
+
+    escaped = service.exec_command(workspace_id=workspace["workspace_id"], command="ls /tmp", timeout=5)
+    escaped_session = _wait_for_exec_session(app, escaped["process_id"])
+    source_dir = app.state.container.workspace_service.source_dir(workspace["workspace_id"])
+    outside_link = source_dir / "miniapp" / "outside"
+    try:
+        outside_link.symlink_to(tmp_path, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        outside_link = None
+    symlink_session: dict[str, Any] | None = None
+    if outside_link is not None:
+        symlinked = service.exec_command(workspace_id=workspace["workspace_id"], command="ls miniapp/outside", timeout=5)
+        symlink_session = _wait_for_exec_session(app, symlinked["process_id"])
+
+    assert started["status"] in {"starting", "running"}
+    assert output["status"] == "completed"
+    assert "app" in output["content"]
+    assert resized["ok"] is True
+    assert escaped_session["result"]["semantic_status"] == "blocked_by_sandbox"
+    assert escaped_session["result"]["success"] is False
+    if symlink_session is not None:
+        assert symlink_session["result"]["semantic_status"] == "blocked_by_sandbox"
 
 
 def _workspace_with_run(tmp_path: Path) -> tuple[Any, TestClient, dict, RunRecord]:
@@ -109,6 +194,27 @@ def _workspace_with_run(tmp_path: Path) -> tuple[Any, TestClient, dict, RunRecor
     )
     app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
     return app, client, workspace, run
+
+
+def _wait_for_exec_output(service: Any, process_id: str) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for _ in range(30):
+        output = service.read_exec_output(process_id, stream="stdout")
+        if output.get("status") == "completed":
+            return output
+        time.sleep(0.05)
+    return output
+
+
+def _wait_for_exec_session(app: Any, process_id: str) -> dict[str, Any]:
+    session: dict[str, Any] = {}
+    for _ in range(30):
+        snapshot = app.state.container.exec_runtime_service.snapshot()
+        session = next((item for item in snapshot.get("sessions", []) if item.get("process_id") == process_id), {})
+        if session.get("status") in {"completed", "failed"}:
+            return session
+        time.sleep(0.05)
+    return session
 
 
 def test_approval_rejection_blocks_and_appears_in_timeline(tmp_path: Path) -> None:

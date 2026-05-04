@@ -21,6 +21,7 @@ from app.services.workspace.run_service import RunService
 from app.services.workspace.service import WorkspaceService
 from app.core.config import Settings
 from app.ai.openai_client import OpenAIClient
+from app.models.artifacts import PatchOperationModel
 
 
 def re_slug(value: object) -> str:
@@ -77,6 +78,48 @@ class WorkbenchService:
                 )
             )
         return {"run_id": run_id, "tool_protocol_version": TOOL_PROTOCOL_VERSION, "events": events}
+
+    def trace_view(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        timeline = self.timeline(run_id)["items"]
+        artifacts = self._run_artifacts_or_empty(run_id)
+        failures = [
+            item
+            for item in timeline
+            if str(item.get("status") or "").lower() in {"failed", "blocked", "conflict"}
+            or str(item.get("kind") or "") in {"failure"}
+        ]
+        fixes = [
+            item
+            for item in timeline
+            if str(item.get("kind") or "") in {"editing", "apply", "checks", "browser"}
+            and str(item.get("status") or "").lower() in {"completed", "passed", "applied"}
+        ]
+        reducer = {
+            "why": self._trace_why(run, artifacts),
+            "failed_checks": [item for item in timeline if item.get("kind") == "checks" and item.get("status") == "failed"],
+            "patches": [item for item in timeline if item.get("kind") in {"editing", "diff", "apply"}],
+            "browser_proofs": [item for item in timeline if item.get("kind") == "browser"],
+            "failures": failures,
+            "fixes": fixes,
+        }
+        payload = {
+            "run_id": run_id,
+            "trace_id": f"trace_{run_id}",
+            "status": run.status,
+            "apply_status": run.apply_status,
+            "timeline": timeline,
+            "reducer": reducer,
+            "artifact_refs": {
+                "transcript": run.agent_transcript_ref,
+                "tool_trace": run.tool_trace_ref,
+                "rollout_trace": run.rollout_trace_ref,
+                "browser_proof": run.browser_proof_ref,
+                "verification": run.verification_report_ref,
+            },
+        }
+        self.store.upsert("reports", f"trace_view:{run_id}", payload)
+        return payload
 
     def record_tool_event(self, run_id: str | None, event: dict[str, Any]) -> dict[str, Any]:
         if not run_id:
@@ -199,12 +242,24 @@ class WorkbenchService:
     def observability(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         artifacts = self._run_artifacts_or_empty(run_id)
+        timeline_items = self.timeline(run_id).get("items") or []
         return {
             "trace_id": f"trace_{run.run_id}",
             "run_id": run.run_id,
             "thread_id": None,
             "turn_id": None,
             "tool_call_count": len((self.tool_events(run_id)).get("events") or []),
+            "span_count": len(timeline_items),
+            "spans": [
+                {
+                    "span_id": f"span_{index + 1}",
+                    "name": item.get("kind"),
+                    "status": item.get("status"),
+                    "started_at": item.get("created_at"),
+                    "attributes": {"title": item.get("title"), "sequence": item.get("sequence")},
+                }
+                for index, item in enumerate(timeline_items[:200])
+            ],
             "latency_breakdown": artifacts.get("latency_breakdown") or {},
             "token_usage": run.token_usage,
             "model_profile": run.model_profile,
@@ -215,6 +270,30 @@ class WorkbenchService:
                 "signature": run.failure_signature,
                 "reason": run.failure_reason,
             },
+        }
+
+    def git_status(self, workspace_id: str) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        source_dir = self.workspace_service.source_dir(workspace_id)
+
+        def git(args: list[str]) -> tuple[int, str, str]:
+            try:
+                result = subprocess.run(["git", *args], cwd=source_dir, text=True, capture_output=True, timeout=8)
+                return result.returncode, result.stdout.strip(), result.stderr.strip()
+            except Exception as exc:
+                return 1, "", str(exc)
+
+        branch_code, branch, branch_err = git(["rev-parse", "--abbrev-ref", "HEAD"])
+        status_code, status, status_err = git(["status", "--short"])
+        log_code, log, log_err = git(["log", "--oneline", "-5"])
+        return {
+            "workspace_id": workspace_id,
+            "source_dir": str(source_dir),
+            "branch": branch if branch_code == 0 else None,
+            "status": status.splitlines() if status_code == 0 and status else [],
+            "recent_commits": log.splitlines() if log_code == 0 and log else [],
+            "worktree_recommended_branch_prefix": "grounded/run-",
+            "errors": [item for item in [branch_err, status_err, log_err] if item],
         }
 
     def workers(self, run_id: str) -> dict[str, Any]:
@@ -454,6 +533,8 @@ class WorkbenchService:
             "failed_runs": len([run for run in runs if run.get("status") == "failed"]),
             "blocked_runs": len([run for run in runs if run.get("status") == "blocked"]),
             "tool_protocol_version": TOOL_PROTOCOL_VERSION,
+            "token_usage_total": sum(int(((run.get("token_usage") or {}).get("total_tokens") or 0)) for run in runs),
+            "latency_ms_total": sum(int(((run.get("latency_breakdown") or {}).get("total_ms") or 0)) for run in runs),
         }
 
     def config_schema(self) -> dict[str, Any]:
@@ -552,6 +633,8 @@ class WorkbenchService:
     def security_summary(self) -> dict[str, Any]:
         return {
             "status": "configured",
+            "permission_rules": self.permission_rules()["items"],
+            "recent_denials": self.recent_denials()["items"],
             "checks": [
                 {"key": "path_traversal", "status": "covered", "evidence": "Workspace paths normalize through safe relative path checks."},
                 {"key": "write_denylist", "status": "covered", "evidence": self.exec_policy_service.write_grants()["deny"]},
@@ -561,6 +644,59 @@ class WorkbenchService:
                 {"key": "artifact_access_boundaries", "status": "covered", "evidence": "Artifacts are fetched through run-scoped refs."},
             ],
         }
+
+    def permission_rules(self) -> dict[str, Any]:
+        stored = self.store.get("reports", "permission_rules") or {"items": []}
+        defaults = [
+            {"rule_id": "allow_readonly_diagnostics", "scope": "workspace", "risk": "read_only", "action": "allow", "source": "default"},
+            {"rule_id": "prompt_mutating", "scope": "workspace", "risk": "mutating", "action": "prompt", "source": "default"},
+            {"rule_id": "block_destructive", "scope": "workspace", "risk": "destructive", "action": "block", "source": "default"},
+            {"rule_id": "block_network", "scope": "external", "risk": "network", "action": "prompt", "source": "default"},
+        ]
+        merged = {item["rule_id"]: item for item in defaults}
+        for item in stored.get("items") or []:
+            if isinstance(item, dict) and item.get("rule_id"):
+                merged[str(item["rule_id"])] = item
+        return {"items": sorted(merged.values(), key=lambda item: str(item.get("rule_id") or ""))}
+
+    def upsert_permission_rule(self, payload: dict[str, Any]) -> dict[str, Any]:
+        item = {
+            "rule_id": str(payload.get("rule_id") or f"rule_{uuid4().hex}"),
+            "scope": str(payload.get("scope") or "workspace"),
+            "risk": str(payload.get("risk") or "unknown"),
+            "action": str(payload.get("action") or "prompt"),
+            "pattern": str(payload.get("pattern") or ""),
+            "source": "user",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        current = self.permission_rules()
+        current["items"] = [entry for entry in current["items"] if entry.get("rule_id") != item["rule_id"]]
+        current["items"].append(item)
+        self.store.upsert("reports", "permission_rules", current)
+        return item
+
+    def recent_denials(self) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        for key, payload in self.store.items("reports"):
+            if not key.startswith("tool_events:") or not isinstance(payload, dict):
+                continue
+            for event in payload.get("items") or []:
+                if not isinstance(event, dict):
+                    continue
+                approval = event.get("approval") if isinstance(event.get("approval"), dict) else {}
+                result = event.get("result") if isinstance(event.get("result"), dict) else {}
+                decision = result.get("decision") if isinstance(result.get("decision"), dict) else {}
+                if approval.get("status") == "blocked" or decision.get("action") == "forbidden":
+                    items.append(
+                        {
+                            "run_id": payload.get("run_id"),
+                            "tool": event.get("tool"),
+                            "risk": event.get("risk") or decision.get("risk"),
+                            "reason": decision.get("reason") or ((event.get("error") or {}).get("message") if isinstance(event.get("error"), dict) else ""),
+                            "created_at": event.get("created_at"),
+                        }
+                    )
+        return {"items": sorted(items, key=lambda item: str(item.get("created_at") or ""), reverse=True)[:50]}
 
     def compact_run(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -660,7 +796,14 @@ class WorkbenchService:
         if shutil.which("rg"):
             rg_items = self._ripgrep_search(root, normalized_query)
             if rg_items:
-                return {"workspace_id": workspace_id, "run_id": run_id, "query": normalized_query, "engine": "ripgrep", "items": rg_items}
+                return {
+                    "workspace_id": workspace_id,
+                    "run_id": run_id,
+                    "query": normalized_query,
+                    "engine": "ripgrep",
+                    "items": self._rank_search_items(rg_items, normalized_query, root),
+                    "symbols": self._symbol_overview(root, normalized_query),
+                }
         items: list[dict[str, Any]] = []
         for entry in self.workspace_service.file_tree(workspace_id, run_id=run_id):
             if entry.get("type") != "file":
@@ -681,7 +824,56 @@ class WorkbenchService:
                 items.append({"path": relative_path, "hits": hits})
             if len(items) >= 80:
                 break
-        return {"workspace_id": workspace_id, "run_id": run_id, "query": normalized_query, "engine": "python", "items": items}
+        return {
+            "workspace_id": workspace_id,
+            "run_id": run_id,
+            "query": normalized_query,
+            "engine": "python",
+            "items": self._rank_search_items(items, normalized_query, root),
+            "symbols": self._symbol_overview(root, normalized_query),
+        }
+
+    def lsp_diagnostics(self, workspace_id: str, *, run_id: str | None = None) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
+        items: list[dict[str, Any]] = []
+        py_files = [path for path in root.rglob("*.py") if not self.workspace_service._is_ignored_workspace_path(path.relative_to(root))]
+        for path in py_files[:120]:
+            try:
+                result = subprocess.run([sys.executable, "-m", "py_compile", str(path)], text=True, capture_output=True, timeout=4)
+            except Exception as exc:
+                items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": str(exc), "source": "py_compile"})
+                continue
+            if result.returncode != 0:
+                items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": (result.stderr or result.stdout).strip()[:1200], "source": "py_compile"})
+        if shutil.which("node"):
+            for path in list(root.rglob("*.js"))[:80]:
+                if self.workspace_service._is_ignored_workspace_path(path.relative_to(root)):
+                    continue
+                try:
+                    result = subprocess.run(["node", "--check", str(path)], text=True, capture_output=True, timeout=4)
+                except Exception as exc:
+                    items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": str(exc), "source": "node --check"})
+                    continue
+                if result.returncode != 0:
+                    items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": (result.stderr or result.stdout).strip()[:1200], "source": "node --check"})
+        return {"workspace_id": workspace_id, "run_id": run_id, "status": "passed" if not items else "failed", "items": items[:100], "symbols": self._symbol_overview(root, "")}
+
+    def patch_preflight(self, workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_ops = payload.get("ops") or payload.get("patch_actions") or []
+        ops = [PatchOperationModel.model_validate(item) for item in raw_ops if isinstance(item, dict)]
+        return self._patch_preflight(workspace_id, ops, payload)
+
+    def _patch_preflight(self, workspace_id: str, ops: list[PatchOperationModel], payload: dict[str, Any]) -> dict[str, Any]:
+        from app.services.patch_service import PatchService
+
+        service = PatchService(self.workspace_service)
+        return service.preflight(
+            workspace_id=workspace_id,
+            patch_actions=ops,
+            run_id=payload.get("run_id"),
+            base_revision_id=payload.get("base_revision_id"),
+        )
 
     def _run_artifacts_or_empty(self, run_id: str) -> dict[str, Any]:
         try:
@@ -975,6 +1167,95 @@ class WorkbenchService:
                 line_number = 0
             grouped.setdefault(relative_path, []).append({"line": line_number, "text": snippet[:240]})
         return [{"path": path, "hits": hits[:5]} for path, hits in list(grouped.items())[:80]]
+
+    @staticmethod
+    def _rank_search_items(items: list[dict[str, Any]], query: str, root: Path) -> list[dict[str, Any]]:
+        query_lower = query.lower()
+        ranked: list[dict[str, Any]] = []
+        for item in items:
+            path = str(item.get("path") or "")
+            hits = item.get("hits") if isinstance(item.get("hits"), list) else []
+            score = len(hits) * 10
+            if query_lower in path.lower():
+                score += 25
+            if path.endswith((".py", ".js", ".ts", ".tsx", ".html", ".css")):
+                score += 3
+            ranked.append({**item, "score": score, "language": WorkbenchService._language_for_path(path), "symbols": WorkbenchService._symbols_for_file(root / path)[:12]})
+        return sorted(ranked, key=lambda item: (-int(item.get("score") or 0), str(item.get("path") or "")))[:80]
+
+    @staticmethod
+    def _symbol_overview(root: Path, query: str) -> list[dict[str, Any]]:
+        symbols: list[dict[str, Any]] = []
+        query_lower = query.lower()
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in {".py", ".js", ".ts", ".tsx"}:
+                continue
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if any(part in {".git", "node_modules", "dist", "build", "__pycache__"} for part in Path(relative).parts):
+                continue
+            for symbol in WorkbenchService._symbols_for_file(path):
+                if query_lower and query_lower not in symbol["name"].lower() and query_lower not in relative.lower():
+                    continue
+                symbols.append({"path": relative, **symbol})
+                if len(symbols) >= 100:
+                    return symbols
+        return symbols
+
+    @staticmethod
+    def _symbols_for_file(path: Path) -> list[dict[str, Any]]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return []
+        patterns = [
+            ("function", re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_$]+)", re.M)),
+            ("class", re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z0-9_$]+)", re.M)),
+            ("const", re.compile(r"^\s*(?:export\s+)?const\s+([A-Za-z0-9_$]+)\s*=", re.M)),
+            ("python_function", re.compile(r"^\s*def\s+([A-Za-z0-9_]+)\s*\(", re.M)),
+            ("python_class", re.compile(r"^\s*class\s+([A-Za-z0-9_]+)\s*[:(]", re.M)),
+        ]
+        symbols: list[dict[str, Any]] = []
+        line_starts = [0]
+        for match in re.finditer("\n", text):
+            line_starts.append(match.end())
+        for kind, pattern in patterns:
+            for match in pattern.finditer(text):
+                line = 1
+                for index, start in enumerate(line_starts):
+                    if start > match.start():
+                        break
+                    line = index + 1
+                symbols.append({"kind": kind, "name": match.group(1), "line": line})
+                if len(symbols) >= 50:
+                    return symbols
+        return symbols
+
+    @staticmethod
+    def _language_for_path(path: str) -> str:
+        suffix = Path(path).suffix.lower()
+        return {
+            ".py": "python",
+            ".js": "javascript",
+            ".jsx": "javascript",
+            ".ts": "typescript",
+            ".tsx": "typescript",
+            ".html": "html",
+            ".css": "css",
+        }.get(suffix, "text")
+
+    @staticmethod
+    def _trace_why(run: RunRecord, artifacts: dict[str, Any]) -> str:
+        if run.failure_reason:
+            return f"Run is focused on resolving: {run.failure_reason}"
+        if run.summary:
+            return run.summary
+        plan = artifacts.get("implementation_plan") or run.implementation_plan or {}
+        if isinstance(plan, dict) and plan.get("summary"):
+            return str(plan["summary"])
+        return run.prompt[:500]
 
     def _check(self, name: str, ok: bool, details: str = "", command: str | None = None, *, required: bool = True) -> dict[str, Any]:
         return {"name": name, "status": "passed" if ok else "failed", "details": details, "command": command, "required": required}

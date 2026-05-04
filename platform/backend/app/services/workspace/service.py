@@ -31,6 +31,7 @@ class WorkspaceService:
         ".next",
         ".vite",
         ".cache",
+        ".sandbox",
     }
     IGNORED_TREE_SUFFIXES = (".pyc", ".pyo", ".tsbuildinfo", ".db", ".sqlite", ".sqlite3")
     IGNORED_TREE_NAMES = {".DS_Store", "vite.config.js", "vite.config.d.ts"}
@@ -1233,6 +1234,7 @@ class WorkspaceService:
                 ".next",
                 ".vite",
                 ".cache",
+                ".sandbox",
                 ".DS_Store",
                 "vite.config.js",
                 "vite.config.d.ts",
@@ -1277,6 +1279,7 @@ class WorkspaceService:
                         ".next",
                         ".vite",
                         ".cache",
+                        ".sandbox",
                         ".DS_Store",
                         "vite.config.js",
                         "vite.config.d.ts",

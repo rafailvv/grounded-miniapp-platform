@@ -3718,7 +3718,6 @@ except Exception as exc:
         role_tokens: dict[str, set[str]] = {}
         role_surface_text: dict[str, str] = {}
         route_pages = cls._routeable_role_pages(source_dir)
-        del generation_mode
 
         for role in ROLE_ORDER:
             role_dir = source_dir / "miniapp" / "app" / "static" / role

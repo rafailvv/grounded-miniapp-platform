@@ -123,7 +123,7 @@ def extract_declared_routes(routes_root: Path, *, api_only: bool = True) -> set[
         ):
             prefix = router_prefixes.get(match.group("name"), "")
             full_path = _join_route(prefix, match.group("path"))
-            if api_only and not full_path.startswith("/api/"):
+            if api_only and full_path != "/api" and not full_path.startswith("/api/"):
                 continue
             paths.add((match.group("method").upper(), normalize_api_path(full_path)))
     return paths

@@ -306,6 +306,8 @@ class AgentToolRegistry:
     def openai_tools(cls, allowed_names: set[str] | None = None) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         for name in sorted(cls._SPECS):
+            if "." in name or name == "browser_verify":
+                continue
             if allowed_names is not None and name not in allowed_names:
                 continue
             spec = cls._SPECS[name]

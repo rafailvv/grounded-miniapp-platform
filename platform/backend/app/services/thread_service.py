@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import subprocess
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 from app.models.domain import CreateRunRequest, new_id
@@ -12,6 +10,7 @@ from app.models.threads import ItemRecord, RolloutEventRecord, ThreadRecord, Thr
 from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
+from app.services.exec_runtime_service import ExecRuntimeService
 from app.services.rpc_event_hub import RpcEventHub
 from app.services.tool_protocol import tool_envelope
 from app.services.workspace.run_service import RunService
@@ -31,6 +30,7 @@ class ThreadService:
         *,
         store: StateStore | None = None,
         exec_policy_service: ExecPolicyService | None = None,
+        exec_runtime_service: ExecRuntimeService | None = None,
     ) -> None:
         self.db = db
         self.run_service = run_service
@@ -38,6 +38,12 @@ class ThreadService:
         self.event_hub = event_hub
         self.store = store or run_service.store
         self.exec_policy_service = exec_policy_service or ExecPolicyService()
+        self.exec_runtime_service = exec_runtime_service or ExecRuntimeService(
+            workspace_service=workspace_service,
+            platform_db=db,
+            event_hub=event_hub,
+            store=self.store,
+        )
         self._monitors: dict[str, threading.Thread] = {}
 
     def start_thread(self, *, workspace_id: str, title: str | None = None, metadata: dict[str, Any] | None = None) -> ThreadRecord:
@@ -58,6 +64,29 @@ class ThreadService:
         items = self.db.list_items(thread_id, limit=1000)
         events = self.db.list_events(thread_id, limit=1000) if include_events else []
         return ThreadSnapshot(thread=thread, turns=turns, items=items, events=events)
+
+    def create_snapshot(self, thread_id: str, *, reason: str = "manual", turn_id: str | None = None) -> dict[str, Any]:
+        snapshot = self.read_thread(thread_id)
+        payload = {
+            "thread": snapshot.thread.model_dump(mode="json"),
+            "turns": [turn.model_dump(mode="json") for turn in snapshot.turns],
+            "items": [item.model_dump(mode="json") for item in snapshot.items],
+            "events": [event.model_dump(mode="json") for event in snapshot.events],
+            "compact_boundary": reason == "compaction",
+        }
+        record = self.db.insert_thread_snapshot(
+            snapshot_id=new_id("snapshot"),
+            thread_id=thread_id,
+            turn_id=turn_id,
+            reason=reason,
+            payload=payload,
+        )
+        self._append_event(thread_id, turn_id, "thread.snapshot", {"snapshot_id": record["snapshot_id"], "reason": reason})
+        return record
+
+    def list_snapshots(self, thread_id: str, *, limit: int = 50) -> dict[str, Any]:
+        self._get_thread(thread_id)
+        return {"items": self.db.list_thread_snapshots(thread_id, limit=limit)}
 
     def resume_thread(self, thread_id: str) -> ThreadRecord:
         thread = self._get_thread(thread_id)
@@ -223,6 +252,7 @@ class ThreadService:
         self.db.insert_turn(turn)
         self._append_item(thread_id, turn.turn_id, "thread.compaction_summary", summary)
         self._append_event(thread_id, turn.turn_id, "thread.compacted", summary)
+        self.create_snapshot(thread_id, reason="compaction", turn_id=turn.turn_id)
         return turn
 
     def review_thread(self, thread_id: str) -> TurnRecord:
@@ -282,39 +312,42 @@ class ThreadService:
         if approval.get("required"):
             if not approval_id or not linked_run_id or not self._run_approval_status(linked_run_id, approval_id) == "approved":
                 raise ValueError(f"Command requires approval: {approval.get('approval_id')}")
-        process_id = new_id("proc")
-        cwd = self.workspace_service.source_dir(workspace_id)
-        started = time.perf_counter()
-        result = subprocess.run(list(decision.get("argv") or []), cwd=cwd, shell=False, text=True, capture_output=True, timeout=max(1, min(timeout, 120)))
-        payload = {
-            "process_id": process_id,
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "workspace_id": workspace_id,
-            "command": command,
-            "status": "completed",
-            "exit_code": result.returncode,
-            "stdout": result.stdout[-12000:],
-            "stderr": result.stderr[-12000:],
-            "duration_ms": int((time.perf_counter() - started) * 1000),
-            "policy_decision": decision,
-        }
-        self.db.record_exec_process(process_id, payload)
+        payload = self.exec_runtime_service.start(
+            workspace_id=workspace_id,
+            command=command,
+            decision=self.exec_policy_service.policy.decide(command),
+            policy_evaluation=evaluation,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            run_id=linked_run_id,
+            timeout_seconds=timeout,
+        )
         if linked_run_id:
             self._record_run_tool_event(
                 linked_run_id,
                 tool_envelope(
                     tool="shell.exec",
                     input_payload={"command": self.exec_policy_service.redact(command)},
-                    result={key: payload[key] for key in ("status", "exit_code", "duration_ms")},
+                    result={key: payload.get(key) for key in ("status", "process_id", "timeout_seconds")},
                     risk=decision.get("risk") or "read_only",
                     approval={"required": False, "status": "approved" if approval_id else "not_required", "approval_id": approval_id},
-                    timing={"duration_ms": payload["duration_ms"]},
                 ),
             )
         if thread_id:
-            self._append_item(thread_id, turn_id, "command.exec.completed", payload)
+            self._append_item(thread_id, turn_id, "command.exec.started", payload)
         return payload
+
+    def write_exec(self, process_id: str, data: str) -> dict[str, Any]:
+        return self.exec_runtime_service.write(process_id, data)
+
+    def resize_exec(self, process_id: str, *, cols: int | None = None, rows: int | None = None) -> dict[str, Any]:
+        return self.exec_runtime_service.resize(process_id, cols=cols, rows=rows)
+
+    def terminate_exec(self, process_id: str) -> dict[str, Any]:
+        return self.exec_runtime_service.terminate(process_id)
+
+    def read_exec_output(self, process_id: str, *, stream: str = "stdout", start: int | None = None, end: int | None = None) -> dict[str, Any]:
+        return self.exec_runtime_service.read_output(process_id, stream=stream, start=start, end=end)
 
     def _record_run_tool_event(self, run_id: str, event: dict[str, Any]) -> None:
         key = f"tool_events:{run_id}"

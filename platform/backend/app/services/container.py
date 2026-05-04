@@ -28,6 +28,7 @@ from app.services.workspace.service import WorkspaceService
 from app.validators.suite import ValidationSuite
 from app.ai.openai_client import OpenAIClient
 from app.services.exec_policy_service import ExecPolicyService
+from app.services.exec_runtime_service import ExecRuntimeService
 from app.services.workbench_service import WorkbenchService
 
 
@@ -86,6 +87,12 @@ class ServiceContainer:
             self.workspace_log_service,
         )
         self.exec_policy_service = ExecPolicyService()
+        self.exec_runtime_service = ExecRuntimeService(
+            workspace_service=self.workspace_service,
+            platform_db=self.platform_db,
+            event_hub=self.rpc_event_hub,
+            store=self.store,
+        )
         self.workbench_service = WorkbenchService(
             settings=self.settings,
             store=self.store,
@@ -101,6 +108,7 @@ class ServiceContainer:
             self.rpc_event_hub,
             store=self.store,
             exec_policy_service=self.exec_policy_service,
+            exec_runtime_service=self.exec_runtime_service,
         )
         self.export_service = ExportService(self.settings, self.store, self.workspace_service)
 

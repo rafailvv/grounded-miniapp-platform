@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import signal
 import subprocess
 import threading
 import time
@@ -22,6 +23,13 @@ DEFAULT_AGENT_ENV = {
     "PYTHONIOENCODING": "utf-8",
     "LC_ALL": "C.UTF-8",
     "LANG": "C.UTF-8",
+}
+
+DEFAULT_RESOURCE_LIMITS = {
+    "cpu_seconds": int(os.getenv("AGENT_EXEC_CPU_SECONDS", "120")),
+    "address_space_bytes": int(os.getenv("AGENT_EXEC_ADDRESS_SPACE_BYTES", str(1024 * 1024 * 1024))),
+    "file_size_bytes": int(os.getenv("AGENT_EXEC_FILE_SIZE_BYTES", str(128 * 1024 * 1024))),
+    "open_files": int(os.getenv("AGENT_EXEC_OPEN_FILES", "256")),
 }
 
 
@@ -146,8 +154,9 @@ class AgentCommandSemantics:
 class AgentProcessManager:
     """Safe streaming process runner for agent diagnostic commands."""
 
-    def __init__(self, *, deterministic_env: dict[str, str] | None = None) -> None:
+    def __init__(self, *, deterministic_env: dict[str, str] | None = None, resource_limits: dict[str, int] | None = None) -> None:
         self.deterministic_env = dict(deterministic_env or DEFAULT_AGENT_ENV)
+        self.resource_limits = dict(resource_limits or DEFAULT_RESOURCE_LIMITS)
         self._active: dict[str, subprocess.Popen[str]] = {}
         self._active_meta: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
@@ -172,6 +181,7 @@ class AgentProcessManager:
         output_delta_count = 0
         cwd = draft_source / "miniapp" if decision.cwd_policy == "miniapp" else draft_source
         policy_payload = self._policy_payload(decision)
+        sandbox_summary = self._sandbox_summary(draft_source=draft_source, cwd=cwd, decision=decision)
 
         def emit(payload: dict[str, Any]) -> None:
             if progress_callback is not None:
@@ -193,7 +203,7 @@ class AgentProcessManager:
                 stdout=stdout_buffer.snapshot(),
                 stderr=stderr_buffer.snapshot(),
                 output_delta_count=0,
-                policy_decision=policy_payload,
+                policy_decision={**policy_payload, "sandbox": sandbox_summary},
                 error=decision.reason,
             )
 
@@ -213,12 +223,51 @@ class AgentProcessManager:
                 stdout=stdout_buffer.snapshot(),
                 stderr=stderr_buffer.snapshot(),
                 output_delta_count=0,
-                policy_decision=policy_payload,
+                policy_decision={**policy_payload, "sandbox": sandbox_summary},
                 error="Command policy allowed the command but produced no argv.",
             )
 
-        env = os.environ.copy()
-        env.update(self.deterministic_env)
+        if not self._cwd_inside_workspace(draft_source, cwd):
+            return AgentCommandResult(
+                command=command,
+                process_id=resolved_process_id,
+                argv=list(decision.argv),
+                cwd=str(cwd),
+                started_at=started_at,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                exit_code=None,
+                semantic_status="blocked_by_sandbox",
+                success=False,
+                timed_out=False,
+                timeout_seconds=timeout_seconds,
+                stdout=stdout_buffer.snapshot(),
+                stderr=stderr_buffer.snapshot(),
+                output_delta_count=0,
+                policy_decision={**policy_payload, "sandbox": sandbox_summary},
+                error=f"Command cwd escapes workspace: {cwd}",
+            )
+        escaped_arg = self._first_workspace_escaping_arg(draft_source, cwd, list(decision.argv))
+        if escaped_arg:
+            return AgentCommandResult(
+                command=command,
+                process_id=resolved_process_id,
+                argv=list(decision.argv),
+                cwd=str(cwd),
+                started_at=started_at,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                exit_code=None,
+                semantic_status="blocked_by_sandbox",
+                success=False,
+                timed_out=False,
+                timeout_seconds=timeout_seconds,
+                stdout=stdout_buffer.snapshot(),
+                stderr=stderr_buffer.snapshot(),
+                output_delta_count=0,
+                policy_decision={**policy_payload, "sandbox": sandbox_summary},
+                error=f"Command argument escapes workspace allowlist: {escaped_arg}",
+            )
+
+        env = self._sandbox_env(cwd)
         if not cwd.exists():
             return AgentCommandResult(
                 command=command,
@@ -235,10 +284,10 @@ class AgentProcessManager:
                 stdout=stdout_buffer.snapshot(),
                 stderr=stderr_buffer.snapshot(),
                 output_delta_count=0,
-                policy_decision=policy_payload,
+                policy_decision={**policy_payload, "sandbox": sandbox_summary},
                 error=f"Command cwd does not exist: {cwd}",
             )
-        emit({"status": "started", "process_id": resolved_process_id, "command": command, "argv": list(decision.argv), "cwd": str(cwd)})
+        emit({"status": "started", "process_id": resolved_process_id, "command": command, "argv": list(decision.argv), "cwd": str(cwd), "sandbox": sandbox_summary})
         try:
             process = subprocess.Popen(
                 list(decision.argv),
@@ -251,6 +300,8 @@ class AgentProcessManager:
                 errors="replace",
                 env=env,
                 bufsize=1,
+                start_new_session=True,
+                preexec_fn=self._preexec_fn(),
             )
         except OSError as exc:
             return AgentCommandResult(
@@ -283,6 +334,8 @@ class AgentProcessManager:
                 "stdout": stdout_buffer.snapshot(),
                 "stderr": stderr_buffer.snapshot(),
                 "output_delta_count": 0,
+                "sandbox": sandbox_summary,
+                "network_mode": sandbox_summary["network_mode"],
             }
 
         lock = threading.Lock()
@@ -307,6 +360,7 @@ class AgentProcessManager:
                             "process_id": resolved_process_id,
                             "stream": stream_name,
                             "chars": len(chunk),
+                            "text": chunk[-4000:],
                             "elapsed_ms": int((time.perf_counter() - started) * 1000),
                         }
                     )
@@ -334,11 +388,11 @@ class AgentProcessManager:
             elapsed = time.perf_counter() - started
             if elapsed >= timeout_seconds:
                 timed_out = True
-                process.terminate()
+                self._terminate_process_tree(process, kill=False)
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    self._terminate_process_tree(process, kill=True)
                 break
             if (time.perf_counter() - last_heartbeat) * 1000 >= max(250, yield_time_ms):
                 last_heartbeat = time.perf_counter()
@@ -371,6 +425,7 @@ class AgentProcessManager:
                 "exit_code": exit_code,
                 "semantic_status": semantic_status,
                 "success": success,
+                "sandbox": sandbox_summary,
             }
         )
         with self._lock:
@@ -385,6 +440,7 @@ class AgentProcessManager:
                     "stdout": stdout_buffer.snapshot(),
                     "stderr": stderr_buffer.snapshot(),
                     "output_delta_count": output_delta_count,
+                    "sandbox": sandbox_summary,
                 }
             )
             self._active.pop(resolved_process_id, None)
@@ -404,7 +460,7 @@ class AgentProcessManager:
             stdout=stdout_buffer.snapshot(),
             stderr=stderr_buffer.snapshot(),
             output_delta_count=output_delta_count,
-            policy_decision=policy_payload,
+            policy_decision={**policy_payload, "sandbox": sandbox_summary},
             error=f"Command timed out after {timeout_seconds}s." if timed_out else None,
         )
 
@@ -427,11 +483,24 @@ class AgentProcessManager:
             process = self._active.get(process_id)
         if process is None:
             return False
-        process.terminate()
+        self._terminate_process_tree(process, kill=False)
         with self._lock:
             meta = self._active_meta.get(process_id)
             if meta is not None:
                 meta["terminate_requested_at"] = datetime.now(timezone.utc).isoformat()
+        return True
+
+    def resize(self, process_id: str, *, cols: int | None = None, rows: int | None = None) -> bool:
+        with self._lock:
+            meta = self._active_meta.get(process_id)
+            if meta is None:
+                return False
+            meta["terminal_size"] = {
+                "cols": max(1, int(cols or 80)),
+                "rows": max(1, int(rows or 24)),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "pty_backed": False,
+            }
         return True
 
     def read_output(self, process_id: str, *, stream: str = "stdout", start: int | None = None, end: int | None = None) -> dict[str, Any]:
@@ -460,6 +529,115 @@ class AgentProcessManager:
                 "processes": list(self._active_meta.values()),
                 "active_count": len(self._active),
             }
+
+    def _sandbox_env(self, cwd: Path) -> dict[str, str]:
+        tmp_dir = cwd / ".sandbox" / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        base: dict[str, str] = {}
+        for key in ("PATH", "HOME", "USER", "SHELL"):
+            if os.environ.get(key):
+                base[key] = str(os.environ[key])
+        base.update(self.deterministic_env)
+        base.update(
+            {
+                "TMPDIR": str(tmp_dir),
+                "TEMP": str(tmp_dir),
+                "TMP": str(tmp_dir),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+                "HTTP_PROXY": "http://127.0.0.1:9",
+                "HTTPS_PROXY": "http://127.0.0.1:9",
+                "ALL_PROXY": "socks5://127.0.0.1:9",
+                "http_proxy": "http://127.0.0.1:9",
+                "https_proxy": "http://127.0.0.1:9",
+                "all_proxy": "socks5://127.0.0.1:9",
+                "NO_PROXY": "",
+                "no_proxy": "",
+            }
+        )
+        return base
+
+    def _preexec_fn(self):
+        if os.name != "posix":
+            return None
+        limits = dict(self.resource_limits)
+
+        def apply_limits() -> None:
+            try:
+                os.umask(0o077)
+            except Exception:
+                pass
+            try:
+                import resource
+
+                if limits.get("cpu_seconds"):
+                    resource.setrlimit(resource.RLIMIT_CPU, (limits["cpu_seconds"], limits["cpu_seconds"]))
+                if limits.get("address_space_bytes") and hasattr(resource, "RLIMIT_AS"):
+                    resource.setrlimit(resource.RLIMIT_AS, (limits["address_space_bytes"], limits["address_space_bytes"]))
+                if limits.get("file_size_bytes"):
+                    resource.setrlimit(resource.RLIMIT_FSIZE, (limits["file_size_bytes"], limits["file_size_bytes"]))
+                if limits.get("open_files"):
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (limits["open_files"], limits["open_files"]))
+            except Exception:
+                pass
+
+        return apply_limits
+
+    @staticmethod
+    def _terminate_process_tree(process: subprocess.Popen[str], *, kill: bool) -> None:
+        if process.poll() is not None:
+            return
+        if os.name == "posix":
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL if kill else signal.SIGTERM)
+                return
+            except Exception:
+                pass
+        try:
+            if kill:
+                process.kill()
+            else:
+                process.terminate()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _cwd_inside_workspace(workspace_root: Path, cwd: Path) -> bool:
+        try:
+            cwd.resolve().relative_to(workspace_root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _first_workspace_escaping_arg(workspace_root: Path, cwd: Path, argv: list[str]) -> str | None:
+        root = workspace_root.resolve()
+        for arg in argv[1:]:
+            text = str(arg or "")
+            if not text or text.startswith("-"):
+                continue
+            if not text.startswith("/") and "/" not in text and not text.startswith("."):
+                continue
+            candidate = Path(text) if text.startswith("/") else cwd / text
+            if not candidate.exists() and not text.startswith("/"):
+                continue
+            try:
+                candidate.resolve().relative_to(root)
+            except ValueError:
+                return text
+        return None
+
+    def _sandbox_summary(self, *, draft_source: Path, cwd: Path, decision: CommandPolicyDecision) -> dict[str, Any]:
+        return {
+            "mode": "workspace_process_group",
+            "fs_allowlist": [str(draft_source.resolve())],
+            "cwd": str(cwd),
+            "network_mode": "blocked",
+            "env_isolated": True,
+            "resource_limits": dict(self.resource_limits),
+            "process_group_kill": os.name == "posix",
+            "cwd_policy": decision.cwd_policy,
+        }
 
     @staticmethod
     def _policy_payload(decision: CommandPolicyDecision) -> dict[str, Any]:

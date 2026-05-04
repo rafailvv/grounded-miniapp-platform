@@ -5,7 +5,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 
-TOOL_PROTOCOL_VERSION = "grounded.tool.v1"
+TOOL_PROTOCOL_VERSION = "grounded.tool.v2"
 
 ToolRisk = Literal["safe", "read_only", "mutating", "network", "destructive", "forbidden", "unknown"]
 
@@ -83,11 +83,27 @@ def tool_registry_contract() -> dict[str, Any]:
             "input",
             "risk",
             "approval",
+            "progress",
             "result",
             "artifacts",
             "timing",
+            "retry",
+            "truncation",
             "error",
         ],
+        "error_shape": {
+            "code": "stable_machine_code",
+            "message": "human-readable message",
+            "retryable": False,
+            "details": {},
+        },
+        "artifact_shape": {
+            "artifact_id": "optional stable id",
+            "ref": "run-scoped artifact reference",
+            "kind": "trace|diff|stdout|stderr|screenshot|json",
+            "mime_type": "application/json",
+            "size_bytes": 0,
+        },
         "tools": tools,
     }
 
@@ -102,9 +118,20 @@ def tool_envelope(
     artifacts: list[dict[str, Any]] | None = None,
     timing: dict[str, Any] | None = None,
     error: dict[str, Any] | None = None,
+    progress: list[dict[str, Any]] | None = None,
+    retry: dict[str, Any] | None = None,
+    truncation: dict[str, Any] | None = None,
     tool_call_id: str | None = None,
 ) -> dict[str, Any]:
     canonical = canonical_tool_name(tool)
+    normalized_error = None
+    if error:
+        normalized_error = {
+            "code": str(error.get("code") or "tool_error"),
+            "message": str(error.get("message") or error.get("detail") or "Tool failed."),
+            "retryable": bool(error.get("retryable") or False),
+            "details": error.get("details") or {},
+        }
     return {
         "tool_call_id": tool_call_id or f"tool_{uuid4().hex}",
         "tool": canonical,
@@ -112,9 +139,27 @@ def tool_envelope(
         "input": input_payload or {},
         "risk": risk or default_tool_risk(canonical),
         "approval": approval or {"required": False, "status": "not_required"},
+        "progress": progress or [],
         "result": result or {},
         "artifacts": artifacts or [],
         "timing": timing or {},
-        "error": error,
+        "retry": retry or {"retryable": bool(normalized_error and normalized_error.get("retryable")), "attempt": 1},
+        "truncation": truncation or {"truncated": False},
+        "error": normalized_error,
         "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def structured_tool_error(
+    *,
+    code: str,
+    message: str,
+    retryable: bool = False,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+        "details": details or {},
     }

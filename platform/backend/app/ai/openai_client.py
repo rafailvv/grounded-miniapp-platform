@@ -15,6 +15,7 @@ from app.ai.model_registry import (
     TASK_PROFILES,
     default_profile_for_generation_mode,
     models_for_role,
+    provider_routing_table,
 )
 from app.core.config import Settings
 from app.models.common import GenerationMode
@@ -65,7 +66,9 @@ class OpenAIClient:
             "routing": {
                 "provider": "openai" if self.enabled else None,
                 "providers": ["openai"] if self.enabled else [],
+                "fallback_enabled": True,
             },
+            "provider_routing": provider_routing_table(),
             "supports_prompt_cache_key": True,
             "mode_profiles": {
                 "fast": "openai_code_fast",
