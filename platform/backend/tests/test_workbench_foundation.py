@@ -51,7 +51,7 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     ).json()
     run = RunRecord(
         workspace_id=workspace["workspace_id"],
-        prompt="Build a CRM",
+        prompt="Build a workflow",
         intent="create",
         target_role_scope=["client", "specialist", "manager"],
         model_profile="test",
@@ -62,7 +62,7 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     policy = client.get("/system/policies/exec").json()
     evaluation = client.post(
         f"/workspaces/{workspace['workspace_id']}/policy/evaluate-command",
-        json={"command": "rg CRM miniapp/app"},
+        json={"command": "rg workflow miniapp/app"},
     ).json()
     timeline = client.get(f"/runs/{run.run_id}/timeline").json()
     trace = client.get(f"/runs/{run.run_id}/trace-view").json()
@@ -93,11 +93,11 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert policy["tool_protocol_version"] == TOOL_PROTOCOL_VERSION
     assert evaluation["decision"]["action"] == "allow"
     assert timeline["items"][0]["kind"] == "prompt"
-    assert trace["reducer"]["why"] == "Build a CRM"
+    assert trace["reducer"]["why"] == "Build a workflow"
     assert doctor["checks"]
     assert memory["items"][0]["text"] == "Use dense operational UI."
-    assert any(item["id"] == "crm" for item in skills["items"])
-    assert any(item["id"] == "reservation" for item in skills["items"])
+    assert any(item["id"] == "state-workflow" for item in skills["items"])
+    assert any(item["id"] == "role-surfaces" for item in skills["items"])
     assert any(item["worker_id"] == "backend_api" for item in workers["workers"])
     assert any(item["rule_id"] == "block_destructive" for item in permissions["items"])
     assert lsp["status"] in {"passed", "failed"}

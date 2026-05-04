@@ -44,7 +44,7 @@ def test_materializer_is_idempotent_and_registry_passes(tmp_path: Path) -> None:
     contract = MiniAppContractCompiler.compile(
         workspace_id="ws_test",
         run_id="run_test",
-        prompt="Create an order app",
+        prompt="Create a record app",
         intent="create",
         generation_mode=GenerationMode.FAST,
     )
@@ -52,14 +52,14 @@ def test_materializer_is_idempotent_and_registry_passes(tmp_path: Path) -> None:
     first = MiniAppContractMaterializer.materialize(source, contract)
     second = MiniAppContractMaterializer.materialize(source, contract)
     snapshot = MiniAppRouteRegistry.snapshot(source, contract)
-    preloaded_issues, preloaded_findings = CheckRunner._preloaded_business_data_issues(source)
+    preloaded_issues, preloaded_findings = CheckRunner._preloaded_domain_data_issues(source)
 
     assert "miniapp/app/generated/miniapp_contract.json" in first
     assert second == []
     assert snapshot.status == "passed"
     assert preloaded_issues == []
     assert preloaded_findings == []
-    assert "POST /api/orders" in snapshot.declared_routes
+    assert "POST /api/records" in snapshot.declared_routes
     assert "/client" in snapshot.manifest_routes
 
 

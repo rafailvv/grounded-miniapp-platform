@@ -95,8 +95,8 @@ PRELOADED_BUSINESS_DATA_MARKERS = (
     "fixture data",
     "preloaded records",
     "preloaded data",
-    "hard-coded business records",
-    "hardcoded business records",
+    "hard-coded domain records",
+    "hardcoded domain records",
     "initialrecords",
     "samplerecords",
     "demorecords",
@@ -2125,7 +2125,7 @@ class CheckRunner:
         This keeps create/workflow verification code-agent-like: the platform
         executes the generated app and proves behavior even when the shared
         Docker preview service is unavailable. The generated source is not
-        changed and no business-category assumptions are introduced.
+        changed and no domain-category assumptions are introduced.
         """
         miniapp_dir = source_dir / "miniapp"
         if not miniapp_dir.exists():
@@ -3680,7 +3680,7 @@ except Exception as exc:
         if agentic_scope and str(intent or "").strip().lower() == "create":
             api_issues, api_contract = self._create_api_contract_issues(source_dir)
             issues.extend(api_issues)
-            data_issues, preloaded_data_findings = self._preloaded_business_data_issues(source_dir)
+            data_issues, preloaded_data_findings = self._preloaded_domain_data_issues(source_dir)
             issues.extend(data_issues)
         if not css_only_focused_edit:
             dom_contract_files = list(relevant_changed)
@@ -3939,7 +3939,7 @@ except Exception as exc:
                 issues.append(
                     ValidationIssue(
                         code="platform.disconnected_role_surfaces",
-                        message="Client, specialist, and manager surfaces do not share visible prompt-derived content. Use one connected business context across all roles.",
+                        message="Client, specialist, and manager surfaces do not share visible prompt-derived content. Use one connected prompt-derived context across all roles.",
                         severity="high",
                         location="miniapp/app/static",
                         blocking=True,
@@ -4427,7 +4427,7 @@ except Exception as exc:
         return normalize_api_path(value)
 
     @classmethod
-    def _preloaded_business_data_issues(cls, source_dir: Path) -> tuple[list[ValidationIssue], list[dict[str, str]]]:
+    def _preloaded_domain_data_issues(cls, source_dir: Path) -> tuple[list[ValidationIssue], list[dict[str, str]]]:
         app_root = source_dir / "miniapp/app"
         findings: list[dict[str, str]] = []
         issues: list[ValidationIssue] = []
@@ -4450,15 +4450,15 @@ except Exception as exc:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            marker = cls._preloaded_business_data_marker(content)
+            marker = cls._preloaded_domain_data_marker(content)
             if not marker:
                 continue
             findings.append({"file_path": relative_path, "marker": marker})
             issues.append(
                 ValidationIssue(
-                    code="platform.preloaded_business_data",
+                    code="platform.preloaded_domain_data",
                     message=(
-                        f"{relative_path} appears to include preloaded business data ({marker}). "
+                        f"{relative_path} appears to include preloaded domain data ({marker}). "
                         "Create apps must start with empty persistent state and let users add their own data."
                     ),
                     severity="high",
@@ -4469,7 +4469,7 @@ except Exception as exc:
         return issues, findings
 
     @staticmethod
-    def _preloaded_business_data_marker(content: str) -> str | None:
+    def _preloaded_domain_data_marker(content: str) -> str | None:
         text = str(content or "")
         lowered = text.lower()
         compact = re.sub(r"[\s_\-]+", "", lowered)

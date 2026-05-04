@@ -1435,10 +1435,9 @@ class WorkbenchService:
     @staticmethod
     def _builtin_skills() -> dict[str, dict[str, Any]]:
         return {
-            "crm": {"id": "crm", "name": "CRM", "trigger_keywords": ["crm", "lead", "pipeline"], "constraints": ["Persist customer records and status transitions."], "validation_hints": ["Create/update/list workflow exists."]},
-            "reservation": {"id": "reservation", "name": "Reservation", "trigger_keywords": ["reservation", "schedule", "slot"], "constraints": ["Persist reserved slots and status."], "validation_hints": ["Client creates request; staff confirms."]},
-            "marketplace": {"id": "marketplace", "name": "Marketplace", "trigger_keywords": ["marketplace", "catalog", "order"], "constraints": ["Catalog and order state must be connected."], "validation_hints": ["Role pages expose different order actions."]},
-            "internal-dashboard": {"id": "internal-dashboard", "name": "Internal dashboard", "trigger_keywords": ["dashboard", "admin", "ops"], "constraints": ["Dense operational UI over marketing layout."], "validation_hints": ["Filters, statuses, and review actions exist."]},
-            "telegram-miniapp": {"id": "telegram-miniapp", "name": "Telegram miniapp", "trigger_keywords": ["telegram", "mini app"], "constraints": ["Mobile-first role pages."], "validation_hints": ["No horizontal overflow on mobile."]},
-            "max-miniapp": {"id": "max-miniapp", "name": "Max miniapp", "trigger_keywords": ["max", "mini app"], "constraints": ["Mobile-first role pages."], "validation_hints": ["Preview profile supports max_mock."]},
+            "state-workflow": {"id": "state-workflow", "name": "State workflow", "trigger_keywords": ["state", "status", "workflow"], "constraints": ["Persist shared records and status transitions."], "validation_hints": ["Create/update/list workflow exists."]},
+            "role-surfaces": {"id": "role-surfaces", "name": "Role surfaces", "trigger_keywords": ["client", "specialist", "manager"], "constraints": ["Role pages share connected state."], "validation_hints": ["Each role has a distinct action surface."]},
+            "route-manifest": {"id": "route-manifest", "name": "Route manifest", "trigger_keywords": ["route", "manifest", "page"], "constraints": ["Route manifest matches static pages."], "validation_hints": ["Every role page is routeable."]},
+            "mobile-shell": {"id": "mobile-shell", "name": "Mobile shell", "trigger_keywords": ["mobile", "telegram", "mini app"], "constraints": ["Mobile-first role pages."], "validation_hints": ["No horizontal overflow on mobile."]},
+            "preview-profile": {"id": "preview-profile", "name": "Preview profile", "trigger_keywords": ["preview", "max", "telegram"], "constraints": ["Preview profile selects the right host shell."], "validation_hints": ["Preview profile supports configured mock surface."]},
         }

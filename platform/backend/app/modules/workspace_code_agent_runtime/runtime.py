@@ -228,7 +228,6 @@ PROMPT_SEMANTIC_STOPWORDS = {
     "app",
     "application",
     "build",
-    "business",
     "create",
     "for",
     "from",
@@ -613,7 +612,7 @@ class WorkspaceCodeAgentRuntime:
     def _sync_route_manifest_from_static_pages(source_dir: Path) -> bool:
         """Keep platform routing metadata aligned with generated role pages.
 
-        This does not generate product UI or business data. It only makes every
+        This does not generate product UI or domain data. It only makes every
         existing static role page reachable through the mini-app shell so
         tests, preview, and browser proof operate on the same route graph.
         """
@@ -2633,7 +2632,7 @@ class WorkspaceCodeAgentRuntime:
                 [
                     "Focused visual_style_edit lane: change only CSS/style files listed in focused_edit_files. Do not edit HTML, JavaScript, backend routes, route_manifest.json, generated tests, docs, or unrelated files.",
                     f"Use one compact mutating tool batch with at most {FOCUSED_VISUAL_WRITE_LIMIT} CSS writes. Prefer write_file for CSS if a hunk patch would be ambiguous or has already conflicted.",
-                "Do not add business behavior, data, tests, API calls, navigation, or role copy for a pure style/color/spacing prompt.",
+                "Do not add product behavior, data, tests, API calls, navigation, or role copy for a pure style/color/spacing prompt.",
                     "CSS may use hex/rgb/hsl values for requested colors; the literal user color word does not need to appear in generated CSS.",
                     "Keep the existing top safe spacing and existing selectors/data-testid hooks intact while changing the visual styling.",
                 ]
@@ -2844,11 +2843,11 @@ class WorkspaceCodeAgentRuntime:
                     "Build three isolated role surfaces in the miniapp shell: client creates/submits the main prompt-derived state, specialist processes or updates it, manager reviews/control-checks the persisted state. Do not link role roots to each other.",
                     "For multi-page role apps, shared static/<role>/app.js must initialize per page: use body[data-view] or route, guard optional DOM nodes from other pages, and bind every visible child-page form/button/control to persisted API behavior.",
                     "The client/source role must display both its original submitted state and the persisted progress/update fields changed by specialist or manager roles after reload.",
-                    "User-facing UI copy must be polished business language: do not render raw API paths, HTTP methods, internal route names, role slugs, or enum codes like `new`/`preparing`; map persisted values to human-readable labels and keep label/value pairs visually separated.",
+                    "User-facing UI copy must be polished product language: do not render raw API paths, HTTP methods, internal route names, role slugs, or enum codes like `new`/`preparing`; map persisted values to human-readable labels and keep label/value pairs visually separated.",
                     "In async JavaScript form handlers, capture DOM nodes before any await, for example `const form = event.currentTarget`, then use `form.reset()` after awaited API calls. Do not read `event.currentTarget` after await because browsers clear it after dispatch.",
                     "Fast should be compact and working; Balanced should add moderate workflow/design depth; Quality should first get the workflow green, then add a polished mobile design pass. Never add pages or resources just to satisfy a fixed count.",
                     "Mobile-first: target Telegram widths around 360-430px, use one consistent light neutral product visual system across all roles unless the user explicitly asks for a dark theme, preserve safe top spacing/preview bridge, and avoid horizontal scroll or overlapping cards/forms/actions.",
-                    "Generated source must start empty: no mock, seed, demo, sample, fixture, preloaded, or hard-coded business records. Empty states and validation test payloads are allowed.",
+                    "Generated source must start empty: no mock, seed, demo, sample, fixture, preloaded, or hard-coded domain records. Empty states and validation test payloads are allowed.",
                     "Generated tests must verify the actual app contract: persistent API create/list/update, real role HTML/JS selectors, role-specific actions, and no stale UI-only controls. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods. FastAPI generated tests should use `with TestClient(app) as client:` so lifespan/table setup runs, or explicitly create tables after generated ORM models are imported. JS generated tests run from cwd=miniapp, so read app/static/... and app/generated/... paths, not miniapp/app/... paths. Do not write pytest-only top-level test functions. Patch tests only when they are stale with the app contract.",
                     "For edit/refine/fix/repair, patch existing files with small unified diffs. Use full-file replace only for new files, tiny files, create-mode work, or a file that repeatedly conflicts.",
                     "If checks/browser proof fail, repair the concrete failing slice from latest_checks/tool_results: align selectors, payload fields, API routes, rendered state, and tests together. Do not rewrite unrelated files.",
@@ -3734,7 +3733,7 @@ class WorkspaceCodeAgentRuntime:
             "This is a compact code-agent repair turn for the current draft. Do not rebuild the whole app unless the failing file is missing.",
             "Read the latest check/browser diagnostics as the source of truth, patch the smallest connected slice, then let validation run again.",
             "Prefer apply_patch_to_draft for existing files. Use write_file only for a new/missing/tiny file or after a repeated apply conflict on that same file.",
-            "Keep the app prompt-owned and prompt-derived: do not introduce platform templates, seed/demo/mock business records, or fixed resource/page names.",
+            "Keep the app prompt-owned and prompt-derived: do not introduce platform templates, seed/demo/mock domain records, or fixed resource/page names.",
             "For create/workflow failures, keep HTML controls, JavaScript handlers, API routes/schemas, persistence, and generated tests aligned to one actual contract.",
             "Browser-flow failures are product failures: make the UI action change persisted state, make other roles observe it, and make reload preserve it.",
             "The source/user-facing role must render the persisted fields that operational roles can update, such as status, notes, comments, assignment, payment, or other prompt-derived progress fields. It is not enough to show only the fields originally submitted by the user.",
@@ -4148,7 +4147,7 @@ class WorkspaceCodeAgentRuntime:
                 "If this is a repair for an existing draft, patch the smallest coherent failing workflow slice and touch only the concrete failed files/checks; do not rebuild the whole app. "
                 "If this is the first implementation, write a compact but complete prompt-derived app surface, avoid inline styles and long comments, and do not request more context unless a specific required file is absent. "
                 "Keep the app working, not static-only: align backend API routes, form/fetch frontend code, and generated tests around the same persisted fields. "
-                "Do not add mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded business records."
+                "Do not add mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded domain records."
             )
         else:
             next_action = (
@@ -4173,7 +4172,7 @@ class WorkspaceCodeAgentRuntime:
                 "Call apply_patch_to_draft or write_file now. Do not request more read-only tools in the next answer. "
                 "Use the file_contexts and latest_checks already provided. "
                 + (
-                    "For create, produce compact writes that advance the prompt-derived app contract across backend, role UI, frontend behavior, route manifest when needed, and generated tests. Keep HTML concise and do not include large inline style blocks or preloaded business records."
+                    "For create, produce compact writes that advance the prompt-derived app contract across backend, role UI, frontend behavior, route manifest when needed, and generated tests. Keep HTML concise and do not include large inline style blocks or preloaded domain records."
                     if create_task
                     else "For edit/fix, patch the smallest complete set of files needed for the requested behavior."
                 )
@@ -5048,7 +5047,7 @@ class WorkspaceCodeAgentRuntime:
             "platform.missing_create_get_api",
             "platform.missing_create_post_api",
             "platform.frontend_missing_post_api",
-            "platform.preloaded_business_data",
+            "platform.preloaded_domain_data",
         }
         issues: list[dict[str, object]] = []
         for result in latest_execution.results:
@@ -5095,7 +5094,7 @@ class WorkspaceCodeAgentRuntime:
                     "For platform.missing_generated_app_tests, create miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. "
                     "For platform.missing_create_get_api/platform.missing_create_post_api, create or register a backend /api route with persistent GET and POST behavior. "
                     "For platform.frontend_missing_post_api, add form/fetch code that POSTs user-provided state to the matching /api route. "
-                    "For platform.preloaded_business_data, remove hard-coded business records and start from empty persistent state. "
+                    "For platform.preloaded_domain_data, remove hard-coded domain records and start from empty persistent state. "
                     "For platform.missing_role_workflow_actions on manager, add a real manager dashboard control such as a review/refresh/filter/oversight button with a guarded JavaScript handler, or a PATCH/PUT oversight action if the requested flow needs manager mutation. "
                     "Do not rewrite unrelated role pages."
                 ),

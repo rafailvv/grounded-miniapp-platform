@@ -171,7 +171,7 @@ def test_role_surface_issues_accepts_generation_mode(tmp_path: Path) -> None:
         role_dir = tmp_path / "miniapp" / "app" / "static" / role
         role_dir.mkdir(parents=True)
         (role_dir / "index.html").write_text(
-            f"<main><section class='dashboard'><h1>{role} coffee app</h1><button class='button'>Save</button></section></main>",
+            f"<main><section class='dashboard'><h1>{role} workflow app</h1><button class='button'>Save</button></section></main>",
             encoding="utf-8",
         )
         (role_dir / "app.js").write_text("document.body.dataset.ready = 'true';\n", encoding="utf-8")

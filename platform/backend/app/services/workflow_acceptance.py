@@ -11,7 +11,6 @@ PROMPT_PLAN_STOPWORDS = {
     "and",
     "app",
     "application",
-    "business",
     "create",
     "for",
     "from",
@@ -131,9 +130,9 @@ def extract_prompt_planning_hints(prompt: str) -> dict[str, Any]:
         for role, patterns in actor_patterns.items():
             if any(pattern in lowered for pattern in patterns):
                 actor_hints[role].append(sentence)
-    # If the entrepreneur wrote actor/action sentences without platform role
+    # If the user wrote actor/action sentences without platform role
     # names, preserve the sentence order as role hints instead of inventing a
-    # business template.
+    # domain template.
     for role, sentence in zip(ROLE_ORDER, action_sentences):
         if not actor_hints[role]:
             actor_hints[role].append(sentence)
@@ -569,7 +568,7 @@ def build_implementation_plan(
             "route_manifest_required": True,
             "no_cross_role_navigation": True,
             "role_specific_actions": True,
-            "business_copy_quality": "Do not expose API paths, HTTP methods, route slugs, role slugs, raw enum codes, or internal implementation labels in normal role UI; render readable business labels with clear spacing between label and value.",
+            "copy_quality": "Do not expose API paths, HTTP methods, route slugs, role slugs, raw enum codes, or internal implementation labels in normal role UI; render readable labels with clear spacing between label and value.",
             "role_independence": {
                 "client": "user-facing mobile app for the primary prompt-derived create/select/save flow; no links to specialist or manager surfaces",
                 "specialist": "operational mobile app for processing/updating shared state; no client-only duplicate page",

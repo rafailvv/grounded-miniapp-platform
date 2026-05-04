@@ -829,7 +829,7 @@ class AgentWorkerBranchLoop:
                 "Use read/search tools first if you need context; otherwise patch directly.",
                 "Use apply_patch_to_draft for existing files and write_file for new or full owned files.",
                 "Mutating tools write exactly one file_path per tool call. If your owned slice needs index.html, app.js, and styles.css, call write_file/apply_patch_to_draft separately for each file.",
-                "Do not write preloaded business records.",
+                "Do not write preloaded domain records.",
             ],
             "current_step_instruction": (
                 "You have inspected enough context; now call write_file or apply_patch_to_draft for every required owned file."
