@@ -228,6 +228,9 @@ class PreviewRuntimeManager:
             logs.append("[runtime] compose down failed, but direct stale-resource cleanup completed.")
         return [item for item in logs if item]
 
+    def remove_project_resources(self, workspace_id: str) -> list[str]:
+        return self._remove_project_resources(self.project_name(workspace_id))
+
     def project_name(self, workspace_id: str) -> str:
         return f"grounded_preview_{workspace_id[:18]}"
 
@@ -400,10 +403,20 @@ class PreviewRuntimeManager:
         }
         for pattern, replacement in replacements.items():
             rendered = rendered.replace(pattern, replacement)
+        rendered = self._force_preview_bridge_network(rendered)
 
         with tempfile.NamedTemporaryFile("w", suffix="-preview-compose.yml", delete=False, encoding="utf-8") as handle:
             handle.write(rendered)
             return Path(handle.name)
+
+    @staticmethod
+    def _force_preview_bridge_network(rendered: str) -> str:
+        if "network_mode:" in rendered:
+            return rendered
+        marker = "    working_dir: /app"
+        if marker not in rendered:
+            return rendered
+        return rendered.replace(marker, "    network_mode: bridge\n" + marker, 1)
 
     @staticmethod
     def _port_free(port: int) -> bool:

@@ -12,6 +12,7 @@ from app.models.domain import JobRecord, PreviewRecord, RunRecord
 from app.services.repair_catalog import RepairCatalog
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, canonical_tool_name, tool_envelope
+from app.services.workspace.runtime_manager import PreviewRuntimeManager
 
 
 def test_tool_protocol_normalizes_aliases() -> None:
@@ -203,6 +204,94 @@ def test_local_preview_port_selection_does_not_probe_docker(tmp_path: Path) -> N
     )
 
     assert selected == 16667
+
+
+def test_preview_get_never_marks_running_without_url(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    workspace = TestClient(app).post(
+        "/workspaces",
+        json={
+            "name": "Queued Preview",
+            "description": "Do not fake readiness without a URL",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    preview = PreviewRecord(
+        workspace_id=workspace["workspace_id"],
+        runtime_mode="docker",
+        status="starting",
+        stage="rebuilding",
+        proxy_port=None,
+        url=None,
+        project_name=None,
+        logs=[
+            "Queued asynchronous preview rebuild.",
+            "Observed asynchronous preview rebuild from API polling.",
+        ],
+    )
+    container = app.state.container
+    container.store.upsert("previews", workspace["workspace_id"], preview.model_dump(mode="json"))
+
+    observed = container.preview_service.get(workspace["workspace_id"])
+
+    assert observed.status == "starting"
+    assert observed.url is None
+
+
+def test_delete_workspace_cleans_docker_resources_for_stale_local_record(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Delete Cleanup",
+            "description": "Remove stale docker resources during delete",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    container = app.state.container
+    calls: list[tuple[str, str]] = []
+    preview = PreviewRecord(
+        workspace_id=workspace["workspace_id"],
+        runtime_mode="local",
+        status="running",
+        stage="running",
+        proxy_port=16668,
+        url="http://localhost:16668",
+        project_name="grounded_preview_stale",
+    )
+    container.store.upsert("previews", workspace["workspace_id"], preview.model_dump(mode="json"))
+    container.preview_service.runtime_manager.reset_local = lambda workspace_id: calls.append(("local", workspace_id)) or []  # type: ignore[method-assign]
+    container.preview_service.runtime_manager.remove_project_resources = lambda workspace_id: calls.append(("docker", workspace_id)) or [  # type: ignore[method-assign]
+        "[runtime] removed stale preview resources"
+    ]
+    container.preview_service.runtime_manager.reset = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("local preview deletion should use direct docker cleanup, not compose down")
+    )
+
+    response = client.delete(f"/workspaces/{workspace['workspace_id']}")
+
+    assert response.status_code == 200
+    assert response.json()["preview_cleanup"] == "completed"
+    assert ("local", workspace["workspace_id"]) in calls
+    assert ("docker", workspace["workspace_id"]) in calls
+
+
+def test_preview_compose_uses_bridge_network_without_project_network() -> None:
+    rendered = """services:
+  preview-app:
+    image: grounded-miniapp-preview-base:latest
+    build:
+      context: ../miniapp
+    working_dir: /app
+"""
+
+    normalized = PreviewRuntimeManager._force_preview_bridge_network(rendered)  # noqa: SLF001
+
+    assert "network_mode: bridge" in normalized
+    assert normalized.count("network_mode: bridge") == 1
 
 
 def test_api_errors_use_typed_envelope(tmp_path: Path) -> None:

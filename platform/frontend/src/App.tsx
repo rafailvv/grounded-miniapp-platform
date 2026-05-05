@@ -259,7 +259,7 @@ function isSupportedEditorPath(path: string): boolean {
   );
 }
 
-const PREVIEW_BOOT_POLL_ATTEMPTS = 45;
+const PREVIEW_BOOT_POLL_ATTEMPTS = 130;
 const PREVIEW_BOOT_POLL_INTERVAL_MS = 1000;
 const PREVIEW_FRAME_SOFT_CLEAR_MS = 6500;
 const PREVIEW_FRAME_LOAD_TIMEOUT_MS = 25000;
@@ -1316,9 +1316,16 @@ export default function App() {
     void (async () => {
       await refreshWorkspaceState(workspace.workspace_id);
       try {
-        await ensurePreview(workspace.workspace_id);
-      } catch {
-        // Preview bootstrap is best-effort; polling and rebuild path will handle late startup.
+        const preview = await ensurePreview(workspace.workspace_id);
+        if (preview.status === "error") {
+          setPreviewStatus("error");
+          setError(preview.last_error ? `Preview runtime failed: ${preview.last_error}` : "Preview runtime failed to start.");
+          return;
+        }
+      } catch (err) {
+        setPreviewStatus("error");
+        setError(err instanceof Error ? err.message : "Preview runtime failed to start.");
+        return;
       }
       void pollPreviewUntilReady(workspace.workspace_id);
     })();
@@ -2062,19 +2069,27 @@ export default function App() {
         }
 
         if (preview.status === "error") {
-          setPreviewStatus("starting");
-          try {
-            await ensurePreview(workspaceId);
-          } catch {
-            // If ensure also fails, keep current error state and surface logs.
-          }
-          await sleep(PREVIEW_BOOT_POLL_INTERVAL_MS);
-          continue;
+          setPreviewStatus("error");
+          setPreviewUrl("");
+          setRolePreviewUrls({});
+          setPreviewBooting(false);
+          setPreviewLoading({
+            client: false,
+            specialist: false,
+            manager: false,
+          });
+          setPreviewFailed({
+            client: true,
+            specialist: true,
+            manager: true,
+          });
+          setError(preview.last_error ? `Preview runtime failed: ${preview.last_error}` : "Preview runtime failed to start.");
+          return;
         }
 
         const previewLooksStuck =
           !preview.url &&
-          (preview.status === "starting" || preview.status === "stopped" || !preview.status);
+          (preview.status === "starting" || preview.status === "stopped" || preview.status === "running" || !preview.status);
         if (!rebuildTriggered && ((attempt >= 2 && (preview.status === "stopped" || !preview.status)) || (attempt >= PREVIEW_STUCK_REBUILD_ATTEMPT && previewLooksStuck))) {
           rebuildTriggered = true;
           try {

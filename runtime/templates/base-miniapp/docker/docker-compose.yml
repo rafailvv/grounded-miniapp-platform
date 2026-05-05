@@ -3,6 +3,7 @@ services:
     image: grounded-miniapp-preview-base:latest
     build:
       context: ../miniapp
+    network_mode: bridge
     working_dir: /app
     volumes:
       - ../miniapp:/app

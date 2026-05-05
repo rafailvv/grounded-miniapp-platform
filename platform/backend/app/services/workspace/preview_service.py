@@ -363,6 +363,75 @@ class PreviewService:
         self._persist(preview)
         return preview
 
+    def destroy_workspace_runtime(self, workspace_id: str) -> PreviewRecord:
+        lock = self._workspace_lock(workspace_id)
+        lock.acquire()
+        preview = self._get_or_create(workspace_id)
+        cleanup_errors: list[str] = []
+        cleanup_logs: list[str] = []
+        try:
+            self._append_log(preview, "Workspace deletion requested preview runtime cleanup.")
+
+            try:
+                local_logs = self.runtime_manager.reset_local(workspace_id)
+                cleanup_logs.extend(local_logs)
+            except Exception as exc:
+                cleanup_errors.append(f"local preview cleanup failed: {exc}")
+
+            source_dir = self.settings.workspaces_dir / workspace_id
+            try:
+                source_dir = self.workspace_service.source_dir(workspace_id)
+            except Exception:
+                pass
+
+            has_docker_runtime_state = bool(preview.project_name or preview.proxy_port is not None or preview.url)
+            if preview.runtime_mode == "docker" and has_docker_runtime_state:
+                try:
+                    cleanup_logs.extend(self.runtime_manager.reset(workspace_id, source_dir, preview.proxy_port))
+                except Exception as exc:
+                    direct_logs = self.runtime_manager.remove_project_resources(workspace_id)
+                    cleanup_logs.extend(direct_logs)
+                    if not direct_logs:
+                        cleanup_errors.append(f"docker preview cleanup failed: {exc}")
+                    else:
+                        cleanup_logs.append(f"[runtime] docker compose cleanup failed, direct cleanup completed: {exc}")
+            else:
+                cleanup_logs.extend(self.runtime_manager.remove_project_resources(workspace_id))
+
+            if cleanup_logs:
+                preview.logs.extend(cleanup_logs)
+                preview.logs = preview.logs[-240:]
+            if cleanup_errors:
+                preview.status = "error"
+                preview.stage = "error"
+                preview.progress_percent = 100
+                preview.last_error = "; ".join(cleanup_errors)
+                self._append_log(preview, f"Preview runtime cleanup failed: {preview.last_error}")
+                self._persist(preview)
+                raise RuntimeError(preview.last_error)
+
+            preview.status = "stopped"
+            preview.stage = "idle"
+            preview.progress_percent = 0
+            preview.url = None
+            preview.frontend_url = None
+            preview.backend_url = None
+            preview.proxy_port = None
+            preview.project_name = None
+            preview.draft_run_id = None
+            preview.last_error = None
+            preview.preview_failure_kind = None
+            preview.preview_retry_count = 0
+            preview.preview_cleanup_attempted = True
+            preview.preview_reused_existing_runtime = False
+            preview.preview_cooldown_until = None
+            preview.last_failure_signature = None
+            self._append_log(preview, "Preview runtime resources destroyed for workspace deletion.")
+            self._persist(preview)
+            return preview
+        finally:
+            lock.release()
+
     def get(self, workspace_id: str) -> PreviewRecord:
         payload = self.store.get("previews", workspace_id)
         if not payload:
@@ -391,16 +460,6 @@ class PreviewService:
                     preview = refreshed
                     break
             else:
-                if (
-                    preview.proxy_port is None
-                    and any("Queued asynchronous preview rebuild." in line for line in preview.logs[-8:])
-                    and any("Observed asynchronous preview rebuild from API polling." in line for line in preview.logs[-8:])
-                ):
-                    preview.status = "running"
-                    preview.stage = "running"
-                    preview.progress_percent = 100
-                    self._persist(preview)
-                    return preview
                 if preview.proxy_port is None and any("Queued asynchronous preview rebuild." in line for line in preview.logs[-8:]):
                     self._append_log(preview, "Observed asynchronous preview rebuild from API polling.")
                     self._persist(preview)

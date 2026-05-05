@@ -118,11 +118,8 @@ def index_status(workspace_id: str, container: ServiceContainer = Depends(get_co
 @router.delete("/workspaces/{workspace_id}")
 def delete_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, str]:
     try:
-        try:
-            container.preview_service.reset(workspace_id)
-        except Exception:
-            pass
+        container.preview_service.destroy_workspace_runtime(workspace_id)
         container.workspace_service.delete_workspace(workspace_id)
-        return {"deleted": workspace_id}
+        return {"deleted": workspace_id, "preview_cleanup": "completed"}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

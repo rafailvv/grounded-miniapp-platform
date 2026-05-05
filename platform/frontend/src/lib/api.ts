@@ -13,6 +13,18 @@ export type Workspace = {
   }>;
 };
 
+export type PreviewRuntimeInfo = {
+  url?: string | null;
+  role_urls?: Record<string, string>;
+  runtime_mode?: string;
+  status?: string;
+  stage?: string;
+  progress_percent?: number;
+  draft_run_id?: string | null;
+  latency_breakdown?: Record<string, number>;
+  last_error?: string | null;
+};
+
 export type Run = {
   run_id: string;
   workspace_id: string;
@@ -944,20 +956,20 @@ export async function discardRun(runId: string): Promise<Run> {
   });
 }
 
-export async function rebuildPreview(workspaceId: string): Promise<void> {
-  await request(`/workspaces/${workspaceId}/preview/rebuild`, {
+export async function rebuildPreview(workspaceId: string): Promise<PreviewRuntimeInfo> {
+  return request<PreviewRuntimeInfo>(`/workspaces/${workspaceId}/preview/rebuild`, {
     method: "POST",
   });
 }
 
-export async function startPreview(workspaceId: string): Promise<void> {
-  await request(`/workspaces/${workspaceId}/preview/start`, {
+export async function startPreview(workspaceId: string): Promise<PreviewRuntimeInfo> {
+  return request<PreviewRuntimeInfo>(`/workspaces/${workspaceId}/preview/start`, {
     method: "POST",
   });
 }
 
-export async function ensurePreview(workspaceId: string): Promise<void> {
-  await request(`/workspaces/${workspaceId}/preview/ensure`, {
+export async function ensurePreview(workspaceId: string): Promise<PreviewRuntimeInfo> {
+  return request<PreviewRuntimeInfo>(`/workspaces/${workspaceId}/preview/ensure`, {
     method: "POST",
   });
 }
