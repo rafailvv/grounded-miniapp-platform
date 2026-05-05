@@ -47,6 +47,16 @@ def test_exec_policy_classifies_and_redacts_commands() -> None:
     assert "sk-secretvalue" not in redacted["command"]
 
 
+def test_exec_policy_loads_json_policy_and_validates_not_match_examples() -> None:
+    service = ExecPolicyService(Path("runtime/policies/agent_exec_policy.json").resolve())
+    snapshot = service.snapshot()
+
+    assert snapshot["policy_file"]["status"] == "loaded"
+    assert any("not_match" in item for item in snapshot["rules"])
+    assert service.evaluate_command("python3 -m py_compile miniapp/app/main.py")["decision"]["action"] == "allow"
+    assert service.evaluate_command("python3 -m pip install requests")["decision"]["action"] == "forbidden"
+
+
 def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
@@ -77,12 +87,18 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     ).json()
     timeline = client.get(f"/runs/{run.run_id}/timeline").json()
     trace = client.get(f"/runs/{run.run_id}/trace-view").json()
+    trace_bundle = client.get(f"/runs/{run.run_id}/trace-bundle").json()
+    trace_bundle_state = client.get(f"/runs/{run.run_id}/trace-bundle/state").json()
+    tasks = client.get(f"/runs/{run.run_id}/tasks").json()
     run_events = client.get(f"/runs/{run.run_id}/events").json()
     doctor = client.get("/doctor").json()
     memory = client.post(
         f"/workspaces/{workspace['workspace_id']}/memory",
         json={"kind": "project_rule", "text": "Use dense operational UI."},
     ).json()
+    extracted_memory = client.post(f"/runs/{run.run_id}/memory/extract").json()
+    memory_pipeline = client.get(f"/workspaces/{workspace['workspace_id']}/memory/pipeline").json()
+    consolidated_memory = client.post(f"/workspaces/{workspace['workspace_id']}/memory/consolidate").json()
     skills = client.get("/skills").json()
     workers = client.get(f"/runs/{run.run_id}/workers").json()
     permissions = client.get("/system/permissions/rules").json()
@@ -109,12 +125,19 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert evaluation["decision"]["action"] == "allow"
     assert timeline["items"][0]["kind"] == "prompt"
     assert trace["reducer"]["why"] == "Build a workflow"
+    assert trace_bundle["schema"] == "grounded.trace_bundle.v1"
+    assert trace_bundle_state["schema"] == "grounded.trace_bundle_state.v1"
+    assert tasks["schema"] == "grounded.run_tasks.v1"
     assert run_events["schema"] == "grounded.run_events.v1"
     assert doctor["checks"]
     assert memory["items"][0]["text"] == "Use dense operational UI."
+    assert extracted_memory["schema"] == "grounded.memory_stage1.v1"
+    assert memory_pipeline["schema"] == "grounded.memory_pipeline.v1"
+    assert consolidated_memory["pipeline"]["schema"] == "grounded.memory_pipeline.v1"
     assert any(item["id"] == "state-workflow" for item in skills["items"])
     assert any(item["id"] == "role-surfaces" for item in skills["items"])
     assert any(item["worker_id"] == "backend_api" for item in workers["workers"])
+    assert any(item["status"] == "available_disabled" for item in workers["workers"])
     assert any(item["rule_id"] == "block_destructive" for item in permissions["items"])
     assert lsp["status"] in {"passed", "failed"}
     assert thread_snapshot["thread"]["thread_id"] == thread["thread_id"]
@@ -605,14 +628,14 @@ def test_reliability_gate_final_report_and_repair_catalog(tmp_path: Path) -> Non
     ).json()
     run = RunRecord(
         workspace_id=workspace["workspace_id"],
-        prompt="Build an intake workflow",
+        prompt="Build a role-owned workflow",
         intent="create",
         target_role_scope=["client", "specialist", "manager"],
         model_profile="test",
         status="completed",
         apply_status="applied",
         touched_files=["miniapp/app/static/client/app.js"],
-        acceptance_contract={"required": True, "flows": [{"id": "create_intake"}]},
+        acceptance_contract={"required": True, "flows": [{"id": "create_role_owned_entity"}]},
         browser_flow_proof={"steps": [{"status": "passed", "route": "/client"}]},
         mobile_layout_report={"status": "passed"},
     )
@@ -640,6 +663,13 @@ def test_reliability_gate_final_report_and_repair_catalog(tmp_path: Path) -> Non
     assert final_report["diff_summary"]["diff_available"] is True
     assert repair["status"] == "empty"
     assert any(item["signature"] == "backend.missing_route" for item in RepairCatalog.entries())
+    catalog_signatures = {item["signature"] for item in RepairCatalog.entries()}
+    assert {
+        "edit.stale_read_state",
+        "preview.boot_failed",
+        "api.workflow_smoke_failed",
+        "workflow.shared_role_state_broken",
+    }.issubset(catalog_signatures)
 
 
 def test_reliability_gate_blocks_missing_browser_proof(tmp_path: Path) -> None:

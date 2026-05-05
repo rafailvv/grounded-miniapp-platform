@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 
 AgentHookName = Literal[
+    "session_start",
     "before_run",
     "after_run",
     "pre_tool_use",
@@ -42,6 +43,25 @@ class AgentHookEvent:
         }
 
 
+@dataclass(frozen=True)
+class AgentHookOutcome:
+    hook: AgentHookName
+    should_block: bool
+    block_reason: str | None
+    additional_contexts: list[str]
+    event: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "grounded.hook_outcome.v1",
+            "hook": self.hook,
+            "should_block": self.should_block,
+            "block_reason": self.block_reason,
+            "additional_contexts": list(self.additional_contexts),
+            "event": self.event,
+        }
+
+
 class AgentHookManager:
     """Small lifecycle hook recorder for agent tools, patches, and proof steps."""
 
@@ -67,6 +87,47 @@ class AgentHookManager:
         )
         self._events.setdefault(run_id, []).append(event)
         return event.as_dict()
+
+    def run(
+        self,
+        run_id: str,
+        hook: AgentHookName,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> AgentHookOutcome:
+        safe_payload = dict(payload or {})
+        additional_contexts: list[str] = []
+        should_block = False
+        block_reason = None
+        if safe_payload.get("block_reason"):
+            should_block = True
+            block_reason = str(safe_payload.get("block_reason"))
+        if hook == "on_check_failed":
+            failed = safe_payload.get("failed_checks")
+            if isinstance(failed, list) and failed:
+                additional_contexts.append(
+                    "Repair must start from the failing check evidence and named repair packet before broad edits."
+                )
+        if hook == "pre_tool_use" and safe_payload.get("risk") == "forbidden":
+            should_block = True
+            block_reason = "Tool risk is forbidden by internal hook policy."
+        event = self.record(
+            run_id,
+            hook,
+            status="failed" if should_block else "completed",
+            payload={
+                **safe_payload,
+                "additional_contexts": additional_contexts,
+                "block_reason": block_reason,
+            },
+        )
+        return AgentHookOutcome(
+            hook=hook,
+            should_block=should_block,
+            block_reason=block_reason,
+            additional_contexts=additional_contexts,
+            event=event,
+        )
 
     def snapshot(self, run_id: str) -> dict[str, Any]:
         events = [item.as_dict() for item in self._events.get(run_id, [])]

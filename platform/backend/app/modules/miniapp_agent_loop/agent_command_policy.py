@@ -22,6 +22,7 @@ class CommandPolicyRule:
     action: CommandPolicyAction
     reason: str
     examples: tuple[CommandPolicyExample, ...] = field(default_factory=tuple)
+    not_match_examples: tuple[str, ...] = field(default_factory=tuple)
 
     def matches(self, args: list[str]) -> bool:
         lowered = [item.lower() for item in args]
@@ -93,11 +94,19 @@ class AgentCommandPolicy:
                 continue
             examples: list[CommandPolicyExample] = []
             for raw_example in raw_rule.get("examples", []):
-                if not isinstance(raw_example, dict):
-                    continue
-                expected = str(raw_example.get("action") or action)
-                if expected in {"allow", "prompt", "forbidden"}:
-                    examples.append(CommandPolicyExample(str(raw_example.get("command") or ""), expected))  # type: ignore[arg-type]
+                if isinstance(raw_example, dict):
+                    expected = str(raw_example.get("action") or action)
+                    if expected in {"allow", "prompt", "forbidden"}:
+                        examples.append(CommandPolicyExample(str(raw_example.get("command") or ""), expected))  # type: ignore[arg-type]
+            for raw_example in raw_rule.get("match", []):
+                command = " ".join(str(item) for item in raw_example) if isinstance(raw_example, list) else str(raw_example or "")
+                if command.strip():
+                    examples.append(CommandPolicyExample(command, action))  # type: ignore[arg-type]
+            not_match_examples: list[str] = []
+            for raw_example in raw_rule.get("not_match", []):
+                command = " ".join(str(item) for item in raw_example) if isinstance(raw_example, list) else str(raw_example or "")
+                if command.strip():
+                    not_match_examples.append(command)
             if prefixes:
                 rules.append(
                     CommandPolicyRule(
@@ -105,6 +114,7 @@ class AgentCommandPolicy:
                         action=action,  # type: ignore[arg-type]
                         reason=str(raw_rule.get("reason") or "Rule-file command policy decision."),
                         examples=tuple(examples),
+                        not_match_examples=tuple(not_match_examples),
                     )
                 )
         return cls(rules or None)
@@ -426,6 +436,20 @@ class AgentCommandPolicy:
                         "status": "passed" if decision.action == example.action else "failed",
                     }
                 )
+            for command in rule.not_match_examples:
+                try:
+                    args = shlex.split(command)
+                except ValueError:
+                    args = []
+                matched_this_rule = bool(args and rule.matches(args))
+                examples.append(
+                    {
+                        "command": command,
+                        "expected": "not_match",
+                        "actual": "matched" if matched_this_rule else "not_match",
+                        "status": "failed" if matched_this_rule else "passed",
+                    }
+                )
         return examples
 
     def snapshot(self) -> dict[str, object]:
@@ -436,6 +460,8 @@ class AgentCommandPolicy:
                     "prefixes": [" ".join(prefix) for prefix in rule.prefixes],
                     "action": rule.action,
                     "reason": rule.reason,
+                    "match": [example.command for example in rule.examples],
+                    "not_match": list(rule.not_match_examples),
                 }
                 for rule in self.rules
             ],
@@ -444,6 +470,11 @@ class AgentCommandPolicy:
 
 
 DEFAULT_COMMAND_POLICY = AgentCommandPolicy()
+
+
+def configure_default_command_policy(policy: AgentCommandPolicy) -> None:
+    global DEFAULT_COMMAND_POLICY
+    DEFAULT_COMMAND_POLICY = policy
 
 
 def decide_workspace_command(command: str) -> CommandPolicyDecision:

@@ -23,6 +23,8 @@ class BrowserProofReplay:
             "failed_route": diagnostics.get("failed_route"),
             "failed_selector": diagnostics.get("failed_selector"),
             "action": diagnostics.get("action"),
+            "persisted_marker": diagnostics.get("persisted_marker") or diagnostics.get("persisted_state_marker") or diagnostics.get("created_marker") or diagnostics.get("created_state_marker"),
+            "update_marker": diagnostics.get("update_marker") or diagnostics.get("update_state_marker") or diagnostics.get("updated_marker") or diagnostics.get("updated_state_marker"),
             "created_marker": diagnostics.get("created_marker") or diagnostics.get("created_state_marker"),
             "updated_marker": diagnostics.get("updated_marker") or diagnostics.get("updated_state_marker"),
             "console_errors": list(diagnostics.get("console_errors") or [])[-8:],

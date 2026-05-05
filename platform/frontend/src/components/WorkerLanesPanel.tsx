@@ -19,6 +19,7 @@ export function WorkerLanesPanel({ workerReport }: WorkerLanesPanelProps) {
               <span className={`run-status ${worker.status}`}>{worker.status}</span>
             </div>
             <p>{worker.owner_scope}</p>
+            {worker.disabled_reason ? <small>{worker.disabled_reason}</small> : null}
             <small>{worker.changed_files.length ? worker.changed_files.join(", ") : "No owned file changes recorded."}</small>
           </div>
         )) ?? <p className="muted">No worker report is available.</p>}

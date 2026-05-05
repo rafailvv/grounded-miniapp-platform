@@ -118,6 +118,33 @@ def test_quality_create_prompt_with_error_states_stays_quality_mode() -> None:
     assert service._resolve_generation_mode(workspace, request, "create") == GenerationMode.QUALITY
 
 
+def test_balanced_quality_runs_require_acceptance_contract_with_prompt_analysis() -> None:
+    contract = build_acceptance_contract(
+        prompt="Improve the operations flow",
+        intent="edit",
+        generation_mode=GenerationMode.BALANCED,
+        prompt_analysis=_prompt_analysis(resource="operations"),
+    )
+
+    assert contract["required"] is True
+    assert contract["workflow_kind"] == "product_quality_run"
+    assert contract["api_contract"]["resource_hint"] == "operations"
+
+
+def test_lsp_static_diagnostics_reports_structured_python_issue(tmp_path: Path) -> None:
+    app_dir = tmp_path / "miniapp" / "app"
+    app_dir.mkdir(parents=True)
+    (app_dir / "main.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
+    runner = object.__new__(CheckRunner)
+
+    result = runner._lsp_static_diagnostics(source_dir=tmp_path)
+
+    assert result.name == "lsp_static_diagnostics"
+    assert result.status == "failed"
+    assert result.diagnostics["items"][0]["source"] == "python_compile"
+    assert result.diagnostics["items"][0]["file"] == "miniapp/app/main.py"
+
+
 def test_prompt_planning_hints_extract_role_fields_from_colon_and_action_sentences() -> None:
     hints = extract_prompt_planning_hints(
         "Клиент описывает объект: название, локация, тип, количество, бюджет, срок, контакт и комментарий. "
@@ -1535,7 +1562,8 @@ def test_worker_manager_rejects_conflicting_owned_edits() -> None:
     assert report["conflicts"][0]["path"] == "miniapp/app/static/client/app.js"  # type: ignore[index]
 
 
-def test_generation_modes_use_serial_contract_runtime_writes() -> None:
+def test_generation_modes_use_serial_contract_runtime_writes(monkeypatch) -> None:
+    monkeypatch.delenv("GROUNDED_ENABLE_WORKER_BRANCHES", raising=False)
     for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY):
         mailbox = AgentWorkerManager.mailbox_for_plan(
             generation_mode=mode,
@@ -1548,8 +1576,35 @@ def test_generation_modes_use_serial_contract_runtime_writes() -> None:
 
         assert mailbox["enabled"] is False
         assert mailbox["write_coordination"] == "serial_contract_runtime_writes"
+        assert mailbox["disabled_reason"]
+        assert all(worker["status"] == "available_disabled" for worker in mailbox["workers"])  # type: ignore[index]
         assert prompt_payload["enabled"] is False
-        assert prompt_payload["reason"] == "serial_contract_runtime_writes"
+        assert "GROUNDED_ENABLE_WORKER_BRANCHES" in prompt_payload["reason"]
+    monkeypatch.setenv("GROUNDED_ENABLE_WORKER_BRANCHES", "1")
+    quality_mailbox = AgentWorkerManager.mailbox_for_plan(
+        generation_mode=GenerationMode.QUALITY,
+        implementation_plan={"primary_entities": ["entity"]},
+    )
+    fast_mailbox = AgentWorkerManager.mailbox_for_plan(
+        generation_mode=GenerationMode.FAST,
+        implementation_plan={"primary_entities": ["entity"]},
+    )
+    assert quality_mailbox["enabled"] is True
+    assert fast_mailbox["enabled"] is False
+
+
+def test_hook_manager_records_context_and_blocks_forbidden_tool() -> None:
+    manager = AgentHookManager()
+
+    failed = manager.run("run_1", "on_check_failed", payload={"failed_checks": ["browser_flow_smoke"]})
+    blocked = manager.run("run_1", "pre_tool_use", payload={"risk": "forbidden", "tool": "shell.exec"})
+    snapshot = manager.snapshot("run_1")
+
+    assert failed.should_block is False
+    assert failed.additional_contexts
+    assert blocked.should_block is True
+    assert blocked.block_reason
+    assert snapshot["counts"]["pre_tool_use:failed"] == 1
 
 
 def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
@@ -1767,7 +1822,7 @@ def test_verification_worker_rejects_incomplete_browser_proof() -> None:
     issue_kinds = {issue["kind"] for issue in report["issues"]}  # type: ignore[index]
     assert report["status"] == "failed"
     assert "browser_proof_missing_roles" in issue_kinds
-    assert "browser_proof_missing_created_marker" in issue_kinds
+    assert "browser_proof_missing_persisted_marker" in issue_kinds
 
 
 def test_check_orchestrator_selects_full_create_gate() -> None:

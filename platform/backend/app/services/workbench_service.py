@@ -15,13 +15,27 @@ from typing import Any
 from uuid import uuid4
 
 from app.models.domain import CreateRunRequest, RunRecord
+from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
 from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
+from app.services.generation_enhancements import (
+    AcceptanceScenarioGenerator,
+    ConfigMigrationCatalog,
+    MagicDocsBuilder,
+    ProjectInstructionBundle,
+    SkillPackCatalog,
+    SlashCommandCatalog,
+    TraceReducer,
+    VisualQAGenerator,
+    WorkerRoleCatalog,
+)
 from app.services.miniapp_contract import MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.repair_catalog import RepairCatalog
 from app.services.run_state_machine import RunStateMachine
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, tool_envelope, tool_registry_contract
+from app.services.memory_pipeline import WorkspaceMemoryPipeline
+from app.services.trace_bundle import TraceBundleReducer
 from app.services.workspace.run_service import RunService
 from app.services.workspace.service import WorkspaceService
 from app.core.config import Settings
@@ -104,6 +118,7 @@ class WorkbenchService:
         run = self.run_service.get_run(run_id)
         timeline = self.timeline(run_id)["items"]
         artifacts = self._run_artifacts_or_empty(run_id)
+        tool_events = self.tool_events(run_id).get("events") or []
         failures = [
             item
             for item in timeline
@@ -138,6 +153,12 @@ class WorkbenchService:
                 "browser_proof": run.browser_proof_ref,
                 "verification": run.verification_report_ref,
             },
+            "reduced_trace": TraceReducer.build(
+                run=run,
+                timeline=timeline,
+                tool_events=[item for item in tool_events if isinstance(item, dict)],
+                artifacts=artifacts,
+            ),
         }
         self.store.upsert("reports", f"trace_view:{run_id}", payload)
         return payload
@@ -321,7 +342,16 @@ class WorkbenchService:
         run = self.run_service.get_run(run_id)
         artifacts = self._run_artifacts_or_empty(run_id)
         merge = ((artifacts.get("worker_results") or {}).get("merge") or {}) if isinstance(artifacts.get("worker_results"), dict) else {}
-        worker_ids = ["backend_api", "client_ui", "specialist_ui", "manager_ui", "generated_tests", "verifier"]
+        mailbox = self.store.get("reports", run.worker_mailbox_ref) if run.worker_mailbox_ref else None
+        mailbox_workers = ((mailbox or {}).get("mailbox") or {}).get("workers") if isinstance(mailbox, dict) else []
+        if not mailbox_workers:
+            synthesized_mailbox = AgentWorkerManager.mailbox_for_plan(
+                generation_mode=run.generation_mode,
+                implementation_plan=run.implementation_plan or {},
+            )
+            mailbox = {"mailbox": synthesized_mailbox}
+            mailbox_workers = synthesized_mailbox.get("workers") or []
+        worker_ids = ["planner", "backend_api", "client_ui", "specialist_ui", "manager_ui", "generated_tests", "verifier"]
         lanes = []
         for worker_id in worker_ids:
             summaries = [
@@ -333,14 +363,53 @@ class WorkbenchService:
             lanes.append(
                 {
                     "worker_id": worker_id,
-                    "status": self._worker_status(worker_id, run, summaries, merge_reports),
+                    "status": self._worker_status(worker_id, run, summaries, merge_reports, mailbox_workers),
                     "owner_scope": self._worker_scope(worker_id),
                     "changed_files": [path for path in run.touched_files if self._path_owned_by_worker(worker_id, path)],
                     "summaries": summaries,
                     "merge_reports": merge_reports,
+                    "disabled_reason": self._worker_disabled_reason(worker_id, mailbox_workers),
                 }
             )
-        return {"run_id": run_id, "workers": lanes, "worker_branch_refs": run.worker_branch_refs}
+        return {
+            "run_id": run_id,
+            "workers": lanes,
+            "worker_branch_refs": run.worker_branch_refs,
+            "mailbox": (mailbox or {}).get("mailbox") if isinstance(mailbox, dict) else {},
+        }
+
+    def tasks(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        scratchpad = self.store.get("reports", run.scratchpad_ref) if run.scratchpad_ref else None
+        raw_todos = []
+        if isinstance(scratchpad, dict):
+            raw_todos = scratchpad.get("todo_plan") or scratchpad.get("agent_todos") or []
+        items: list[dict[str, Any]] = []
+        for index, item in enumerate(raw_todos if isinstance(raw_todos, list) else [], start=1):
+            if not isinstance(item, dict):
+                continue
+            phase = str(item.get("phase") or item.get("id") or f"task_{index}")
+            status = self._task_status(str(item.get("status") or "planned"))
+            items.append(
+                {
+                    "task_id": str(item.get("task_id") or item.get("id") or f"{run_id}:{index}"),
+                    "title": str(item.get("task") or item.get("content") or phase).strip(),
+                    "phase": phase,
+                    "status": status,
+                    "owner": str(item.get("owner") or self._owner_for_phase(phase)),
+                    "files": list(item.get("files") or []),
+                    "proof": item.get("proof") or {},
+                    "blocker": item.get("blocker") or None,
+                    "artifact_refs": {"scratchpad": run.scratchpad_ref},
+                    "updated_at": item.get("updated_at"),
+                }
+            )
+        if not items:
+            items = self._tasks_from_activity(run)
+        return {"schema": "grounded.run_tasks.v1", "run_id": run_id, "workspace_id": run.workspace_id, "status": run.status, "items": items}
+
+    def worker_roles(self) -> dict[str, Any]:
+        return WorkerRoleCatalog.roles()
 
     def worker_artifacts(self, run_id: str, worker_id: str) -> dict[str, Any]:
         workers = self.workers(run_id)["workers"]
@@ -434,6 +503,78 @@ class WorkbenchService:
         payload = self._normalize_browser_proof_payload(run, artifacts)
         self.store.upsert("reports", f"browser_proof:{run_id}", payload)
         return payload
+
+    def acceptance_scenarios(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        payload = AcceptanceScenarioGenerator.build(run, self._run_artifacts_or_empty(run_id))
+        self.store.upsert("reports", f"acceptance_scenarios:{run_id}", payload)
+        return payload
+
+    def visual_qa(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        source_dir = (
+            self.workspace_service.draft_source_dir(run.workspace_id, run_id)
+            if self.workspace_service.draft_exists(run.workspace_id, run_id)
+            else self.workspace_service.source_dir(run.workspace_id)
+        )
+        payload = VisualQAGenerator.build(run=run, artifacts=self._run_artifacts_or_empty(run_id), source_dir=source_dir)
+        self.store.upsert("reports", f"visual_qa:{run_id}", payload)
+        return payload
+
+    def trace_reducer(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        payload = TraceReducer.build(
+            run=run,
+            timeline=self.timeline(run_id).get("items") or [],
+            tool_events=self.tool_events(run_id).get("events") or [],
+            artifacts=self._run_artifacts_or_empty(run_id),
+        )
+        self.store.upsert("reports", f"trace_reducer:{run_id}", payload)
+        return payload
+
+    def trace_bundle(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        ref = run.trace_bundle_ref or f"trace_bundle:{run.workspace_id}:{run_id}"
+        payload = self.store.get("reports", ref)
+        if not isinstance(payload, dict):
+            return {
+                "schema": "grounded.trace_bundle.v1",
+                "run_id": run_id,
+                "workspace_id": run.workspace_id,
+                "status": "missing",
+                "event_count": 0,
+                "state": {},
+            }
+        state = payload.get("state")
+        if not isinstance(state, dict):
+            state = self.trace_bundle_state(run_id)
+            payload = {**payload, "state": state}
+            self.store.upsert("reports", ref, payload)
+        return payload
+
+    def trace_bundle_state(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        ref = run.trace_bundle_ref or f"trace_bundle:{run.workspace_id}:{run_id}"
+        payload = self.store.get("reports", ref) or {}
+        state = payload.get("state") if isinstance(payload, dict) else None
+        if isinstance(state, dict) and state:
+            return state
+        bundle_dir_value = str((payload or {}).get("bundle_dir") or "").strip()
+        bundle_dir = Path(bundle_dir_value) if bundle_dir_value else None
+        if bundle_dir is not None and bundle_dir.exists():
+            state = TraceBundleReducer.reduce_bundle(bundle_dir)
+        else:
+            state = {
+                "schema": "grounded.trace_bundle_state.v1",
+                "run_id": run_id,
+                "workspace_id": run.workspace_id,
+                "event_count": 0,
+                "blockers": [],
+                "changed_files": [],
+                "next_action": {"action": "none", "reason": "Trace bundle is missing."},
+            }
+        self.store.upsert("reports", f"trace_reducer:{run.workspace_id}:{run_id}", state)
+        return state
 
     def gate(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -824,8 +965,60 @@ class WorkbenchService:
             "platform_constraints": [],
             "repeated_fixes": [],
         }
-        current["stale_check"] = self._memory_stale_check(workspace_id, current)
+        current["stale_check"] = WorkspaceMemoryPipeline.stale_check(self.workspace_service.source_dir(workspace_id), current)
+        current["pipeline"] = self.memory_pipeline(workspace_id)
         return current
+
+    def extract_run_memory(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        payload = WorkspaceMemoryPipeline.extract_run(run, self._run_artifacts_or_empty(run_id))
+        self.store.upsert("reports", f"memory_stage1:{run.workspace_id}:{run_id}", payload)
+        return payload
+
+    def memory_pipeline(self, workspace_id: str) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        stage1 = [
+            payload
+            for key, payload in self.store.items("reports")
+            if key.startswith(f"memory_stage1:{workspace_id}:") and isinstance(payload, dict)
+        ]
+        consolidated = self.store.get("reports", f"memory_consolidation:{workspace_id}") or {}
+        return {
+            "schema": "grounded.memory_pipeline.v1",
+            "workspace_id": workspace_id,
+            "status": "ready" if stage1 or consolidated else "empty",
+            "stage1_count": len(stage1),
+            "stage1_items": sum(len(payload.get("items") or []) for payload in stage1),
+            "consolidated_at": consolidated.get("updated_at") or consolidated.get("created_at"),
+            "items": stage1[-20:],
+        }
+
+    def consolidate_memory(self, workspace_id: str) -> dict[str, Any]:
+        self.workspace_service.get_workspace(workspace_id)
+        stage1 = [
+            payload
+            for key, payload in self.store.items("reports")
+            if key.startswith(f"memory_stage1:{workspace_id}:") and isinstance(payload, dict)
+        ]
+        current = self.store.get("reports", f"workspace_memory:{workspace_id}") or {"workspace_id": workspace_id, "items": []}
+        consolidated = WorkspaceMemoryPipeline.consolidate(workspace_id, stage1, current)
+        consolidated["stale_check"] = WorkspaceMemoryPipeline.stale_check(self.workspace_service.source_dir(workspace_id), consolidated)
+        self.store.upsert("reports", f"workspace_memory:{workspace_id}", consolidated)
+        summary = {
+            "schema": "grounded.memory_consolidation.v1",
+            "workspace_id": workspace_id,
+            "status": "consolidated",
+            "stage1_count": len(stage1),
+            "active_count": len(consolidated.get("items") or []),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.store.upsert("reports", f"memory_consolidation:{workspace_id}", summary)
+        return {**consolidated, "pipeline": self.memory_pipeline(workspace_id)}
+
+    def project_instructions(self) -> dict[str, Any]:
+        payload = ProjectInstructionBundle.build(repo_root=self.settings.repo_root, template_dir=self.settings.template_dir)
+        self.store.upsert("reports", "project_instructions:current", payload)
+        return payload
 
     def upsert_memory(self, workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.memory(workspace_id)
@@ -863,15 +1056,52 @@ class WorkbenchService:
 
     def skills(self) -> dict[str, Any]:
         skills = dict(self._builtin_skills())
+        for item in SkillPackCatalog.load_from_runtime(self.settings.runtime_dir, self.settings.repo_root):
+            skills.setdefault(item["id"], item)
         for item in self._document_skills():
             skills.setdefault(item["id"], item)
-        return {"items": sorted(skills.values(), key=lambda item: str(item.get("id") or ""))}
+        for item in skills.values():
+            item.setdefault("activation_reason", "available_metadata")
+        return {
+            "schema": "grounded.skills.v1",
+            "items": sorted(skills.values(), key=lambda item: str(item.get("id") or "")),
+        }
 
     def skill(self, skill_id: str) -> dict[str, Any]:
         item = {item["id"]: item for item in self.skills()["items"]}.get(skill_id)
         if item is None:
             raise KeyError(f"Skill not found: {skill_id}")
         return item
+
+    def slash_commands(self) -> dict[str, Any]:
+        payload = SlashCommandCatalog.list()
+        self.store.upsert("reports", "slash_commands:current", payload)
+        return payload
+
+    def resolve_slash_command(self, command_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        resolved = SlashCommandCatalog.resolve(command_id, payload)
+        self.store.upsert("reports", f"slash_command:{command_id}", resolved)
+        return resolved
+
+    def magic_doc(self, workspace_id: str, *, write: bool = False) -> dict[str, Any]:
+        workspace = self.workspace_service.get_workspace(workspace_id)
+        runs = self.run_service.list_runs(workspace_id)
+        payload = MagicDocsBuilder.build(
+            workspace=workspace,
+            memory=self.memory(workspace_id),
+            runs=runs,
+            source_dir=self.workspace_service.source_dir(workspace_id),
+        )
+        if write:
+            doc_path = self.workspace_service.source_dir(workspace_id) / payload["path"]
+            doc_path.parent.mkdir(parents=True, exist_ok=True)
+            doc_path.write_text(str(payload["content"]), encoding="utf-8")
+            payload["write_status"] = "written"
+            payload["absolute_path"] = str(doc_path)
+        else:
+            payload["write_status"] = "preview"
+        self.store.upsert("reports", f"magic_doc:{workspace_id}:product_architecture", payload)
+        return payload
 
     def plugins(self) -> dict[str, Any]:
         items = [
@@ -963,6 +1193,7 @@ class WorkbenchService:
                 "workspace": {"$ref": "#/schemas/workspace"},
                 "policy": {"$ref": "#/schemas/policy"},
                 "plugin": {"$ref": "#/schemas/plugin"},
+                "generation_enhancements": {"$ref": "#/schemas/generation_enhancements"},
             },
             "schemas": {
                 "platform": {
@@ -998,8 +1229,34 @@ class WorkbenchService:
                         "version": {"type": "string"},
                         "capabilities": {"type": "array", "items": {"type": "string"}},
                     },
-                    "capabilities": ["validators", "exporters", "preview_adapters", "platform_adapters", "skills", "mcp_tools"],
+                    "capabilities": [
+                        "validators",
+                        "exporters",
+                        "preview_adapters",
+                        "platform_adapters",
+                        "skills",
+                        "mcp_tools",
+                        "slash_commands",
+                        "acceptance_scenarios",
+                        "visual_qa",
+                        "trace_reducer",
+                        "magic_docs",
+                    ],
                     "additionalProperties": True,
+                },
+                "generation_enhancements": {
+                    "type": "object",
+                    "properties": {
+                        "project_instructions": {"type": "boolean", "default": True},
+                        "runtime_skills": {"type": "boolean", "default": True},
+                        "workspace_memory": {"type": "boolean", "default": True},
+                        "magic_docs": {"type": "boolean", "default": True},
+                        "slash_commands": {"type": "boolean", "default": True},
+                        "acceptance_scenarios": {"type": "boolean", "default": True},
+                        "visual_qa": {"type": "boolean", "default": True},
+                        "trace_reducer": {"type": "boolean", "default": True},
+                    },
+                    "additionalProperties": False,
                 },
             },
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1022,6 +1279,7 @@ class WorkbenchService:
                 "status": "current",
                 "description": "Run artifacts remain addressable through report refs.",
             },
+            *ConfigMigrationCatalog.items(),
         ]
         return {"status": "current", "items": checks, "created_at": datetime.now(timezone.utc).isoformat()}
 
@@ -1046,6 +1304,20 @@ class WorkbenchService:
             entry("persistence", "Persisted workflow checks", ("api_workflow_proof", "browser_flow_smoke")),
             entry("docker_compose_boot", "Docker compose boot", ("preview_boot_smoke",), required=False),
             entry("playwright_proof", "Playwright proof", ("browser_flow_smoke", "browser_proof")),
+            {
+                "key": "acceptance_scenarios",
+                "label": "Acceptance scenarios",
+                "status": "passed" if self.acceptance_scenarios(run_id).get("items") else "failed",
+                "required": True,
+                "evidence": self.acceptance_scenarios(run_id).get("items", []),
+            },
+            {
+                "key": "visual_qa",
+                "label": "Visual QA",
+                "status": "passed" if self.visual_qa(run_id).get("status") == "passed" else "failed",
+                "required": False,
+                "evidence": self.visual_qa(run_id).get("issues", []),
+            },
         ]
         status = "passed" if all(item["status"] == "passed" for item in items if item["required"]) else "incomplete"
         payload = {"run_id": run_id, "workspace_id": run.workspace_id, "status": status, "items": items}
@@ -1696,6 +1968,7 @@ class WorkbenchService:
     @staticmethod
     def _worker_scope(worker_id: str) -> str:
         return {
+            "planner": "Prompt contract, acceptance scenarios, and ownership plan",
             "backend_api": "Backend API and shared persistence",
             "client_ui": "Client role UI",
             "specialist_ui": "Specialist role UI",
@@ -1707,6 +1980,8 @@ class WorkbenchService:
     @staticmethod
     def _path_owned_by_worker(worker_id: str, path: str) -> bool:
         normalized = str(path or "").replace("\\", "/")
+        if worker_id == "planner":
+            return normalized.startswith("docs/") or normalized.endswith("README.md")
         if worker_id == "backend_api":
             return normalized.startswith("miniapp/app/") and "/static/" not in normalized
         if worker_id in {"client_ui", "specialist_ui", "manager_ui"}:
@@ -1717,12 +1992,71 @@ class WorkbenchService:
         return False
 
     @staticmethod
-    def _worker_status(worker_id: str, run: Any, summaries: list[dict[str, Any]], merge_reports: list[dict[str, Any]]) -> str:
+    def _worker_status(worker_id: str, run: Any, summaries: list[dict[str, Any]], merge_reports: list[dict[str, Any]], mailbox_workers: Any = None) -> str:
         if summaries or merge_reports:
             if any(str(item.get("status") or "") == "failed" for item in [*summaries, *merge_reports]):
                 return "failed"
+            if any(str(item.get("status") or "") in {"changes_ready", "merged"} for item in [*summaries, *merge_reports]):
+                return "merged"
             return "completed"
+        for worker in mailbox_workers if isinstance(mailbox_workers, list) else []:
+            if isinstance(worker, dict) and str(worker.get("worker") or worker.get("worker_id") or "") == worker_id:
+                status = str(worker.get("status") or "")
+                if status == "available_disabled":
+                    return status
         return "not_started" if run.status == "completed" else "pending"
+
+    @staticmethod
+    def _worker_disabled_reason(worker_id: str, mailbox_workers: Any = None) -> str:
+        for worker in mailbox_workers if isinstance(mailbox_workers, list) else []:
+            if isinstance(worker, dict) and str(worker.get("worker") or worker.get("worker_id") or "") == worker_id:
+                return str(worker.get("disabled_reason") or "")
+        return ""
+
+    @staticmethod
+    def _task_status(value: str) -> str:
+        normalized = str(value or "").lower()
+        if normalized in {"pending", "planned"}:
+            return "planned"
+        if normalized in {"in_progress", "running", "started"}:
+            return "in_progress"
+        if normalized in {"failed", "blocked"}:
+            return "blocked"
+        if normalized in {"done", "completed", "passed"}:
+            return "completed"
+        return normalized or "planned"
+
+    @staticmethod
+    def _owner_for_phase(phase: str) -> str:
+        if phase in {"checking", "browser_verifying", "verify"}:
+            return "verifier"
+        if phase in {"editing", "build"}:
+            return "coordinator"
+        return "planner" if phase == "planning" else "coordinator"
+
+    def _tasks_from_activity(self, run: Any) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for index, event in enumerate(run.agent_activity_events or [], start=1):
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("type") or "activity")
+            detail_status = event.get("details", {}).get("status") if isinstance(event.get("details"), dict) else None
+            status = self._task_status(str(event.get("status") or detail_status or "completed"))
+            items.append(
+                {
+                    "task_id": f"{run.run_id}:activity:{index}",
+                    "title": str(event.get("message") or event_type),
+                    "phase": str(event.get("phase") or event_type),
+                    "status": status,
+                    "owner": str(event.get("worker_id") or self._owner_for_phase(event_type)),
+                    "files": list((event.get("details") or {}).get("changed_files") or []) if isinstance(event.get("details"), dict) else [],
+                    "proof": {},
+                    "blocker": None if status != "blocked" else event.get("message"),
+                    "artifact_refs": {"artifact": event.get("artifact_ref")},
+                    "updated_at": event.get("created_at"),
+                }
+            )
+        return items[-80:]
 
     @staticmethod
     def _filter_diff(diff: str, paths: list[str]) -> str:
@@ -2145,10 +2479,4 @@ class WorkbenchService:
 
     @staticmethod
     def _builtin_skills() -> dict[str, dict[str, Any]]:
-        return {
-            "state-workflow": {"id": "state-workflow", "name": "State workflow", "activation": "llm_planning_only", "constraints": ["Persist shared records and status transitions."], "validation_hints": ["Create/update/list workflow exists."]},
-            "role-surfaces": {"id": "role-surfaces", "name": "Role surfaces", "activation": "llm_planning_only", "constraints": ["Role pages share connected state."], "validation_hints": ["Each role has a distinct action surface."]},
-            "route-manifest": {"id": "route-manifest", "name": "Route manifest", "activation": "llm_planning_only", "constraints": ["Route manifest matches static pages."], "validation_hints": ["Every role page is routeable."]},
-            "mobile-shell": {"id": "mobile-shell", "name": "Mobile shell", "activation": "llm_planning_only", "constraints": ["Mobile-first role pages."], "validation_hints": ["No horizontal overflow on mobile."]},
-            "preview-profile": {"id": "preview-profile", "name": "Preview profile", "activation": "llm_planning_only", "constraints": ["Preview profile selects the right host shell."], "validation_hints": ["Preview profile supports configured mock surface."]},
-        }
+        return SkillPackCatalog.builtin()

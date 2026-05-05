@@ -269,10 +269,66 @@ class ThreadService:
 
     def review_thread(self, thread_id: str) -> TurnRecord:
         thread = self._get_thread(thread_id)
+        turns = self.db.list_turns(thread_id, limit=500)
+        linked_turns = [turn for turn in turns if turn.linked_run_id]
+        latest_run = None
+        latest_turn = linked_turns[-1] if linked_turns else None
+        if latest_turn and latest_turn.linked_run_id:
+            try:
+                latest_run = self.run_service.get_run(latest_turn.linked_run_id)
+            except Exception:
+                latest_run = None
+
+        changed_files: list[str] = []
+        check_issues: list[dict[str, Any]] = []
+        artifact_refs: dict[str, Any] = {}
+        if latest_run is not None:
+            changed_files = list(latest_run.touched_files or [])[:30]
+            latest_execution = self.store.get("reports", f"latest_check_execution:{latest_run.run_id}") or {}
+            if isinstance(latest_execution, dict):
+                for result in latest_execution.get("results") or []:
+                    if not isinstance(result, dict):
+                        continue
+                    status = str(result.get("status") or "")
+                    if status not in {"failed", "blocked"}:
+                        continue
+                    check_issues.append(
+                        {
+                            "check": result.get("name"),
+                            "status": status,
+                            "details": result.get("details"),
+                            "logs": list(result.get("logs") or [])[-5:],
+                        }
+                    )
+            for key in (
+                f"trace_bundle:{thread.workspace_id}:{latest_run.run_id}",
+                f"acceptance_contract:{thread.workspace_id}:{latest_run.run_id}",
+                f"run_artifacts:{latest_run.run_id}",
+            ):
+                value = self.store.get("reports", key)
+                if value:
+                    artifact_refs[key.split(":", 1)[0]] = key
+
+        status = "passed" if latest_run is not None and latest_run.status == "completed" and not check_issues else "needs_attention"
+        summary = {
+            "schema": "grounded.thread_review.v1",
+            "status": status,
+            "thread_id": thread_id,
+            "latest_run": latest_run.model_dump(mode="json") if latest_run is not None else None,
+            "changed_files": changed_files,
+            "issues": check_issues,
+            "artifact_refs": artifact_refs,
+            "summary": (
+                "Latest linked run completed without failed checks."
+                if status == "passed"
+                else "Latest linked run is missing, incomplete, or has failed checks."
+            ),
+        }
         turn = TurnRecord(thread_id=thread_id, workspace_id=thread.workspace_id, kind="review", status="completed", prompt="Review current thread changes.", completed_at=self._now())
+        turn.metadata["review"] = summary
         self.db.insert_turn(turn)
-        self._append_item(thread_id, turn.turn_id, "review.summary", {"summary": "Review mode scaffold is ready; wire detailed diff review in the next iteration."})
-        self._append_event(thread_id, turn.turn_id, "review.completed", {})
+        self._append_item(thread_id, turn.turn_id, "review.summary", summary)
+        self._append_event(thread_id, turn.turn_id, "review.completed", summary)
         return turn
 
     def fs_read_file(self, *, workspace_id: str, path: str, run_id: str | None = None) -> dict[str, str]:

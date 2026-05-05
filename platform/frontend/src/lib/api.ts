@@ -426,6 +426,36 @@ export type RunTraceView = {
   artifact_refs?: Record<string, string | null | undefined>;
 };
 
+export type TraceBundleReport = {
+  schema?: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  bundle_dir?: string;
+  manifest_path?: string;
+  trace_path?: string;
+  state_path?: string;
+  payload_dir?: string;
+  event_count?: number;
+  payload_count?: number;
+  state?: TraceBundleState;
+};
+
+export type TraceBundleState = {
+  schema?: string;
+  run_id?: string;
+  workspace_id?: string;
+  event_count?: number;
+  turns?: Array<Record<string, unknown>>;
+  tool_calls?: Array<Record<string, unknown>>;
+  artifacts?: Array<Record<string, unknown>>;
+  changed_files?: string[];
+  blockers?: Array<Record<string, unknown>>;
+  proof_edges?: Array<Record<string, unknown>>;
+  next_action?: Record<string, unknown>;
+  payload_refs?: Array<Record<string, unknown>>;
+};
+
 export type DoctorReport = {
   status: string;
   checks: Array<{
@@ -447,8 +477,29 @@ export type WorkerReport = {
     changed_files: string[];
     summaries?: Array<Record<string, unknown>>;
     merge_reports?: Array<Record<string, unknown>>;
+    disabled_reason?: string | null;
   }>;
   worker_branch_refs?: string[];
+  mailbox?: Record<string, unknown>;
+};
+
+export type RunTaskReport = {
+  schema?: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  items: Array<{
+    task_id: string;
+    title: string;
+    phase?: string;
+    status: "planned" | "in_progress" | "blocked" | "completed" | string;
+    owner?: string;
+    files?: string[];
+    proof?: Record<string, unknown> | string;
+    blocker?: Record<string, unknown> | string | null;
+    artifact_refs?: Record<string, string | null | undefined>;
+    updated_at?: string | null;
+  }>;
 };
 
 export type ReviewReport = {
@@ -520,10 +571,23 @@ export type WorkspaceMemory = {
     citation?: Record<string, unknown> | null;
     created_at?: string;
   }>;
-  project_rules?: string[];
-  user_preferences?: string[];
-  platform_constraints?: string[];
-  repeated_fixes?: string[];
+  project_rules?: Array<string | Record<string, unknown>>;
+  user_preferences?: Array<string | Record<string, unknown>>;
+  product_decisions?: Array<string | Record<string, unknown>>;
+  platform_constraints?: Array<string | Record<string, unknown>>;
+  repeated_fixes?: Array<string | Record<string, unknown>>;
+  pipeline?: MemoryPipelineReport;
+  stale_check?: Record<string, unknown>;
+};
+
+export type MemoryPipelineReport = {
+  schema?: string;
+  workspace_id: string;
+  status: string;
+  stage1_count?: number;
+  stage1_items?: number;
+  consolidated_at?: string | null;
+  items?: Array<Record<string, unknown>>;
 };
 
 export type ApprovalRecord = {
@@ -638,6 +702,28 @@ export type CommandPaletteAction = {
   label: string;
   description?: string;
   disabled?: boolean;
+};
+
+export type SlashCommand = {
+  id: string;
+  name: string;
+  kind: string;
+  description: string;
+  requires: string[];
+};
+
+export type SlashCommandList = {
+  schema: string;
+  items: SlashCommand[];
+};
+
+export type GeneratedReport = {
+  schema?: string;
+  status?: string;
+  items?: unknown[];
+  issues?: unknown[];
+  content?: string;
+  [key: string]: unknown;
 };
 
 type RpcEnvelope = {
@@ -848,6 +934,18 @@ export async function getRunTraceView(runId: string): Promise<RunTraceView> {
   return request<RunTraceView>(`/runs/${runId}/trace-view`);
 }
 
+export async function getRunTraceBundle(runId: string): Promise<TraceBundleReport> {
+  return request<TraceBundleReport>(`/runs/${runId}/trace-bundle`);
+}
+
+export async function getRunTraceBundleState(runId: string): Promise<TraceBundleState> {
+  return request<TraceBundleState>(`/runs/${runId}/trace-bundle/state`);
+}
+
+export async function getRunTasks(runId: string): Promise<RunTaskReport> {
+  return request<RunTaskReport>(`/runs/${runId}/tasks`);
+}
+
 export async function getRunGate(runId: string): Promise<RunGateReport> {
   return request<RunGateReport>(`/runs/${runId}/gate`);
 }
@@ -924,6 +1022,57 @@ export async function getRunPromptContract(runId: string): Promise<PromptContrac
 
 export async function getRunMiniAppContract(runId: string): Promise<MiniAppContractReport> {
   return request<MiniAppContractReport>(`/runs/${runId}/miniapp-contract`);
+}
+
+export async function getRunAcceptanceScenarios(runId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/runs/${runId}/acceptance-scenarios`);
+}
+
+export async function getRunVisualQa(runId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/runs/${runId}/visual-qa`);
+}
+
+export async function getRunTraceReducer(runId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/runs/${runId}/trace-reducer`);
+}
+
+export async function extractRunMemory(runId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/runs/${runId}/memory/extract`, { method: "POST" });
+}
+
+export async function getWorkspaceMemoryPipeline(workspaceId: string): Promise<MemoryPipelineReport> {
+  return request<MemoryPipelineReport>(`/workspaces/${workspaceId}/memory/pipeline`);
+}
+
+export async function consolidateWorkspaceMemory(workspaceId: string): Promise<WorkspaceMemory> {
+  return request<WorkspaceMemory>(`/workspaces/${workspaceId}/memory/consolidate`, { method: "POST" });
+}
+
+export async function getProjectInstructions(): Promise<GeneratedReport> {
+  return request<GeneratedReport>("/system/project-instructions");
+}
+
+export async function getWorkerRoles(): Promise<GeneratedReport> {
+  return request<GeneratedReport>("/system/worker-roles");
+}
+
+export async function getSlashCommands(): Promise<SlashCommandList> {
+  return request<SlashCommandList>("/slash-commands");
+}
+
+export async function resolveSlashCommand(commandId: string, prompt?: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/slash-commands/${commandId}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ prompt }),
+  });
+}
+
+export async function getWorkspaceMagicDoc(workspaceId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/workspaces/${workspaceId}/magic-docs/product-architecture`);
+}
+
+export async function updateWorkspaceMagicDoc(workspaceId: string): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/workspaces/${workspaceId}/magic-docs/product-architecture`, { method: "POST" });
 }
 
 export async function getRunState(runId: string): Promise<RunStateReport> {

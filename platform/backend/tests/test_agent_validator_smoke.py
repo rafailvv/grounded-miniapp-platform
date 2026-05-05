@@ -69,7 +69,7 @@ def test_form_wiring_accepts_change_only_filter_forms(tmp_path: Path) -> None:
         "form?.addEventListener('change', () => { renderFiltered(filter.value); });\n"
     )
 
-    issues = CheckRunner._form_wiring_issues("miniapp/app/static/specialist/queue/index.html", js_path, html, js)
+    issues = CheckRunner._form_wiring_issues("miniapp/app/static/specialist/workflow/index.html", js_path, html, js)
 
     assert not any(issue.code == "platform.workflow_form_without_submit_handler" for issue in issues)
 

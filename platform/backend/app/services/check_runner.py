@@ -269,6 +269,20 @@ class CheckRunner:
             check_profile=check_profile,
         )
 
+        self._emit_check_progress(progress_callback, "lsp_static_diagnostics", "started", changed_files=changed_files, check_profile=check_profile)
+        lsp_started = time.perf_counter()
+        lsp_result = self._lsp_static_diagnostics(source_dir=source_dir, focused_css_only=focused_css_only_profile)
+        lsp_result.duration_ms = int((time.perf_counter() - lsp_started) * 1000)
+        results.append(lsp_result)
+        self._emit_check_progress(
+            progress_callback,
+            "lsp_static_diagnostics",
+            lsp_result.status,
+            duration_ms=lsp_result.duration_ms,
+            issue_count=len(lsp_result.diagnostics.get("items") or []) if isinstance(lsp_result.diagnostics, dict) else 0,
+            check_profile=check_profile,
+        )
+
         self._emit_check_progress(progress_callback, "platform_invariants", "started", changed_files=changed_files, check_profile=check_profile)
         canonical_started = time.perf_counter()
         platform_smoke_result = self._platform_invariants_smoke(
@@ -316,6 +330,7 @@ class CheckRunner:
             bool(filtered_issues)
             or bool(connectivity_issues)
             or static_result.status == "failed"
+            or lsp_result.status == "failed"
             or platform_smoke_result.status == "failed"
             or frontend_flow_result.status == "failed"
         )
@@ -638,12 +653,18 @@ class CheckRunner:
             )
         contract = dict(acceptance_contract or {})
         if not contract:
-            contract = build_acceptance_contract(
-                prompt="",
-                intent=intent,
-                generation_mode=generation_mode,
-                focused_edit_kind="",
-            )
+            intent_value = str(intent or "").strip().lower()
+            mode_value = str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
+            if intent_value == "create" or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
+                return RunCheckResult(
+                    name="frontend_interaction_static_smoke",
+                    status="failed",
+                    details="Frontend interaction smoke requires a product acceptance contract, but none was provided.",
+                    command="frontend interaction static smoke",
+                    logs=["Missing acceptance contract for a product-changing create/balanced/quality run."],
+                    diagnostics={"acceptance_contract_required": True, "missing_acceptance_contract": True},
+                )
+            contract = build_acceptance_contract(prompt="", intent=intent, generation_mode=generation_mode, focused_edit_kind="")
         if not contract.get("required"):
             return RunCheckResult(
                 name="frontend_interaction_static_smoke",
@@ -2051,11 +2072,11 @@ class CheckRunner:
             base = lowered.split("-", 1)[0]
             if base in {item.lower() for item in css_classes}:
                 return False
-        if lowered.endswith(("-page", "-dashboard", "-root", "-home", "-work", "-queue", "-summary")):
+        if lowered.endswith(("-page", "-dashboard", "-root", "-home", "-work", "-summary")):
             return False
         if lowered in {"panel"}:
             return False
-        if re.match(r"^(?:client|specialist|manager)-(?:root|form|details|dashboard|page|home|work|queue|summary|subtext)$", lowered):
+        if re.match(r"^(?:client|specialist|manager)-(?:root|form|details|dashboard|page|home|work|summary|subtext)$", lowered):
             return False
         if lowered in {"muted", "small", "subtle"} or any(marker in lowered for marker in ("eyebrow", "hint", "placeholder")):
             return False
@@ -2174,7 +2195,7 @@ class CheckRunner:
             return False
         required_terms = ["post", "get"]
         features = contract.get("features") or {}
-        if features.get("workflow_update", True):
+        if features.get("workflow_update", False):
             non_get_mutation_terms = ("patch", "put", "delete")
             return all(term in lowered for term in required_terms) and (
                 any(term in lowered for term in non_get_mutation_terms)
@@ -2251,6 +2272,8 @@ class CheckRunner:
             "roles_checked": list(contract.get("roles") or ROLE_ORDER),
             "steps": proof.get("steps") or [],
             "api_paths": proof.get("api_paths") or [],
+            "persisted_state_marker": proof.get("persisted_state_marker") or proof.get("created_state_marker"),
+            "update_state_marker": proof.get("update_state_marker") or proof.get("updated_state_marker"),
             "created_state_marker": proof.get("created_state_marker"),
             "updated_state_marker": proof.get("updated_state_marker"),
             "api_before": proof.get("api_before"),
@@ -2265,7 +2288,7 @@ class CheckRunner:
         return RunCheckResult(
             name="api_workflow_smoke",
             status="passed" if bool(proof.get("passed")) else "failed",
-            details="Generic API workflow proof checked GET/POST persistence and update visibility before browser UI proof.",
+            details="Generic API workflow proof checked prompt-derived API persistence before browser UI proof.",
             command="api workflow smoke",
             logs=logs,
             diagnostics=diagnostics,
@@ -2332,6 +2355,8 @@ class CheckRunner:
             "steps": proof.get("ui_steps") or proof.get("steps") or [],
             "ui_steps": proof.get("ui_steps") or [],
             "api_paths": proof.get("api_paths") or [],
+            "persisted_state_marker": proof.get("persisted_state_marker") or proof.get("created_marker") or proof.get("created_state_marker"),
+            "update_state_marker": proof.get("update_state_marker") or proof.get("updated_marker") or proof.get("updated_state_marker"),
             "created_state_marker": proof.get("created_state_marker") or proof.get("created_marker"),
             "updated_state_marker": proof.get("updated_state_marker") or proof.get("updated_marker"),
             "created_marker": proof.get("created_marker") or proof.get("created_state_marker"),
@@ -2625,7 +2650,7 @@ def discover_api():
     if not GET_API_PATHS:
         fail("api_discovery", "No GET /api resource is discoverable for browser UI proof.")
     if not API_PATHS:
-        fail("api_discovery", "No GET+POST /api resource is discoverable for the source role create proof.")
+        fail("api_discovery", "No read/write /api resource is discoverable for prompt-derived persisted workflow proof.")
     BASE_API_PATH = API_PATHS[0]
 
 
@@ -3015,10 +3040,10 @@ def run_flow(page):
         )
     created_id = find_id(created_item)
     if created_id is None:
-        fail("created_id_missing", "Created UI state does not expose an id usable by another role action.", page, failed_role=source_role, api_after=after_create)
+        fail("persisted_id_missing", "Persisted UI state does not expose an id usable by another role action.", page, failed_role=source_role, api_after=after_create)
     has_marker, route, text = role_has_marker(page, source_role, CREATED_MARKER)
     if not has_marker:
-        fail(f"{source_role}_refresh_visibility_ui", f"{source_role} UI did not show the created marker after reload, although API state exists.", page, failed_role=source_role, failed_route=route, api_after=after_create)
+        fail(f"{source_role}_refresh_visibility_ui", f"{source_role} UI did not show the persisted proof marker after reload, although API state exists.", page, failed_role=source_role, failed_route=route, api_after=after_create)
 
     API_AFTER = after_create
     update_markers = {}
@@ -3048,7 +3073,7 @@ def run_flow(page):
         if role in {source_role, *OBSERVER_ROLES} and not created_visible:
             fail(
                 "role_created_state_visibility_ui",
-                f"{role} UI did not show the source-created shared state after reload.",
+                f"{role} UI did not show the source role's prompt-derived shared state after reload.",
                 page,
                 failed_role=role,
                 failed_route=visible_route,
@@ -3453,9 +3478,9 @@ try:
         after_create_json = after_create.json()
         created_item = find_created(after_create_json, marker, created_id)
         if created_item is None:
-            fail("create_persistence", f"POST {base_path} did not persist a discoverable item/state through later GET.", api_paths=api_paths, api_before=before_json, api_after=after_create_json)
+            fail("write_persistence", f"POST {base_path} did not persist a discoverable prompt-derived item/state through later GET.", api_paths=api_paths, api_before=before_json, api_after=after_create_json)
         created_id = created_id or find_id(created_item)
-        STEPS.append({"step": "create_persistence", "path": base_path, "status": after_create.status_code, "id": created_id})
+        STEPS.append({"step": "write_persistence", "path": base_path, "status": after_create.status_code, "id": created_id})
 
         update_template, method = update_path_for(OPENAPI, base_path)
         if not update_template:
@@ -3469,11 +3494,11 @@ try:
                 "api_before": before_json,
                 "api_after": after_create_json,
                 "steps": STEPS,
-                "logs": [f"Generic workflow proof passed create/list persistence through {base_path}; no app-owned update route was required or discovered."],
+                "logs": [f"Generic workflow proof passed prompt-derived write/read persistence through {base_path}; no app-owned update route was required or discovered."],
             }, ensure_ascii=False))
             sys.exit(0)
         if created_id is None:
-            fail("created_id", "Created state did not expose an id-like field usable for the discovered update route.", api_paths=api_paths, api_after=after_create_json)
+            fail("persisted_id", "Persisted state did not expose an id-like field usable for the discovered update route.", api_paths=api_paths, api_after=after_create_json)
         update_path = concrete(update_template, created_id)
         update_payload = build_payload(OPENAPI, update_template, method, update_marker, "update")
         update = getattr(client, method)(update_path, json=update_payload)
@@ -3485,7 +3510,7 @@ try:
         after_update_json = after_update.json()
         updated_item = find_created(after_update_json, marker, created_id)
         if updated_item is None:
-            fail("post_update_visibility", "Shared GET state could not find the created entity after update.", api_paths=api_paths, api_after=after_update_json)
+            fail("post_update_visibility", "Shared GET state could not find the persisted entity after update.", api_paths=api_paths, api_after=after_update_json)
         update_visible = any(contains_marker(updated_item.get(key) if isinstance(updated_item, dict) else updated_item, str(value)) for key, value in update_payload.items())
         if not update_visible and not contains_marker(updated_item, update_marker):
             if isinstance(updated_item, dict) and update_payload:
@@ -3666,8 +3691,8 @@ except Exception as exc:
                 elif isinstance(post_persistence_failure, dict):
                     path = str(post_persistence_failure.get("path") or "").strip()
                     resource_slug = str(post_persistence_failure.get("resource_slug") or "").strip()
-                    resource_label = path or (f"/api/{resource_slug}" if resource_slug else "created record API")
-                    message = f"Generated app POST persistence failure: {resource_label} did not persist the created record."
+                    resource_label = path or (f"/api/{resource_slug}" if resource_slug else "prompt-derived API")
+                    message = f"Generated app POST persistence failure: {resource_label} did not persist the submitted state."
                 elif isinstance(api_failure, dict):
                     method = str(api_failure.get("method") or "").strip().upper()
                     path = str(api_failure.get("path") or "").strip()
@@ -4682,7 +4707,7 @@ except Exception as exc:
             issues.append(
                 ValidationIssue(
                     code="platform.missing_create_get_api",
-                    message="Create runs must expose at least one GET /api resource so saved user-created state can be listed.",
+                    message="Create runs must expose at least one read /api resource so prompt-derived saved state can be loaded.",
                     severity="high",
                     location="miniapp/app/routes",
                     blocking=True,
@@ -4692,7 +4717,7 @@ except Exception as exc:
             issues.append(
                 ValidationIssue(
                     code="platform.missing_create_post_api",
-                    message="Create runs must expose at least one POST /api resource so users can save new state.",
+                    message="Create runs must expose at least one write /api resource so users can save prompt-derived state.",
                     severity="high",
                     location="miniapp/app/routes",
                     blocking=True,
@@ -5726,6 +5751,342 @@ except Exception as exc:
             details="No changed-file static checks were required.",
         )
 
+    def _lsp_static_diagnostics(self, *, source_dir: Path, focused_css_only: bool = False) -> RunCheckResult:
+        items: list[dict[str, Any]] = []
+        logs: list[str] = []
+        tool_status: dict[str, Any] = {}
+        backend_dir = source_dir / "miniapp"
+        app_dir = backend_dir / "app"
+
+        if focused_css_only:
+            return RunCheckResult(
+                name="lsp_static_diagnostics",
+                status="skipped",
+                details="LSP-like diagnostics were skipped for a focused CSS-only edit.",
+                command="python -m py_compile; node --check; selector/API static diagnostics",
+                logs=["Focused CSS-only edit: Python, JS, selector, and API diagnostics skipped."],
+                diagnostics={"items": [], "tool_status": {"focused_css_only": "skipped"}},
+            )
+
+        py_files = sorted(app_dir.rglob("*.py")) if app_dir.exists() else []
+        py_checked = 0
+        for py_file in py_files[:120]:
+            py_checked += 1
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "py_compile", str(py_file.relative_to(backend_dir))],
+                    cwd=backend_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+            except subprocess.TimeoutExpired as exc:
+                items.append(
+                    self._diagnostic_item(
+                        source="python_compile",
+                        severity="error",
+                        file_path=py_file,
+                        root=source_dir,
+                        message="Python compile timed out.",
+                        details="\n".join(self._command_logs("Python compile timed out.", exc.stdout or "", exc.stderr or "", tail_lines=8)),
+                    )
+                )
+                continue
+            if result.returncode != 0:
+                items.append(
+                    self._diagnostic_item(
+                        source="python_compile",
+                        severity="error",
+                        file_path=py_file,
+                        root=source_dir,
+                        message=self._first_meaningful_line(result.stderr or result.stdout) or "Python compile failed.",
+                        details="\n".join(self._command_logs("Python compile failed.", result.stdout, result.stderr, tail_lines=8)),
+                    )
+                )
+        tool_status["python_compile"] = {"status": "checked", "file_count": py_checked, "truncated": len(py_files) > py_checked}
+
+        node_binary = shutil.which("node") or shutil.which("nodejs")
+        static_dir = app_dir / "static"
+        js_files = sorted(static_dir.rglob("*.js")) if static_dir.exists() else []
+        if node_binary:
+            js_checked = 0
+            for js_file in js_files[:120]:
+                js_checked += 1
+                try:
+                    result = subprocess.run(
+                        [node_binary, "--check", str(js_file.relative_to(backend_dir))],
+                        cwd=backend_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=8,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    items.append(
+                        self._diagnostic_item(
+                            source="node_check",
+                            severity="error",
+                            file_path=js_file,
+                            root=source_dir,
+                            message="JavaScript syntax check timed out.",
+                            details="\n".join(self._command_logs("JavaScript syntax check timed out.", exc.stdout or "", exc.stderr or "", tail_lines=8)),
+                        )
+                    )
+                    continue
+                if result.returncode != 0:
+                    items.append(
+                        self._diagnostic_item(
+                            source="node_check",
+                            severity="error",
+                            file_path=js_file,
+                            root=source_dir,
+                            message=self._first_meaningful_line(result.stderr or result.stdout) or "JavaScript syntax check failed.",
+                            details="\n".join(self._command_logs("JavaScript syntax check failed.", result.stdout, result.stderr, tail_lines=8)),
+                        )
+                    )
+            tool_status["node_check"] = {"status": "checked", "file_count": js_checked, "truncated": len(js_files) > js_checked}
+        else:
+            tool_status["node_check"] = {"status": "unavailable", "message": "node was not found on PATH"}
+
+        items.extend(self._selector_static_diagnostics(source_dir=source_dir, js_files=js_files[:120]))
+        items.extend(self._api_route_static_diagnostics(source_dir=source_dir, js_files=js_files[:120]))
+        self._append_optional_lsp_tool_diagnostics(source_dir=source_dir, backend_dir=backend_dir, items=items, tool_status=tool_status)
+
+        error_count = sum(1 for item in items if item.get("severity") == "error")
+        warning_count = sum(1 for item in items if item.get("severity") == "warning")
+        if error_count:
+            status = "failed"
+            details = f"LSP-like diagnostics found {error_count} blocking issue(s)."
+        else:
+            status = "passed"
+            details = "LSP-like diagnostics completed without blocking issues."
+        logs.append(f"Python files checked: {tool_status.get('python_compile', {}).get('file_count', 0)}.")
+        logs.append(f"JavaScript files checked: {tool_status.get('node_check', {}).get('file_count', 0)}.")
+        logs.append(f"Diagnostics: {error_count} error(s), {warning_count} warning(s).")
+        for item in items[:12]:
+            location = str(item.get("file") or "")
+            line = item.get("line")
+            if line:
+                location = f"{location}:{line}"
+            logs.append(f"{item.get('severity', 'info')}: {location}: {item.get('message', '')}")
+        return RunCheckResult(
+            name="lsp_static_diagnostics",
+            status=status,
+            details=details,
+            command="python -m py_compile; node --check; selector/API static diagnostics",
+            logs=logs,
+            diagnostics={"items": items[:200], "tool_status": tool_status, "error_count": error_count, "warning_count": warning_count},
+        )
+
+    def _selector_static_diagnostics(self, *, source_dir: Path, js_files: list[Path]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for js_file in js_files:
+            try:
+                relative = js_file.relative_to(source_dir).as_posix()
+                js_content = js_file.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                continue
+            dom_ids = extract_js_dom_ids(js_content)
+            if not dom_ids:
+                continue
+            html_ids = role_html_ids(source_dir, relative)
+            if not html_ids:
+                continue
+            missing = sorted(dom_ids - html_ids)
+            for dom_id in missing[:20]:
+                items.append(
+                    self._diagnostic_item(
+                        source="selector_static",
+                        severity="error",
+                        file_path=js_file,
+                        root=source_dir,
+                        message=f"JavaScript references missing DOM id #{dom_id}.",
+                        code="missing_dom_id",
+                        data={"selector": f"#{dom_id}"},
+                    )
+                )
+        return items
+
+    def _api_route_static_diagnostics(self, *, source_dir: Path, js_files: list[Path]) -> list[dict[str, Any]]:
+        declared_routes = extract_declared_routes(source_dir / "miniapp" / "app" / "routes", api_only=True)
+        items: list[dict[str, Any]] = []
+        for js_file in js_files:
+            try:
+                js_content = js_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            for method, path in sorted(extract_frontend_api_refs(js_content)):
+                normalized_ref = (method.upper(), normalize_api_path(path))
+                if not declared_routes:
+                    items.append(
+                        self._diagnostic_item(
+                            source="api_route_static",
+                            severity="error",
+                            file_path=js_file,
+                            root=source_dir,
+                            message=f"Frontend calls {normalized_ref[0]} {normalized_ref[1]}, but no API routes are declared.",
+                            code="missing_backend_route",
+                            data={"method": normalized_ref[0], "path": normalized_ref[1]},
+                        )
+                    )
+                    continue
+                if normalized_ref in declared_routes:
+                    continue
+                if self._route_ref_has_compatible_template(normalized_ref, declared_routes):
+                    continue
+                items.append(
+                    self._diagnostic_item(
+                        source="api_route_static",
+                        severity="error",
+                        file_path=js_file,
+                        root=source_dir,
+                        message=f"Frontend calls undeclared API route {normalized_ref[0]} {normalized_ref[1]}.",
+                        code="missing_backend_route",
+                        data={"method": normalized_ref[0], "path": normalized_ref[1]},
+                    )
+                )
+        return items
+
+    def _append_optional_lsp_tool_diagnostics(
+        self,
+        *,
+        source_dir: Path,
+        backend_dir: Path,
+        items: list[dict[str, Any]],
+        tool_status: dict[str, Any],
+    ) -> None:
+        ruff_binary = shutil.which("ruff")
+        if ruff_binary and (backend_dir / "app").exists():
+            try:
+                result = subprocess.run(
+                    [ruff_binary, "check", "app", "--output-format=json"],
+                    cwd=backend_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=25,
+                )
+                tool_status["ruff"] = {"status": "checked", "exit_code": result.returncode}
+                for issue in self._parse_ruff_json(result.stdout)[:80]:
+                    file_path = backend_dir / str(issue.get("filename") or "")
+                    items.append(
+                        self._diagnostic_item(
+                            source="ruff",
+                            severity="warning",
+                            file_path=file_path,
+                            root=source_dir,
+                            message=str(issue.get("message") or "ruff diagnostic"),
+                            line=issue.get("location", {}).get("row") if isinstance(issue.get("location"), dict) else None,
+                            column=issue.get("location", {}).get("column") if isinstance(issue.get("location"), dict) else None,
+                            code=str(issue.get("code") or ""),
+                        )
+                    )
+            except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+                tool_status["ruff"] = {"status": "failed", "message": str(exc)}
+        else:
+            tool_status["ruff"] = {"status": "unavailable"}
+
+        pyright_binary = shutil.which("pyright")
+        if pyright_binary and (backend_dir / "app").exists():
+            try:
+                result = subprocess.run(
+                    [pyright_binary, "--outputjson", "app"],
+                    cwd=backend_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=35,
+                )
+                tool_status["pyright"] = {"status": "checked", "exit_code": result.returncode}
+                for issue in self._parse_pyright_json(result.stdout)[:80]:
+                    file_path = Path(str(issue.get("file") or ""))
+                    items.append(
+                        self._diagnostic_item(
+                            source="pyright",
+                            severity="warning",
+                            file_path=file_path,
+                            root=source_dir,
+                            message=str(issue.get("message") or "pyright diagnostic"),
+                            line=int((issue.get("range") or {}).get("start", {}).get("line", 0)) + 1
+                            if isinstance(issue.get("range"), dict)
+                            else None,
+                            column=int((issue.get("range") or {}).get("start", {}).get("character", 0)) + 1
+                            if isinstance(issue.get("range"), dict)
+                            else None,
+                            code=str(issue.get("rule") or ""),
+                        )
+                    )
+            except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+                tool_status["pyright"] = {"status": "failed", "message": str(exc)}
+        else:
+            tool_status["pyright"] = {"status": "unavailable"}
+
+    @staticmethod
+    def _parse_ruff_json(raw: str) -> list[dict[str, Any]]:
+        parsed = json.loads(raw or "[]")
+        return parsed if isinstance(parsed, list) else []
+
+    @staticmethod
+    def _parse_pyright_json(raw: str) -> list[dict[str, Any]]:
+        parsed = json.loads(raw or "{}")
+        diagnostics = parsed.get("generalDiagnostics") if isinstance(parsed, dict) else []
+        return diagnostics if isinstance(diagnostics, list) else []
+
+    @staticmethod
+    def _diagnostic_item(
+        *,
+        source: str,
+        severity: str,
+        file_path: Path,
+        root: Path,
+        message: str,
+        line: Any = None,
+        column: Any = None,
+        code: str = "",
+        details: str = "",
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            relative = file_path.relative_to(root).as_posix()
+        except ValueError:
+            relative = file_path.as_posix()
+        payload: dict[str, Any] = {
+            "source": source,
+            "severity": severity,
+            "file": relative,
+            "message": message,
+        }
+        if code:
+            payload["code"] = code
+        if line:
+            payload["line"] = line
+        if column:
+            payload["column"] = column
+        if details:
+            payload["details"] = details
+        if data:
+            payload["data"] = data
+        return payload
+
+    @staticmethod
+    def _first_meaningful_line(text: str) -> str:
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if stripped:
+                return stripped[:300]
+        return ""
+
+    @staticmethod
+    def _route_ref_has_compatible_template(ref: tuple[str, str], declared_routes: set[tuple[str, str]]) -> bool:
+        method, path = ref
+        ref_parts = [part for part in path.split("/") if part]
+        for declared_method, declared_path in declared_routes:
+            if method != declared_method:
+                continue
+            declared_parts = [part for part in declared_path.split("/") if part]
+            if len(ref_parts) != len(declared_parts):
+                continue
+            if all(left == right or "{param}" in {left, right} or (left.startswith("{") and right.startswith("{")) for left, right in zip(ref_parts, declared_parts)):
+                return True
+        return False
+
     def _run_python_app_tests(self, backend_dir: Path, *, require_present: bool = False) -> RunCheckResult:
         test_file = backend_dir / "tests" / "test_generated_app.py"
         if not test_file.exists():
@@ -6721,7 +7082,7 @@ except Exception as exc:
                 "path": path or None,
                 "resource_slug": cls._resource_slug_from_api_path(path) or cls._resource_slug_from_payload_keys(payload) or None,
                 "payload_excerpt": payload[:700] or None,
-                "expected_behavior": "A generated create API must persist the POSTed record so a later GET returns it.",
+                "expected_behavior": "A generated API must persist the prompt-derived write payload so a later read returns it.",
             }
             break
         for line in reversed(logs):

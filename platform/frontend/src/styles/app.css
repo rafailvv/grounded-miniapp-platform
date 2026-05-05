@@ -1099,6 +1099,7 @@ button:disabled {
 
 .timeline-list,
 .worker-lanes,
+.task-lane,
 .doctor-grid {
   display: grid;
   gap: 10px;
@@ -1106,11 +1107,60 @@ button:disabled {
 
 .timeline-event,
 .worker-lane,
+.task-lane-item,
 .doctor-check {
   border: 1px solid var(--border);
   border-radius: 12px;
   background: #fff;
   padding: 12px;
+}
+
+.trace-bundle-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 10px;
+}
+
+.trace-bundle-grid > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid rgba(86, 102, 168, 0.14);
+  border-radius: 10px;
+  background: rgba(247, 249, 255, 0.92);
+  padding: 10px;
+}
+
+.trace-bundle-grid strong {
+  font-size: 18px;
+}
+
+.trace-bundle-grid span,
+.task-lane-meta,
+.task-lane-item small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.task-lane-top,
+.task-lane-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.task-lane-item {
+  display: grid;
+  gap: 8px;
+}
+
+.task-blocker {
+  margin: 0;
+  color: #9f2f2f;
+  overflow-wrap: anywhere;
 }
 
 .command-palette-backdrop {

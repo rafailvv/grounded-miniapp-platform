@@ -32,6 +32,7 @@ from app.models.domain import (
 from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
+from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.miniapp_contract import MiniAppContractCompiler
 from app.services.run_state_machine import RunStateMachine
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, orchestration_metadata_for_contract
@@ -175,7 +176,11 @@ class RunService:
         prompt_analysis: dict[str, Any] | None = None
         prompt_analysis_usage: dict[str, Any] = {}
         prompt_analysis_model: str | None = None
-        requires_prompt_analysis = resolved_intent == "create" or focused_edit_kind == "behavior_workflow_edit"
+        requires_prompt_analysis = (
+            resolved_intent == "create"
+            or focused_edit_kind == "behavior_workflow_edit"
+            or effective_generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
+        )
         if requires_prompt_analysis:
             if not self.openai_client.enabled:
                 raise RuntimeError("LLM prompt analysis is required before creating a workflow run.")
@@ -271,6 +276,18 @@ class RunService:
                     "status": "compiled",
                     "contract_id": miniapp_contract.contract_id,
                     "contract_owned_paths": miniapp_contract.allowed_file_graph.contract_owned_paths,
+                },
+            )
+        if acceptance_contract.get("required") or request.mode == "generate":
+            self.store.upsert(
+                "reports",
+                f"acceptance_contract:{workspace_id}:{run.run_id}",
+                {
+                    "workspace_id": workspace_id,
+                    "run_id": run.run_id,
+                    "contract": run.acceptance_contract,
+                    "implementation_plan": implementation_plan,
+                    "orchestration": orchestration,
                 },
             )
         self._save_run(run)
@@ -1539,6 +1556,8 @@ class RunService:
                 )
             self._save_run(run)
             self._store_run_artifacts(run, change_plan, job, preview)
+            if run.status in TERMINAL_RUN_STATUSES or run.apply_status in {"applied", "blocked", "failed"}:
+                self._extract_run_memory_stage1(run)
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
             logger.info(
                 "run_finished run_id=%s workspace_id=%s status=%s progress=%s",
@@ -1566,6 +1585,10 @@ class RunService:
             run.updated_at = datetime.now(timezone.utc)
             linked_job_id = self._resolve_linked_job_id(run)
             self._save_run(run)
+            try:
+                self._extract_run_memory_stage1(run)
+            except Exception:
+                logger.exception("memory_stage1_extract_failed run_id=%s workspace_id=%s", run.run_id, run.workspace_id)
             if linked_job_id:
                 try:
                     job = self.code_agent_runtime.get_job(linked_job_id)
@@ -2114,6 +2137,13 @@ class RunService:
         run.storage_version = 2
         run.artifact_storage_ref = self.store.expected_storage_ref("reports", f"run_artifacts:{run.run_id}")
         self._save_run(run)
+
+    def _extract_run_memory_stage1(self, run: RunRecord) -> None:
+        artifacts = self.store.get("reports", f"run_artifacts:{run.run_id}")
+        if not isinstance(artifacts, dict):
+            artifacts = {}
+        payload = WorkspaceMemoryPipeline.extract_run(run, artifacts)
+        self.store.upsert("reports", f"memory_stage1:{run.workspace_id}:{run.run_id}", payload)
 
     def _resolve_intent(self, workspace: WorkspaceRecord, request: CreateRunRequest, *, resolved_role_scope: list[str] | None = None) -> str:
         if request.intent != "auto":

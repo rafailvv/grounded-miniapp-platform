@@ -87,7 +87,7 @@ class ServiceContainer:
             self.openai_client,
             self.workspace_log_service,
         )
-        self.exec_policy_service = ExecPolicyService()
+        self.exec_policy_service = ExecPolicyService(self.settings.runtime_dir / "policies" / "agent_exec_policy.json")
         self.exec_runtime_service = ExecRuntimeService(
             workspace_service=self.workspace_service,
             platform_db=self.platform_db,

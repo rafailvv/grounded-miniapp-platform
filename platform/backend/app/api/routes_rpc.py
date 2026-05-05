@@ -164,9 +164,11 @@ async def _dispatch(container: ServiceContainer, method: str, params: dict[str, 
     if method == "model/list":
         return container.openai_client.configuration()
     if method == "skills/list":
-        return {"items": []}
+        return container.workbench_service.skills()
+    if method == "slash_commands/list":
+        return container.workbench_service.slash_commands()
     if method == "plugin/list":
-        return {"items": []}
+        return container.workbench_service.plugins()
     raise RpcError(-32601, f"Unknown method: {method}")
 
 

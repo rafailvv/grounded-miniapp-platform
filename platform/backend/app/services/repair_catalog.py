@@ -21,6 +21,8 @@ class RepairCatalogEntry:
     verification_command: str = "run_checks"
     retry_policy: str = "deterministic_repair"
     deterministic: bool = True
+    forbidden_tools_once: tuple[str, ...] = field(default_factory=tuple)
+    expected_proof: str | None = None
     patterns: tuple[re.Pattern[str], ...] = field(default_factory=tuple)
 
     def packet(self, *, evidence: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -52,7 +54,8 @@ class RepairCatalogEntry:
             "failure_class": str(evidence_payload.get("failure_class") or self.verification_check),
             "failure_signature": str(evidence_payload.get("failure_signature") or self.signature),
             "repair_recipe_id": f"catalog.{self.issue_code}",
-            "forbidden_tools_once": [],
+            "forbidden_tools_once": list(self.forbidden_tools_once),
+            "expected_proof": self.expected_proof or self.verification_check,
             "next_forced_action": {
                 "required_next_tool": self.required_next_tool,
                 "target_files": target_files,
@@ -124,6 +127,31 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         patterns=(_rx(r"missing_backend_route"), _rx(r"frontend.*api.*missing"), _rx(r"404")),
     ),
     RepairCatalogEntry(
+        signature="edit.stale_read_state",
+        issue_code="stale_edit_read_state_failure",
+        severity="high",
+        likely_root_cause="The patch was based on stale file contents or attempted to edit a file that was not freshly read.",
+        target_files=("miniapp/app/**",),
+        verification_check="edit_validator",
+        instruction=(
+            "Read the exact target files again, compare the current content to the intended patch, then make a minimal patch against the fresh state. "
+            "Do not retry the same stale edit payload."
+        ),
+        required_next_tool="read_files",
+        suggested_tool_after_read="apply_patch_to_draft_or_write_file",
+        verification_command="run_checks changed_files_static",
+        retry_policy="refresh_read_before_retry",
+        forbidden_tools_once=("apply_patch_to_draft", "write_file"),
+        expected_proof="fresh read evidence plus successful changed_files_static check",
+        patterns=(
+            _rx(r"stale(?: file| read| state)"),
+            _rx(r"old_string_not_found"),
+            _rx(r"file_not_read"),
+            _rx(r"partial_read"),
+            _rx(r"read state"),
+        ),
+    ),
+    RepairCatalogEntry(
         signature="backend.fastapi_response_model",
         issue_code="fastapi_response_model_error",
         severity="critical",
@@ -142,7 +170,7 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         likely_root_cause="Generated persistence code reads or writes a table/column that DB initialization does not create.",
         target_files=("miniapp/app/db.py", "miniapp/app/routes/**", "miniapp/app/schemas.py"),
         verification_check="api_workflow_smoke",
-        instruction="Update schema initialization and route SQL together, then verify create/list/update persistence.",
+        instruction="Update schema initialization and route SQL together, then verify prompt-derived persisted write/read/update behavior.",
         required_next_tool="read_files",
         verification_command="run_checks api_workflow_smoke",
         patterns=(_rx(r"no such table"), _rx(r"has no column named"), _rx(r"operationalerror")),
@@ -251,13 +279,34 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         patterns=(_rx(r"no(?: declared)? pages?.*role"), _rx(r"missing_role_page"), _rx(r"missing.*role.*page"), _rx(r"/(?:client|specialist|manager)")),
     ),
     RepairCatalogEntry(
+        signature="preview.boot_failed",
+        issue_code="preview_boot_failure",
+        severity="critical",
+        likely_root_cause="The generated FastAPI app cannot start, so browser proof cannot run.",
+        target_files=("miniapp/app/main.py", "miniapp/app/routes/**", "miniapp/app/db.py", "miniapp/app/schemas.py"),
+        verification_check="preview_boot_smoke",
+        instruction="Use the preview boot traceback to fix import-time, route registration, dependency, or DB initialization failures before touching UI flow code.",
+        required_next_tool="read_files",
+        suggested_tool_after_read="apply_patch_to_draft_or_write_file",
+        verification_command="run_checks preview_boot_smoke",
+        retry_policy="fix_boot_before_workflow_retry",
+        forbidden_tools_once=("browser_verify",),
+        expected_proof="preview_boot_smoke passes and the preview server returns a role page",
+        patterns=(
+            _rx(r"preview_boot_smoke"),
+            _rx(r"preview.*(?:boot|start).*fail"),
+            _rx(r"runtime did not start"),
+            _rx(r"traceback.*uvicorn"),
+        ),
+    ),
+    RepairCatalogEntry(
         signature="preview.browser_flow_failed",
         issue_code="failed_browser_flow_step",
         severity="critical",
         likely_root_cause="The product workflow could not be completed in browser proof.",
         target_files=("miniapp/app/static/**", "miniapp/app/routes/**", "miniapp/app/db.py"),
         verification_check="browser_flow_smoke",
-        instruction="Use the failed browser step evidence to fix the exact create/update/list/reload interaction, then rerun browser proof.",
+        instruction="Use the failed browser step evidence to fix the exact prompt-derived interaction and reload proof, then rerun browser proof.",
         required_next_tool="read_files",
         verification_command="browser_verify",
         patterns=(_rx(r"browser_flow_smoke"), _rx(r"workflow_flow_failed"), _rx(r"browser proof")),
@@ -273,6 +322,26 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         required_next_tool="read_files",
         verification_command="browser_verify",
         patterns=(_rx(r"did not persist"), _rx(r"not reflect.*shared state"), _rx(r"api_workflow")),
+    ),
+    RepairCatalogEntry(
+        signature="api.workflow_smoke_failed",
+        issue_code="api_workflow_smoke_failed",
+        severity="critical",
+        likely_root_cause="The prompt-derived API workflow fails or returns an unexpected persisted marker.",
+        target_files=("miniapp/app/routes/**", "miniapp/app/db.py", "miniapp/app/schemas.py", "miniapp/app/static/**/app.js", "miniapp/tests/test_generated_app.py"),
+        verification_check="api_workflow_smoke",
+        instruction="Align the API route, schema, persistence writes, and frontend payload contract so the expected prompt-derived markers survive a fresh read.",
+        required_next_tool="read_files",
+        suggested_tool_after_read="apply_patch_to_draft_or_write_file",
+        verification_command="run_checks api_workflow_smoke",
+        retry_policy="repair_api_then_browser",
+        forbidden_tools_once=("browser_verify",),
+        expected_proof="api_workflow_smoke passes with the expected prompt-derived persisted markers",
+        patterns=(
+            _rx(r"(?:create|update|list|post-update list|post-create list)\s+api\s+failed"),
+            _rx(r"api_workflow_smoke"),
+            _rx(r"expected persisted marker"),
+        ),
     ),
     RepairCatalogEntry(
         signature="workflow.missing_role_actions",
@@ -370,6 +439,29 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         ),
     ),
     RepairCatalogEntry(
+        signature="workflow.shared_role_state_broken",
+        issue_code="broken_shared_role_state",
+        severity="high",
+        likely_root_cause="Client, specialist, and manager surfaces are no longer reading or writing the same backend state contract.",
+        target_files=("miniapp/app/routes/**", "miniapp/app/db.py", "miniapp/app/static/client/app.js", "miniapp/app/static/specialist/app.js", "miniapp/app/static/manager/app.js"),
+        verification_check="frontend_interaction_static_smoke",
+        instruction="Trace the shared entity from create payload through backend persistence and every role renderer; repair the first role that diverges from the shared state contract.",
+        required_next_tool="read_files",
+        suggested_tool_after_read="apply_patch_to_draft_or_write_file",
+        verification_command="run_checks frontend_interaction_static_smoke",
+        retry_policy="repair_shared_state_contract",
+        expected_proof="role-specific generated tests and frontend interaction smoke show the same persisted marker across roles",
+        patterns=(
+            _rx(r"broken shared role state"),
+            _rx(r"shared role state"),
+            _rx(r"persisted_marker"),
+            _rx(r"update_marker"),
+            _rx(r"created_marker"),
+            _rx(r"updated_marker"),
+            _rx(r"role state.*(?:diverge|broken|missing)"),
+        ),
+    ),
+    RepairCatalogEntry(
         signature="workflow.payload_schema_mismatch",
         issue_code="workflow_patch_payload_field_mismatch",
         severity="high",
@@ -447,6 +539,7 @@ class RepairCatalog:
             "failure_signature": str(issue.get("failure_signature") or issue.get("signature") or "generation.unknown_failure"),
             "repair_recipe_id": str(issue.get("repair_recipe_id") or f"catalog.{issue.get('code') or issue.get('check') or 'unknown_failure'}"),
             "forbidden_tools_once": list(issue.get("forbidden_tools_once") or []),
+            "expected_proof": str(issue.get("expected_proof") or issue.get("check") or "rerun failing check successfully"),
             "next_forced_action": {
                 "required_next_tool": str(issue.get("required_next_tool") or "read_files"),
                 "target_files": list(issue.get("paths") or []),

@@ -74,10 +74,21 @@ class VerificationWorker:
                 ui_steps = diagnostics.get("ui_steps") or diagnostics.get("steps") or []
                 if not isinstance(ui_steps, list) or not ui_steps:
                     issues.append({"kind": "browser_proof_missing_ui_steps", "check": "browser_flow_smoke"})
-                if not (diagnostics.get("created_marker") or diagnostics.get("created_state_marker")):
-                    issues.append({"kind": "browser_proof_missing_created_marker", "check": "browser_flow_smoke"})
-                if not (diagnostics.get("updated_marker") or diagnostics.get("updated_state_marker")):
-                    issues.append({"kind": "browser_proof_missing_updated_marker", "check": "browser_flow_smoke"})
+                if not (
+                    diagnostics.get("persisted_marker")
+                    or diagnostics.get("persisted_state_marker")
+                    or diagnostics.get("created_marker")
+                    or diagnostics.get("created_state_marker")
+                ):
+                    issues.append({"kind": "browser_proof_missing_persisted_marker", "check": "browser_flow_smoke"})
+                features = dict((acceptance_contract or {}).get("features") or {})
+                if features.get("workflow_update") and not (
+                    diagnostics.get("update_marker")
+                    or diagnostics.get("update_state_marker")
+                    or diagnostics.get("updated_marker")
+                    or diagnostics.get("updated_state_marker")
+                ):
+                    issues.append({"kind": "browser_proof_missing_update_marker", "check": "browser_flow_smoke"})
                 mobile = diagnostics.get("mobile_layout")
                 if isinstance(mobile, dict) and (mobile.get("horizontal_overflow") or mobile.get("critical_overlap")):
                     issues.append({"kind": "mobile_layout_failed", "diagnostics": mobile})

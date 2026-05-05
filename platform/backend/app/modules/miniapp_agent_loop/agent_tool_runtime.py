@@ -4,7 +4,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from app.modules.miniapp_agent_loop.agent_command_policy import DEFAULT_COMMAND_POLICY, decide_workspace_command
+from app.modules.miniapp_agent_loop.agent_command_policy import command_policy_snapshot as current_command_policy_snapshot
+from app.modules.miniapp_agent_loop.agent_command_policy import decide_workspace_command
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
 
@@ -187,4 +188,4 @@ def run_workspace_command(
 
 
 def command_policy_snapshot() -> dict[str, object]:
-    return DEFAULT_COMMAND_POLICY.snapshot()
+    return current_command_policy_snapshot()

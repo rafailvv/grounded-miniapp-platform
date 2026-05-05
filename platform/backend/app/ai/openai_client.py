@@ -197,7 +197,7 @@ class OpenAIClient:
                     "routeable_screen_plan": {
                         "multi_page_recommended": True,
                         "roles": {
-                            "client": [{"intent": "overview|create_or_configure|list_or_queue|detail_or_update|summary_or_insight", "purpose": "why this screen exists", "source": ["prompt phrase"]}],
+                            "client": [{"intent": "overview|create_or_configure|list_or_read|detail_or_update|summary_or_insight", "purpose": "why this screen exists", "source": ["prompt phrase"]}],
                             "specialist": [],
                             "manager": [],
                         },

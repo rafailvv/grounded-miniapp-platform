@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import importlib
+import pkgutil
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,7 @@ from app.routes.role_routes import router as role_router
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+ROUTES_DIR = BASE_DIR / "routes"
 
 
 @asynccontextmanager
@@ -26,6 +29,19 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(health_router)
 app.include_router(role_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+def include_generated_routers(target: FastAPI) -> None:
+    for module_info in pkgutil.iter_modules([str(ROUTES_DIR)]):
+        if module_info.name in {"health", "role_pages", "role_routes"} or module_info.name.startswith("_"):
+            continue
+        module = importlib.import_module(f"app.routes.{module_info.name}")
+        router = getattr(module, "router", None)
+        if router is not None:
+            target.include_router(router)
+
+
+include_generated_routers(app)
 
 
 @app.middleware("http")

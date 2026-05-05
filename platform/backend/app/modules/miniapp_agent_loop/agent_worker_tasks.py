@@ -24,7 +24,7 @@ class AgentWorkerTaskPlanner:
                 "depth": "deep",
                 "passes": ["green_workflow", "role_consistency", "mobile_design_polish", "fresh_verifier"],
                 "design_bar": "modern mobile product UI with polished spacing, states, responsive cards/forms/lists, no horizontal overflow, and consistent light theme across role apps unless explicitly requested otherwise",
-                "workflow_bar": "multiple prompt-derived role actions where useful, with create/list/update/summary proof and refresh persistence",
+                "workflow_bar": "multiple prompt-derived role actions where useful, with persisted write/read/update proof only when the prompt implies it",
                 "page_bar": "well-organized prompt-derived role pages with no long dashboard-only scrolls",
             }
         return {

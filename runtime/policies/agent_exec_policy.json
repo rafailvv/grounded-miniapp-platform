@@ -1,0 +1,40 @@
+{
+  "schema": "grounded.agent_exec_policy.v1",
+  "rules": [
+    {
+      "prefixes": [["python", "-m", "unittest"], ["python3", "-m", "unittest"], ["python", "-m", "py_compile"], ["python3", "-m", "py_compile"]],
+      "action": "allow",
+      "reason": "Python unit and compile diagnostics are allowed inside the draft workspace.",
+      "match": ["python -m unittest discover", "python3 -m py_compile miniapp/app/main.py"],
+      "not_match": ["python -m pip install fastapi"]
+    },
+    {
+      "prefixes": [["node", "--test"], ["node", "--check"]],
+      "action": "allow",
+      "reason": "Node diagnostics are allowed inside the draft workspace.",
+      "match": ["node --check miniapp/app/static/client/app.js", "node --test tests/generated_app.test.mjs"],
+      "not_match": ["node server.js"]
+    },
+    {
+      "prefixes": [["rg"], ["sed"], ["ls"]],
+      "action": "allow",
+      "reason": "Read-only workspace inspection commands are allowed.",
+      "match": ["rg api miniapp/app", "ls miniapp/app"],
+      "not_match": ["rm -rf miniapp"]
+    },
+    {
+      "prefixes": [["pip", "install"], ["pip3", "install"], ["python", "-m", "pip", "install"], ["python3", "-m", "pip", "install"], ["npm", "install"], ["npm", "i"], ["pnpm", "install"], ["pnpm", "add"], ["yarn", "install"], ["yarn", "add"]],
+      "action": "forbidden",
+      "reason": "Package installation is not an agent diagnostic command.",
+      "match": ["npm install", "python -m pip install requests"],
+      "not_match": ["python -m py_compile miniapp/app/main.py"]
+    },
+    {
+      "prefixes": [["rm"], ["git", "reset"], ["git", "clean"], ["git", "checkout", "--"], ["curl"], ["wget"], ["docker", "build"], ["docker", "run"], ["docker", "pull"], ["apt"], ["apt-get"], ["brew"]],
+      "action": "forbidden",
+      "reason": "The command can mutate, destroy, or fetch outside the draft diagnostic boundary.",
+      "match": ["rm -rf miniapp", "curl https://example.com"],
+      "not_match": ["git status"]
+    }
+  ]
+}

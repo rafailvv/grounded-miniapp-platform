@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import re
 from pathlib import PurePosixPath
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from app.modules.miniapp_agent_loop.agent_command_policy import DEFAULT_COMMAND_POLICY, CommandPolicyDecision
+from app.modules.miniapp_agent_loop.agent_command_policy import (
+    DEFAULT_COMMAND_POLICY,
+    AgentCommandPolicy,
+    CommandPolicyDecision,
+    configure_default_command_policy,
+)
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, ToolRisk
 
 
@@ -61,8 +67,25 @@ SECRET_PATTERNS = (
 class ExecPolicyService:
     """Central policy facade for command, path, and approval decisions."""
 
-    def __init__(self) -> None:
+    def __init__(self, policy_path: Path | None = None) -> None:
+        self.policy_source = str(policy_path) if policy_path else "builtin"
+        self.policy_status = "builtin"
+        self.policy_errors: list[str] = []
         self.policy = DEFAULT_COMMAND_POLICY
+        if policy_path is not None and policy_path.exists():
+            try:
+                loaded = AgentCommandPolicy.from_rule_file(policy_path)
+                examples = loaded.validation_examples()
+                failed = [item for item in examples if item.get("status") != "passed"]
+                if failed:
+                    raise ValueError(f"Policy examples failed: {failed[:3]}")
+                self.policy = loaded
+                self.policy_status = "loaded"
+            except Exception as exc:
+                self.policy_errors.append(str(exc))
+                self.policy_status = "fallback_builtin"
+                self.policy = DEFAULT_COMMAND_POLICY
+        configure_default_command_policy(self.policy)
 
     def snapshot(self) -> dict[str, Any]:
         payload = self.policy.snapshot()
@@ -79,6 +102,11 @@ class ExecPolicyService:
                     "path_traversal": "parent-directory traversal is denied",
                 },
                 "write_grants": self.write_grants(),
+                "policy_file": {
+                    "source": self.policy_source,
+                    "status": self.policy_status,
+                    "errors": list(self.policy_errors),
+                },
             }
         )
         return payload

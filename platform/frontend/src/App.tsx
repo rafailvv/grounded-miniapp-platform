@@ -15,6 +15,8 @@ import {
   getRunArtifacts,
   getRunTimeline,
   getRunTraceView,
+  getRunTraceBundle,
+  getRunTasks,
   getRunApprovals,
   getDoctorReport,
   getRunWorkers,
@@ -42,6 +44,8 @@ import {
   RunArtifacts,
   RunTimeline,
   RunTraceView,
+  TraceBundleReport,
+  RunTaskReport,
   ApprovalRecord,
   FileSearchResult,
   CommandPaletteAction,
@@ -63,6 +67,7 @@ import { DoctorPanel } from "./components/DoctorPanel";
 import { FileSearchPanel } from "./components/FileSearchPanel";
 import { MemoryPanel } from "./components/MemoryPanel";
 import { ReviewPanel } from "./components/ReviewPanel";
+import { TaskLanePanel } from "./components/TaskLanePanel";
 import { TimelinePanel } from "./components/TimelinePanel";
 import { TracePanel } from "./components/TracePanel";
 import { WorkbenchTabs } from "./components/WorkbenchTabs";
@@ -101,7 +106,7 @@ type PreviewHistoryState = {
 
 type RunComposerMode = "generate" | "fix";
 type UserGenerationMode = "fast" | "balanced" | "quality";
-type WorkbenchTab = "preview" | "timeline" | "trace" | "code" | "diff" | "logs" | "workers" | "review" | "checks" | "doctor" | "memory" | "search";
+type WorkbenchTab = "preview" | "timeline" | "tasks" | "trace" | "code" | "diff" | "logs" | "workers" | "review" | "checks" | "doctor" | "memory" | "search";
 
 type FixErrorContext = {
   raw_error: string;
@@ -1158,6 +1163,8 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<WorkbenchTab>("preview");
   const [runTimeline, setRunTimeline] = useState<RunTimeline | null>(null);
   const [runTraceView, setRunTraceView] = useState<RunTraceView | null>(null);
+  const [runTraceBundle, setRunTraceBundle] = useState<TraceBundleReport | null>(null);
+  const [runTaskReport, setRunTaskReport] = useState<RunTaskReport | null>(null);
   const [runApprovals, setRunApprovals] = useState<ApprovalRecord[]>([]);
   const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
   const [workerReport, setWorkerReport] = useState<WorkerReport | null>(null);
@@ -1447,6 +1454,8 @@ export default function App() {
     if (!activeRunId) {
       setRunTimeline(null);
       setRunTraceView(null);
+      setRunTraceBundle(null);
+      setRunTaskReport(null);
       setRunApprovals([]);
       setWorkerReport(null);
       setReviewReport(null);
@@ -1458,9 +1467,11 @@ export default function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [timeline, traceView, approvals, workers, review, matrix, contract, miniappContract] = await Promise.all([
+        const [timeline, traceView, traceBundle, tasks, approvals, workers, review, matrix, contract, miniappContract] = await Promise.all([
           getRunTimeline(activeRunId),
           getRunTraceView(activeRunId),
+          getRunTraceBundle(activeRunId),
+          getRunTasks(activeRunId),
           getRunApprovals(activeRunId),
           getRunWorkers(activeRunId),
           getRunReview(activeRunId),
@@ -1471,6 +1482,8 @@ export default function App() {
         if (!cancelled) {
           setRunTimeline(timeline);
           setRunTraceView(traceView);
+          setRunTraceBundle(traceBundle);
+          setRunTaskReport(tasks);
           setRunApprovals(approvals.items);
           setWorkerReport(workers);
           setReviewReport(review);
@@ -1482,6 +1495,8 @@ export default function App() {
         if (!cancelled) {
           setRunTimeline(null);
           setRunTraceView(null);
+          setRunTraceBundle(null);
+          setRunTaskReport(null);
           setRunApprovals([]);
           setWorkerReport(null);
           setReviewReport(null);
@@ -2320,15 +2335,19 @@ export default function App() {
 
   async function refreshWorkbenchPanels(runId: string) {
     try {
-      const [timeline, traceView, approvals, workers, review] = await Promise.all([
+      const [timeline, traceView, traceBundle, tasks, approvals, workers, review] = await Promise.all([
         getRunTimeline(runId),
         getRunTraceView(runId),
+        getRunTraceBundle(runId),
+        getRunTasks(runId),
         getRunApprovals(runId),
         getRunWorkers(runId),
         getRunReview(runId),
       ]);
       setRunTimeline(timeline);
       setRunTraceView(traceView);
+      setRunTraceBundle(traceBundle);
+      setRunTaskReport(tasks);
       setRunApprovals(approvals.items);
       setWorkerReport(workers);
       setReviewReport(review);
@@ -3364,7 +3383,7 @@ export default function App() {
                 </p>
               </header>
               <WorkbenchTabs
-                tabs={["preview", "timeline", "trace", "code", "diff", "logs", "workers", "review", "checks", "doctor", "memory", "search"] as const}
+                tabs={["preview", "timeline", "tasks", "trace", "code", "diff", "logs", "workers", "review", "checks", "doctor", "memory", "search"] as const}
                 activeTab={activeTab}
                 onChange={setActiveTab}
               />
@@ -3460,7 +3479,11 @@ export default function App() {
           ) : null}
 
           {activeTab === "trace" ? (
-            <TracePanel trace={runTraceView} />
+            <TracePanel trace={runTraceView} traceBundle={runTraceBundle} />
+          ) : null}
+
+          {activeTab === "tasks" ? (
+            <TaskLanePanel taskReport={runTaskReport} />
           ) : null}
 
           {activeTab === "preview" ? (

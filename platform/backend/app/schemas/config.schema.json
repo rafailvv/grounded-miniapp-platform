@@ -61,11 +61,37 @@
         "capabilities": {
           "type": "array",
           "items": {
-            "enum": ["validators", "exporters", "preview_adapters", "platform_adapters", "skills", "mcp_tools"]
+            "enum": [
+              "validators",
+              "exporters",
+              "preview_adapters",
+              "platform_adapters",
+              "skills",
+              "mcp_tools",
+              "slash_commands",
+              "acceptance_scenarios",
+              "visual_qa",
+              "trace_reducer",
+              "magic_docs"
+            ]
           }
         }
       },
       "additionalProperties": true
+    },
+    "generation_enhancements": {
+      "type": "object",
+      "properties": {
+        "project_instructions": { "type": "boolean", "default": true },
+        "runtime_skills": { "type": "boolean", "default": true },
+        "workspace_memory": { "type": "boolean", "default": true },
+        "magic_docs": { "type": "boolean", "default": true },
+        "slash_commands": { "type": "boolean", "default": true },
+        "acceptance_scenarios": { "type": "boolean", "default": true },
+        "visual_qa": { "type": "boolean", "default": true },
+        "trace_reducer": { "type": "boolean", "default": true }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

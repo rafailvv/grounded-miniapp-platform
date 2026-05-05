@@ -42,6 +42,9 @@ class StateStore:
         "worker_mailbox:",
         "scratchpad:",
         "agent_memory_store:",
+        "memory_stage1:",
+        "memory_pipeline:",
+        "memory_consolidation:",
         "worker_drafts:",
         "worker_merge:",
         "trace_bundle:",
@@ -60,6 +63,12 @@ class StateStore:
         "route_registry:",
         "contract_compile:",
         "repair_recipes:",
+        "project_instructions:",
+        "slash_commands:",
+        "slash_command:",
+        "acceptance_scenarios:",
+        "visual_qa:",
+        "magic_doc:",
     )
 
     def __init__(self, path: Path) -> None:

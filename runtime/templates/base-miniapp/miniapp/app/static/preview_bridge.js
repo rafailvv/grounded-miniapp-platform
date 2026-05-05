@@ -128,9 +128,9 @@ function buildPreviewHeaders(role = currentRole) {
   const normalizedRole = typeof role === "string" && role ? role : "client";
   const label = normalizedRole.charAt(0).toUpperCase() + normalizedRole.slice(1);
   return {
-    "X-User-Id": `${normalizedRole}-demo`,
+    "X-User-Id": `${normalizedRole}-preview`,
     "X-User-Role": normalizedRole,
-    "X-User-Name": `${label} Demo`,
+    "X-User-Name": `${label} Preview`,
     Accept: "application/json",
   };
 }

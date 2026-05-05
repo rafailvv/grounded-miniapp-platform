@@ -19,6 +19,20 @@ The agent reads the workspace, edits files through draft operations, runs checks
 - Frontend: `platform/frontend/`
 - Base mini-app template: `runtime/templates/base-miniapp/`
 
+## Generation Enhancement Layer
+
+The platform now exposes reusable generation-quality primitives inspired by mature coding-agent workflows:
+
+- Project instructions: `AGENTS.md` and template `AGENTS.md` are loaded into context summaries.
+- Runtime skill packs: `runtime/skills/*/SKILL.md` provide focused guidance for Telegram product generation, FastAPI persistence, mobile polish, repair, browser proof, and existing-app edits.
+- Persistent workspace memory: `/workspaces/{id}/memory` stores preferences, decisions, known failures, and stale-reference checks.
+- Slash commands: `/slash-commands` lists Workbench command contracts such as `/generate`, `/fix`, `/polish`, `/review`, `/acceptance`, `/visual-qa`, and `/docs`.
+- Acceptance scenarios: `/runs/{id}/acceptance-scenarios` derives proof scenarios from the run contract.
+- Visual QA: `/runs/{id}/visual-qa` combines static mobile checks with browser mobile diagnostics.
+- Trace reducer: `/runs/{id}/trace-reducer` summarizes phases, blockers, quality signals, changed files, and next action.
+- Magic Docs: `/workspaces/{id}/magic-docs/product-architecture` previews or writes the current product architecture doc.
+- Worker roles: `/system/worker-roles` formalizes planner, backend, role UI, tests, and verifier ownership.
+
 ## Generation Contract
 
 Generation, edit, fix, visual change, retry, and failed-check apply all use `WorkspaceCodeAgentRuntime`.

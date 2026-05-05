@@ -225,19 +225,6 @@ def _role_screen_plan(
                     "source": list(source_fields)[:6],
                 }
             )
-        if (
-            role == "manager"
-            and source_phrases
-            and mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
-        ):
-            if not any(item["intent"] == "summary_or_insight" for item in detected):
-                detected.append(
-                    {
-                        "intent": "summary_or_insight",
-                        "purpose": "prompt-derived management summary screen",
-                        "source": source_phrases[:3],
-                    }
-                )
         # De-duplicate while preserving order.
         unique: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -279,7 +266,11 @@ def build_acceptance_contract(
     intent_value = str(intent or "").strip().lower()
     mode_value = normalized_generation_mode(generation_mode)
     workflow_kind = str(focused_edit_kind or "").strip().lower()
-    requires_contract = intent_value == "create" or workflow_kind == "behavior_workflow_edit"
+    requires_contract = (
+        intent_value == "create"
+        or workflow_kind == "behavior_workflow_edit"
+        or mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
+    )
     if not requires_contract:
         return {
             "required": False,
@@ -303,7 +294,7 @@ def build_acceptance_contract(
             "roles": list(ROLE_ORDER),
             "requirements": [
                 "The agent chooses API routes, entities, and persistence shape from the prompt and current code; the platform does not provide a product CRUD scaffold.",
-                "Prompt-assigned source roles create, publish, configure, or import shared state only when the prompt requires that behavior.",
+                "Prompt-assigned source roles perform state-producing actions only when the prompt requires that behavior.",
                 "Other roles load or change the same persisted state only through prompt-assigned actions.",
                 "No role is forced into unrequested workflow semantics.",
                 "Saved data remains visible after reload through the app-owned API; app source starts with no seed/mock records.",
@@ -321,7 +312,7 @@ def build_acceptance_contract(
                 "title": "Related prompt-derived operations",
                 "roles": list(ROLE_ORDER),
                 "requirements": [
-                    "The LLM-selected shared state supports create/list plus only the update, publish, edit, summary, or operational workflows implied by the prompt.",
+                    "The LLM-selected shared state supports only the read, mutate, publish, edit, summary, or operational workflows implied by the prompt.",
                     "Role pages expose different actions based on prompt-owned role responsibilities, not fixed processing roles.",
                     "Prompt-assigned role updates are visible to the other relevant roles through later reads.",
                 ],
@@ -334,7 +325,7 @@ def build_acceptance_contract(
         "required": True,
         "intent": intent_value,
         "generation_mode": mode_value,
-        "workflow_kind": workflow_kind or ("create" if intent_value == "create" else "behavior_workflow_edit"),
+        "workflow_kind": workflow_kind or ("create" if intent_value == "create" else "product_quality_run"),
         "roles": list(ROLE_ORDER),
         "features": {
             "cross_role_persistence": True,
@@ -485,7 +476,7 @@ def build_implementation_plan(
             "copy_quality": "Do not expose API paths, HTTP methods, route slugs, role slugs, raw enum codes, or internal implementation labels in normal role UI; render readable labels with clear spacing between label and value.",
             "role_independence": {
                 role: (
-                    "source mobile app for creating or publishing the prompt-derived shared state"
+                    "source mobile app for the prompt-derived state-producing action"
                     if role in source_roles
                     else "mobile app for this role's prompt-derived update/control action"
                     if role in update_roles
@@ -494,7 +485,7 @@ def build_implementation_plan(
                 for role in ROLE_ORDER
             },
             "shared_state_contract": [
-                "prompt-assigned source role(s), if any, create/select/configure persisted shared state through UI",
+                "prompt-assigned source role(s), if any, perform the prompt-derived persisted action through UI",
                 "update roles persist only prompt-derived changes when the prompt needs those changes",
                 "observer roles load the same state without owning another role's controls when observer roles are explicit",
                 "all relevant roles can reload and see persisted state through UI",
@@ -504,7 +495,7 @@ def build_implementation_plan(
             "generated_tests_required": bool(contract.get("required")),
             "browser_flow_required": bool(contract.get("required")),
             "proof_steps": [
-                "source_role_ui_action_changes_persisted_state",
+                "prompt_source_role_action_changes_persisted_state",
                 "prompt_update_role_updates_same_state_when_required",
                 "observer_roles_load_persisted_state",
                 "source_role_observes_update_after_refresh",
@@ -586,7 +577,7 @@ def orchestration_metadata_for_contract(
         {
             "worker": "backend_api",
             "ownership": ["miniapp/app/routes/**", "miniapp/app/main.py", "miniapp/app/db.py", "miniapp/app/schemas.py"],
-            "responsibility": "Persistent resources, GET/POST/update APIs, and route registration.",
+            "responsibility": "Prompt-derived persistent resources, read/write APIs, and route registration.",
         },
         {
             "worker": "client_ui",

@@ -76,6 +76,7 @@ from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
 from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.platform_shell import BASE_STYLESHEET_HREF, BASE_STYLESHEET_PATH, PAGE_SHELL_INLINE_STYLE
+from app.services.trace_bundle import TraceBundleWriter
 from app.services.workflow_acceptance import (
     build_acceptance_contract,
     build_implementation_plan,
@@ -173,6 +174,7 @@ class WorkspaceCodeAgentRuntime:
         self.rollout_trace = RolloutTraceRecorder()
         self.transcript_store = AgentTranscriptStore()
         self.process_manager = AgentProcessManager()
+        self.trace_bundle_writers: dict[str, TraceBundleWriter] = {}
         self.tool_batch_summaries: dict[str, list[dict[str, object]]] = {}
         self.context_pressure_history: dict[str, list[dict[str, Any]]] = {}
         self.scratchpads: dict[str, AgentScratchpad] = {}
@@ -262,10 +264,19 @@ class WorkspaceCodeAgentRuntime:
             execution_class="shell_app",
             completion_budget=completion_budget_for_mode(generation_mode),
         )
+        writer = self._trace_bundle_writer(job)
+        job.trace_bundle_ref = f"trace_bundle:{workspace_id}:{run_id}"
+        self._store_report(job.trace_bundle_ref, {"workspace_id": workspace_id, "run_id": run_id, **writer.index(status="recording")})
         self._clear_agent_reports(workspace_id)
         self._clear_trace(workspace_id)
         self._save_job(job)
         self._append_event(job, "job_started", "Workspace code agent started.", {"run_id": run_id, "mode": request.mode})
+        self._record_hook(
+            job=job,
+            hook="session_start",
+            status="completed",
+            payload={"run_id": run_id, "workspace_id": workspace_id},
+        )
         self._record_hook(
             job=job,
             hook="before_run",
@@ -288,6 +299,7 @@ class WorkspaceCodeAgentRuntime:
                 status="failed",
                 payload={"status": job.status, "failure_class": job.failure_class},
             )
+            self._finalize_trace_bundle(job)
             self._save_job(job)
             return job
 
@@ -751,7 +763,11 @@ class WorkspaceCodeAgentRuntime:
             else {}
         )
         prompt_analysis: dict[str, Any] | None = None
-        requires_prompt_analysis = create_intent or focused_edit_kind == "behavior_workflow_edit"
+        requires_prompt_analysis = (
+            create_intent
+            or focused_edit_kind == "behavior_workflow_edit"
+            or generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
+        )
         if requires_prompt_analysis and not isinstance(stored_acceptance_contract.get("prompt_hints"), dict):
             prompt_analysis = self.openai_client.analyze_miniapp_prompt(
                 prompt=request.prompt,
@@ -988,7 +1004,7 @@ class WorkspaceCodeAgentRuntime:
             },
             save=False,
         )
-        if acceptance_contract.get("required"):
+        if acceptance_contract.get("required") or request.mode == "generate":
             self._store_report(
                 f"acceptance_contract:{workspace_id}:{run_id}",
                 {
@@ -2637,6 +2653,18 @@ class WorkspaceCodeAgentRuntime:
             if isinstance(stored_run, dict) and isinstance(stored_run.get("acceptance_contract"), dict)
             else {}
         )
+        prompt_analysis: dict[str, Any] | None = None
+        requires_prompt_analysis = (
+            intent_value == "create"
+            or focused_edit_kind == "behavior_workflow_edit"
+            or request.generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
+        )
+        if requires_prompt_analysis and not isinstance(stored_acceptance_contract.get("prompt_hints"), dict):
+            prompt_analysis = self.openai_client.analyze_miniapp_prompt(
+                prompt=request.prompt,
+                generation_mode=request.generation_mode,
+                model_profile=request.model_profile,
+            )
         acceptance_contract = (
             stored_acceptance_contract
             if isinstance(stored_acceptance_contract.get("prompt_hints"), dict)
@@ -2645,6 +2673,7 @@ class WorkspaceCodeAgentRuntime:
                 intent=intent_value,
                 generation_mode=request.generation_mode,
                 focused_edit_kind=focused_edit_kind,
+                prompt_analysis=prompt_analysis,
             )
         )
         orchestration = orchestration_metadata_for_contract(
@@ -2991,7 +3020,7 @@ class WorkspaceCodeAgentRuntime:
             return {
                 "enabled": False,
                 "mode": str(getattr(generation_mode, "value", generation_mode) or ""),
-                "reason": "serial_contract_runtime_writes",
+                "reason": mailbox.get("disabled_reason") or "serial_contract_runtime_writes",
                 "write_coordination": mailbox.get("write_coordination") or "serial_contract_runtime_writes",
                 "contract": "Use read/search/check tools freely, but keep all draft mutations in the coordinator loop.",
             }
@@ -3781,24 +3810,32 @@ class WorkspaceCodeAgentRuntime:
         payload: dict[str, Any] | None = None,
     ) -> None:
         artifact_run_id = job.linked_run_id or job.job_id
+        outcome_payload: dict[str, Any] | None = None
         try:
-            event = self.hook_manager.record(artifact_run_id, hook, status=status, payload=payload or {})  # type: ignore[arg-type]
+            if status == "started":
+                event = self.hook_manager.record(artifact_run_id, hook, status=status, payload=payload or {})  # type: ignore[arg-type]
+            else:
+                outcome = self.hook_manager.run(artifact_run_id, hook, payload={**dict(payload or {}), "requested_status": status})  # type: ignore[arg-type]
+                event = outcome.event
+                outcome_payload = outcome.as_dict()
+                if outcome.should_block:
+                    status = "failed"
         except Exception:
             return
         job.hook_trace_ref = job.hook_trace_ref or f"hook_trace:{job.workspace_id}:{artifact_run_id}"
-        self._store_report(
-            job.hook_trace_ref,
-            {
-                "workspace_id": job.workspace_id,
-                "run_id": job.linked_run_id,
-                **self.hook_manager.snapshot(artifact_run_id),
-                "activity_hooks": [
-                    item
-                    for item in job.agent_activity_events
-                    if str(item.get("type") or "") in {"hook_started", "hook_completed"}
-                ][-500:],
-            },
-        )
+        hook_report = {
+            "workspace_id": job.workspace_id,
+            "run_id": job.linked_run_id,
+            **self.hook_manager.snapshot(artifact_run_id),
+            "activity_hooks": [
+                item
+                for item in job.agent_activity_events
+                if str(item.get("type") or "") in {"hook_started", "hook_completed"}
+            ][-500:],
+        }
+        if outcome_payload is not None:
+            hook_report["latest_outcome"] = outcome_payload
+        self._store_report(job.hook_trace_ref, hook_report)
         self._append_activity(
             job,
             "hook_completed" if status != "started" else "hook_started",
@@ -3807,6 +3844,7 @@ class WorkspaceCodeAgentRuntime:
                 "hook": hook,
                 "status": status,
                 "artifact_ref": job.hook_trace_ref,
+                "outcome": outcome_payload,
                 **dict(payload or {}),
             },
             save=False,
@@ -5026,6 +5064,8 @@ class WorkspaceCodeAgentRuntime:
             payload={"status": job.status, "outcome_kind": job.outcome_kind, "failure_class": job.failure_class},
         )
         self._append_event(job, event_type, job.summary or ("Workspace code agent completed." if job.status == "completed" else "Workspace code agent failed."))
+        self._finalize_trace_bundle(job)
+        self._save_job(job)
         return job
 
     @staticmethod
@@ -5358,8 +5398,8 @@ class WorkspaceCodeAgentRuntime:
                     "For build.duplicate_static_route, keep one canonical route_manifest entry per route and make it point to the static page that should serve that route. "
                     "For build.broken_static_ref or build.missing_static_asset, either create the referenced asset or remove the script/link tag from the exact page. "
                     "For platform.missing_generated_app_tests, create miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. "
-                    "For platform.missing_create_get_api/platform.missing_create_post_api, create or register a backend /api route with persistent GET and POST behavior. "
-                    "For platform.frontend_missing_post_api, add form/fetch code that POSTs user-provided state to the matching /api route. "
+                    "For platform.missing_create_get_api/platform.missing_create_post_api, create or register backend /api read/write routes for the prompt-derived persisted workflow. "
+                    "For platform.frontend_missing_post_api, add the prompt-required control/fetch code that writes user-provided state to the matching /api route. "
                     "For platform.preloaded_product_data, remove preloaded product records and start from empty persistent state. "
                     "For connectivity.missing_backend_route, patch either the exact frontend API reference from repair_recipe.frontend_ref or the matching FastAPI route; do not rewrite unrelated UI/tests first. "
                     "Do not rewrite unrelated role pages."
@@ -5467,6 +5507,7 @@ class WorkspaceCodeAgentRuntime:
                 "items": items[-500:],
             },
         )
+        self._append_trace_bundle_event(job, f"activity.{normalized_type}", event)
         if save:
             self._sync_activity_to_run(job)
             self._save_job(job)
@@ -5554,6 +5595,7 @@ class WorkspaceCodeAgentRuntime:
             event_type,
             {"message": message, "details": WorkspaceCodeAgentRuntime._compact_jsonish(details, max_chars=900, max_items=8)},
         )
+        self._append_trace_bundle_event(job, event_type, {"message": message, "details": details})
         self._persist_run_event(job, event_type, message, details)
         job.events.append(JobEvent(event_type=event_type, message=message, details=details))
         activity = self._activity_from_event(event_type, message, details)
@@ -5742,6 +5784,8 @@ class WorkspaceCodeAgentRuntime:
             return "frontend_build_started"
         if step == "changed_files_static":
             return "backend_compile_started"
+        if step == "lsp_static_diagnostics":
+            return "backend_compile_started"
         if step in {"generated_app_python_tests", "generated_app_js_tests"}:
             return "final_checks_started"
         if step == "frontend_interaction_static_smoke":
@@ -5756,6 +5800,7 @@ class WorkspaceCodeAgentRuntime:
             "schema_validators": "schema and route manifest",
             "connectivity_validators": "frontend API connectivity",
             "changed_files_static": "static files and backend imports",
+            "lsp_static_diagnostics": "language diagnostics",
             "platform_invariants": "role workflow invariants",
             "frontend_interaction_static_smoke": "frontend interaction flow wiring",
             "generated_app_python_tests": "generated Python persistence tests",
@@ -5802,6 +5847,44 @@ class WorkspaceCodeAgentRuntime:
 
     def _store_report(self, key: str, payload: dict[str, Any]) -> None:
         self.artifact_reporter.store_report(key, payload)
+
+    def _trace_bundle_writer(self, job: JobRecord) -> TraceBundleWriter:
+        run_id = job.linked_run_id or job.job_id
+        writer = self.trace_bundle_writers.get(run_id)
+        if writer is None:
+            writer = TraceBundleWriter(root=self.store.path.parent, workspace_id=job.workspace_id, run_id=run_id)
+            self.trace_bundle_writers[run_id] = writer
+        return writer
+
+    def _append_trace_bundle_event(self, job: JobRecord, event_type: str, payload: dict[str, Any] | None = None) -> None:
+        if not (job.linked_run_id or job.job_id):
+            return
+        try:
+            writer = self._trace_bundle_writer(job)
+            event = writer.record(event_type, payload or {})
+            job.trace_bundle_ref = job.trace_bundle_ref or f"trace_bundle:{job.workspace_id}:{job.linked_run_id or job.job_id}"
+            self._store_report(
+                job.trace_bundle_ref,
+                {
+                    "workspace_id": job.workspace_id,
+                    "run_id": job.linked_run_id,
+                    **writer.index(status="recording"),
+                    "latest_event": event,
+                },
+            )
+        except Exception:
+            logger.exception("Failed to append trace bundle event %s for job %s.", event_type, job.job_id)
+
+    def _finalize_trace_bundle(self, job: JobRecord) -> None:
+        try:
+            writer = self._trace_bundle_writer(job)
+            state = writer.reduce()
+            job.trace_bundle_ref = job.trace_bundle_ref or f"trace_bundle:{job.workspace_id}:{job.linked_run_id or job.job_id}"
+            job.trace_reducer_ref = job.trace_reducer_ref or f"trace_reducer:{job.workspace_id}:{job.linked_run_id or job.job_id}"
+            self._store_report(job.trace_bundle_ref, {"workspace_id": job.workspace_id, "run_id": job.linked_run_id, **writer.index(status="reduced"), "state": state})
+            self._store_report(job.trace_reducer_ref, state)
+        except Exception:
+            logger.exception("Failed to finalize trace bundle for job %s.", job.job_id)
 
     def _clear_trace(self, workspace_id: str) -> None:
         self._store_report(f"trace:{workspace_id}", {"workspace_id": workspace_id, "entries": []})

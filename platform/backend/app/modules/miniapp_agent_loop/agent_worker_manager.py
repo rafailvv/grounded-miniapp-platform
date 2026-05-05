@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any
 
 from app.models.common import GenerationMode
@@ -47,12 +48,11 @@ class AgentWorkerManager:
         generation_mode: GenerationMode,
         implementation_plan: dict[str, Any],
     ) -> dict[str, object]:
-        # Claude/Codex-style orchestration keeps independent reads parallel but
-        # serializes writes through one coordinator when the app contract is
-        # already materialized. Multi-writer draft branches were too expensive
-        # for Fast create runs and regularly produced route/schema/test drift, so
-        # all modes keep mutations in the main repair loop for now.
-        enabled = False
+        enabled = (
+            os.getenv("GROUNDED_ENABLE_WORKER_BRANCHES", "").strip().lower() in {"1", "true", "yes", "on"}
+            and generation_mode == GenerationMode.QUALITY
+        )
+        disabled_reason = "" if enabled else "isolated worker branches are gated off unless GROUNDED_ENABLE_WORKER_BRANCHES=1 and generation mode is quality"
         prompt_contract = implementation_plan.get("prompt_contract_v1") if isinstance(implementation_plan, dict) else {}
         materialized_tests = bool(isinstance(prompt_contract, dict) and prompt_contract.get("materialized_tests"))
         workers = [
@@ -60,7 +60,8 @@ class AgentWorkerManager:
                 "worker": scope.worker,
                 "owner_scope": scope.owner_scope,
                 "path_prefixes": list(scope.path_prefixes),
-                "status": "pending" if enabled else "not_used",
+                    "status": "pending" if enabled else "available_disabled",
+                    "disabled_reason": disabled_reason if not enabled else "",
             }
             for scope in cls.SCOPES
             if not (materialized_tests and scope.worker == "generated_tests")
@@ -71,11 +72,13 @@ class AgentWorkerManager:
                     "worker": "design_verifier",
                     "owner_scope": "mobile design and verification",
                     "path_prefixes": ["miniapp/app/static", "miniapp/tests"],
-                    "status": "pending",
+                    "status": "pending" if enabled else "available_disabled",
+                    "disabled_reason": disabled_reason if not enabled else "",
                 }
             )
         return {
             "enabled": enabled,
+            "disabled_reason": disabled_reason,
             "mode": str(getattr(generation_mode, "value", generation_mode) or ""),
             "workers": workers,
             "plan_entities": list(implementation_plan.get("primary_entities") or [])[:8],

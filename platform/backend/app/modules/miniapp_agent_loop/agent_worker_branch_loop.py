@@ -875,7 +875,7 @@ class AgentWorkerBranchLoop:
                     "registered routes",
                     "schemas",
                     "table creation before requests",
-                    "GET/POST/update endpoints",
+                    "prompt-derived read/write/update endpoints",
                     "every APIRouter that declares /api endpoints must be imported and included by app.main",
                     "prefer one exported router when possible so page routes and API routes are both mounted",
                     "do not edit miniapp/app/routes/role_pages.py or miniapp/app/routes/role_routes.py; those files are platform shell routing for static role apps",
