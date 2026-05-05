@@ -165,7 +165,7 @@ class OpenAIClient:
         model = models_for_role("cheap_task", model_profile=model_profile, generation_mode=generation_mode)
         system_prompt = (
             "You extract a product-neutral mini-app contract from a user prompt. "
-            "Do not use templates or infer from local term lists. Return only valid JSON. "
+            "Use only the supplied prompt and the requested JSON schema. Return only valid JSON. "
             "Use the user's wording for labels. If a detail is not explicit, leave the list empty. "
             "Do not add any workflow, state machine, or role responsibility unless the prompt explicitly asks for it."
         )
@@ -278,7 +278,7 @@ class OpenAIClient:
         system_prompt = (
             "You classify a failed mini-app generation run into one concrete repair packet. "
             "Use only the supplied logs, browser proof, diff summary, and check metadata. "
-            "Do not use local term or product-category heuristics. Return only valid JSON."
+            "Return only valid JSON."
         )
         user_prompt = json.dumps(
             {

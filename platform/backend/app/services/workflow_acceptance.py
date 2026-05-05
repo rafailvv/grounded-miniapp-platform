@@ -90,11 +90,10 @@ def normalize_prompt_contract_analysis(
     prompt: str,
     analysis: dict[str, Any],
 ) -> dict[str, Any]:
-    """Normalize structured LLM prompt analysis without local term extraction.
+    """Normalize structured LLM prompt analysis.
 
-    This function is intentionally not an NLP parser and does not locally mine
-    product terms from the prompt. The LLM is the only component allowed to
-    decide product nouns, resources, fields, role ownership, and screen intent.
+    This function only accepts and sanitizes structured model output. It does
+    not decide product nouns, resources, fields, role ownership, or screen intent.
     """
     if not isinstance(analysis, dict):
         raise ValueError("Prompt contract analysis is required and must be a JSON object.")
@@ -155,9 +154,8 @@ def extract_prompt_planning_hints(
 ) -> dict[str, Any]:
     """Return contract hints from structured LLM analysis only.
 
-    The previous implementation tried to infer fields/resources from prompt
-    local term parsing. That was too brittle and could accidentally bias
-    generation. The runtime now requires structured model analysis.
+    The runtime requires structured model analysis before product fields,
+    resources, ownership, or screen intent enter the implementation plan.
     """
     return normalize_prompt_contract_analysis(prompt, prompt_analysis)
 

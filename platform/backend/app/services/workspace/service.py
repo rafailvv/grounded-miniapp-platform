@@ -40,6 +40,7 @@ class WorkspaceService:
         self.settings = settings
         self.store = store
         self.workspace_log_service = workspace_log_service
+        self.code_index_service = None
 
     @staticmethod
     def _strip_leading_dot_slash(raw_path: object) -> str:
@@ -47,7 +48,6 @@ class WorkspaceService:
         while path.startswith("./"):
             path = path[2:]
         return path
-        self.code_index_service = None
 
     def attach_code_index_service(self, code_index_service) -> None:
         self.code_index_service = code_index_service

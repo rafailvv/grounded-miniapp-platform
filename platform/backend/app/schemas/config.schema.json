@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grounded.local/schemas/grounded.platform.config.schema.json",
+  "title": "Grounded Platform Configuration",
+  "type": "object",
+  "required": ["platform", "workspace", "policy", "plugin"],
+  "properties": {
+    "platform": {
+      "type": "object",
+      "required": ["data_dir", "runtime_dir", "template_dir", "preview_port_base"],
+      "properties": {
+        "data_dir": { "type": "string" },
+        "runtime_dir": { "type": "string" },
+        "template_dir": { "type": "string" },
+        "preview_port_base": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      },
+      "additionalProperties": false
+    },
+    "workspace": {
+      "type": "object",
+      "required": ["workspace_id", "name", "target_platform", "preview_profile", "current_revision_id"],
+      "properties": {
+        "workspace_id": { "type": "string" },
+        "name": { "type": "string" },
+        "target_platform": { "type": "string" },
+        "preview_profile": { "type": "string" },
+        "current_revision_id": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "policy": {
+      "type": "object",
+      "required": ["risk_model", "approval_presets", "sandbox_profiles"],
+      "properties": {
+        "risk_model": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "safe",
+              "read_only",
+              "draft_write",
+              "workspace_write",
+              "network_limited",
+              "dangerous_requires_approval",
+              "forbidden",
+              "unknown"
+            ]
+          }
+        },
+        "approval_presets": { "type": "object" },
+        "sandbox_profiles": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "plugin": {
+      "type": "object",
+      "required": ["id", "version", "capabilities"],
+      "properties": {
+        "id": { "type": "string" },
+        "version": { "type": "string" },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "enum": ["validators", "exporters", "preview_adapters", "platform_adapters", "skills", "mcp_tools"]
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

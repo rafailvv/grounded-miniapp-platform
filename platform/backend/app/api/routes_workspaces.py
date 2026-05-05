@@ -47,23 +47,6 @@ def get_workspace(workspace_id: str, container: ServiceContainer = Depends(get_c
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/workspaces/{workspace_id}/clone-template", response_model=WorkspaceRecord)
-def clone_template(
-    workspace_id: str,
-    container: ServiceContainer = Depends(get_container),
-) -> WorkspaceRecord:
-    try:
-        workspace = container.workspace_service.clone_template(workspace_id)
-        threading.Thread(
-            target=container.code_index_service.index_workspace,
-            args=(workspace, container.workspace_service.source_dir(workspace_id)),
-            daemon=True,
-        ).start()
-        return workspace
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
 @router.post("/workspaces/{workspace_id}/reset", response_model=WorkspaceRecord)
 def reset_workspace(workspace_id: str, container: ServiceContainer = Depends(get_container)) -> WorkspaceRecord:
     try:

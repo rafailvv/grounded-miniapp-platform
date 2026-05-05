@@ -272,6 +272,14 @@ def get_run_gate(run_id: str, container: ServiceContainer = Depends(get_containe
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/state")
+def get_run_state(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.workbench_service.run_state(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/runs/{run_id}/final-report")
 def get_run_final_report(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:

@@ -90,6 +90,9 @@ def main(argv: list[str] | None = None) -> int:
     final_report = sub.add_parser("final-report")
     final_report.add_argument("run_id")
 
+    state = sub.add_parser("state")
+    state.add_argument("run_id")
+
     args = parser.parse_args(argv)
     if args.command == "create-workspace":
         result = _request(
@@ -178,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
         result = _request(args.base_url, "POST", f"/workspaces/{urllib.parse.quote(args.workspace_id)}/export/{args.kind}", {})
     elif args.command == "final-report":
         result = _request(args.base_url, "GET", f"/runs/{urllib.parse.quote(args.run_id)}/final-report")
+    elif args.command == "state":
+        result = _request(args.base_url, "GET", f"/runs/{urllib.parse.quote(args.run_id)}/state")
     else:
         parser.error("unknown command")
         return 2

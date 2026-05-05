@@ -33,6 +33,7 @@ from app.modules.workspace_code_agent_runtime import WorkspaceCodeAgentRuntime
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
 from app.services.miniapp_contract import MiniAppContractCompiler
+from app.services.run_state_machine import RunStateMachine
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, orchestration_metadata_for_contract
 from app.services.workspace.log_service import WorkspaceLogService
 from app.services.workspace.preview_service import PreviewService
@@ -571,6 +572,79 @@ class RunService:
         }
         self.store.upsert("reports", f"run_artifacts:{run_id}", payload)
         return payload
+
+    def reconcile_run_with_gate(self, run_id: str, gate: dict[str, Any]) -> RunRecord:
+        payload = self.store.get("runs", run_id)
+        if not payload:
+            raise KeyError(f"Run not found: {run_id}")
+        run = RunRecord.model_validate(payload)
+        if run.status not in TERMINAL_RUN_STATUSES:
+            return run
+        artifacts = self.store.get("reports", f"run_artifacts:{run_id}") if run_id else {}
+        browser_proof = self.store.get("reports", run.browser_proof_ref) if run.browser_proof_ref else {}
+        state = RunStateMachine.evaluate(
+            run=run,
+            gate=gate,
+            artifacts=artifacts if isinstance(artifacts, dict) else {},
+            browser_proof=browser_proof if isinstance(browser_proof, dict) else {},
+        )
+        self.store.upsert("reports", f"run_state:{run_id}", state)
+        changed = False
+        first_issue = next((item for item in state.get("issues") or [] if isinstance(item, dict) and item.get("blocking", True)), {})
+        if state.get("blocking"):
+            if run.status != "failed" and run.status != "blocked":
+                run.status = "blocked"
+                changed = True
+            if run.status != "failed" and run.apply_status not in {"applied", "awaiting_approval"}:
+                run.apply_status = "blocked"
+                changed = True
+            if run.status != "failed" and run.current_stage != "blocked by reliability gate":
+                run.current_stage = "blocked by reliability gate"
+                changed = True
+            if not run.failure_class:
+                run.failure_class = "reliability_gate.blocked"
+                changed = True
+            if not run.failure_signature:
+                run.failure_signature = f"reliability_gate.blocked:{str(first_issue.get('check') or 'unknown')}"
+                changed = True
+            details = str(first_issue.get("details") or "").strip()
+            if details and (not run.failure_reason or self._is_generic_failure_reason(run.failure_reason)):
+                run.failure_reason = details
+                changed = True
+        elif state.get("status") == "passed" and run.apply_status == "applied":
+            if run.status != "completed":
+                run.status = "completed"
+                changed = True
+            if run.current_stage != "completed":
+                run.current_stage = "completed"
+                changed = True
+            if run.failure_reason or run.failure_class or run.failure_signature or run.root_cause_summary:
+                run.failure_reason = None
+                run.failure_class = None
+                run.failure_signature = None
+                run.root_cause_summary = None
+                changed = True
+        elif state.get("manual_approval_ok"):
+            if run.status != "awaiting_approval":
+                run.status = "awaiting_approval"
+                changed = True
+            if run.apply_status != "awaiting_approval":
+                run.apply_status = "awaiting_approval"
+                changed = True
+        gate_status = "blocked" if state.get("blocking") else "passed" if state.get("status") == "passed" else "pending"
+        if run.checks_summary.gate_status != gate_status:
+            run.checks_summary.gate_status = gate_status  # type: ignore[assignment]
+            changed = True
+        if changed:
+            run.progress_percent = 100 if run.status in TERMINAL_RUN_STATUSES else run.progress_percent
+            run.updated_at = datetime.now(timezone.utc)
+            self._save_run(run)
+            artifacts_payload = self.store.get("reports", f"run_artifacts:{run_id}")
+            if isinstance(artifacts_payload, dict):
+                artifacts_payload["run"] = run.model_dump(mode="json")
+                artifacts_payload["run_state"] = state
+                self.store.upsert("reports", f"run_artifacts:{run_id}", artifacts_payload)
+        return run
 
     def get_run_iterations(self, run_id: str) -> list[dict[str, Any]]:
         artifacts = self.get_run_artifacts(run_id)

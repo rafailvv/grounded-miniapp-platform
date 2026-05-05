@@ -479,7 +479,6 @@ export type PromptContractReport = {
   resource_hint?: string | null;
   field_hints?: string[];
   role_field_hints?: Record<string, string[]>;
-  local_prompt_matching?: string;
   findings: Array<Record<string, unknown>>;
 };
 
@@ -492,6 +491,24 @@ export type MiniAppContractReport = {
   drift_issues: Array<Record<string, unknown>>;
   repair_recipes: Array<Record<string, unknown>>;
   artifact_refs: Record<string, string | null>;
+};
+
+export type RunStateReport = {
+  schema: string;
+  run_id: string;
+  workspace_id: string;
+  status: string;
+  blocking: boolean;
+  terminal: boolean;
+  apply_ok: boolean;
+  manual_approval_ok: boolean;
+  gate_status: string;
+  gate_blocking: boolean;
+  issues: Array<Record<string, unknown>>;
+  invariant_issues: Array<Record<string, unknown>>;
+  source_state: Record<string, unknown>;
+  artifact_refs?: Record<string, string | null | undefined>;
+  created_at?: string;
 };
 
 export type WorkspaceMemory = {
@@ -907,6 +924,10 @@ export async function getRunPromptContract(runId: string): Promise<PromptContrac
 
 export async function getRunMiniAppContract(runId: string): Promise<MiniAppContractReport> {
   return request<MiniAppContractReport>(`/runs/${runId}/miniapp-contract`);
+}
+
+export async function getRunState(runId: string): Promise<RunStateReport> {
+  return request<RunStateReport>(`/runs/${runId}/state`);
 }
 
 export async function getWorkspaceMemory(workspaceId: string): Promise<WorkspaceMemory> {

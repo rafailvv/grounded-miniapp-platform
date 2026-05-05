@@ -12,6 +12,7 @@ export type RunEventType =
   | "repair_packet"
   | "browser_step"
   | "gate_changed"
+  | "run_state_changed"
   | "run_completed"
   | "run_stream_timeout"
   | "timeline_event";
@@ -63,6 +64,10 @@ export class GroundedClient {
 
   async getGate(runId: string): Promise<JsonObject> {
     return this.requestObject(`/runs/${encodeURIComponent(runId)}/gate`);
+  }
+
+  async getRunState(runId: string): Promise<JsonObject> {
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}/state`);
   }
 
   async getFinalReport(runId: string): Promise<JsonObject> {
@@ -145,6 +150,7 @@ export class GroundedClient {
       }
       const gate = await this.getGate(runId);
       yield { type: "gate_changed", runId, payload: gate };
+      yield { type: "run_state_changed", runId, payload: await this.getRunState(runId) };
       const run = await this.getRun(runId);
       const status = String(run.status ?? "");
       if (["completed", "blocked", "failed", "awaiting_approval"].includes(status)) {

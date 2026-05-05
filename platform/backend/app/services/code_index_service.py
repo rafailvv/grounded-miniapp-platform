@@ -208,7 +208,6 @@ class CodeIndexService:
                 "doc_chunk_count": 0,
                 "code_hits": len(code),
                 "doc_hits": len(docs),
-                "local_prompt_matching": "disabled",
                 "candidate_files": len(candidate_paths),
                 "candidate_cache_hit": candidate_cache_hit,
                 "unchanged_file_reads": unchanged_reads,

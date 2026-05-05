@@ -19,6 +19,7 @@ from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.miniapp_contract import MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.repair_catalog import RepairCatalog
+from app.services.run_state_machine import RunStateMachine
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, tool_envelope, tool_registry_contract
 from app.services.workspace.run_service import RunService
 from app.services.workspace.service import WorkspaceService
@@ -498,7 +499,37 @@ class WorkbenchService:
                 "diagnostics_delta": (checkpoint or {}).get("diagnostics_delta_ref") if isinstance(checkpoint, dict) else None,
             },
         }
+        browser_proof = self._normalize_browser_proof_payload(run, artifacts)
+        state = RunStateMachine.evaluate(run=run, gate=payload, artifacts=artifacts, browser_proof=browser_proof)
+        if state.get("invariant_issues"):
+            payload["issues"] = [*payload["issues"], *state["invariant_issues"]]
+            payload["blocking"] = True
+            payload["status"] = "blocked"
+            payload["blocking_repair_packet"] = (
+                payload["repair_packets"][0]
+                if payload.get("repair_packets")
+                else {
+                    "signature": "reliability_gate.state_invariant",
+                    "issue_code": "state_invariant",
+                    "code": "state_invariant",
+                    "severity": "high",
+                    "target_files": [],
+                    "required_next_tool": "run_checks",
+                    "suggested_tool_after_read": "run_checks",
+                    "retryable": False,
+                    "deterministic": True,
+                    "failure_class": "reliability_gate.state_invariant",
+                    "failure_signature": "reliability_gate.state_invariant",
+                    "instruction": "Inspect the run state, gate issues, and artifacts before applying or marking completion.",
+                    "evidence": {"run_state": state},
+                }
+            )
+            state = RunStateMachine.evaluate(run=run, gate=payload, artifacts=artifacts, browser_proof=browser_proof)
+        payload["run_state"] = state
+        payload["artifact_refs"]["run_state"] = f"run_state:{run_id}"
         self.store.upsert("reports", f"gate:{run_id}", payload)
+        self.store.upsert("reports", f"run_state:{run_id}", state)
+        self.run_service.reconcile_run_with_gate(run_id, payload)
         return payload
 
     def repair_signatures(self, run_id: str) -> dict[str, Any]:
@@ -674,6 +705,7 @@ class WorkbenchService:
         artifacts = self._run_artifacts_or_empty(run_id)
         preview = artifacts.get("preview") or {}
         gate = self.gate(run_id)
+        run = self.run_service.get_run(run_id)
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
         diagnostics_delta_ref = (checkpoint or {}).get("diagnostics_delta_ref") if isinstance(checkpoint, dict) else None
         diagnostics_delta = self.store.get("reports", diagnostics_delta_ref) if diagnostics_delta_ref else None
@@ -694,6 +726,7 @@ class WorkbenchService:
             "repair_signatures": self.repair_signatures(run_id).get("items", []),
             "repair_packets": gate.get("repair_packets", []),
             "next_forced_action": gate.get("next_forced_action", {}),
+            "run_state": gate.get("run_state") or self.run_state(run_id),
             "diagnostics_delta": diagnostics_delta,
             "token_usage": run.token_usage,
             "token_usage_status": "recorded" if run.token_usage else "not_recorded",
@@ -713,6 +746,17 @@ class WorkbenchService:
         }
         self.store.upsert("reports", f"final_report:{run_id}", report)
         return report
+
+    def run_state(self, run_id: str) -> dict[str, Any]:
+        run = self.run_service.get_run(run_id)
+        artifacts = self._run_artifacts_or_empty(run_id)
+        gate = self.store.get("reports", f"gate:{run_id}")
+        if not isinstance(gate, dict):
+            gate = {"status": "pending", "blocking": False, "issues": []}
+        browser_proof = self._normalize_browser_proof_payload(run, artifacts)
+        state = RunStateMachine.evaluate(run=run, gate=gate, artifacts=artifacts, browser_proof=browser_proof)
+        self.store.upsert("reports", f"run_state:{run_id}", state)
+        return state
 
     def resume_run(self, run_id: str) -> RunRecord:
         run = self.run_service.get_run(run_id)
@@ -884,30 +928,60 @@ class WorkbenchService:
 
     def config_schema(self) -> dict[str, Any]:
         return {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://grounded.local/schemas/grounded.platform.config.schema.json",
+            "title": "Grounded Platform Configuration",
+            "type": "object",
             "platform_config_version": "grounded.platform.v1",
             "workspace_config_version": "grounded.workspace.v1",
             "policy_config_version": "grounded.policy.v1",
             "plugin_config_version": "grounded.plugin.v1",
+            "required": ["platform", "workspace", "policy", "plugin"],
+            "properties": {
+                "platform": {"$ref": "#/schemas/platform"},
+                "workspace": {"$ref": "#/schemas/workspace"},
+                "policy": {"$ref": "#/schemas/policy"},
+                "plugin": {"$ref": "#/schemas/plugin"},
+            },
             "schemas": {
                 "platform": {
+                    "type": "object",
                     "required": ["data_dir", "runtime_dir", "template_dir", "preview_port_base"],
                     "properties": {
-                        "data_dir": str(self.settings.data_dir),
-                        "runtime_dir": str(self.settings.runtime_dir),
-                        "template_dir": str(self.settings.template_dir),
-                        "preview_port_base": self.settings.preview_port_base,
+                        "data_dir": {"type": "string", "default": str(self.settings.data_dir)},
+                        "runtime_dir": {"type": "string", "default": str(self.settings.runtime_dir)},
+                        "template_dir": {"type": "string", "default": str(self.settings.template_dir)},
+                        "preview_port_base": {"type": "integer", "default": self.settings.preview_port_base},
                     },
+                    "additionalProperties": False,
                 },
                 "workspace": {
+                    "type": "object",
                     "required": ["workspace_id", "name", "target_platform", "preview_profile", "current_revision_id"],
-                    "backward_compatible": True,
+                    "properties": {
+                        "workspace_id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "target_platform": {"type": "string"},
+                        "preview_profile": {"type": "string"},
+                        "current_revision_id": {"type": ["string", "null"]},
+                    },
+                    "strict_api_edges": True,
+                    "additionalProperties": True,
                 },
                 "policy": self.exec_policy_service.snapshot(),
                 "plugin": {
+                    "type": "object",
                     "required": ["id", "version", "capabilities"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "version": {"type": "string"},
+                        "capabilities": {"type": "array", "items": {"type": "string"}},
+                    },
                     "capabilities": ["validators", "exporters", "preview_adapters", "platform_adapters", "skills", "mcp_tools"],
+                    "additionalProperties": True,
                 },
             },
+            "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 
     def migrations(self) -> dict[str, Any]:
@@ -925,7 +999,7 @@ class WorkbenchService:
             {
                 "id": "artifact_refs_v1",
                 "status": "current",
-                "description": "Run artifacts remain addressable through report refs and compatibility reads.",
+                "description": "Run artifacts remain addressable through report refs.",
             },
         ]
         return {"status": "current", "items": checks, "created_at": datetime.now(timezone.utc).isoformat()}
@@ -971,7 +1045,6 @@ class WorkbenchService:
             "resource_hint": prompt_hints.get("resource_hint"),
             "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
             "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
-            "local_prompt_matching": "disabled",
             "findings": [] if status == "passed" else [{"severity": "medium", "message": "Prompt contract analysis is unavailable; generation should use LLM prompt analysis before applying product fields."}],
         }
         self.store.upsert("reports", f"prompt_contract:{run_id}", payload)

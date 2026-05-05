@@ -32,14 +32,12 @@ Terminal success requires:
 - `status=completed`
 - `apply_status=applied`
 - platform invariant checks passed
-- prompt-alignment smoke passed
+- contract smoke passed
 - draft diff applied to the source workspace
 
 ## Workspace Creation
 
-`POST /workspaces` is the cold-create path. It creates workspace storage, clones the base template, indexes files, and starts preview once. The frontend must open existing workspaces with `GET /workspaces/{id}` and must not call `/clone-template`.
-
-`POST /workspaces/{id}/clone-template` is kept only as a backend/admin compatibility endpoint.
+`POST /workspaces` is the cold-create path. It creates workspace storage, clones the base template, indexes files, and starts preview once. The frontend opens existing workspaces with `GET /workspaces/{id}`.
 
 ## Public Run APIs
 
@@ -63,4 +61,4 @@ PYTHONPATH=platform/backend python3 -m compileall -q platform/backend/app
 PYTHONPATH=platform/backend pytest -q platform/backend/tests
 ```
 
-Static cleanup is covered by `platform/backend/tests/test_no_legacy_imports.py`.
+Static cleanup is covered by the backend test suite.

@@ -115,6 +115,130 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert patch_preflight["status"] == "passed"
 
 
+def test_reliability_gate_reconciles_completed_run_with_missing_product_proof(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Gate Reconcile",
+            "description": "Terminal state must follow Reliability Gate",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a business workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        draft_status="approved",
+        acceptance_contract={"required": True},
+        touched_files=["miniapp/app/main.py"],
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "run": run.model_dump(mode="json"),
+            "diff": "diff --git a/miniapp/app/main.py b/miniapp/app/main.py\n",
+            "check_results": [],
+        },
+    )
+
+    gate = client.get(f"/runs/{run.run_id}/gate").json()
+    reconciled = client.get(f"/runs/{run.run_id}").json()
+    state = client.get(f"/runs/{run.run_id}/state").json()
+
+    assert gate["status"] == "blocked"
+    assert gate["run_state"]["blocking"] is True
+    assert state["schema"] == "grounded.run_state.v1"
+    assert reconciled["status"] == "blocked"
+    assert reconciled["apply_status"] == "applied"
+    assert reconciled["failure_class"] == "reliability_gate.blocked"
+
+
+def test_reliability_gate_passes_applied_run_with_product_proof(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Gate Passed",
+            "description": "Green product proof keeps completed status",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a business workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="completed",
+        apply_status="applied",
+        draft_status="approved",
+        acceptance_contract={"required": True},
+        touched_files=["miniapp/app/main.py"],
+    )
+    check_results = [
+        {"name": "backend_static_validators", "status": "passed", "details": "ok"},
+        {"name": "api_workflow_smoke", "status": "passed", "details": "ok"},
+        {"name": "browser_flow_smoke", "status": "passed", "details": "ok", "diagnostics": {"steps": [{"role": "client", "status": "passed"}]}},
+    ]
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "run": run.model_dump(mode="json"),
+            "diff": "diff --git a/miniapp/app/main.py b/miniapp/app/main.py\n",
+            "check_results": check_results,
+        },
+    )
+
+    gate = client.get(f"/runs/{run.run_id}/gate").json()
+    state = client.get(f"/runs/{run.run_id}/state").json()
+    final_report = client.get(f"/runs/{run.run_id}/final-report").json()
+
+    assert gate["status"] == "passed"
+    assert gate["blocking"] is False
+    assert state["status"] == "passed"
+    assert final_report["status"] == "passed"
+
+
+def test_api_errors_use_typed_envelope(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    response = client.get("/runs/run_missing")
+
+    assert response.status_code == 404
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["blocking"] is True
+    assert payload["error"]["code"] == "not_found"
+    assert payload["error"]["retryable"] is False
+    assert payload["error"]["failure_signature"].startswith("api.not_found:")
+
+
+def test_config_schema_is_versioned_json_schema(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    schema = client.get("/system/config/schema").json()
+
+    assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    assert schema["type"] == "object"
+    assert schema["platform_config_version"] == "grounded.platform.v1"
+    assert schema["schemas"]["platform"]["properties"]["preview_port_base"]["type"] == "integer"
+
+
 def test_workspace_creation_does_not_start_preview_before_generated_app_exists(tmp_path: Path) -> None:
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)

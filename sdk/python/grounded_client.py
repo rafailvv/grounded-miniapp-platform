@@ -42,6 +42,9 @@ class GroundedClient:
     def gate(self, run_id: str) -> JsonObject:
         return self._json_object("GET", f"/runs/{parse.quote(run_id)}/gate")
 
+    def run_state(self, run_id: str) -> JsonObject:
+        return self._json_object("GET", f"/runs/{parse.quote(run_id)}/state")
+
     def final_report(self, run_id: str) -> JsonObject:
         return self._json_object("GET", f"/runs/{parse.quote(run_id)}/final-report")
 
@@ -107,6 +110,7 @@ class GroundedClient:
                 yield RunEvent(self._event_type_from_timeline(item), run_id, cast(JsonObject, item))
             gate = self.gate(run_id)
             yield RunEvent("gate_changed", run_id, gate)
+            yield RunEvent("run_state_changed", run_id, self.run_state(run_id))
             run = self.get_run(run_id)
             if str(run.get("status") or "") in {"completed", "blocked", "failed", "awaiting_approval"}:
                 yield RunEvent("run_completed", run_id, {"run": run, "gate": gate})
