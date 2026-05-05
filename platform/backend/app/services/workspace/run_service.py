@@ -1839,10 +1839,10 @@ class RunService:
             return "edit"
         prompt = request.prompt.lower()
         role_scope = list(resolved_role_scope if resolved_role_scope is not None else self._resolve_target_role_scope(request))
-        if self._looks_like_fix_request(prompt):
-            return "edit"
         if self._looks_like_create_request(prompt):
             return "create"
+        if self._looks_like_fix_request(prompt):
+            return "edit"
         if role_scope and len(role_scope) == 1:
             return "role_only_change"
         if any(token in prompt for token in ("refine", "polish", "improve", "tighten", "cleanup")):
@@ -1952,7 +1952,7 @@ class RunService:
             return request.generation_mode
         prompt = request.prompt.lower()
         has_existing_build = self._workspace_has_existing_build(workspace)
-        if self._looks_like_fix_request(prompt):
+        if self._looks_like_fix_request(prompt) and resolved_intent != "create":
             return GenerationMode.BALANCED
         if resolved_intent in {"edit", "refine", "role_only_change"} and has_existing_build:
             return GenerationMode.BALANCED

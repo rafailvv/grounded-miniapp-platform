@@ -207,7 +207,11 @@ class RepairTransitionPolicy:
             int(repeated_failure_signatures.get(signature, 0) or 0),
         )
         if all_read:
-            forced_tools = ["write_file", "apply_patch_to_draft"]
+            forbidden_once = {str(item) for item in packet.get("forbidden_tools_once") or []}
+            if str(packet.get("code") or "") == "patch_conflict" or "apply_patch_to_draft" in forbidden_once:
+                forced_tools = ["write_file"]
+            else:
+                forced_tools = ["write_file", "apply_patch_to_draft"]
             phase = "write_after_forced_read"
             focus = (
                 "The failing files were read after repeated edit failure. Patch only these target files now; "
@@ -269,4 +273,3 @@ class RepairTransitionPolicy:
         if path and path not in targets:
             targets.append(path)
         return targets[:8]
-

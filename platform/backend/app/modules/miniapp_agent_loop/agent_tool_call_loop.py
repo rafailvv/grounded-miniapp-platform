@@ -185,6 +185,7 @@ class AgentToolCallLoop:
         latest_repair_transition: dict[str, Any] = {}
         previous_diagnostics_snapshot: dict[str, dict[str, Any]] | None = None
         latest_diagnostics_delta: dict[str, Any] = {"status": "unchanged", "added": [], "changed": [], "resolved": []}
+        pending_validation_after_patch = bool(initial_file_changes or initial_changed_files)
 
         turn = 0
         while True:
@@ -207,7 +208,7 @@ class AgentToolCallLoop:
                 )
 
             budget_state = self._budget_state(callbacks, turn)
-            if budget_state.get("exhausted"):
+            if budget_state.get("exhausted") and not pending_validation_after_patch:
                 failure_reason = self._budget_failure_reason(budget_state)
                 if callbacks.append_activity:
                     callbacks.append_activity(
@@ -289,6 +290,7 @@ class AgentToolCallLoop:
                     {"turn": turn, "has_file_edits": has_draft_diff},
                 )
                 latest_execution, latest_preview_details = callbacks.execute_checks(changed_files)
+                pending_validation_after_patch = False
                 validation_snapshot = callbacks.build_validation_snapshot(latest_execution)
                 completion_state = callbacks.completion_state(
                     latest_execution.results,
@@ -781,6 +783,7 @@ class AgentToolCallLoop:
                 continue
 
             changed_files = callbacks.post_apply_stabilize(workspace_id, run_id, apply_result, [operation.file_path for operation in synced_file_changes]) if callbacks.post_apply_stabilize else [operation.file_path for operation in synced_file_changes]
+            pending_validation_after_patch = True
             if callbacks.append_activity:
                 callbacks.append_activity(
                     job,

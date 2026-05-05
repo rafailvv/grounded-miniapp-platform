@@ -466,13 +466,19 @@ class WorkbenchService:
         if run.status in {"completed", "awaiting_approval", "blocked", "failed"} and not apply_ok:
             add_issue("apply_gate", "apply_status", "Run must be applied or awaiting manual approval after green checks.", evidence={"apply_status": run.apply_status, "status": run.status})
 
-        repair_packets = RepairCatalog.classify_many(issues)
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
         checkpoint_packets = list((checkpoint or {}).get("repair_packets") or []) if isinstance(checkpoint, dict) else []
-        if checkpoint_packets:
-            repair_packets = [*checkpoint_packets, *repair_packets]
         next_forced_action = dict((checkpoint or {}).get("next_forced_action") or {}) if isinstance(checkpoint, dict) else {}
         blocking = any(item.get("blocking", True) for item in issues)
+        repair_packets = RepairCatalog.classify_many(issues)
+        include_checkpoint_packets = bool(blocking or run.status not in {"completed", "awaiting_approval"})
+        if checkpoint_packets and include_checkpoint_packets:
+            repair_packets = [*checkpoint_packets, *repair_packets]
+        repair_history = [
+            {**item, "resolved": True}
+            for item in checkpoint_packets
+            if isinstance(item, dict)
+        ] if checkpoint_packets and not include_checkpoint_packets else []
         status = "passed" if not blocking and apply_ok else "blocked" if blocking else "pending"
         payload = {
             "run_id": run_id,
@@ -481,6 +487,7 @@ class WorkbenchService:
             "blocking": blocking,
             "issues": issues,
             "repair_packets": repair_packets,
+            "repair_history": repair_history,
             "next_forced_action": next_forced_action,
             "blocking_repair_packet": repair_packets[0] if blocking and repair_packets else {},
             "requirements": {
@@ -510,13 +517,19 @@ class WorkbenchService:
         packets = RepairCatalog.classify_many([*explicit, *gate.get("issues", [])])
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
         checkpoint_packets = list((checkpoint or {}).get("repair_packets") or []) if isinstance(checkpoint, dict) else []
-        if checkpoint_packets:
+        include_checkpoint_packets = bool(gate.get("blocking") or run.status not in {"completed", "awaiting_approval"})
+        if checkpoint_packets and include_checkpoint_packets:
             packets = [*checkpoint_packets, *packets]
         payload = {
             "run_id": run_id,
             "status": "available" if packets else "empty",
             "blocking": bool(gate.get("blocking")),
             "items": packets,
+            "history": [
+                {**item, "resolved": True}
+                for item in checkpoint_packets
+                if isinstance(item, dict)
+            ] if checkpoint_packets and not include_checkpoint_packets else [],
             "next_forced_action": dict((checkpoint or {}).get("next_forced_action") or {}) if isinstance(checkpoint, dict) else {},
             "catalog": RepairCatalog.entries(),
         }

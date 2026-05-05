@@ -76,7 +76,7 @@ class AgentWorkerRuntime:
                 )
             )
         self._drafts[run_id] = drafts
-        return {"enabled": True, "mode": str(generation_mode.value), "workers": [item.as_dict() for item in drafts]}
+        return {"enabled": bool(drafts), "mode": str(generation_mode.value), "workers": [item.as_dict() for item in drafts]}
 
     def prepare_workspace_branches(
         self,
@@ -106,7 +106,7 @@ class AgentWorkerRuntime:
                 )
             )
         self._drafts[run_id] = drafts
-        return {"enabled": True, "mode": str(generation_mode.value), "workers": [item.as_dict() for item in drafts]}
+        return {"enabled": bool(drafts), "mode": str(generation_mode.value), "workers": [item.as_dict() for item in drafts]}
 
     def merge_report(self, run_id: str, file_changes: list[DraftAction]) -> dict[str, Any]:
         ownership = AgentWorkerManager.validate_non_conflicting(file_changes)

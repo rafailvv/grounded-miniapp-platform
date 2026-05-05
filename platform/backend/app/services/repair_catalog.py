@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -191,6 +192,100 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         patterns=(_rx(r"missing_role_workflow_actions"), _rx(r"lacks its own workflow actions"), _rx(r"missing_role_actions")),
     ),
     RepairCatalogEntry(
+        signature="workflow.manager_missing_specialist_result_visibility",
+        issue_code="manager_missing_specialist_result_visibility",
+        severity="high",
+        likely_root_cause="Manager detail cards omit specialist-owned persisted fields, so approval happens without seeing the specialist result.",
+        target_files=(
+            "miniapp/app/static/manager/app.js",
+            "miniapp/app/static/manager/index.html",
+            "miniapp/tests/generated_app.test.mjs",
+        ),
+        verification_check="frontend_interaction_static_smoke",
+        instruction=(
+            "Read the manager role files and make the manager card/detail renderer display specialist-owned fields "
+            "before approval. Prefer rendering Object.entries(FIELD_LABELS) or explicitly include all specialist "
+            "contract keys, then update the generated browser test."
+        ),
+        required_next_tool="read_files",
+        suggested_tool_after_read="write_file",
+        verification_command="run_checks frontend_interaction_static_smoke",
+        patterns=(
+            _rx(r"manager_missing_specialist_result_visibility"),
+            _rx(r"Manager role must render specialist-owned persisted result fields"),
+            _rx(r"Missing specialist fields in manager card/detail renderer"),
+        ),
+    ),
+    RepairCatalogEntry(
+        signature="frontend.unwired_button",
+        issue_code="workflow_button_without_handler",
+        severity="high",
+        likely_root_cause="A visible workflow button is present in HTML but the role JavaScript never wires it.",
+        target_files=("miniapp/app/static/**/index.html", "miniapp/app/static/**/app.js"),
+        verification_check="frontend_interaction_static_smoke",
+        instruction="Either wire the button to the intended handler or remove the button and expose the same action through an existing wired control.",
+        required_next_tool="read_files",
+        suggested_tool_after_read="write_file",
+        verification_command="run_checks frontend_interaction_static_smoke",
+        patterns=(
+            _rx(r"workflow_button_without_handler"),
+            _rx(r"has button #[A-Za-z0-9_-]+, but app\.js never references it"),
+        ),
+    ),
+    RepairCatalogEntry(
+        signature="workflow.prompt_specificity_mismatch",
+        issue_code="prompt_specificity_missing_fields",
+        severity="high",
+        likely_root_cause="Generated UI/API stayed on the generic contract scaffold instead of implementing the user's prompt-derived fields and role responsibilities.",
+        target_files=(
+            "miniapp/app/static/client/index.html",
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/specialist/index.html",
+            "miniapp/app/static/specialist/app.js",
+            "miniapp/app/static/manager/index.html",
+            "miniapp/app/static/manager/app.js",
+            "miniapp/app/routes/generated_contract.py",
+            "miniapp/tests/test_generated_app.py",
+            "miniapp/tests/generated_app.test.mjs",
+        ),
+        verification_check="frontend_interaction_static_smoke",
+        instruction=(
+            "Replace generic Title/Note/shared-record UI with prompt-owned business fields, persist those fields through the API, "
+            "add role-specific specialist/manager actions, and update generated tests to prove the domain workflow."
+        ),
+        required_next_tool="read_files",
+        verification_command="run_checks frontend_interaction_static_smoke",
+        patterns=(
+            _rx(r"prompt_specificity"),
+            _rx(r"generic_scaffold_leakage"),
+            _rx(r"Title/Note"),
+            _rx(r"generic shared-record"),
+        ),
+    ),
+    RepairCatalogEntry(
+        signature="workflow.cross_role_update_not_rendered_in_client",
+        issue_code="cross_role_update_not_rendered_in_client",
+        severity="high",
+        likely_root_cause="Operational roles persist update fields that the client page does not render after reload.",
+        target_files=(
+            "miniapp/app/static/client/app.js",
+            "miniapp/app/static/specialist/app.js",
+            "miniapp/app/static/manager/app.js",
+            "miniapp/tests/generated_app.test.mjs",
+        ),
+        verification_check="frontend_interaction_static_smoke",
+        instruction=(
+            "Align specialist/manager PATCH payload fields with the client card renderer so status, estimate, dates, notes, "
+            "priority, and management updates are visible to the client after reload."
+        ),
+        required_next_tool="read_files",
+        verification_command="run_checks frontend_interaction_static_smoke",
+        patterns=(
+            _rx(r"cross_role_update_not_rendered_in_client"),
+            _rx(r"never renders after reload"),
+        ),
+    ),
+    RepairCatalogEntry(
         signature="workflow.payload_schema_mismatch",
         issue_code="workflow_patch_payload_field_mismatch",
         severity="high",
@@ -238,6 +333,9 @@ class RepairCatalog:
 
     @staticmethod
     def classify_issue(issue: dict[str, Any]) -> dict[str, Any]:
+        embedded = RepairCatalog._packet_from_embedded_recipe(issue)
+        if embedded:
+            return embedded
         text = RepairCatalog._issue_text(issue)
         for entry in REPAIR_CATALOG:
             if entry.signature in text or entry.issue_code in text:
@@ -312,3 +410,119 @@ class RepairCatalog:
             seen.add(key)
             packets.append(packet)
         return packets
+
+    @staticmethod
+    def _packet_from_embedded_recipe(issue: dict[str, Any]) -> dict[str, Any] | None:
+        """Prefer typed repair recipes emitted by validators over broad text matching."""
+
+        candidates = RepairCatalog._embedded_recipe_candidates(issue)
+        if not candidates:
+            return None
+        candidate = candidates[0]
+        recipe = candidate.get("repair_recipe")
+        if not isinstance(recipe, dict):
+            return None
+        code = str(candidate.get("code") or recipe.get("failure_signature") or issue.get("code") or "validator_repair")
+        issue_code = code.removeprefix("platform.")
+        signature = str(recipe.get("failure_signature") or candidate.get("signature") or issue_code)
+        catalog_entry = RepairCatalog._entry_for_signature(signature, issue_code)
+        evidence = {
+            "validator_issue": {k: v for k, v in candidate.items() if k != "repair_recipe"},
+            "repair_recipe": recipe,
+            "source_issue": issue,
+        }
+        target_files = list(
+            (catalog_entry.target_files if catalog_entry else None)
+            or recipe.get("target_files")
+            or issue.get("paths")
+            or []
+        )
+        verification_check = str(
+            (catalog_entry.verification_check if catalog_entry else None)
+            or recipe.get("verification_check")
+            or issue.get("check")
+            or "checks.run"
+        )
+        return {
+            "signature": signature,
+            "issue_code": issue_code,
+            "code": issue_code,
+            "severity": str(candidate.get("severity") or (catalog_entry.severity if catalog_entry else None) or issue.get("severity") or "high"),
+            "likely_root_cause": str(
+                candidate.get("message")
+                or (catalog_entry.likely_root_cause if catalog_entry else None)
+                or issue.get("details")
+                or "Validator emitted a structured repair recipe."
+            ),
+            "target_files": target_files,
+            "verification_check": verification_check,
+            "verification_command": str((catalog_entry.verification_command if catalog_entry else None) or recipe.get("verification_command") or "run_checks"),
+            "instruction": str(
+                (catalog_entry.instruction if catalog_entry else None)
+                or recipe.get("instruction")
+                or "Read the target files, apply the validator repair recipe, and rerun the failing check."
+            ),
+            "auto_fixable": bool(recipe.get("retryable", catalog_entry.auto_fixable if catalog_entry else True)),
+            "required_next_tool": str((catalog_entry.required_next_tool if catalog_entry else None) or recipe.get("required_next_tool") or "read_files"),
+            "suggested_tool_after_read": str(
+                (catalog_entry.suggested_tool_after_read if catalog_entry else None)
+                or recipe.get("suggested_tool_after_read")
+                or "apply_patch_to_draft_or_write_file"
+            ),
+            "retry_policy": str((catalog_entry.retry_policy if catalog_entry else None) or recipe.get("retry_policy") or "deterministic_repair"),
+            "retryable": bool(recipe.get("retryable", catalog_entry.auto_fixable if catalog_entry else True)),
+            "deterministic": bool(recipe.get("deterministic", catalog_entry.deterministic if catalog_entry else True)),
+            "failure_class": str(recipe.get("failure_class") or issue.get("failure_class") or verification_check),
+            "failure_signature": signature,
+            "repair_recipe_id": str(recipe.get("recipe_id") or f"catalog.{issue_code}"),
+            "forbidden_tools_once": [],
+            "next_forced_action": {
+                "required_next_tool": str(recipe.get("required_next_tool") or "read_files"),
+                "target_files": target_files,
+                "verification_check": verification_check,
+            },
+            "evidence": evidence,
+        }
+
+    @staticmethod
+    def _embedded_recipe_candidates(value: Any) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+
+        def visit(item: Any) -> None:
+            if item is None:
+                return
+            if isinstance(item, str):
+                text = item.strip()
+                if not (text.startswith("{") and "repair_recipe" in text):
+                    return
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    return
+                visit(parsed)
+                return
+            if isinstance(item, dict):
+                if isinstance(item.get("repair_recipe"), dict):
+                    candidates.append(item)
+                for nested in item.values():
+                    visit(nested)
+                return
+            if isinstance(item, (list, tuple, set)):
+                for nested in item:
+                    visit(nested)
+
+        visit(value)
+        candidates.sort(
+            key=lambda item: (
+                0 if item.get("blocking", True) else 1,
+                {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(str(item.get("severity") or "").lower(), 4),
+            )
+        )
+        return candidates
+
+    @staticmethod
+    def _entry_for_signature(signature: str, issue_code: str) -> RepairCatalogEntry | None:
+        for entry in REPAIR_CATALOG:
+            if entry.signature == signature or entry.issue_code == issue_code:
+                return entry
+        return None

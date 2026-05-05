@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from html import escape
 import json
 import re
 from pathlib import Path
@@ -14,6 +15,11 @@ from app.validators.static_analysis import extract_declared_routes, extract_fron
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
+ROLE_LABELS_RU = {
+    "client": "Клиент",
+    "specialist": "Специалист",
+    "manager": "Менеджер",
+}
 
 
 class MiniAppEndpoint(StrictModel):
@@ -33,6 +39,8 @@ class MiniAppResource(StrictModel):
     name: str
     display_name: str
     fields: list[str] = Field(default_factory=list)
+    field_labels: dict[str, str] = Field(default_factory=dict)
+    role_field_labels: dict[str, dict[str, str]] = Field(default_factory=dict)
     endpoints: list[MiniAppEndpoint] = Field(default_factory=list)
 
 
@@ -116,10 +124,19 @@ class MiniAppContractCompiler:
         intent_value = str(intent or "").strip().lower() or "create"
         hints = extract_prompt_planning_hints(prompt)
         terms = [str(item) for item in hints.get("prompt_terms") or [] if str(item).strip()]
-        slug_source = next((term for term in terms if term not in {"client", "manager", "specialist"}), "items")
+        slug_source = str(hints.get("resource_hint") or "").strip() or next((term for term in terms if term not in {"client", "manager", "specialist"}), "items")
+        slug_source = cls._resource_display_source(slug_source)
         slug = cls._plural_slug(slug_source)
         display_name = cls._display_name(slug_source)
-        resource = cls._resource(slug=slug, display_name=display_name)
+        resource = cls._resource(
+            slug=slug,
+            display_name=display_name,
+            field_hints=[str(item) for item in hints.get("field_hints") or [] if str(item).strip()],
+            role_field_hints={
+                role: [str(item) for item in (items or []) if str(item).strip()]
+                for role, items in dict(hints.get("role_field_hints") or {}).items()
+            },
+        )
         screens = cls._screens()
         endpoints = list(resource.endpoints)
         allowed_graph = AllowedFileGraph(
@@ -212,7 +229,22 @@ class MiniAppContractCompiler:
         return contract
 
     @classmethod
-    def _resource(cls, *, slug: str, display_name: str) -> MiniAppResource:
+    def _resource(
+        cls,
+        *,
+        slug: str,
+        display_name: str,
+        field_hints: list[str] | None = None,
+        role_field_hints: dict[str, list[str]] | None = None,
+    ) -> MiniAppResource:
+        role_field_labels, field_labels = cls._role_field_labels(role_field_hints or {}, field_hints or [])
+        client_labels = role_field_labels.get("client") or field_labels
+        update_labels = {
+            **dict(role_field_labels.get("specialist") or {}),
+            **dict(role_field_labels.get("manager") or {}),
+        }
+        create_fields = [*client_labels.keys(), "title", "note", "created_by"] if client_labels else ["title", "note"]
+        update_fields = list(dict.fromkeys(["status", "note", "updated_by", *update_labels.keys()]))
         endpoints = [
             MiniAppEndpoint(
                 endpoint_id=f"{slug}.list",
@@ -229,7 +261,7 @@ class MiniAppContractCompiler:
                 purpose="Create a persisted record from the client role",
                 resource=slug,
                 role="client",
-                request_fields=["title", "note"],
+                request_fields=create_fields,
             ),
             MiniAppEndpoint(
                 endpoint_id=f"{slug}.update_status",
@@ -238,7 +270,7 @@ class MiniAppContractCompiler:
                 purpose="Persist a specialist or manager status update",
                 resource=slug,
                 role="specialist",
-                request_fields=["status", "note"],
+                request_fields=update_fields,
             ),
         ]
         return MiniAppResource(
@@ -246,9 +278,79 @@ class MiniAppContractCompiler:
             slug=slug,
             name=slug,
             display_name=display_name,
-            fields=["id", "title", "note", "status", "created_by", "updated_by"],
+            fields=list(dict.fromkeys(["id", "title", "note", "status", "created_by", "updated_by", *field_labels.keys()])),
+            field_labels=field_labels,
+            role_field_labels=role_field_labels,
             endpoints=endpoints,
         )
+
+    @classmethod
+    def _role_field_labels(cls, role_field_hints: dict[str, list[str]], field_hints: list[str]) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+        role_labels: dict[str, dict[str, str]] = {role: {} for role in ROLE_ORDER}
+        combined: dict[str, str] = {}
+        normalized_to_name: dict[str, str] = {}
+
+        def add_label(role: str | None, raw_label: str, index: int) -> None:
+            label = " ".join(str(raw_label or "").split()).strip(" .:-")
+            if len(label) < 2:
+                return
+            normalized = cls._semantic_label_key(label)
+            if normalized in normalized_to_name:
+                name = normalized_to_name[normalized]
+            else:
+                base_name = cls._field_name(label) or f"field_{index}"
+                name = base_name
+                suffix = 2
+                while name in combined:
+                    name = f"{base_name}_{suffix}"
+                    suffix += 1
+                normalized_to_name[normalized] = name
+                combined[name] = label[:80]
+            if role in ROLE_ORDER:
+                role_labels.setdefault(str(role), {})[name] = combined[name]
+
+        index = 1
+        for role in ROLE_ORDER:
+            for raw_label in (role_field_hints.get(role) or [])[:12]:
+                add_label(role, raw_label, index)
+                index += 1
+        for raw_label in field_hints[:12]:
+            before = set(combined)
+            add_label(None, raw_label, index)
+            if set(combined) != before:
+                index += 1
+        return role_labels, combined
+
+    @staticmethod
+    def _semantic_label_key(label: str) -> str:
+        return re.sub(r"[^a-z0-9а-яё]+", "", str(label or "").lower())
+
+    @classmethod
+    def _field_labels(cls, field_hints: list[str]) -> dict[str, str]:
+        labels: dict[str, str] = {}
+        for index, raw_label in enumerate(field_hints[:12], start=1):
+            label = " ".join(str(raw_label or "").split()).strip(" .:-")
+            if len(label) < 2:
+                continue
+            base_name = cls._field_name(label) or f"field_{index}"
+            name = base_name
+            suffix = 2
+            while name in labels:
+                name = f"{base_name}_{suffix}"
+                suffix += 1
+            labels[name] = label[:80]
+        return labels
+
+    @classmethod
+    def _field_name(cls, label: str) -> str:
+        slug = cls._slug(label).replace("-", "_")
+        parts = [part for part in slug.split("_") if part]
+        if not parts:
+            return ""
+        name = parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+        if name and name[0].isdigit():
+            name = f"field{name}"
+        return name[:48]
 
     @staticmethod
     def _screens() -> list[MiniAppScreen]:
@@ -268,7 +370,8 @@ class MiniAppContractCompiler:
 
     @staticmethod
     def _slug(value: str) -> str:
-        slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+        value = MiniAppContractCompiler._transliterate(str(value or "").lower())
+        slug = re.sub(r"[^a-z0-9]+", "-", value).strip("-")
         return slug or "item"
 
     @classmethod
@@ -284,6 +387,67 @@ class MiniAppContractCompiler:
     def _display_name(value: str) -> str:
         cleaned = re.sub(r"[-_]+", " ", str(value or "item")).strip()
         return cleaned[:1].upper() + cleaned[1:] if cleaned else "Item"
+
+    @staticmethod
+    def _resource_display_source(value: str) -> str:
+        cleaned = re.sub(r"\s+", " ", str(value or "item")).strip(" .:-")
+        cleaned = re.sub(r"^[Bb]2[Bb][-_ ]*", "", cleaned).strip()
+        lowered = cleaned.lower()
+        replacements = (
+            ("цию", "ция"),
+            ("сию", "сия"),
+            ("ию", "ия"),
+            ("ку", "ка"),
+            ("гу", "га"),
+            ("чу", "ча"),
+            ("шу", "ша"),
+            ("ью", "ья"),
+        )
+        for suffix, replacement in replacements:
+            if lowered.endswith(suffix) and len(cleaned) > len(suffix) + 1:
+                return f"{cleaned[:-len(suffix)]}{replacement}"
+        if lowered.endswith("у") and len(cleaned) > 4:
+            return f"{cleaned[:-1]}а"
+        return cleaned or "item"
+
+    @staticmethod
+    def _transliterate(value: str) -> str:
+        table = {
+            "а": "a",
+            "б": "b",
+            "в": "v",
+            "г": "g",
+            "д": "d",
+            "е": "e",
+            "ё": "e",
+            "ж": "zh",
+            "з": "z",
+            "и": "i",
+            "й": "y",
+            "к": "k",
+            "л": "l",
+            "м": "m",
+            "н": "n",
+            "о": "o",
+            "п": "p",
+            "р": "r",
+            "с": "s",
+            "т": "t",
+            "у": "u",
+            "ф": "f",
+            "х": "h",
+            "ц": "c",
+            "ч": "ch",
+            "ш": "sh",
+            "щ": "shch",
+            "ъ": "",
+            "ы": "y",
+            "ь": "",
+            "э": "e",
+            "ю": "yu",
+            "я": "ya",
+        }
+        return "".join(table.get(char, char) for char in value)
 
 
 class MiniAppContractMaterializer:
@@ -482,7 +646,7 @@ from itertools import count
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 router = APIRouter(prefix="/api", tags=["contract-runtime"])
@@ -491,12 +655,16 @@ _ITEMS: list[dict[str, Any]] = []
 
 
 class ContractItemCreate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     title: str = Field(default="{title}", min_length=1)
     note: str = ""
     created_by: str = "client"
 
 
 class ContractItemStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     status: str = Field(default="updated", min_length=1)
     note: str = ""
     updated_by: str = "specialist"
@@ -509,8 +677,15 @@ def list_contract_items() -> list[dict[str, Any]]:
 
 @router.post("/{slug}", status_code=201)
 def create_contract_item(payload: ContractItemCreate) -> dict[str, Any]:
+    payload_data = payload.model_dump()
+    prompt_fields = {{
+        key: value
+        for key, value in payload_data.items()
+        if key not in {{"title", "note", "created_by"}}
+    }}
     item = {{
         "id": str(next(_NEXT_ID)),
+        **prompt_fields,
         "title": payload.title,
         "note": payload.note,
         "status": "new",
@@ -523,11 +698,15 @@ def create_contract_item(payload: ContractItemCreate) -> dict[str, Any]:
 
 @router.patch("/{slug}/{{item_id}}/status")
 def update_contract_item_status(item_id: str, payload: ContractItemStatusUpdate) -> dict[str, Any]:
+    payload_data = payload.model_dump()
     for item in _ITEMS:
         if str(item.get("id")) == str(item_id):
             item["status"] = payload.status
             item["note"] = payload.note or item.get("note", "")
             item["updated_by"] = payload.updated_by or "specialist"
+            for key, value in payload_data.items():
+                if key not in {{"status", "note", "updated_by"}}:
+                    item[key] = value
             return item
     raise HTTPException(status_code=404, detail="Contract item not found")
 '''
@@ -536,6 +715,16 @@ def update_contract_item_status(item_id: str, payload: ContractItemStatusUpdate)
     def _render_python_tests(contract: MiniAppContract) -> str:
         resource = contract.resources[0]
         path = f"/api/{resource.slug}"
+        create_labels = dict((resource.role_field_labels or {}).get("client") or resource.field_labels or {})
+        prompt_payload = {
+            field: f"{label} value"
+            for field, label in list(create_labels.items())[:4]
+        }
+        create_payload = {
+            **prompt_payload,
+            "title": "Contract item",
+            "note": "created",
+        }
         return f'''from __future__ import annotations
 
 import unittest
@@ -550,10 +739,13 @@ class GeneratedContractRuntimeTest(unittest.TestCase):
         with TestClient(app) as client:
             before = client.get({json.dumps(path)})
             self.assertEqual(before.status_code, 200)
-            create = client.post({json.dumps(path)}, json={{"title": "Contract item", "note": "created"}})
+            create_payload = {json.dumps(create_payload, ensure_ascii=False)}
+            create = client.post({json.dumps(path)}, json=create_payload)
             self.assertEqual(create.status_code, 201)
             created = create.json()
             self.assertEqual(created["status"], "new")
+            for key, value in create_payload.items():
+                self.assertEqual(created.get(key), value)
             after = client.get({json.dumps(path)})
             self.assertEqual(after.status_code, 200)
             self.assertTrue(any(str(item.get("id")) == str(created["id"]) for item in after.json()))
@@ -600,31 +792,148 @@ test("generated contract files expose route manifest and API client", () => {{
         for role in ROLE_ORDER:
             files[f"miniapp/app/static/{role}/index.html"] = cls._role_html(role=role, resource=resource)
             files[f"miniapp/app/static/{role}/app.js"] = cls._role_js(role=role, resource=resource)
-            files[f"miniapp/app/static/{role}/styles.css"] = cls._role_css(role=role)
+            files[f"miniapp/app/static/{role}/styles.css"] = cls._role_css(role=role, generation_mode=contract.generation_mode)
         return files
 
     @staticmethod
+    def _prompt_form_controls(resource: MiniAppResource, *, role: str = "client") -> str:
+        labels = dict((resource.role_field_labels or {}).get(role) or {})
+        if role == "client" and not labels:
+            labels = dict(resource.field_labels or {})
+        if not labels:
+            labels = {
+                "client": {
+                    "requestName": "Название заявки",
+                    "clientComment": "Комментарий клиента",
+                },
+                "specialist": {
+                    "specialistDecision": "Решение специалиста",
+                    "specialistComment": "Комментарий специалиста",
+                },
+                "manager": {
+                    "managerDecision": "Решение менеджера",
+                    "managerComment": "Комментарий менеджера",
+                },
+            }.get(role, {"workComment": "Комментарий"})
+        controls: list[str] = []
+        for index, (name, label) in enumerate(labels.items()):
+            safe_name = escape(name, quote=True)
+            safe_label = escape(label, quote=True)
+            required = " required" if index == 0 else ""
+            lowered = f"{name} {label}".lower()
+            if any(marker in lowered for marker in ("comment", "note", "opis", "kommentar", "predpochten", "message")):
+                controls.append(
+                    f'          <label>{safe_label} <textarea id="contract-{safe_name}" name="{safe_name}"{required}></textarea></label>'
+                )
+            else:
+                input_type = "date" if any(marker in lowered for marker in ("date", "data", "datum", "srok")) else "text"
+                controls.append(
+                    f'          <label>{safe_label} <input id="contract-{safe_name}" name="{safe_name}" type="{input_type}"{required} /></label>'
+                )
+        return "\n".join(controls)
+
+    @staticmethod
     def _role_html(*, role: str, resource: MiniAppResource) -> str:
-        title = {
-            "client": f"Create {resource.display_name}",
-            "specialist": f"Process {resource.display_name}",
-            "manager": f"Review {resource.display_name}",
-        }.get(role, resource.display_name)
+        cyrillic = bool(re.search(r"[А-Яа-яЁё]", resource.display_name))
+        role_label = ROLE_LABELS_RU.get(role, role.title()) if cyrillic else role.title()
+        if cyrillic:
+            title = {
+                "client": f"Новая {resource.display_name}",
+                "specialist": f"Обработка: {resource.display_name}",
+                "manager": f"Контроль: {resource.display_name}",
+            }.get(role, resource.display_name)
+            saved_copy = "Сохраненные записи доступны после перезагрузки."
+            save_label = "Сохранить"
+            refresh_label = "Обновить"
+            select_label = "Запись"
+            update_label = "Сохранить изменения"
+            status_label = "Статус"
+            status_options_by_role = {
+                "manager": (
+                    '<option value="reviewed">На согласовании</option>\n'
+                    '            <option value="ready">Готово к согласованию</option>\n'
+                    '            <option value="approved">Одобрена</option>\n'
+                    '            <option value="rejected">Отклонена</option>'
+                ),
+                "specialist": (
+                    '<option value="processed">В работе</option>\n'
+                    '            <option value="reviewed">Проверена</option>\n'
+                    '            <option value="ready">Готово к согласованию</option>'
+                ),
+            }
+            status_options = status_options_by_role.get(
+                role,
+                '<option value="processed">В работе</option>\n'
+                '            <option value="reviewed">Проверена</option>\n'
+                '            <option value="ready">Готово к согласованию</option>',
+            )
+            list_title = {
+                "client": f"Мои {resource.display_name.lower()}",
+                "specialist": "Очередь обработки",
+                "manager": "Контроль заявок",
+            }.get(role, "Сохраненные записи")
+            loading_copy = "Загружаем сохраненные записи..."
+            error_copy = "Не удалось загрузить данные. Попробуйте обновить список."
+            success_copy = "Данные обновлены."
+            metrics_label = "Метрики заявок"
+        else:
+            title = {
+                "client": f"Create {resource.display_name}",
+                "specialist": f"Process {resource.display_name}",
+                "manager": f"Review {resource.display_name}",
+            }.get(role, resource.display_name)
+            saved_copy = "Saved records are available after reload."
+            save_label = "Save"
+            refresh_label = "Refresh"
+            select_label = "Record"
+            update_label = "Save changes"
+            status_label = "Status"
+            status_options_by_role = {
+                "manager": (
+                    '<option value="reviewed">Reviewed</option>\n'
+                    '            <option value="ready">Ready</option>\n'
+                    '            <option value="approved">Approved</option>\n'
+                    '            <option value="rejected">Rejected</option>'
+                ),
+                "specialist": (
+                    '<option value="processed">Processed</option>\n'
+                    '            <option value="reviewed">Reviewed</option>\n'
+                    '            <option value="ready">Ready</option>'
+                ),
+            }
+            status_options = status_options_by_role.get(
+                role,
+                '<option value="processed">Processed</option>\n'
+                '            <option value="reviewed">Reviewed</option>\n'
+                '            <option value="ready">Ready</option>',
+            )
+            list_title = f"{resource.display_name} records"
+            loading_copy = "Loading saved records..."
+            error_copy = "Could not load records. Try refreshing the list."
+            success_copy = "Data updated."
+            metrics_label = "Request metrics"
         form = (
-            '''
+            f'''
         <form id="contract-create-form" class="contract-form">
-          <label>Title <input id="contract-title" name="title" required /></label>
-          <label>Note <textarea id="contract-note" name="note"></textarea></label>
-          <button type="submit">Save</button>
+{MiniAppContractMaterializer._prompt_form_controls(resource, role="client")}
+          <button type="submit">{save_label}</button>
         </form>'''
             if role == "client"
-            else '''
+            else f'''
+        <form id="contract-update-form" class="contract-form">
+          <label>{select_label} <select id="contract-item-select" name="item_id"></select></label>
+{MiniAppContractMaterializer._prompt_form_controls(resource, role=role)}
+          <label>{status_label} <select id="contract-status-field" name="status">
+            {status_options}
+          </select></label>
+          <button type="submit">{update_label}</button>
+        </form>
         <div class="contract-actions">
-          <button id="contract-refresh" type="button">Refresh</button>
+          <button id="contract-refresh" type="button">{refresh_label}</button>
         </div>'''
         )
         return f'''<!doctype html>
-<html lang="en">
+<html lang="{'ru' if cyrillic else 'en'}">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -636,13 +945,17 @@ test("generated contract files expose route manifest and API client", () => {{
     <main class="page-shell">
       <section class="page" data-role="{role}">
         <header class="contract-header">
-          <p class="contract-eyebrow">{role.title()}</p>
+          <p class="contract-eyebrow">{role_label}</p>
           <h1>{title}</h1>
-          <p id="contract-status" class="contract-copy">Loading saved workflow state.</p>
+          <p id="contract-status" class="contract-copy">{saved_copy}</p>
         </header>
+        <div id="contract-loading" class="contract-state contract-loading" hidden>{loading_copy}</div>
+        <div id="contract-error" class="contract-state contract-error" hidden>{error_copy}</div>
+        <div id="contract-success" class="contract-state contract-success" hidden>{success_copy}</div>
+{f'        <section id="contract-metrics" class="metrics-grid" aria-label="{escape(metrics_label)}"></section>' if role == "manager" else ''}
 {form}
         <section class="contract-list" aria-live="polite">
-          <h2>Shared records</h2>
+          <h2>{escape(list_title)}</h2>
           <div id="contract-items"></div>
         </section>
       </section>
@@ -657,6 +970,11 @@ test("generated contract files expose route manifest and API client", () => {{
     def _role_js(*, role: str, resource: MiniAppResource) -> str:
         slug = resource.slug
         update_status = "processed" if role == "specialist" else "reviewed"
+        quick_action_label = "Отметить обработку" if role == "specialist" else "Сохранить решение"
+        field_labels = dict(resource.field_labels or {})
+        role_field_labels = dict((resource.role_field_labels or {}).get(role) or {})
+        client_field_labels = dict((resource.role_field_labels or {}).get("client") or field_labels)
+        primary_field = next(iter(field_labels.keys()), "")
         create_handler = ""
         if role == "client":
             create_handler = f'''
@@ -665,13 +983,20 @@ if (form) {{
   form.addEventListener("submit", async (event) => {{
     event.preventDefault();
     const formData = new FormData(form);
+    const payload = {{}};
+    for (const [key, value] of formData.entries()) {{
+      payload[key] = String(value || "");
+    }}
+    const primaryValue = PRIMARY_FIELD ? String(payload[PRIMARY_FIELD] || "") : "";
+    payload.title = payload.title || primaryValue || {json.dumps(resource.display_name)};
+    payload.note = payload.note || Object.entries(FIELD_LABELS)
+      .map(([key, label]) => payload[key] ? `${{label}}: ${{payload[key]}}` : "")
+      .filter(Boolean)
+      .join(" · ");
+    payload.created_by = ROLE;
     await requestJson(API_BASE, {{
       method: "POST",
-      body: JSON.stringify({{
-        title: String(formData.get("title") || "{resource.display_name}"),
-        note: String(formData.get("note") || ""),
-        created_by: ROLE,
-      }}),
+      body: JSON.stringify(payload),
     }});
     form.reset();
     await loadItems();
@@ -681,6 +1006,32 @@ if (form) {{
         update_handler = ""
         if role in {"specialist", "manager"}:
             update_handler = f'''
+const updateForm = document.getElementById("contract-update-form");
+if (updateForm) {{
+  updateForm.addEventListener("submit", async (event) => {{
+    event.preventDefault();
+    const formData = new FormData(updateForm);
+    const itemId = String(formData.get("item_id") || "");
+    if (!itemId) {{
+      setState("error", "Сначала выберите сохраненную запись.");
+      return;
+    }}
+    const payload = {{ status: String(formData.get("status") || {json.dumps(update_status)}), updated_by: ROLE }};
+    for (const [key, value] of formData.entries()) {{
+      if (key !== "item_id" && key !== "status") payload[key] = String(value || "");
+    }}
+    payload.note = payload.note || Object.entries(ROLE_FIELD_LABELS)
+      .map(([key, label]) => payload[key] ? `${{label}}: ${{payload[key]}}` : "")
+      .filter(Boolean)
+      .join(" · ");
+    await requestJson(`${{API_BASE}}/${{encodeURIComponent(itemId)}}/status`, {{
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }});
+    updateForm.reset();
+    await loadItems();
+  }});
+}}
 itemsRoot?.addEventListener("click", async (event) => {{
   const button = event.target.closest("[data-update-id]");
   if (!button) return;
@@ -694,8 +1045,32 @@ document.getElementById("contract-refresh")?.addEventListener("click", loadItems
 '''
         return f'''const ROLE = {json.dumps(role)};
 const API_BASE = {json.dumps(f"/api/{slug}")};
+const FIELD_LABELS = {json.dumps(field_labels, ensure_ascii=False)};
+const ROLE_FIELD_LABELS = {json.dumps(role_field_labels, ensure_ascii=False)};
+const CLIENT_FIELD_LABELS = {json.dumps(client_field_labels, ensure_ascii=False)};
+const DETAIL_FIELD_LABELS = ROLE === "manager" ? FIELD_LABELS : (ROLE === "client" ? FIELD_LABELS : {{...CLIENT_FIELD_LABELS, ...ROLE_FIELD_LABELS}});
+const PRIMARY_FIELD = {json.dumps(primary_field)};
+const STATUS_LABELS = {{
+  new: "Новая",
+  pending: "На проверке",
+  processing: "В работе",
+  processed: "В работе",
+  reviewed: "Проверена",
+  ready: "Готово к согласованию",
+  approved: "Одобрена",
+  rejected: "Отклонена",
+  done: "Готово",
+  completed: "Завершена",
+  confirmed: "Подтверждена",
+  paid: "Оплачена",
+}};
 const statusNode = document.getElementById("contract-status");
+const loadingNode = document.getElementById("contract-loading");
+const errorNode = document.getElementById("contract-error");
+const successNode = document.getElementById("contract-success");
+const metricsRoot = document.getElementById("contract-metrics");
 const itemsRoot = document.getElementById("contract-items");
+const itemSelect = document.getElementById("contract-item-select");
 
 window.setupPreviewBridge?.(ROLE);
 
@@ -704,32 +1079,97 @@ async function requestJson(path, options = {{}}) {{
     headers: {{ "Content-Type": "application/json", ...(options.headers || {{}}) }},
     ...options,
   }});
-  if (!response.ok) throw new Error(`Request failed: ${{response.status}}`);
+  if (!response.ok) throw new Error(`Запрос завершился ошибкой: ${{response.status}}`);
   return response.json();
 }}
 
 async function loadItems() {{
+  setState("loading", "Загружаем сохраненные записи...");
   try {{
     const items = await requestJson(API_BASE);
+    renderMetrics(items);
     renderItems(items);
-    if (statusNode) statusNode.textContent = items.length ? `${{items.length}} saved records` : "No saved records yet.";
+    renderItemOptions(items);
+    setState("success", items.length ? `Найдено записей: ${{items.length}}.` : "Пока нет сохраненных записей.");
   }} catch (error) {{
-    if (statusNode) statusNode.textContent = error.message || "Unable to load saved records.";
+    setState("error", error.message || "Не удалось загрузить сохраненные записи.");
   }}
+}}
+
+function escapeHtml(value) {{
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({{
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }}[char]));
+}}
+
+function itemTitle(item) {{
+  return item.title || (PRIMARY_FIELD ? item[PRIMARY_FIELD] : "") || {json.dumps(resource.display_name)};
+}}
+
+function humanizeStatus(value) {{
+  const text = String(value || "").replace(/[_-]+/g, " ").trim();
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : "Новая";
+}}
+
+function statusLabel(value) {{
+  const key = String(value || "new").trim();
+  return STATUS_LABELS[key] || "Статус уточняется";
+}}
+
+function setState(state, message = "") {{
+  if (loadingNode) loadingNode.hidden = state !== "loading";
+  if (errorNode) {{
+    errorNode.hidden = state !== "error";
+    if (state === "error" && message) errorNode.textContent = message;
+  }}
+  if (successNode) {{
+    successNode.hidden = state !== "success";
+    if (state === "success" && message) successNode.textContent = message;
+  }}
+  if (statusNode && message) statusNode.textContent = message;
+}}
+
+function renderMetrics(items) {{
+  if (!metricsRoot) return;
+  const total = items.length;
+  const approved = items.filter((item) => item.status === "approved").length;
+  const inReview = items.filter((item) => ["processed", "reviewed", "ready"].includes(item.status)).length;
+  metricsRoot.innerHTML = [
+    ["Всего", total],
+    ["На согласовании", inReview],
+    ["Одобрено", approved],
+  ].map(([label, value]) => `<article class="metric-card"><span>${{escapeHtml(label)}}</span><strong>${{escapeHtml(value)}}</strong></article>`).join("");
+}}
+
+function itemDetails(item) {{
+  const rows = Object.entries(DETAIL_FIELD_LABELS)
+    .filter(([key]) => item[key])
+    .map(([key, label]) => `<p><b>${{escapeHtml(label)}}</b>: ${{escapeHtml(item[key])}}</p>`);
+  if (rows.length) return rows.join("");
+  return `<p>${{escapeHtml(item.note || "")}}</p>`;
+}}
+
+function renderItemOptions(items) {{
+  if (!itemSelect) return;
+  itemSelect.innerHTML = items.map((item) => `<option value="${{escapeHtml(item.id)}}">${{escapeHtml(itemTitle(item))}}</option>`).join("");
 }}
 
 function renderItems(items) {{
   if (!itemsRoot) return;
   if (!items.length) {{
-    itemsRoot.innerHTML = '<p class="contract-empty">Create the first record to start the shared workflow.</p>';
+    itemsRoot.innerHTML = '<p class="contract-empty">Пока нет сохраненных записей. Создайте первую запись через форму.</p>';
     return;
   }}
   itemsRoot.innerHTML = items.map((item) => `
     <article class="contract-card">
-      <strong>${{item.title || "{resource.display_name}"}}</strong>
-      <span>${{item.status || "new"}}</span>
-      <p>${{item.note || ""}}</p>
-      {('<button type="button" data-update-id="${item.id}">Update status</button>' if role in {"specialist", "manager"} else '')}
+      <strong>${{escapeHtml(itemTitle(item))}}</strong>
+      <span>${{escapeHtml(statusLabel(item.status))}}</span>
+      ${{itemDetails(item)}}
+      {('<button type="button" data-update-id="${item.id}">' + quick_action_label + '</button>' if role in {"specialist", "manager"} else '')}
     </article>
   `).join("");
 }}
@@ -739,8 +1179,52 @@ loadItems();
 '''
 
     @staticmethod
-    def _role_css(*, role: str) -> str:
+    def _role_css(*, role: str, generation_mode: GenerationMode | str | None = None) -> str:
         accent = {"client": "#0f766e", "specialist": "#2563eb", "manager": "#7c3aed"}.get(role, "#0f766e")
+        mode_value = normalized_generation_mode(generation_mode)
+        quality_css = ""
+        if mode_value == GenerationMode.QUALITY.value:
+            quality_css = '''
+
+.page {
+  min-height: calc(100vh - 32px);
+  border-left: 4px solid var(--contract-accent);
+}
+
+.contract-header {
+  padding: 16px 0 18px;
+  border-bottom: 1px solid var(--contract-border);
+}
+
+.contract-header h1 {
+  font-size: 28px;
+  line-height: 1.08;
+}
+
+.contract-form {
+  padding: 16px;
+  border: 1px solid var(--contract-border);
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 16px 36px rgba(15, 23, 42, 0.08);
+}
+
+.contract-list h2 {
+  letter-spacing: 0;
+}
+
+.contract-card {
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.07);
+}
+
+.contract-card strong {
+  font-size: 17px;
+}
+
+.contract-card button {
+  justify-self: start;
+}
+'''
         return f''':root {{
   color-scheme: light;
   --contract-accent: {accent};
@@ -767,7 +1251,8 @@ body {{
 .contract-header,
 .contract-form,
 .contract-list,
-.contract-actions {{
+.contract-actions,
+.metrics-grid {{
   display: grid;
   gap: 12px;
   margin-bottom: 16px;
@@ -798,12 +1283,22 @@ label {{
 }}
 
 input,
-textarea {{
+textarea,
+select {{
   border: 1px solid var(--contract-border);
   border-radius: 8px;
   padding: 11px 12px;
   font: inherit;
   background: white;
+  min-width: 0;
+}}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+button:focus-visible {{
+  outline: 3px solid color-mix(in srgb, var(--contract-accent) 28%, transparent);
+  outline-offset: 2px;
 }}
 
 button {{
@@ -815,6 +1310,59 @@ button {{
   padding: 10px 14px;
   font: inherit;
   font-weight: 700;
+}}
+
+[hidden] {{
+  display: none !important;
+}}
+
+.contract-state {{
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--contract-border);
+  background: white;
+  font-weight: 700;
+}}
+
+.contract-loading {{
+  color: var(--contract-muted);
+}}
+
+.contract-error {{
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
+}}
+
+.contract-success {{
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+  color: #166534;
+}}
+
+.metrics-grid {{
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}}
+
+.metric-card {{
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--contract-border);
+  border-radius: 8px;
+  background: var(--contract-panel);
+}}
+
+.metric-card span {{
+  display: block;
+  color: var(--contract-muted);
+  font-size: 12px;
+}}
+
+.metric-card strong {{
+  display: block;
+  margin-top: 4px;
+  color: var(--contract-accent);
+  font-size: 22px;
 }}
 
 #contract-items {{
@@ -840,6 +1388,21 @@ button {{
   font-size: 12px;
   font-weight: 700;
 }}
+
+@media (max-width: 420px) {{
+  .page {{
+    padding: 16px;
+  }}
+
+  .metrics-grid {{
+    grid-template-columns: 1fr;
+  }}
+
+  .contract-card {{
+    overflow-wrap: anywhere;
+  }}
+}}
+{quality_css}
 '''
 
     @staticmethod

@@ -7,7 +7,7 @@ from pathlib import Path
 from app.ai.openai_client import OpenAIClient
 from app.ai.model_registry import CODEX_MINI_MODEL, models_for_role
 from app.models.common import GenerationMode
-from app.models.domain import CheckExecutionRecord, DraftAction, RunCheckResult, utc_now
+from app.models.domain import CheckExecutionRecord, CreateRunRequest, DraftAction, RunCheckResult, WorkspaceRecord, utc_now
 from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
 from app.modules.miniapp_agent_loop.agent_command_policy import DEFAULT_COMMAND_POLICY, decide_workspace_command
 from app.modules.miniapp_agent_loop.agent_coordinator import AgentCoordinator
@@ -39,8 +39,10 @@ from app.modules.workspace_code_agent_runtime.process_recovery import AgentProce
 from app.modules.workspace_code_agent_runtime.prompt_contract import agent_system_prompt
 from app.modules.workspace_code_agent_runtime.runtime import WorkspaceCodeAgentRuntime
 from app.services.check_runner import CheckRunner
+from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer
 from app.services.repair_catalog import RepairCatalog
-from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan
+from app.services.workspace.run_service import RunService
+from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, extract_prompt_planning_hints
 
 
 def test_code_agent_defaults_to_mini_for_all_generation_modes() -> None:
@@ -48,6 +50,93 @@ def test_code_agent_defaults_to_mini_for_all_generation_modes() -> None:
         assert models_for_role("agent_turn", model_profile="", generation_mode=mode) == CODEX_MINI_MODEL
         assert models_for_role("repair", model_profile="", generation_mode=mode) == CODEX_MINI_MODEL
         assert models_for_role("summarize", model_profile="", generation_mode=mode) == CODEX_MINI_MODEL
+
+
+def test_quality_create_prompt_with_error_states_stays_quality_mode() -> None:
+    service = object.__new__(RunService)
+    workspace = WorkspaceRecord(name="test", path="/tmp/ws")
+    request = CreateRunRequest(
+        prompt="Создай приложение. Quality: добавь empty/loading/error states.",
+        intent="create",
+        generation_mode=GenerationMode.QUALITY,
+    )
+
+    assert service._resolve_generation_mode(workspace, request, "create") == GenerationMode.QUALITY
+
+
+def test_prompt_planning_hints_extract_role_fields_from_colon_and_action_sentences() -> None:
+    hints = extract_prompt_planning_hints(
+        "Клиент оставляет заявку: компания, офис, категория материалов, количество, бюджет, срок поставки, контакт и комментарий. "
+        "Специалист видит заявку, подбирает поставщика, уточняет наличие, цену, срок доставки, замену при отсутствии и рабочий статус. "
+        "Менеджер контролирует бюджет и срочность, назначает приоритет, утверждает лимит или замену, оставляет управленческий комментарий."
+    )
+
+    assert hints["resource_hint"] == "заявка"
+    assert hints["role_field_hints"]["client"][:4] == [
+        "компания",
+        "офис",
+        "категория материалов",
+        "количество",
+    ]
+    assert "поставщика" in hints["role_field_hints"]["specialist"]
+    assert "наличие" in hints["role_field_hints"]["specialist"]
+    assert "приоритет" in hints["role_field_hints"]["manager"]
+    assert "утверждает лимит или замену" not in hints["role_field_hints"]["client"]
+
+
+def test_prompt_planning_hints_do_not_turn_workflow_actions_into_form_fields() -> None:
+    hints = extract_prompt_planning_hints(
+        "Клиент: HR-менеджер оставляет заявку на обучение: компания, подразделение, тема обучения, количество участников, бюджет, контакт. "
+        "Специалист: методист обрабатывает заявку: программа, тренер, стоимость, доступные даты, рабочий статус. "
+        "Менеджер: руководитель согласует: приоритет, лимит бюджета, итоговое решение. "
+        "Нужно приложение с ролями /client, /specialist, /manager: создание заявки, список заявок, выбор заявки специалистом и менеджером, обновление статуса, сохранение данных после перезагрузки."
+    )
+
+    all_fields = [
+        field
+        for fields in hints["role_field_hints"].values()
+        for field in fields
+    ]
+
+    assert "компания" in hints["role_field_hints"]["client"]
+    assert "программа" in hints["role_field_hints"]["specialist"]
+    assert "приоритет" in hints["role_field_hints"]["manager"]
+    assert "компания" not in hints["role_field_hints"]["manager"]
+    assert "контакт" not in hints["role_field_hints"]["manager"]
+    assert "создание заявки" not in all_fields
+    assert "список заявок" not in all_fields
+    assert "выбор заявки специалистом" not in all_fields
+    assert "менеджером" not in all_fields
+
+
+def test_prompt_planning_hints_skip_actor_action_and_mode_instruction_fields() -> None:
+    hints = extract_prompt_planning_hints(
+        "Клиент: HR-менеджер оставляет заявку на корпоративное обучение, указывает компанию, количество участников, тему обучения, желаемые даты, формат, бюджет и комментарий. "
+        "Специалист: методист видит заявку, подбирает программу, тренера, длительность, стоимость, материалы и рабочий статус. "
+        "Менеджер: руководитель видит все заявки и результат методиста, назначает приоритет, утверждает лимит бюджета, выбирает финальные даты и оставляет управленческий комментарий. "
+        "Balanced режим: сделай дизайн лучше fast, метрики для менеджера, состояния empty/loading/error/success. "
+        "Строго используй contract-owned schema/routes/field keys из miniapp/app/generated/miniapp_contract.json; не создавай English aliases и не меняй /status route."
+    )
+
+    all_fields = {
+        field
+        for fields in hints["role_field_hints"].values()
+        for field in fields
+    }
+    manager_fields = set(hints["role_field_hints"]["manager"])
+
+    assert "HR-менеджер оставляет заявку на обучение" not in all_fields
+    assert "методист видит заявку" not in all_fields
+    assert "руководитель видит все заявки" not in all_fields
+    assert "на обучение" not in all_fields
+    assert "на корпоративное обучение" not in all_fields
+    assert "компанию" in hints["role_field_hints"]["client"]
+    assert "программу" in hints["role_field_hints"]["specialist"]
+    assert "приоритет" in hints["role_field_hints"]["manager"]
+    assert "лимит бюджета" in hints["role_field_hints"]["manager"]
+    assert not any("отклоняет" in field for field in all_fields)
+    assert not any("Balanced режим" in field for field in manager_fields)
+    assert not any("contract-owned" in field for field in all_fields)
 
 
 def test_agent_prompt_is_tool_loop_contract_not_domain_template() -> None:
@@ -63,6 +152,8 @@ def test_agent_prompt_is_tool_loop_contract_not_domain_template() -> None:
     assert "Do not leave empty static/<role>/<child>/ directories" in prompt
     assert "role entries must include a root field" in prompt
     assert "return the persisted fields at the top level" in prompt
+    assert "miniapp/app/generated/miniapp_contract.json" in prompt
+    assert "Do not invent parallel English aliases" in prompt
 
 
 def test_implementation_plan_has_prompt_derived_routeable_screen_intents() -> None:
@@ -88,6 +179,539 @@ def test_implementation_plan_has_prompt_derived_routeable_screen_intents() -> No
     assert any(item["intent"] == "create_or_configure" for item in screen_plan["roles"]["client"])
     assert any(item["intent"] == "detail_or_update" for item in screen_plan["roles"]["specialist"])
     assert any(item["intent"] == "summary_or_insight" for item in screen_plan["roles"]["manager"])
+
+
+def test_acceptance_contract_carries_prompt_field_hints() -> None:
+    prompt = "Клиент указывает компанию, адрес, дату, бюджет и комментарий. Менеджер видит выручку."
+
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+
+    assert contract["api_contract"]["field_hints"][:3] == ["компанию", "адрес", "дату"]
+    assert contract["api_contract"]["role_field_hints"]["client"][:3] == ["компанию", "адрес", "дату"]
+    assert "prompt_hints" in contract
+
+
+def test_acceptance_contract_splits_role_owned_fields_and_resource_hint() -> None:
+    prompt = (
+        "Клиент создает заявку, указывает компанию, телефон и бюджет. "
+        "Специалист назначает материалы, рассчитывает стоимость и добавляет комментарий цеха. "
+        "Менеджер может пометить приоритет и добавить управленческий комментарий."
+    )
+
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+
+    role_fields = contract["api_contract"]["role_field_hints"]
+    assert role_fields["client"] == ["компанию", "телефон", "бюджет"]
+    assert "материалы" in role_fields["specialist"]
+    assert "управленческий комментарий" in role_fields["manager"]
+    assert contract["api_contract"]["resource_hint"] == "заявка"
+
+
+def test_acceptance_contract_does_not_merge_followup_visibility_sentence_into_client_fields() -> None:
+    prompt = (
+        "Клиент создает заявку, указывает компанию, бюджет и комментарий. "
+        "Видит статус, расчет стоимости и дату визита после перезагрузки. "
+        "Специалист рассчитывает стоимость и добавляет комментарий бригады."
+    )
+
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+
+    assert contract["api_contract"]["role_field_hints"]["client"] == ["компанию", "бюджет", "комментарий"]
+    assert "стоимость" in contract["api_contract"]["role_field_hints"]["specialist"]
+
+
+def test_frontend_prompt_specificity_blocks_generic_scaffold(tmp_path: Path) -> None:
+    prompt = (
+        "Клиент создает заказ на офисный ланч, указывает компанию, адрес, дату, количество персон, "
+        "бюджет, предпочтения по меню и комментарий. Специалист назначает меню, ставит статус "
+        "приготовления/доставки, добавляет комментарий кухни и время готовности. Менеджер видит "
+        "выручку, средний чек, проблемные задержки и управленческий комментарий."
+    )
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    role_text = {
+        "client": "<h1>Create Видит</h1><label>Title <input name='title'></label><label>Note <textarea name='note'></textarea></label><h2>Shared records</h2>",
+        "specialist": "<h1>Process Видит</h1><button>Update status</button><h2>Shared records</h2>",
+        "manager": "<h1>Review Видит</h1><button>Update status</button><h2>Shared records</h2>",
+    }
+
+    issues = CheckRunner._frontend_prompt_specificity_issues(
+        source_dir=tmp_path,
+        contract=contract,
+        role_text=role_text,
+        backend_text="class ContractItemCreate(BaseModel):\n    title: str\n    note: str\n",
+    )
+    codes = {issue.code for issue in issues}
+
+    assert "platform.generic_scaffold_leakage" in codes
+    assert "platform.prompt_specificity_missing_fields" in codes
+    assert any(issue.repair_recipe and issue.repair_recipe["required_next_tool"] == "read_files" for issue in issues)
+
+
+def test_frontend_prompt_specificity_accepts_prompt_owned_surfaces(tmp_path: Path) -> None:
+    prompt = (
+        "Клиент создает заказ на офисный ланч, указывает компанию, адрес, дату, количество персон, "
+        "бюджет, предпочтения по меню и комментарий. Специалист назначает меню, ставит статус "
+        "приготовления/доставки, добавляет комментарий кухни и время готовности. Менеджер видит "
+        "выручку, средний чек, проблемные задержки, требует внимания и управленческий комментарий."
+    )
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    role_text = {
+        "client": "Компания Адрес Дата Количество персон Бюджет Предпочтения по меню Комментарий Офисный ланч",
+        "specialist": "Назначить меню Статус приготовления Доставка Комментарий кухни Время готовности Новые заказы",
+        "manager": "Выручка Средний чек Проблемные задержки Требует внимания Управленческий комментарий Заказы",
+    }
+
+    issues = CheckRunner._frontend_prompt_specificity_issues(
+        source_dir=tmp_path,
+        contract=contract,
+        role_text=role_text,
+        backend_text="company address date budget menu preferences kitchen comment revenue average check delay",
+    )
+
+    assert issues == []
+
+
+def test_frontend_prompt_specificity_requires_visible_client_form_fields(tmp_path: Path) -> None:
+    prompt = "Клиент указывает компанию, адрес, материалы и комментарий. Специалист обновляет статус."
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    role_text = {
+        "client": "Компания Адрес Материалы Комментарий const FIELD_LABELS = { materials: 'Материалы', comment: 'Комментарий' }",
+        "specialist": "Статус Материалы Комментарий",
+        "manager": "Статус заявки",
+    }
+    role_html = {
+        "client": "<form><label>компания<input name='company'></label><label>адрес<input name='address'></label></form>",
+        "specialist": "Статус Материалы Комментарий",
+        "manager": "Статус заявки",
+    }
+
+    issues = CheckRunner._frontend_prompt_specificity_issues(
+        source_dir=tmp_path,
+        contract=contract,
+        role_text=role_text,
+        role_html_text=role_html,
+        backend_text="",
+    )
+
+    assert any(issue.code == "platform.prompt_specificity_missing_fields" for issue in issues)
+
+
+def test_frontend_prompt_specificity_blocks_role_fields_in_client_form(tmp_path: Path) -> None:
+    prompt = (
+        "Клиент создает заявку, указывает компанию, телефон и бюджет. "
+        "Специалист добавляет комментарий цеха и дату готовности. "
+        "Менеджер может пометить приоритет."
+    )
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    role_text = {
+        "client": "компания телефон бюджет комментарий цеха дата готовности",
+        "specialist": "комментарий цеха дата готовности",
+        "manager": "приоритет",
+    }
+    role_html = {
+        "client": (
+            "<form><label>компания<input name='company'></label>"
+            "<label>телефон<input name='phone'></label>"
+            "<label>бюджет<input name='budget'></label>"
+            "<label>комментарий цеха<textarea name='workshop_comment'></textarea></label></form>"
+        ),
+        "specialist": "<form><label>комментарий цеха<textarea></textarea></label></form>",
+        "manager": "<form><label>приоритет<select></select></label></form>",
+    }
+
+    issues = CheckRunner._frontend_prompt_specificity_issues(
+        source_dir=tmp_path,
+        contract=contract,
+        role_text=role_text,
+        role_html_text=role_html,
+        backend_text="",
+    )
+
+    assert any(issue.code == "platform.prompt_specificity_cross_role_fields_in_client_form" for issue in issues)
+
+
+def test_frontend_prompt_specificity_allows_client_comment_without_specialist_comment_leak(tmp_path: Path) -> None:
+    prompt = (
+        "Клиент создает заявку, указывает компанию, дату и комментарий. "
+        "Специалист добавляет комментарий бригады и дату визита."
+    )
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    role_text = {
+        "client": "компания дата комментарий",
+        "specialist": "комментарий бригады дата визита",
+        "manager": "",
+    }
+    role_html = {
+        "client": "<form><label>компания<input name='company'></label><label>дата<input name='date'></label><label>комментарий<textarea name='comment'></textarea></label></form>",
+        "specialist": "<form><label>комментарий бригады<textarea></textarea></label><label>дата визита<input></label></form>",
+        "manager": "",
+    }
+
+    issues = CheckRunner._frontend_prompt_specificity_issues(
+        source_dir=tmp_path,
+        contract=contract,
+        role_text=role_text,
+        role_html_text=role_html,
+        backend_text="",
+    )
+
+    assert not any(issue.code == "platform.prompt_specificity_cross_role_fields_in_client_form" for issue in issues)
+
+
+def test_frontend_prompt_specificity_does_not_confuse_delivery_term_with_supplier(tmp_path: Path) -> None:
+    prompt = (
+        "Клиент оставляет заявку: компания, желаемый срок поставки и комментарий. "
+        "Специалист подбирает поставщика и уточняет наличие."
+    )
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    role_text = {
+        "client": "компания желаемый срок поставки комментарий",
+        "specialist": "поставщика наличие",
+        "manager": "",
+    }
+    role_html = {
+        "client": (
+            "<form><label>компания<input name='company'></label>"
+            "<label>желаемый срок поставки<input name='delivery'></label>"
+            "<label>комментарий<textarea name='comment'></textarea></label></form>"
+        ),
+        "specialist": "<form><label>поставщика<input></label><label>наличие<input></label></form>",
+        "manager": "",
+    }
+
+    issues = CheckRunner._frontend_prompt_specificity_issues(
+        source_dir=tmp_path,
+        contract=contract,
+        role_text=role_text,
+        role_html_text=role_html,
+        backend_text="",
+    )
+
+    assert not any(issue.code == "platform.prompt_specificity_cross_role_fields_in_client_form" for issue in issues)
+
+
+def test_cross_role_update_visibility_requires_client_renderer(tmp_path: Path) -> None:
+    static_root = tmp_path / "miniapp/app/static"
+    (static_root / "client").mkdir(parents=True)
+    role_text = {
+        "client": "function itemDetails(item) { return item.status + item.materials; }",
+        "specialist": 'fetch("/api/items/1/status", { method: "PATCH", body: JSON.stringify({ status: "production", calculated_price: "1000", ready_date: "2026-06-05", workshop_comment: "ready" }) });',
+        "manager": "",
+    }
+
+    issues = CheckRunner._cross_role_update_visibility_issues(static_root=static_root, role_text=role_text)
+
+    assert issues
+    assert issues[0].code == "platform.cross_role_update_not_rendered_in_client"
+    assert set(issues[0].repair_recipe["evidence"]["missing_client_fields"]) >= {
+        "calculated_price",
+        "ready_date",
+        "workshop_comment",
+    }
+
+
+def test_manager_must_render_specialist_result_fields() -> None:
+    role_field_hints = {
+        "specialist": ["программу", "тренера", "стоимость"],
+        "manager": ["приоритет", "лимит бюджета"],
+    }
+    bad_manager = """
+      const FIELD_LABELS = { programmu: "программу", trenera: "тренера", stoimost: "стоимость", prioritet: "приоритет" };
+      function itemDetails(item) {
+        const pairs = [
+          ["kompaniyu", item.kompaniyu],
+          ["prioritet", item.prioritet],
+        ];
+        return pairs.map(([key, value]) => `${FIELD_LABELS[key]}: ${value}`).join("");
+      }
+    """
+    good_manager = """
+      const FIELD_LABELS = { programmu: "программу", trenera: "тренера", stoimost: "стоимость", prioritet: "приоритет" };
+      function itemDetails(item) {
+        const rows = Object.entries(FIELD_LABELS).filter(([key]) => item[key]).map(([key, label]) => `${label}: ${item[key]}`);
+        return rows.join("");
+      }
+    """
+
+    issue = CheckRunner._manager_specialist_field_visibility_issue(
+        manager_text=bad_manager,
+        role_field_hints=role_field_hints,
+    )
+    ok = CheckRunner._manager_specialist_field_visibility_issue(
+        manager_text=good_manager,
+        role_field_hints=role_field_hints,
+    )
+
+    assert issue is not None
+    assert issue.code == "platform.manager_missing_specialist_result_visibility"
+    assert ok is None
+
+
+def test_contract_materializer_manager_surface_has_dashboard_and_quality_css() -> None:
+    prompt = (
+        "Клиент указывает компанию, бюджет и комментарий. "
+        "Специалист добавляет программу, тренера и стоимость. "
+        "Менеджер видит результат специалиста, утверждает лимит и согласует заявку."
+    )
+    contract = MiniAppContractCompiler.compile(
+        workspace_id="ws_test",
+        run_id="run_test",
+        prompt=prompt,
+        intent="create",
+        generation_mode=GenerationMode.QUALITY,
+        acceptance_contract=build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.QUALITY),
+    )
+
+    html = MiniAppContractMaterializer._role_html(role="manager", resource=contract.resources[0])
+    js = MiniAppContractMaterializer._role_js(role="manager", resource=contract.resources[0])
+    css = MiniAppContractMaterializer._role_css(role="manager", generation_mode=GenerationMode.QUALITY)
+
+    assert set(CheckRunner._role_action_signals("manager", html + "\n" + js + "\n" + css)) == {
+        "dashboard",
+        "oversight_action",
+    }
+    assert CheckRunner._role_design_depth_issue("manager", css, html + "\n" + js, GenerationMode.QUALITY) is None
+    assert "contract-metrics" in html
+    assert "focus-visible" in css
+
+
+def test_role_prompt_update_payload_requires_real_specialist_controls() -> None:
+    prompt = (
+        "Клиент создает заявку. Специалист назначает материалы, рассчитывает стоимость, "
+        "ставит статус производства, добавляет комментарий цеха и дату готовности. "
+        "Менеджер видит приоритет."
+    )
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    role_text = {
+        "client": "",
+        "specialist": 'const WORKFLOW_FIELDS = { estimated_cost: "расчет стоимости" }; fetch("/api/items/1/status", { method: "PATCH", body: JSON.stringify({ status: "processed", updated_by: ROLE }) });',
+        "manager": '<select id="priority"></select> fetch("/api/items/1/status", { method: "PATCH", body: JSON.stringify({ priority: "high", management_comment: "ok", updated_by: ROLE }) });',
+    }
+    role_html = {
+        "client": "",
+        "specialist": "<button>Save progress</button>",
+        "manager": "<select id='priority'></select><textarea id='management'></textarea>",
+    }
+
+    issues = CheckRunner._role_prompt_update_payload_issues(
+        contract=contract,
+        role_text=role_text,
+        role_html_text=role_html,
+    )
+
+    assert [issue.location for issue in issues] == ["miniapp/app/static/specialist"]
+    assert issues[0].code == "platform.prompt_specificity_missing_role_update_payload"
+
+
+def test_role_surface_blocks_generic_workflow_copy_and_raw_status_rendering() -> None:
+    technical = CheckRunner._technical_role_copy_markers(
+        '<p>No workflow entries yet.</p><button type="button">Save progress</button>'
+    )
+    raw_status = CheckRunner._raw_status_render_markers(
+        """
+        function render(item) {
+          return `<span>${escapeHtml(item.status || "new")}</span>`;
+          return `<p><strong>Приоритет:</strong> ${escapeHtml(item.priority)}</p>`;
+        }
+        buildLine('Статус', item.status);
+        function statusLabel(status) { return STATUS_LABELS[status] || status || "Новый"; }
+        function humanStatus(status) {
+          const labels = { ready: "Готово" };
+          return labels[status] || status || "Новая";
+        }
+        """
+    )
+
+    assert "no workflow entries yet" in technical
+    assert ">save progress<" in technical
+    assert "template escape(item.status)" in raw_status
+    assert "template item.priority raw enum" in raw_status
+    assert "buildLine status=item.status" in raw_status
+    assert "status label raw fallback" in raw_status
+
+
+def test_hidden_state_class_requires_effective_css_rule() -> None:
+    issue = CheckRunner._hidden_state_css_issue(
+        "client",
+        '<div id="contract-empty" class="state hidden">Пока нет заявок</div>',
+        ".state { display: grid; }",
+    )
+    ok = CheckRunner._hidden_state_css_issue(
+        "client",
+        '<div id="contract-empty" class="state hidden">Пока нет заявок</div>',
+        ".hidden { display: none; }",
+    )
+
+    assert issue is not None
+    assert issue.code == "platform.hidden_state_class_without_css"
+    assert ok is None
+
+
+def test_role_surface_blocks_visible_http_api_copy_without_blocking_js_methods() -> None:
+    markers = CheckRunner._technical_visible_html_copy_markers(
+        '<p>PATCH сохраняет изменения</p><p>/api/vizitas</p><p>Через защищённое API</p><p>Client</p><script>fetch("/api/vizitas", { method: "PATCH" })</script>'
+    )
+    js_markers = CheckRunner._technical_visible_html_copy_markers(
+        '<script>fetch("/api/vizitas", { method: "PATCH" })</script>'
+    )
+
+    assert markers == ["visible HTTP method", "visible API path", "visible API term", "visible role slug"]
+    assert js_markers == []
+
+
+def test_role_prompt_update_payload_accepts_formdata_dynamic_patch_fields() -> None:
+    prompt = (
+        "Клиент создает заявку. Специалист назначает бригаду, рассчитывает стоимость, "
+        "добавляет комментарий бригады и дату визита. Менеджер видит приоритет."
+    )
+    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    role_text = {
+        "client": "",
+        "specialist": '''
+          const updateForm = document.getElementById("contract-update-form");
+          updateForm.addEventListener("submit", async (event) => {
+            const formData = new FormData(updateForm);
+            const payload = { status: String(formData.get("status") || "processed"), updated_by: ROLE };
+            for (const [key, value] of formData.entries()) {
+              if (key !== "item_id" && key !== "status") payload[key] = String(value || "");
+            }
+            await fetch(`/api/items/${formData.get("item_id")}/status`, { method: "PATCH", body: JSON.stringify(payload) });
+          });
+        ''',
+        "manager": '<select id="priority"></select> fetch("/api/items/1/status", { method: "PATCH", body: JSON.stringify({ priority: "high", updated_by: ROLE }) });',
+    }
+    role_html = {
+        "client": "",
+        "specialist": (
+            "<form id='contract-update-form'>"
+            "<select name='item_id'></select><input name='brigadu'>"
+            "<input name='stoimost'><textarea name='kommentariyBrigady'></textarea>"
+            "<input name='datuVizita'><select name='status'></select></form>"
+        ),
+        "manager": "<select id='priority'></select>",
+    }
+
+    issues = CheckRunner._role_prompt_update_payload_issues(
+        contract=contract,
+        role_text=role_text,
+        role_html_text=role_html,
+    )
+
+    assert issues == []
+
+
+def test_frontend_form_field_reads_accept_dynamic_formdata_entries_payload() -> None:
+    js_source = '''
+      const form = document.getElementById("contract-create-form");
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const formData = new FormData(form);
+        const payload = {};
+        for (const [key, value] of formData.entries()) {
+          payload[key] = String(value || "");
+        }
+        payload.created_by = ROLE;
+        await fetch(API_BASE, { method: "POST", body: JSON.stringify(payload) });
+      });
+    '''
+
+    assert CheckRunner._js_reads_form_field(js_source, "kompaniya")
+    assert CheckRunner._js_effective_form_payload_fields(js_source, {"kompaniya", "byudzhet"}) == {
+        "kompaniya",
+        "byudzhet",
+        "created_by",
+    }
+
+
+def test_miniapp_contract_uses_prompt_fields_instead_of_items_slug() -> None:
+    prompt = "Клиент указывает компанию, адрес и бюджет для корпоративного ланча."
+    acceptance_contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    implementation_plan = build_implementation_plan(
+        prompt=prompt,
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract=acceptance_contract,
+    )
+
+    contract = MiniAppContractCompiler.compile(
+        workspace_id="ws_test",
+        run_id="run_test",
+        prompt=prompt,
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract=acceptance_contract,
+        implementation_plan=implementation_plan,
+    )
+
+    resource = contract.resources[0]
+    assert resource.slug != "items"
+    assert set(resource.field_labels.values()) >= {"компанию", "адрес", "бюджет для корпоративного ланча"}
+    assert any(field.startswith("komp") for field in resource.field_labels)
+
+
+def test_miniapp_contract_uses_role_scoped_fields_and_business_resource_name() -> None:
+    prompt = (
+        "Клиент создает заявку, указывает компанию, телефон и бюджет. "
+        "Специалист добавляет комментарий цеха и дату готовности."
+    )
+    acceptance_contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+
+    contract = MiniAppContractCompiler.compile(
+        workspace_id="ws_test",
+        run_id="run_test",
+        prompt=prompt,
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        acceptance_contract=acceptance_contract,
+    )
+
+    resource = contract.resources[0]
+    assert "zayav" in resource.slug
+    assert resource.display_name == "Заявка"
+    assert set(resource.role_field_labels["client"].values()) == {"компанию", "телефон", "бюджет"}
+    assert "комментарий цеха" in set(resource.role_field_labels["specialist"].values())
+    create_endpoint = next(endpoint for endpoint in resource.endpoints if endpoint.method == "POST")
+    assert "kommentariyCeha" not in create_endpoint.request_fields
+
+
+def test_repair_catalog_classifies_prompt_specificity_failure() -> None:
+    packet = RepairCatalog.classify_issue(
+        {
+            "code": "platform.prompt_specificity_missing_fields",
+            "message": "Client create flow does not expose enough prompt-derived fields.",
+            "check": "frontend_interaction_static_smoke",
+        }
+    )
+
+    assert packet["signature"] == "workflow.prompt_specificity_mismatch"
+    assert packet["required_next_tool"] == "read_files"
+    assert packet["deterministic"] is True
+
+
+def test_frontend_backend_payload_validator_accepts_pydantic_extra_allow(tmp_path: Path) -> None:
+    backend_text = '''
+from pydantic import BaseModel, ConfigDict
+
+class ContractItemStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    status: str = "updated"
+    updated_by: str = "manager"
+'''
+    schemas = CheckRunner._backend_update_schema_contracts(backend_text)
+    js_path = tmp_path / "a/b/c/d/manager/app.js"
+    js_path.parent.mkdir(parents=True)
+    js_path.write_text("", encoding="utf-8")
+
+    issues = CheckRunner._frontend_backend_patch_payload_issues(
+        "manager",
+        js_path,
+        'fetch("/api/items/1/status", { method: "PATCH", body: JSON.stringify({ priority: "Высокий", updated_by: ROLE }) });',
+        backend_patch_schemas=schemas,
+    )
+
+    assert schemas[0]["accepted"] >= {"*", "status", "updated_by"}
+    assert issues == []
 
 
 def test_platform_shell_stabilizer_adds_shell_assets_to_plain_html() -> None:
@@ -350,6 +974,30 @@ def test_repair_transition_policy_forces_read_then_write() -> None:
 
     assert read_decision.active is True
     assert read_decision.forced_tool_names == ["read_files"]
+    assert write_decision.forced_tool_names == ["write_file"]
+
+
+def test_repair_transition_policy_allows_patch_after_non_patch_conflict_read() -> None:
+    packet = AgentEditValidator.repair_packet_for_issue(
+        code="old_string_not_found",
+        message="old string missing",
+        file_changes=[
+            DraftAction(
+                file_path="miniapp/app/static/client/app.js",
+                operation="patch",
+                diff="bad",
+                reason="test",
+            )
+        ],
+        repeated_count=2,
+    )
+
+    write_decision = RepairTransitionPolicy.decide(
+        repair_packets=[packet],
+        repeated_failure_signatures={str(packet["failure_signature"]): 2},
+        latest_files_read=["miniapp/app/static/client/app.js"],
+    )
+
     assert write_decision.forced_tool_names == ["write_file", "apply_patch_to_draft"]
 
 
@@ -678,6 +1326,23 @@ def test_worker_manager_rejects_conflicting_owned_edits() -> None:
     assert report["conflicts"][0]["path"] == "miniapp/app/static/client/app.js"  # type: ignore[index]
 
 
+def test_balanced_quality_use_serial_contract_runtime_writes() -> None:
+    for mode in (GenerationMode.BALANCED, GenerationMode.QUALITY):
+        mailbox = AgentWorkerManager.mailbox_for_plan(
+            generation_mode=mode,
+            implementation_plan={"contract_runtime_v1": {"enabled": True}},
+        )
+        prompt_payload = WorkspaceCodeAgentRuntime._worker_branching_prompt_payload(
+            generation_mode=mode,
+            implementation_plan={"contract_runtime_v1": {"enabled": True}},
+        )
+
+        assert mailbox["enabled"] is False
+        assert mailbox["write_coordination"] == "serial_contract_runtime_writes"
+        assert prompt_payload["enabled"] is False
+        assert prompt_payload["reason"] == "serial_contract_runtime_writes"
+
+
 def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
     tasks = AgentWorkerTaskPlanner.worker_tasks(
         generation_mode=GenerationMode.QUALITY,
@@ -688,6 +1353,8 @@ def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
 
     assert "client_ui" in by_id
     assert "Own only these paths" in by_id["client_ui"]["prompt"]
+    assert "miniapp/app/generated/miniapp_contract.json" in by_id["client_ui"]["prompt"]
+    assert "Do not introduce parallel aliases" in by_id["client_ui"]["prompt"]
     assert by_id["client_ui"]["mode_contract"]["depth"] == "deep"
     assert "mobile layout works" in by_id["client_ui"]["self_check"][3]
 

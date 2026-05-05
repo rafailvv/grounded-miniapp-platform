@@ -1066,6 +1066,8 @@ class WorkspaceCodeAgentRuntime:
             generation_mode=generation_mode,
             implementation_plan=implementation_plan,
         )
+        if not bool(worker_mailbox.get("enabled")):
+            worker_tasks = []
         worker_prefix = self._worker_prefix_payload(
             implementation_plan=implementation_plan,
             acceptance_contract=acceptance_contract,
@@ -1078,7 +1080,11 @@ class WorkspaceCodeAgentRuntime:
                 "workspace_id": workspace_id,
                 "run_id": run_id,
                 "prefix": worker_prefix,
-                "contract": "Balanced/Quality workers share this stable prefix; only owned task directive differs.",
+                "contract": (
+                    "Worker branches are disabled for this mode; contract-owned files and subsequent mutations are serialized through the coordinator."
+                    if not bool(worker_mailbox.get("enabled"))
+                    else "Worker branches share this stable prefix; only owned task directive differs."
+                ),
             },
         )
         job.worker_mailbox_ref = f"worker_mailbox:{workspace_id}:{artifact_run_id}"
@@ -1179,6 +1185,23 @@ class WorkspaceCodeAgentRuntime:
             if focused_visual_edit
             else (contract_materialized_paths or ["miniapp", "docs", "README.md"])
         )
+        if contract_materialized_paths and create_intent and not focused_visual_edit:
+            coordinator.complete_phase("editing", "Contract runtime materialized the initial backend, role UI, styles, and generated checks.")
+            scratchpad.set_next_action(
+                action="run static, API, generated, browser, and mobile proof",
+                reason="contract_runtime_materialized",
+                payload={"paths": contract_materialized_paths[:24]},
+            )
+            self._append_event(
+                job,
+                "patch_apply_completed",
+                "Contract runtime materialized the initial mini-app draft.",
+                {
+                    "turn": 0,
+                    "files": contract_materialized_paths[:24],
+                    "file_count": len(contract_materialized_paths),
+                },
+            )
         cached_no_diff_checks: tuple[CheckExecutionRecord, dict[str, Any]] | None = None
         branch_initial_file_changes: list[DraftAction] = []
         branch_initial_message = "Workspace code agent initialized."
@@ -1935,7 +1958,7 @@ class WorkspaceCodeAgentRuntime:
             store_report=self._store_report,
             record_compact_boundary=_record_compact_boundary,
             allow_optimistic_completion=False,
-            skip_initial_checks=focused_visual_edit or (create_intent and not contract_runtime_fast_path),
+            skip_initial_checks=focused_visual_edit,
             stop_if_requested=should_stop,
             budget_status=lambda attempt: completion_budget_status(
                 job=job,
@@ -2768,20 +2791,9 @@ class WorkspaceCodeAgentRuntime:
                     "reason": "focused_generated_test_repair" if generated_tests_repair else "focused_browser_step_repair" if browser_step_repair else "compact_repair_after_no_progress",
                 }
                 if generated_tests_repair or browser_step_repair or (compact_repair_prompt and repeated_no_progress > 0)
-                else
-                self._compact_jsonish(
-                    {
-                        "mailbox": AgentWorkerManager.mailbox_for_plan(
-                            generation_mode=generation_mode,
-                            implementation_plan=implementation_plan,
-                        ),
-                        "worker_tasks": AgentWorkerTaskPlanner.worker_tasks(
-                            generation_mode=generation_mode,
-                            implementation_plan=implementation_plan,
-                        ),
-                    },
-                    max_chars=2600,
-                    max_items=12,
+                else self._worker_branching_prompt_payload(
+                    generation_mode=generation_mode,
+                    implementation_plan=implementation_plan,
                 )
                 if generation_mode in {GenerationMode.BALANCED, GenerationMode.QUALITY}
                 else {"enabled": False, "mode": "single_agent_loop"}
@@ -2924,12 +2936,15 @@ class WorkspaceCodeAgentRuntime:
                     *focused_rules,
                     f"Keep each turn applyable: use mutating tools for a compact coherent edit, or request only the specific read-only tools needed for the next patch.",
                     "Use the implementation_plan and acceptance_contract as the product contract. Derive entities, fields, routes, labels, and role actions from the user's prompt and current code, not from platform templates.",
+                    "If acceptance_contract.api_contract.field_hints is non-empty, the client form, persisted API payload, rendered cards, and generated tests must expose those prompt-derived fields. A generic Title/Note/Shared records scaffold is a blocking product failure, even if compile/apply passes.",
+                    "Specialist and manager surfaces must visibly reflect their own prompt sentences: operational updates for specialist, metrics/oversight/control for manager. Do not satisfy those roles with only a generic refresh/list page.",
                     "Create/workflow completion requires real UI controls, JavaScript handlers, backend persistence, generated tests, cross-role visibility, refresh persistence, and browser/mobile proof.",
                     "Build three isolated role surfaces in the miniapp shell: client creates/submits the main prompt-derived state, specialist processes or updates it, manager reviews/control-checks the persisted state. Do not link role roots to each other.",
                     "For multi-page role apps, shared static/<role>/app.js must initialize per page: use body[data-view] or route, guard optional DOM nodes from other pages, and bind every visible child-page form/button/control to persisted API behavior.",
                     "The client/source role must display both its original submitted state and the persisted progress/update fields changed by specialist or manager roles after reload.",
-                    "User-facing UI copy must be polished product language: do not render raw API paths, HTTP methods, internal route names, role slugs, or enum codes like `new`/`preparing`; map persisted values to human-readable labels and keep label/value pairs visually separated.",
+                    "User-facing UI copy must be polished product language: do not render raw API paths, the word API, HTTP methods, internal route names, role slugs, or enum codes like `new`/`preparing`; map persisted values to human-readable labels and keep label/value pairs visually separated.",
                     "In async JavaScript form handlers, capture DOM nodes before any await, for example `const form = event.currentTarget`, then use `form.reset()` after awaited API calls. Do not read `event.currentTarget` after await because browsers clear it after dispatch.",
+                    "Do not initialize workflow bindings only with `document.addEventListener('DOMContentLoaded', init)`. Use a readyState guard (`if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();`) so forms still bind when scripts load after DOMContentLoaded in preview/browser verification.",
                     "Fast should be compact and working; Balanced should add moderate workflow/design depth; Quality should first get the workflow green, then add a polished mobile design pass. Never add pages or resources just to satisfy a fixed count.",
                     "Mobile-first: target Telegram widths around 360-430px, use one consistent light neutral product visual system across all roles unless the user explicitly asks for a dark theme, preserve safe top spacing/preview bridge, and avoid horizontal scroll or overlapping cards/forms/actions.",
                     "Generated source must start empty: no mock, seed, demo, sample, fixture, preloaded, or hard-coded domain records. Empty states and validation test payloads are allowed.",
@@ -2983,6 +2998,36 @@ class WorkspaceCodeAgentRuntime:
             "current_diff_summary": current_diff_summary,
             "worker_directive_slot": "<owned worker directive is appended separately>",
         }
+
+    @staticmethod
+    def _worker_branching_prompt_payload(
+        *,
+        generation_mode: GenerationMode,
+        implementation_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        mailbox = AgentWorkerManager.mailbox_for_plan(
+            generation_mode=generation_mode,
+            implementation_plan=implementation_plan,
+        )
+        if not bool(mailbox.get("enabled")):
+            return {
+                "enabled": False,
+                "mode": str(getattr(generation_mode, "value", generation_mode) or ""),
+                "reason": "serial_contract_runtime_writes",
+                "write_coordination": mailbox.get("write_coordination") or "serial_contract_runtime_writes",
+                "contract": "Use read/search/check tools freely, but keep all draft mutations in the coordinator loop.",
+            }
+        return WorkspaceCodeAgentRuntime._compact_jsonish(
+            {
+                "mailbox": mailbox,
+                "worker_tasks": AgentWorkerTaskPlanner.worker_tasks(
+                    generation_mode=generation_mode,
+                    implementation_plan=implementation_plan,
+                ),
+            },
+            max_chars=2600,
+            max_items=12,
+        )
 
     def _context_pack_payload(
         self,
@@ -3819,6 +3864,7 @@ class WorkspaceCodeAgentRuntime:
             "Read the latest check/browser diagnostics as the source of truth, patch the smallest connected slice, then let validation run again.",
             "Prefer apply_patch_to_draft for existing files. Use write_file only for a new/missing/tiny file or after a repeated apply conflict on that same file.",
             "Keep the app prompt-owned and prompt-derived: do not introduce platform templates, seed/demo/mock domain records, or fixed resource/page names.",
+            "Prompt-specificity failures are blocking: replace generic Title/Note/shared-record UI with the user's fields, persisted payload fields, rendered card labels, and role-specific specialist/manager controls.",
             "For create/workflow failures, keep HTML controls, JavaScript handlers, API routes/schemas, persistence, and generated tests aligned to one actual contract.",
             "Browser-flow failures are product failures: make the UI action change persisted state, make other roles observe it, and make reload preserve it.",
             "The source/user-facing role must render the persisted fields that operational roles can update, such as status, notes, comments, assignment, payment, or other prompt-derived progress fields. It is not enough to show only the fields originally submitted by the user.",

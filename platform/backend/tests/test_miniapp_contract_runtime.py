@@ -63,6 +63,38 @@ def test_materializer_is_idempotent_and_registry_passes(tmp_path: Path) -> None:
     assert "/client" in snapshot.manifest_routes
 
 
+def test_contract_shell_copy_uses_product_labels_not_internal_status_or_workflow_copy(tmp_path: Path) -> None:
+    source = _template_source(tmp_path)
+    contract = MiniAppContractCompiler.compile(
+        workspace_id="ws_test",
+        run_id="run_test",
+        prompt="Создай приложение для заявок на аренду оборудования.",
+        intent="create",
+        generation_mode=GenerationMode.QUALITY,
+    )
+    MiniAppContractMaterializer.materialize(source, contract)
+
+    specialist_js = (source / "miniapp/app/static/specialist/app.js").read_text(encoding="utf-8")
+    specialist_html = (source / "miniapp/app/static/specialist/index.html").read_text(encoding="utf-8")
+
+    assert "Отметить обработку" in specialist_js
+    assert "statusLabel(item.status)" in specialist_js
+    assert 'ready: "Готово к согласованию"' in specialist_js
+    assert 'rejected: "Отклонена"' in specialist_js
+    manager_js = (source / "miniapp/app/static/manager/app.js").read_text(encoding="utf-8")
+    manager_html = (source / "miniapp/app/static/manager/index.html").read_text(encoding="utf-8")
+    assert 'ROLE === "manager" ? FIELD_LABELS' in manager_js
+    assert '<option value="approved">Одобрена</option>' in manager_html
+    assert '<option value="rejected">Отклонена</option>' in manager_html
+    assert "Save progress" not in specialist_js
+    assert "workflow entries" not in specialist_js
+    assert "Specialist" not in specialist_html
+    assert "workflow" not in specialist_html
+    assert "Title" not in specialist_html
+    assert "Note" not in specialist_html
+    assert 'item.status || "new"' not in specialist_js
+
+
 def test_registry_returns_repair_recipe_for_backend_contract_drift(tmp_path: Path) -> None:
     source = _template_source(tmp_path)
     contract = MiniAppContractCompiler.compile(

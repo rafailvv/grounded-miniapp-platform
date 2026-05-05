@@ -94,6 +94,8 @@ class AgentWorkerTaskPlanner:
             f"Use the implementation plan ({plan_summary}) and the user's prompt-derived entities/actions as source of truth. "
             f"Mode depth is {mode_contract.get('depth')}: {mode_contract.get('workflow_bar')}; page organization: {mode_contract.get('page_bar')}; design bar: {mode_contract.get('design_bar')}. "
             "Use implementation_plan.routeable_screen_plan for screen intent guidance; choose concrete route names from the prompt and keep only screens that clarify the mobile workflow. "
+            "Read miniapp/app/generated/miniapp_contract.json before changing payloads, forms, renderers, routes, or tests; preserve exact contract resource slugs and field keys across backend, JS payloads, and generated tests. "
+            "Do not introduce parallel aliases for the same data, especially English aliases such as company/topic/priority/budget_limit/final_dates/manager_comment/working_status when the contract already defines prompt-derived keys. "
             "Read the files you need, patch the smallest complete owned slice, run or request the relevant checks, and report exact changed paths and self-check result. "
             "Do not create templates, seed records, mock records, domain-category shortcuts, or cross-role navigation links. "
             "Do not copy another role's primary workflow into this role surface: client UI creates the user-provided state, specialist UI operates on existing shared state, manager UI reviews and controls shared state unless the user's prompt explicitly assigns a different action. "

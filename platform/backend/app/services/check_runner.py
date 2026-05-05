@@ -112,6 +112,71 @@ CSS_PLACEHOLDER_MARKERS = (
     "generated manager page styles can replace this file",
     "styles can replace this file",
 )
+PROMPT_SPECIFICITY_STOPWORDS = {
+    "add",
+    "adds",
+    "all",
+    "and",
+    "app",
+    "application",
+    "can",
+    "client",
+    "create",
+    "creates",
+    "customer",
+    "manager",
+    "miniapp",
+    "needs",
+    "role",
+    "save",
+    "see",
+    "sees",
+    "specialist",
+    "status",
+    "submit",
+    "update",
+    "user",
+    "workflow",
+    "администратор",
+    "будет",
+    "видеть",
+    "видит",
+    "видят",
+    "все",
+    "всё",
+    "добавить",
+    "добавляет",
+    "должен",
+    "должна",
+    "должны",
+    "заказ",
+    "заказы",
+    "заказа",
+    "клиент",
+    "менеджер",
+    "мини",
+    "может",
+    "нужно",
+    "обновляет",
+    "пометить",
+    "после",
+    "приложение",
+    "роль",
+    "создает",
+    "создаёт",
+    "специалист",
+    "ставит",
+    "статус",
+    "указывает",
+}
+GENERIC_SCAFFOLD_VISIBLE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("visible Title label", r"<label[^>]*>\s*title\b"),
+    ("visible Note label", r"<label[^>]*>\s*note\b"),
+    ("Shared records heading", r">\s*shared records\s*<"),
+    ("saved records status copy", r"\bsaved records\b"),
+    ("first record empty state", r"create the first record"),
+    ("generic Update status button", r">\s*update status\s*<"),
+)
 PAGE_SHELL_SAFE_TOP_MARKERS = (
     "var(--telegram-top-safe-offset)",
     "telegram-top-safe-offset",
@@ -653,6 +718,8 @@ class CheckRunner:
 
         issues = self._frontend_interaction_contract_issues(source_dir=source_dir, contract=contract)
         blocking = self._blocking_validation_issues(issues)
+        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
+        api_contract = contract.get("api_contract") if isinstance(contract.get("api_contract"), dict) else {}
         return RunCheckResult(
             name="frontend_interaction_static_smoke",
             status="failed" if blocking else "passed",
@@ -663,6 +730,15 @@ class CheckRunner:
                 "acceptance_contract_required": True,
                 "flow_ids": [flow.get("id") for flow in contract.get("flows", []) if isinstance(flow, dict)],
                 "features": dict(contract.get("features") or {}),
+                "prompt_specificity": {
+                    "field_hints": list(api_contract.get("field_hints") or prompt_hints.get("field_hints") or [])[:12],
+                    "blocking_codes": [
+                        issue.code
+                        for issue in blocking
+                        if str(issue.code).startswith("platform.prompt_specificity")
+                        or str(issue.code) == "platform.generic_scaffold_leakage"
+                    ],
+                },
             },
         )
 
@@ -672,6 +748,10 @@ class CheckRunner:
         static_root = source_dir / "miniapp/app/static"
         role_text = {
             role: cls._read_role_surface_text(static_root / role)
+            for role in ROLE_ORDER
+        }
+        role_html_text = {
+            role: cls._read_role_html_surface_text(static_root / role)
             for role in ROLE_ORDER
         }
         backend_text = cls._read_backend_routes_text(source_dir)
@@ -707,9 +787,618 @@ class CheckRunner:
                     blocking=True,
                 )
             )
+        issues.extend(
+            cls._frontend_prompt_specificity_issues(
+                source_dir=source_dir,
+                contract=contract,
+                role_text=role_text,
+                role_html_text=role_html_text,
+                backend_text=backend_text,
+            )
+        )
+        issues.extend(
+            cls._role_prompt_update_payload_issues(
+                contract=contract,
+                role_text=role_text,
+                role_html_text=role_html_text,
+            )
+        )
+        issues.extend(cls._cross_role_update_visibility_issues(static_root=static_root, role_text=role_text))
         issues.extend(cls._frontend_role_wiring_issues(static_root, backend_text=backend_text))
         issues.extend(cls._role_css_html_contract_issues(static_root))
         return cls._dedupe_validation_issues(issues)
+
+    @classmethod
+    def _frontend_prompt_specificity_issues(
+        cls,
+        *,
+        source_dir: Path,
+        contract: dict[str, Any],
+        role_text: dict[str, str],
+        role_html_text: dict[str, str] | None = None,
+        backend_text: str,
+    ) -> list[ValidationIssue]:
+        del source_dir
+        role_html_text = dict(role_html_text or role_text)
+        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
+        api_contract = contract.get("api_contract") if isinstance(contract.get("api_contract"), dict) else {}
+        field_hints = [
+            str(item).strip()
+            for item in (api_contract.get("field_hints") or prompt_hints.get("field_hints") or [])
+            if str(item).strip()
+        ]
+        role_field_hints = (
+            api_contract.get("role_field_hints")
+            if isinstance(api_contract.get("role_field_hints"), dict)
+            else prompt_hints.get("role_field_hints")
+            if isinstance(prompt_hints.get("role_field_hints"), dict)
+            else {}
+        )
+        role_prompts = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
+        if not field_hints and not role_prompts:
+            return []
+
+        issues: list[ValidationIssue] = []
+        all_frontend = "\n".join(role_html_text.values())
+        scaffold_markers = cls._generic_scaffold_markers(all_frontend)
+        if field_hints and scaffold_markers:
+            issues.append(
+                ValidationIssue(
+                    code="platform.generic_scaffold_leakage",
+                    message=(
+                        "Prompt-derived fields are required, but the role UI still exposes generic contract scaffold copy "
+                        f"({', '.join(scaffold_markers[:4])}). Replace Title/Note/records copy with the user's business fields and workflow labels."
+                    ),
+                    severity="high",
+                    location="miniapp/app/static",
+                    blocking=True,
+                    repair_recipe=cls._prompt_specificity_repair_recipe(
+                        signature="workflow.generic_scaffold_leakage",
+                        target_files=[
+                            "miniapp/app/static/client/index.html",
+                            "miniapp/app/static/client/app.js",
+                            "miniapp/app/static/specialist/index.html",
+                            "miniapp/app/static/specialist/app.js",
+                            "miniapp/app/static/manager/index.html",
+                            "miniapp/app/static/manager/app.js",
+                        ],
+                        evidence={"markers": scaffold_markers, "field_hints": field_hints[:8]},
+                    ),
+                )
+            )
+
+        if field_hints:
+            role_prompts_for_fields = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
+            client_prompt_keys = cls._semantic_keys_from_text(
+                " ".join(str(item) for item in role_prompts_for_fields.get("client") or []),
+                exclude_stopwords=True,
+            )
+            explicit_client_field_hints = [
+                str(item).strip()
+                for item in (role_field_hints.get("client") or [])
+                if str(item).strip()
+            ] if isinstance(role_field_hints, dict) else []
+            client_field_hints = [
+                hint
+                for hint in field_hints
+                if cls._semantic_keys_from_text(hint, exclude_stopwords=True) & client_prompt_keys
+            ]
+            client_field_hints = explicit_client_field_hints or client_field_hints or field_hints
+            client_surface = f"{role_html_text.get('client', '')}\n{backend_text}"
+            matched_fields = cls._matched_prompt_hints(client_field_hints, client_surface)
+            required_count = max(2, min(len(client_field_hints), int(len(client_field_hints) * 0.8 + 0.999)))
+            if len(matched_fields) < required_count:
+                missing_fields = [hint for hint in client_field_hints if hint not in matched_fields]
+                issues.append(
+                    ValidationIssue(
+                        code="platform.prompt_specificity_missing_fields",
+                        message=(
+                            "Client create flow does not expose enough prompt-derived fields. "
+                            f"Matched {len(matched_fields)}/{required_count}; missing examples: {', '.join(missing_fields[:6])}."
+                        ),
+                        severity="high",
+                        location="miniapp/app/static/client",
+                        blocking=True,
+                        repair_recipe=cls._prompt_specificity_repair_recipe(
+                            signature="workflow.prompt_specificity_missing_fields",
+                            target_files=[
+                                "miniapp/app/static/client/index.html",
+                                "miniapp/app/static/client/app.js",
+                                "miniapp/app/routes/generated_contract.py",
+                                "miniapp/tests/test_generated_app.py",
+                                "miniapp/tests/generated_app.test.mjs",
+                            ],
+                            evidence={
+                                "field_hints": client_field_hints[:12],
+                                "matched_fields": matched_fields,
+                                "missing_fields": missing_fields[:8],
+                            },
+                        ),
+                    )
+                )
+            issues.extend(
+                cls._client_form_cross_role_field_issues(
+                    client_html=role_html_text.get("client", ""),
+                    role_field_hints=role_field_hints if isinstance(role_field_hints, dict) else {},
+                    client_field_hints=client_field_hints,
+                )
+            )
+            manager_visibility_issue = cls._manager_specialist_field_visibility_issue(
+                manager_text=role_text.get("manager", ""),
+                role_field_hints=role_field_hints if isinstance(role_field_hints, dict) else {},
+            )
+            if manager_visibility_issue is not None:
+                issues.append(manager_visibility_issue)
+
+        for role in ROLE_ORDER:
+            prompts = role_prompts.get(role) if isinstance(role_prompts, dict) else []
+            if not isinstance(prompts, list) or not prompts:
+                continue
+            expected_keys = cls._semantic_keys_from_text(" ".join(str(item) for item in prompts), exclude_stopwords=True)
+            if len(expected_keys) < 4:
+                continue
+            surface_keys = cls._semantic_keys_from_text(role_text.get(role, ""), exclude_stopwords=False)
+            matched_count = len(expected_keys & surface_keys)
+            threshold = 2 if role in {"specialist", "manager"} else 3
+            if matched_count >= threshold:
+                continue
+            issues.append(
+                ValidationIssue(
+                    code="platform.prompt_specificity_missing_role_surface",
+                    message=(
+                        f"{role} role surface does not reflect its prompt-specific responsibility. "
+                        "Add visible labels, controls, persisted fields, and JS handlers for the role action instead of a generic shared-record page."
+                    ),
+                    severity="high",
+                    location=f"miniapp/app/static/{role}",
+                    blocking=True,
+                    repair_recipe=cls._prompt_specificity_repair_recipe(
+                        signature=f"workflow.prompt_specificity_missing_role_surface.{role}",
+                        target_files=[
+                            f"miniapp/app/static/{role}/index.html",
+                            f"miniapp/app/static/{role}/app.js",
+                            f"miniapp/app/static/{role}/styles.css",
+                            "miniapp/app/routes/generated_contract.py",
+                            "miniapp/tests/test_generated_app.py",
+                            "miniapp/tests/generated_app.test.mjs",
+                        ],
+                        evidence={
+                            "role": role,
+                            "role_prompt": prompts[:4],
+                            "matched_semantic_terms": matched_count,
+                        },
+                    ),
+                )
+            )
+        return issues
+
+    @classmethod
+    def _manager_specialist_field_visibility_issue(
+        cls,
+        *,
+        manager_text: str,
+        role_field_hints: dict[str, Any],
+    ) -> ValidationIssue | None:
+        specialist_hints = [
+            str(item).strip()
+            for item in (role_field_hints.get("specialist") or [])
+            if str(item).strip()
+        ]
+        if len(specialist_hints) < 2 or not str(manager_text or "").strip():
+            return None
+        detail_slice = cls._js_function_slice(str(manager_text or ""), "itemDetails")
+        if not detail_slice:
+            detail_slice = cls._js_function_slice(str(manager_text or ""), "render")
+        if not detail_slice:
+            detail_slice = cls._js_function_slice(str(manager_text or ""), "renderItems")
+        if not detail_slice:
+            return None
+        detail_lower = detail_slice.lower()
+        if (
+            ("object.entries(field_labels)" in detail_lower or "detail_field_labels" in detail_lower)
+            and re.search(r"\bitem\s*\[\s*key\s*\]", detail_slice, flags=re.IGNORECASE)
+        ):
+            return None
+        label_to_keys = cls._js_label_to_field_keys(str(manager_text or ""))
+        rendered_keys = set(re.findall(r"\bitem\.([A-Za-z_$][A-Za-z0-9_$]*)\b", detail_slice))
+        rendered_keys.update(
+            match.group(1)
+            for match in re.finditer(r"\[\s*['\"]([A-Za-z_$][A-Za-z0-9_$]*)['\"]\s*,\s*item\.", detail_slice)
+        )
+        missing: list[str] = []
+        for hint in specialist_hints:
+            hint_keys = cls._semantic_keys_from_text(hint, exclude_stopwords=True)
+            mapped_keys = {
+                key
+                for label, keys in label_to_keys.items()
+                if hint_keys and cls._semantic_keys_from_text(label, exclude_stopwords=True) & hint_keys
+                for key in keys
+            }
+            if mapped_keys and mapped_keys & rendered_keys:
+                continue
+            if hint_keys and hint_keys & cls._semantic_keys_from_text(detail_slice, exclude_stopwords=True):
+                continue
+            missing.append(hint)
+        if len(missing) < max(2, min(3, len(specialist_hints))):
+            return None
+        return ValidationIssue(
+            code="platform.manager_missing_specialist_result_visibility",
+            message=(
+                "Manager role must render specialist-owned persisted result fields before approval. "
+                f"Missing specialist fields in manager card/detail renderer: {', '.join(missing[:6])}."
+            ),
+            severity="high",
+            location="miniapp/app/static/manager/app.js",
+            blocking=True,
+            repair_recipe=cls._prompt_specificity_repair_recipe(
+                signature="workflow.manager_missing_specialist_result_visibility",
+                target_files=[
+                    "miniapp/app/static/manager/app.js",
+                    "miniapp/app/static/manager/index.html",
+                    "miniapp/tests/generated_app.test.mjs",
+                ],
+                evidence={
+                    "missing_specialist_fields": missing[:8],
+                    "rendered_keys": sorted(rendered_keys)[:16],
+                    "required_next_tool": "read_files",
+                },
+            ),
+        )
+
+    @staticmethod
+    def _js_function_slice(source: str, function_name: str) -> str:
+        match = re.search(rf"\bfunction\s+{re.escape(function_name)}\s*\([^)]*\)\s*\{{", source)
+        if not match:
+            return ""
+        start = match.start()
+        next_match = re.search(r"\n(?:async\s+)?function\s+[A-Za-z_$][A-Za-z0-9_$]*\s*\(", source[match.end():])
+        end = match.end() + next_match.start() if next_match else min(len(source), start + 2400)
+        return source[start:end]
+
+    @staticmethod
+    def _js_label_to_field_keys(source: str) -> dict[str, set[str]]:
+        mapping: dict[str, set[str]] = {}
+        for match in re.finditer(
+            r"(?:['\"](?P<quoted>[A-Za-z_$][A-Za-z0-9_$]*)['\"]|(?P<bare>[A-Za-z_$][A-Za-z0-9_$]*))\s*:\s*['\"](?P<label>[^'\"]{2,80})['\"]",
+            source,
+        ):
+            key = str(match.group("quoted") or match.group("bare") or "").strip()
+            label = str(match.group("label") or "").strip()
+            if key and label:
+                mapping.setdefault(label, set()).add(key)
+        return mapping
+
+    @classmethod
+    def _client_form_cross_role_field_issues(
+        cls,
+        *,
+        client_html: str,
+        role_field_hints: dict[str, Any],
+        client_field_hints: list[str],
+    ) -> list[ValidationIssue]:
+        if not client_html or not role_field_hints:
+            return []
+        form_text = " ".join(
+            re.findall(r"<form\b[^>]*>(.*?)</form>", client_html, flags=re.IGNORECASE | re.DOTALL)
+        )
+        if not form_text:
+            return []
+        client_keys = {
+            frozenset(cls._semantic_keys_from_text(hint, exclude_stopwords=True))
+            for hint in client_field_hints
+            if hint
+        }
+        exclusive: list[str] = []
+        for role in ("specialist", "manager"):
+            hints = role_field_hints.get(role) if isinstance(role_field_hints, dict) else []
+            for hint in hints or []:
+                text = str(hint).strip()
+                if not text:
+                    continue
+                hint_keys = frozenset(cls._semantic_keys_from_text(text, exclude_stopwords=True))
+                if hint_keys and hint_keys in client_keys:
+                    continue
+                exclusive.append(text)
+        if not exclusive:
+            return []
+        form_keys = cls._semantic_keys_from_text(form_text, exclude_stopwords=False)
+        form_exact_keys = cls._role_leak_exact_keys(form_text)
+        leaked: list[str] = []
+        for hint in list(dict.fromkeys(exclusive)):
+            hint_keys = cls._semantic_keys_from_text(hint, exclude_stopwords=True)
+            if not hint_keys:
+                continue
+            hint_words = [
+                raw
+                for raw in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{2,}", str(hint or "").lower())
+                if raw not in PROMPT_SPECIFICITY_STOPWORDS
+            ]
+            if len(hint_words) == 1:
+                if cls._role_leak_exact_keys(hint) & form_exact_keys:
+                    leaked.append(hint)
+                continue
+            if hint_keys <= form_keys:
+                leaked.append(hint)
+        if not leaked:
+            return []
+        return [
+            ValidationIssue(
+                code="platform.prompt_specificity_cross_role_fields_in_client_form",
+                message=(
+                    "Client create form includes fields owned by specialist/manager workflow: "
+                    f"{', '.join(leaked[:6])}. Keep role-owned update fields in their own role surfaces; client may render updates after reload, but should not collect them at creation time."
+                ),
+                severity="high",
+                location="miniapp/app/static/client/index.html",
+                blocking=True,
+                repair_recipe=cls._prompt_specificity_repair_recipe(
+                    signature="workflow.cross_role_fields_in_client_form",
+                    target_files=[
+                        "miniapp/app/static/client/index.html",
+                        "miniapp/app/static/client/app.js",
+                        "miniapp/app/static/specialist/index.html",
+                        "miniapp/app/static/specialist/app.js",
+                        "miniapp/app/static/manager/index.html",
+                        "miniapp/app/static/manager/app.js",
+                    ],
+                    evidence={
+                        "leaked_role_fields": leaked[:8],
+                        "client_field_hints": client_field_hints[:12],
+                    },
+                ),
+            )
+        ]
+
+    @classmethod
+    def _role_leak_exact_keys(cls, content: str) -> set[str]:
+        keys: set[str] = set()
+        for raw in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{2,}", str(content or "").lower()):
+            normalized = re.sub(r"[^a-zа-яё0-9]+", "", raw)
+            if not normalized:
+                continue
+            for variant in {normalized, cls._ascii_transliterate(normalized)}:
+                keys.add(variant[:7] if len(variant) > 6 else variant)
+        return keys
+
+    @classmethod
+    def _role_prompt_update_payload_issues(
+        cls,
+        *,
+        contract: dict[str, Any],
+        role_text: dict[str, str],
+        role_html_text: dict[str, str],
+    ) -> list[ValidationIssue]:
+        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
+        role_prompts = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
+        issues: list[ValidationIssue] = []
+        technical_fields = {"id", "item_id", "updated_by", "created_by", "current_view", "role", "status", "note"}
+        for role in ("specialist", "manager"):
+            prompts = role_prompts.get(role) if isinstance(role_prompts, dict) else []
+            if not isinstance(prompts, list) or not prompts:
+                continue
+            expected_keys = cls._semantic_keys_from_text(" ".join(str(item) for item in prompts), exclude_stopwords=True)
+            if len(expected_keys) < 4:
+                continue
+            surface = f"{role_html_text.get(role, '')}\n{role_text.get(role, '')}"
+            has_interactive_update_controls = bool(re.search(r"<(?:input|select|textarea)\b", surface, re.IGNORECASE))
+            patch_fields = {
+                field
+                for payload_fields in cls._js_patch_payload_field_sets(role_text.get(role, ""))
+                for field in payload_fields
+                if field and not cls._is_path_id_field(field)
+            }
+            if cls._js_patch_payload_uses_dynamic_formdata(role_text.get(role, "")):
+                for form in cls._html_forms(role_html_text.get(role, "")):
+                    patch_fields.update(
+                        field
+                        for field in (form.get("field_names") or [])
+                        if isinstance(field, str) and field and not cls._is_path_id_field(field)
+                    )
+            meaningful_payload_fields = sorted(field for field in patch_fields if field not in technical_fields)
+            if has_interactive_update_controls and len(meaningful_payload_fields) >= (2 if role == "specialist" else 1):
+                continue
+            missing_parts: list[str] = []
+            if not has_interactive_update_controls:
+                missing_parts.append("interactive form/select/textarea controls")
+            if len(meaningful_payload_fields) < (2 if role == "specialist" else 1):
+                missing_parts.append("role-owned PATCH fields beyond status")
+            issues.append(
+                ValidationIssue(
+                    code="platform.prompt_specificity_missing_role_update_payload",
+                    message=(
+                        f"{role} role prompt describes operational fields/actions, but the role update surface lacks "
+                        f"{' and '.join(missing_parts)}. Add controls and PATCH payload fields for the role-specific work, "
+                        "for example estimates, materials, readiness dates, comments, priorities, or management notes."
+                    ),
+                    severity="high",
+                    location=f"miniapp/app/static/{role}",
+                    blocking=True,
+                    repair_recipe=cls._prompt_specificity_repair_recipe(
+                        signature=f"workflow.prompt_specificity_missing_role_update_payload.{role}",
+                        target_files=[
+                            f"miniapp/app/static/{role}/index.html",
+                            f"miniapp/app/static/{role}/app.js",
+                            "miniapp/app/routes/generated_contract.py",
+                            "miniapp/tests/generated_app.test.mjs",
+                        ],
+                        evidence={
+                            "role": role,
+                            "role_prompt": prompts[:4],
+                            "patch_fields": sorted(patch_fields),
+                            "meaningful_payload_fields": meaningful_payload_fields,
+                            "has_interactive_update_controls": has_interactive_update_controls,
+                        },
+                    ),
+                )
+            )
+        return issues
+
+    @classmethod
+    def _cross_role_update_visibility_issues(cls, *, static_root: Path, role_text: dict[str, str]) -> list[ValidationIssue]:
+        client_text = role_text.get("client", "")
+        operational_text = "\n".join(role_text.get(role, "") for role in ("specialist", "manager"))
+        update_fields = {
+            field
+            for payload_fields in cls._js_patch_payload_field_sets(operational_text)
+            for field in payload_fields
+            if field
+            and field
+            not in {
+                "id",
+                "item_id",
+                "updated_by",
+                "created_by",
+                "current_view",
+                "role",
+            }
+            and not cls._is_path_id_field(field)
+        }
+        if not update_fields:
+            return []
+        client_identifiers = set(re.findall(r"\b[A-Za-z_$][\w$]*\b", client_text))
+        missing = sorted(field for field in update_fields if field not in client_identifiers)
+        if not missing:
+            return []
+        return [
+            ValidationIssue(
+                code="platform.cross_role_update_not_rendered_in_client",
+                message=(
+                    "Specialist/manager PATCH payload updates fields that the client role never renders after reload: "
+                    f"{', '.join(missing[:8])}. Client must show persisted status, estimate, dates, notes, and management updates changed by other roles."
+                ),
+                severity="high",
+                location="miniapp/app/static/client/app.js",
+                blocking=True,
+                repair_recipe={
+                    "recipe_id": "workflow.cross_role_update_visibility",
+                    "failure_class": "semantic_contract_mismatch",
+                    "failure_signature": "workflow.cross_role_update_not_rendered_in_client",
+                    "required_next_tool": "read_files",
+                    "suggested_tool_after_read": "apply_patch_to_draft_or_write_file",
+                    "target_files": [
+                        "miniapp/app/static/client/app.js",
+                        "miniapp/app/static/specialist/app.js",
+                        "miniapp/app/static/manager/app.js",
+                        "miniapp/tests/generated_app.test.mjs",
+                    ],
+                    "verification_check": "frontend_interaction_static_smoke",
+                    "verification_command": "run_checks frontend_interaction_static_smoke",
+                    "retryable": True,
+                    "deterministic": True,
+                    "evidence": {
+                        "update_fields": sorted(update_fields),
+                        "missing_client_fields": missing,
+                    },
+                },
+            )
+        ]
+
+    @staticmethod
+    def _prompt_specificity_repair_recipe(
+        *,
+        signature: str,
+        target_files: list[str],
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "recipe_id": "workflow.prompt_specificity",
+            "failure_class": "semantic_contract_mismatch",
+            "failure_signature": signature,
+            "required_next_tool": "read_files",
+            "suggested_tool_after_read": "apply_patch_to_draft_or_write_file",
+            "target_files": target_files,
+            "verification_check": "frontend_interaction_static_smoke",
+            "verification_command": "run_checks frontend_interaction_static_smoke",
+            "retry_policy": "deterministic_repair",
+            "deterministic": True,
+            "retryable": True,
+            "instruction": (
+                "Read the target role files, replace generic Title/Note/shared-record UI with prompt-owned business fields, "
+                "persist those fields through the API, update role-specific actions, then rerun frontend and browser workflow checks."
+            ),
+            "evidence": evidence,
+        }
+
+    @staticmethod
+    def _generic_scaffold_markers(content: str) -> list[str]:
+        markers: list[str] = []
+        for label, pattern in GENERIC_SCAFFOLD_VISIBLE_PATTERNS:
+            if re.search(pattern, str(content or ""), re.IGNORECASE):
+                markers.append(label)
+        return markers
+
+    @classmethod
+    def _matched_prompt_hints(cls, hints: list[str], surface_text: str) -> list[str]:
+        surface_keys = cls._semantic_keys_from_text(surface_text, exclude_stopwords=False)
+        matched: list[str] = []
+        for hint in hints:
+            hint_keys = cls._semantic_keys_from_text(hint, exclude_stopwords=True)
+            if hint_keys and hint_keys & surface_keys:
+                matched.append(hint)
+        return matched
+
+    @classmethod
+    def _semantic_keys_from_text(cls, content: str, *, exclude_stopwords: bool) -> set[str]:
+        keys: set[str] = set()
+        for raw in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{2,}", str(content or "").lower()):
+            token = raw.strip("_-")
+            if not token:
+                continue
+            if exclude_stopwords and token in PROMPT_SPECIFICITY_STOPWORDS:
+                continue
+            for variant in {token, cls._ascii_transliterate(token)}:
+                key = cls._semantic_key(variant)
+                if key:
+                    keys.add(key)
+        return keys
+
+    @staticmethod
+    def _semantic_key(token: str) -> str:
+        value = re.sub(r"[^a-zа-яё0-9]+", "", str(token or "").lower())
+        if len(value) < 3:
+            return ""
+        if len(value) <= 4:
+            return value[:3]
+        return value[:5]
+
+    @staticmethod
+    def _ascii_transliterate(value: str) -> str:
+        table = {
+            "а": "a",
+            "б": "b",
+            "в": "v",
+            "г": "g",
+            "д": "d",
+            "е": "e",
+            "ё": "e",
+            "ж": "zh",
+            "з": "z",
+            "и": "i",
+            "й": "y",
+            "к": "k",
+            "л": "l",
+            "м": "m",
+            "н": "n",
+            "о": "o",
+            "п": "p",
+            "р": "r",
+            "с": "s",
+            "т": "t",
+            "у": "u",
+            "ф": "f",
+            "х": "h",
+            "ц": "c",
+            "ч": "ch",
+            "ш": "sh",
+            "щ": "shch",
+            "ъ": "",
+            "ы": "y",
+            "ь": "",
+            "э": "e",
+            "ю": "yu",
+            "я": "ya",
+        }
+        return "".join(table.get(char, char) for char in str(value or ""))
 
     @classmethod
     def _frontend_role_wiring_issues(cls, static_root: Path, *, backend_text: str = "") -> list[ValidationIssue]:
@@ -739,6 +1428,7 @@ class CheckRunner:
                     continue
             combined_html = "\n".join(html_by_path.values())
             issues.extend(cls._js_obvious_undefined_workflow_issues(role, js_path, js_source))
+            issues.extend(cls._late_domcontentloaded_init_issues(role, js_path, js_source, combined_html))
             issues.extend(cls._selector_wiring_issues(role, js_path, js_source, combined_html))
             for relative_path, html_source in html_by_path.items():
                 issues.extend(
@@ -761,6 +1451,35 @@ class CheckRunner:
                 )
             )
         return issues
+
+    @classmethod
+    def _late_domcontentloaded_init_issues(cls, role: str, js_path: Path, js_source: str, html_source: str) -> list[ValidationIssue]:
+        text = str(js_source or "")
+        if "DOMContentLoaded" not in text:
+            return []
+        if "readyState" in text:
+            return []
+        if not re.search(r"document\s*\.\s*addEventListener\(\s*([\"'])DOMContentLoaded\1", text):
+            return []
+        if not re.search(r"<(?:form|button|select|textarea|input)\b", str(html_source or ""), re.IGNORECASE):
+            return []
+        return [
+            ValidationIssue(
+                code="platform.workflow_late_domcontentloaded_init",
+                message=(
+                    f"{role} app initializes workflow handlers only from DOMContentLoaded. In preview/browser verification the script can load after "
+                    "that event, leaving visible forms unbound. Use a readyState guard: if document.readyState is 'loading', add the listener; otherwise call init() immediately."
+                ),
+                severity="high",
+                location=js_path.relative_to(js_path.parents[4]).as_posix(),
+                blocking=True,
+                repair_recipe=cls._prompt_specificity_repair_recipe(
+                    signature=f"workflow.late_domcontentloaded_init.{role}",
+                    target_files=[js_path.relative_to(js_path.parents[4]).as_posix()],
+                    evidence={"role": role, "uses_domcontentloaded": True, "ready_state_guard": False},
+                ),
+            )
+        ]
 
     @staticmethod
     def _js_obvious_undefined_workflow_issues(role: str, js_path: Path, js_source: str) -> list[ValidationIssue]:
@@ -1053,6 +1772,7 @@ class CheckRunner:
                 )
             if (
                 backend_create_fields
+                and "*" not in backend_create_fields
                 and re.search(r"\bmethod\s*:\s*([\"'`])POST\1", js_source, re.IGNORECASE)
                 and not (
                     cls._form_looks_like_workflow_update(field_names)
@@ -1156,6 +1876,7 @@ class CheckRunner:
             body = text[start:end]
             accepted: set[str] = set()
             required: set[str] = set()
+            allows_extra = CheckRunner._schema_allows_extra_fields(body)
             for field_match in re.finditer(
                 r"^\s{4}(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?P<type>[^=\n#]+?)(?:\s*=\s*(?P<default>[^\n#]+))?\s*$",
                 body,
@@ -1174,6 +1895,8 @@ class CheckRunner:
                 )
                 if not optional:
                     required.add(field_name)
+            if allows_extra:
+                accepted.add("*")
             if accepted:
                 contracts.append(
                     {
@@ -1183,6 +1906,16 @@ class CheckRunner:
                     }
                 )
         return contracts
+
+    @staticmethod
+    def _schema_allows_extra_fields(body: str) -> bool:
+        text = str(body or "")
+        if re.search(r"\bmodel_config\s*=\s*ConfigDict\([^)]*\bextra\s*=\s*([\"'])allow\1", text, re.DOTALL):
+            return True
+        config_match = re.search(r"^\s+class\s+Config\s*:\s*(?P<body>.*?)(?=^\s{0,4}\w|\Z)", text, re.MULTILINE | re.DOTALL)
+        if config_match and re.search(r"\bextra\s*=\s*([\"'])allow\1", config_match.group("body"), re.DOTALL):
+            return True
+        return False
 
     @staticmethod
     def _schema_field_default_is_optional(default: str | None) -> bool:
@@ -1246,6 +1979,8 @@ class CheckRunner:
             if set(schema.get("accepted") or set())
         ]
         if not patch_payloads or not accepted_sets:
+            return issues
+        if any("*" in accepted for accepted in accepted_sets):
             return issues
         allowed_path_fields = {field for fields in patch_payloads for field in fields if cls._is_path_id_field(field)}
         for payload_fields in patch_payloads:
@@ -1343,6 +2078,25 @@ class CheckRunner:
         return deduped
 
     @staticmethod
+    def _js_patch_payload_uses_dynamic_formdata(js_source: str) -> bool:
+        text = str(js_source or "")
+        return bool(
+            re.search(r"\bmethod\s*:\s*([\"'`])PATCH\1", text, re.IGNORECASE)
+            and CheckRunner._js_payload_uses_dynamic_formdata_entries(text)
+        )
+
+    @staticmethod
+    def _js_payload_uses_dynamic_formdata_entries(js_source: str) -> bool:
+        text = str(js_source or "")
+        return bool(
+            re.search(r"\bnew\s+FormData\s*\(", text)
+            and re.search(r"\.entries\s*\(\s*\)", text)
+            and re.search(r"\bfor\s*\([^)]*\[[^\]]*\bkey\b[^\]]*\][^)]*\bof\b[^)]*\.entries\s*\(\s*\)", text, re.DOTALL)
+            and re.search(r"JSON\.stringify\(\s*[A-Za-z_$][\w$]*\s*\)", text)
+            and re.search(r"\[\s*key\s*\]\s*=", text)
+        )
+
+    @staticmethod
     def _js_object_literal_keys(body: str) -> set[str]:
         keys: set[str] = set()
         text = str(body or "")
@@ -1401,6 +2155,13 @@ class CheckRunner:
     def _js_effective_form_payload_fields(js_source: str, field_names: set[str]) -> set[str]:
         text = str(js_source or "")
         explicit_post_payloads = CheckRunner._js_post_payload_field_sets(text)
+        if CheckRunner._js_payload_uses_dynamic_formdata_entries(text):
+            fields = set(field_names)
+            if explicit_post_payloads:
+                fields.update(set().union(*explicit_post_payloads))
+            for match in re.finditer(r"\bdelete\s+payload(?:\.([A-Za-z_$][\w$]*)|\[\s*([\"'])([A-Za-z_$][\w$]*)\2\s*\])", text):
+                fields.discard(str(match.group(1) or match.group(3) or ""))
+            return fields
         if explicit_post_payloads:
             explicit_fields = set().union(*explicit_post_payloads)
             if "Object.fromEntries" in text and "FormData" in text:
@@ -1630,6 +2391,7 @@ class CheckRunner:
             or re.search(rf"\[\s*name\s*=\s*([\"']){escaped}\1\s*\]", text)
             or re.search(rf"\bname\s*=\s*([\"']){escaped}\1", text)
             or re.search(rf"\bcollectFormData\([^)]*\[[^\]]*([\"']){escaped}\1", text, re.DOTALL)
+            or CheckRunner._js_payload_uses_dynamic_formdata_entries(text)
             or re.search(
                 rf"\bfor\s*\([^)]*\bkey\b[^)]*\bof\b\s*\[[^\]]*([\"']){escaped}\1[^\]]*\][\s\S]{{0,500}}\.get\(\s*key\s*\)",
                 text,
@@ -1808,6 +2570,18 @@ class CheckRunner:
         for path in sorted(role_dir.rglob("*")):
             if path.suffix.lower() not in {".html", ".js"}:
                 continue
+            try:
+                chunks.append(path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+        return "\n".join(chunks)
+
+    @staticmethod
+    def _read_role_html_surface_text(role_dir: Path) -> str:
+        if not role_dir.exists():
+            return ""
+        chunks: list[str] = []
+        for path in sorted(role_dir.rglob("*.html")):
             try:
                 chunks.append(path.read_text(encoding="utf-8"))
             except OSError:
@@ -3728,23 +4502,30 @@ except Exception as exc:
             }
             missing = [path.relative_to(source_dir).as_posix() for path in expected_files.values() if not path.exists()]
             texts: list[str] = []
-            for path in expected_files.values():
+            html_texts: list[str] = []
+            for kind, path in expected_files.items():
                 if not path.exists():
                     continue
                 try:
-                    texts.append(path.read_text(encoding="utf-8"))
+                    content = path.read_text(encoding="utf-8")
                 except OSError:
                     continue
+                texts.append(content)
+                if kind == "html":
+                    html_texts.append(content)
             for page in route_pages.get(role, []):
                 page_path_raw = str(page.get("file_path") or "")
                 page_path = source_dir / page_path_raw
                 if page_path in expected_files.values() or not page_path.exists():
                     continue
                 try:
-                    texts.append(page_path.read_text(encoding="utf-8"))
+                    content = page_path.read_text(encoding="utf-8")
                 except OSError:
                     continue
+                texts.append(content)
+                html_texts.append(content)
             combined = "\n".join(texts)
+            html_combined = "\n".join(html_texts)
             normalized = combined.lower()
             markers = [marker for marker in NEUTRAL_TEMPLATE_MARKERS if marker in normalized]
             role_tokens[role] = cls._semantic_tokens(combined)
@@ -3830,6 +4611,16 @@ except Exception as exc:
                 }
                 issues.append(design_depth_issue)
                 continue
+            hidden_state_issue = cls._hidden_state_css_issue(role, html_combined, css_text)
+            if hidden_state_issue is not None:
+                coverage[role] = {
+                    "status": "visible_hidden_state",
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                }
+                issues.append(hidden_state_issue)
+                continue
             cross_role_links = cls._cross_role_links(role, combined)
             if cross_role_links:
                 coverage[role] = {
@@ -3874,7 +4665,14 @@ except Exception as exc:
                     )
                 )
                 continue
-            technical_copy = cls._technical_role_copy_markers(combined)
+            technical_copy = list(
+                dict.fromkeys(
+                    [
+                        *cls._technical_role_copy_markers(combined),
+                        *cls._technical_visible_html_copy_markers(html_combined),
+                    ]
+                )
+            )
             if technical_copy:
                 coverage[role] = {
                     "status": "technical_role_copy",
@@ -3889,6 +4687,28 @@ except Exception as exc:
                         message=(
                             f"{role} role contains technical/generated copy: {', '.join(technical_copy[:4])}. "
                             "Use polished user-facing text in the user's language."
+                        ),
+                        severity="high",
+                        location=f"miniapp/app/static/{role}",
+                        blocking=True,
+                    )
+                )
+                continue
+            raw_status_markers = cls._raw_status_render_markers(combined)
+            if raw_status_markers:
+                coverage[role] = {
+                    "status": "raw_status_copy",
+                    "markers": raw_status_markers,
+                    "route_count": len(role_routes),
+                    "secondary_route_count": len(secondary_routes),
+                    "routes": role_routes,
+                }
+                issues.append(
+                    ValidationIssue(
+                        code="platform.raw_status_rendered_to_user",
+                        message=(
+                            f"{role} role renders persisted status codes directly: {', '.join(raw_status_markers[:4])}. "
+                            "Map internal status values to polished human-readable labels before rendering."
                         ),
                         severity="high",
                         location=f"miniapp/app/static/{role}",
@@ -4206,8 +5026,73 @@ except Exception as exc:
             "source request",
             "collect user-provided details",
             "placeholder records",
+            "workflow entries",
+            "create the first workflow entry",
+            "no workflow entries yet",
+            "select a saved record first",
+            "unable to load saved records",
+            ">save progress<",
         )
         return [marker for marker in markers if marker in lowered]
+
+    @staticmethod
+    def _technical_visible_html_copy_markers(content: str) -> list[str]:
+        text = re.sub(r"<script\b.*?</script>", " ", str(content or ""), flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<style\b.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+        visibleish = re.sub(r"<[^>]+>", " ", text)
+        markers: list[str] = []
+        if re.search(r"\b(?:GET|POST|PATCH|PUT|DELETE)\b", visibleish):
+            markers.append("visible HTTP method")
+        if re.search(r"/api/[A-Za-z0-9_/{}/.-]+", visibleish):
+            markers.append("visible API path")
+        if re.search(r"\bAPI\b", visibleish):
+            markers.append("visible API term")
+        if re.search(r"[А-Яа-яЁё]", visibleish) and re.search(r"\b(?:Client|Specialist|Manager)\b", visibleish):
+            markers.append("visible role slug")
+        return markers
+
+    @staticmethod
+    def _raw_status_render_markers(content: str) -> list[str]:
+        text = str(content or "")
+        patterns = (
+            (r"\$\{\s*escape(?:Html|Text)?\s*\(\s*item\.status\b", "template escape(item.status)"),
+            (r"\$\{\s*item\.status\b", "template item.status"),
+            (r"\bbuildLine\s*\(\s*['\"][^'\"]*статус[^'\"]*['\"]\s*,\s*item\.status\s*\)", "buildLine status=item.status"),
+            (r"\bitem\.status\s*\|\|\s*['\"](?:new|pending|processed|approved|reviewed|done|completed)['\"]", "item.status fallback enum"),
+            (r"(?:Приоритет|priority)[^`]*\$\{[^}]*item\.priority", "template item.priority raw enum"),
+            (r"\bstatus-pill[^`'\"]*`[^`]*item\.status", "status pill item.status"),
+            (r"\bSTATUS_LABELS\s*\[\s*(?:value|key|item\.status)\s*\]\s*\|\|\s*(?:value|key|item\.status)\b", "status label raw fallback"),
+            (r"\bSTATUS_LABELS\s*\[[^\]]+\]\s*\|\|\s*(?:[A-Za-z_$][\w$]*|item\.status)\b", "status label raw fallback"),
+            (r"\bSTATUS_LABELS\s*\[[^\]]+\]\s*\|\|\s*normalize\s*\(\s*value\b", "status label normalize(value) fallback"),
+            (r"\bfunction\s+statusLabel\b[\s\S]{0,500}\breturn\s+[^;{}]*\[[^\]]+\]\s*\|\|\s*(?:status|value|key)\b", "status label raw fallback"),
+            (r"\bfunction\s+(?:humanStatus|formatStatus)\b[\s\S]{0,500}\breturn\s+[^;{}]*\[[^\]]+\]\s*\|\|\s*(?:status|value|key)\b", "status label raw fallback"),
+        )
+        markers: list[str] = []
+        for pattern, label in patterns:
+            if re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+                markers.append(label)
+        return markers
+
+    @staticmethod
+    def _hidden_state_css_issue(role: str, html_text: str, css_text: str) -> ValidationIssue | None:
+        html = str(html_text or "")
+        css = str(css_text or "")
+        if not re.search(r"\bclass\s*=\s*([\"'])[^\"']*\bhidden\b", html, flags=re.IGNORECASE):
+            return None
+        if re.search(r"\.hidden\s*\{[^}]*display\s*:\s*none\b", css, flags=re.IGNORECASE | re.DOTALL):
+            return None
+        if re.search(r"\.hidden\s*\{[^}]*visibility\s*:\s*hidden\b", css, flags=re.IGNORECASE | re.DOTALL):
+            return None
+        return ValidationIssue(
+            code="platform.hidden_state_class_without_css",
+            message=(
+                f"{role} role uses a hidden state class for loading/empty/error sections, "
+                "but styles.css does not actually hide it. This can show empty/loading states together with real records."
+            ),
+            severity="high",
+            location=f"miniapp/app/static/{role}/styles.css",
+            blocking=True,
+        )
 
     @staticmethod
     def _role_surfaces_too_similar(role_text: dict[str, str]) -> bool:

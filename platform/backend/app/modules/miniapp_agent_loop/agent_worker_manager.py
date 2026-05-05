@@ -47,7 +47,13 @@ class AgentWorkerManager:
         generation_mode: GenerationMode,
         implementation_plan: dict[str, Any],
     ) -> dict[str, object]:
-        enabled = generation_mode in {GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY}
+        # Claude/Codex-style orchestration keeps independent reads parallel but
+        # serializes writes through one coordinator when the app contract is
+        # already materialized. Balanced/quality runs are especially sensitive to
+        # route/schema drift from parallel writer branches, so they use the main
+        # repair loop for mutations and reserve workers for future read-only
+        # planning/verifier roles.
+        enabled = generation_mode == GenerationMode.FAST
         contract_runtime = implementation_plan.get("contract_runtime_v1") if isinstance(implementation_plan, dict) else {}
         materialized_tests = bool(isinstance(contract_runtime, dict) and contract_runtime.get("materialized_tests"))
         workers = [
@@ -78,6 +84,11 @@ class AgentWorkerManager:
                 "Each worker prompt must be self-contained: owner scope, path prefixes, exact product plan slice, "
                 "expected self-check, and repair instruction. Continue the same worker for failures in owned paths; "
                 "use a fresh verifier only after green checks."
+            ),
+            "write_coordination": (
+                "parallel_owned_branches"
+                if enabled
+                else "serial_contract_runtime_writes"
             ),
             "merge_policy": "accept non-conflicting owned diffs; return conflicts to the owning worker as a repair packet",
         }

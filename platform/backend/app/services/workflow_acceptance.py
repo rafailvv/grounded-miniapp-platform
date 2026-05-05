@@ -12,11 +12,14 @@ PROMPT_PLAN_STOPWORDS = {
     "app",
     "application",
     "create",
+    "client",
     "for",
     "from",
+    "manager",
     "mini",
     "miniapp",
     "need",
+    "specialist",
     "that",
     "the",
     "this",
@@ -26,6 +29,9 @@ PROMPT_PLAN_STOPWORDS = {
     "будет",
     "вести",
     "видеть",
+    "видит",
+    "видят",
+    "видно",
     "всё",
     "для",
     "должен",
@@ -34,12 +40,16 @@ PROMPT_PLAN_STOPWORDS = {
     "есть",
     "каждый",
     "как",
+    "который",
     "маленький",
     "мне",
     "может",
     "нужно",
+    "после",
+    "перезагрузки",
     "помогало",
     "приложение",
+    "реально",
     "современно",
     "таблиц",
     "удобно",
@@ -51,6 +61,259 @@ PROMPT_PLAN_STOPWORDS = {
 
 def _clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+ACTION_REQUIREMENT_PREFIXES = (
+    "создание ",
+    "список ",
+    "выбор ",
+    "обновление ",
+    "сохранение ",
+    "перезагрузка",
+    "открытие ",
+    "переход ",
+    "submit ",
+    "create ",
+    "list ",
+    "select ",
+    "update ",
+    "save ",
+)
+
+
+ACTION_REQUIREMENT_TERMS = {
+    "api",
+    "http",
+    "raw status",
+    "workflow",
+    "role",
+    "roles",
+    "client",
+    "specialist",
+    "manager",
+    "/client",
+    "/specialist",
+    "/manager",
+    "специалистом",
+    "менеджером",
+    "клиентом",
+}
+
+
+def _looks_like_action_requirement_field(value: str) -> bool:
+    lowered = _clean_text(value).lower()
+    if not lowered:
+        return True
+    if any(lowered.startswith(prefix) for prefix in ACTION_REQUIREMENT_PREFIXES):
+        return True
+    return lowered in ACTION_REQUIREMENT_TERMS
+
+
+def _explicit_role_prefix(sentence: str) -> str | None:
+    lowered = _clean_text(sentence).lower()
+    if re.match(r"^(?:клиент|заказчик|пользователь|client|customer)\s*[:：-]", lowered):
+        return "client"
+    if re.match(r"^(?:специалист|исполнитель|методист|оператор|specialist|worker|staff)\s*[:：-]", lowered):
+        return "specialist"
+    if re.match(r"^(?:менеджер|администратор|руководитель|manager|admin|administrator)\s*[:：-]", lowered):
+        return "manager"
+    return None
+
+
+def _is_general_role_requirement_sentence(sentence: str) -> bool:
+    lowered = _clean_text(sentence).lower()
+    if any(marker in lowered for marker in ("contract-owned", "miniapp/app/generated", "english aliases", "/status route")):
+        return True
+    if "режим" in lowered and any(marker in lowered for marker in ("fast", "balanced", "quality", "дизайн", "responsive")):
+        return True
+    return lowered.startswith(("нужно", "нужен", "нужна", "need ", "requires ")) and any(
+        marker in lowered for marker in ("/client", "/specialist", "/manager", "ролями", "roles")
+    )
+
+
+def _extract_field_hints_from_text(text: str, *, limit: int = 12) -> list[str]:
+    field_hints: list[str] = []
+    markers = (
+        "оставляет",
+        "оставить",
+        "создает",
+        "создаёт",
+        "создать",
+        "оформляет",
+        "оформить",
+        "подбирает",
+        "подобрать",
+        "уточняет",
+        "уточнить",
+        "контролирует",
+        "контролировать",
+        "утверждает",
+        "утвердить",
+        "переводит",
+        "перевести",
+        "выбирает",
+        "выбрать",
+        "указывает",
+        "указать",
+        "добавляет",
+        "добавить",
+        "заполняет",
+        "заполнить",
+        "назначает",
+        "назначить",
+        "рассчитывает",
+        "рассчитать",
+        "ставит",
+        "поставить",
+        "помечает",
+        "пометить",
+        "chooses",
+        "adds",
+        "fills",
+        "assigns",
+        "calculates",
+        "sets",
+        "marks",
+    )
+    marker_prefix = (
+        "оставляет|оставить|создает|создаёт|создать|оформляет|оформить|подбирает|подобрать|"
+        "уточняет|уточнить|контролирует|контролировать|утверждает|утвердить|переводит|перевести|"
+        "видит|видеть|видят|просматривает|просмотреть|"
+        "выбирает|выбрать|указывает|указать|добавляет|добавить|заполняет|заполнить|"
+        "согласует|согласовать|отклоняет|отклонить|"
+        "назначает|назначить|рассчитывает|рассчитать|ставит|поставить|помечает|пометить|"
+        "chooses|adds|fills|assigns|calculates|sets|marks"
+    )
+
+    def add_tail(tail: str) -> None:
+        nonlocal field_hints
+        if ":" in tail:
+            tail = tail.split(":", 1)[1]
+        for part in re.split(r"[,;]|\s+и\s+|\s+или\s+|\s+and\s+|\s+or\s+", tail):
+            cleaned = _clean_text(part).strip(" .:-")
+            if re.fullmatch(rf"(?:{marker_prefix})", cleaned, flags=re.IGNORECASE):
+                continue
+            cleaned = re.sub(rf"^(?:{marker_prefix})\s+", "", cleaned, flags=re.IGNORECASE)
+            if re.search(
+                rf"\b(?:{marker_prefix})\s+(?:все\s+)?(?:заявк[ауие]?|заявки|запис[ьи]?|заказ|заказы|форму|record|records|request|requests)\b",
+                cleaned,
+                flags=re.IGNORECASE,
+            ):
+                continue
+            cleaned = re.sub(
+                r"^(?:заявк[ауие]?|запис[ьи]?|заказ|форму|record|request)\s+",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            if re.match(
+                r"^(?:на|для|по|for)\s+[A-Za-zА-Яа-яЁё0-9_ -]{3,80}$",
+                cleaned,
+                flags=re.IGNORECASE,
+            ):
+                continue
+            if cleaned.lower() in {
+                "заявка",
+                "заявку",
+                "заявки",
+                "запись",
+                "заказ",
+                "форму",
+                "record",
+                "request",
+            }:
+                continue
+            if _looks_like_action_requirement_field(cleaned):
+                continue
+            if 2 < len(cleaned) <= 80 and cleaned not in field_hints:
+                field_hints.append(cleaned)
+
+    for sentence in re.split(r"[.!?\n]+", text):
+        if len(field_hints) >= limit:
+            return field_hints[:limit]
+        if ":" not in sentence:
+            continue
+        if not re.search(
+            r"\b(?:клиент|заказчик|пользователь|специалист|исполнитель|мастер|сотрудник|оператор|менеджер|администратор|client|customer|specialist|manager|admin)\b",
+            sentence,
+            flags=re.IGNORECASE,
+        ):
+            continue
+        add_tail(sentence.split(":", 1)[1])
+
+    for marker in markers:
+        pattern = re.compile(rf"{marker}\s+(?P<tail>[^.!?\n]+)", re.IGNORECASE)
+        for match in pattern.finditer(text):
+            add_tail(match.group("tail"))
+            if len(field_hints) >= limit:
+                return field_hints[:limit]
+    return field_hints[:limit]
+
+
+def _extract_resource_hint(text: str, actor_hints: dict[str, list[str]], prompt_terms: list[str], field_hints: list[str]) -> str:
+    field_keys = {_clean_text(item).lower() for item in field_hints}
+    candidate_sources = [
+        ". ".join(actor_hints.get("client") or []),
+        text,
+    ]
+    resource_markers = (
+        "создает",
+        "создаёт",
+        "оформляет",
+        "оставляет",
+        "принимает",
+        "добавляет",
+        "ведет",
+        "ведёт",
+        "creates",
+        "accepts",
+        "manages",
+        "tracks",
+    )
+    for source in candidate_sources:
+        for marker in resource_markers:
+            pattern = re.compile(rf"{marker}\s+(?P<tail>[^,.;!?\n]+)", re.IGNORECASE)
+            for match in pattern.finditer(source):
+                tail = _clean_text(match.group("tail")).strip(" .:-")
+                if ":" in tail:
+                    tail = _clean_text(tail.split(":", 1)[0]).strip(" .:-")
+                tail = re.split(r"\s+(?:на|для|по|with|for)\s+", tail, maxsplit=1, flags=re.IGNORECASE)[0]
+                words = [
+                    word
+                    for word in re.findall(r"[A-Za-zА-Яа-яЁё0-9_-]{3,}", tail)
+                    if word.lower() not in PROMPT_PLAN_STOPWORDS
+                ]
+                if not words:
+                    continue
+                candidate = _clean_text(" ".join(words[:3])).strip(" .:-")
+                if candidate and candidate.lower() not in field_keys:
+                    return _normalize_resource_hint_label(candidate[:80])
+    for term in prompt_terms:
+        normalized = _clean_text(term).lower()
+        if normalized and normalized not in field_keys and normalized not in PROMPT_PLAN_STOPWORDS:
+            return _normalize_resource_hint_label(term[:80])
+    return "items"
+
+
+def _normalize_resource_hint_label(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "items")).strip(" .:-")
+    lowered = cleaned.lower()
+    replacements = (
+        ("цию", "ция"),
+        ("сию", "сия"),
+        ("ию", "ия"),
+        ("ку", "ка"),
+        ("гу", "га"),
+        ("чу", "ча"),
+        ("шу", "ша"),
+        ("ью", "ья"),
+    )
+    for suffix, replacement in replacements:
+        if lowered.endswith(suffix) and len(cleaned) > len(suffix) + 1:
+            return f"{cleaned[:-len(suffix)]}{replacement}"
+    if lowered.endswith("у") and len(cleaned) > 4:
+        return f"{cleaned[:-1]}а"
+    return cleaned or "items"
 
 
 def extract_prompt_planning_hints(prompt: str) -> dict[str, Any]:
@@ -126,10 +389,28 @@ def extract_prompt_planning_hints(prompt: str) -> dict[str, Any]:
         "manage",
     )
     action_sentences = [sentence for sentence, lowered in lowered_sentences if any(marker in lowered for marker in action_markers)]
+    last_role: str | None = None
     for sentence, lowered in lowered_sentences:
+        explicit_role = _explicit_role_prefix(sentence)
+        if explicit_role:
+            actor_hints[explicit_role].append(sentence)
+            last_role = explicit_role
+            continue
+        if _is_general_role_requirement_sentence(sentence):
+            continue
+        matched_roles: list[str] = []
         for role, patterns in actor_patterns.items():
             if any(pattern in lowered for pattern in patterns):
+                matched_roles.append(role)
                 actor_hints[role].append(sentence)
+        if matched_roles:
+            last_role = matched_roles[-1]
+        elif (
+            last_role
+            and any(marker in lowered for marker in action_markers)
+            and not lowered.startswith(("нужно", "нужен", "нужна", "need "))
+        ):
+            actor_hints[last_role].append(sentence)
     # If the user wrote actor/action sentences without platform role
     # names, preserve the sentence order as role hints instead of inventing a
     # domain template.
@@ -149,26 +430,31 @@ def extract_prompt_planning_hints(prompt: str) -> dict[str, Any]:
         term
         for term, _count in sorted(frequency.items(), key=lambda item: (-item[1], item[0]))[:16]
     ]
+    role_field_hints: dict[str, list[str]] = {
+        role: _extract_field_hints_from_text(". ".join(hints), limit=12)
+        for role, hints in actor_hints.items()
+    }
     field_hints: list[str] = []
-    for marker in ("выбирает", "выбрать", "указывает", "указать", "добавляет", "добавить", "заполняет", "заполнить", "chooses", "adds", "fills"):
-        pattern = re.compile(rf"{marker}\s+(?P<tail>[^.!?\n]+)", re.IGNORECASE)
-        for match in pattern.finditer(text):
-            tail = match.group("tail")
-            for part in re.split(r"[,;]|\s+и\s+|\s+and\s+", tail):
-                cleaned = _clean_text(part).strip(" .")
-                if 2 < len(cleaned) <= 80 and cleaned not in field_hints:
-                    field_hints.append(cleaned)
-                if len(field_hints) >= 12:
-                    break
-            if len(field_hints) >= 12:
-                break
+    for role in ROLE_ORDER:
+        for hint in role_field_hints.get(role) or []:
+            if hint not in field_hints:
+                field_hints.append(hint)
+    for hint in _extract_field_hints_from_text(text, limit=12):
+        if hint not in field_hints:
+            field_hints.append(hint)
         if len(field_hints) >= 12:
             break
+    resource_hint = _extract_resource_hint(text, actor_hints, prompt_terms, field_hints)
     return {
         "prompt_summary": text[:1200],
         "prompt_sentences": sentences[:10],
         "prompt_terms": prompt_terms,
         "field_hints": field_hints[:12],
+        "role_field_hints": {
+            role: hints[:12]
+            for role, hints in role_field_hints.items()
+        },
+        "resource_hint": resource_hint,
         "role_action_prompts": {
             role: hints[:4]
             for role, hints in actor_hints.items()
@@ -453,6 +739,7 @@ def build_acceptance_contract(
             "flows": [],
             "test_requirements": [],
         }
+    prompt_hints = extract_prompt_planning_hints(prompt)
     flows: list[dict[str, Any]] = [
         {
             "id": "role_shared_persistence",
@@ -500,6 +787,13 @@ def build_acceptance_contract(
             "api_discovery_required": True,
         },
         "required_endpoints": [],
+        "prompt_hints": prompt_hints,
+        "api_contract": {
+            "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
+            "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
+            "resource_hint": prompt_hints.get("resource_hint") or None,
+            "prompt_terms": list(prompt_hints.get("prompt_terms") or [])[:16],
+        },
         "required_controls": [
             {"role": "client", "action": "submit the user-facing prompt-derived create/select/save flow through UI and POST-capable API"},
             {"role": "specialist", "action": "perform the prompt-derived operational action through POST/PATCH when the workflow needs persisted updates"},
@@ -559,6 +853,8 @@ def build_implementation_plan(
             "must_persist": True,
             "must_support_update": bool((contract.get("features") or {}).get("workflow_update", True)),
             "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
+            "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
+            "resource_hint": prompt_hints.get("resource_hint") or None,
         },
         "ui_contract": {
             "required_controls": required_controls,
@@ -640,11 +936,7 @@ def orchestration_metadata_for_contract(
         else "agent_tool_call_loop_with_design_pass" if enabled and mode_value == GenerationMode.QUALITY.value
         else "agent_tool_call_loop" if enabled else "none"
     )
-    isolated_worker_drafts = enabled and mode_value in {
-        GenerationMode.FAST.value,
-        GenerationMode.BALANCED.value,
-        GenerationMode.QUALITY.value,
-    }
+    isolated_worker_drafts = enabled and mode_value == GenerationMode.FAST.value
     phases = [
         {
             "id": "spec_extract",
@@ -657,7 +949,7 @@ def orchestration_metadata_for_contract(
             "description": (
                 "Use owned agent worker drafts for backend/API, role UI, and generated tests, then merge non-conflicting diffs."
                 if isolated_worker_drafts
-                else "Use tool-loop patches to build backend/API, role UI, and generated tests from the implementation plan."
+                else "Use the contract-owned runtime as the first draft and serialize further backend/API, role UI, generated test, and design mutations through the coordinator tool loop."
             ),
         },
         {

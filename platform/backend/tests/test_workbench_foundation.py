@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import time
 from typing import Any
@@ -233,6 +234,52 @@ def test_repair_catalog_extracts_nested_workflow_evidence() -> None:
     signatures = {item["signature"] for item in packets}
     assert "workflow.missing_role_actions" in signatures
     assert "workflow.payload_schema_mismatch" in signatures
+
+
+def test_repair_catalog_prefers_embedded_validator_recipe_over_generic_static_failure() -> None:
+    packet = RepairCatalog.classify_issue(
+        {
+            "kind": "check_failure",
+            "check": "frontend_interaction_static_smoke",
+            "details": "Frontend interaction smoke checked required buttons/forms.",
+            "logs": [
+                json.dumps(
+                    {
+                        "code": "platform.manager_missing_specialist_result_visibility",
+                        "message": "Manager role must render specialist-owned persisted result fields before approval.",
+                        "severity": "high",
+                        "location": "miniapp/app/static/manager/app.js",
+                        "blocking": True,
+                        "repair_recipe": {
+                            "recipe_id": "workflow.prompt_specificity",
+                            "failure_class": "semantic_contract_mismatch",
+                            "failure_signature": "workflow.manager_missing_specialist_result_visibility",
+                            "required_next_tool": "read_files",
+                            "suggested_tool_after_read": "write_file",
+                            "target_files": ["miniapp/app/static/manager/app.js"],
+                            "verification_check": "frontend_interaction_static_smoke",
+                            "verification_command": "run_checks frontend_interaction_static_smoke",
+                            "retry_policy": "deterministic_repair",
+                            "deterministic": True,
+                            "retryable": True,
+                            "instruction": "Render specialist fields in the manager details.",
+                            "evidence": {"missing_specialist_fields": ["программу"]},
+                        },
+                    }
+                )
+            ],
+            "failure_class": "frontend_interaction_static_smoke",
+            "failure_signature": "frontend_interaction_static_smoke:buttons/forms",
+        }
+    )
+
+    assert packet["signature"] == "workflow.manager_missing_specialist_result_visibility"
+    assert packet["code"] == "manager_missing_specialist_result_visibility"
+    assert packet["suggested_tool_after_read"] == "write_file"
+    assert packet["target_files"][:2] == [
+        "miniapp/app/static/manager/app.js",
+        "miniapp/app/static/manager/index.html",
+    ]
 
 
 def test_thread_snapshots_are_persistent(tmp_path: Path) -> None:
