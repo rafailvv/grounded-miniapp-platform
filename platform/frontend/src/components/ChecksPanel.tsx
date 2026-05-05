@@ -45,9 +45,9 @@ export function ChecksPanel({ matrix, promptContract, miniappContract, previewRu
             ))}
           </div>
         ) : (
-          <p className="muted">Prompt terms match the available change evidence or no diff has been recorded.</p>
+          <p className="muted">Prompt contract uses structured analysis; local lexical matching is disabled.</p>
         )}
-        {promptContract ? <small>{promptContract.matched_terms.slice(0, 16).join(", ")}</small> : null}
+        {promptContract ? <small>{promptContract.analysis_status ?? "analysis not loaded"}</small> : null}
       </div>
       <div className="workbench-panel">
         <div className="workbench-panel-header">

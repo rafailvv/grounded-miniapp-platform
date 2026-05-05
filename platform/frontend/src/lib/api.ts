@@ -462,8 +462,12 @@ export type TestMatrixReport = {
 export type PromptContractReport = {
   run_id: string;
   status: string;
-  prompt_terms_checked: string[];
-  matched_terms: string[];
+  analysis_source?: string | null;
+  analysis_status?: string | null;
+  resource_hint?: string | null;
+  field_hints?: string[];
+  role_field_hints?: Record<string, string[]>;
+  lexical_matching?: string;
   findings: Array<Record<string, unknown>>;
 };
 

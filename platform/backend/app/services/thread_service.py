@@ -211,6 +211,17 @@ class ThreadService:
         for turn in turns:
             if not turn.linked_run_id:
                 continue
+            raw_run = self.run_service.store.get("runs", turn.linked_run_id)
+            raw_failure_reason = (
+                str(raw_run.get("failure_reason") or "").strip()
+                if isinstance(raw_run, dict)
+                else ""
+            )
+            raw_touched_files = (
+                [str(item) for item in raw_run.get("touched_files") or [] if str(item).strip()]
+                if isinstance(raw_run, dict) and isinstance(raw_run.get("touched_files"), list)
+                else []
+            )
             try:
                 run = self.run_service.get_run(turn.linked_run_id)
             except Exception:
@@ -224,9 +235,10 @@ class ThreadService:
                     "created_at": run.created_at.isoformat(),
                 }
             )
-            if run.failure_reason:
-                known_failures.append(run.failure_reason)
-            active_files.extend(run.touched_files[:20])
+            failure_reason = raw_failure_reason or str(run.failure_reason or "").strip()
+            if failure_reason:
+                known_failures.append(failure_reason)
+            active_files.extend((raw_touched_files or run.touched_files)[:20])
             active_constraints.extend(str(item) for item in (run.acceptance_contract or {}).get("constraints") or [])
             accepted_decisions.extend(str(item) for item in (run.implementation_plan or {}).get("decisions") or [])
             approvals = self.run_service.store.get("reports", f"approvals:{run.run_id}") or {}

@@ -17,7 +17,7 @@ class Settings:
     runtime_dir: Path
     template_dir: Path
     preview_base_url: str = "http://localhost:8000"
-    preview_runtime_mode: str = "auto"
+    preview_runtime_mode: str = "local"
     preview_port_base: int = 16000
     preview_start_timeout_sec: int = 120
 
@@ -64,7 +64,7 @@ def get_settings(
         runtime_dir=root / "runtime",
         template_dir=root / "runtime" / "templates" / "base-miniapp",
         preview_base_url=preview_base_url,
-        preview_runtime_mode=os.getenv("PREVIEW_RUNTIME_MODE", "auto"),
+        preview_runtime_mode=os.getenv("PREVIEW_RUNTIME_MODE", "local"),
         preview_port_base=int(os.getenv("PREVIEW_PORT_BASE", "16000")),
         preview_start_timeout_sec=timeout_profile.preview_start_sec,
     )

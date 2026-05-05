@@ -89,7 +89,6 @@ PROVIDER_REGISTRY = {
     "openai": {
         "enabled_env": "OPENAI_API_KEY",
         "base_url_env": "OPENAI_BASE_URL",
-        "supports_fallback": True,
         "models": sorted(MODEL_CAPABILITIES),
     },
 }
@@ -184,7 +183,6 @@ def provider_routing_table() -> dict[str, object]:
     return {
         "providers": PROVIDER_REGISTRY,
         "profiles": profiles,
-        "fallback_order": ["openai_code_fast", "research_balanced", "openai_code_quality"],
     }
 
 

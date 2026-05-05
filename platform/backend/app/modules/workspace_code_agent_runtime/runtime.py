@@ -221,110 +221,6 @@ INITIAL_CONTEXT_PATHS = (
     "miniapp/app/static/client/app.js",
     "miniapp/app/generated/route_manifest.json",
 )
-PROMPT_SEMANTIC_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "app",
-    "application",
-    "build",
-    "create",
-    "for",
-    "from",
-    "i",
-    "make",
-    "miniapp",
-    "need",
-    "owner",
-    "please",
-    "sell",
-    "selling",
-    "small",
-    "that",
-    "the",
-    "this",
-    "to",
-    "want",
-    "with",
-    "без",
-    "будет",
-    "вам",
-    "ваш",
-    "для",
-    "его",
-    "есть",
-    "занимаюсь",
-    "занимается",
-    "заниматься",
-    "как",
-    "который",
-    "маленький",
-    "малого",
-    "мне",
-    "мини",
-    "небольшого",
-    "небольшой",
-    "нужно",
-    "обычно",
-    "они",
-    "оно",
-    "продаю",
-    "продавать",
-    "продажи",
-    "приложение",
-    "сделай",
-    "соцсети",
-    "соцсетях",
-    "создай",
-    "так",
-    "там",
-    "через",
-    "хочу",
-    "чтобы",
-    "это",
-    "этот",
-    "владелец",
-    "я",
-}
-CYRILLIC_TRANSLIT = str.maketrans(
-    {
-        "а": "a",
-        "б": "b",
-        "в": "v",
-        "г": "g",
-        "д": "d",
-        "е": "e",
-        "ё": "e",
-        "ж": "zh",
-        "з": "z",
-        "и": "i",
-        "й": "y",
-        "к": "k",
-        "л": "l",
-        "м": "m",
-        "н": "n",
-        "о": "o",
-        "п": "p",
-        "р": "r",
-        "с": "s",
-        "т": "t",
-        "у": "u",
-        "ф": "f",
-        "х": "h",
-        "ц": "ts",
-        "ч": "ch",
-        "ш": "sh",
-        "щ": "sch",
-        "ъ": "",
-        "ы": "y",
-        "ь": "",
-        "э": "e",
-        "ю": "yu",
-        "я": "ya",
-    }
-)
-
-
 class WorkspaceCodeAgentRuntime:
     """Single agentic code path for create, edit, fix, refine, and visual changes."""
 
@@ -909,34 +805,64 @@ class WorkspaceCodeAgentRuntime:
         focused_edit_kind = self._focused_edit_kind(request)
         focused_visual_edit = focused_edit_kind == "visual_style_edit"
         create_intent = str(request.intent or "").strip().lower() == "create"
-        acceptance_contract = build_acceptance_contract(
-            prompt=request.prompt,
-            intent=str(request.intent or ""),
-            generation_mode=generation_mode,
-            focused_edit_kind=focused_edit_kind,
+        stored_run = self.store.get("runs", run_id) if run_id else None
+        stored_acceptance_contract = (
+            dict(stored_run.get("acceptance_contract") or {})
+            if isinstance(stored_run, dict) and isinstance(stored_run.get("acceptance_contract"), dict)
+            else {}
+        )
+        stored_plan = (
+            dict(stored_run.get("implementation_plan") or {})
+            if isinstance(stored_run, dict) and isinstance(stored_run.get("implementation_plan"), dict)
+            else {}
+        )
+        prompt_analysis: dict[str, Any] | None = None
+        requires_prompt_analysis = create_intent or focused_edit_kind == "behavior_workflow_edit"
+        if requires_prompt_analysis and not isinstance(stored_acceptance_contract.get("prompt_hints"), dict):
+            prompt_analysis = self.openai_client.analyze_miniapp_prompt(
+                prompt=request.prompt,
+                generation_mode=generation_mode,
+                model_profile=request.model_profile,
+            )
+        acceptance_contract = (
+            stored_acceptance_contract
+            if isinstance(stored_acceptance_contract.get("prompt_hints"), dict)
+            else build_acceptance_contract(
+                prompt=request.prompt,
+                intent=str(request.intent or ""),
+                generation_mode=generation_mode,
+                focused_edit_kind=focused_edit_kind,
+                prompt_analysis=prompt_analysis,
+            )
         )
         orchestration = orchestration_metadata_for_contract(
             contract=acceptance_contract,
             generation_mode=generation_mode,
             focused_edit_kind=focused_edit_kind,
         )
-        implementation_plan = build_implementation_plan(
+        implementation_plan = stored_plan or build_implementation_plan(
             prompt=request.prompt,
             intent=str(request.intent or ""),
             generation_mode=generation_mode,
             acceptance_contract=acceptance_contract,
             orchestration=orchestration,
+            prompt_analysis=prompt_analysis,
         )
-        miniapp_contract = MiniAppContractCompiler.compile(
-            workspace_id=workspace_id,
-            run_id=run_id,
-            prompt=request.prompt,
-            intent=str(request.intent or ""),
-            generation_mode=generation_mode,
-            acceptance_contract=acceptance_contract,
-            implementation_plan=implementation_plan,
-        )
-        acceptance_contract = miniapp_contract.acceptance_summary
+        miniapp_contract = None
+        contract_materialized_paths: list[str] = []
+        contract_runtime_fast_path = False
+        if acceptance_contract.get("required"):
+            miniapp_contract = MiniAppContractCompiler.compile(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                prompt=request.prompt,
+                intent=str(request.intent or ""),
+                generation_mode=generation_mode,
+                acceptance_contract=acceptance_contract,
+                implementation_plan=implementation_plan,
+                prompt_analysis=prompt_analysis,
+            )
+            acceptance_contract = miniapp_contract.acceptance_summary
         job.acceptance_contract = acceptance_contract
         job.implementation_plan = implementation_plan
         job.orchestration_phases = list(orchestration.get("phases") or [])
@@ -972,51 +898,52 @@ class WorkspaceCodeAgentRuntime:
         job.hook_trace_ref = f"hook_trace:{workspace_id}:{artifact_run_id}"
         job.semantic_graph_ref = f"semantic_graph:{workspace_id}:{artifact_run_id}"
         job.worker_prefix_ref = f"worker_prefix:{workspace_id}:{artifact_run_id}"
-        job.miniapp_contract_ref = f"miniapp_contract:{workspace_id}:{artifact_run_id}"
-        job.contract_compile_ref = f"contract_compile:{workspace_id}:{artifact_run_id}"
-        job.route_registry_ref = f"route_registry:{workspace_id}:{artifact_run_id}"
-        job.repair_recipes_ref = f"repair_recipes:{workspace_id}:{artifact_run_id}"
-        contract_materialized_paths = MiniAppContractMaterializer.materialize(
-            draft_source,
-            miniapp_contract,
-            include_role_shell=create_intent,
-        )
-        contract_runtime_fast_path = (
-            create_intent
-            and generation_mode == GenerationMode.FAST
-            and bool(contract_materialized_paths)
-        )
-        route_registry_snapshot = MiniAppRouteRegistry.snapshot(
-            draft_source,
-            miniapp_contract,
-            regenerated_files=contract_materialized_paths,
-        )
-        self._store_report(
-            job.miniapp_contract_ref,
-            {"workspace_id": workspace_id, "run_id": run_id, "contract": miniapp_contract.model_dump(mode="json")},
-        )
-        self._store_report(
-            job.contract_compile_ref,
-            {
-                "workspace_id": workspace_id,
-                "run_id": run_id,
-                "status": "compiled_and_materialized",
-                "contract_id": miniapp_contract.contract_id,
-                "materialized_paths": contract_materialized_paths,
-            },
-        )
-        self._store_report(
-            job.route_registry_ref,
-            {"workspace_id": workspace_id, "run_id": run_id, "snapshot": route_registry_snapshot.model_dump(mode="json")},
-        )
-        self._store_report(
-            job.repair_recipes_ref,
-            {
-                "workspace_id": workspace_id,
-                "run_id": run_id,
-                "items": [item.model_dump(mode="json") for item in route_registry_snapshot.repair_recipes],
-            },
-        )
+        if miniapp_contract is not None:
+            job.miniapp_contract_ref = f"miniapp_contract:{workspace_id}:{artifact_run_id}"
+            job.contract_compile_ref = f"contract_compile:{workspace_id}:{artifact_run_id}"
+            job.route_registry_ref = f"route_registry:{workspace_id}:{artifact_run_id}"
+            job.repair_recipes_ref = f"repair_recipes:{workspace_id}:{artifact_run_id}"
+            contract_materialized_paths = MiniAppContractMaterializer.materialize(
+                draft_source,
+                miniapp_contract,
+                include_role_shell=create_intent,
+            )
+            contract_runtime_fast_path = (
+                create_intent
+                and generation_mode == GenerationMode.FAST
+                and bool(contract_materialized_paths)
+            )
+            route_registry_snapshot = MiniAppRouteRegistry.snapshot(
+                draft_source,
+                miniapp_contract,
+                regenerated_files=contract_materialized_paths,
+            )
+            self._store_report(
+                job.miniapp_contract_ref,
+                {"workspace_id": workspace_id, "run_id": run_id, "contract": miniapp_contract.model_dump(mode="json")},
+            )
+            self._store_report(
+                job.contract_compile_ref,
+                {
+                    "workspace_id": workspace_id,
+                    "run_id": run_id,
+                    "status": "compiled_and_materialized",
+                    "contract_id": miniapp_contract.contract_id,
+                    "materialized_paths": contract_materialized_paths,
+                },
+            )
+            self._store_report(
+                job.route_registry_ref,
+                {"workspace_id": workspace_id, "run_id": run_id, "snapshot": route_registry_snapshot.model_dump(mode="json")},
+            )
+            self._store_report(
+                job.repair_recipes_ref,
+                {
+                    "workspace_id": workspace_id,
+                    "run_id": run_id,
+                    "items": [item.model_dump(mode="json") for item in route_registry_snapshot.repair_recipes],
+                },
+            )
         restored_process_view = self.process_recovery.restore_view(self.store.get("reports", job.resume_checkpoint_ref))
         if restored_process_view.get("stale_processes"):
             self._store_report(
@@ -1234,27 +1161,28 @@ class WorkspaceCodeAgentRuntime:
         def _execute_checks(changed_files: list[str]) -> tuple[CheckExecutionRecord, dict[str, Any]]:
             nonlocal last_changed_files, cached_no_diff_checks
             last_changed_files = list(changed_files or last_changed_files)
-            registry_regenerated = MiniAppRouteRegistry.sync_contract_owned_files(draft_source, miniapp_contract)
-            if registry_regenerated:
-                self.file_state_cache.invalidate(run_id, registry_regenerated)
-                last_changed_files = list(dict.fromkeys([*last_changed_files, *registry_regenerated]))
-            registry_snapshot = MiniAppRouteRegistry.snapshot(
-                draft_source,
-                miniapp_contract,
-                regenerated_files=registry_regenerated,
-            )
-            self._store_report(
-                job.route_registry_ref,
-                {"workspace_id": workspace_id, "run_id": run_id, "snapshot": registry_snapshot.model_dump(mode="json")},
-            )
-            self._store_report(
-                job.repair_recipes_ref,
-                {
-                    "workspace_id": workspace_id,
-                    "run_id": run_id,
-                    "items": [item.model_dump(mode="json") for item in registry_snapshot.repair_recipes],
-                },
-            )
+            if miniapp_contract is not None and job.route_registry_ref and job.repair_recipes_ref:
+                registry_regenerated = MiniAppRouteRegistry.sync_contract_owned_files(draft_source, miniapp_contract)
+                if registry_regenerated:
+                    self.file_state_cache.invalidate(run_id, registry_regenerated)
+                    last_changed_files = list(dict.fromkeys([*last_changed_files, *registry_regenerated]))
+                registry_snapshot = MiniAppRouteRegistry.snapshot(
+                    draft_source,
+                    miniapp_contract,
+                    regenerated_files=registry_regenerated,
+                )
+                self._store_report(
+                    job.route_registry_ref,
+                    {"workspace_id": workspace_id, "run_id": run_id, "snapshot": registry_snapshot.model_dump(mode="json")},
+                )
+                self._store_report(
+                    job.repair_recipes_ref,
+                    {
+                        "workspace_id": workspace_id,
+                        "run_id": run_id,
+                        "items": [item.model_dump(mode="json") for item in registry_snapshot.repair_recipes],
+                    },
+                )
             has_draft_diff = bool(self.workspace_service.diff(workspace_id, run_id=run_id).strip())
             self._append_event(
                 job,
@@ -2698,18 +2626,33 @@ class WorkspaceCodeAgentRuntime:
             and self._stale_generated_tests_repair_needed(latest_execution)
         )
         generated_tests_repair = missing_generated_tests_repair or stale_generated_tests_repair
-        acceptance_contract = build_acceptance_contract(
-            prompt=request.prompt,
-            intent=intent_value,
-            generation_mode=request.generation_mode,
-            focused_edit_kind=focused_edit_kind,
+        stored_run = self.store.get("runs", run_id) if run_id else None
+        stored_acceptance_contract = (
+            dict(stored_run.get("acceptance_contract") or {})
+            if isinstance(stored_run, dict) and isinstance(stored_run.get("acceptance_contract"), dict)
+            else {}
+        )
+        acceptance_contract = (
+            stored_acceptance_contract
+            if isinstance(stored_acceptance_contract.get("prompt_hints"), dict)
+            else build_acceptance_contract(
+                prompt=request.prompt,
+                intent=intent_value,
+                generation_mode=request.generation_mode,
+                focused_edit_kind=focused_edit_kind,
+            )
         )
         orchestration = orchestration_metadata_for_contract(
             contract=acceptance_contract,
             generation_mode=request.generation_mode,
             focused_edit_kind=focused_edit_kind,
         )
-        implementation_plan = build_implementation_plan(
+        stored_plan = (
+            dict(stored_run.get("implementation_plan") or {})
+            if isinstance(stored_run, dict) and isinstance(stored_run.get("implementation_plan"), dict)
+            else {}
+        )
+        implementation_plan = stored_plan or build_implementation_plan(
             prompt=request.prompt,
             intent=intent_value,
             generation_mode=request.generation_mode,

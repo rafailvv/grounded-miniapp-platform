@@ -24,12 +24,10 @@ class PreviewRuntimeManager:
         self._local_processes: dict[str, subprocess.Popen] = {}
 
     def preferred_mode(self) -> str:
-        configured = str(self.settings.preview_runtime_mode or "auto").strip().lower()
-        if configured == "local":
-            return "local"
-        if configured == "docker":
-            return "docker"
-        return "docker"
+        configured = str(self.settings.preview_runtime_mode or "local").strip().lower()
+        if configured in {"local", "docker"}:
+            return configured
+        raise RuntimeError("PREVIEW_RUNTIME_MODE must be either 'local' or 'docker'.")
 
     def start_local(self, workspace_id: str, source_dir: Path, proxy_port: int) -> tuple[str, list[str]]:
         project_name = self.project_name(workspace_id)

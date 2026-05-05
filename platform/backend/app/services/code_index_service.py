@@ -129,7 +129,6 @@ class CodeIndexService:
         active = set(active_paths or [])
         recent = set(recent_paths or [])
         query_embedding = self._embedding(prompt)
-        query_terms = self._tokenize(prompt)
         status = self.get_workspace_status(workspace_id)
         revision_id = status.revision_id or "unversioned"
         source_dir = self.settings.workspaces_dir / workspace_id / "source"
@@ -151,7 +150,6 @@ class CodeIndexService:
                 path_limit = min(path_limit, int(budget.get("targeted_file_limit", path_limit)) * 3)
             candidate_paths = self._candidate_workspace_paths(
                 source_dir=source_dir,
-                query_terms=query_terms,
                 active_paths=active,
                 recent_paths=recent,
                 limit=path_limit,
@@ -200,7 +198,7 @@ class CodeIndexService:
                         source_type="workspace_code",
                     )
                 )
-        code = self._rank_chunks(candidate_chunks, query_terms, query_embedding, active, recent)[:code_limit]
+        code = self._rank_chunks(candidate_chunks, query_embedding, active, recent)[:code_limit]
         docs: list[CodeChunkRecord] = []
         return {
             "code": [chunk.model_dump(mode="json") for chunk in code],
@@ -210,7 +208,8 @@ class CodeIndexService:
                 "doc_chunk_count": 0,
                 "code_hits": len(code),
                 "doc_hits": len(docs),
-                "query_terms": len(query_terms),
+                "local_prompt_matching_inputs": 0,
+                "lexical_matching": "disabled",
                 "candidate_files": len(candidate_paths),
                 "candidate_cache_hit": candidate_cache_hit,
                 "unchanged_file_reads": unchanged_reads,
@@ -326,7 +325,6 @@ class CodeIndexService:
         self,
         *,
         source_dir: Path,
-        query_terms: set[str],
         active_paths: set[str],
         recent_paths: set[str],
         limit: int,
@@ -334,7 +332,7 @@ class CodeIndexService:
         ranked: list[tuple[float, str]] = []
         for file_path in self._iter_workspace_files(source_dir):
             relative_path = str(file_path.relative_to(source_dir))
-            score = self._path_score(relative_path, query_terms)
+            score = self._generic_path_priority(relative_path)
             if relative_path in active_paths:
                 score += 1.25
             if relative_path in recent_paths:
@@ -345,18 +343,20 @@ class CodeIndexService:
         ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return [path for _, path in ranked[:limit]]
 
-    def _path_score(self, relative_path: str, query_terms: set[str]) -> float:
-        if not query_terms:
-            return 0.0
-        lowered = relative_path.lower()
-        path_terms = self._tokenize(relative_path)
-        overlap = len(query_terms & path_terms)
-        score = overlap * 0.5
-        score += sum(0.15 for term in query_terms if term in lowered)
-        basename = Path(relative_path).name.lower()
-        if any(term in basename for term in query_terms):
-            score += 0.35
-        return score
+    @staticmethod
+    def _generic_path_priority(relative_path: str) -> float:
+        path = relative_path.replace("\\", "/")
+        if path.startswith("miniapp/app/static/"):
+            return 0.85
+        if path.startswith("miniapp/app/routes/"):
+            return 0.8
+        if path.startswith("miniapp/tests/"):
+            return 0.7
+        if path.startswith("miniapp/app/generated/"):
+            return 0.6
+        if path.endswith((".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".json")):
+            return 0.35
+        return 0.05
 
     def _chunk_text(
         self,
@@ -423,23 +423,19 @@ class CodeIndexService:
     def _rank_chunks(
         self,
         chunks: list[CodeChunkRecord],
-        query_terms: set[str],
         query_embedding: list[float],
         active_paths: set[str],
         recent_paths: set[str],
     ) -> list[CodeChunkRecord]:
         ranked: list[CodeChunkRecord] = []
         for chunk in chunks:
-            lexical = self._lexical_score(query_terms, chunk)
             dense = self._cosine(query_embedding, chunk.embedding)
             boost = 0.0
             if chunk.path in active_paths:
                 boost += 0.35
             if chunk.path in recent_paths:
                 boost += 0.2
-            if any(term in chunk.path.lower() for term in query_terms):
-                boost += 0.15
-            score = lexical * 0.55 + dense * 0.35 + boost
+            score = dense * 0.75 + boost
             if score <= 0:
                 continue
             ranked.append(chunk.model_copy(update={"score": round(score, 5)}))
@@ -478,13 +474,6 @@ class CodeIndexService:
     @staticmethod
     def _tokenize(text: str) -> set[str]:
         return {token.lower() for token in re.findall(r"[A-Za-z0-9_./-]{3,}", text)}
-
-    def _lexical_score(self, query_terms: set[str], chunk: CodeChunkRecord) -> float:
-        if not query_terms:
-            return 0.0
-        haystack = set(chunk.symbols) | set(chunk.imports) | self._tokenize(chunk.path) | self._tokenize(chunk.text[:800])
-        overlap = len({term for term in query_terms if term in {item.lower() for item in haystack}})
-        return overlap / max(len(query_terms), 1)
 
     @staticmethod
     def _embedding(text: str) -> list[float]:

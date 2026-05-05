@@ -97,13 +97,6 @@ WORKSPACE_NAME_STOPWORDS = {
     "с",
     "и",
 }
-ROLE_SCOPE_HINTS: dict[str, tuple[str, ...]] = {
-    "client": ("client", "customer", "user", "end user", "клиент", "пользователь", "заказчик"),
-    "specialist": ("specialist", "worker", "staff", "employee", "master", "executor", "agent", "service provider", "team member", "специалист", "сотрудник", "мастер", "исполнитель", "операционист", "член команды"),
-    "manager": ("manager", "admin", "administrator", "operator", "owner", "менеджер", "администратор", "оператор", "админ", "руководитель", "владелец"),
-}
-
-
 class RunService:
     def __init__(
         self,
@@ -176,11 +169,26 @@ class RunService:
             error_context=request.error_context,
         )
         focused_edit_kind = WorkspaceCodeAgentRuntime._focused_edit_kind(contract_probe)
+        prompt_analysis: dict[str, Any] | None = None
+        requires_prompt_analysis = resolved_intent == "create" or focused_edit_kind == "behavior_workflow_edit"
+        if requires_prompt_analysis:
+            if not self.openai_client.enabled:
+                raise RuntimeError("LLM prompt analysis is required before creating a workflow run.")
+            with self.openai_client.routing_context(
+                model_profile=effective_model_profile,
+                generation_mode=effective_generation_mode,
+            ):
+                prompt_analysis = self.openai_client.analyze_miniapp_prompt(
+                    prompt=request.prompt,
+                    generation_mode=effective_generation_mode,
+                    model_profile=effective_model_profile,
+                )
         acceptance_contract = build_acceptance_contract(
             prompt=request.prompt,
             intent=resolved_intent,
             generation_mode=effective_generation_mode,
             focused_edit_kind=focused_edit_kind,
+            prompt_analysis=prompt_analysis,
         )
         orchestration = orchestration_metadata_for_contract(
             contract=acceptance_contract,
@@ -193,6 +201,7 @@ class RunService:
             generation_mode=effective_generation_mode,
             acceptance_contract=acceptance_contract,
             orchestration=orchestration,
+            prompt_analysis=prompt_analysis,
         )
         run = RunRecord(
             workspace_id=workspace_id,
@@ -222,37 +231,39 @@ class RunService:
             progress_percent=2,
             storage_version=2,
         )
-        miniapp_contract = MiniAppContractCompiler.compile(
-            workspace_id=workspace_id,
-            run_id=run.run_id,
-            prompt=request.prompt,
-            intent=resolved_intent,
-            generation_mode=effective_generation_mode,
-            acceptance_contract=acceptance_contract,
-            implementation_plan=implementation_plan,
-        )
-        run.acceptance_contract = miniapp_contract.acceptance_summary
         run.implementation_plan = implementation_plan
-        run.miniapp_contract_ref = f"miniapp_contract:{workspace_id}:{run.run_id}"
-        run.contract_compile_ref = f"contract_compile:{workspace_id}:{run.run_id}"
-        run.route_registry_ref = f"route_registry:{workspace_id}:{run.run_id}"
-        run.repair_recipes_ref = f"repair_recipes:{workspace_id}:{run.run_id}"
-        self.store.upsert(
-            "reports",
-            run.miniapp_contract_ref,
-            {"workspace_id": workspace_id, "run_id": run.run_id, "contract": miniapp_contract.model_dump(mode="json")},
-        )
-        self.store.upsert(
-            "reports",
-            run.contract_compile_ref,
-            {
-                "workspace_id": workspace_id,
-                "run_id": run.run_id,
-                "status": "compiled",
-                "contract_id": miniapp_contract.contract_id,
-                "contract_owned_paths": miniapp_contract.allowed_file_graph.contract_owned_paths,
-            },
-        )
+        if acceptance_contract.get("required"):
+            miniapp_contract = MiniAppContractCompiler.compile(
+                workspace_id=workspace_id,
+                run_id=run.run_id,
+                prompt=request.prompt,
+                intent=resolved_intent,
+                generation_mode=effective_generation_mode,
+                acceptance_contract=acceptance_contract,
+                implementation_plan=implementation_plan,
+                prompt_analysis=prompt_analysis,
+            )
+            run.acceptance_contract = miniapp_contract.acceptance_summary
+            run.miniapp_contract_ref = f"miniapp_contract:{workspace_id}:{run.run_id}"
+            run.contract_compile_ref = f"contract_compile:{workspace_id}:{run.run_id}"
+            run.route_registry_ref = f"route_registry:{workspace_id}:{run.run_id}"
+            run.repair_recipes_ref = f"repair_recipes:{workspace_id}:{run.run_id}"
+            self.store.upsert(
+                "reports",
+                run.miniapp_contract_ref,
+                {"workspace_id": workspace_id, "run_id": run.run_id, "contract": miniapp_contract.model_dump(mode="json")},
+            )
+            self.store.upsert(
+                "reports",
+                run.contract_compile_ref,
+                {
+                    "workspace_id": workspace_id,
+                    "run_id": run.run_id,
+                    "status": "compiled",
+                    "contract_id": miniapp_contract.contract_id,
+                    "contract_owned_paths": miniapp_contract.allowed_file_graph.contract_owned_paths,
+                },
+            )
         self._save_run(run)
         self.store.delete("reports", f"run_stop_request:{run.run_id}")
         if wait:
@@ -1857,13 +1868,7 @@ class RunService:
         explicit_scope = [role for role in request.target_role_scope if role in ROLE_SCOPE]
         if explicit_scope:
             return explicit_scope
-        prompt = str(request.prompt or "").lower()
-        inferred_scope: list[str] = []
-        for role in ("client", "specialist", "manager"):
-            hints = ROLE_SCOPE_HINTS.get(role) or ()
-            if any(hint in prompt for hint in hints):
-                inferred_scope.append(role)
-        return inferred_scope
+        return []
 
     def _agent_quality_report(self, workspace_id: str) -> dict[str, Any]:
         payload = self.code_agent_runtime.current_report(workspace_id, "agent_quality")

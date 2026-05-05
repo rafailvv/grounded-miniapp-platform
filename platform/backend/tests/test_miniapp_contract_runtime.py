@@ -21,6 +21,15 @@ def _template_source(tmp_path: Path) -> Path:
     return source
 
 
+def _analysis(resource: str) -> dict:
+    return {
+        "resource_hint": resource,
+        "field_hints": [],
+        "role_field_hints": {"client": [], "specialist": [], "manager": []},
+        "role_action_prompts": {"client": [], "specialist": [], "manager": []},
+    }
+
+
 def test_fast_contract_compiler_creates_deterministic_resource_and_routes() -> None:
     contract = MiniAppContractCompiler.compile(
         workspace_id="ws_test",
@@ -28,6 +37,7 @@ def test_fast_contract_compiler_creates_deterministic_resource_and_routes() -> N
         prompt="Create a ledger app for client specialist manager",
         intent="create",
         generation_mode=GenerationMode.FAST,
+        prompt_analysis=_analysis("ledger"),
     )
 
     routes = {(endpoint.method, endpoint.path) for endpoint in contract.endpoints}
@@ -47,6 +57,7 @@ def test_materializer_is_idempotent_and_registry_passes(tmp_path: Path) -> None:
         prompt="Create a record app",
         intent="create",
         generation_mode=GenerationMode.FAST,
+        prompt_analysis=_analysis("record"),
     )
 
     first = MiniAppContractMaterializer.materialize(source, contract)
@@ -71,6 +82,7 @@ def test_contract_shell_copy_uses_product_labels_not_internal_status_or_workflow
         prompt="Создай приложение для заявок на аренду оборудования.",
         intent="create",
         generation_mode=GenerationMode.QUALITY,
+        prompt_analysis=_analysis("заявка"),
     )
     MiniAppContractMaterializer.materialize(source, contract)
 
@@ -103,6 +115,7 @@ def test_registry_returns_repair_recipe_for_backend_contract_drift(tmp_path: Pat
         prompt="Create a task app",
         intent="create",
         generation_mode=GenerationMode.FAST,
+        prompt_analysis=_analysis("task"),
     )
     MiniAppContractMaterializer.materialize(source, contract)
     (source / "miniapp/app/routes/generated_contract.py").write_text("# route drift\n", encoding="utf-8")
@@ -122,6 +135,7 @@ def test_registry_sync_adds_filesystem_child_pages_to_route_manifest(tmp_path: P
         prompt="Create a ledger app",
         intent="create",
         generation_mode=GenerationMode.FAST,
+        prompt_analysis=_analysis("ledger"),
     )
     MiniAppContractMaterializer.materialize(source, contract)
     child_page = source / "miniapp/app/static/client/history/index.html"

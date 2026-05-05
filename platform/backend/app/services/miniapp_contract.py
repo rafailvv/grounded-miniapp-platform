@@ -119,12 +119,13 @@ class MiniAppContractCompiler:
         generation_mode: GenerationMode | str | None,
         acceptance_contract: dict[str, Any] | None = None,
         implementation_plan: dict[str, Any] | None = None,
+        prompt_analysis: dict[str, Any] | None = None,
     ) -> MiniAppContract:
         mode_value = normalized_generation_mode(generation_mode) or GenerationMode.BALANCED.value
         intent_value = str(intent or "").strip().lower() or "create"
-        hints = extract_prompt_planning_hints(prompt)
-        terms = [str(item) for item in hints.get("prompt_terms") or [] if str(item).strip()]
-        slug_source = str(hints.get("resource_hint") or "").strip() or next((term for term in terms if term not in {"client", "manager", "specialist"}), "items")
+        contract_hints = (acceptance_contract or {}).get("prompt_hints") if isinstance((acceptance_contract or {}).get("prompt_hints"), dict) else None
+        hints = contract_hints or extract_prompt_planning_hints(prompt, prompt_analysis=prompt_analysis)
+        slug_source = str(hints.get("resource_hint") or "").strip() or "item"
         slug_source = cls._resource_display_source(slug_source)
         slug = cls._plural_slug(slug_source)
         display_name = cls._display_name(slug_source)
@@ -803,7 +804,7 @@ test("generated contract files expose route manifest and API client", () => {{
         if not labels:
             labels = {
                 "client": {
-                    "requestName": "Название заявки",
+                    "recordName": "Название записи",
                     "clientComment": "Комментарий клиента",
                 },
                 "specialist": {
@@ -838,7 +839,7 @@ test("generated contract files expose route manifest and API client", () => {{
         role_label = ROLE_LABELS_RU.get(role, role.title()) if cyrillic else role.title()
         if cyrillic:
             title = {
-                "client": f"Новая {resource.display_name}",
+                "client": f"Создать запись: {resource.display_name}",
                 "specialist": f"Обработка: {resource.display_name}",
                 "manager": f"Контроль: {resource.display_name}",
             }.get(role, resource.display_name)
@@ -868,7 +869,7 @@ test("generated contract files expose route manifest and API client", () => {{
                 '            <option value="ready">Готово к согласованию</option>',
             )
             list_title = {
-                "client": f"Мои {resource.display_name.lower()}",
+                "client": "Сохраненные записи",
                 "specialist": "Очередь обработки",
                 "manager": "Контроль заявок",
             }.get(role, "Сохраненные записи")
@@ -878,7 +879,7 @@ test("generated contract files expose route manifest and API client", () => {{
             metrics_label = "Метрики заявок"
         else:
             title = {
-                "client": f"Create {resource.display_name}",
+                "client": f"Create record: {resource.display_name}",
                 "specialist": f"Process {resource.display_name}",
                 "manager": f"Review {resource.display_name}",
             }.get(role, resource.display_name)
@@ -1182,23 +1183,35 @@ loadItems();
     def _role_css(*, role: str, generation_mode: GenerationMode | str | None = None) -> str:
         accent = {"client": "#0f766e", "specialist": "#2563eb", "manager": "#7c3aed"}.get(role, "#0f766e")
         mode_value = normalized_generation_mode(generation_mode)
-        quality_css = ""
-        if mode_value == GenerationMode.QUALITY.value:
-            quality_css = '''
+        balanced_css = ""
+        if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
+            balanced_css = '''
 
 .page {
-  min-height: calc(100vh - 32px);
-  border-left: 4px solid var(--contract-accent);
+  padding: 22px 18px 30px;
 }
 
 .contract-header {
-  padding: 16px 0 18px;
-  border-bottom: 1px solid var(--contract-border);
+  padding: 18px;
+  border: 1px solid var(--contract-border);
+  border-radius: 8px;
+  background: var(--contract-panel);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06);
+}
+
+.contract-header::before {
+  content: "";
+  display: block;
+  width: 48px;
+  height: 4px;
+  margin-bottom: 12px;
+  border-radius: 999px;
+  background: var(--contract-accent);
 }
 
 .contract-header h1 {
-  font-size: 28px;
-  line-height: 1.08;
+  font-size: 24px;
+  line-height: 1.12;
 }
 
 .contract-form {
@@ -1206,23 +1219,152 @@ loadItems();
   border: 1px solid var(--contract-border);
   border-radius: 8px;
   background: #ffffff;
-  box-shadow: 0 16px 36px rgba(15, 23, 42, 0.08);
+  box-shadow: 0 14px 34px rgba(15, 23, 42, 0.07);
+}
+
+.contract-form label {
+  color: #26313b;
+  font-size: 13px;
+}
+
+.contract-form button,
+.contract-actions button {
+  width: 100%;
 }
 
 .contract-list h2 {
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.contract-card {
+  border-left: 4px solid var(--contract-accent);
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.06);
+}
+
+.contract-card p {
+  margin-bottom: 0;
+  line-height: 1.45;
+}
+
+.contract-card b {
+  color: var(--contract-ink);
+}
+
+.metric-card {
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
+}
+'''
+        quality_css = ""
+        if mode_value == GenerationMode.QUALITY.value:
+            quality_css = '''
+
+body {
+  background: linear-gradient(180deg, #f7faf9 0%, #eef3f7 48%, #f7f8fb 100%);
+}
+
+.page {
+  width: min(100%, 480px);
+  min-height: calc(100vh - 24px);
+  display: grid;
+  gap: 16px;
+}
+
+.contract-header {
+  padding: 20px;
+  border-color: color-mix(in srgb, var(--contract-accent) 22%, var(--contract-border));
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--contract-accent) 10%, white), #ffffff 46%),
+    #ffffff;
+  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.10);
+}
+
+.contract-eyebrow {
+  width: max-content;
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--contract-accent) 12%, white);
+}
+
+.contract-header h1 {
+  font-size: 26px;
+  line-height: 1.08;
+  font-weight: 800;
+}
+
+.contract-copy {
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.contract-form {
+  gap: 13px;
+  padding: 18px;
+  border-color: color-mix(in srgb, var(--contract-accent) 14%, var(--contract-border));
+  box-shadow: 0 20px 46px rgba(15, 23, 42, 0.10);
+}
+
+input,
+textarea,
+select {
+  background: #fbfcfd;
+  border-color: #cfd8e3;
+}
+
+.contract-list h2 {
+  margin-bottom: 2px;
   letter-spacing: 0;
 }
 
 .contract-card {
-  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.07);
+  gap: 10px;
+  padding: 16px;
+  border-color: color-mix(in srgb, var(--contract-accent) 16%, var(--contract-border));
+  background: #ffffff;
+  box-shadow: 0 16px 38px rgba(15, 23, 42, 0.09);
 }
 
 .contract-card strong {
-  font-size: 17px;
+  font-size: 18px;
+  line-height: 1.18;
+}
+
+.contract-card span {
+  justify-self: start;
+  border: 1px solid color-mix(in srgb, var(--contract-accent) 22%, white);
+}
+
+.contract-card p {
+  padding-top: 7px;
+  border-top: 1px solid #eef2f6;
+}
+
+.metric-card {
+  padding: 14px;
+  border-color: color-mix(in srgb, var(--contract-accent) 16%, var(--contract-border));
+  background: #ffffff;
+}
+
+.metric-card strong {
+  font-size: 24px;
 }
 
 .contract-card button {
   justify-self: start;
+  width: auto;
+  min-width: 160px;
+}
+
+button {
+  box-shadow: 0 10px 24px color-mix(in srgb, var(--contract-accent) 20%, transparent);
+}
+
+@media (max-width: 420px) {
+  .contract-header,
+  .contract-form,
+  .contract-card {
+    box-shadow: 0 10px 24px rgba(15, 23, 42, 0.07);
+  }
 }
 '''
         return f''':root {{
@@ -1402,6 +1544,7 @@ button {{
     overflow-wrap: anywhere;
   }}
 }}
+{balanced_css}
 {quality_css}
 '''
 

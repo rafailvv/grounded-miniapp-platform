@@ -7,459 +7,118 @@ from app.models.common import GenerationMode
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
-PROMPT_PLAN_STOPWORDS = {
-    "and",
-    "app",
-    "application",
-    "create",
-    "client",
-    "for",
-    "from",
-    "manager",
-    "mini",
-    "miniapp",
-    "need",
-    "specialist",
-    "that",
-    "the",
-    "this",
-    "want",
-    "with",
-    "без",
-    "будет",
-    "вести",
-    "видеть",
-    "видит",
-    "видят",
-    "видно",
-    "всё",
-    "для",
-    "должен",
-    "должна",
-    "должны",
-    "есть",
-    "каждый",
-    "как",
-    "который",
-    "маленький",
-    "мне",
-    "может",
-    "нужно",
-    "после",
-    "перезагрузки",
-    "помогало",
-    "приложение",
-    "реально",
-    "современно",
-    "таблиц",
-    "удобно",
-    "удобным",
-    "хочу",
-    "чтобы",
-}
+PROMPT_ANALYSIS_SCHEMA_VERSION = "grounded.prompt_contract_analysis.v1"
 
 
 def _clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
-ACTION_REQUIREMENT_PREFIXES = (
-    "создание ",
-    "список ",
-    "выбор ",
-    "обновление ",
-    "сохранение ",
-    "перезагрузка",
-    "открытие ",
-    "переход ",
-    "submit ",
-    "create ",
-    "list ",
-    "select ",
-    "update ",
-    "save ",
-)
-
-
-ACTION_REQUIREMENT_TERMS = {
-    "api",
-    "http",
-    "raw status",
-    "workflow",
-    "role",
-    "roles",
-    "client",
-    "specialist",
-    "manager",
-    "/client",
-    "/specialist",
-    "/manager",
-    "специалистом",
-    "менеджером",
-    "клиентом",
-}
-
-
-def _looks_like_action_requirement_field(value: str) -> bool:
-    lowered = _clean_text(value).lower()
-    if not lowered:
-        return True
-    if any(lowered.startswith(prefix) for prefix in ACTION_REQUIREMENT_PREFIXES):
-        return True
-    return lowered in ACTION_REQUIREMENT_TERMS
-
-
-def _explicit_role_prefix(sentence: str) -> str | None:
-    lowered = _clean_text(sentence).lower()
-    if re.match(r"^(?:клиент|заказчик|пользователь|client|customer)\s*[:：-]", lowered):
-        return "client"
-    if re.match(r"^(?:специалист|исполнитель|методист|оператор|specialist|worker|staff)\s*[:：-]", lowered):
-        return "specialist"
-    if re.match(r"^(?:менеджер|администратор|руководитель|manager|admin|administrator)\s*[:：-]", lowered):
-        return "manager"
-    return None
-
-
-def _is_general_role_requirement_sentence(sentence: str) -> bool:
-    lowered = _clean_text(sentence).lower()
-    if any(marker in lowered for marker in ("contract-owned", "miniapp/app/generated", "english aliases", "/status route")):
-        return True
-    if "режим" in lowered and any(marker in lowered for marker in ("fast", "balanced", "quality", "дизайн", "responsive")):
-        return True
-    return lowered.startswith(("нужно", "нужен", "нужна", "need ", "requires ")) and any(
-        marker in lowered for marker in ("/client", "/specialist", "/manager", "ролями", "roles")
-    )
-
-
-def _extract_field_hints_from_text(text: str, *, limit: int = 12) -> list[str]:
-    field_hints: list[str] = []
-    markers = (
-        "оставляет",
-        "оставить",
-        "создает",
-        "создаёт",
-        "создать",
-        "оформляет",
-        "оформить",
-        "подбирает",
-        "подобрать",
-        "уточняет",
-        "уточнить",
-        "контролирует",
-        "контролировать",
-        "утверждает",
-        "утвердить",
-        "переводит",
-        "перевести",
-        "выбирает",
-        "выбрать",
-        "указывает",
-        "указать",
-        "добавляет",
-        "добавить",
-        "заполняет",
-        "заполнить",
-        "назначает",
-        "назначить",
-        "рассчитывает",
-        "рассчитать",
-        "ставит",
-        "поставить",
-        "помечает",
-        "пометить",
-        "chooses",
-        "adds",
-        "fills",
-        "assigns",
-        "calculates",
-        "sets",
-        "marks",
-    )
-    marker_prefix = (
-        "оставляет|оставить|создает|создаёт|создать|оформляет|оформить|подбирает|подобрать|"
-        "уточняет|уточнить|контролирует|контролировать|утверждает|утвердить|переводит|перевести|"
-        "видит|видеть|видят|просматривает|просмотреть|"
-        "выбирает|выбрать|указывает|указать|добавляет|добавить|заполняет|заполнить|"
-        "согласует|согласовать|отклоняет|отклонить|"
-        "назначает|назначить|рассчитывает|рассчитать|ставит|поставить|помечает|пометить|"
-        "chooses|adds|fills|assigns|calculates|sets|marks"
-    )
-
-    def add_tail(tail: str) -> None:
-        nonlocal field_hints
-        if ":" in tail:
-            tail = tail.split(":", 1)[1]
-        for part in re.split(r"[,;]|\s+и\s+|\s+или\s+|\s+and\s+|\s+or\s+", tail):
-            cleaned = _clean_text(part).strip(" .:-")
-            if re.fullmatch(rf"(?:{marker_prefix})", cleaned, flags=re.IGNORECASE):
-                continue
-            cleaned = re.sub(rf"^(?:{marker_prefix})\s+", "", cleaned, flags=re.IGNORECASE)
-            if re.search(
-                rf"\b(?:{marker_prefix})\s+(?:все\s+)?(?:заявк[ауие]?|заявки|запис[ьи]?|заказ|заказы|форму|record|records|request|requests)\b",
-                cleaned,
-                flags=re.IGNORECASE,
-            ):
-                continue
-            cleaned = re.sub(
-                r"^(?:заявк[ауие]?|запис[ьи]?|заказ|форму|record|request)\s+",
-                "",
-                cleaned,
-                flags=re.IGNORECASE,
-            )
-            if re.match(
-                r"^(?:на|для|по|for)\s+[A-Za-zА-Яа-яЁё0-9_ -]{3,80}$",
-                cleaned,
-                flags=re.IGNORECASE,
-            ):
-                continue
-            if cleaned.lower() in {
-                "заявка",
-                "заявку",
-                "заявки",
-                "запись",
-                "заказ",
-                "форму",
-                "record",
-                "request",
-            }:
-                continue
-            if _looks_like_action_requirement_field(cleaned):
-                continue
-            if 2 < len(cleaned) <= 80 and cleaned not in field_hints:
-                field_hints.append(cleaned)
-
-    for sentence in re.split(r"[.!?\n]+", text):
-        if len(field_hints) >= limit:
-            return field_hints[:limit]
-        if ":" not in sentence:
-            continue
-        if not re.search(
-            r"\b(?:клиент|заказчик|пользователь|специалист|исполнитель|мастер|сотрудник|оператор|менеджер|администратор|client|customer|specialist|manager|admin)\b",
-            sentence,
-            flags=re.IGNORECASE,
-        ):
-            continue
-        add_tail(sentence.split(":", 1)[1])
-
-    for marker in markers:
-        pattern = re.compile(rf"{marker}\s+(?P<tail>[^.!?\n]+)", re.IGNORECASE)
-        for match in pattern.finditer(text):
-            add_tail(match.group("tail"))
-            if len(field_hints) >= limit:
-                return field_hints[:limit]
-    return field_hints[:limit]
-
-
-def _extract_resource_hint(text: str, actor_hints: dict[str, list[str]], prompt_terms: list[str], field_hints: list[str]) -> str:
-    field_keys = {_clean_text(item).lower() for item in field_hints}
-    candidate_sources = [
-        ". ".join(actor_hints.get("client") or []),
-        text,
-    ]
-    resource_markers = (
-        "создает",
-        "создаёт",
-        "оформляет",
-        "оставляет",
-        "принимает",
-        "добавляет",
-        "ведет",
-        "ведёт",
-        "creates",
-        "accepts",
-        "manages",
-        "tracks",
-    )
-    for source in candidate_sources:
-        for marker in resource_markers:
-            pattern = re.compile(rf"{marker}\s+(?P<tail>[^,.;!?\n]+)", re.IGNORECASE)
-            for match in pattern.finditer(source):
-                tail = _clean_text(match.group("tail")).strip(" .:-")
-                if ":" in tail:
-                    tail = _clean_text(tail.split(":", 1)[0]).strip(" .:-")
-                tail = re.split(r"\s+(?:на|для|по|with|for)\s+", tail, maxsplit=1, flags=re.IGNORECASE)[0]
-                words = [
-                    word
-                    for word in re.findall(r"[A-Za-zА-Яа-яЁё0-9_-]{3,}", tail)
-                    if word.lower() not in PROMPT_PLAN_STOPWORDS
-                ]
-                if not words:
-                    continue
-                candidate = _clean_text(" ".join(words[:3])).strip(" .:-")
-                if candidate and candidate.lower() not in field_keys:
-                    return _normalize_resource_hint_label(candidate[:80])
-    for term in prompt_terms:
-        normalized = _clean_text(term).lower()
-        if normalized and normalized not in field_keys and normalized not in PROMPT_PLAN_STOPWORDS:
-            return _normalize_resource_hint_label(term[:80])
-    return "items"
-
-
-def _normalize_resource_hint_label(value: str) -> str:
-    cleaned = re.sub(r"\s+", " ", str(value or "items")).strip(" .:-")
-    lowered = cleaned.lower()
-    replacements = (
-        ("цию", "ция"),
-        ("сию", "сия"),
-        ("ию", "ия"),
-        ("ку", "ка"),
-        ("гу", "га"),
-        ("чу", "ча"),
-        ("шу", "ша"),
-        ("ью", "ья"),
-    )
-    for suffix, replacement in replacements:
-        if lowered.endswith(suffix) and len(cleaned) > len(suffix) + 1:
-            return f"{cleaned[:-len(suffix)]}{replacement}"
-    if lowered.endswith("у") and len(cleaned) > 4:
-        return f"{cleaned[:-1]}а"
-    return cleaned or "items"
-
-
-def extract_prompt_planning_hints(prompt: str) -> dict[str, Any]:
-    """Extract prompt-owned planning hints without domain templates.
-
-    The platform does not invent routes/resources from these hints. They are a
-    compact scratchpad for the LLM workers so the first build turn is anchored
-    to the user's nouns, role language, fields, and actions instead of generic
-    placeholder records.
-    """
-    text = _clean_text(prompt)
-    sentences = [
+def _prompt_sentences(text: str) -> list[str]:
+    return [
         sentence.strip(" .!?\t")
-        for sentence in re.split(r"[\n.!?]+", text)
+        for sentence in re.split(r"[\n.!?]+", _clean_text(text))
         if sentence.strip(" .!?\t")
-    ]
-    lowered_sentences = [(sentence, sentence.lower()) for sentence in sentences]
-    actor_hints: dict[str, list[str]] = {role: [] for role in ROLE_ORDER}
-    actor_patterns = {
-        "client": (
-            "клиент",
-            "пользователь",
-            "ученик",
-            "посетитель",
-            "покупатель",
-            "заказчик",
-            "пациент",
-            "родитель",
-            "user",
-            "customer",
-            "client",
-        ),
-        "specialist": (
-            "специалист",
-            "исполнитель",
-            "мастер",
-            "сотрудник",
-            "преподаватель",
-            "тренер",
-            "оператор",
-            "worker",
-            "specialist",
-            "staff",
-            "teacher",
-        ),
-        "manager": (
-            "менеджер",
-            "администратор",
-            "управля",
-            "руководитель",
-            "manager",
-            "admin",
-            "administrator",
-            "owner",
-        ),
-    }
-    action_markers = (
-        "долж",
-        "может",
-        "видит",
-        "видеть",
-        "выбира",
-        "оформ",
-        "добав",
-        "меня",
-        "отмеч",
-        "контрол",
-        "create",
-        "choose",
-        "add",
-        "update",
-        "see",
-        "manage",
-    )
-    action_sentences = [sentence for sentence, lowered in lowered_sentences if any(marker in lowered for marker in action_markers)]
-    last_role: str | None = None
-    for sentence, lowered in lowered_sentences:
-        explicit_role = _explicit_role_prefix(sentence)
-        if explicit_role:
-            actor_hints[explicit_role].append(sentence)
-            last_role = explicit_role
-            continue
-        if _is_general_role_requirement_sentence(sentence):
-            continue
-        matched_roles: list[str] = []
-        for role, patterns in actor_patterns.items():
-            if any(pattern in lowered for pattern in patterns):
-                matched_roles.append(role)
-                actor_hints[role].append(sentence)
-        if matched_roles:
-            last_role = matched_roles[-1]
-        elif (
-            last_role
-            and any(marker in lowered for marker in action_markers)
-            and not lowered.startswith(("нужно", "нужен", "нужна", "need "))
-        ):
-            actor_hints[last_role].append(sentence)
-    # If the user wrote actor/action sentences without platform role
-    # names, preserve the sentence order as role hints instead of inventing a
-    # domain template.
-    for role, sentence in zip(ROLE_ORDER, action_sentences):
-        if not actor_hints[role]:
-            actor_hints[role].append(sentence)
+    ][:10]
 
-    words = [
-        item.lower()
-        for item in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{3,}", text)
-        if item.lower() not in PROMPT_PLAN_STOPWORDS
-    ]
-    frequency: dict[str, int] = {}
-    for word in words:
-        frequency[word] = frequency.get(word, 0) + 1
-    prompt_terms = [
-        term
-        for term, _count in sorted(frequency.items(), key=lambda item: (-item[1], item[0]))[:16]
-    ]
-    role_field_hints: dict[str, list[str]] = {
-        role: _extract_field_hints_from_text(". ".join(hints), limit=12)
-        for role, hints in actor_hints.items()
-    }
-    field_hints: list[str] = []
-    for role in ROLE_ORDER:
-        for hint in role_field_hints.get(role) or []:
-            if hint not in field_hints:
-                field_hints.append(hint)
-    for hint in _extract_field_hints_from_text(text, limit=12):
-        if hint not in field_hints:
-            field_hints.append(hint)
-        if len(field_hints) >= 12:
+
+def _sanitize_prompt_label(value: Any, *, limit: int = 80) -> str:
+    cleaned = _clean_text(str(value or "")).strip(" .:-")
+    if len(cleaned) < 2:
+        return ""
+    return cleaned[:limit]
+
+
+def _sanitize_prompt_list(values: Any, *, limit: int = 12, item_limit: int = 80) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    result: list[str] = []
+    for item in values:
+        label = _sanitize_prompt_label(item, limit=item_limit)
+        if label and label not in result:
+            result.append(label)
+        if len(result) >= limit:
             break
-    resource_hint = _extract_resource_hint(text, actor_hints, prompt_terms, field_hints)
+    return result
+
+
+def _sanitize_role_lists(values: Any, *, limit: int = 12) -> dict[str, list[str]]:
+    source = values if isinstance(values, dict) else {}
     return {
-        "prompt_summary": text[:1200],
-        "prompt_sentences": sentences[:10],
-        "prompt_terms": prompt_terms,
-        "field_hints": field_hints[:12],
-        "role_field_hints": {
-            role: hints[:12]
-            for role, hints in role_field_hints.items()
-        },
-        "resource_hint": resource_hint,
-        "role_action_prompts": {
-            role: hints[:4]
-            for role, hints in actor_hints.items()
-        },
+        role: _sanitize_prompt_list(source.get(role), limit=limit)
+        for role in ROLE_ORDER
     }
+
+
+def normalize_prompt_contract_analysis(
+    prompt: str,
+    analysis: dict[str, Any],
+) -> dict[str, Any]:
+    """Normalize structured LLM prompt analysis without local lexical extraction.
+
+    This function is intentionally not an NLP parser and does not locally mine
+    product terms from the prompt. The LLM is the only component allowed to
+    decide product nouns, resources, fields, role ownership, and screen intent.
+    """
+    if not isinstance(analysis, dict):
+        raise ValueError("Prompt contract analysis is required and must be a JSON object.")
+
+    resource_hint = _sanitize_prompt_label(
+        analysis.get("resource_hint")
+        or analysis.get("resource")
+        or analysis.get("shared_resource")
+        or analysis.get("primary_resource")
+    )
+    role_actions = _sanitize_role_lists(
+        analysis.get("role_action_prompts") or analysis.get("role_actions"),
+        limit=4,
+    )
+    role_fields = _sanitize_role_lists(
+        analysis.get("role_field_hints")
+        or analysis.get("role_fields")
+        or analysis.get("fields_by_role"),
+        limit=12,
+    )
+    field_hints = _sanitize_prompt_list(analysis.get("field_hints") or analysis.get("fields"), limit=12)
+    for role in ROLE_ORDER:
+        for field in role_fields.get(role) or []:
+            if field not in field_hints:
+                field_hints.append(field)
+            if len(field_hints) >= 12:
+                break
+
+    screen_plan = analysis.get("routeable_screen_plan") or analysis.get("screen_plan")
+    if not isinstance(screen_plan, dict):
+        screen_plan = {}
+
+    return {
+        "schema_version": PROMPT_ANALYSIS_SCHEMA_VERSION,
+        "analysis_source": "llm",
+        "analysis_status": "ok",
+        "prompt_summary": _sanitize_prompt_label(analysis.get("prompt_summary"), limit=1200)
+        or _clean_text(prompt)[:1200],
+        "prompt_sentences": _prompt_sentences(prompt),
+        "field_hints": field_hints[:12],
+        "role_field_hints": role_fields,
+        "resource_hint": resource_hint or None,
+        "role_action_prompts": role_actions,
+        "routeable_screen_plan": screen_plan,
+    }
+
+
+def extract_prompt_planning_hints(
+    prompt: str,
+    *,
+    prompt_analysis: dict[str, Any],
+) -> dict[str, Any]:
+    """Return contract hints from structured LLM analysis only.
+
+    The previous implementation tried to infer fields/resources from prompt
+    local lexical parsing. That was too brittle and could accidentally bias
+    generation toward a domain. The runtime now requires structured model
+    analysis.
+    """
+    return normalize_prompt_contract_analysis(prompt, prompt_analysis)
 
 
 def _role_screen_plan(
@@ -467,102 +126,35 @@ def _role_screen_plan(
     prompt_hints: dict[str, Any],
     generation_mode: GenerationMode | str | None,
 ) -> dict[str, Any]:
-    """Suggest routeable screen intents from prompt-owned role actions.
-
-    This intentionally does not create route names, resource names, or a fixed
-    page count. The LLM still owns concrete pages. The platform only gives a
-    Claude/Codex-style planning nudge so complex mobile workflows do not get
-    collapsed into one long dashboard.
-    """
+    """Suggest routeable screen intents from LLM-owned prompt analysis."""
     mode_value = normalized_generation_mode(generation_mode)
+    supplied = prompt_hints.get("routeable_screen_plan") if isinstance(prompt_hints, dict) else {}
+    if isinstance(supplied, dict) and supplied.get("roles"):
+        roles_payload = supplied.get("roles") if isinstance(supplied.get("roles"), dict) else {}
+        return {
+            "multi_page_recommended": bool(supplied.get("multi_page_recommended", True)),
+            "route_names_owned_by_agent": True,
+            "no_fixed_page_count": True,
+            "roles": {
+                role: [
+                    {
+                        "intent": _sanitize_prompt_label(item.get("intent"), limit=48) or "overview",
+                        "purpose": _sanitize_prompt_label(item.get("purpose"), limit=160)
+                        or "prompt-derived role screen",
+                        "source": _sanitize_prompt_list(item.get("source"), limit=3, item_limit=160)
+                        if isinstance(item, dict)
+                        else [],
+                    }
+                    for item in (roles_payload.get(role) or [])
+                    if isinstance(item, dict)
+                ][:5]
+                or [{"intent": "overview", "purpose": "prompt-derived role entry screen", "source": []}]
+                for role in ROLE_ORDER
+            },
+        }
     role_prompts = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints, dict) else {}
     field_hints = prompt_hints.get("field_hints") if isinstance(prompt_hints, dict) else []
     sentences = prompt_hints.get("prompt_sentences") if isinstance(prompt_hints, dict) else []
-
-    intent_markers: tuple[tuple[str, tuple[str, ...]], ...] = (
-        (
-            "create_or_configure",
-            (
-                "add",
-                "create",
-                "fill",
-                "submit",
-                "choose",
-                "save",
-                "добав",
-                "созда",
-                "заполн",
-                "оформ",
-                "выбира",
-                "выбрат",
-                "сохран",
-                "указывает",
-                "указать",
-            ),
-        ),
-        (
-            "list_or_queue",
-            (
-                "list",
-                "queue",
-                "see",
-                "view",
-                "track",
-                "видит",
-                "видеть",
-                "очеред",
-                "спис",
-                "отслеж",
-                "смотр",
-            ),
-        ),
-        (
-            "detail_or_update",
-            (
-                "update",
-                "change",
-                "process",
-                "mark",
-                "control",
-                "меня",
-                "обнов",
-                "обработ",
-                "отмеч",
-                "контрол",
-                "управ",
-            ),
-        ),
-        (
-            "summary_or_insight",
-            (
-                "summary",
-                "metrics",
-                "analytics",
-                "overview",
-                "report",
-                "свод",
-                "метрик",
-                "аналит",
-                "отчет",
-                "отчёт",
-                "загруз",
-            ),
-        ),
-        (
-            "settings_or_availability",
-            (
-                "setting",
-                "available",
-                "availability",
-                "status",
-                "настрой",
-                "доступ",
-                "статус",
-                "остат",
-                "график",
-            ),
-        ),
-    )
 
     role_screens: dict[str, list[dict[str, Any]]] = {}
     for role in ROLE_ORDER:
@@ -578,16 +170,6 @@ def _role_screen_plan(
                 "source": source_phrases[:1],
             }
         ]
-        combined = " ".join(source_phrases).lower()
-        for intent, markers in intent_markers:
-            if any(marker in combined for marker in markers):
-                detected.append(
-                    {
-                        "intent": intent,
-                        "purpose": "separate routeable screen when this task would make the role root too long or mix unrelated controls",
-                        "source": source_phrases[:3],
-                    }
-                )
         if role == "client" and field_hints and not any(item["intent"] == "create_or_configure" for item in detected):
             detected.append(
                 {
@@ -724,6 +306,7 @@ def build_acceptance_contract(
     intent: str | None,
     generation_mode: GenerationMode | str | None,
     focused_edit_kind: str = "",
+    prompt_analysis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     intent_value = str(intent or "").strip().lower()
     mode_value = normalized_generation_mode(generation_mode)
@@ -739,7 +322,9 @@ def build_acceptance_contract(
             "flows": [],
             "test_requirements": [],
         }
-    prompt_hints = extract_prompt_planning_hints(prompt)
+    if prompt_analysis is None:
+        raise ValueError("LLM prompt analysis is required before building a workflow acceptance contract.")
+    prompt_hints = extract_prompt_planning_hints(prompt, prompt_analysis=prompt_analysis)
     flows: list[dict[str, Any]] = [
         {
             "id": "role_shared_persistence",
@@ -792,7 +377,8 @@ def build_acceptance_contract(
             "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
             "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
             "resource_hint": prompt_hints.get("resource_hint") or None,
-            "prompt_terms": list(prompt_hints.get("prompt_terms") or [])[:16],
+            "analysis_source": prompt_hints.get("analysis_source"),
+            "analysis_status": prompt_hints.get("analysis_status"),
         },
         "required_controls": [
             {"role": "client", "action": "submit the user-facing prompt-derived create/select/save flow through UI and POST-capable API"},
@@ -816,6 +402,7 @@ def build_implementation_plan(
     generation_mode: GenerationMode | str | None,
     acceptance_contract: dict[str, Any] | None,
     orchestration: dict[str, Any] | None = None,
+    prompt_analysis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a generic agent plan from prompt-derived contract data.
 
@@ -826,7 +413,25 @@ def build_implementation_plan(
     intent_value = str(intent or "").strip().lower()
     mode_value = normalized_generation_mode(generation_mode)
     contract = dict(acceptance_contract or {})
-    prompt_hints = extract_prompt_planning_hints(prompt)
+    existing_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else None
+    if existing_hints:
+        prompt_hints = existing_hints
+    else:
+        if prompt_analysis is None and contract.get("required"):
+            raise ValueError("LLM prompt analysis is required before building a workflow implementation plan.")
+        prompt_hints = (
+            extract_prompt_planning_hints(prompt, prompt_analysis=prompt_analysis)
+            if prompt_analysis is not None
+            else {
+                "prompt_summary": _clean_text(prompt)[:1200],
+                "prompt_sentences": _prompt_sentences(prompt),
+                "field_hints": [],
+                "role_field_hints": {role: [] for role in ROLE_ORDER},
+                "resource_hint": None,
+                "role_action_prompts": {role: [] for role in ROLE_ORDER},
+                "routeable_screen_plan": {},
+            }
+        )
     screen_plan = _role_screen_plan(prompt_hints=prompt_hints, generation_mode=generation_mode)
     required_controls = [
         dict(item)
@@ -842,7 +447,7 @@ def build_implementation_plan(
         "principle": "plan_inspect_build_verify_repair_final_browser_proof",
         "roles": list(contract.get("roles") or ROLE_ORDER),
         "prompt_hints": prompt_hints,
-        "primary_entities": list(prompt_hints.get("prompt_terms") or [])[:8],
+        "primary_entities": [prompt_hints.get("resource_hint")] if prompt_hints.get("resource_hint") else [],
         "role_actions": {
             "client": (prompt_hints.get("role_action_prompts") or {}).get("client") or ["perform the prompt-derived user create, submit, select, or save action through UI and POST API"],
             "specialist": (prompt_hints.get("role_action_prompts") or {}).get("specialist") or ["perform the prompt-derived operational processing/update action through UI and update API"],
@@ -855,6 +460,8 @@ def build_implementation_plan(
             "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
             "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
             "resource_hint": prompt_hints.get("resource_hint") or None,
+            "analysis_source": prompt_hints.get("analysis_source"),
+            "analysis_status": prompt_hints.get("analysis_status"),
         },
         "ui_contract": {
             "required_controls": required_controls,

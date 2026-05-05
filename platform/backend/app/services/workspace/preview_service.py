@@ -115,7 +115,7 @@ class PreviewService:
                 preview.stage = "error"
                 preview.progress_percent = 100
                 preview.last_error = str(exc)
-                self._append_log(preview, f"Docker preview failed: {exc}")
+                self._append_log(preview, f"{preview.runtime_mode or 'preview'} preview failed: {exc}")
             self._persist(preview)
             return preview
         finally:
@@ -219,7 +219,7 @@ class PreviewService:
                 preview.stage = "error"
                 preview.progress_percent = 100
                 preview.last_error = str(exc)
-                self._append_log(preview, f"Docker preview rebuild failed: {exc}")
+                self._append_log(preview, f"{preview.runtime_mode or 'preview'} preview rebuild failed: {exc}")
             self._persist(preview)
             return preview
         finally:
@@ -534,79 +534,7 @@ class PreviewService:
 
     def _handle_preview_start_failure(self, preview: PreviewRecord, workspace_id: str, source_dir: Path, error: Exception) -> bool:
         failure_kind = self._classify_preview_failure(error)
-        cleanup_attempted = False
-        if failure_kind == "container_name_conflict":
-            restored = self._reconcile_runtime_state(preview, workspace_id)
-            if restored.status == "running" and restored.url:
-                restored.preview_reused_existing_runtime = True
-                restored.preview_failure_kind = failure_kind  # type: ignore[assignment]
-                self._append_log(restored, "Preview start reused an already running docker runtime after container-name conflict.")
-                self._persist(restored)
-                return True
-        if failure_kind in {"address_pool_exhausted", "container_name_conflict", "network_conflict"}:
-            try:
-                cleanup_logs = self.runtime_manager.reset(workspace_id, source_dir, preview.proxy_port)
-            except Exception:
-                cleanup_logs = []
-            else:
-                cleanup_attempted = True
-                if cleanup_logs:
-                    preview.logs.extend(cleanup_logs[-20:])
-                    preview.logs = preview.logs[-240:]
-            if cleanup_attempted and preview.proxy_port is not None:
-                try:
-                    project_name, retry_logs = self.runtime_manager.start(workspace_id, source_dir, preview.proxy_port)
-                except Exception as retry_exc:
-                    self._append_log(preview, f"Preview retry after cleanup failed: {retry_exc}")
-                else:
-                    preview.project_name = project_name
-                    preview.url = self.runtime_manager.preview_url(preview.proxy_port)
-                    preview.frontend_url = preview.url
-                    preview.backend_url = self.runtime_manager.backend_url(preview.proxy_port)
-                    preview.logs.extend(retry_logs or [f"Docker preview restarted on port {preview.proxy_port}."])
-                    preview.logs = preview.logs[-240:]
-                    preview.status = "running"
-                    preview.stage = "running"
-                    preview.progress_percent = 100
-                    preview.started_at = preview.started_at or datetime.now(timezone.utc)
-                    preview.last_error = None
-                    preview.preview_failure_kind = None
-                    preview.preview_retry_count = 0
-                    preview.preview_cleanup_attempted = True
-                    preview.preview_reused_existing_runtime = False
-                    preview.preview_cooldown_until = None
-                    preview.last_failure_signature = None
-                    self._append_log(preview, "Preview start recovered after cleanup of stale docker runtime.")
-                    self._persist(preview)
-                    return True
-            if failure_kind == "address_pool_exhausted" and preview.proxy_port is not None:
-                try:
-                    project_name, local_logs = self.runtime_manager.start_local(workspace_id, source_dir, preview.proxy_port)
-                except Exception as local_exc:
-                    self._append_log(preview, f"Local preview fallback failed after docker address-pool exhaustion: {local_exc}")
-                else:
-                    preview.runtime_mode = "local"
-                    preview.project_name = project_name
-                    preview.url = self.runtime_manager.preview_url(preview.proxy_port)
-                    preview.frontend_url = preview.url
-                    preview.backend_url = self.runtime_manager.backend_url(preview.proxy_port)
-                    preview.logs.extend(local_logs or [f"Local preview started on port {preview.proxy_port}."])
-                    preview.logs = preview.logs[-240:]
-                    preview.status = "running"
-                    preview.stage = "running"
-                    preview.progress_percent = 100
-                    preview.started_at = preview.started_at or datetime.now(timezone.utc)
-                    preview.last_error = None
-                    preview.preview_failure_kind = failure_kind  # type: ignore[assignment]
-                    preview.preview_retry_count = 0
-                    preview.preview_cleanup_attempted = cleanup_attempted
-                    preview.preview_reused_existing_runtime = False
-                    preview.preview_cooldown_until = None
-                    preview.last_failure_signature = None
-                    self._append_log(preview, "Docker address-pool exhaustion detected; local uvicorn preview fallback is running.")
-                    self._persist(preview)
-                    return True
-        self._record_preview_failure(preview, error=error, failure_kind=failure_kind, cleanup_attempted=cleanup_attempted)
+        self._record_preview_failure(preview, error=error, failure_kind=failure_kind, cleanup_attempted=False)
         self._append_log(
             preview,
             f"Preview failure classified as {failure_kind}. Cooldown active until {preview.preview_cooldown_until.isoformat() if preview.preview_cooldown_until else 'unknown'}.",
@@ -910,6 +838,33 @@ class PreviewService:
         return age_seconds >= STARTING_STALE_AFTER_SEC
 
     def _reconcile_runtime_state(self, preview: PreviewRecord, workspace_id: str) -> PreviewRecord:
+        if preview.runtime_mode == "local":
+            if preview.status in {"running", "starting"} and preview.url and self._http_preview_ready(preview.url):
+                return preview
+            if (
+                preview.project_name
+                or preview.proxy_port is not None
+                or preview.url
+                or preview.status in {"running", "starting", "error"}
+            ):
+                preview.status = "stopped"
+                preview.stage = "idle"
+                preview.progress_percent = 0
+                preview.url = None
+                preview.frontend_url = None
+                preview.backend_url = None
+                preview.proxy_port = None
+                preview.project_name = None
+                preview.last_error = None
+                preview.preview_failure_kind = None
+                preview.preview_retry_count = 0
+                preview.preview_cleanup_attempted = False
+                preview.preview_reused_existing_runtime = False
+                preview.preview_cooldown_until = None
+                preview.last_failure_signature = None
+                self._append_log(preview, "Local preview runtime was not reachable. Resetting stale preview state.")
+                self._persist(preview)
+            return preview
         if preview.runtime_mode != "docker":
             return preview
 

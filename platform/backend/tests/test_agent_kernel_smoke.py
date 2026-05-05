@@ -45,6 +45,59 @@ from app.services.workspace.run_service import RunService
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, extract_prompt_planning_hints
 
 
+def _prompt_analysis(
+    *,
+    resource: str = "заявка",
+    client: list[str] | None = None,
+    specialist: list[str] | None = None,
+    manager: list[str] | None = None,
+    screen_plan: dict | None = None,
+) -> dict:
+    client_fields = client or []
+    specialist_fields = specialist or []
+    manager_fields = manager or []
+    return {
+        "prompt_summary": "structured test analysis",
+        "resource_hint": resource,
+        "field_hints": [*client_fields, *specialist_fields, *manager_fields],
+        "role_field_hints": {
+            "client": client_fields,
+            "specialist": specialist_fields,
+            "manager": manager_fields,
+        },
+        "role_action_prompts": {
+            "client": ["; ".join(client_fields)] if client_fields else [],
+            "specialist": ["; ".join(specialist_fields)] if specialist_fields else [],
+            "manager": ["; ".join(manager_fields)] if manager_fields else [],
+        },
+        "routeable_screen_plan": screen_plan or {},
+    }
+
+
+def _contract_with_analysis(
+    prompt: str,
+    *,
+    generation_mode: GenerationMode = GenerationMode.FAST,
+    resource: str = "заявка",
+    client: list[str] | None = None,
+    specialist: list[str] | None = None,
+    manager: list[str] | None = None,
+    screen_plan: dict | None = None,
+) -> dict:
+    return build_acceptance_contract(
+        prompt=prompt,
+        intent="create",
+        generation_mode=generation_mode,
+        prompt_analysis=_prompt_analysis(
+            resource=resource,
+            client=client,
+            specialist=specialist,
+            manager=manager,
+            screen_plan=screen_plan,
+        ),
+    )
+
+
 def test_code_agent_defaults_to_mini_for_all_generation_modes() -> None:
     for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY):
         assert models_for_role("agent_turn", model_profile="", generation_mode=mode) == CODEX_MINI_MODEL
@@ -68,7 +121,12 @@ def test_prompt_planning_hints_extract_role_fields_from_colon_and_action_sentenc
     hints = extract_prompt_planning_hints(
         "Клиент оставляет заявку: компания, офис, категория материалов, количество, бюджет, срок поставки, контакт и комментарий. "
         "Специалист видит заявку, подбирает поставщика, уточняет наличие, цену, срок доставки, замену при отсутствии и рабочий статус. "
-        "Менеджер контролирует бюджет и срочность, назначает приоритет, утверждает лимит или замену, оставляет управленческий комментарий."
+        "Менеджер контролирует бюджет и срочность, назначает приоритет, утверждает лимит или замену, оставляет управленческий комментарий.",
+        prompt_analysis=_prompt_analysis(
+            client=["компания", "офис", "категория материалов", "количество", "бюджет", "срок поставки", "контакт", "комментарий"],
+            specialist=["поставщика", "наличие", "цену", "срок доставки", "замену при отсутствии", "рабочий статус"],
+            manager=["приоритет", "лимит", "управленческий комментарий"],
+        ),
     )
 
     assert hints["resource_hint"] == "заявка"
@@ -89,7 +147,12 @@ def test_prompt_planning_hints_do_not_turn_workflow_actions_into_form_fields() -
         "Клиент: HR-менеджер оставляет заявку на обучение: компания, подразделение, тема обучения, количество участников, бюджет, контакт. "
         "Специалист: методист обрабатывает заявку: программа, тренер, стоимость, доступные даты, рабочий статус. "
         "Менеджер: руководитель согласует: приоритет, лимит бюджета, итоговое решение. "
-        "Нужно приложение с ролями /client, /specialist, /manager: создание заявки, список заявок, выбор заявки специалистом и менеджером, обновление статуса, сохранение данных после перезагрузки."
+        "Нужно приложение с ролями /client, /specialist, /manager: создание заявки, список заявок, выбор заявки специалистом и менеджером, обновление статуса, сохранение данных после перезагрузки.",
+        prompt_analysis=_prompt_analysis(
+            client=["компания", "подразделение", "тема обучения", "количество участников", "бюджет", "контакт"],
+            specialist=["программа", "тренер", "стоимость", "доступные даты", "рабочий статус"],
+            manager=["приоритет", "лимит бюджета", "итоговое решение"],
+        ),
     )
 
     all_fields = [
@@ -115,7 +178,12 @@ def test_prompt_planning_hints_skip_actor_action_and_mode_instruction_fields() -
         "Специалист: методист видит заявку, подбирает программу, тренера, длительность, стоимость, материалы и рабочий статус. "
         "Менеджер: руководитель видит все заявки и результат методиста, назначает приоритет, утверждает лимит бюджета, выбирает финальные даты и оставляет управленческий комментарий. "
         "Balanced режим: сделай дизайн лучше fast, метрики для менеджера, состояния empty/loading/error/success. "
-        "Строго используй contract-owned schema/routes/field keys из miniapp/app/generated/miniapp_contract.json; не создавай English aliases и не меняй /status route."
+        "Строго используй contract-owned schema/routes/field keys из miniapp/app/generated/miniapp_contract.json; не создавай English aliases и не меняй /status route.",
+        prompt_analysis=_prompt_analysis(
+            client=["компанию", "количество участников", "тему обучения", "желаемые даты", "формат", "бюджет", "комментарий"],
+            specialist=["программу", "тренера", "длительность", "стоимость", "материалы", "рабочий статус"],
+            manager=["приоритет", "лимит бюджета", "финальные даты", "управленческий комментарий"],
+        ),
     )
 
     all_fields = {
@@ -163,7 +231,23 @@ def test_implementation_plan_has_prompt_derived_routeable_screen_intents() -> No
         "обновлять статус подготовки и оставлять комментарии, менеджер должен видеть "
         "загрузку команды, выручку и позиции, где есть задержки."
     )
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.BALANCED)
+    screen_plan_payload = {
+        "multi_page_recommended": True,
+        "roles": {
+            "client": [{"intent": "overview"}, {"intent": "create_or_configure"}],
+            "specialist": [{"intent": "overview"}, {"intent": "detail_or_update"}],
+            "manager": [{"intent": "overview"}, {"intent": "summary_or_insight"}],
+        },
+    }
+    contract = _contract_with_analysis(
+        prompt,
+        generation_mode=GenerationMode.BALANCED,
+        resource="мероприятие",
+        client=["формат", "дату", "количество гостей", "дополнительные услуги"],
+        specialist=["план", "статус подготовки", "комментарии"],
+        manager=["загрузка команды", "выручка", "задержки"],
+        screen_plan=screen_plan_payload,
+    )
     plan = build_implementation_plan(
         prompt=prompt,
         intent="create",
@@ -184,7 +268,11 @@ def test_implementation_plan_has_prompt_derived_routeable_screen_intents() -> No
 def test_acceptance_contract_carries_prompt_field_hints() -> None:
     prompt = "Клиент указывает компанию, адрес, дату, бюджет и комментарий. Менеджер видит выручку."
 
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    contract = _contract_with_analysis(
+        prompt,
+        client=["компанию", "адрес", "дату", "бюджет", "комментарий"],
+        manager=["выручку"],
+    )
 
     assert contract["api_contract"]["field_hints"][:3] == ["компанию", "адрес", "дату"]
     assert contract["api_contract"]["role_field_hints"]["client"][:3] == ["компанию", "адрес", "дату"]
@@ -198,7 +286,12 @@ def test_acceptance_contract_splits_role_owned_fields_and_resource_hint() -> Non
         "Менеджер может пометить приоритет и добавить управленческий комментарий."
     )
 
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    contract = _contract_with_analysis(
+        prompt,
+        client=["компанию", "телефон", "бюджет"],
+        specialist=["материалы", "стоимость", "комментарий цеха"],
+        manager=["приоритет", "управленческий комментарий"],
+    )
 
     role_fields = contract["api_contract"]["role_field_hints"]
     assert role_fields["client"] == ["компанию", "телефон", "бюджет"]
@@ -214,7 +307,11 @@ def test_acceptance_contract_does_not_merge_followup_visibility_sentence_into_cl
         "Специалист рассчитывает стоимость и добавляет комментарий бригады."
     )
 
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    contract = _contract_with_analysis(
+        prompt,
+        client=["компанию", "бюджет", "комментарий"],
+        specialist=["стоимость", "комментарий бригады"],
+    )
 
     assert contract["api_contract"]["role_field_hints"]["client"] == ["компанию", "бюджет", "комментарий"]
     assert "стоимость" in contract["api_contract"]["role_field_hints"]["specialist"]
@@ -227,7 +324,13 @@ def test_frontend_prompt_specificity_blocks_generic_scaffold(tmp_path: Path) -> 
         "приготовления/доставки, добавляет комментарий кухни и время готовности. Менеджер видит "
         "выручку, средний чек, проблемные задержки и управленческий комментарий."
     )
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    contract = _contract_with_analysis(
+        prompt,
+        resource="заказ",
+        client=["компания", "адрес", "дату", "количество персон", "бюджет", "предпочтения по меню", "комментарий"],
+        specialist=["меню", "статус приготовления/доставки", "комментарий кухни", "время готовности"],
+        manager=["выручку", "средний чек", "проблемные задержки", "управленческий комментарий"],
+    )
     role_text = {
         "client": "<h1>Create Видит</h1><label>Title <input name='title'></label><label>Note <textarea name='note'></textarea></label><h2>Shared records</h2>",
         "specialist": "<h1>Process Видит</h1><button>Update status</button><h2>Shared records</h2>",
@@ -254,7 +357,13 @@ def test_frontend_prompt_specificity_accepts_prompt_owned_surfaces(tmp_path: Pat
         "приготовления/доставки, добавляет комментарий кухни и время готовности. Менеджер видит "
         "выручку, средний чек, проблемные задержки, требует внимания и управленческий комментарий."
     )
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    contract = _contract_with_analysis(
+        prompt,
+        resource="заказ",
+        client=["компания", "адрес", "дата", "количество персон", "бюджет", "предпочтения по меню", "комментарий"],
+        specialist=["меню", "статус приготовления", "доставка", "комментарий кухни", "время готовности"],
+        manager=["выручка", "средний чек", "проблемные задержки", "требует внимания", "управленческий комментарий"],
+    )
     role_text = {
         "client": "Компания Адрес Дата Количество персон Бюджет Предпочтения по меню Комментарий Офисный ланч",
         "specialist": "Назначить меню Статус приготовления Доставка Комментарий кухни Время готовности Новые заказы",
@@ -273,7 +382,11 @@ def test_frontend_prompt_specificity_accepts_prompt_owned_surfaces(tmp_path: Pat
 
 def test_frontend_prompt_specificity_requires_visible_client_form_fields(tmp_path: Path) -> None:
     prompt = "Клиент указывает компанию, адрес, материалы и комментарий. Специалист обновляет статус."
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    contract = _contract_with_analysis(
+        prompt,
+        client=["компания", "адрес", "материалы", "комментарий"],
+        specialist=["статус"],
+    )
     role_text = {
         "client": "Компания Адрес Материалы Комментарий const FIELD_LABELS = { materials: 'Материалы', comment: 'Комментарий' }",
         "specialist": "Статус Материалы Комментарий",
@@ -302,7 +415,12 @@ def test_frontend_prompt_specificity_blocks_role_fields_in_client_form(tmp_path:
         "Специалист добавляет комментарий цеха и дату готовности. "
         "Менеджер может пометить приоритет."
     )
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    contract = _contract_with_analysis(
+        prompt,
+        client=["компания", "телефон", "бюджет"],
+        specialist=["комментарий цеха", "дату готовности"],
+        manager=["приоритет"],
+    )
     role_text = {
         "client": "компания телефон бюджет комментарий цеха дата готовности",
         "specialist": "комментарий цеха дата готовности",
@@ -335,7 +453,11 @@ def test_frontend_prompt_specificity_allows_client_comment_without_specialist_co
         "Клиент создает заявку, указывает компанию, дату и комментарий. "
         "Специалист добавляет комментарий бригады и дату визита."
     )
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    contract = _contract_with_analysis(
+        prompt,
+        client=["компания", "дата", "комментарий"],
+        specialist=["комментарий бригады", "дата визита"],
+    )
     role_text = {
         "client": "компания дата комментарий",
         "specialist": "комментарий бригады дата визита",
@@ -363,7 +485,11 @@ def test_frontend_prompt_specificity_does_not_confuse_delivery_term_with_supplie
         "Клиент оставляет заявку: компания, желаемый срок поставки и комментарий. "
         "Специалист подбирает поставщика и уточняет наличие."
     )
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    contract = _contract_with_analysis(
+        prompt,
+        client=["компания", "желаемый срок поставки", "комментарий"],
+        specialist=["поставщика", "наличие"],
+    )
     role_text = {
         "client": "компания желаемый срок поставки комментарий",
         "specialist": "поставщика наличие",
@@ -459,7 +585,13 @@ def test_contract_materializer_manager_surface_has_dashboard_and_quality_css() -
         prompt=prompt,
         intent="create",
         generation_mode=GenerationMode.QUALITY,
-        acceptance_contract=build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.QUALITY),
+        acceptance_contract=_contract_with_analysis(
+            prompt,
+            generation_mode=GenerationMode.QUALITY,
+            client=["компания", "бюджет", "комментарий"],
+            specialist=["программа", "тренер", "стоимость"],
+            manager=["лимит", "согласование"],
+        ),
     )
 
     html = MiniAppContractMaterializer._role_html(role="manager", resource=contract.resources[0])
@@ -481,7 +613,12 @@ def test_role_prompt_update_payload_requires_real_specialist_controls() -> None:
         "ставит статус производства, добавляет комментарий цеха и дату готовности. "
         "Менеджер видит приоритет."
     )
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    contract = _contract_with_analysis(
+        prompt,
+        client=[],
+        specialist=["материалы", "стоимость", "статус производства", "комментарий цеха", "дата готовности"],
+        manager=["приоритет"],
+    )
     role_text = {
         "client": "",
         "specialist": 'const WORKFLOW_FIELDS = { estimated_cost: "расчет стоимости" }; fetch("/api/items/1/status", { method: "PATCH", body: JSON.stringify({ status: "processed", updated_by: ROLE }) });',
@@ -527,7 +664,20 @@ def test_role_surface_blocks_generic_workflow_copy_and_raw_status_rendering() ->
     assert "template escape(item.status)" in raw_status
     assert "template item.priority raw enum" in raw_status
     assert "buildLine status=item.status" in raw_status
-    assert "status label raw fallback" in raw_status
+    assert "status label raw passthrough" in raw_status
+
+    safe_status = CheckRunner._raw_status_render_markers(
+        """
+        const STATUS_LABELS = { new: "Новый", ready: "Готов" };
+        function statusLabel(value) {
+          return STATUS_LABELS[String(value || "").toLowerCase()] || "На обработке";
+        }
+        function render(item) {
+          return `<span>${escapeHtml(statusLabel(item.status))}</span>`;
+        }
+        """
+    )
+    assert safe_status == []
 
 
 def test_hidden_state_class_requires_effective_css_rule() -> None:
@@ -564,7 +714,12 @@ def test_role_prompt_update_payload_accepts_formdata_dynamic_patch_fields() -> N
         "Клиент создает заявку. Специалист назначает бригаду, рассчитывает стоимость, "
         "добавляет комментарий бригады и дату визита. Менеджер видит приоритет."
     )
-    contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    contract = _contract_with_analysis(
+        prompt,
+        client=[],
+        specialist=["бригаду", "стоимость", "комментарий бригады", "дату визита"],
+        manager=["приоритет"],
+    )
     role_text = {
         "client": "",
         "specialist": '''
@@ -625,7 +780,11 @@ def test_frontend_form_field_reads_accept_dynamic_formdata_entries_payload() -> 
 
 def test_miniapp_contract_uses_prompt_fields_instead_of_items_slug() -> None:
     prompt = "Клиент указывает компанию, адрес и бюджет для корпоративного ланча."
-    acceptance_contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    acceptance_contract = _contract_with_analysis(
+        prompt,
+        resource="корпоративный ланч",
+        client=["компанию", "адрес", "бюджет для корпоративного ланча"],
+    )
     implementation_plan = build_implementation_plan(
         prompt=prompt,
         intent="create",
@@ -654,7 +813,11 @@ def test_miniapp_contract_uses_role_scoped_fields_and_business_resource_name() -
         "Клиент создает заявку, указывает компанию, телефон и бюджет. "
         "Специалист добавляет комментарий цеха и дату готовности."
     )
-    acceptance_contract = build_acceptance_contract(prompt=prompt, intent="create", generation_mode=GenerationMode.FAST)
+    acceptance_contract = _contract_with_analysis(
+        prompt,
+        client=["компанию", "телефон", "бюджет"],
+        specialist=["комментарий цеха", "дату готовности"],
+    )
 
     contract = MiniAppContractCompiler.compile(
         workspace_id="ws_test",

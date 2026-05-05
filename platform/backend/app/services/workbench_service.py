@@ -16,7 +16,7 @@ from uuid import uuid4
 from app.models.domain import CreateRunRequest, RunRecord
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
-from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer, MiniAppRouteRegistry
+from app.services.miniapp_contract import MiniAppContractMaterializer, MiniAppRouteRegistry
 from app.services.repair_catalog import RepairCatalog
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, tool_envelope, tool_registry_contract
 from app.services.workspace.run_service import RunService
@@ -790,7 +790,7 @@ class WorkbenchService:
             {
                 "id": "artifact_refs_v1",
                 "status": "current",
-                "description": "Run artifacts remain addressable through report refs and compatibility fallbacks.",
+                "description": "Run artifacts remain addressable through report refs and compatibility reads.",
             },
         ]
         return {"status": "current", "items": checks, "created_at": datetime.now(timezone.utc).isoformat()}
@@ -824,18 +824,20 @@ class WorkbenchService:
 
     def prompt_contract(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
-        prompt_terms = set(re.findall(r"[a-zA-Zа-яА-Я0-9]{4,}", run.prompt.lower()))
-        artifacts = self._run_artifacts_or_empty(run_id)
-        diff_text = str(artifacts.get("diff") or "")
-        diff_terms = set(re.findall(r"[a-zA-Zа-яА-Я0-9]{4,}", diff_text.lower()))
-        overlap = sorted(prompt_terms & diff_terms)[:40]
-        status = "passed" if not diff_text or overlap or len(prompt_terms) < 4 else "needs_review"
+        contract = dict(run.acceptance_contract or {})
+        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
+        analysis_status = str(prompt_hints.get("analysis_status") or "unknown")
+        status = "passed" if not contract.get("required") or analysis_status == "ok" else "needs_review"
         payload = {
             "run_id": run_id,
             "status": status,
-            "prompt_terms_checked": sorted(prompt_terms)[:80],
-            "matched_terms": overlap,
-            "findings": [] if status == "passed" else [{"severity": "medium", "message": "Diff has low lexical overlap with the user prompt; review product semantics before apply."}],
+            "analysis_source": prompt_hints.get("analysis_source"),
+            "analysis_status": analysis_status,
+            "resource_hint": prompt_hints.get("resource_hint"),
+            "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
+            "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
+            "lexical_matching": "disabled",
+            "findings": [] if status == "passed" else [{"severity": "medium", "message": "Prompt contract analysis is unavailable; generation should use LLM prompt analysis before applying domain-specific fields."}],
         }
         self.store.upsert("reports", f"prompt_contract:{run_id}", payload)
         return payload
@@ -860,22 +862,18 @@ class WorkbenchService:
                 contract = MiniAppContract.model_validate(contract_payload)
             except Exception:
                 contract = None
-        if contract is None:
-            contract = MiniAppContractCompiler.compile(
-                workspace_id=run.workspace_id,
-                run_id=run.run_id,
-                prompt=run.prompt,
-                intent=run.intent,
-                generation_mode=run.generation_mode,
-                acceptance_contract=run.acceptance_contract,
-                implementation_plan=run.implementation_plan,
-            )
         registry_report = self.store.get("reports", run.route_registry_ref) if run.route_registry_ref else None
         registry_snapshot = None
         if isinstance(registry_report, dict) and isinstance(registry_report.get("snapshot"), dict):
             registry_snapshot = registry_report["snapshot"]
-        if registry_snapshot is None:
+        if registry_snapshot is None and contract is not None:
             registry_snapshot = MiniAppRouteRegistry.snapshot(source_dir, contract).model_dump(mode="json")
+        if registry_snapshot is None:
+            registry_snapshot = {
+                "status": "not_available",
+                "drift_issues": [],
+                "repair_recipes": [],
+            }
         repair_report = self.store.get("reports", run.repair_recipes_ref) if run.repair_recipes_ref else None
         repair_recipes = (
             repair_report.get("items")
@@ -886,7 +884,7 @@ class WorkbenchService:
             "run_id": run_id,
             "workspace_id": run.workspace_id,
             "status": registry_snapshot.get("status") or "passed",
-            "contract": contract.model_dump(mode="json"),
+            "contract": contract.model_dump(mode="json") if contract is not None else None,
             "registry_snapshot": registry_snapshot,
             "drift_issues": registry_snapshot.get("drift_issues", []),
             "repair_recipes": repair_recipes,
@@ -1420,7 +1418,7 @@ class WorkbenchService:
                         "id": skill_id,
                         "name": title[:80],
                         "source": str(path.relative_to(self.settings.repo_root)) if path.is_relative_to(self.settings.repo_root) else str(path),
-                        "trigger_keywords": [part for part in re_slug(title).split("-") if len(part) > 2][:8],
+                        "activation": "llm_planning_only",
                         "constraints": [line.strip("- ").strip() for line in text.splitlines() if line.strip().startswith("-")][:6],
                         "validation_hints": [],
                     }
@@ -1690,9 +1688,9 @@ class WorkbenchService:
     @staticmethod
     def _builtin_skills() -> dict[str, dict[str, Any]]:
         return {
-            "state-workflow": {"id": "state-workflow", "name": "State workflow", "trigger_keywords": ["state", "status", "workflow"], "constraints": ["Persist shared records and status transitions."], "validation_hints": ["Create/update/list workflow exists."]},
-            "role-surfaces": {"id": "role-surfaces", "name": "Role surfaces", "trigger_keywords": ["client", "specialist", "manager"], "constraints": ["Role pages share connected state."], "validation_hints": ["Each role has a distinct action surface."]},
-            "route-manifest": {"id": "route-manifest", "name": "Route manifest", "trigger_keywords": ["route", "manifest", "page"], "constraints": ["Route manifest matches static pages."], "validation_hints": ["Every role page is routeable."]},
-            "mobile-shell": {"id": "mobile-shell", "name": "Mobile shell", "trigger_keywords": ["mobile", "telegram", "mini app"], "constraints": ["Mobile-first role pages."], "validation_hints": ["No horizontal overflow on mobile."]},
-            "preview-profile": {"id": "preview-profile", "name": "Preview profile", "trigger_keywords": ["preview", "max", "telegram"], "constraints": ["Preview profile selects the right host shell."], "validation_hints": ["Preview profile supports configured mock surface."]},
+            "state-workflow": {"id": "state-workflow", "name": "State workflow", "activation": "llm_planning_only", "constraints": ["Persist shared records and status transitions."], "validation_hints": ["Create/update/list workflow exists."]},
+            "role-surfaces": {"id": "role-surfaces", "name": "Role surfaces", "activation": "llm_planning_only", "constraints": ["Role pages share connected state."], "validation_hints": ["Each role has a distinct action surface."]},
+            "route-manifest": {"id": "route-manifest", "name": "Route manifest", "activation": "llm_planning_only", "constraints": ["Route manifest matches static pages."], "validation_hints": ["Every role page is routeable."]},
+            "mobile-shell": {"id": "mobile-shell", "name": "Mobile shell", "activation": "llm_planning_only", "constraints": ["Mobile-first role pages."], "validation_hints": ["No horizontal overflow on mobile."]},
+            "preview-profile": {"id": "preview-profile", "name": "Preview profile", "activation": "llm_planning_only", "constraints": ["Preview profile selects the right host shell."], "validation_hints": ["Preview profile supports configured mock surface."]},
         }

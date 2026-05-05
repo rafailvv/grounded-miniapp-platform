@@ -930,46 +930,6 @@ class CheckRunner:
             if manager_visibility_issue is not None:
                 issues.append(manager_visibility_issue)
 
-        for role in ROLE_ORDER:
-            prompts = role_prompts.get(role) if isinstance(role_prompts, dict) else []
-            if not isinstance(prompts, list) or not prompts:
-                continue
-            expected_keys = cls._semantic_keys_from_text(" ".join(str(item) for item in prompts), exclude_stopwords=True)
-            if len(expected_keys) < 4:
-                continue
-            surface_keys = cls._semantic_keys_from_text(role_text.get(role, ""), exclude_stopwords=False)
-            matched_count = len(expected_keys & surface_keys)
-            threshold = 2 if role in {"specialist", "manager"} else 3
-            if matched_count >= threshold:
-                continue
-            issues.append(
-                ValidationIssue(
-                    code="platform.prompt_specificity_missing_role_surface",
-                    message=(
-                        f"{role} role surface does not reflect its prompt-specific responsibility. "
-                        "Add visible labels, controls, persisted fields, and JS handlers for the role action instead of a generic shared-record page."
-                    ),
-                    severity="high",
-                    location=f"miniapp/app/static/{role}",
-                    blocking=True,
-                    repair_recipe=cls._prompt_specificity_repair_recipe(
-                        signature=f"workflow.prompt_specificity_missing_role_surface.{role}",
-                        target_files=[
-                            f"miniapp/app/static/{role}/index.html",
-                            f"miniapp/app/static/{role}/app.js",
-                            f"miniapp/app/static/{role}/styles.css",
-                            "miniapp/app/routes/generated_contract.py",
-                            "miniapp/tests/test_generated_app.py",
-                            "miniapp/tests/generated_app.test.mjs",
-                        ],
-                        evidence={
-                            "role": role,
-                            "role_prompt": prompts[:4],
-                            "matched_semantic_terms": matched_count,
-                        },
-                    ),
-                )
-            )
         return issues
 
     @classmethod
@@ -3091,6 +3051,7 @@ API_PATHS = []
 BASE_API_PATH = ""
 CREATED_MARKER = "browser-ui-proof"
 UPDATED_MARKER = "browser-ui-updated"
+MANAGER_MARKER = "browser-manager-updated"
 API_BEFORE = None
 API_AFTER = None
 
@@ -3118,6 +3079,7 @@ def fail(step, message, page=None, **extra):
         "ui_steps": STEPS,
         "created_marker": CREATED_MARKER,
         "updated_marker": UPDATED_MARKER,
+        "manager_marker": MANAGER_MARKER,
         "console_errors": CONSOLE_ERRORS[-20:],
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
@@ -3454,6 +3416,25 @@ def submit_specialist_update(page, created_id, before_item):
     fail("specialist_update_discovery", "No specialist update form/control was found for the created state.", page, failed_role="specialist", failed_selector="form/button", api_after=before_item)
 
 
+def submit_manager_update(page, created_id, before_item):
+    for route in normalize_routes("manager"):
+        goto(page, route)
+        forms = page.locator("form")
+        for index in range(forms.count()):
+            form = forms.nth(index)
+            controls = form.locator("input, textarea, select")
+            if controls.count() == 0:
+                continue
+            submit_form(page, form, "manager", route, MANAGER_MARKER, "update", created_id)
+            check_runtime_errors(page, "manager_update_ui", route)
+            return route
+        fill_page_update_controls(page, MANAGER_MARKER, created_id)
+        if click_update_button(page, "manager", route):
+            check_runtime_errors(page, "manager_update_ui", route)
+            return route
+    fail("manager_update_discovery", "No manager update form/control was found for the created state.", page, failed_role="manager", failed_selector="form/button", api_after=before_item)
+
+
 def click_refresh_controls(page):
     buttons = page.locator("button, [role=button], a")
     for index in range(min(buttons.count(), 12)):
@@ -3576,11 +3557,23 @@ def run_flow(page):
     manager_updated = UPDATED_MARKER in manager_text
     if not (manager_created or manager_updated):
         fail("manager_visibility_ui", "Manager UI did not show the created/updated shared state after reload.", page, failed_role="manager", failed_route=manager_route, api_after=API_AFTER)
+    submit_manager_update(page, created_id, updated_item)
+    try:
+        API_AFTER = request_json("GET", BASE_API_PATH)
+    except Exception as exc:
+        fail("manager_update_api_after", f"GET {BASE_API_PATH} failed after manager UI update: {exc}", page, failed_role="manager")
+    manager_item = find_created(API_AFTER, CREATED_MARKER, created_id)
+    if manager_item is None:
+        fail("manager_update_lost_state", "Manager UI update lost the created shared state.", page, failed_role="manager", api_after=API_AFTER)
+    if not contains_marker(manager_item, MANAGER_MARKER) and not item_changed(updated_item, manager_item):
+        fail("manager_update_state_change", "Manager UI action did not persist a changed shared state.", page, failed_role="manager", api_before=updated_item, api_after=API_AFTER)
     client_created, client_route, client_text = role_has_marker(page, "client", CREATED_MARKER)
     if not client_created:
         fail("client_final_refresh_visibility_ui", "Client UI lost the created state after specialist update and reload.", page, failed_role="client", failed_route=client_route, api_after=API_AFTER)
     if contains_marker(updated_item, UPDATED_MARKER) and UPDATED_MARKER not in client_text:
         fail("client_updated_status_visibility_ui", "Client UI did not show updated shared state after specialist update and reload.", page, failed_role="client", failed_route=client_route, api_after=API_AFTER)
+    if contains_marker(manager_item, MANAGER_MARKER) and MANAGER_MARKER not in client_text:
+        fail("client_manager_update_visibility_ui", "Client UI did not show manager-updated shared state after reload.", page, failed_role="client", failed_route=client_route, api_after=API_AFTER)
     for role in ("client", "specialist", "manager"):
         for route in normalize_routes(role)[:4]:
             route_text_after_reload(page, route)
@@ -3592,6 +3585,7 @@ def run_flow(page):
         "ui_steps": STEPS,
         "created_marker": CREATED_MARKER,
         "updated_marker": UPDATED_MARKER,
+        "manager_marker": MANAGER_MARKER,
         "console_errors": CONSOLE_ERRORS[-20:],
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
@@ -3628,6 +3622,7 @@ except Exception as exc:
         "ui_steps": STEPS,
         "created_marker": CREATED_MARKER,
         "updated_marker": UPDATED_MARKER,
+        "manager_marker": MANAGER_MARKER,
         "console_errors": CONSOLE_ERRORS[-20:],
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
@@ -5058,14 +5053,14 @@ except Exception as exc:
             (r"\$\{\s*escape(?:Html|Text)?\s*\(\s*item\.status\b", "template escape(item.status)"),
             (r"\$\{\s*item\.status\b", "template item.status"),
             (r"\bbuildLine\s*\(\s*['\"][^'\"]*статус[^'\"]*['\"]\s*,\s*item\.status\s*\)", "buildLine status=item.status"),
-            (r"\bitem\.status\s*\|\|\s*['\"](?:new|pending|processed|approved|reviewed|done|completed)['\"]", "item.status fallback enum"),
+            (r"\bitem\.status\s*\|\|\s*['\"](?:new|pending|processed|approved|reviewed|done|completed)['\"]", "item.status raw enum passthrough"),
             (r"(?:Приоритет|priority)[^`]*\$\{[^}]*item\.priority", "template item.priority raw enum"),
             (r"\bstatus-pill[^`'\"]*`[^`]*item\.status", "status pill item.status"),
-            (r"\bSTATUS_LABELS\s*\[\s*(?:value|key|item\.status)\s*\]\s*\|\|\s*(?:value|key|item\.status)\b", "status label raw fallback"),
-            (r"\bSTATUS_LABELS\s*\[[^\]]+\]\s*\|\|\s*(?:[A-Za-z_$][\w$]*|item\.status)\b", "status label raw fallback"),
-            (r"\bSTATUS_LABELS\s*\[[^\]]+\]\s*\|\|\s*normalize\s*\(\s*value\b", "status label normalize(value) fallback"),
-            (r"\bfunction\s+statusLabel\b[\s\S]{0,500}\breturn\s+[^;{}]*\[[^\]]+\]\s*\|\|\s*(?:status|value|key)\b", "status label raw fallback"),
-            (r"\bfunction\s+(?:humanStatus|formatStatus)\b[\s\S]{0,500}\breturn\s+[^;{}]*\[[^\]]+\]\s*\|\|\s*(?:status|value|key)\b", "status label raw fallback"),
+            (r"\bSTATUS_LABELS\s*\[\s*(?:value|key|item\.status)\s*\]\s*\|\|\s*(?:value|key|item\.status)\b", "status label raw passthrough"),
+            (r"\bSTATUS_LABELS\s*\[[^\]]+\]\s*\|\|\s*(?:[A-Za-z_$][\w$]*|item\.status)\b", "status label raw passthrough"),
+            (r"\bSTATUS_LABELS\s*\[[^\]]+\]\s*\|\|\s*normalize\s*\(\s*value\b", "status label normalize(value) passthrough"),
+            (r"\bfunction\s+statusLabel\b[\s\S]{0,500}\breturn\s+[^;{}]*\[[^\]]+\]\s*\|\|\s*(?:status|value|key)\b", "status label raw passthrough"),
+            (r"\bfunction\s+(?:humanStatus|formatStatus)\b[\s\S]{0,500}\breturn\s+[^;{}]*\[[^\]]+\]\s*\|\|\s*(?:status|value|key)\b", "status label raw passthrough"),
         )
         markers: list[str] = []
         for pattern, label in patterns:

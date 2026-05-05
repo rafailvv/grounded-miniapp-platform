@@ -66,7 +66,6 @@ class OpenAIClient:
             "routing": {
                 "provider": "openai" if self.enabled else None,
                 "providers": ["openai"] if self.enabled else [],
-                "fallback_enabled": True,
             },
             "provider_routing": provider_routing_table(),
             "supports_prompt_cache_key": True,
@@ -152,6 +151,106 @@ class OpenAIClient:
             "cache_stats": payload["cache_stats"],
         }
 
+    def analyze_miniapp_prompt(
+        self,
+        *,
+        prompt: str,
+        generation_mode: GenerationMode | str | None,
+        model_profile: str | None = None,
+    ) -> dict[str, Any]:
+        """Ask the model for product contract hints instead of local parsing."""
+        if not self.enabled:
+            raise RuntimeError("OpenAI API key is not configured.")
+        mode_value = str(getattr(generation_mode, "value", generation_mode) or "").strip()
+        model = models_for_role("cheap_task", model_profile=model_profile, generation_mode=generation_mode)
+        system_prompt = (
+            "You extract a domain-neutral mini-app contract from a user prompt. "
+            "Do not use templates or infer from local lexical lists. Return only valid JSON. "
+            "Use the user's wording for labels. If a detail is not explicit, leave the list empty."
+        )
+        user_prompt = json.dumps(
+            {
+                "schema": "grounded.prompt_contract_analysis.v1",
+                "generation_mode": mode_value,
+                "prompt": str(prompt or ""),
+                "required_json_shape": {
+                    "prompt_summary": "short summary in the prompt language",
+                    "resource_hint": "single shared business object name or null",
+                    "field_hints": ["all explicit create/update field labels from the prompt"],
+                    "role_field_hints": {
+                        "client": ["fields owned by client role"],
+                        "specialist": ["fields owned by specialist role"],
+                        "manager": ["fields owned by manager role"],
+                    },
+                    "role_action_prompts": {
+                        "client": ["client role actions from the prompt"],
+                        "specialist": ["specialist role actions from the prompt"],
+                        "manager": ["manager role actions from the prompt"],
+                    },
+                    "routeable_screen_plan": {
+                        "multi_page_recommended": True,
+                        "roles": {
+                            "client": [{"intent": "overview|create_or_configure|list_or_queue|detail_or_update|summary_or_insight", "purpose": "why this screen exists", "source": ["prompt phrase"]}],
+                            "specialist": [],
+                            "manager": [],
+                        },
+                    },
+                },
+            },
+            ensure_ascii=False,
+        )
+        if model.startswith("gpt-5"):
+            payload = {
+                "model": model,
+                "input": self._responses_input(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    prompt_cache_key=None,
+                    stable_prefix=None,
+                ),
+                "reasoning": {"effort": "low"},
+            }
+            endpoint = "responses"
+            schema_name = "prompt_contract_analysis"
+            self._log_prompt_bundle(
+                role="summarize",
+                schema_name=schema_name,
+                endpoint=endpoint,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+            self._log_request(endpoint=endpoint, model=model, payload=payload)
+            data = self._post_json_with_retries(endpoint=endpoint, model=model, payload=payload)
+            self._raise_for_incomplete_response(data, endpoint=endpoint)
+            text = self._extract_response_text(data)
+        else:
+            payload = {
+                "model": model,
+                "messages": self._chat_messages(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    prompt_cache_key=None,
+                    stable_prefix=None,
+                ),
+                "response_format": {"type": "json_object"},
+            }
+            endpoint = "chat/completions"
+            self._log_prompt_bundle(
+                role="summarize",
+                schema_name="prompt_contract_analysis",
+                endpoint=endpoint,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+            self._log_request(endpoint=endpoint, model=model, payload=payload)
+            data = self._post_json_with_retries(endpoint=endpoint, model=model, payload=payload)
+            text = self._extract_chat_text(data)
+        parsed = self._parse_json_object_from_text(text)
+        self._log_parsed_text(endpoint=endpoint, model=model, text=json.dumps(parsed, ensure_ascii=False)[:4000])
+        return parsed
+
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.openai_api_key}",
@@ -164,6 +263,23 @@ class OpenAIClient:
             return json.dumps(payload, ensure_ascii=False, default=str)
         except Exception:
             return str(payload)
+
+    @staticmethod
+    def _parse_json_object_from_text(text: str) -> dict[str, Any]:
+        raw = str(text or "").strip()
+        if not raw:
+            raise RuntimeError("Model returned empty prompt analysis.")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start < 0 or end <= start:
+                raise
+            parsed = json.loads(raw[start : end + 1])
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Model prompt analysis must be a JSON object.")
+        return parsed
 
     @classmethod
     def _truncate_log_text(cls, text: str, *, limit: int | None = None) -> str:

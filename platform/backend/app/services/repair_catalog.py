@@ -192,6 +192,28 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         patterns=(_rx(r"missing_role_workflow_actions"), _rx(r"lacks its own workflow actions"), _rx(r"missing_role_actions")),
     ),
     RepairCatalogEntry(
+        signature="workflow.raw_status_rendered_to_user",
+        issue_code="raw_status_rendered_to_user",
+        severity="high",
+        likely_root_cause="A role UI maps known status values but still renders the raw persisted status for unknown or default cases.",
+        target_files=("miniapp/app/static/**/app.js", "miniapp/app/static/**/index.html"),
+        verification_check="platform_invariants",
+        instruction=(
+            "Read the implicated role app.js. Replace every direct status passthrough with a fixed human label: "
+            "do not use `item.status`, `status`, `value`, or `key` after `||`; use a constant like `На обработке` "
+            "or `Без статуса` for unknown values, and render only statusLabel(...) in HTML."
+        ),
+        required_next_tool="read_files",
+        suggested_tool_after_read="write_file",
+        verification_command="run_checks platform_invariants",
+        patterns=(
+            _rx(r"raw_status_rendered_to_user"),
+            _rx(r"raw_status_copy"),
+            _rx(r"status label raw passthrough"),
+            _rx(r"renders persisted status codes directly"),
+        ),
+    ),
+    RepairCatalogEntry(
         signature="workflow.manager_missing_specialist_result_visibility",
         issue_code="manager_missing_specialist_result_visibility",
         severity="high",
