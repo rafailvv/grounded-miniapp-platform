@@ -17,6 +17,7 @@ class AgentFileStateEntry:
     size: int | None = None
     read_count: int = 1
     cache_hits: int = 0
+    content_available: bool = True
     last_read_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def summary(self) -> dict[str, object]:
@@ -27,6 +28,7 @@ class AgentFileStateEntry:
             "size": self.size,
             "read_count": self.read_count,
             "cache_hits": self.cache_hits,
+            "content_available": self.content_available,
             "last_read_at": self.last_read_at,
         }
 
@@ -34,9 +36,9 @@ class AgentFileStateEntry:
 class AgentFileStateCache:
     """Run-scoped read-file cache with mutation invalidation.
 
-    The cache is intentionally process-local. Runtime persists only summaries so
-    replays can see whether repeated reads were avoided without storing source
-    contents in the main state document.
+    Runtime persists only summaries. On resume the cache is rehydrated with file
+    hashes/mtime/size so stale-read validation keeps working without storing
+    source contents in the main state document.
     """
 
     def __init__(self) -> None:
@@ -75,7 +77,7 @@ class AgentFileStateCache:
         key = (run_id, normalized)
         mtime_ns, size = self._stat(root, normalized)
         cached = self._entries.get(key)
-        if cached is not None and cached.mtime_ns == mtime_ns and cached.size == size:
+        if cached is not None and cached.content_available and cached.mtime_ns == mtime_ns and cached.size == size:
             cached.cache_hits += 1
             cached.last_read_at = datetime.now(timezone.utc).isoformat()
             return cached.content
@@ -93,6 +95,7 @@ class AgentFileStateCache:
             size=size,
             read_count=(cached.read_count + 1) if cached is not None else 1,
             cache_hits=cached.cache_hits if cached is not None else 0,
+            content_available=True,
         )
         return content
 
@@ -148,3 +151,41 @@ class AgentFileStateCache:
             "entries": entries,
             "freshness_available": root is not None,
         }
+
+    def restore_snapshot(self, *, run_id: str, snapshot: dict[str, object]) -> dict[str, object]:
+        restored = 0
+        skipped = 0
+        raw_entries = snapshot.get("entries") if isinstance(snapshot, dict) else None
+        if not isinstance(raw_entries, list):
+            return {"run_id": run_id, "restored": 0, "skipped": 0, "status": "empty"}
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                skipped += 1
+                continue
+            path = self._normalize_path(item.get("path"))
+            sha256 = str(item.get("sha256") or "").strip()
+            if not path or not sha256:
+                skipped += 1
+                continue
+            try:
+                mtime_ns = int(item["mtime_ns"]) if item.get("mtime_ns") is not None else None
+                size = int(item["size"]) if item.get("size") is not None else None
+                read_count = max(1, int(item.get("read_count") or 1))
+                cache_hits = max(0, int(item.get("cache_hits") or 0))
+            except (TypeError, ValueError):
+                skipped += 1
+                continue
+            self._entries[(run_id, path)] = AgentFileStateEntry(
+                run_id=run_id,
+                path=path,
+                content="",
+                sha256=sha256,
+                mtime_ns=mtime_ns,
+                size=size,
+                read_count=read_count,
+                cache_hits=cache_hits,
+                content_available=False,
+                last_read_at=str(item.get("last_read_at") or datetime.now(timezone.utc).isoformat()),
+            )
+            restored += 1
+        return {"run_id": run_id, "restored": restored, "skipped": skipped, "status": "restored" if restored else "empty"}

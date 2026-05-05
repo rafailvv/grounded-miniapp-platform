@@ -20,6 +20,29 @@ ROLE_LABELS_RU = {
     "specialist": "Специалист",
     "manager": "Менеджер",
 }
+STANDARD_ROLE_FIELD_LABELS = {
+    "client": {
+        "recordName": "Название записи",
+        "clientComment": "Комментарий клиента",
+    },
+    "specialist": {
+        "specialistDecision": "Решение специалиста",
+        "specialistComment": "Комментарий специалиста",
+    },
+    "manager": {
+        "managerDecision": "Решение менеджера",
+        "managerComment": "Комментарий менеджера",
+    },
+}
+RESERVED_WORKFLOW_FIELD_KEYS = {
+    "id",
+    "item_id",
+    "title",
+    "note",
+    "status",
+    "created_by",
+    "updated_by",
+}
 
 
 class MiniAppEndpoint(StrictModel):
@@ -296,10 +319,12 @@ class MiniAppContractCompiler:
             if len(label) < 2:
                 return
             normalized = cls._semantic_label_key(label)
+            base_name = cls._field_name(label) or f"field_{index}"
+            if base_name in RESERVED_WORKFLOW_FIELD_KEYS:
+                return
             if normalized in normalized_to_name:
                 name = normalized_to_name[normalized]
             else:
-                base_name = cls._field_name(label) or f"field_{index}"
                 name = base_name
                 suffix = 2
                 while name in combined:
@@ -797,25 +822,32 @@ test("generated contract files expose route manifest and API client", () => {{
         return files
 
     @staticmethod
-    def _prompt_form_controls(resource: MiniAppResource, *, role: str = "client") -> str:
+    def _standard_role_field_labels(role: str) -> dict[str, str]:
+        labels = STANDARD_ROLE_FIELD_LABELS.get(role)
+        if labels is not None:
+            return dict(labels)
+        return {"workComment": "Комментарий"}
+
+    @classmethod
+    def _role_field_labels_for_ui(cls, resource: MiniAppResource, role: str) -> dict[str, str]:
         labels = dict((resource.role_field_labels or {}).get(role) or {})
         if role == "client" and not labels:
             labels = dict(resource.field_labels or {})
         if not labels:
-            labels = {
-                "client": {
-                    "recordName": "Название записи",
-                    "clientComment": "Комментарий клиента",
-                },
-                "specialist": {
-                    "specialistDecision": "Решение специалиста",
-                    "specialistComment": "Комментарий специалиста",
-                },
-                "manager": {
-                    "managerDecision": "Решение менеджера",
-                    "managerComment": "Комментарий менеджера",
-                },
-            }.get(role, {"workComment": "Комментарий"})
+            labels = cls._standard_role_field_labels(role)
+        return labels
+
+    @classmethod
+    def _detail_field_labels_for_ui(cls, resource: MiniAppResource) -> dict[str, str]:
+        labels: dict[str, str] = {}
+        labels.update(dict(resource.field_labels or {}))
+        for role in ROLE_ORDER:
+            labels.update(cls._role_field_labels_for_ui(resource, role))
+        return labels
+
+    @classmethod
+    def _prompt_form_controls(cls, resource: MiniAppResource, *, role: str = "client") -> str:
+        labels = cls._role_field_labels_for_ui(resource, role)
         controls: list[str] = []
         for index, (name, label) in enumerate(labels.items()):
             safe_name = escape(name, quote=True)
@@ -967,15 +999,15 @@ test("generated contract files expose route manifest and API client", () => {{
 </html>
 '''
 
-    @staticmethod
-    def _role_js(*, role: str, resource: MiniAppResource) -> str:
+    @classmethod
+    def _role_js(cls, *, role: str, resource: MiniAppResource) -> str:
         slug = resource.slug
         update_status = "processed" if role == "specialist" else "reviewed"
         quick_action_label = "Отметить обработку" if role == "specialist" else "Сохранить решение"
-        field_labels = dict(resource.field_labels or {})
-        role_field_labels = dict((resource.role_field_labels or {}).get(role) or {})
-        client_field_labels = dict((resource.role_field_labels or {}).get("client") or field_labels)
-        primary_field = next(iter(field_labels.keys()), "")
+        client_field_labels = cls._role_field_labels_for_ui(resource, "client")
+        role_field_labels = cls._role_field_labels_for_ui(resource, role)
+        detail_field_labels = cls._detail_field_labels_for_ui(resource)
+        primary_field = next(iter(client_field_labels.keys()), "")
         create_handler = ""
         if role == "client":
             create_handler = f'''
@@ -1046,10 +1078,10 @@ document.getElementById("contract-refresh")?.addEventListener("click", loadItems
 '''
         return f'''const ROLE = {json.dumps(role)};
 const API_BASE = {json.dumps(f"/api/{slug}")};
-const FIELD_LABELS = {json.dumps(field_labels, ensure_ascii=False)};
+const FIELD_LABELS = {json.dumps(client_field_labels, ensure_ascii=False)};
 const ROLE_FIELD_LABELS = {json.dumps(role_field_labels, ensure_ascii=False)};
 const CLIENT_FIELD_LABELS = {json.dumps(client_field_labels, ensure_ascii=False)};
-const DETAIL_FIELD_LABELS = ROLE === "manager" ? FIELD_LABELS : (ROLE === "client" ? FIELD_LABELS : {{...CLIENT_FIELD_LABELS, ...ROLE_FIELD_LABELS}});
+const DETAIL_FIELD_LABELS = {json.dumps(detail_field_labels, ensure_ascii=False)};
 const PRIMARY_FIELD = {json.dumps(primary_field)};
 const STATUS_LABELS = {{
   new: "Новая",

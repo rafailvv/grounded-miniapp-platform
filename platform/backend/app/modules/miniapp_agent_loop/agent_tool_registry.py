@@ -163,6 +163,13 @@ class AgentToolRegistry:
             activity="editing",
             progress_label="Writing one draft file",
         ),
+        "edit_file_exact": AgentToolSpec(
+            name="edit_file_exact",
+            kind="mutating",
+            concurrency_safe=False,
+            activity="editing",
+            progress_label="Applying an exact old/new string edit to one draft file",
+        ),
         "file.read": AgentToolSpec(
             name="file.read",
             kind="read_only",
@@ -349,6 +356,20 @@ class AgentToolRegistry:
                     "reason": {"type": "string"},
                 }
                 required = ["file_path", "content", "reason"]
+            elif name == "edit_file_exact":
+                properties = {
+                    "file_path": {"type": "string"},
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text currently present in the file. It must match exactly and uniquely unless replace_all is true.",
+                    },
+                    "new_string": {"type": "string", "description": "Replacement text."},
+                    "replace_all": {"type": "boolean"},
+                    "worker_id": {"type": "string"},
+                    "owner_scope": {"type": "string"},
+                    "reason": {"type": "string"},
+                }
+                required = ["file_path", "old_string", "new_string", "reason"]
             else:
                 properties = {
                     "mode": {"type": "string", "enum": ["exact", "final"]},

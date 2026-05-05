@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import http.client
 import json
 import os
@@ -412,18 +413,7 @@ class WorkbenchService:
     def browser_proof(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
         artifacts = self._run_artifacts_or_empty(run_id)
-        payload = {
-            "run_id": run_id,
-            "status": "available" if (run.browser_flow_proof or artifacts.get("browser_proof_steps")) else "not_recorded",
-            "screenshots": self._collect_values(artifacts, keys=("screenshot", "screenshot_path", "image_path")),
-            "console_errors": self._collect_values(artifacts, keys=("console_error", "console_errors")),
-            "network_errors": self._collect_values(artifacts, keys=("network_error", "network_errors")),
-            "route_coverage": (run.flow_coverage or {}).get("routes", []),
-            "mobile_layout": run.mobile_layout_report,
-            "role_workflows": run.browser_flow_proof,
-            "steps": artifacts.get("browser_proof_steps") or [],
-            "verification_report": self.store.get("reports", run.verification_report_ref) if run.verification_report_ref else None,
-        }
+        payload = self._normalize_browser_proof_payload(run, artifacts)
         self.store.upsert("reports", f"browser_proof:{run_id}", payload)
         return payload
 
@@ -471,6 +461,7 @@ class WorkbenchService:
         next_forced_action = dict((checkpoint or {}).get("next_forced_action") or {}) if isinstance(checkpoint, dict) else {}
         blocking = any(item.get("blocking", True) for item in issues)
         repair_packets = RepairCatalog.classify_many(issues)
+        repair_packets = self._llm_refine_unknown_repair_packets(run, artifacts, issues, repair_packets)
         include_checkpoint_packets = bool(blocking or run.status not in {"completed", "awaiting_approval"})
         if checkpoint_packets and include_checkpoint_packets:
             repair_packets = [*checkpoint_packets, *repair_packets]
@@ -515,6 +506,7 @@ class WorkbenchService:
         gate = self.gate(run_id)
         explicit = [item for item in run.repair_issue_signatures if isinstance(item, dict)]
         packets = RepairCatalog.classify_many([*explicit, *gate.get("issues", [])])
+        packets = self._llm_refine_unknown_repair_packets(run, self._run_artifacts_or_empty(run_id), [*explicit, *gate.get("issues", [])], packets)
         checkpoint = self.store.get("reports", run.resume_checkpoint_ref) if run.resume_checkpoint_ref else None
         checkpoint_packets = list((checkpoint or {}).get("repair_packets") or []) if isinstance(checkpoint, dict) else []
         include_checkpoint_packets = bool(gate.get("blocking") or run.status not in {"completed", "awaiting_approval"})
@@ -535,6 +527,147 @@ class WorkbenchService:
         }
         self.store.upsert("reports", f"repair_signatures:{run_id}", payload)
         return payload
+
+    def _llm_refine_unknown_repair_packets(
+        self,
+        run: RunRecord,
+        artifacts: dict[str, Any],
+        issues: list[dict[str, Any]],
+        packets: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        refined: list[dict[str, Any]] = []
+        unknown_issue_iter = iter([issue for issue in issues if isinstance(issue, dict)])
+        for packet in packets:
+            if not self._is_unknown_repair_packet(packet):
+                refined.append(packet)
+                continue
+            issue = next(unknown_issue_iter, packet)
+            cache_key = self._repair_classifier_cache_key(run.run_id, issue)
+            cached = self.store.get("reports", cache_key)
+            if isinstance(cached, dict) and isinstance(cached.get("packet"), dict):
+                refined.append(dict(cached["packet"]))
+                continue
+            if not self.openai_client.enabled:
+                classified = self._llm_classifier_unavailable_packet(issue)
+                self.store.upsert("reports", cache_key, {"run_id": run.run_id, "packet": classified, "status": "blocked", "created_at": datetime.now(timezone.utc).isoformat()})
+                refined.append(classified)
+                continue
+            try:
+                classified_raw = self.openai_client.classify_repair_issue(
+                    issue=issue,
+                    run_context={
+                        "run_id": run.run_id,
+                        "prompt": run.prompt,
+                        "acceptance_contract": run.acceptance_contract,
+                        "diff_summary": {
+                            "changed_files": run.touched_files or self._paths_from_diff(str(artifacts.get("diff") or "")),
+                            "diff_available": bool(str(artifacts.get("diff") or "").strip()),
+                        },
+                        "browser_proof": run.browser_flow_proof or artifacts.get("browser_flow_proof") or {},
+                        "checks": artifacts.get("check_results") or [],
+                    },
+                    model_profile=run.model_profile,
+                    generation_mode=run.generation_mode,
+                )
+                classified = self._normalize_llm_repair_packet(classified_raw, issue)
+            except Exception as exc:
+                classified = self._llm_classifier_failed_packet(issue, exc)
+            self.store.upsert("reports", cache_key, {"run_id": run.run_id, "packet": classified, "status": classified.get("status") or "available", "created_at": datetime.now(timezone.utc).isoformat()})
+            refined.append(classified)
+        return refined
+
+    @staticmethod
+    def _is_unknown_repair_packet(packet: dict[str, Any]) -> bool:
+        return str(packet.get("signature") or "") == "generation.unknown_failure" or str(packet.get("issue_code") or packet.get("code") or "") == "unknown_failure"
+
+    @staticmethod
+    def _repair_classifier_cache_key(run_id: str, issue: dict[str, Any]) -> str:
+        digest = hashlib.sha256(json.dumps(issue, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+        return f"repair_llm_classifier:{run_id}:{digest}"
+
+    @staticmethod
+    def _normalize_llm_repair_packet(raw: dict[str, Any], issue: dict[str, Any]) -> dict[str, Any]:
+        signature = str(raw.get("signature") or raw.get("failure_signature") or "llm_repair.classified").strip()
+        issue_code = str(raw.get("issue_code") or raw.get("code") or "llm_classified_repair").strip()
+        target_files = [
+            str(item).strip().replace("\\", "/")
+            for item in raw.get("target_files") or issue.get("paths") or []
+            if str(item).strip().replace("\\", "/").startswith("miniapp/")
+        ][:8]
+        required_next_tool = str(raw.get("required_next_tool") or "read_files").strip() or "read_files"
+        suggested = str(raw.get("suggested_tool_after_read") or "write_file").strip() or "write_file"
+        return {
+            "signature": signature,
+            "issue_code": issue_code,
+            "code": issue_code,
+            "severity": str(raw.get("severity") or issue.get("severity") or "high"),
+            "likely_root_cause": str(raw.get("likely_root_cause") or issue.get("details") or "LLM repair classifier identified a concrete repair path."),
+            "target_files": target_files,
+            "verification_check": str(raw.get("verification_check") or issue.get("check") or "checks.run"),
+            "verification_command": str(raw.get("verification_command") or "run_checks"),
+            "instruction": str(raw.get("instruction") or "Read the target files, apply the classified repair, and rerun the failing check."),
+            "auto_fixable": bool(raw.get("retryable", True)),
+            "required_next_tool": required_next_tool,
+            "suggested_tool_after_read": suggested,
+            "retry_policy": "llm_classified_repair",
+            "retryable": bool(raw.get("retryable", True)),
+            "deterministic": False,
+            "failure_class": str(issue.get("failure_class") or issue.get("check") or "llm_repair_classifier"),
+            "failure_signature": signature,
+            "repair_recipe_id": f"llm.{issue_code}",
+            "forbidden_tools_once": [],
+            "next_forced_action": {
+                "required_next_tool": required_next_tool,
+                "target_files": target_files,
+                "verification_check": str(raw.get("verification_check") or issue.get("check") or "checks.run"),
+            },
+            "llm_usage": raw.get("_llm_usage") or {},
+            "llm_model": raw.get("_llm_model"),
+            "evidence": {"source_issue": issue, "classifier": "llm_json"},
+        }
+
+    @staticmethod
+    def _llm_classifier_unavailable_packet(issue: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "signature": "repair.llm_classifier_unavailable",
+            "issue_code": "llm_repair_classifier_unavailable",
+            "code": "llm_repair_classifier_unavailable",
+            "severity": "high",
+            "likely_root_cause": "Unknown repair issue requires LLM JSON classification, but OpenAI is not configured.",
+            "target_files": list(issue.get("paths") or []),
+            "verification_check": str(issue.get("check") or "checks.run"),
+            "verification_command": "run_checks",
+            "instruction": "Configure the LLM classifier, then classify the issue before another repair attempt.",
+            "auto_fixable": False,
+            "required_next_tool": "read_files",
+            "suggested_tool_after_read": "write_file",
+            "retry_policy": "requires_llm_classifier",
+            "retryable": False,
+            "deterministic": False,
+            "failure_class": "repair.llm_classifier_unavailable",
+            "failure_signature": "repair.llm_classifier_unavailable",
+            "repair_recipe_id": "llm.classifier_unavailable",
+            "forbidden_tools_once": [],
+            "next_forced_action": {"required_next_tool": "read_files", "target_files": list(issue.get("paths") or []), "verification_check": str(issue.get("check") or "checks.run")},
+            "evidence": {"source_issue": issue},
+        }
+
+    @staticmethod
+    def _llm_classifier_failed_packet(issue: dict[str, Any], exc: Exception) -> dict[str, Any]:
+        packet = WorkbenchService._llm_classifier_unavailable_packet(issue)
+        packet.update(
+            {
+                "signature": "repair.llm_classifier_failed",
+                "issue_code": "llm_repair_classifier_failed",
+                "code": "llm_repair_classifier_failed",
+                "likely_root_cause": "LLM repair classifier failed before returning a typed packet.",
+                "failure_class": "repair.llm_classifier_failed",
+                "failure_signature": f"repair.llm_classifier_failed:{type(exc).__name__}",
+                "repair_recipe_id": "llm.classifier_failed",
+                "evidence": {"source_issue": issue, "error": str(exc), "error_type": type(exc).__name__},
+            }
+        )
+        return packet
 
     def final_report(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -557,11 +690,13 @@ class WorkbenchService:
                 "diff_available": bool(str(artifacts.get("diff") or "").strip()),
             },
             "checks": artifacts.get("check_results") or [],
-            "browser_proof": run.browser_flow_proof or artifacts.get("browser_flow_proof") or {},
+            "browser_proof": self.browser_proof(run_id),
             "repair_signatures": self.repair_signatures(run_id).get("items", []),
             "repair_packets": gate.get("repair_packets", []),
             "next_forced_action": gate.get("next_forced_action", {}),
             "diagnostics_delta": diagnostics_delta,
+            "token_usage": run.token_usage,
+            "token_usage_status": "recorded" if run.token_usage else "not_recorded",
             "preview": {
                 "url": preview.get("url"),
                 "role_urls": preview.get("role_urls") or {},
@@ -1157,6 +1292,189 @@ class WorkbenchService:
         except KeyError:
             self.run_service.get_run(run_id)
             return {}
+
+    def _normalize_browser_proof_payload(self, run: RunRecord, artifacts: dict[str, Any]) -> dict[str, Any]:
+        stored_ref_payload = self.store.get("reports", run.browser_proof_ref) if run.browser_proof_ref else None
+        verification_report = self.store.get("reports", run.verification_report_ref) if run.verification_report_ref else None
+        proof = self._first_dict(
+            run.browser_flow_proof,
+            artifacts.get("browser_flow_proof"),
+            (stored_ref_payload or {}).get("proof") if isinstance(stored_ref_payload, dict) else None,
+            stored_ref_payload,
+            verification_report,
+        )
+        browser_check = self._check_result_by_name(artifacts, "browser_flow_smoke")
+        diagnostics = browser_check.get("diagnostics") if isinstance(browser_check.get("diagnostics"), dict) else {}
+        mobile_layout = self._first_dict(
+            run.mobile_layout_report,
+            proof.get("mobile_layout") if isinstance(proof, dict) else None,
+            diagnostics.get("mobile_layout") if isinstance(diagnostics, dict) else None,
+            (stored_ref_payload or {}).get("mobile_layout_report") if isinstance(stored_ref_payload, dict) else None,
+        )
+        steps = self._first_list(
+            artifacts.get("browser_proof_steps"),
+            proof.get("steps") if isinstance(proof, dict) else None,
+            diagnostics.get("steps") if isinstance(diagnostics, dict) else None,
+            (verification_report or {}).get("steps") if isinstance(verification_report, dict) else None,
+        )
+        screenshots = self._dedupe_strings(
+            [
+                *self._collect_values(artifacts, keys=("screenshot", "screenshot_path", "image_path")),
+                *self._collect_values(proof, keys=("screenshot", "screenshot_path", "image_path", "screenshots")),
+                *self._collect_values(verification_report or {}, keys=("screenshot", "screenshot_path", "image_path", "screenshots")),
+            ]
+        )
+        console_errors = self._dedupe_strings(
+            [
+                *self._collect_values(artifacts, keys=("console_error", "console_errors")),
+                *self._collect_values(proof, keys=("console_error", "console_errors")),
+                *self._collect_values(verification_report or {}, keys=("console_error", "console_errors")),
+            ]
+        )
+        network_errors = self._dedupe_strings(
+            [
+                *self._collect_values(artifacts, keys=("network_error", "network_errors")),
+                *self._collect_values(proof, keys=("network_error", "network_errors")),
+                *self._collect_values(verification_report or {}, keys=("network_error", "network_errors")),
+            ]
+        )
+        roles_checked = self._browser_roles_checked(steps, proof)
+        status = self._browser_proof_status(browser_check, proof, steps, console_errors, network_errors, mobile_layout)
+        issues = self._browser_proof_issues(browser_check, steps, console_errors, network_errors, mobile_layout)
+        return {
+            "run_id": run.run_id,
+            "workspace_id": run.workspace_id,
+            "status": status,
+            "blocking": status in {"failed", "blocked", "not_recorded"} or bool(issues),
+            "issues": issues,
+            "roles_checked": roles_checked,
+            "screenshots": screenshots,
+            "video_refs": self._dedupe_strings(self._collect_values(proof, keys=("video", "video_path", "video_ref", "videos"))),
+            "console_errors": console_errors,
+            "network_errors": network_errors,
+            "route_coverage": (run.flow_coverage or {}).get("routes", []),
+            "mobile_layout": mobile_layout,
+            "role_workflows": proof,
+            "steps": steps,
+            "verification_report": verification_report,
+            "artifact_refs": {
+                "browser_proof": run.browser_proof_ref,
+                "verification_report": run.verification_report_ref,
+                "run_artifacts": f"run_artifacts:{run.run_id}",
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @staticmethod
+    def _first_dict(*values: Any) -> dict[str, Any]:
+        for value in values:
+            if isinstance(value, dict) and value:
+                return dict(value)
+        return {}
+
+    @staticmethod
+    def _first_list(*values: Any) -> list[Any]:
+        for value in values:
+            if isinstance(value, list) and value:
+                return list(value)
+        return []
+
+    @staticmethod
+    def _dedupe_strings(values: list[Any]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if isinstance(value, dict):
+                text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            else:
+                text = str(value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    @staticmethod
+    def _check_result_by_name(artifacts: dict[str, Any], name: str) -> dict[str, Any]:
+        for item in artifacts.get("check_results") or []:
+            if isinstance(item, dict) and item.get("name") == name:
+                return item
+        return {}
+
+    @staticmethod
+    def _browser_roles_checked(steps: list[Any], proof: dict[str, Any]) -> list[str]:
+        roles: set[str] = set()
+        for role in ("client", "specialist", "manager"):
+            if role in proof:
+                roles.add(role)
+        for item in steps:
+            if not isinstance(item, dict):
+                continue
+            text = " ".join(str(item.get(key) or "") for key in ("role", "route", "url", "path"))
+            for role in ("client", "specialist", "manager"):
+                if f"/{role}" in text or text.strip() == role:
+                    roles.add(role)
+        return sorted(roles)
+
+    @staticmethod
+    def _browser_proof_status(
+        browser_check: dict[str, Any],
+        proof: dict[str, Any],
+        steps: list[Any],
+        console_errors: list[str],
+        network_errors: list[str],
+        mobile_layout: dict[str, Any],
+    ) -> str:
+        explicit = str(proof.get("status") or browser_check.get("status") or "").strip().lower()
+        if explicit in {"passed", "failed", "blocked"}:
+            return explicit
+        if not proof and not steps:
+            return "not_recorded"
+        if console_errors or network_errors:
+            return "failed"
+        if str(mobile_layout.get("status") or "").lower() == "failed":
+            return "failed"
+        if any(isinstance(item, dict) and str(item.get("status") or "").lower() in {"failed", "blocked"} for item in steps):
+            return "failed"
+        return "passed"
+
+    @staticmethod
+    def _browser_proof_issues(
+        browser_check: dict[str, Any],
+        steps: list[Any],
+        console_errors: list[str],
+        network_errors: list[str],
+        mobile_layout: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        if str(browser_check.get("status") or "").lower() in {"failed", "blocked"}:
+            issues.append(
+                {
+                    "kind": "browser_check_failed",
+                    "check": "browser_flow_smoke",
+                    "details": str(browser_check.get("details") or "Browser proof failed."),
+                    "blocking": True,
+                    "evidence": browser_check,
+                }
+            )
+        for item in steps:
+            if isinstance(item, dict) and str(item.get("status") or "").lower() in {"failed", "blocked"}:
+                issues.append(
+                    {
+                        "kind": "browser_step_failed",
+                        "check": "browser_flow_smoke",
+                        "details": str(item.get("message") or item.get("step") or "Browser step failed."),
+                        "blocking": True,
+                        "evidence": item,
+                    }
+                )
+        if console_errors:
+            issues.append({"kind": "browser_console_error", "check": "browser_console", "details": console_errors[0], "blocking": True, "evidence": {"items": console_errors}})
+        if network_errors:
+            issues.append({"kind": "browser_network_error", "check": "browser_network", "details": network_errors[0], "blocking": True, "evidence": {"items": network_errors}})
+        if str(mobile_layout.get("status") or "").lower() == "failed":
+            issues.append({"kind": "mobile_layout", "check": "browser_flow_smoke", "details": "Mobile layout report failed.", "blocking": True, "evidence": mobile_layout})
+        return issues
 
     def approval_decision(self, run_id: str, approval_id: str, *, approved: bool) -> dict[str, Any]:
         self.run_service.get_run(run_id)

@@ -224,6 +224,7 @@ class OpenAIClient:
             data = self._post_json_with_retries(endpoint=endpoint, model=model, payload=payload)
             self._raise_for_incomplete_response(data, endpoint=endpoint)
             text = self._extract_response_text(data)
+            usage = self._usage_from_response_payload(data)
         else:
             payload = {
                 "model": model,
@@ -247,8 +248,95 @@ class OpenAIClient:
             self._log_request(endpoint=endpoint, model=model, payload=payload)
             data = self._post_json_with_retries(endpoint=endpoint, model=model, payload=payload)
             text = self._extract_chat_text(data)
+            usage = self._usage_from_response_payload(data)
         parsed = self._parse_json_object_from_text(text)
+        if usage:
+            parsed["_llm_usage"] = usage
+            parsed["_llm_model"] = model
         self._log_parsed_text(endpoint=endpoint, model=model, text=json.dumps(parsed, ensure_ascii=False)[:4000])
+        return parsed
+
+    def classify_repair_issue(
+        self,
+        *,
+        issue: dict[str, Any],
+        run_context: dict[str, Any] | None = None,
+        model_profile: str | None = None,
+        generation_mode: GenerationMode | str | None = None,
+    ) -> dict[str, Any]:
+        """Classify non-deterministic repair needs with a structured LLM packet."""
+        if not self.enabled:
+            raise RuntimeError("OpenAI API key is not configured.")
+        model = models_for_role("cheap_task", model_profile=model_profile, generation_mode=generation_mode)
+        system_prompt = (
+            "You classify a failed mini-app generation run into one concrete repair packet. "
+            "Use only the supplied logs, browser proof, diff summary, and check metadata. "
+            "Do not infer from business-domain keywords. Return only valid JSON."
+        )
+        user_prompt = json.dumps(
+            {
+                "schema": "grounded.repair_classifier.v1",
+                "issue": issue,
+                "run_context": run_context or {},
+                "required_json_shape": {
+                    "signature": "stable dotted signature",
+                    "issue_code": "stable_snake_case_code",
+                    "severity": "low|medium|high|critical",
+                    "likely_root_cause": "short concrete cause",
+                    "target_files": ["miniapp/..."],
+                    "verification_check": "check name or browser_verify",
+                    "instruction": "specific repair instruction",
+                    "required_next_tool": "read_files",
+                    "suggested_tool_after_read": "write_file|apply_patch_to_draft|edit_file_exact",
+                    "retryable": True,
+                    "deterministic": False,
+                },
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        if model.startswith("gpt-5"):
+            payload = {
+                "model": model,
+                "input": self._responses_input(system_prompt=system_prompt, user_prompt=user_prompt, prompt_cache_key=None, stable_prefix=None),
+                "reasoning": {"effort": "low"},
+            }
+            endpoint = "responses"
+            self._log_prompt_bundle(
+                role="repair",
+                schema_name="repair_classifier",
+                endpoint=endpoint,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+            self._log_request(endpoint=endpoint, model=model, payload=payload)
+            data = self._post_json_with_retries(endpoint=endpoint, model=model, payload=payload)
+            self._raise_for_incomplete_response(data, endpoint=endpoint)
+            text = self._extract_response_text(data)
+            usage = self._usage_from_response_payload(data)
+        else:
+            payload = {
+                "model": model,
+                "messages": self._chat_messages(system_prompt=system_prompt, user_prompt=user_prompt, prompt_cache_key=None, stable_prefix=None),
+                "response_format": {"type": "json_object"},
+            }
+            endpoint = "chat/completions"
+            self._log_prompt_bundle(
+                role="repair",
+                schema_name="repair_classifier",
+                endpoint=endpoint,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+            self._log_request(endpoint=endpoint, model=model, payload=payload)
+            data = self._post_json_with_retries(endpoint=endpoint, model=model, payload=payload)
+            text = self._extract_chat_text(data)
+            usage = self._usage_from_response_payload(data)
+        parsed = self._parse_json_object_from_text(text)
+        parsed["_llm_usage"] = usage or {}
+        parsed["_llm_model"] = model
         return parsed
 
     def _headers(self) -> dict[str, str]:
@@ -706,6 +794,28 @@ class OpenAIClient:
             "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
             "total_tokens": int(usage.get("total_tokens") or 0),
         }
+
+    @staticmethod
+    def _usage_from_response_payload(payload: dict[str, Any]) -> dict[str, int] | None:
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            return None
+        output_details = usage.get("output_tokens_details")
+        if not isinstance(output_details, dict):
+            output_details = {}
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        input_tokens = usage.get("input_tokens", prompt_tokens)
+        output_tokens = usage.get("output_tokens", completion_tokens)
+        try:
+            return {
+                "input_tokens": int(input_tokens or 0),
+                "output_tokens": int(output_tokens or 0),
+                "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
+                "total_tokens": int(usage.get("total_tokens") or ((input_tokens or 0) + (output_tokens or 0))),
+            }
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _raise_for_incomplete_response(payload: dict[str, Any], *, endpoint: str) -> None:

@@ -23,6 +23,7 @@ CANONICAL_TOOL_ALIASES: dict[str, str] = {
     "browser_verify": "browser.verify",
     "apply_patch_to_draft": "patch.apply",
     "write_file": "file.write",
+    "edit_file_exact": "file.edit",
     "file.edit": "file.edit",
     "file.read": "file.read",
     "file.write": "file.write",
@@ -175,6 +176,17 @@ TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "allowed_file_graph": {"type": "object"},
         },
     },
+    "file.edit": {
+        "type": "object",
+        "required": ["file_path", "old_string", "new_string"],
+        "properties": {
+            "file_path": {"type": "string"},
+            "old_string": {"type": "string"},
+            "new_string": {"type": "string"},
+            "replace_all": {"type": "boolean"},
+            "allowed_file_graph": {"type": "object"},
+        },
+    },
 }
 
 TOOL_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -183,6 +195,7 @@ TOOL_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "checks.run": {"type": "object", "required": ["status", "results"]},
     "patch.apply": {"type": "object", "required": ["status", "changed_files"]},
     "file.write": {"type": "object", "required": ["status", "file_path"]},
+    "file.edit": {"type": "object", "required": ["status", "file_path"]},
 }
 
 

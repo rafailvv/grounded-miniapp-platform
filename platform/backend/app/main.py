@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi import HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import (
@@ -20,6 +22,7 @@ from app.api import (
     routes_workbench,
     routes_workspaces,
 )
+from app.api.errors import http_exception_handler, unhandled_exception_handler, validation_exception_handler
 from app.services.container import build_container
 
 
@@ -42,6 +45,9 @@ def create_app(*, repo_root: Path | None = None, data_dir: Path | None = None) -
         description="Research-first grounded mini-app generation platform.",
     )
     app.state.container = build_container(repo_root=repo_root, data_dir=data_dir)
+    app.add_exception_handler(HTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(Exception, unhandled_exception_handler)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

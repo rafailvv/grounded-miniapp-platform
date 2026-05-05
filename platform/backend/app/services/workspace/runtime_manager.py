@@ -76,6 +76,19 @@ class PreviewRuntimeManager:
         project_name, logs = self.start_local(workspace_id, source_dir, proxy_port)
         return [*logs, f"[runtime] local preview project={project_name}"]
 
+    def local_process_port(self, workspace_id: str) -> int | None:
+        process = self._local_processes.get(workspace_id)
+        if process is None or process.poll() is not None:
+            return None
+        args = list(getattr(process, "args", []) or [])
+        for index, item in enumerate(args):
+            if str(item) == "--port" and index + 1 < len(args):
+                try:
+                    return int(str(args[index + 1]))
+                except ValueError:
+                    return None
+        return None
+
     def reset_local(self, workspace_id: str) -> list[str]:
         process = self._local_processes.pop(workspace_id, None)
         if process is None:

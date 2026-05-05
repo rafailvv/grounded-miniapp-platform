@@ -215,7 +215,20 @@ class AgentWorkerBranchLoop:
                     tool_calls,
                     default_worker_id=worker_id,
                     default_owner_scope=owner_scope,
+                    read_text_file=lambda relative_path: self._read_branch_text(branch_source, relative_path),
                 )
+                failed_mutating_results = [
+                    item
+                    for item in mutating_trace
+                    if isinstance(item, dict) and str(item.get("status") or "") == "failed" and item.get("repair_packet")
+                ]
+                if failed_mutating_results:
+                    tool_results.extend(failed_mutating_results)
+                    worker_feedback.extend(failed_mutating_results)
+                    transcript.append_tool_results(transcript_key, failed_mutating_results)
+                    for repair_result in failed_mutating_results:
+                        transcript.append_repair(transcript_key, repair_result)
+                    continue
                 read_calls = [item for item in tool_calls if not is_mutating_agent_tool_call(item)]
                 if mutation_required and not mutating_changes:
                     repeated_read_only_after_required_patch += 1
@@ -552,6 +565,17 @@ class AgentWorkerBranchLoop:
             return path.read_text(encoding="utf-8") if path.exists() else ""
         except OSError:
             return ""
+
+    @staticmethod
+    def _read_branch_text(branch_source: Path, relative_path: str) -> str | None:
+        normalized = str(relative_path or "").strip().replace("\\", "/")
+        if not normalized.startswith("miniapp/") or normalized.startswith(("/", "~")) or ".." in normalized.split("/"):
+            return None
+        try:
+            target = branch_source / normalized
+            return target.read_text(encoding="utf-8") if target.exists() else None
+        except OSError:
+            return None
 
     @staticmethod
     def _looks_like_neutral_starter(text: str) -> bool:

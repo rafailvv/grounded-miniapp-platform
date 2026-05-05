@@ -6,12 +6,21 @@ from typing import Any, Literal
 
 
 AgentHookName = Literal[
+    "before_run",
+    "after_run",
     "pre_tool_use",
     "post_tool_use",
     "post_tool_use_failure",
+    "before_apply",
+    "after_apply",
+    "before_checks",
+    "on_check_failed",
     "pre_apply_patch",
     "post_apply_patch",
     "post_browser_verify",
+    "after_gate",
+    "on_memory_update",
+    "on_export",
 ]
 
 
@@ -26,6 +35,8 @@ class AgentHookEvent:
         return {
             "hook": self.hook,
             "status": self.status,
+            "schema": "grounded.hook_event.v1",
+            "side_effects_allowed": False,
             "payload": self.payload,
             "created_at": self.created_at,
         }
@@ -45,10 +56,13 @@ class AgentHookManager:
         status: Literal["started", "completed", "failed"] = "completed",
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        safe_payload = dict(payload or {})
+        safe_payload.setdefault("side_effects_allowed", False)
+        safe_payload.setdefault("permission", "record_only")
         event = AgentHookEvent(
             hook=hook,
             status=status,
-            payload=dict(payload or {}),
+            payload=safe_payload,
             created_at=datetime.now(timezone.utc).isoformat(),
         )
         self._events.setdefault(run_id, []).append(event)
@@ -60,4 +74,11 @@ class AgentHookManager:
         for item in events:
             key = f"{item.get('hook')}:{item.get('status')}"
             counts[key] = counts.get(key, 0) + 1
-        return {"run_id": run_id, "event_count": len(events), "counts": counts, "events": events[-500:]}
+        return {
+            "schema": "grounded.hook_trace.v1",
+            "run_id": run_id,
+            "side_effects_allowed": False,
+            "event_count": len(events),
+            "counts": counts,
+            "events": events[-500:],
+        }

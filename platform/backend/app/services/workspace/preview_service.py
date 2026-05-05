@@ -270,6 +270,13 @@ class PreviewService:
     def _select_proxy_port(self, workspace_id: str, preview: PreviewRecord, source_dir: Path) -> int:
         existing_port = preview.proxy_port
         reserved_ports = self._reserved_preview_ports(workspace_id)
+        if preview.runtime_mode == "local":
+            tracked_port = self.runtime_manager.local_process_port(workspace_id)
+            if existing_port is not None and tracked_port == existing_port:
+                return existing_port
+            if existing_port is not None and self.runtime_manager.port_free(existing_port):
+                return existing_port
+            return self.runtime_manager.allocate_port(workspace_id, reserved_ports=reserved_ports)
         if existing_port is not None and self._port_belongs_to_workspace(workspace_id, source_dir, existing_port):
             return existing_port
         if existing_port is not None and existing_port not in reserved_ports and self.runtime_manager.port_free(existing_port):
@@ -280,6 +287,7 @@ class PreviewService:
         preview = self._reconcile_runtime_state(self._get_or_create(workspace_id), workspace_id)
         should_rebuild = force_rebuild or bool(preview.project_name or preview.proxy_port)
         self._append_log(preview, f"Ensure worker started. rebuild={should_rebuild}.")
+        preview.status = "starting"
         preview.stage = "rebuilding" if should_rebuild else "starting"
         preview.progress_percent = max(preview.progress_percent, 14)
         self._persist(preview)
@@ -363,6 +371,10 @@ class PreviewService:
         preview = self._fast_restore_preview_from_http(preview)
         if preview.status == "error":
             return preview
+        if preview.runtime_mode == "local" and preview.status == "starting" and not preview.url:
+            preview = self._reconcile_runtime_state(preview, workspace_id)
+            if preview.status == "running" and preview.url:
+                return preview
         if (
             preview.status == "starting"
             and preview.stage in {"starting", "rebuilding", "health_check"}
@@ -839,6 +851,29 @@ class PreviewService:
 
     def _reconcile_runtime_state(self, preview: PreviewRecord, workspace_id: str) -> PreviewRecord:
         if preview.runtime_mode == "local":
+            local_port = preview.proxy_port or self.runtime_manager.local_process_port(workspace_id)
+            if local_port is not None:
+                runtime_url = self.runtime_manager.preview_url(local_port)
+                if self._http_preview_ready(runtime_url):
+                    preview.proxy_port = local_port
+                    preview.project_name = preview.project_name or self.runtime_manager.project_name(workspace_id)
+                    preview.url = runtime_url
+                    preview.frontend_url = runtime_url
+                    preview.backend_url = self.runtime_manager.backend_url(local_port)
+                    preview.status = "running"
+                    preview.stage = "running"
+                    preview.progress_percent = 100
+                    preview.last_error = None
+                    preview.preview_failure_kind = None
+                    preview.preview_cooldown_until = None
+                    self._persist(preview)
+                    return preview
+            if (
+                preview.status == "starting"
+                and preview.stage in {"starting", "rebuilding", "health_check"}
+                and not self._is_stale_starting_preview(preview)
+            ):
+                return preview
             if preview.status in {"running", "starting"} and preview.url and self._http_preview_ready(preview.url):
                 return preview
             if (
@@ -866,6 +901,15 @@ class PreviewService:
                 self._persist(preview)
             return preview
         if preview.runtime_mode != "docker":
+            return preview
+        if (
+            preview.status == "stopped"
+            and preview.project_name is None
+            and preview.proxy_port is None
+            and not preview.url
+            and not preview.frontend_url
+            and not preview.backend_url
+        ):
             return preview
 
         source_dir: Path | None

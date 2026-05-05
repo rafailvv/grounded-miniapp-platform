@@ -51,6 +51,10 @@ class AgentCommandPolicy:
 
     _BLOCKED_META_CHARS = re.compile(r"[`$<>|;]")
     _BLOCKED_EXPANSION = re.compile(r"\$\(|\${|%[A-Za-z_][A-Za-z0-9_]*%")
+    _BLOCKED_HEREDOC = re.compile(r"<<-?")
+    _BLOCKED_LINE_CONTINUATION = re.compile(r"\\\s*(?:\r?\n)")
+    _BLOCKED_ENV_ASSIGNMENT = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*=")
+    _BLOCKED_BRACE_EXPANSION = re.compile(r"(?:^|[^$])\{[^{}\n]*,[^{}\n]*\}")
 
     def __init__(self, rules: list[CommandPolicyRule] | None = None) -> None:
         self.rules = list(rules or self.default_rules())
@@ -166,6 +170,14 @@ class AgentCommandPolicy:
         stripped = str(command or "").strip()
         if not stripped:
             return CommandPolicyDecision("forbidden", "Empty command.", command, "")
+        if self._BLOCKED_LINE_CONTINUATION.search(stripped):
+            return CommandPolicyDecision("forbidden", "Line-continuation shell syntax is blocked.", command, stripped)
+        if self._BLOCKED_HEREDOC.search(stripped):
+            return CommandPolicyDecision("forbidden", "Here-doc and here-string shell syntax is blocked.", command, stripped)
+        if self._BLOCKED_ENV_ASSIGNMENT.search(stripped):
+            return CommandPolicyDecision("forbidden", "Inline environment assignment is blocked for agent diagnostics.", command, stripped)
+        if self._BLOCKED_BRACE_EXPANSION.search(stripped):
+            return CommandPolicyDecision("forbidden", "Brace expansion is blocked for agent diagnostics.", command, stripped)
         if self._BLOCKED_META_CHARS.search(stripped):
             return CommandPolicyDecision(
                 "forbidden",
@@ -195,8 +207,10 @@ class AgentCommandPolicy:
             return CommandPolicyDecision("forbidden", "Empty command.", command, normalized)
         if any(arg == ".." or arg.startswith("../") or "/../" in arg for arg in args):
             return CommandPolicyDecision("forbidden", "Parent-directory paths are blocked.", command, normalized, tuple(args))
-        if any(str(arg).startswith(("/", "~")) for arg in args[1:]):
+        if any(str(arg).startswith(("/", "~")) for arg in args):
             return CommandPolicyDecision("forbidden", "Absolute and home-relative paths are blocked.", command, normalized, tuple(args))
+        if any(re.search(r"[*?\\[]", str(arg)) for arg in args[1:]):
+            return CommandPolicyDecision("forbidden", "Shell glob patterns are blocked; use explicit paths from list_files/search results.", command, normalized, tuple(args))
         if any(arg == ".git" or arg.startswith(".git/") or "/.git/" in arg for arg in args[1:]):
             return CommandPolicyDecision("forbidden", "Git internals are blocked.", command, normalized, tuple(args))
         normalized_args = [Path(args[0]).name.lower(), *[str(arg).lower() for arg in args[1:]]]

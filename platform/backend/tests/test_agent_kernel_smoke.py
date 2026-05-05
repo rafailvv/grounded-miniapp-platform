@@ -18,6 +18,7 @@ from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessMan
 from app.modules.miniapp_agent_loop.agent_scratchpad import AgentScratchpad
 from app.modules.miniapp_agent_loop.agent_transcript import AgentTranscriptStore
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
+from app.modules.miniapp_agent_loop.agent_tool_changes import file_changes_from_mutating_tool_calls
 from app.modules.miniapp_agent_loop.diagnostics_delta import AgentDiagnosticsDelta
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
 from app.modules.miniapp_agent_loop.agent_worker_branch_loop import AgentWorkerBranchLoop
@@ -651,6 +652,7 @@ def test_role_surface_blocks_generic_workflow_copy_and_raw_status_rendering() ->
           return `<p><strong>Приоритет:</strong> ${escapeHtml(item.priority)}</p>`;
         }
         buildLine('Статус', item.status);
+        const DETAIL_FIELD_LABELS = { status: "статус", title: "название" };
         function statusLabel(status) { return STATUS_LABELS[status] || status || "Новый"; }
         function humanStatus(status) {
           const labels = { ready: "Готово" };
@@ -664,6 +666,7 @@ def test_role_surface_blocks_generic_workflow_copy_and_raw_status_rendering() ->
     assert "template escape(item.status)" in raw_status
     assert "template item.priority raw enum" in raw_status
     assert "buildLine status=item.status" in raw_status
+    assert "detail labels include raw status field" in raw_status
     assert "status label raw passthrough" in raw_status
 
     safe_status = CheckRunner._raw_status_render_markers(
@@ -695,6 +698,24 @@ def test_hidden_state_class_requires_effective_css_rule() -> None:
     assert issue is not None
     assert issue.code == "platform.hidden_state_class_without_css"
     assert ok is None
+
+
+def test_html_control_contract_blocks_duplicate_ids_and_form_names() -> None:
+    issues = CheckRunner._html_control_contract_issues(
+        "miniapp/app/static/specialist/index.html",
+        """
+        <form>
+          <label>Результат <textarea id="contract-result" name="result"></textarea></label>
+          <label>Результат <input id="contract-result" name="result" type="text" /></label>
+          <label><input name="options" type="checkbox" /> Разрешенный повтор для группы</label>
+          <label><input name="options" type="checkbox" /> Разрешенный повтор для группы</label>
+        </form>
+        """,
+    )
+
+    codes = {issue.code for issue in issues}
+    assert "platform.duplicate_dom_id" in codes
+    assert "platform.duplicate_form_control_name" in codes
 
 
 def test_role_surface_blocks_visible_http_api_copy_without_blocking_js_methods() -> None:
@@ -1794,3 +1815,81 @@ def test_rollout_trace_reduces_tool_events() -> None:
 
     assert snapshot["event_count"] == 2
     assert snapshot["tool_counts"] == {"read_files": 1, "run_checks": 1}
+
+
+def test_file_state_cache_restore_keeps_freshness_without_content(tmp_path: Path) -> None:
+    root = tmp_path
+    target = root / "miniapp/app/main.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("print('ok')\n", encoding="utf-8")
+    cache = AgentFileStateCache()
+    assert cache.read(run_id="run_a", root=root, path="miniapp/app/main.py", read_text=lambda path: (root / path).read_text(encoding="utf-8"))
+    snapshot = cache.snapshot("run_a", root=root)
+
+    restored = AgentFileStateCache()
+    result = restored.restore_snapshot(run_id="run_b", snapshot=snapshot)
+    freshness = restored.freshness(run_id="run_b", root=root, path="miniapp/app/main.py")
+    content = restored.read(run_id="run_b", root=root, path="miniapp/app/main.py", read_text=lambda path: (root / path).read_text(encoding="utf-8"))
+
+    assert result["restored"] == 1
+    assert freshness["status"] == "fresh"
+    assert content == "print('ok')\n"
+
+
+def test_exact_edit_tool_reports_multiple_matches_and_applies_unique_match(tmp_path: Path) -> None:
+    root = tmp_path
+    target = root / "miniapp/app/static/client/app.js"
+    target.parent.mkdir(parents=True)
+    target.write_text("const status = 'new';\nconst next = 'new';\n", encoding="utf-8")
+
+    changes, trace = file_changes_from_mutating_tool_calls(
+        [
+            {
+                "tool": "edit_file_exact",
+                "file_path": "miniapp/app/static/client/app.js",
+                "old_string": "new",
+                "new_string": "ready",
+                "reason": "test",
+            }
+        ],
+        read_text_file=lambda path: (root / path).read_text(encoding="utf-8") if (root / path).exists() else None,
+    )
+
+    assert changes == []
+    assert trace[0]["status"] == "failed"
+    assert trace[0]["repair_packet"]["code"] == "multiple_matches"  # type: ignore[index]
+
+    changes, trace = file_changes_from_mutating_tool_calls(
+        [
+            {
+                "tool": "edit_file_exact",
+                "file_path": "miniapp/app/static/client/app.js",
+                "old_string": "const status = 'new';",
+                "new_string": "const status = 'ready';",
+                "reason": "test",
+            }
+        ],
+        read_text_file=lambda path: (root / path).read_text(encoding="utf-8") if (root / path).exists() else None,
+    )
+
+    assert trace[0]["tool"] == "edit_file_exact"
+    assert changes[0].operation == "replace"
+    assert "const status = 'ready';" in str(changes[0].content)
+
+
+def test_command_policy_blocks_shell_expansion_invariants() -> None:
+    assert decide_workspace_command("PYTHONPATH=platform/backend pytest -q").action == "forbidden"
+    assert decide_workspace_command("rg foo miniapp/app/*.py").action == "forbidden"
+    assert decide_workspace_command("rg foo miniapp/app <<EOF").action == "forbidden"
+    assert decide_workspace_command("python -m py_compile miniapp/app/main.py").action == "allow"
+
+
+def test_hook_trace_declares_record_only_side_effects() -> None:
+    hooks = AgentHookManager()
+    event = hooks.record("run_1", "before_apply", payload={"path": "miniapp/app/main.py"})
+    snapshot = hooks.snapshot("run_1")
+
+    assert event["schema"] == "grounded.hook_event.v1"
+    assert event["side_effects_allowed"] is False
+    assert event["payload"]["permission"] == "record_only"
+    assert snapshot["schema"] == "grounded.hook_trace.v1"

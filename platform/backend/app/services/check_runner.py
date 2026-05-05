@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import difflib
 import hashlib
+from html.parser import HTMLParser
 import json
 import os
 import posixpath
@@ -52,6 +53,38 @@ NEUTRAL_TEMPLATE_MARKERS = (
     "should be replaced by the generated app",
     "replace starter screens",
 )
+
+
+class _HtmlControlContractParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ids: list[str] = []
+        self.form_index = -1
+        self.form_depth = 0
+        self.names_by_form: dict[int, list[str]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = {str(name).lower(): str(value or "") for name, value in attrs}
+        if tag.lower() == "form":
+            self.form_index += 1
+            self.form_depth += 1
+            self.names_by_form.setdefault(self.form_index, [])
+        element_id = attr_map.get("id", "").strip()
+        if element_id:
+            self.ids.append(element_id)
+        if tag.lower() not in {"input", "textarea", "select"} or self.form_depth <= 0:
+            return
+        control_name = attr_map.get("name", "").strip()
+        if not control_name:
+            return
+        input_type = attr_map.get("type", "").strip().lower()
+        if tag.lower() == "input" and input_type in {"checkbox", "radio"}:
+            return
+        self.names_by_form.setdefault(self.form_index, []).append(control_name)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "form" and self.form_depth > 0:
+            self.form_depth -= 1
 ROLE_LINK_STOPWORDS = {
     "client",
     "specialist",
@@ -5061,6 +5094,7 @@ except Exception as exc:
             (r"\bSTATUS_LABELS\s*\[[^\]]+\]\s*\|\|\s*normalize\s*\(\s*value\b", "status label normalize(value) passthrough"),
             (r"\bfunction\s+statusLabel\b[\s\S]{0,500}\breturn\s+[^;{}]*\[[^\]]+\]\s*\|\|\s*(?:status|value|key)\b", "status label raw passthrough"),
             (r"\bfunction\s+(?:humanStatus|formatStatus)\b[\s\S]{0,500}\breturn\s+[^;{}]*\[[^\]]+\]\s*\|\|\s*(?:status|value|key)\b", "status label raw passthrough"),
+            (r"\bDETAIL_FIELD_LABELS\s*=\s*\{[^{}]*(?:['\"]status['\"]|status)\s*:", "detail labels include raw status field"),
         )
         markers: list[str] = []
         for pattern, label in patterns:
@@ -5758,6 +5792,7 @@ except Exception as exc:
                 html_sources.append(html_source)
                 html_relative = html_path.relative_to(source_dir).as_posix()
                 html_ids = extract_html_ids(html_source)
+                issues.extend(cls._html_control_contract_issues(html_relative, html_source))
                 all_page_sources.append((html_relative, html_source, html_ids))
                 if cls._html_references_script(html_relative, html_source, relative_path):
                     page_sources.append((html_relative, html_source, html_ids))
@@ -5780,6 +5815,47 @@ except Exception as exc:
             if not page_sources:
                 page_sources = all_page_sources
             issues.extend(cls._unchecked_page_dom_issues(relative_path, js_source, page_sources))
+        return issues
+
+    @staticmethod
+    def _html_control_contract_issues(relative_path: str, html_source: str) -> list[ValidationIssue]:
+        parser = _HtmlControlContractParser()
+        try:
+            parser.feed(str(html_source or ""))
+        except Exception:
+            return []
+        issues: list[ValidationIssue] = []
+        duplicate_ids = sorted({item for item in parser.ids if parser.ids.count(item) > 1})
+        if duplicate_ids:
+            issues.append(
+                ValidationIssue(
+                    code="platform.duplicate_dom_id",
+                    message=(
+                        f"{relative_path} contains duplicate DOM ids: {', '.join(duplicate_ids[:8])}. "
+                        "Each interactive control needs a unique id so labels, scripts, and browser proof target one element."
+                    ),
+                    severity="high",
+                    location=relative_path,
+                    blocking=True,
+                )
+            )
+        duplicate_names: list[str] = []
+        for names in parser.names_by_form.values():
+            duplicate_names.extend(sorted({item for item in names if names.count(item) > 1}))
+        duplicate_names = sorted(set(duplicate_names))
+        if duplicate_names:
+            issues.append(
+                ValidationIssue(
+                    code="platform.duplicate_form_control_name",
+                    message=(
+                        f"{relative_path} contains duplicate form control names in one form: {', '.join(duplicate_names[:8])}. "
+                        "Remove the duplicate field or rename it before serializing FormData."
+                    ),
+                    severity="high",
+                    location=relative_path,
+                    blocking=True,
+                )
+            )
         return issues
 
     @staticmethod

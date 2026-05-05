@@ -494,6 +494,6 @@ def start_browser_proof(run_id: str, container: ServiceContainer = Depends(get_c
 @router.get("/runs/{run_id}/browser-proof")
 def get_browser_proof(run_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
-        return container.store.get("reports", f"browser_proof:{run_id}") or container.workbench_service.browser_proof(run_id)
+        return container.workbench_service.browser_proof(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

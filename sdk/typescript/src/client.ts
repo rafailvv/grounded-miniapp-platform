@@ -3,6 +3,25 @@ export type GroundedClientOptions = {
   fetchImpl?: typeof fetch;
 };
 
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+export type JsonObject = { [key: string]: JsonValue };
+export type RunEventType =
+  | "run_started"
+  | "tool_event"
+  | "check_completed"
+  | "repair_packet"
+  | "browser_step"
+  | "gate_changed"
+  | "run_completed"
+  | "run_stream_timeout"
+  | "timeline_event";
+
+export type RunEvent = {
+  type: RunEventType;
+  runId: string;
+  payload: JsonObject;
+};
+
 export class GroundedClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
@@ -12,105 +31,135 @@ export class GroundedClient {
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
-  async listWorkspaces<T = unknown>(): Promise<T> {
-    return this.request<T>("/workspaces");
+  async listWorkspaces(): Promise<JsonValue> {
+    return this.requestValue("/workspaces");
   }
 
-  async createWorkspace<T = unknown>(payload: Record<string, unknown>): Promise<T> {
-    return this.request<T>("/workspaces", {
+  async createWorkspace(payload: JsonObject): Promise<JsonObject> {
+    return this.requestObject("/workspaces", {
       method: "POST",
       body: JSON.stringify(payload),
     });
   }
 
-  async createRun<T = unknown>(workspaceId: string, payload: Record<string, unknown>): Promise<T> {
-    return this.request<T>(`/workspaces/${encodeURIComponent(workspaceId)}/runs`, {
+  async createRun(workspaceId: string, payload: JsonObject): Promise<JsonObject> {
+    return this.requestObject(`/workspaces/${encodeURIComponent(workspaceId)}/runs`, {
       method: "POST",
       body: JSON.stringify(payload),
     });
   }
 
-  async getRun<T = unknown>(runId: string): Promise<T> {
-    return this.request<T>(`/runs/${encodeURIComponent(runId)}`);
+  async getRun(runId: string): Promise<JsonObject> {
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}`);
   }
 
-  async getTimeline<T = unknown>(runId: string): Promise<T> {
-    return this.request<T>(`/runs/${encodeURIComponent(runId)}/timeline`);
+  async getTimeline(runId: string): Promise<JsonObject> {
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}/timeline`);
   }
 
-  async getTraceView<T = unknown>(runId: string): Promise<T> {
-    return this.request<T>(`/runs/${encodeURIComponent(runId)}/trace-view`);
+  async getTraceView(runId: string): Promise<JsonObject> {
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}/trace-view`);
   }
 
-  async getGate<T = unknown>(runId: string): Promise<T> {
-    return this.request<T>(`/runs/${encodeURIComponent(runId)}/gate`);
+  async getGate(runId: string): Promise<JsonObject> {
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}/gate`);
   }
 
-  async getFinalReport<T = unknown>(runId: string): Promise<T> {
-    return this.request<T>(`/runs/${encodeURIComponent(runId)}/final-report`);
+  async getFinalReport(runId: string): Promise<JsonObject> {
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}/final-report`);
   }
 
-  async getRepairSignatures<T = unknown>(runId: string): Promise<T> {
-    return this.request<T>(`/runs/${encodeURIComponent(runId)}/repair-signatures`);
+  async getRepairSignatures(runId: string): Promise<JsonObject> {
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}/repair-signatures`);
   }
 
-  async resumeRun<T = unknown>(runId: string): Promise<T> {
-    return this.request<T>(`/runs/${encodeURIComponent(runId)}/resume`, { method: "POST" });
+  async resumeRun(runId: string): Promise<JsonObject> {
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}/resume`, { method: "POST" });
   }
 
-  async getArtifacts<T = unknown>(runId: string): Promise<T> {
-    return this.request<T>(`/runs/${encodeURIComponent(runId)}/artifacts`);
+  async getArtifacts(runId: string): Promise<JsonObject> {
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}/artifacts`);
   }
 
-  async getApprovals<T = unknown>(runId: string): Promise<T> {
-    return this.request<T>(`/runs/${encodeURIComponent(runId)}/approvals`);
+  async getApprovals(runId: string): Promise<JsonObject> {
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}/approvals`);
   }
 
-  async approve(runId: string, approvalId: string): Promise<unknown> {
-    return this.request(`/runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(approvalId)}/approve`, { method: "POST" });
+  async approve(runId: string, approvalId: string): Promise<JsonObject> {
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(approvalId)}/approve`, { method: "POST" });
   }
 
-  async searchFiles<T = unknown>(workspaceId: string, query: string, runId?: string): Promise<T> {
+  async searchFiles(workspaceId: string, query: string, runId?: string): Promise<JsonObject> {
     const params = new URLSearchParams({ q: query });
     if (runId) params.set("run_id", runId);
-    return this.request<T>(`/workspaces/${encodeURIComponent(workspaceId)}/files/search?${params.toString()}`);
+    return this.requestObject(`/workspaces/${encodeURIComponent(workspaceId)}/files/search?${params.toString()}`);
   }
 
-  async diagnostics<T = unknown>(workspaceId: string, runId?: string): Promise<T> {
+  async diagnostics(workspaceId: string, runId?: string): Promise<JsonObject> {
     const params = new URLSearchParams();
     if (runId) params.set("run_id", runId);
     const suffix = params.toString() ? `?${params.toString()}` : "";
-    return this.request<T>(`/workspaces/${encodeURIComponent(workspaceId)}/diagnostics/lsp${suffix}`);
+    return this.requestObject(`/workspaces/${encodeURIComponent(workspaceId)}/diagnostics/lsp${suffix}`);
   }
 
-  async patchPreflight<T = unknown>(workspaceId: string, payload: Record<string, unknown>): Promise<T> {
-    return this.request<T>(`/workspaces/${encodeURIComponent(workspaceId)}/patch/preflight`, {
+  async patchPreflight(workspaceId: string, payload: JsonObject): Promise<JsonObject> {
+    return this.requestObject(`/workspaces/${encodeURIComponent(workspaceId)}/patch/preflight`, {
       method: "POST",
       body: JSON.stringify(payload),
     });
   }
 
-  async doctor<T = unknown>(): Promise<T> {
-    return this.request<T>("/doctor");
+  async doctor(): Promise<JsonObject> {
+    return this.requestObject("/doctor");
   }
 
-  async metrics<T = unknown>(): Promise<T> {
-    return this.request<T>("/system/metrics/summary");
+  async metrics(): Promise<JsonObject> {
+    return this.requestObject("/system/metrics/summary");
   }
 
-  async securitySummary<T = unknown>(): Promise<T> {
-    return this.request<T>("/system/security/summary");
+  async securitySummary(): Promise<JsonObject> {
+    return this.requestObject("/system/security/summary");
   }
 
-  async permissionRules<T = unknown>(): Promise<T> {
-    return this.request<T>("/system/permissions/rules");
+  async permissionRules(): Promise<JsonObject> {
+    return this.requestObject("/system/permissions/rules");
   }
 
-  async export(workspaceId: string, kind: "zip" | "git-patch" | "deploy-bundle" | "docker-validation-report" | "manifest" | "browser-proof-bundle"): Promise<unknown> {
-    return this.request(`/workspaces/${encodeURIComponent(workspaceId)}/export/${kind}`, { method: "POST" });
+  async export(workspaceId: string, kind: "zip" | "git-patch" | "deploy-bundle" | "docker-validation-report" | "manifest" | "browser-proof-bundle"): Promise<JsonObject> {
+    return this.requestObject(`/workspaces/${encodeURIComponent(workspaceId)}/export/${kind}`, { method: "POST" });
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  async *streamRunEvents(runId: string, options: { pollIntervalMs?: number; timeoutMs?: number } = {}): AsyncGenerator<RunEvent> {
+    const started = Date.now();
+    const seen = new Set<string>();
+    yield { type: "run_started", runId, payload: await this.getRun(runId) };
+    while (true) {
+      const timeline = await this.getTimeline(runId);
+      const items = Array.isArray(timeline.items) ? timeline.items : [];
+      for (const item of items) {
+        if (!isJsonObject(item)) continue;
+        const key = String(item.id ?? item.created_at ?? JSON.stringify(item));
+        if (seen.has(key)) continue;
+        seen.add(key);
+        yield { type: timelineEventType(item), runId, payload: item };
+      }
+      const gate = await this.getGate(runId);
+      yield { type: "gate_changed", runId, payload: gate };
+      const run = await this.getRun(runId);
+      const status = String(run.status ?? "");
+      if (["completed", "blocked", "failed", "awaiting_approval"].includes(status)) {
+        yield { type: "run_completed", runId, payload: { run, gate } };
+        return;
+      }
+      if (Date.now() - started >= (options.timeoutMs ?? 600_000)) {
+        yield { type: "run_stream_timeout", runId, payload: { run, gate } };
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, options.pollIntervalMs ?? 1000));
+    }
+  }
+
+  private async requestValue(path: string, init: RequestInit = {}): Promise<JsonValue> {
     const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
       headers: { "Content-Type": "application/json", ...(init.headers ?? {}) },
       ...init,
@@ -118,6 +167,27 @@ export class GroundedClient {
     if (!response.ok) {
       throw new Error(await response.text());
     }
-    return response.json() as Promise<T>;
+    return response.json() as Promise<JsonValue>;
   }
+
+  private async requestObject(path: string, init: RequestInit = {}): Promise<JsonObject> {
+    const value = await this.requestValue(path, init);
+    if (!isJsonObject(value)) {
+      throw new Error(`Expected JSON object from ${path}`);
+    }
+    return value;
+  }
+}
+
+function isJsonObject(value: JsonValue): value is JsonObject {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function timelineEventType(item: JsonObject): RunEventType {
+  const kind = String(item.kind ?? "");
+  if (kind === "tool") return "tool_event";
+  if (kind === "check") return "check_completed";
+  if (kind === "browser") return "browser_step";
+  if (kind === "repair") return "repair_packet";
+  return kind ? "timeline_event" : "timeline_event";
 }

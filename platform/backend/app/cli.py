@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,8 +70,10 @@ def main(argv: list[str] | None = None) -> int:
     generate.add_argument("prompt")
     generate.add_argument("--workspace-id", default="")
     generate.add_argument("--workspace-name", default="Generated App")
+    generate.add_argument("--generation-mode", choices=["fast", "balanced", "quality"], default="balanced")
     generate.add_argument("--quality", action="store_true")
     generate.add_argument("--export", action="store_true")
+    generate.add_argument("--timeout-seconds", type=int, default=1800)
 
     fix = sub.add_parser("fix")
     fix.add_argument("workspace_id")
@@ -147,11 +150,15 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "prompt": args.prompt,
                 "mode": "generate",
-                "generation_mode": "quality" if args.quality else "balanced",
+                "generation_mode": "quality" if args.quality else args.generation_mode,
             },
         )
-        result = {"workspace_id": workspace_id, "run": run_result}
+        run_result = _wait_for_terminal_run(args.base_url, str(run_result["run_id"]), timeout_seconds=args.timeout_seconds)
+        final = _request(args.base_url, "GET", f"/runs/{urllib.parse.quote(str(run_result['run_id']))}/final-report")
+        result = {"workspace_id": workspace_id, "run": run_result, "final_report": final}
         if args.export:
+            if final.get("status") != "passed":
+                raise SystemExit("Reliability Gate did not pass; export is blocked by CLI.")
             result["export"] = _request(args.base_url, "POST", f"/workspaces/{urllib.parse.quote(workspace_id)}/export/zip", {})
     elif args.command == "fix":
         result = _request(
@@ -176,6 +183,17 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
+
+
+def _wait_for_terminal_run(base_url: str, run_id: str, *, timeout_seconds: int) -> dict[str, Any]:
+    started = time.monotonic()
+    while True:
+        run = _request(base_url, "GET", f"/runs/{urllib.parse.quote(run_id)}")
+        if str(run.get("status") or "") in {"completed", "blocked", "failed", "awaiting_approval"}:
+            return run
+        if time.monotonic() - started >= timeout_seconds:
+            raise SystemExit(f"Run {run_id} did not reach a terminal state within {timeout_seconds}s.")
+        time.sleep(2)
 
 
 if __name__ == "__main__":

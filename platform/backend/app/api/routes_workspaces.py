@@ -31,11 +31,6 @@ def create_workspace(
         args=(workspace, container.workspace_service.source_dir(workspace.workspace_id)),
         daemon=True,
     ).start()
-    threading.Thread(
-        target=container.preview_service.ensure_started,
-        args=(workspace.workspace_id,),
-        daemon=True,
-    ).start()
     return workspace
 
 
@@ -64,11 +59,6 @@ def clone_template(
             args=(workspace, container.workspace_service.source_dir(workspace_id)),
             daemon=True,
         ).start()
-        threading.Thread(
-            target=container.preview_service.ensure_started,
-            args=(workspace_id,),
-            daemon=True,
-        ).start()
         return workspace
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -81,11 +71,6 @@ def reset_workspace(workspace_id: str, container: ServiceContainer = Depends(get
         threading.Thread(
             target=container.code_index_service.index_workspace,
             args=(workspace, container.workspace_service.source_dir(workspace_id)),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=container.preview_service.ensure_started,
-            args=(workspace_id,),
             daemon=True,
         ).start()
         return workspace

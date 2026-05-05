@@ -371,6 +371,11 @@ class WorkspaceCodeAgentRuntime:
             return job
 
         draft_source = self._prepare_draft(workspace_id=workspace_id, run_id=run_id, request=request)
+        self._restore_file_state_cache_from_resume(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            source_run_id=str(request.resume_from_run_id or "").strip(),
+        )
         self._store_report(
             f"spec:{workspace_id}:{run_id}",
             {
@@ -411,6 +416,31 @@ class WorkspaceCodeAgentRuntime:
         if self.workspace_service.draft_exists(workspace_id, run_id):
             return self.workspace_service.ensure_draft(workspace_id, run_id)
         return self.workspace_service.prepare_draft(workspace_id, run_id)
+
+    def _restore_file_state_cache_from_resume(self, *, workspace_id: str, run_id: str, source_run_id: str) -> None:
+        if not source_run_id or source_run_id == run_id:
+            return
+        checkpoint = self.store.get("reports", f"resume_checkpoint:{workspace_id}:{source_run_id}")
+        if not isinstance(checkpoint, dict):
+            return
+        ref = str(checkpoint.get("file_state_cache_ref") or "").strip()
+        if not ref:
+            return
+        snapshot = self.store.get("reports", ref)
+        if not isinstance(snapshot, dict):
+            return
+        result = self.file_state_cache.restore_snapshot(run_id=run_id, snapshot=snapshot)
+        self._store_report(
+            f"file_state_cache_restore:{workspace_id}:{run_id}",
+            {
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "source_run_id": source_run_id,
+                "source_file_state_cache_ref": ref,
+                **result,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     @staticmethod
     def _effective_role_scope(request: GenerateRequest) -> list[str]:
@@ -1409,7 +1439,24 @@ class WorkspaceCodeAgentRuntime:
                         root_cause_summary=str(llm_payload.get("error") or ""),
                     )
                 raw_tool_calls = self._agent_tool_calls(llm_payload.get("tool_calls") or [])
-                mutating_file_changes, mutating_tool_trace = self._file_changes_from_mutating_tool_calls(raw_tool_calls)
+                mutating_file_changes, mutating_tool_trace = self._file_changes_from_mutating_tool_calls(raw_tool_calls, draft_source=draft_source)
+                failed_mutating_tool_results = [
+                    item
+                    for item in mutating_tool_trace
+                    if isinstance(item, dict) and str(item.get("status") or "") == "failed" and item.get("repair_packet")
+                ]
+                if failed_mutating_tool_results:
+                    local_tool_results.extend(failed_mutating_tool_results)
+                    tool_results.extend(failed_mutating_tool_results)
+                    self.transcript_store.append_tool_results(artifact_run_id, failed_mutating_tool_results)
+                    self._store_transcript_snapshot(job, artifact_run_id)
+                    self._append_event(
+                        job,
+                        "repair_iteration",
+                        "Agent exact edit tool failed; retrying with typed edit failure packet.",
+                        {"attempt": attempt, "tool_round": tool_round, "repair_packets": [item.get("repair_packet") for item in failed_mutating_tool_results]},
+                    )
+                    continue
                 if mutating_file_changes:
                     invalid_mutation = AgentEditValidator._first_invalid_file_change(mutating_file_changes)
                     if invalid_mutation and not invalid_mutation_correction_sent:
@@ -4429,8 +4476,26 @@ class WorkspaceCodeAgentRuntime:
         return is_mutating_agent_tool_call(request_item)
 
     @staticmethod
-    def _file_changes_from_mutating_tool_calls(tool_calls: list[dict[str, Any]]) -> tuple[list[DraftAction], list[dict[str, object]]]:
-        return file_changes_from_mutating_tool_calls(tool_calls)
+    def _file_changes_from_mutating_tool_calls(
+        tool_calls: list[dict[str, Any]],
+        *,
+        draft_source: Path | None = None,
+    ) -> tuple[list[DraftAction], list[dict[str, object]]]:
+        def read_text_file(relative_path: str) -> str | None:
+            if draft_source is None:
+                return None
+            normalized = str(relative_path or "").replace("\\", "/")
+            if not normalized.startswith("miniapp/") or normalized.startswith(("/", "~")) or ".." in normalized.split("/"):
+                return None
+            try:
+                return (draft_source / normalized).read_text(encoding="utf-8")
+            except OSError:
+                return None
+
+        return file_changes_from_mutating_tool_calls(
+            tool_calls,
+            read_text_file=read_text_file if draft_source is not None else None,
+        )
 
     def _read_state_repair_packets(
         self,

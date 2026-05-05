@@ -95,7 +95,7 @@ def test_contract_shell_copy_uses_product_labels_not_internal_status_or_workflow
     assert 'rejected: "Отклонена"' in specialist_js
     manager_js = (source / "miniapp/app/static/manager/app.js").read_text(encoding="utf-8")
     manager_html = (source / "miniapp/app/static/manager/index.html").read_text(encoding="utf-8")
-    assert 'ROLE === "manager" ? FIELD_LABELS' in manager_js
+    assert 'const DETAIL_FIELD_LABELS = {' in manager_js
     assert '<option value="approved">Одобрена</option>' in manager_html
     assert '<option value="rejected">Отклонена</option>' in manager_html
     assert "Save progress" not in specialist_js
@@ -105,6 +105,56 @@ def test_contract_shell_copy_uses_product_labels_not_internal_status_or_workflow
     assert "Title" not in specialist_html
     assert "Note" not in specialist_html
     assert 'item.status || "new"' not in specialist_js
+
+
+def test_role_operation_fields_are_visible_across_roles_when_prompt_has_no_field_hints(tmp_path: Path) -> None:
+    source = _template_source(tmp_path)
+    contract = MiniAppContractCompiler.compile(
+        workspace_id="ws_test",
+        run_id="run_test",
+        prompt="Создай приложение для согласования рабочего процесса.",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        prompt_analysis=_analysis("заявка"),
+    )
+    MiniAppContractMaterializer.materialize(source, contract)
+
+    client_js = (source / "miniapp/app/static/client/app.js").read_text(encoding="utf-8")
+    manager_html = (source / "miniapp/app/static/manager/index.html").read_text(encoding="utf-8")
+
+    assert 'name="managerDecision"' in manager_html
+    assert 'name="managerComment"' in manager_html
+    assert '"recordName": "Название записи"' in client_js
+    assert '"specialistDecision": "Решение специалиста"' in client_js
+    assert '"managerDecision": "Решение менеджера"' in client_js
+    assert "ROLE === \"manager\" ? FIELD_LABELS" not in client_js
+
+
+def test_internal_status_hint_stays_dedicated_control_not_detail_field(tmp_path: Path) -> None:
+    source = _template_source(tmp_path)
+    analysis = _analysis("заявка")
+    analysis["field_hints"] = ["название", "статус", "комментарий"]
+    analysis["role_field_hints"] = {
+        "client": ["название", "комментарий"],
+        "specialist": ["решение", "статус"],
+        "manager": ["статус", "комментарий"],
+    }
+    contract = MiniAppContractCompiler.compile(
+        workspace_id="ws_test",
+        run_id="run_test",
+        prompt="Создай приложение для согласования заявки.",
+        intent="create",
+        generation_mode=GenerationMode.FAST,
+        prompt_analysis=analysis,
+    )
+    MiniAppContractMaterializer.materialize(source, contract)
+
+    client_js = (source / "miniapp/app/static/client/app.js").read_text(encoding="utf-8")
+    manager_html = (source / "miniapp/app/static/manager/index.html").read_text(encoding="utf-8")
+
+    assert '"status": "статус"' not in client_js
+    assert 'id="contract-status-field" name="status"' in manager_html
+    assert "statusLabel(item.status)" in client_js
 
 
 def test_registry_returns_repair_recipe_for_backend_contract_drift(tmp_path: Path) -> None:

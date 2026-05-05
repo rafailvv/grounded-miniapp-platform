@@ -90,8 +90,32 @@ class AgentWorkerManager:
                 if enabled
                 else "serial_contract_runtime_writes"
             ),
+            "ownership_locks": cls.ownership_locks(),
             "merge_policy": "accept non-conflicting owned diffs; return conflicts to the owning worker as a repair packet",
         }
+
+    @classmethod
+    def ownership_locks(cls) -> list[dict[str, object]]:
+        locks = [
+            {
+                "lock_id": scope.worker,
+                "worker": scope.worker,
+                "owner_scope": scope.owner_scope,
+                "path_prefixes": list(scope.path_prefixes),
+                "exclusive_write": True,
+            }
+            for scope in cls.SCOPES
+        ]
+        locks.append(
+            {
+                "lock_id": "verifier",
+                "worker": "verifier",
+                "owner_scope": "checks, browser proof, and review artifacts",
+                "path_prefixes": ["verification", "browser_proof", "reports"],
+                "exclusive_write": False,
+            }
+        )
+        return locks
 
     @classmethod
     def validate_non_conflicting(cls, file_changes: list[DraftAction]) -> dict[str, object]:
@@ -119,4 +143,5 @@ class AgentWorkerManager:
             "ok": not conflicts,
             "conflicts": conflicts,
             "owners": {path: edits[0]["owner"] for path, edits in by_path.items() if edits},
+            "ownership_locks": cls.ownership_locks(),
         }

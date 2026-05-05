@@ -8,7 +8,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.models.domain import RunRecord
+from app.models.domain import JobRecord, PreviewRecord, RunRecord
 from app.services.repair_catalog import RepairCatalog
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.tool_protocol import TOOL_PROTOCOL_VERSION, canonical_tool_name, tool_envelope
@@ -112,6 +112,175 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert any(item["rule_id"] == "block_destructive" for item in permissions["items"])
     assert lsp["status"] in {"passed", "failed"}
     assert patch_preflight["status"] == "passed"
+
+
+def test_workspace_creation_does_not_start_preview_before_generated_app_exists(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Preview Lock Guard",
+            "description": "Avoid starting preview on the blank template",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+
+    preview = app.state.container.preview_service.peek(workspace["workspace_id"])
+
+    assert preview.status == "stopped"
+    assert preview.stage == "idle"
+    assert preview.proxy_port is None
+    assert not any("Preview ensure requested" in item for item in preview.logs)
+
+
+def test_local_preview_reconciles_live_process_without_resetting_to_stopped(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    workspace = TestClient(app).post(
+        "/workspaces",
+        json={
+            "name": "Local Preview Reconcile",
+            "description": "Restore live local preview state",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    preview = PreviewRecord(
+        workspace_id=workspace["workspace_id"],
+        runtime_mode="local",
+        status="starting",
+        stage="starting",
+        proxy_port=None,
+        url=None,
+        project_name=None,
+    )
+    container = app.state.container
+    container.store.upsert("previews", workspace["workspace_id"], preview.model_dump(mode="json"))
+    container.preview_service.runtime_manager.local_process_port = lambda workspace_id: 16666  # type: ignore[method-assign]
+    container.preview_service._http_preview_ready = lambda url: url == "http://localhost:16666"  # type: ignore[method-assign]
+
+    reconciled = container.preview_service.get(workspace["workspace_id"])
+
+    assert reconciled.status == "running"
+    assert reconciled.stage == "running"
+    assert reconciled.proxy_port == 16666
+    assert reconciled.url == "http://localhost:16666"
+
+
+def test_local_preview_port_selection_does_not_probe_docker(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    workspace = TestClient(app).post(
+        "/workspaces",
+        json={
+            "name": "Local Port Selection",
+            "description": "Keep local preview lifecycle independent from docker state",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    container = app.state.container
+    preview = PreviewRecord(
+        workspace_id=workspace["workspace_id"],
+        runtime_mode="local",
+        status="starting",
+        stage="rebuilding",
+        proxy_port=16667,
+        url="http://localhost:16667",
+        project_name="local-preview",
+    )
+
+    container.preview_service.runtime_manager.local_process_port = lambda workspace_id: 16667  # type: ignore[method-assign]
+    container.preview_service.runtime_manager.inspect_containers = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("local preview selection must not inspect docker containers")
+    )
+
+    selected = container.preview_service._select_proxy_port(  # noqa: SLF001
+        workspace["workspace_id"],
+        preview,
+        container.workspace_service.source_dir(workspace["workspace_id"]),
+    )
+
+    assert selected == 16667
+
+
+def test_api_errors_use_typed_envelope(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+
+    response = client.get("/runs/run_missing_for_error_envelope")
+
+    assert response.status_code == 404
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["blocking"] is True
+    assert payload["error"]["code"] == "not_found"
+    assert payload["error"]["retryable"] is False
+    assert payload["error"]["deterministic"] is True
+
+
+def test_run_record_reconciles_from_terminal_artifacts(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    workspace = TestClient(app).post(
+        "/workspaces",
+        json={
+            "name": "Reconcile Workspace",
+            "description": "Run state reconciliation test",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a reconciled workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+        status="running",
+        apply_status="pending",
+        current_stage="refreshing preview",
+        progress_percent=99,
+    )
+    job = JobRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt=run.prompt,
+        status="completed",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        generation_mode="fast",
+        linked_run_id=run.run_id,
+        outcome_kind="applied",
+        token_usage={"total_tokens": 123, "turn_count": 2},
+    )
+    run.linked_job_id = job.job_id
+    terminal = run.model_copy(deep=True)
+    terminal.status = "completed"
+    terminal.apply_status = "applied"
+    terminal.current_stage = "completed"
+    terminal.progress_percent = 100
+    terminal.token_usage = {"total_tokens": 123, "turn_count": 2}
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.store.upsert("jobs", job.job_id, job.model_dump(mode="json"))
+    app.state.container.store.upsert(
+        "reports",
+        f"run_artifacts:{run.run_id}",
+        {
+            "run": terminal.model_dump(mode="json"),
+            "job": job.model_dump(mode="json"),
+            "diff": "diff --git a/miniapp/app/main.py b/miniapp/app/main.py\n",
+            "check_results": [],
+        },
+    )
+
+    reconciled = app.state.container.run_service.get_run(run.run_id)
+    persisted = app.state.container.store.get("runs", run.run_id)
+
+    assert reconciled.status == "completed"
+    assert reconciled.apply_status == "applied"
+    assert reconciled.progress_percent == 100
+    assert reconciled.token_usage["total_tokens"] == 123
+    assert persisted["status"] == "completed"
 
 
 def test_reliability_gate_final_report_and_repair_catalog(tmp_path: Path) -> None:

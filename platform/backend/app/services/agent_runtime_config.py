@@ -60,7 +60,7 @@ class TimeoutProfile:
             openai_read_sec=_env_float("OPENAI_READ_TIMEOUT_SEC", 300.0),
             openai_write_sec=_env_float("OPENAI_WRITE_TIMEOUT_SEC", 300.0),
             openai_pool_sec=_env_float("OPENAI_POOL_TIMEOUT_SEC", 120.0),
-            preview_start_sec=_env_int("PREVIEW_START_TIMEOUT_SEC", 1200),
+            preview_start_sec=_env_int("PREVIEW_START_TIMEOUT_SEC", 120),
         )
 
 

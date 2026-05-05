@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import PurePosixPath
 import os
@@ -40,6 +41,7 @@ from app.services.workspace.service import WorkspaceService
 ROLE_ORDER = ("client", "specialist", "manager")
 ROLE_SCOPE = set(ROLE_ORDER)
 ACTIVE_RUN_RECOVERY_STALE_SECONDS = int(os.getenv("ACTIVE_RUN_RECOVERY_STALE_SECONDS", "3600"))
+TERMINAL_RUN_STATUSES = {"completed", "blocked", "failed", "awaiting_approval"}
 MEANINGFUL_DIFF_IGNORED_PARTS = {
     ".git",
     "node_modules",
@@ -170,6 +172,8 @@ class RunService:
         )
         focused_edit_kind = WorkspaceCodeAgentRuntime._focused_edit_kind(contract_probe)
         prompt_analysis: dict[str, Any] | None = None
+        prompt_analysis_usage: dict[str, Any] = {}
+        prompt_analysis_model: str | None = None
         requires_prompt_analysis = resolved_intent == "create" or focused_edit_kind == "behavior_workflow_edit"
         if requires_prompt_analysis:
             if not self.openai_client.enabled:
@@ -183,6 +187,8 @@ class RunService:
                     generation_mode=effective_generation_mode,
                     model_profile=effective_model_profile,
                 )
+            prompt_analysis_usage = dict((prompt_analysis or {}).pop("_llm_usage", {}) or {})
+            prompt_analysis_model = str((prompt_analysis or {}).pop("_llm_model", "") or "") or None
         acceptance_contract = build_acceptance_contract(
             prompt=request.prompt,
             intent=resolved_intent,
@@ -214,6 +220,7 @@ class RunService:
             model_profile=effective_model_profile,
             generation_mode=effective_generation_mode,
             llm_provider=(self.openai_client.configuration().get("routing") or {}).get("provider") if self.openai_client.enabled else None,
+            llm_model=prompt_analysis_model,
             resume_from_run_id=request.resume_from_run_id,
             source_revision_id=workspace.current_revision_id,
             error_context=request.error_context,
@@ -230,6 +237,7 @@ class RunService:
             current_stage="queued",
             progress_percent=2,
             storage_version=2,
+            token_usage=self._token_usage_from_prompt_analysis(prompt_analysis_usage),
         )
         run.implementation_plan = implementation_plan
         if acceptance_contract.get("required"):
@@ -695,6 +703,11 @@ class RunService:
         if isinstance(existing, dict):
             existing_usage = existing.get("token_usage") if isinstance(existing.get("token_usage"), dict) else {}
             run.token_usage = self._richer_token_usage(run.token_usage, existing_usage)
+            successful_clear = run.status == "completed" and run.apply_status == "applied"
+            if not successful_clear:
+                for attr in ("failure_reason", "failure_class", "failure_signature", "root_cause_summary"):
+                    if not getattr(run, attr, None) and existing.get(attr):
+                        setattr(run, attr, str(existing.get(attr) or ""))
             if not run.linked_job_id and existing.get("linked_job_id"):
                 run.linked_job_id = str(existing.get("linked_job_id") or "")
             for attr in ("orchestration_phases", "worker_summaries", "repair_issue_signatures", "agent_activity_events"):
@@ -800,6 +813,19 @@ class RunService:
             return False
         usage_keys = {"input_tokens", "output_tokens", "reasoning_tokens", "total_tokens", "turn_count", "last_turn"}
         return any(key in usage for key in usage_keys)
+
+    @staticmethod
+    def _token_usage_from_prompt_analysis(usage: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(usage, dict) or not usage:
+            return {}
+        result: dict[str, Any] = {"turn_count": 1, "prompt_analysis": dict(usage)}
+        for key in ("input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"):
+            try:
+                result[key] = int(usage.get(key) or 0)
+            except (TypeError, ValueError):
+                result[key] = 0
+        result["last_turn"] = dict(usage)
+        return result
 
     @staticmethod
     def _budget_status_with_token_usage(budget_status: dict[str, Any] | None, token_usage: dict[str, Any] | None) -> dict[str, Any]:
@@ -916,6 +942,8 @@ class RunService:
                 if not getattr(run, attr, None) and getattr(job, attr, None):
                     setattr(run, attr, dict(getattr(job, attr) or {}))
                     changed = True
+        if self._reconcile_terminal_run_state_from_authoritative_records(run, job):
+            changed = True
         synced_budget_status = self._budget_status_with_token_usage(run.budget_status, run.token_usage)
         if synced_budget_status != run.budget_status:
             run.budget_status = synced_budget_status
@@ -933,6 +961,174 @@ class RunService:
             run.updated_at = datetime.now(timezone.utc)
             self._save_run(run)
         return run
+
+    def _reconcile_terminal_run_state_from_authoritative_records(
+        self,
+        run: RunRecord,
+        job: JobRecord | None,
+    ) -> bool:
+        """Repair stale active run rows from terminal job/artifact snapshots.
+
+        The platform stores heavy run evidence separately from the indexed run
+        row. A preview refresh can complete after artifacts/job have already
+        reached a terminal state, so reads must reconcile the indexed row before
+        the UI/API decides gate status.
+        """
+        if run.status in TERMINAL_RUN_STATUSES and run.apply_status != "pending":
+            return False
+        source = self._terminal_run_snapshot_from_artifacts(run.run_id)
+        source_reason = "run_artifacts"
+        if source is None:
+            source = self._terminal_run_snapshot_from_job(run, job)
+            source_reason = "linked_job"
+        if source is None:
+            return False
+        before = {
+            "status": run.status,
+            "apply_status": run.apply_status,
+            "current_stage": run.current_stage,
+            "updated_at": run.updated_at.isoformat(),
+        }
+        changed = self._merge_terminal_run_snapshot(run, source)
+        if not changed:
+            return False
+        run.updated_at = datetime.now(timezone.utc)
+        self.store.upsert(
+            "reports",
+            f"run_state_reconciliation:{run.run_id}",
+            {
+                "run_id": run.run_id,
+                "workspace_id": run.workspace_id,
+                "source": source_reason,
+                "before": before,
+                "after": {
+                    "status": run.status,
+                    "apply_status": run.apply_status,
+                    "current_stage": run.current_stage,
+                    "updated_at": run.updated_at.isoformat(),
+                },
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return True
+
+    def _terminal_run_snapshot_from_artifacts(self, run_id: str) -> RunRecord | None:
+        payload = self.store.get("reports", f"run_artifacts:{run_id}")
+        if not isinstance(payload, dict):
+            return None
+        candidate = payload.get("run")
+        if not isinstance(candidate, dict):
+            return None
+        try:
+            snapshot = RunRecord.model_validate(candidate)
+        except Exception:
+            return None
+        if snapshot.run_id != run_id:
+            return None
+        if snapshot.status not in TERMINAL_RUN_STATUSES:
+            return None
+        if snapshot.status == "completed" and snapshot.apply_status != "applied":
+            return None
+        if snapshot.status == "awaiting_approval" and snapshot.apply_status != "awaiting_approval":
+            return None
+        return snapshot
+
+    def _terminal_run_snapshot_from_job(self, run: RunRecord, job: JobRecord | None) -> RunRecord | None:
+        if job is None or job.status not in {"completed", "blocked", "failed"}:
+            return None
+        snapshot = run.model_copy(deep=True)
+        snapshot.linked_job_id = job.job_id
+        snapshot.summary = job.summary or snapshot.summary
+        snapshot.failure_reason = job.failure_reason
+        snapshot.failure_class = job.failure_class
+        snapshot.failure_signature = job.failure_signature
+        snapshot.root_cause_summary = job.root_cause_summary
+        snapshot.outcome_kind = job.outcome_kind or snapshot.outcome_kind
+        snapshot.current_fix_phase = job.current_fix_phase or snapshot.current_fix_phase
+        snapshot.current_failing_command = job.current_failing_command or snapshot.current_failing_command
+        snapshot.current_exit_code = job.current_exit_code if job.current_exit_code is not None else snapshot.current_exit_code
+        snapshot.remaining_issues = list(job.remaining_issues or snapshot.remaining_issues)
+        snapshot.token_usage = self._richer_token_usage(self._richer_token_usage(snapshot.token_usage, job.token_usage), self._token_usage_from_job_events(job))
+        snapshot.latency_breakdown = dict(job.latency_breakdown or snapshot.latency_breakdown)
+        snapshot.iteration_count = max(int(snapshot.iteration_count or 0), len(job.repair_iterations or []))
+        snapshot.repair_iterations = list(job.repair_iterations or snapshot.repair_iterations)
+        snapshot.repair_issue_signatures = list(job.repair_issue_signatures or snapshot.repair_issue_signatures)
+        snapshot.acceptance_contract = dict(job.acceptance_contract or snapshot.acceptance_contract)
+        snapshot.browser_flow_proof = dict(job.browser_flow_proof or snapshot.browser_flow_proof)
+        snapshot.mobile_layout_report = dict(job.mobile_layout_report or snapshot.mobile_layout_report)
+        snapshot.flow_coverage = dict(job.flow_coverage or snapshot.flow_coverage)
+        if job.status == "completed":
+            applied_by_job = str(job.outcome_kind or "") == "applied" or bool((job.apply_result or {}).get("revision_id"))
+            applied_by_run = run.apply_status == "applied"
+            awaiting_review = run.apply_strategy == "manual_approve" and run.apply_status == "awaiting_approval"
+            if applied_by_job or applied_by_run:
+                snapshot.status = "completed"
+                snapshot.apply_status = "applied"
+                snapshot.current_stage = "completed"
+                snapshot.progress_percent = 100
+            elif awaiting_review:
+                snapshot.status = "awaiting_approval"
+                snapshot.apply_status = "awaiting_approval"
+                snapshot.current_stage = "awaiting review"
+                snapshot.progress_percent = 99
+            else:
+                return None
+        elif job.status == "blocked":
+            snapshot.status = "blocked"
+            snapshot.apply_status = "blocked"
+            snapshot.current_stage = "blocked"
+            snapshot.progress_percent = self._terminal_failure_progress(snapshot.progress_percent)
+        else:
+            snapshot.status = "failed"
+            snapshot.apply_status = "failed"
+            snapshot.current_stage = "failed"
+            snapshot.progress_percent = self._terminal_failure_progress(snapshot.progress_percent)
+        return snapshot
+
+    def _merge_terminal_run_snapshot(self, run: RunRecord, snapshot: RunRecord) -> bool:
+        changed = False
+        protected = {"run_id", "workspace_id", "prompt", "created_at"}
+        always = {
+            "status",
+            "apply_status",
+            "draft_status",
+            "draft_ready",
+            "approval_required",
+            "current_stage",
+            "progress_percent",
+            "summary",
+            "failure_reason",
+            "failure_class",
+            "failure_signature",
+            "root_cause_summary",
+            "outcome_kind",
+            "linked_job_id",
+            "result_revision_id",
+            "candidate_revision_id",
+            "checks_summary",
+            "latency_breakdown",
+            "token_usage",
+            "budget_status",
+            "browser_flow_proof",
+            "mobile_layout_report",
+            "preview_refresh_status",
+        }
+        for field in RunRecord.model_fields:
+            if field in protected:
+                continue
+            value = copy.deepcopy(getattr(snapshot, field))
+            current = getattr(run, field)
+            if field == "token_usage":
+                value = self._richer_token_usage(value, current)
+            should_copy = field in always or not self._empty_observability_value(value) or self._empty_observability_value(current)
+            if should_copy and current != value:
+                setattr(run, field, value)
+                changed = True
+        return changed
+
+    @staticmethod
+    def _empty_observability_value(value: Any) -> bool:
+        return value is None or value == "" or value == [] or value == {}
 
     @staticmethod
     def _failed_run_has_retained_draft(run: RunRecord) -> bool:
@@ -1810,6 +2006,8 @@ class RunService:
                 if key in {"status", "stage", "progress_percent", "runtime_mode", "url", "role_urls", "draft_run_id"}
             },
             "latency_breakdown": job.latency_breakdown,
+            "token_usage": run.token_usage,
+            "token_usage_status": "recorded" if run.token_usage else "not_recorded",
             "retrieval_stats": job.retrieval_stats,
             "cache_stats": job.cache_stats,
             "apply_result": job.apply_result,

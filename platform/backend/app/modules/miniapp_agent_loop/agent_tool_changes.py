@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from app.models.domain import DraftAction
+from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.agent_worker_manager import AgentWorkerManager
 
 
-MUTATING_AGENT_TOOLS = {"apply_patch_to_draft", "write_file"}
+MUTATING_AGENT_TOOLS = {"apply_patch_to_draft", "write_file", "edit_file_exact"}
 
 
 def is_mutating_agent_tool_call(request_item: dict[str, Any]) -> bool:
@@ -18,6 +19,7 @@ def file_changes_from_mutating_tool_calls(
     *,
     default_worker_id: str | None = None,
     default_owner_scope: str | None = None,
+    read_text_file: Callable[[str], str | None] | None = None,
 ) -> tuple[list[DraftAction], list[dict[str, object]]]:
     file_changes: list[DraftAction] = []
     trace: list[dict[str, object]] = []
@@ -47,6 +49,56 @@ def file_changes_from_mutating_tool_calls(
                     reason=reason,
                 )
             )
+        elif tool == "edit_file_exact":
+            path_safe = _is_safe_exact_path(file_path)
+            current = read_text_file(file_path) if read_text_file is not None and path_safe else None
+            old_string = str(request_item.get("old_string") or "")
+            new_string = str(request_item.get("new_string") or "")
+            replace_all = bool(request_item.get("replace_all") or False)
+            exact_failure = _exact_edit_failure(
+                file_path=file_path,
+                current=current,
+                old_string=old_string,
+                replace_all=replace_all,
+            )
+            if exact_failure is not None:
+                code, message, evidence = exact_failure
+                packet = AgentEditValidator.repair_packet_for_issue(
+                    code=code,
+                    message=message,
+                    file_changes=[
+                        DraftAction(file_path=file_path or "miniapp/invalid_exact_edit", operation="replace", content="invalid exact edit", reason=reason)
+                    ],
+                    evidence=evidence,
+                )
+                trace.append(
+                    {
+                        "tool": tool,
+                        "tool_use_id": str(request_item.get("tool_use_id") or ""),
+                        "status": "failed",
+                        "failure_class": packet.get("failure_class"),
+                        "failure_signature": packet.get("failure_signature"),
+                        "error_code": code,
+                        "message": message,
+                        "file_path": file_path,
+                        "worker_id": worker_id,
+                        "owner_scope": owner_scope,
+                        "reason": reason,
+                        "repair_packet": packet,
+                        "required_next_action": "Read the exact target file, then retry edit_file_exact with a unique old_string or use write_file.",
+                    }
+                )
+                continue
+            assert current is not None
+            updated = current.replace(old_string, new_string) if replace_all else current.replace(old_string, new_string, 1)
+            file_changes.append(
+                DraftAction(
+                    file_path=file_path,
+                    operation="replace",
+                    content=updated,
+                    reason=reason,
+                )
+            )
         else:
             file_changes.append(
                 DraftAction(
@@ -68,6 +120,32 @@ def file_changes_from_mutating_tool_calls(
             }
         )
     return file_changes, trace
+
+
+def _is_safe_exact_path(file_path: str) -> bool:
+    normalized = str(file_path or "").replace("\\", "/")
+    return bool(normalized and normalized.startswith("miniapp/") and not normalized.startswith(("/", "~")) and ".." not in normalized.split("/"))
+
+
+def _exact_edit_failure(
+    *,
+    file_path: str,
+    current: str | None,
+    old_string: str,
+    replace_all: bool,
+) -> tuple[str, str, dict[str, object]] | None:
+    if not _is_safe_exact_path(file_path):
+        return ("unsafe_path", "Exact edit must target a relative file path inside miniapp/.", {})
+    if current is None:
+        return ("file_missing", f"{file_path} could not be read before exact edit.", {"target_files": [file_path]})
+    if not old_string:
+        return ("old_string_not_found", f"{file_path} exact edit requires a non-empty old_string.", {"target_files": [file_path]})
+    count = current.count(old_string)
+    if count == 0:
+        return ("old_string_not_found", f"{file_path} old_string was not found exactly.", {"target_files": [file_path], "old_string_length": len(old_string)})
+    if count > 1 and not replace_all:
+        return ("multiple_matches", f"{file_path} old_string matched {count} times; make it unique or set replace_all.", {"target_files": [file_path], "match_count": count})
+    return None
 
 
 def _strip_leading_dot_slash(raw_path: object) -> str:
