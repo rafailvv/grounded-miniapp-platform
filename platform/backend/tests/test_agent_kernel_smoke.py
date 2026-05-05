@@ -40,7 +40,7 @@ from app.modules.workspace_code_agent_runtime.process_recovery import AgentProce
 from app.modules.workspace_code_agent_runtime.prompt_contract import agent_system_prompt
 from app.modules.workspace_code_agent_runtime.runtime import WorkspaceCodeAgentRuntime
 from app.services.check_runner import CheckRunner
-from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer
+from app.services.miniapp_contract import MiniAppContractCompiler
 from app.services.repair_catalog import RepairCatalog
 from app.services.workspace.run_service import RunService
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, extract_prompt_planning_hints
@@ -48,7 +48,7 @@ from app.services.workflow_acceptance import build_acceptance_contract, build_im
 
 def _prompt_analysis(
     *,
-    resource: str = "заявка",
+    resource: str = "ресурс",
     client: list[str] | None = None,
     specialist: list[str] | None = None,
     manager: list[str] | None = None,
@@ -79,7 +79,7 @@ def _contract_with_analysis(
     prompt: str,
     *,
     generation_mode: GenerationMode = GenerationMode.FAST,
-    resource: str = "заявка",
+    resource: str = "ресурс",
     client: list[str] | None = None,
     specialist: list[str] | None = None,
     manager: list[str] | None = None,
@@ -120,17 +120,18 @@ def test_quality_create_prompt_with_error_states_stays_quality_mode() -> None:
 
 def test_prompt_planning_hints_extract_role_fields_from_colon_and_action_sentences() -> None:
     hints = extract_prompt_planning_hints(
-        "Клиент оставляет заявку: компания, офис, категория материалов, количество, бюджет, срок поставки, контакт и комментарий. "
-        "Специалист видит заявку, подбирает поставщика, уточняет наличие, цену, срок доставки, замену при отсутствии и рабочий статус. "
-        "Менеджер контролирует бюджет и срочность, назначает приоритет, утверждает лимит или замену, оставляет управленческий комментарий.",
+        "Клиент описывает поставку: компания, офис, категория материалов, количество, бюджет, срок поставки, контакт и комментарий. "
+        "Специалист видит поставку, подбирает поставщика, уточняет наличие, цену, срок доставки, замену при отсутствии и рабочий статус. "
+        "Менеджер контролирует бюджет и срочность, назначает приоритет, фиксирует лимит или замену, оставляет управленческий комментарий.",
         prompt_analysis=_prompt_analysis(
+            resource="поставка",
             client=["компания", "офис", "категория материалов", "количество", "бюджет", "срок поставки", "контакт", "комментарий"],
             specialist=["поставщика", "наличие", "цену", "срок доставки", "замену при отсутствии", "рабочий статус"],
             manager=["приоритет", "лимит", "управленческий комментарий"],
         ),
     )
 
-    assert hints["resource_hint"] == "заявка"
+    assert hints["resource_hint"] == "поставка"
     assert hints["role_field_hints"]["client"][:4] == [
         "компания",
         "офис",
@@ -145,11 +146,12 @@ def test_prompt_planning_hints_extract_role_fields_from_colon_and_action_sentenc
 
 def test_prompt_planning_hints_do_not_turn_workflow_actions_into_form_fields() -> None:
     hints = extract_prompt_planning_hints(
-        "Клиент: HR-менеджер оставляет заявку на обучение: компания, подразделение, тема обучения, количество участников, бюджет, контакт. "
-        "Специалист: методист обрабатывает заявку: программа, тренер, стоимость, доступные даты, рабочий статус. "
+        "Клиент: HR-менеджер описывает обучение: компания, подразделение, тема обучения, количество участников, бюджет, контакт. "
+        "Специалист: методист готовит обучение: программа, тренер, стоимость, доступные даты, рабочий статус. "
         "Менеджер: руководитель согласует: приоритет, лимит бюджета, итоговое решение. "
-        "Нужно приложение с ролями /client, /specialist, /manager: создание заявки, список заявок, выбор заявки специалистом и менеджером, обновление статуса, сохранение данных после перезагрузки.",
+        "Нужно приложение с ролями /client, /specialist, /manager: создание карточки обучения, список карточек, выбор карточки специалистом и менеджером, обновление состояния, сохранение данных после перезагрузки.",
         prompt_analysis=_prompt_analysis(
+            resource="обучение",
             client=["компания", "подразделение", "тема обучения", "количество участников", "бюджет", "контакт"],
             specialist=["программа", "тренер", "стоимость", "доступные даты", "рабочий статус"],
             manager=["приоритет", "лимит бюджета", "итоговое решение"],
@@ -167,20 +169,21 @@ def test_prompt_planning_hints_do_not_turn_workflow_actions_into_form_fields() -
     assert "приоритет" in hints["role_field_hints"]["manager"]
     assert "компания" not in hints["role_field_hints"]["manager"]
     assert "контакт" not in hints["role_field_hints"]["manager"]
-    assert "создание заявки" not in all_fields
-    assert "список заявок" not in all_fields
-    assert "выбор заявки специалистом" not in all_fields
+    assert "создание карточки обучения" not in all_fields
+    assert "список карточек" not in all_fields
+    assert "выбор карточки специалистом" not in all_fields
     assert "менеджером" not in all_fields
 
 
 def test_prompt_planning_hints_skip_actor_action_and_mode_instruction_fields() -> None:
     hints = extract_prompt_planning_hints(
-        "Клиент: HR-менеджер оставляет заявку на корпоративное обучение, указывает компанию, количество участников, тему обучения, желаемые даты, формат, бюджет и комментарий. "
-        "Специалист: методист видит заявку, подбирает программу, тренера, длительность, стоимость, материалы и рабочий статус. "
-        "Менеджер: руководитель видит все заявки и результат методиста, назначает приоритет, утверждает лимит бюджета, выбирает финальные даты и оставляет управленческий комментарий. "
+        "Клиент: HR-менеджер описывает корпоративное обучение, указывает компанию, количество участников, тему обучения, желаемые даты, формат, бюджет и комментарий. "
+        "Специалист: методист видит обучение, подбирает программу, тренера, длительность, стоимость, материалы и рабочий статус. "
+        "Менеджер: руководитель видит все карточки обучения и результат методиста, назначает приоритет, фиксирует лимит бюджета, выбирает финальные даты и оставляет управленческий комментарий. "
         "Balanced режим: сделай дизайн лучше fast, метрики для менеджера, состояния empty/loading/error/success. "
-        "Строго используй contract-owned schema/routes/field keys из miniapp/app/generated/miniapp_contract.json; не создавай English aliases и не меняй /status route.",
+        "Техническую инструкцию про generated metadata не добавляй как поле.",
         prompt_analysis=_prompt_analysis(
+            resource="обучение",
             client=["компанию", "количество участников", "тему обучения", "желаемые даты", "формат", "бюджет", "комментарий"],
             specialist=["программу", "тренера", "длительность", "стоимость", "материалы", "рабочий статус"],
             manager=["приоритет", "лимит бюджета", "финальные даты", "управленческий комментарий"],
@@ -194,9 +197,9 @@ def test_prompt_planning_hints_skip_actor_action_and_mode_instruction_fields() -
     }
     manager_fields = set(hints["role_field_hints"]["manager"])
 
-    assert "HR-менеджер оставляет заявку на обучение" not in all_fields
-    assert "методист видит заявку" not in all_fields
-    assert "руководитель видит все заявки" not in all_fields
+    assert "HR-менеджер описывает обучение" not in all_fields
+    assert "методист видит обучение" not in all_fields
+    assert "руководитель видит все карточки обучения" not in all_fields
     assert "на обучение" not in all_fields
     assert "на корпоративное обучение" not in all_fields
     assert "компанию" in hints["role_field_hints"]["client"]
@@ -205,7 +208,7 @@ def test_prompt_planning_hints_skip_actor_action_and_mode_instruction_fields() -
     assert "лимит бюджета" in hints["role_field_hints"]["manager"]
     assert not any("отклоняет" in field for field in all_fields)
     assert not any("Balanced режим" in field for field in manager_fields)
-    assert not any("contract-owned" in field for field in all_fields)
+    assert not any("generated metadata" in field for field in all_fields)
 
 
 def test_agent_prompt_is_tool_loop_contract_not_domain_template() -> None:
@@ -222,7 +225,7 @@ def test_agent_prompt_is_tool_loop_contract_not_domain_template() -> None:
     assert "role entries must include a root field" in prompt
     assert "return the persisted fields at the top level" in prompt
     assert "miniapp/app/generated/miniapp_contract.json" in prompt
-    assert "Do not invent parallel English aliases" in prompt
+    assert "keep names consistent across backend, JS payloads, renderers, and tests" in prompt
 
 
 def test_implementation_plan_has_prompt_derived_routeable_screen_intents() -> None:
@@ -282,13 +285,14 @@ def test_acceptance_contract_carries_prompt_field_hints() -> None:
 
 def test_acceptance_contract_splits_role_owned_fields_and_resource_hint() -> None:
     prompt = (
-        "Клиент создает заявку, указывает компанию, телефон и бюджет. "
+        "Клиент создает проект, указывает компанию, телефон и бюджет. "
         "Специалист назначает материалы, рассчитывает стоимость и добавляет комментарий цеха. "
         "Менеджер может пометить приоритет и добавить управленческий комментарий."
     )
 
     contract = _contract_with_analysis(
         prompt,
+        resource="проект",
         client=["компанию", "телефон", "бюджет"],
         specialist=["материалы", "стоимость", "комментарий цеха"],
         manager=["приоритет", "управленческий комментарий"],
@@ -298,18 +302,19 @@ def test_acceptance_contract_splits_role_owned_fields_and_resource_hint() -> Non
     assert role_fields["client"] == ["компанию", "телефон", "бюджет"]
     assert "материалы" in role_fields["specialist"]
     assert "управленческий комментарий" in role_fields["manager"]
-    assert contract["api_contract"]["resource_hint"] == "заявка"
+    assert contract["api_contract"]["resource_hint"] == "проект"
 
 
 def test_acceptance_contract_does_not_merge_followup_visibility_sentence_into_client_fields() -> None:
     prompt = (
-        "Клиент создает заявку, указывает компанию, бюджет и комментарий. "
+        "Клиент создает проект, указывает компанию, бюджет и комментарий. "
         "Видит статус, расчет стоимости и дату визита после перезагрузки. "
         "Специалист рассчитывает стоимость и добавляет комментарий бригады."
     )
 
     contract = _contract_with_analysis(
         prompt,
+        resource="проект",
         client=["компанию", "бюджет", "комментарий"],
         specialist=["стоимость", "комментарий бригады"],
     )
@@ -320,22 +325,22 @@ def test_acceptance_contract_does_not_merge_followup_visibility_sentence_into_cl
 
 def test_frontend_prompt_specificity_blocks_generic_scaffold(tmp_path: Path) -> None:
     prompt = (
-        "Клиент создает заказ на офисный ланч, указывает компанию, адрес, дату, количество персон, "
+        "Клиент планирует офисный ланч, указывает компанию, адрес, дату, количество персон, "
         "бюджет, предпочтения по меню и комментарий. Специалист назначает меню, ставит статус "
         "приготовления/доставки, добавляет комментарий кухни и время готовности. Менеджер видит "
         "выручку, средний чек, проблемные задержки и управленческий комментарий."
     )
     contract = _contract_with_analysis(
         prompt,
-        resource="заказ",
+        resource="ланч",
         client=["компания", "адрес", "дату", "количество персон", "бюджет", "предпочтения по меню", "комментарий"],
         specialist=["меню", "статус приготовления/доставки", "комментарий кухни", "время готовности"],
         manager=["выручку", "средний чек", "проблемные задержки", "управленческий комментарий"],
     )
     role_text = {
-        "client": "<h1>Create Видит</h1><label>Title <input name='title'></label><label>Note <textarea name='note'></textarea></label><h2>Shared records</h2>",
-        "specialist": "<h1>Process Видит</h1><button>Update status</button><h2>Shared records</h2>",
-        "manager": "<h1>Review Видит</h1><button>Update status</button><h2>Shared records</h2>",
+        "client": "<h1>Create Видит</h1><label>Title <input name='title'></label><label>Note <textarea name='note'></textarea></label><h2>Saved records</h2>",
+        "specialist": "<h1>Process Видит</h1><button>Update state</button><h2>Saved records</h2>",
+        "manager": "<h1>Inspect Видит</h1><button>Update state</button><h2>Saved records</h2>",
     }
 
     issues = CheckRunner._frontend_prompt_specificity_issues(
@@ -353,22 +358,22 @@ def test_frontend_prompt_specificity_blocks_generic_scaffold(tmp_path: Path) -> 
 
 def test_frontend_prompt_specificity_accepts_prompt_owned_surfaces(tmp_path: Path) -> None:
     prompt = (
-        "Клиент создает заказ на офисный ланч, указывает компанию, адрес, дату, количество персон, "
+        "Клиент планирует офисный ланч, указывает компанию, адрес, дату, количество персон, "
         "бюджет, предпочтения по меню и комментарий. Специалист назначает меню, ставит статус "
         "приготовления/доставки, добавляет комментарий кухни и время готовности. Менеджер видит "
         "выручку, средний чек, проблемные задержки, требует внимания и управленческий комментарий."
     )
     contract = _contract_with_analysis(
         prompt,
-        resource="заказ",
+        resource="ланч",
         client=["компания", "адрес", "дата", "количество персон", "бюджет", "предпочтения по меню", "комментарий"],
         specialist=["меню", "статус приготовления", "доставка", "комментарий кухни", "время готовности"],
         manager=["выручка", "средний чек", "проблемные задержки", "требует внимания", "управленческий комментарий"],
     )
     role_text = {
         "client": "Компания Адрес Дата Количество персон Бюджет Предпочтения по меню Комментарий Офисный ланч",
-        "specialist": "Назначить меню Статус приготовления Доставка Комментарий кухни Время готовности Новые заказы",
-        "manager": "Выручка Средний чек Проблемные задержки Требует внимания Управленческий комментарий Заказы",
+        "specialist": "Назначить меню Статус приготовления Доставка Комментарий кухни Время готовности Новые позиции",
+        "manager": "Выручка Средний чек Проблемные задержки Требует внимания Управленческий комментарий Позиции",
     }
 
     issues = CheckRunner._frontend_prompt_specificity_issues(
@@ -391,12 +396,12 @@ def test_frontend_prompt_specificity_requires_visible_client_form_fields(tmp_pat
     role_text = {
         "client": "Компания Адрес Материалы Комментарий const FIELD_LABELS = { materials: 'Материалы', comment: 'Комментарий' }",
         "specialist": "Статус Материалы Комментарий",
-        "manager": "Статус заявки",
+        "manager": "Статус позиции",
     }
     role_html = {
         "client": "<form><label>компания<input name='company'></label><label>адрес<input name='address'></label></form>",
         "specialist": "Статус Материалы Комментарий",
-        "manager": "Статус заявки",
+        "manager": "Статус позиции",
     }
 
     issues = CheckRunner._frontend_prompt_specificity_issues(
@@ -412,12 +417,13 @@ def test_frontend_prompt_specificity_requires_visible_client_form_fields(tmp_pat
 
 def test_frontend_prompt_specificity_blocks_role_fields_in_client_form(tmp_path: Path) -> None:
     prompt = (
-        "Клиент создает заявку, указывает компанию, телефон и бюджет. "
+        "Клиент создает проект, указывает компанию, телефон и бюджет. "
         "Специалист добавляет комментарий цеха и дату готовности. "
         "Менеджер может пометить приоритет."
     )
     contract = _contract_with_analysis(
         prompt,
+        resource="проект",
         client=["компания", "телефон", "бюджет"],
         specialist=["комментарий цеха", "дату готовности"],
         manager=["приоритет"],
@@ -451,11 +457,12 @@ def test_frontend_prompt_specificity_blocks_role_fields_in_client_form(tmp_path:
 
 def test_frontend_prompt_specificity_allows_client_comment_without_specialist_comment_leak(tmp_path: Path) -> None:
     prompt = (
-        "Клиент создает заявку, указывает компанию, дату и комментарий. "
+        "Клиент создает проект, указывает компанию, дату и комментарий. "
         "Специалист добавляет комментарий бригады и дату визита."
     )
     contract = _contract_with_analysis(
         prompt,
+        resource="проект",
         client=["компания", "дата", "комментарий"],
         specialist=["комментарий бригады", "дата визита"],
     )
@@ -483,11 +490,12 @@ def test_frontend_prompt_specificity_allows_client_comment_without_specialist_co
 
 def test_frontend_prompt_specificity_does_not_confuse_delivery_term_with_supplier(tmp_path: Path) -> None:
     prompt = (
-        "Клиент оставляет заявку: компания, желаемый срок поставки и комментарий. "
+        "Клиент описывает поставку: компания, желаемый срок поставки и комментарий. "
         "Специалист подбирает поставщика и уточняет наличие."
     )
     contract = _contract_with_analysis(
         prompt,
+        resource="поставка",
         client=["компания", "желаемый срок поставки", "комментарий"],
         specialist=["поставщика", "наличие"],
     )
@@ -522,7 +530,7 @@ def test_cross_role_update_visibility_requires_client_renderer(tmp_path: Path) -
     (static_root / "client").mkdir(parents=True)
     role_text = {
         "client": "function itemDetails(item) { return item.status + item.materials; }",
-        "specialist": 'fetch("/api/items/1/status", { method: "PATCH", body: JSON.stringify({ status: "production", calculated_price: "1000", ready_date: "2026-06-05", workshop_comment: "ready" }) });',
+        "specialist": 'fetch("/api/items/1/update", { method: "PATCH", body: JSON.stringify({ status: "production", calculated_price: "1000", ready_date: "2026-06-05", workshop_comment: "ready" }) });',
         "manager": "",
     }
 
@@ -574,11 +582,11 @@ def test_manager_must_render_specialist_result_fields() -> None:
     assert ok is None
 
 
-def test_contract_materializer_manager_surface_has_dashboard_and_quality_css() -> None:
+def test_contract_compiler_preserves_prompt_metadata_without_product_shell() -> None:
     prompt = (
         "Клиент указывает компанию, бюджет и комментарий. "
         "Специалист добавляет программу, тренера и стоимость. "
-        "Менеджер видит результат специалиста, утверждает лимит и согласует заявку."
+        "Менеджер видит результат специалиста, фиксирует лимит и итоговое решение."
     )
     contract = MiniAppContractCompiler.compile(
         workspace_id="ws_test",
@@ -589,41 +597,38 @@ def test_contract_materializer_manager_surface_has_dashboard_and_quality_css() -
         acceptance_contract=_contract_with_analysis(
             prompt,
             generation_mode=GenerationMode.QUALITY,
+            resource="обучение",
             client=["компания", "бюджет", "комментарий"],
             specialist=["программа", "тренер", "стоимость"],
-            manager=["лимит", "согласование"],
+            manager=["лимит", "итоговое решение"],
         ),
     )
 
-    html = MiniAppContractMaterializer._role_html(role="manager", resource=contract.resources[0])
-    js = MiniAppContractMaterializer._role_js(role="manager", resource=contract.resources[0])
-    css = MiniAppContractMaterializer._role_css(role="manager", generation_mode=GenerationMode.QUALITY)
+    resource = contract.resources[0]
 
-    assert set(CheckRunner._role_action_signals("manager", html + "\n" + js + "\n" + css)) == {
-        "dashboard",
-        "oversight_action",
-    }
-    assert CheckRunner._role_design_depth_issue("manager", css, html + "\n" + js, GenerationMode.QUALITY) is None
-    assert "contract-metrics" in html
-    assert "focus-visible" in css
+    assert resource.role_actions["manager"] == ["лимит; итоговое решение"]
+    assert all("miniapp/app/routes/" not in path for path in contract.allowed_file_graph.contract_owned_paths)
+    assert "miniapp/tests/test_generated_app.py" not in contract.allowed_file_graph.blocked_globs
+    assert contract.acceptance_summary["features"]["platform_product_scaffold"] is False
 
 
 def test_role_prompt_update_payload_requires_real_specialist_controls() -> None:
     prompt = (
-        "Клиент создает заявку. Специалист назначает материалы, рассчитывает стоимость, "
+        "Клиент создает проект. Специалист назначает материалы, рассчитывает стоимость, "
         "ставит статус производства, добавляет комментарий цеха и дату готовности. "
         "Менеджер видит приоритет."
     )
     contract = _contract_with_analysis(
         prompt,
+        resource="проект",
         client=[],
         specialist=["материалы", "стоимость", "статус производства", "комментарий цеха", "дата готовности"],
         manager=["приоритет"],
     )
     role_text = {
         "client": "",
-        "specialist": 'const WORKFLOW_FIELDS = { estimated_cost: "расчет стоимости" }; fetch("/api/items/1/status", { method: "PATCH", body: JSON.stringify({ status: "processed", updated_by: ROLE }) });',
-        "manager": '<select id="priority"></select> fetch("/api/items/1/status", { method: "PATCH", body: JSON.stringify({ priority: "high", management_comment: "ok", updated_by: ROLE }) });',
+        "specialist": 'const WORKFLOW_FIELDS = { estimated_cost: "расчет стоимости" }; fetch("/api/items/1/update", { method: "PATCH", body: JSON.stringify({ status: "processed", updated_by: ROLE }) });',
+        "manager": '<select id="priority"></select> fetch("/api/items/1/update", { method: "PATCH", body: JSON.stringify({ priority: "high", management_comment: "ok", updated_by: ROLE }) });',
     }
     role_html = {
         "client": "",
@@ -686,12 +691,12 @@ def test_role_surface_blocks_generic_workflow_copy_and_raw_status_rendering() ->
 def test_hidden_state_class_requires_effective_css_rule() -> None:
     issue = CheckRunner._hidden_state_css_issue(
         "client",
-        '<div id="contract-empty" class="state hidden">Пока нет заявок</div>',
+        '<div id="contract-empty" class="state hidden">Пока нет записей</div>',
         ".state { display: grid; }",
     )
     ok = CheckRunner._hidden_state_css_issue(
         "client",
-        '<div id="contract-empty" class="state hidden">Пока нет заявок</div>',
+        '<div id="contract-empty" class="state hidden">Пока нет записей</div>',
         ".hidden { display: none; }",
     )
 
@@ -732,11 +737,12 @@ def test_role_surface_blocks_visible_http_api_copy_without_blocking_js_methods()
 
 def test_role_prompt_update_payload_accepts_formdata_dynamic_patch_fields() -> None:
     prompt = (
-        "Клиент создает заявку. Специалист назначает бригаду, рассчитывает стоимость, "
+        "Клиент создает проект. Специалист назначает бригаду, рассчитывает стоимость, "
         "добавляет комментарий бригады и дату визита. Менеджер видит приоритет."
     )
     contract = _contract_with_analysis(
         prompt,
+        resource="проект",
         client=[],
         specialist=["бригаду", "стоимость", "комментарий бригады", "дату визита"],
         manager=["приоритет"],
@@ -751,10 +757,10 @@ def test_role_prompt_update_payload_accepts_formdata_dynamic_patch_fields() -> N
             for (const [key, value] of formData.entries()) {
               if (key !== "item_id" && key !== "status") payload[key] = String(value || "");
             }
-            await fetch(`/api/items/${formData.get("item_id")}/status`, { method: "PATCH", body: JSON.stringify(payload) });
+            await fetch(`/api/items/${formData.get("item_id")}/update`, { method: "PATCH", body: JSON.stringify(payload) });
           });
         ''',
-        "manager": '<select id="priority"></select> fetch("/api/items/1/status", { method: "PATCH", body: JSON.stringify({ priority: "high", updated_by: ROLE }) });',
+        "manager": '<select id="priority"></select> fetch("/api/items/1/update", { method: "PATCH", body: JSON.stringify({ priority: "high", updated_by: ROLE }) });',
     }
     role_html = {
         "client": "",
@@ -778,7 +784,7 @@ def test_role_prompt_update_payload_accepts_formdata_dynamic_patch_fields() -> N
 
 def test_frontend_form_field_reads_accept_dynamic_formdata_entries_payload() -> None:
     js_source = '''
-      const form = document.getElementById("contract-create-form");
+      const form = document.getElementById("main-create-form");
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
         const formData = new FormData(form);
@@ -831,11 +837,12 @@ def test_miniapp_contract_uses_prompt_fields_instead_of_items_slug() -> None:
 
 def test_miniapp_contract_uses_role_scoped_fields_and_business_resource_name() -> None:
     prompt = (
-        "Клиент создает заявку, указывает компанию, телефон и бюджет. "
+        "Клиент создает проект, указывает компанию, телефон и бюджет. "
         "Специалист добавляет комментарий цеха и дату готовности."
     )
     acceptance_contract = _contract_with_analysis(
         prompt,
+        resource="проект",
         client=["компанию", "телефон", "бюджет"],
         specialist=["комментарий цеха", "дату готовности"],
     )
@@ -850,12 +857,12 @@ def test_miniapp_contract_uses_role_scoped_fields_and_business_resource_name() -
     )
 
     resource = contract.resources[0]
-    assert "zayav" in resource.slug
-    assert resource.display_name == "Заявка"
+    assert "proekt" in resource.slug
+    assert resource.display_name == "Проект"
     assert set(resource.role_field_labels["client"].values()) == {"компанию", "телефон", "бюджет"}
     assert "комментарий цеха" in set(resource.role_field_labels["specialist"].values())
-    create_endpoint = next(endpoint for endpoint in resource.endpoints if endpoint.method == "POST")
-    assert "kommentariyCeha" not in create_endpoint.request_fields
+    assert resource.endpoints == []
+    assert "kommentariyCeha" not in resource.role_field_labels["client"]
 
 
 def test_repair_catalog_classifies_prompt_specificity_failure() -> None:
@@ -890,7 +897,7 @@ class ContractItemStatusUpdate(BaseModel):
     issues = CheckRunner._frontend_backend_patch_payload_issues(
         "manager",
         js_path,
-        'fetch("/api/items/1/status", { method: "PATCH", body: JSON.stringify({ priority: "Высокий", updated_by: ROLE }) });',
+        'fetch("/api/items/1/update", { method: "PATCH", body: JSON.stringify({ priority: "Высокий", updated_by: ROLE }) });',
         backend_patch_schemas=schemas,
     )
 
@@ -1514,11 +1521,11 @@ def test_balanced_quality_use_serial_contract_runtime_writes() -> None:
     for mode in (GenerationMode.BALANCED, GenerationMode.QUALITY):
         mailbox = AgentWorkerManager.mailbox_for_plan(
             generation_mode=mode,
-            implementation_plan={"contract_runtime_v1": {"enabled": True}},
+            implementation_plan={"prompt_contract_v1": {"enabled": True, "metadata_only": True}},
         )
         prompt_payload = WorkspaceCodeAgentRuntime._worker_branching_prompt_payload(
             generation_mode=mode,
-            implementation_plan={"contract_runtime_v1": {"enabled": True}},
+            implementation_plan={"prompt_contract_v1": {"enabled": True, "metadata_only": True}},
         )
 
         assert mailbox["enabled"] is False
@@ -1538,7 +1545,7 @@ def test_worker_task_planner_builds_self_contained_owner_prompts() -> None:
     assert "client_ui" in by_id
     assert "Own only these paths" in by_id["client_ui"]["prompt"]
     assert "miniapp/app/generated/miniapp_contract.json" in by_id["client_ui"]["prompt"]
-    assert "Do not introduce parallel aliases" in by_id["client_ui"]["prompt"]
+    assert "keep them consistent across backend, JS payloads, renderers, and tests" in by_id["client_ui"]["prompt"]
     assert by_id["client_ui"]["mode_contract"]["depth"] == "deep"
     assert "mobile layout works" in by_id["client_ui"]["self_check"][3]
 

@@ -242,7 +242,7 @@ class AgentToolRegistry:
             kind="mutating",
             concurrency_safe=False,
             activity="checking",
-            progress_label="Synchronizing contract-owned generated files",
+            progress_label="Synchronizing prompt-contract metadata",
         ),
         "ask_user": AgentToolSpec(
             name="ask_user",

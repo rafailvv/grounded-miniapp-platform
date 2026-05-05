@@ -166,7 +166,8 @@ class OpenAIClient:
         system_prompt = (
             "You extract a domain-neutral mini-app contract from a user prompt. "
             "Do not use templates or infer from local lexical lists. Return only valid JSON. "
-            "Use the user's wording for labels. If a detail is not explicit, leave the list empty."
+            "Use the user's wording for labels. If a detail is not explicit, leave the list empty. "
+            "Do not add any workflow, state machine, or role responsibility unless the prompt explicitly asks for it."
         )
         user_prompt = json.dumps(
             {
@@ -186,6 +187,12 @@ class OpenAIClient:
                         "client": ["client role actions from the prompt"],
                         "specialist": ["specialist role actions from the prompt"],
                         "manager": ["manager role actions from the prompt"],
+                    },
+                    "role_state_contract": {
+                        "source_roles": ["roles that create/publish the primary shared business object"],
+                        "update_roles": ["roles that edit/update/change the shared object after it exists"],
+                        "observer_roles": ["roles that mostly browse/view/select/read the shared object"],
+                        "status_values": ["business state labels only if the prompt explicitly defines them"],
                     },
                     "routeable_screen_plan": {
                         "multi_page_recommended": True,

@@ -9,7 +9,6 @@ import os
 import posixpath
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import threading
@@ -47,11 +46,11 @@ NEUTRAL_TEMPLATE_MARKERS = (
     "client surface",
     "specialist surface",
     "manager surface",
-    "neutral starter",
-    "starter screen",
+    "neutral shell",
+    "blank shell screen",
     "preview entry",
     "should be replaced by the generated app",
-    "replace starter screens",
+    "replace blank shell screens",
 )
 
 
@@ -91,7 +90,7 @@ ROLE_LINK_STOPWORDS = {
     "manager",
     "preview",
     "surface",
-    "starter",
+    "blank-shell",
     "screen",
     "generated",
     "static",
@@ -182,9 +181,6 @@ PROMPT_SPECIFICITY_STOPWORDS = {
     "должен",
     "должна",
     "должны",
-    "заказ",
-    "заказы",
-    "заказа",
     "клиент",
     "менеджер",
     "мини",
@@ -205,7 +201,6 @@ PROMPT_SPECIFICITY_STOPWORDS = {
 GENERIC_SCAFFOLD_VISIBLE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("visible Title label", r"<label[^>]*>\s*title\b"),
     ("visible Note label", r"<label[^>]*>\s*note\b"),
-    ("Shared records heading", r">\s*shared records\s*<"),
     ("saved records status copy", r"\bsaved records\b"),
     ("first record empty state", r"create the first record"),
     ("generic Update status button", r">\s*update status\s*<"),
@@ -790,21 +785,23 @@ class CheckRunner:
         backend_text = cls._read_backend_routes_text(source_dir)
         tests_text = cls._read_generated_tests_text(source_dir)
         all_frontend = "\n".join(role_text.values())
+        features = contract.get("features") if isinstance(contract.get("features"), dict) else {}
+        update_required = bool(features.get("workflow_update"))
         if not cls._has_frontend_post(all_frontend):
             issues.append(
                 ValidationIssue(
                     code="platform.workflow_missing_frontend_post",
-                    message="Acceptance workflow requires at least one frontend POST submit/fetch path, but no POST-capable frontend action was found.",
+                    message="Acceptance workflow requires at least one frontend save/create/import action that persists user-provided state, but no POST frontend action was found.",
                     severity="high",
                     location="miniapp/app/static",
                     blocking=True,
                 )
             )
-        if not cls._has_workflow_update_action(role_text.get("specialist", "") + "\n" + role_text.get("manager", "")):
+        if update_required and not cls._has_workflow_update_action(role_text.get("specialist", "") + "\n" + role_text.get("manager", "")):
             issues.append(
                 ValidationIssue(
                     code="platform.workflow_missing_update_action",
-                    message="Acceptance workflow requires specialist/manager processing actions, but no persisted POST/PATCH/PUT update action was found.",
+                    message="Acceptance workflow requires a prompt-assigned persisted update action, but no matching POST/PATCH/PUT/DELETE action was found.",
                     severity="high",
                     location="miniapp/app/static",
                     blocking=True,
@@ -814,7 +811,7 @@ class CheckRunner:
             issues.append(
                 ValidationIssue(
                     code="platform.workflow_tests_missing_contract",
-                    message="Generated tests do not cover the workflow acceptance contract. Add Python/JS tests for the required form/API/status/cross-role flow.",
+                    message="Generated tests do not cover the workflow acceptance contract. Add Python/JS tests for the actual prompt-owned UI/API/persistence flow.",
                     severity="high",
                     location="miniapp/tests",
                     blocking=True,
@@ -879,8 +876,8 @@ class CheckRunner:
                 ValidationIssue(
                     code="platform.generic_scaffold_leakage",
                     message=(
-                        "Prompt-derived fields are required, but the role UI still exposes generic contract scaffold copy "
-                        f"({', '.join(scaffold_markers[:4])}). Replace Title/Note/records copy with the user's business fields and workflow labels."
+                        "Prompt-derived fields are required, but the role UI still exposes generic scaffold copy "
+                        f"({', '.join(scaffold_markers[:4])}). Replace generic placeholder copy with the user's business fields and workflow labels."
                     ),
                     severity="high",
                     location="miniapp/app/static",
@@ -902,60 +899,78 @@ class CheckRunner:
 
         if field_hints:
             role_prompts_for_fields = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
-            client_prompt_keys = cls._semantic_keys_from_text(
-                " ".join(str(item) for item in role_prompts_for_fields.get("client") or []),
+            source_roles = cls._prompt_source_roles(prompt_hints=prompt_hints, role_field_hints=role_field_hints)
+            source_role = source_roles[0] if source_roles else ""
+            source_prompt_keys = cls._semantic_keys_from_text(
+                " ".join(str(item) for item in role_prompts_for_fields.get(source_role) or []),
                 exclude_stopwords=True,
             )
-            explicit_client_field_hints = [
+            explicit_source_field_hints = [
                 str(item).strip()
-                for item in (role_field_hints.get("client") or [])
+                for item in (role_field_hints.get(source_role) or [])
                 if str(item).strip()
             ] if isinstance(role_field_hints, dict) else []
-            client_field_hints = [
+            source_field_hints = [
                 hint
                 for hint in field_hints
-                if cls._semantic_keys_from_text(hint, exclude_stopwords=True) & client_prompt_keys
+                if cls._semantic_keys_from_text(hint, exclude_stopwords=True) & source_prompt_keys
             ]
-            client_field_hints = explicit_client_field_hints or client_field_hints or field_hints
-            client_surface = f"{role_html_text.get('client', '')}\n{backend_text}"
-            matched_fields = cls._matched_prompt_hints(client_field_hints, client_surface)
-            required_count = max(2, min(len(client_field_hints), int(len(client_field_hints) * 0.8 + 0.999)))
+            source_field_hints = explicit_source_field_hints or source_field_hints or field_hints
+            source_surface = f"{role_html_text.get(source_role, '')}\n{backend_text}" if source_role else f"{all_frontend}\n{backend_text}"
+            matched_fields = cls._matched_prompt_hints(source_field_hints, source_surface)
+            required_count = max(2, min(len(source_field_hints), int(len(source_field_hints) * 0.8 + 0.999)))
             if len(matched_fields) < required_count:
-                missing_fields = [hint for hint in client_field_hints if hint not in matched_fields]
+                missing_fields = [hint for hint in source_field_hints if hint not in matched_fields]
+                issue_location = f"miniapp/app/static/{source_role}" if source_role else "miniapp/app/static"
                 issues.append(
                     ValidationIssue(
                         code="platform.prompt_specificity_missing_fields",
                         message=(
-                            "Client create flow does not expose enough prompt-derived fields. "
+                            f"{source_role or 'prompt-owned'} source flow does not expose enough prompt-derived fields. "
                             f"Matched {len(matched_fields)}/{required_count}; missing examples: {', '.join(missing_fields[:6])}."
                         ),
                         severity="high",
-                        location="miniapp/app/static/client",
+                        location=issue_location,
                         blocking=True,
                         repair_recipe=cls._prompt_specificity_repair_recipe(
                             signature="workflow.prompt_specificity_missing_fields",
-                            target_files=[
-                                "miniapp/app/static/client/index.html",
-                                "miniapp/app/static/client/app.js",
-                                "miniapp/app/routes/generated_contract.py",
+                            target_files=(
+                                [
+                                    f"miniapp/app/static/{source_role}/index.html",
+                                    f"miniapp/app/static/{source_role}/app.js",
+                                ]
+                                if source_role
+                                else [
+                                    "miniapp/app/static/client/index.html",
+                                    "miniapp/app/static/client/app.js",
+                                    "miniapp/app/static/specialist/index.html",
+                                    "miniapp/app/static/specialist/app.js",
+                                    "miniapp/app/static/manager/index.html",
+                                    "miniapp/app/static/manager/app.js",
+                                ]
+                            )
+                            + [
+                                "miniapp/app/routes",
                                 "miniapp/tests/test_generated_app.py",
                                 "miniapp/tests/generated_app.test.mjs",
                             ],
                             evidence={
-                                "field_hints": client_field_hints[:12],
+                                "source_role": source_role,
+                                "field_hints": source_field_hints[:12],
                                 "matched_fields": matched_fields,
                                 "missing_fields": missing_fields[:8],
                             },
                         ),
                     )
                 )
-            issues.extend(
-                cls._client_form_cross_role_field_issues(
-                    client_html=role_html_text.get("client", ""),
-                    role_field_hints=role_field_hints if isinstance(role_field_hints, dict) else {},
-                    client_field_hints=client_field_hints,
+            if "client" in source_roles:
+                issues.extend(
+                    cls._client_form_cross_role_field_issues(
+                        client_html=role_html_text.get("client", ""),
+                        role_field_hints=role_field_hints if isinstance(role_field_hints, dict) else {},
+                        client_field_hints=source_field_hints if source_role == "client" else [],
+                    )
                 )
-            )
             manager_visibility_issue = cls._manager_specialist_field_visibility_issue(
                 manager_text=role_text.get("manager", ""),
                 role_field_hints=role_field_hints if isinstance(role_field_hints, dict) else {},
@@ -964,6 +979,23 @@ class CheckRunner:
                 issues.append(manager_visibility_issue)
 
         return issues
+
+    @staticmethod
+    def _prompt_source_roles(*, prompt_hints: dict[str, Any], role_field_hints: dict[str, Any]) -> list[str]:
+        state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
+        source_roles = [
+            str(role).strip().lower()
+            for role in (state_contract.get("source_roles") or [])
+            if str(role).strip().lower() in ROLE_ORDER
+        ]
+        if source_roles:
+            return list(dict.fromkeys(source_roles))
+        field_roles = [
+            role
+            for role in ROLE_ORDER
+            if any(str(item).strip() for item in (role_field_hints.get(role) or []))
+        ]
+        return field_roles[:1]
 
     @classmethod
     def _manager_specialist_field_visibility_issue(
@@ -1017,7 +1049,7 @@ class CheckRunner:
         return ValidationIssue(
             code="platform.manager_missing_specialist_result_visibility",
             message=(
-                "Manager role must render specialist-owned persisted result fields before approval. "
+                "Manager role must render specialist-owned persisted result fields when the prompt assigns a manager follow-up view. "
                 f"Missing specialist fields in manager card/detail renderer: {', '.join(missing[:6])}."
             ),
             severity="high",
@@ -1211,7 +1243,7 @@ class CheckRunner:
                         target_files=[
                             f"miniapp/app/static/{role}/index.html",
                             f"miniapp/app/static/{role}/app.js",
-                            "miniapp/app/routes/generated_contract.py",
+                            "miniapp/app/routes",
                             "miniapp/tests/generated_app.test.mjs",
                         ],
                         evidence={
@@ -1306,7 +1338,7 @@ class CheckRunner:
             "deterministic": True,
             "retryable": True,
             "instruction": (
-                "Read the target role files, replace generic Title/Note/shared-record UI with prompt-owned business fields, "
+                "Read the target role files, replace generic placeholder UI with prompt-owned business fields, "
                 "persist those fields through the API, update role-specific actions, then rerun frontend and browser workflow checks."
             ),
             "evidence": evidence,
@@ -2624,7 +2656,7 @@ class CheckRunner:
             or (
                 re.search(r"method\s*:\s*['\"]post['\"]", text, flags=re.IGNORECASE)
                 and "/api" in lowered
-                and any(marker in lowered for marker in ("action", "update", "save", "review", "approve", "control", "обнов", "сохран", "действ", "провер"))
+                and any(marker in lowered for marker in ("action", "update", "save", "control", "обнов", "сохран", "действ"))
             )
         )
 
@@ -2759,12 +2791,17 @@ class CheckRunner:
                 "ui_steps": [],
             }
         elif preview_status != "running" or not preview_url:
-            proof = self._run_real_browser_ui_flow_with_ephemeral_runtime(
-                source_dir=source_dir,
-                acceptance_contract=contract,
-                unavailable_reason="Browser UI proof used an ephemeral local runtime because the shared preview URL was unavailable.",
-            )
-            preview_url = str(proof.get("preview_url") or preview_url)
+            proof = {
+                "passed": False,
+                "failed_step": "preview_unavailable",
+                "infra_unavailable": True,
+                "logs": [
+                    "Browser UI proof requires the configured preview runtime to be running for the current draft.",
+                    f"Observed preview_status={preview_status!r}, preview_url={preview_url!r}.",
+                ],
+                "ui_steps": [],
+                "screenshots": [],
+            }
         else:
             preview_url = self._reachable_preview_base_url(preview_url)
             proof = self._run_real_browser_ui_flow(
@@ -2879,165 +2916,6 @@ class CheckRunner:
             parsed["passed"] = False
             parsed["logs"] = [*list(parsed.get("logs") or []), *self._command_logs("Playwright browser UI proof failed.", "", output)]
         return parsed
-
-    def _run_real_browser_ui_flow_with_ephemeral_runtime(
-        self,
-        *,
-        source_dir: Path,
-        acceptance_contract: dict[str, Any],
-        unavailable_reason: str,
-    ) -> dict[str, Any]:
-        """Run the same generic Playwright proof against a short-lived local app.
-
-        This keeps create/workflow verification code-agent-like: the platform
-        executes the generated app and proves behavior even when the shared
-        Docker preview service is unavailable. The generated source is not
-        changed and no domain-category assumptions are introduced.
-        """
-        miniapp_dir = source_dir / "miniapp"
-        if not miniapp_dir.exists():
-            return {
-                "passed": False,
-                "failed_step": "ephemeral_runtime_missing_source",
-                "infra_unavailable": True,
-                "logs": [f"{unavailable_reason} Miniapp directory is missing: {miniapp_dir}"],
-                "ui_steps": [],
-                "screenshots": [],
-            }
-        port = self._free_local_port()
-        preview_url = f"http://127.0.0.1:{port}"
-        command = [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "app.main:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ]
-        process: subprocess.Popen[str] | None = None
-        stdout_tail: list[str] = []
-        stderr_tail: list[str] = []
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=miniapp_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-            ready_logs = self._wait_for_ephemeral_runtime(preview_url, process, stdout_tail, stderr_tail)
-            if process.poll() is not None:
-                return {
-                    "passed": False,
-                    "failed_step": "ephemeral_runtime_exited",
-                    "infra_unavailable": True,
-                    "preview_url": preview_url,
-                    "logs": [
-                        unavailable_reason,
-                        f"Ephemeral runtime exited with code {process.returncode}.",
-                        *ready_logs,
-                        *stdout_tail[-20:],
-                        *stderr_tail[-20:],
-                    ],
-                    "ui_steps": [],
-                    "screenshots": [],
-                }
-            proof = self._run_real_browser_ui_flow(
-                source_dir=source_dir,
-                preview_url=preview_url,
-                acceptance_contract=acceptance_contract,
-            )
-            proof["preview_url"] = preview_url
-            proof["ephemeral_runtime"] = True
-            proof["logs"] = [
-                unavailable_reason,
-                f"Started ephemeral local runtime at {preview_url}.",
-                *ready_logs,
-                *list(proof.get("logs") or []),
-            ]
-            return proof
-        except Exception as exc:
-            return {
-                "passed": False,
-                "failed_step": "ephemeral_runtime_error",
-                "infra_unavailable": True,
-                "preview_url": preview_url,
-                "logs": [
-                    unavailable_reason,
-                    f"Could not run ephemeral local browser proof: {exc.__class__.__name__}: {exc}",
-                    *stdout_tail[-20:],
-                    *stderr_tail[-20:],
-                ],
-                "ui_steps": [],
-                "screenshots": [],
-            }
-        finally:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-
-    @staticmethod
-    def _free_local_port() -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            return int(sock.getsockname()[1])
-
-    @staticmethod
-    def _wait_for_ephemeral_runtime(
-        preview_url: str,
-        process: subprocess.Popen[str],
-        stdout_tail: list[str],
-        stderr_tail: list[str],
-    ) -> list[str]:
-        deadline = time.time() + int(os.getenv("EPHEMERAL_BROWSER_RUNTIME_START_TIMEOUT_SEC", "25"))
-        logs = [f"Waiting for ephemeral runtime health at {preview_url}/health."]
-        while time.time() < deadline:
-            if process.poll() is not None:
-                break
-            try:
-                with urlopen(Request(preview_url.rstrip("/") + "/health", headers={"User-Agent": "browser-flow-smoke"}), timeout=1.5) as response:
-                    if response.status == 200:
-                        logs.append("Ephemeral runtime health check passed.")
-                        return logs
-            except Exception:
-                pass
-            CheckRunner._drain_process_output(process, stdout_tail, stderr_tail)
-            time.sleep(0.5)
-        CheckRunner._drain_process_output(process, stdout_tail, stderr_tail)
-        logs.append("Ephemeral runtime health check did not pass before timeout.")
-        return logs
-
-    @staticmethod
-    def _drain_process_output(
-        process: subprocess.Popen[str],
-        stdout_tail: list[str],
-        stderr_tail: list[str],
-        *,
-        max_lines: int = 80,
-    ) -> None:
-        for stream, target in ((process.stdout, stdout_tail), (process.stderr, stderr_tail)):
-            if stream is None:
-                continue
-            try:
-                # Avoid blocking: read only if the process has exited. During
-                # startup uvicorn may keep pipes open, so readiness is checked
-                # via HTTP instead of pipe reads.
-                if process.poll() is None:
-                    continue
-                text = stream.read()
-            except Exception:
-                continue
-            if text:
-                target.extend(line for line in text.splitlines() if line.strip())
-                del target[:-max_lines]
 
     @staticmethod
     def _real_browser_ui_flow_python_script() -> str:
@@ -3361,7 +3239,7 @@ def fill_page_update_controls(scope, marker, created_id):
 
 
 def click_update_button(scope, role, route):
-    patterns = re.compile(r"(save|update|status|ready|done|confirm|approve|process|complete|сохран|обнов|статус|готов|подтверд|выполн|обработ)", re.I)
+    patterns = re.compile(r"(save|update|ready|done|complete|сохран|обнов|готов|выполн)", re.I)
     refresh_only = re.compile(r"^(refresh|reload|обновить|перезагрузить)$", re.I)
     buttons = scope.locator("button, [role=button], input[type=button], input[type=submit]")
     for index in range(min(buttons.count(), 12)):
@@ -3374,7 +3252,7 @@ def click_update_button(scope, role, route):
         data_action = button.get_attribute("data-action") or ""
         if refresh_only.search(text) and not (data_id or data_action):
             continue
-        if not patterns.search(text):
+        if not (data_id or data_action or patterns.search(text)):
             continue
         try:
             button.click(timeout=2500)
@@ -3810,7 +3688,7 @@ def value_for(name, schema, marker, purpose):
     schema = resolve_schema(OPENAPI, schema if isinstance(schema, dict) else {})
     enum = schema.get("enum")
     if isinstance(enum, list) and enum:
-        preferred = ("ready", "done", "completed", "confirmed", "approved", "paid", "in_progress", "processing") if purpose == "update" else tuple(enum)
+        preferred = ("ready", "done", "completed", "paid", "in_progress") if purpose == "update" else tuple(enum)
         for value in preferred:
             if value in enum:
                 return value
@@ -3989,13 +3867,25 @@ try:
         if created_item is None:
             fail("create_persistence", f"POST {base_path} did not persist a discoverable item/state through later GET.", api_paths=api_paths, api_before=before_json, api_after=after_create_json)
         created_id = created_id or find_id(created_item)
-        if created_id is None:
-            fail("created_id", "Created state did not expose an id-like field usable for the role update flow.", api_paths=api_paths, api_after=after_create_json)
         STEPS.append({"step": "create_persistence", "path": base_path, "status": after_create.status_code, "id": created_id})
 
         update_template, method = update_path_for(OPENAPI, base_path)
         if not update_template:
-            fail("update_route_discovery", f"No generic update route exists for created state under {base_path}.", api_paths=api_paths, api_after=after_create_json)
+            STEPS.append({"step": "update_route_discovery", "path": base_path, "status": "not_present"})
+            print(json.dumps({
+                "passed": True,
+                "failed_step": None,
+                "api_paths": api_paths,
+                "created_state_marker": marker,
+                "updated_state_marker": None,
+                "api_before": before_json,
+                "api_after": after_create_json,
+                "steps": STEPS,
+                "logs": [f"Generic workflow proof passed create/list persistence through {base_path}; no app-owned update route was required or discovered."],
+            }, ensure_ascii=False))
+            sys.exit(0)
+        if created_id is None:
+            fail("created_id", "Created state did not expose an id-like field usable for the discovered update route.", api_paths=api_paths, api_after=after_create_json)
         update_path = concrete(update_template, created_id)
         update_payload = build_payload(OPENAPI, update_template, method, update_marker, "update")
         update = getattr(client, method)(update_path, json=update_payload)
@@ -4588,7 +4478,7 @@ except Exception as exc:
                 issues.append(
                     ValidationIssue(
                         code="platform.neutral_role_template",
-                        message=f"{role} role still contains neutral starter/template text: {', '.join(markers[:4])}.",
+                        message=f"{role} role still contains neutral shell/template text: {', '.join(markers[:4])}.",
                         severity="high",
                         location=f"miniapp/app/static/{role}",
                         blocking=True,
@@ -5007,12 +4897,12 @@ except Exception as exc:
             has_api_action = bool(
                 has_update_method
                 or has_action_post
-                or ("/api/" in lowered and "fetch(" in lowered and re.search(r"(state|stage|progress|action|update|save|review|статус|сохран|обнов|действ)", lowered))
+                or ("/api/" in lowered and "fetch(" in lowered and re.search(r"(state|stage|progress|action|update|save|сохран|обнов|действ)", lowered))
             )
             if has_api_action:
                 signals.append("workflow_update")
-            if re.search(r"\b(confirm|done|complete|assign|process|status|update|action|review|save)\b", lowered) or re.search(
-                r"(статус|обнов|сохран|действ|работ|провер)", lowered
+            if re.search(r"\b(done|complete|assign|update|action|save)\b", lowered) or re.search(
+                r"(обнов|сохран|действ|работ)", lowered
             ):
                 signals.append("workflow_actions")
             return signals if len(signals) >= 2 else []
@@ -5020,9 +4910,9 @@ except Exception as exc:
             if re.search(r"\b(metric|dashboard|summary|total|workload|overview|count)\b", lowered):
                 signals.append("dashboard")
             has_manager_control = bool(
-                re.search(r"\b(review|approve|escalate|assign|control|oversight|refresh|filter|audit)\b", lowered)
-                or re.search(r"\b(manager-oversight|manager-control|manager-review)\b", lowered)
-                or re.search(r"(контрол|обнов|провер|соглас|назнач|отч[её]т|фильтр)", lowered)
+                re.search(r"\b(escalate|assign|control|oversight|refresh|filter|audit)\b", lowered)
+                or re.search(r"\b(manager-oversight|manager-control)\b", lowered)
+                or re.search(r"(контрол|обнов|назнач|отч[её]т|фильтр)", lowered)
             )
             has_user_action_surface = bool(
                 re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE)
@@ -5051,7 +4941,7 @@ except Exception as exc:
             "client app",
             "specialist app",
             "manager app",
-            "source request",
+            "source placeholder",
             "collect user-provided details",
             "placeholder records",
             "workflow entries",
@@ -5086,7 +4976,7 @@ except Exception as exc:
             (r"\$\{\s*escape(?:Html|Text)?\s*\(\s*item\.status\b", "template escape(item.status)"),
             (r"\$\{\s*item\.status\b", "template item.status"),
             (r"\bbuildLine\s*\(\s*['\"][^'\"]*статус[^'\"]*['\"]\s*,\s*item\.status\s*\)", "buildLine status=item.status"),
-            (r"\bitem\.status\s*\|\|\s*['\"](?:new|pending|processed|approved|reviewed|done|completed)['\"]", "item.status raw enum passthrough"),
+            (r"\bitem\.status\s*\|\|\s*['\"](?:new|pending|done|completed)['\"]", "item.status raw enum passthrough"),
             (r"(?:Приоритет|priority)[^`]*\$\{[^}]*item\.priority", "template item.priority raw enum"),
             (r"\bstatus-pill[^`'\"]*`[^`]*item\.status", "status pill item.status"),
             (r"\bSTATUS_LABELS\s*\[\s*(?:value|key|item\.status)\s*\]\s*\|\|\s*(?:value|key|item\.status)\b", "status label raw passthrough"),
@@ -5209,34 +5099,6 @@ except Exception as exc:
                     blocking=not raw_post_present,
                 )
             )
-        if not has_backend_update:
-            issues.append(
-                ValidationIssue(
-                    code="platform.missing_create_update_api",
-                    message="Create runs must expose at least one update-capable /api endpoint so specialist or manager roles can update saved work.",
-                    severity="high",
-                    location="miniapp/app/routes",
-                    blocking=True,
-                )
-            )
-        if not frontend_update_refs:
-            raw_update_present = bool(frontend_raw_methods.intersection({"PATCH", "PUT", "DELETE"})) or (
-                "POST" in frontend_raw_methods
-                and cls._has_workflow_update_action(cls._read_role_surface_text(static_root / "specialist") + "\n" + cls._read_role_surface_text(static_root / "manager"))
-            )
-            issues.append(
-                ValidationIssue(
-                    code="platform.frontend_missing_update_api",
-                    message=(
-                        "Create runs must include specialist or manager frontend actions that update saved shared state through /api."
-                        if not raw_update_present
-                        else "Frontend contains update-method and /api markers, but the validator could not pair them confidently; generated tests must confirm the flow."
-                    ),
-                    severity="medium" if raw_update_present else "high",
-                    location="miniapp/app/static",
-                    blocking=not raw_update_present,
-                )
-            )
         return issues, {
             "declared_methods": [
                 {"method": method, "path": path}
@@ -5249,6 +5111,10 @@ except Exception as exc:
             "frontend_post_refs": frontend_post_refs,
             "frontend_update_refs": frontend_update_refs,
             "frontend_raw_methods": sorted(frontend_raw_methods),
+            "has_backend_get": has_backend_get,
+            "has_backend_post": has_backend_post,
+            "has_backend_update": has_backend_update,
+            "update_required_by_platform": False,
         }
 
     @staticmethod
@@ -5357,7 +5223,6 @@ except Exception as exc:
                 "miniapp/app/generated/route_manifest.json",
                 "miniapp/app/generated/miniapp_contract.json",
                 "miniapp/app/generated/contract_validator.json",
-                "miniapp/app/generated/api_client.js",
             }:
                 continue
             try:

@@ -146,7 +146,7 @@ def _write_role_surface(root: Path, role: str, *, child_pages: int) -> None:
         "event.preventDefault(); fetch('/api/entities', { method: 'POST', body: '{}' }); });"
         "document.querySelector('#refresh-button')?.addEventListener('click', () => {"
         "fetch('/api/entities/1', { method: 'PATCH', body: '{}' }); });"
-        "const status = 'update progress action save review';"
+        "const status = 'update progress action save';"
     )
     css = ".page{display:block}.card{padding:12px}.button{min-height:44px}.list{min-width:0}\n"
     (role_dir / "index.html").write_text(html, encoding="utf-8")

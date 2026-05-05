@@ -4,10 +4,10 @@ The user's prompt is the only source of product meaning. Template files provide 
 
 ## Generate
 
-- Replace starter screens with the requested app surface.
+- Create the requested app surface from the prompt.
 - Create connected `client`, `specialist`, and `manager` role surfaces for every new app.
 - Keep the three roles tied to the same product content: shared app title, shared prompt-derived objects, and consistent labels/actions.
-- Never leave a role as a generic preview, blank page, or neutral starter.
+- Never leave a role as a generic preview or blank page.
 - Build as many pages as the prompt-derived workflow needs. Each role root (`/client`, `/specialist`, `/manager`) is a focused role entrypoint, not a copy of the same generic page.
 - Declare additional route pages in `miniapp/app/generated/route_manifest.json` only when they support a real prompt-derived workflow. Use neutral paths and file names chosen from the product plan, not platform examples.
 - Add settings or profile pages only when the requested workflow actually needs them.

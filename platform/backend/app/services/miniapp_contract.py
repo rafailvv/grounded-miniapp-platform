@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from html import escape
 import json
 import re
 from pathlib import Path
@@ -15,31 +14,9 @@ from app.validators.static_analysis import extract_declared_routes, extract_fron
 
 
 ROLE_ORDER = ("client", "specialist", "manager")
-ROLE_LABELS_RU = {
-    "client": "Клиент",
-    "specialist": "Специалист",
-    "manager": "Менеджер",
-}
-STANDARD_ROLE_FIELD_LABELS = {
-    "client": {
-        "recordName": "Название записи",
-        "clientComment": "Комментарий клиента",
-    },
-    "specialist": {
-        "specialistDecision": "Решение специалиста",
-        "specialistComment": "Комментарий специалиста",
-    },
-    "manager": {
-        "managerDecision": "Решение менеджера",
-        "managerComment": "Комментарий менеджера",
-    },
-}
 RESERVED_WORKFLOW_FIELD_KEYS = {
     "id",
     "item_id",
-    "title",
-    "note",
-    "status",
     "created_by",
     "updated_by",
 }
@@ -64,6 +41,11 @@ class MiniAppResource(StrictModel):
     fields: list[str] = Field(default_factory=list)
     field_labels: dict[str, str] = Field(default_factory=dict)
     role_field_labels: dict[str, dict[str, str]] = Field(default_factory=dict)
+    role_actions: dict[str, list[str]] = Field(default_factory=dict)
+    source_roles: list[str] = Field(default_factory=list)
+    update_roles: list[str] = Field(default_factory=list)
+    observer_roles: list[str] = Field(default_factory=list)
+    status_values: list[str] = Field(default_factory=list)
     endpoints: list[MiniAppEndpoint] = Field(default_factory=list)
 
 
@@ -148,21 +130,30 @@ class MiniAppContractCompiler:
         intent_value = str(intent or "").strip().lower() or "create"
         contract_hints = (acceptance_contract or {}).get("prompt_hints") if isinstance((acceptance_contract or {}).get("prompt_hints"), dict) else None
         hints = contract_hints or extract_prompt_planning_hints(prompt, prompt_analysis=prompt_analysis)
-        slug_source = str(hints.get("resource_hint") or "").strip() or "item"
-        slug_source = cls._resource_display_source(slug_source)
-        slug = cls._plural_slug(slug_source)
-        display_name = cls._display_name(slug_source)
-        resource = cls._resource(
-            slug=slug,
-            display_name=display_name,
-            field_hints=[str(item) for item in hints.get("field_hints") or [] if str(item).strip()],
-            role_field_hints={
-                role: [str(item) for item in (items or []) if str(item).strip()]
-                for role, items in dict(hints.get("role_field_hints") or {}).items()
-            },
-        )
+        slug_source = str(hints.get("resource_hint") or "").strip()
+        resources: list[MiniAppResource] = []
+        if slug_source:
+            slug_source = cls._resource_display_source(slug_source)
+            slug = cls._plural_slug(slug_source)
+            display_name = cls._display_name(slug_source)
+            resources = [
+                cls._resource(
+                    slug=slug,
+                    display_name=display_name,
+                    field_hints=[str(item) for item in hints.get("field_hints") or [] if str(item).strip()],
+                    role_field_hints={
+                        role: [str(item) for item in (items or []) if str(item).strip()]
+                        for role, items in dict(hints.get("role_field_hints") or {}).items()
+                    },
+                    role_actions={
+                        role: [str(item) for item in (items or []) if str(item).strip()]
+                        for role, items in dict(hints.get("role_action_prompts") or {}).items()
+                    },
+                    role_state_contract=dict(hints.get("role_state_contract") or {}),
+                )
+            ]
         screens = cls._screens()
-        endpoints = list(resource.endpoints)
+        endpoints = [endpoint for resource in resources for endpoint in resource.endpoints]
         allowed_graph = AllowedFileGraph(
             contract_owned_paths=MiniAppContractMaterializer.contract_owned_paths(),
             writable_globs=[
@@ -181,9 +172,6 @@ class MiniAppContractCompiler:
             ],
             blocked_globs=[
                 "miniapp/app/generated/**",
-                "miniapp/tests/test_generated_app.py",
-                "miniapp/tests/generated_app.test.mjs",
-                "miniapp/app/routes/generated_contract.py",
             ],
         )
         contract = MiniAppContract(
@@ -192,7 +180,7 @@ class MiniAppContractCompiler:
             prompt_summary=str(hints.get("prompt_summary") or prompt or "")[:1200],
             generation_mode=mode_value,
             intent=intent_value,
-            resources=[resource],
+            resources=resources,
             endpoints=endpoints,
             screens=screens,
             allowed_file_graph=allowed_graph,
@@ -205,11 +193,7 @@ class MiniAppContractCompiler:
         )
         contract.artifacts = {
             "miniapp_contract": "miniapp/app/generated/miniapp_contract.json",
-            "api_client": "miniapp/app/generated/api_client.js",
             "route_manifest": "miniapp/app/generated/route_manifest.json",
-            "backend_route": "miniapp/app/routes/generated_contract.py",
-            "python_tests": "miniapp/tests/test_generated_app.py",
-            "js_tests": "miniapp/tests/generated_app.test.mjs",
             "validator_metadata": "miniapp/app/generated/contract_validator.json",
         }
         return contract
@@ -231,24 +215,31 @@ class MiniAppContractCompiler:
             for endpoint in endpoints
         ]
         contract.setdefault("features", {})
-        contract["features"] = {**dict(contract.get("features") or {}), "contract_runtime_v1": True}
+        contract["features"] = {
+            **dict(contract.get("features") or {}),
+            "prompt_contract_v1": True,
+            "platform_product_scaffold": False,
+        }
         contract.setdefault("page_contract", {})
         contract["page_contract"] = {
             **dict(contract.get("page_contract") or {}),
             "route_manifest_required": True,
-            "single_source_of_truth": "miniapp_contract",
+            "single_source_of_truth": "user_prompt_and_code",
         }
         if implementation_plan is not None:
-            implementation_plan["contract_runtime_v1"] = {
+            implementation_plan["prompt_contract_v1"] = {
                 "enabled": True,
-                "materialized_tests": True,
+                "metadata_only": True,
+                "materialized_runtime": False,
+                "materialized_tests": False,
                 "contract_owned_paths": MiniAppContractMaterializer.contract_owned_paths(),
             }
             implementation_plan.setdefault("api_contract", {})
             implementation_plan["api_contract"] = {
                 **dict(implementation_plan.get("api_contract") or {}),
                 "required_endpoints": contract["required_endpoints"],
-                "single_source_of_truth": "miniapp_contract",
+                "api_routes_owned_by_agent": True,
+                "single_source_of_truth": "user_prompt_and_code",
             }
         return contract
 
@@ -260,53 +251,92 @@ class MiniAppContractCompiler:
         display_name: str,
         field_hints: list[str] | None = None,
         role_field_hints: dict[str, list[str]] | None = None,
+        role_actions: dict[str, list[str]] | None = None,
+        role_state_contract: dict[str, Any] | None = None,
     ) -> MiniAppResource:
         role_field_labels, field_labels = cls._role_field_labels(role_field_hints or {}, field_hints or [])
-        client_labels = role_field_labels.get("client") or field_labels
-        update_labels = {
-            **dict(role_field_labels.get("specialist") or {}),
-            **dict(role_field_labels.get("manager") or {}),
-        }
-        create_fields = [*client_labels.keys(), "title", "note", "created_by"] if client_labels else ["title", "note"]
-        update_fields = list(dict.fromkeys(["status", "note", "updated_by", *update_labels.keys()]))
-        endpoints = [
-            MiniAppEndpoint(
-                endpoint_id=f"{slug}.list",
-                method="GET",
-                path=f"/api/{slug}",
-                purpose="List persisted shared records",
-                resource=slug,
-                role="system",
-            ),
-            MiniAppEndpoint(
-                endpoint_id=f"{slug}.create",
-                method="POST",
-                path=f"/api/{slug}",
-                purpose="Create a persisted record from the client role",
-                resource=slug,
-                role="client",
-                request_fields=create_fields,
-            ),
-            MiniAppEndpoint(
-                endpoint_id=f"{slug}.update_status",
-                method="PATCH",
-                path=f"/api/{slug}/{{item_id}}/status",
-                purpose="Persist a specialist or manager status update",
-                resource=slug,
-                role="specialist",
-                request_fields=update_fields,
-            ),
-        ]
+        role_actions = cls._normalized_role_actions(role_actions or {})
+        source_roles, update_roles, observer_roles, status_values = cls._resource_role_state(
+            role_field_labels=role_field_labels,
+            role_actions=role_actions,
+            role_state_contract=role_state_contract or {},
+        )
+        endpoints: list[MiniAppEndpoint] = []
+        all_role_labels: dict[str, str] = {}
+        for role in ROLE_ORDER:
+            all_role_labels.update(dict(role_field_labels.get(role) or {}))
         return MiniAppResource(
             resource_id=slug,
             slug=slug,
             name=slug,
             display_name=display_name,
-            fields=list(dict.fromkeys(["id", "title", "note", "status", "created_by", "updated_by", *field_labels.keys()])),
+            fields=list(dict.fromkeys([*field_labels.keys(), *all_role_labels.keys()])),
             field_labels=field_labels,
             role_field_labels=role_field_labels,
+            role_actions=role_actions,
+            source_roles=source_roles,
+            update_roles=update_roles,
+            observer_roles=observer_roles,
+            status_values=status_values,
             endpoints=endpoints,
         )
+
+    @staticmethod
+    def _normalized_roles(values: Any) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        result: list[str] = []
+        for item in values:
+            role = str(item or "").strip().lower()
+            if role in ROLE_ORDER and role not in result:
+                result.append(role)
+        return result
+
+    @classmethod
+    def _normalized_role_actions(cls, values: dict[str, list[str]]) -> dict[str, list[str]]:
+        actions: dict[str, list[str]] = {role: [] for role in ROLE_ORDER}
+        for role in ROLE_ORDER:
+            seen: set[str] = set()
+            for item in (values.get(role) or [])[:4]:
+                action = " ".join(str(item or "").split()).strip(" .:-")
+                if len(action) < 2 or action in seen:
+                    continue
+                seen.add(action)
+                actions[role].append(action[:120])
+        return actions
+
+    @classmethod
+    def _resource_role_state(
+        cls,
+        *,
+        role_field_labels: dict[str, dict[str, str]],
+        role_actions: dict[str, list[str]],
+        role_state_contract: dict[str, Any],
+    ) -> tuple[list[str], list[str], list[str], list[str]]:
+        source_roles = cls._normalized_roles(role_state_contract.get("source_roles"))
+        update_roles = cls._normalized_roles(role_state_contract.get("update_roles"))
+        observer_roles = cls._normalized_roles(role_state_contract.get("observer_roles"))
+        status_values = [
+            " ".join(str(item or "").split()).strip(" .:-")[:80]
+            for item in (role_state_contract.get("status_values") or [])
+            if " ".join(str(item or "").split()).strip(" .:-")
+        ][:8]
+
+        roles_with_fields = [
+            role for role in ROLE_ORDER if any(str(value).strip() for value in (role_field_labels.get(role) or {}).values())
+        ]
+        roles_with_actions = [
+            role for role in ROLE_ORDER if any(str(value).strip() for value in (role_actions.get(role) or []))
+        ]
+        if not source_roles:
+            source_roles = (roles_with_fields or roles_with_actions)[:1]
+        if not update_roles and source_roles:
+            if roles_with_fields or roles_with_actions:
+                candidates = list(dict.fromkeys([*roles_with_actions, *roles_with_fields]))
+                update_roles = [role for role in candidates if role not in source_roles] or list(source_roles)
+        if not observer_roles:
+            observer_roles = [role for role in ROLE_ORDER if role not in {*source_roles, *update_roles}]
+        return source_roles, update_roles, observer_roles, status_values
 
     @classmethod
     def _role_field_labels(cls, role_field_hints: dict[str, list[str]], field_hints: list[str]) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
@@ -479,12 +509,8 @@ class MiniAppContractCompiler:
 class MiniAppContractMaterializer:
     GENERATED_FILES = (
         "miniapp/app/generated/miniapp_contract.json",
-        "miniapp/app/generated/api_client.js",
         "miniapp/app/generated/route_manifest.json",
         "miniapp/app/generated/contract_validator.json",
-        "miniapp/app/routes/generated_contract.py",
-        "miniapp/tests/test_generated_app.py",
-        "miniapp/tests/generated_app.test.mjs",
     )
 
     @classmethod
@@ -497,34 +523,21 @@ class MiniAppContractMaterializer:
         source_dir: Path,
         contract: MiniAppContract,
         *,
-        include_role_shell: bool = True,
+        include_role_shell: bool = False,
     ) -> list[str]:
+        del include_role_shell
         changed: list[str] = []
         generated_root = source_dir / "miniapp/app/generated"
         generated_root.mkdir(parents=True, exist_ok=True)
-        tests_root = source_dir / "miniapp/tests"
-        tests_root.mkdir(parents=True, exist_ok=True)
-        routes_root = source_dir / "miniapp/app/routes"
-        routes_root.mkdir(parents=True, exist_ok=True)
 
         writes = {
             "miniapp/app/generated/miniapp_contract.json": cls._render_json(contract.model_dump(mode="json")),
-            "miniapp/app/generated/api_client.js": cls._render_api_client(contract),
             "miniapp/app/generated/route_manifest.json": cls._render_route_manifest(source_dir, contract),
             "miniapp/app/generated/contract_validator.json": cls._render_json(cls._validator_metadata(contract)),
-            "miniapp/app/routes/generated_contract.py": cls._render_backend_route(contract),
-            "miniapp/tests/test_generated_app.py": cls._render_python_tests(contract),
-            "miniapp/tests/generated_app.test.mjs": cls._render_js_tests(contract),
         }
         for relative_path, content in writes.items():
             if cls._write_if_changed(source_dir / relative_path, content):
                 changed.append(relative_path)
-        if cls._ensure_main_includes_generated_route(source_dir):
-            changed.append("miniapp/app/main.py")
-        if include_role_shell:
-            for relative_path, content in cls._role_shell_files(contract).items():
-                if cls._write_if_changed(source_dir / relative_path, content):
-                    changed.append(relative_path)
         return list(dict.fromkeys(changed))
 
     @classmethod
@@ -625,982 +638,6 @@ class MiniAppContractMaterializer:
         }
 
     @staticmethod
-    def _render_api_client(contract: MiniAppContract) -> str:
-        resource = contract.resources[0]
-        slug = resource.slug
-        return f'''const CONTRACT_RESOURCE = {json.dumps(slug)};
-const CONTRACT_API_BASE = `/api/${{CONTRACT_RESOURCE}}`;
-
-export async function listContractItems() {{
-  return requestJson(CONTRACT_API_BASE);
-}}
-
-export async function createContractItem(payload) {{
-  return requestJson(CONTRACT_API_BASE, {{
-    method: "POST",
-    body: JSON.stringify(payload || {{}}),
-  }});
-}}
-
-export async function updateContractItemStatus(itemId, payload) {{
-  return requestJson(`${{CONTRACT_API_BASE}}/${{encodeURIComponent(itemId)}}/status`, {{
-    method: "PATCH",
-    body: JSON.stringify(payload || {{}}),
-  }});
-}}
-
-async function requestJson(path, options = {{}}) {{
-  const response = await fetch(path, {{
-    headers: {{ "Content-Type": "application/json", ...(options.headers || {{}}) }},
-    ...options,
-  }});
-  if (!response.ok) {{
-    throw new Error(`Request failed: ${{response.status}} ${{path}}`);
-  }}
-  return response.json();
-}}
-'''
-
-    @staticmethod
-    def _render_backend_route(contract: MiniAppContract) -> str:
-        resource = contract.resources[0]
-        slug = resource.slug
-        title = resource.display_name
-        return f'''from __future__ import annotations
-
-from itertools import count
-from typing import Any
-
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
-
-
-router = APIRouter(prefix="/api", tags=["contract-runtime"])
-_NEXT_ID = count(1)
-_ITEMS: list[dict[str, Any]] = []
-
-
-class ContractItemCreate(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    title: str = Field(default="{title}", min_length=1)
-    note: str = ""
-    created_by: str = "client"
-
-
-class ContractItemStatusUpdate(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    status: str = Field(default="updated", min_length=1)
-    note: str = ""
-    updated_by: str = "specialist"
-
-
-@router.get("/{slug}")
-def list_contract_items() -> list[dict[str, Any]]:
-    return list(_ITEMS)
-
-
-@router.post("/{slug}", status_code=201)
-def create_contract_item(payload: ContractItemCreate) -> dict[str, Any]:
-    payload_data = payload.model_dump()
-    prompt_fields = {{
-        key: value
-        for key, value in payload_data.items()
-        if key not in {{"title", "note", "created_by"}}
-    }}
-    item = {{
-        "id": str(next(_NEXT_ID)),
-        **prompt_fields,
-        "title": payload.title,
-        "note": payload.note,
-        "status": "new",
-        "created_by": payload.created_by or "client",
-        "updated_by": "",
-    }}
-    _ITEMS.append(item)
-    return item
-
-
-@router.patch("/{slug}/{{item_id}}/status")
-def update_contract_item_status(item_id: str, payload: ContractItemStatusUpdate) -> dict[str, Any]:
-    payload_data = payload.model_dump()
-    for item in _ITEMS:
-        if str(item.get("id")) == str(item_id):
-            item["status"] = payload.status
-            item["note"] = payload.note or item.get("note", "")
-            item["updated_by"] = payload.updated_by or "specialist"
-            for key, value in payload_data.items():
-                if key not in {{"status", "note", "updated_by"}}:
-                    item[key] = value
-            return item
-    raise HTTPException(status_code=404, detail="Contract item not found")
-'''
-
-    @staticmethod
-    def _render_python_tests(contract: MiniAppContract) -> str:
-        resource = contract.resources[0]
-        path = f"/api/{resource.slug}"
-        create_labels = dict((resource.role_field_labels or {}).get("client") or resource.field_labels or {})
-        prompt_payload = {
-            field: f"{label} value"
-            for field, label in list(create_labels.items())[:4]
-        }
-        create_payload = {
-            **prompt_payload,
-            "title": "Contract item",
-            "note": "created",
-        }
-        return f'''from __future__ import annotations
-
-import unittest
-
-from fastapi.testclient import TestClient
-
-from app.main import app
-
-
-class GeneratedContractRuntimeTest(unittest.TestCase):
-    def test_contract_api_persists_create_and_status_update(self) -> None:
-        with TestClient(app) as client:
-            before = client.get({json.dumps(path)})
-            self.assertEqual(before.status_code, 200)
-            create_payload = {json.dumps(create_payload, ensure_ascii=False)}
-            create = client.post({json.dumps(path)}, json=create_payload)
-            self.assertEqual(create.status_code, 201)
-            created = create.json()
-            self.assertEqual(created["status"], "new")
-            for key, value in create_payload.items():
-                self.assertEqual(created.get(key), value)
-            after = client.get({json.dumps(path)})
-            self.assertEqual(after.status_code, 200)
-            self.assertTrue(any(str(item.get("id")) == str(created["id"]) for item in after.json()))
-            update = client.patch(f"{path}/{{created['id']}}/status", json={{"status": "processed", "updated_by": "specialist"}})
-            self.assertEqual(update.status_code, 200)
-            self.assertEqual(update.json()["status"], "processed")
-
-
-if __name__ == "__main__":
-    unittest.main()
-'''
-
-    @staticmethod
-    def _render_js_tests(contract: MiniAppContract) -> str:
-        resource = contract.resources[0]
-        path = f"/api/{resource.slug}"
-        role_routes = [screen.route_path for screen in contract.screens]
-        return f'''import assert from "node:assert/strict";
-import fs from "node:fs";
-import path from "node:path";
-import test from "node:test";
-
-const appRoot = path.join(process.cwd(), "app");
-
-test("generated contract files expose route manifest and API client", () => {{
-  const contract = JSON.parse(fs.readFileSync(path.join(appRoot, "generated", "miniapp_contract.json"), "utf8"));
-  const manifest = JSON.parse(fs.readFileSync(path.join(appRoot, "generated", "route_manifest.json"), "utf8"));
-  const apiClient = fs.readFileSync(path.join(appRoot, "generated", "api_client.js"), "utf8");
-  assert.equal(contract.version, "grounded.miniapp.contract.v1");
-  assert.match(apiClient, /fetch\\(/);
-  assert.match(apiClient, /method: "POST"/);
-  assert.match(apiClient, /method: "PATCH"/);
-  assert.ok(contract.endpoints.some((endpoint) => endpoint.method === "POST" && endpoint.path === {json.dumps(path)}));
-  for (const route of {json.dumps(role_routes)}) {{
-    assert.ok(manifest.routes[route], `missing route manifest entry for ${{route}}`);
-  }}
-}});
-'''
-
-    @classmethod
-    def _role_shell_files(cls, contract: MiniAppContract) -> dict[str, str]:
-        resource = contract.resources[0]
-        files: dict[str, str] = {}
-        for role in ROLE_ORDER:
-            files[f"miniapp/app/static/{role}/index.html"] = cls._role_html(role=role, resource=resource)
-            files[f"miniapp/app/static/{role}/app.js"] = cls._role_js(role=role, resource=resource)
-            files[f"miniapp/app/static/{role}/styles.css"] = cls._role_css(role=role, generation_mode=contract.generation_mode)
-        return files
-
-    @staticmethod
-    def _standard_role_field_labels(role: str) -> dict[str, str]:
-        labels = STANDARD_ROLE_FIELD_LABELS.get(role)
-        if labels is not None:
-            return dict(labels)
-        return {"workComment": "Комментарий"}
-
-    @classmethod
-    def _role_field_labels_for_ui(cls, resource: MiniAppResource, role: str) -> dict[str, str]:
-        labels = dict((resource.role_field_labels or {}).get(role) or {})
-        if role == "client" and not labels:
-            labels = dict(resource.field_labels or {})
-        if not labels:
-            labels = cls._standard_role_field_labels(role)
-        return labels
-
-    @classmethod
-    def _detail_field_labels_for_ui(cls, resource: MiniAppResource) -> dict[str, str]:
-        labels: dict[str, str] = {}
-        labels.update(dict(resource.field_labels or {}))
-        for role in ROLE_ORDER:
-            labels.update(cls._role_field_labels_for_ui(resource, role))
-        return labels
-
-    @classmethod
-    def _prompt_form_controls(cls, resource: MiniAppResource, *, role: str = "client") -> str:
-        labels = cls._role_field_labels_for_ui(resource, role)
-        controls: list[str] = []
-        for index, (name, label) in enumerate(labels.items()):
-            safe_name = escape(name, quote=True)
-            safe_label = escape(label, quote=True)
-            required = " required" if index == 0 else ""
-            lowered = f"{name} {label}".lower()
-            if any(marker in lowered for marker in ("comment", "note", "opis", "kommentar", "predpochten", "message")):
-                controls.append(
-                    f'          <label>{safe_label} <textarea id="contract-{safe_name}" name="{safe_name}"{required}></textarea></label>'
-                )
-            else:
-                input_type = "date" if any(marker in lowered for marker in ("date", "data", "datum", "srok")) else "text"
-                controls.append(
-                    f'          <label>{safe_label} <input id="contract-{safe_name}" name="{safe_name}" type="{input_type}"{required} /></label>'
-                )
-        return "\n".join(controls)
-
-    @staticmethod
-    def _role_html(*, role: str, resource: MiniAppResource) -> str:
-        cyrillic = bool(re.search(r"[А-Яа-яЁё]", resource.display_name))
-        role_label = ROLE_LABELS_RU.get(role, role.title()) if cyrillic else role.title()
-        if cyrillic:
-            title = {
-                "client": f"Создать запись: {resource.display_name}",
-                "specialist": f"Обработка: {resource.display_name}",
-                "manager": f"Контроль: {resource.display_name}",
-            }.get(role, resource.display_name)
-            saved_copy = "Сохраненные записи доступны после перезагрузки."
-            save_label = "Сохранить"
-            refresh_label = "Обновить"
-            select_label = "Запись"
-            update_label = "Сохранить изменения"
-            status_label = "Статус"
-            status_options_by_role = {
-                "manager": (
-                    '<option value="reviewed">На согласовании</option>\n'
-                    '            <option value="ready">Готово к согласованию</option>\n'
-                    '            <option value="approved">Одобрена</option>\n'
-                    '            <option value="rejected">Отклонена</option>'
-                ),
-                "specialist": (
-                    '<option value="processed">В работе</option>\n'
-                    '            <option value="reviewed">Проверена</option>\n'
-                    '            <option value="ready">Готово к согласованию</option>'
-                ),
-            }
-            status_options = status_options_by_role.get(
-                role,
-                '<option value="processed">В работе</option>\n'
-                '            <option value="reviewed">Проверена</option>\n'
-                '            <option value="ready">Готово к согласованию</option>',
-            )
-            list_title = {
-                "client": "Сохраненные записи",
-                "specialist": "Очередь обработки",
-                "manager": "Контроль заявок",
-            }.get(role, "Сохраненные записи")
-            loading_copy = "Загружаем сохраненные записи..."
-            error_copy = "Не удалось загрузить данные. Попробуйте обновить список."
-            success_copy = "Данные обновлены."
-            metrics_label = "Метрики заявок"
-        else:
-            title = {
-                "client": f"Create record: {resource.display_name}",
-                "specialist": f"Process {resource.display_name}",
-                "manager": f"Review {resource.display_name}",
-            }.get(role, resource.display_name)
-            saved_copy = "Saved records are available after reload."
-            save_label = "Save"
-            refresh_label = "Refresh"
-            select_label = "Record"
-            update_label = "Save changes"
-            status_label = "Status"
-            status_options_by_role = {
-                "manager": (
-                    '<option value="reviewed">Reviewed</option>\n'
-                    '            <option value="ready">Ready</option>\n'
-                    '            <option value="approved">Approved</option>\n'
-                    '            <option value="rejected">Rejected</option>'
-                ),
-                "specialist": (
-                    '<option value="processed">Processed</option>\n'
-                    '            <option value="reviewed">Reviewed</option>\n'
-                    '            <option value="ready">Ready</option>'
-                ),
-            }
-            status_options = status_options_by_role.get(
-                role,
-                '<option value="processed">Processed</option>\n'
-                '            <option value="reviewed">Reviewed</option>\n'
-                '            <option value="ready">Ready</option>',
-            )
-            list_title = f"{resource.display_name} records"
-            loading_copy = "Loading saved records..."
-            error_copy = "Could not load records. Try refreshing the list."
-            success_copy = "Data updated."
-            metrics_label = "Request metrics"
-        form = (
-            f'''
-        <form id="contract-create-form" class="contract-form">
-{MiniAppContractMaterializer._prompt_form_controls(resource, role="client")}
-          <button type="submit">{save_label}</button>
-        </form>'''
-            if role == "client"
-            else f'''
-        <form id="contract-update-form" class="contract-form">
-          <label>{select_label} <select id="contract-item-select" name="item_id"></select></label>
-{MiniAppContractMaterializer._prompt_form_controls(resource, role=role)}
-          <label>{status_label} <select id="contract-status-field" name="status">
-            {status_options}
-          </select></label>
-          <button type="submit">{update_label}</button>
-        </form>
-        <div class="contract-actions">
-          <button id="contract-refresh" type="button">{refresh_label}</button>
-        </div>'''
-        )
-        return f'''<!doctype html>
-<html lang="{'ru' if cyrillic else 'en'}">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>{title}</title>
-    <link rel="stylesheet" href="/static/shared/base.css" />
-    <link rel="stylesheet" href="/static/{role}/styles.css" />
-  </head>
-  <body data-role="{role}">
-    <main class="page-shell">
-      <section class="page" data-role="{role}">
-        <header class="contract-header">
-          <p class="contract-eyebrow">{role_label}</p>
-          <h1>{title}</h1>
-          <p id="contract-status" class="contract-copy">{saved_copy}</p>
-        </header>
-        <div id="contract-loading" class="contract-state contract-loading" hidden>{loading_copy}</div>
-        <div id="contract-error" class="contract-state contract-error" hidden>{error_copy}</div>
-        <div id="contract-success" class="contract-state contract-success" hidden>{success_copy}</div>
-{f'        <section id="contract-metrics" class="metrics-grid" aria-label="{escape(metrics_label)}"></section>' if role == "manager" else ''}
-{form}
-        <section class="contract-list" aria-live="polite">
-          <h2>{escape(list_title)}</h2>
-          <div id="contract-items"></div>
-        </section>
-      </section>
-    </main>
-    <script src="/static/preview_bridge.js" defer></script>
-    <script src="/static/{role}/app.js" defer></script>
-  </body>
-</html>
-'''
-
-    @classmethod
-    def _role_js(cls, *, role: str, resource: MiniAppResource) -> str:
-        slug = resource.slug
-        update_status = "processed" if role == "specialist" else "reviewed"
-        quick_action_label = "Отметить обработку" if role == "specialist" else "Сохранить решение"
-        client_field_labels = cls._role_field_labels_for_ui(resource, "client")
-        role_field_labels = cls._role_field_labels_for_ui(resource, role)
-        detail_field_labels = cls._detail_field_labels_for_ui(resource)
-        primary_field = next(iter(client_field_labels.keys()), "")
-        create_handler = ""
-        if role == "client":
-            create_handler = f'''
-const form = document.getElementById("contract-create-form");
-if (form) {{
-  form.addEventListener("submit", async (event) => {{
-    event.preventDefault();
-    const formData = new FormData(form);
-    const payload = {{}};
-    for (const [key, value] of formData.entries()) {{
-      payload[key] = String(value || "");
-    }}
-    const primaryValue = PRIMARY_FIELD ? String(payload[PRIMARY_FIELD] || "") : "";
-    payload.title = payload.title || primaryValue || {json.dumps(resource.display_name)};
-    payload.note = payload.note || Object.entries(FIELD_LABELS)
-      .map(([key, label]) => payload[key] ? `${{label}}: ${{payload[key]}}` : "")
-      .filter(Boolean)
-      .join(" · ");
-    payload.created_by = ROLE;
-    await requestJson(API_BASE, {{
-      method: "POST",
-      body: JSON.stringify(payload),
-    }});
-    form.reset();
-    await loadItems();
-  }});
-}}
-'''
-        update_handler = ""
-        if role in {"specialist", "manager"}:
-            update_handler = f'''
-const updateForm = document.getElementById("contract-update-form");
-if (updateForm) {{
-  updateForm.addEventListener("submit", async (event) => {{
-    event.preventDefault();
-    const formData = new FormData(updateForm);
-    const itemId = String(formData.get("item_id") || "");
-    if (!itemId) {{
-      setState("error", "Сначала выберите сохраненную запись.");
-      return;
-    }}
-    const payload = {{ status: String(formData.get("status") || {json.dumps(update_status)}), updated_by: ROLE }};
-    for (const [key, value] of formData.entries()) {{
-      if (key !== "item_id" && key !== "status") payload[key] = String(value || "");
-    }}
-    payload.note = payload.note || Object.entries(ROLE_FIELD_LABELS)
-      .map(([key, label]) => payload[key] ? `${{label}}: ${{payload[key]}}` : "")
-      .filter(Boolean)
-      .join(" · ");
-    await requestJson(`${{API_BASE}}/${{encodeURIComponent(itemId)}}/status`, {{
-      method: "PATCH",
-      body: JSON.stringify(payload),
-    }});
-    updateForm.reset();
-    await loadItems();
-  }});
-}}
-itemsRoot?.addEventListener("click", async (event) => {{
-  const button = event.target.closest("[data-update-id]");
-  if (!button) return;
-  await requestJson(`${{API_BASE}}/${{button.dataset.updateId}}/status`, {{
-    method: "PATCH",
-    body: JSON.stringify({{ status: "{update_status}", updated_by: ROLE }}),
-  }});
-  await loadItems();
-}});
-document.getElementById("contract-refresh")?.addEventListener("click", loadItems);
-'''
-        return f'''const ROLE = {json.dumps(role)};
-const API_BASE = {json.dumps(f"/api/{slug}")};
-const FIELD_LABELS = {json.dumps(client_field_labels, ensure_ascii=False)};
-const ROLE_FIELD_LABELS = {json.dumps(role_field_labels, ensure_ascii=False)};
-const CLIENT_FIELD_LABELS = {json.dumps(client_field_labels, ensure_ascii=False)};
-const DETAIL_FIELD_LABELS = {json.dumps(detail_field_labels, ensure_ascii=False)};
-const PRIMARY_FIELD = {json.dumps(primary_field)};
-const STATUS_LABELS = {{
-  new: "Новая",
-  pending: "На проверке",
-  processing: "В работе",
-  processed: "В работе",
-  reviewed: "Проверена",
-  ready: "Готово к согласованию",
-  approved: "Одобрена",
-  rejected: "Отклонена",
-  done: "Готово",
-  completed: "Завершена",
-  confirmed: "Подтверждена",
-  paid: "Оплачена",
-}};
-const statusNode = document.getElementById("contract-status");
-const loadingNode = document.getElementById("contract-loading");
-const errorNode = document.getElementById("contract-error");
-const successNode = document.getElementById("contract-success");
-const metricsRoot = document.getElementById("contract-metrics");
-const itemsRoot = document.getElementById("contract-items");
-const itemSelect = document.getElementById("contract-item-select");
-
-window.setupPreviewBridge?.(ROLE);
-
-async function requestJson(path, options = {{}}) {{
-  const response = await fetch(path, {{
-    headers: {{ "Content-Type": "application/json", ...(options.headers || {{}}) }},
-    ...options,
-  }});
-  if (!response.ok) throw new Error(`Запрос завершился ошибкой: ${{response.status}}`);
-  return response.json();
-}}
-
-async function loadItems() {{
-  setState("loading", "Загружаем сохраненные записи...");
-  try {{
-    const items = await requestJson(API_BASE);
-    renderMetrics(items);
-    renderItems(items);
-    renderItemOptions(items);
-    setState("success", items.length ? `Найдено записей: ${{items.length}}.` : "Пока нет сохраненных записей.");
-  }} catch (error) {{
-    setState("error", error.message || "Не удалось загрузить сохраненные записи.");
-  }}
-}}
-
-function escapeHtml(value) {{
-  return String(value ?? "").replace(/[&<>"']/g, (char) => ({{
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  }}[char]));
-}}
-
-function itemTitle(item) {{
-  return item.title || (PRIMARY_FIELD ? item[PRIMARY_FIELD] : "") || {json.dumps(resource.display_name)};
-}}
-
-function humanizeStatus(value) {{
-  const text = String(value || "").replace(/[_-]+/g, " ").trim();
-  return text ? text.charAt(0).toUpperCase() + text.slice(1) : "Новая";
-}}
-
-function statusLabel(value) {{
-  const key = String(value || "new").trim();
-  return STATUS_LABELS[key] || "Статус уточняется";
-}}
-
-function setState(state, message = "") {{
-  if (loadingNode) loadingNode.hidden = state !== "loading";
-  if (errorNode) {{
-    errorNode.hidden = state !== "error";
-    if (state === "error" && message) errorNode.textContent = message;
-  }}
-  if (successNode) {{
-    successNode.hidden = state !== "success";
-    if (state === "success" && message) successNode.textContent = message;
-  }}
-  if (statusNode && message) statusNode.textContent = message;
-}}
-
-function renderMetrics(items) {{
-  if (!metricsRoot) return;
-  const total = items.length;
-  const approved = items.filter((item) => item.status === "approved").length;
-  const inReview = items.filter((item) => ["processed", "reviewed", "ready"].includes(item.status)).length;
-  metricsRoot.innerHTML = [
-    ["Всего", total],
-    ["На согласовании", inReview],
-    ["Одобрено", approved],
-  ].map(([label, value]) => `<article class="metric-card"><span>${{escapeHtml(label)}}</span><strong>${{escapeHtml(value)}}</strong></article>`).join("");
-}}
-
-function itemDetails(item) {{
-  const rows = Object.entries(DETAIL_FIELD_LABELS)
-    .filter(([key]) => item[key])
-    .map(([key, label]) => `<p><b>${{escapeHtml(label)}}</b>: ${{escapeHtml(item[key])}}</p>`);
-  if (rows.length) return rows.join("");
-  return `<p>${{escapeHtml(item.note || "")}}</p>`;
-}}
-
-function renderItemOptions(items) {{
-  if (!itemSelect) return;
-  itemSelect.innerHTML = items.map((item) => `<option value="${{escapeHtml(item.id)}}">${{escapeHtml(itemTitle(item))}}</option>`).join("");
-}}
-
-function renderItems(items) {{
-  if (!itemsRoot) return;
-  if (!items.length) {{
-    itemsRoot.innerHTML = '<p class="contract-empty">Пока нет сохраненных записей. Создайте первую запись через форму.</p>';
-    return;
-  }}
-  itemsRoot.innerHTML = items.map((item) => `
-    <article class="contract-card">
-      <strong>${{escapeHtml(itemTitle(item))}}</strong>
-      <span>${{escapeHtml(statusLabel(item.status))}}</span>
-      ${{itemDetails(item)}}
-      {('<button type="button" data-update-id="${item.id}">' + quick_action_label + '</button>' if role in {"specialist", "manager"} else '')}
-    </article>
-  `).join("");
-}}
-{create_handler}
-{update_handler}
-loadItems();
-'''
-
-    @staticmethod
-    def _role_css(*, role: str, generation_mode: GenerationMode | str | None = None) -> str:
-        accent = {"client": "#0f766e", "specialist": "#2563eb", "manager": "#7c3aed"}.get(role, "#0f766e")
-        mode_value = normalized_generation_mode(generation_mode)
-        balanced_css = ""
-        if mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
-            balanced_css = '''
-
-.page {
-  padding: 22px 18px 30px;
-}
-
-.contract-header {
-  padding: 18px;
-  border: 1px solid var(--contract-border);
-  border-radius: 8px;
-  background: var(--contract-panel);
-  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06);
-}
-
-.contract-header::before {
-  content: "";
-  display: block;
-  width: 48px;
-  height: 4px;
-  margin-bottom: 12px;
-  border-radius: 999px;
-  background: var(--contract-accent);
-}
-
-.contract-header h1 {
-  font-size: 24px;
-  line-height: 1.12;
-}
-
-.contract-form {
-  padding: 16px;
-  border: 1px solid var(--contract-border);
-  border-radius: 8px;
-  background: #ffffff;
-  box-shadow: 0 14px 34px rgba(15, 23, 42, 0.07);
-}
-
-.contract-form label {
-  color: #26313b;
-  font-size: 13px;
-}
-
-.contract-form button,
-.contract-actions button {
-  width: 100%;
-}
-
-.contract-list h2 {
-  font-size: 18px;
-  line-height: 1.2;
-}
-
-.contract-card {
-  border-left: 4px solid var(--contract-accent);
-  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.06);
-}
-
-.contract-card p {
-  margin-bottom: 0;
-  line-height: 1.45;
-}
-
-.contract-card b {
-  color: var(--contract-ink);
-}
-
-.metric-card {
-  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
-}
-'''
-        quality_css = ""
-        if mode_value == GenerationMode.QUALITY.value:
-            quality_css = '''
-
-body {
-  background: linear-gradient(180deg, #f7faf9 0%, #eef3f7 48%, #f7f8fb 100%);
-}
-
-.page {
-  width: min(100%, 480px);
-  min-height: calc(100vh - 24px);
-  display: grid;
-  gap: 16px;
-}
-
-.contract-header {
-  padding: 20px;
-  border-color: color-mix(in srgb, var(--contract-accent) 22%, var(--contract-border));
-  background:
-    linear-gradient(135deg, color-mix(in srgb, var(--contract-accent) 10%, white), #ffffff 46%),
-    #ffffff;
-  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.10);
-}
-
-.contract-eyebrow {
-  width: max-content;
-  padding: 5px 9px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--contract-accent) 12%, white);
-}
-
-.contract-header h1 {
-  font-size: 26px;
-  line-height: 1.08;
-  font-weight: 800;
-}
-
-.contract-copy {
-  font-size: 14px;
-  line-height: 1.5;
-}
-
-.contract-form {
-  gap: 13px;
-  padding: 18px;
-  border-color: color-mix(in srgb, var(--contract-accent) 14%, var(--contract-border));
-  box-shadow: 0 20px 46px rgba(15, 23, 42, 0.10);
-}
-
-input,
-textarea,
-select {
-  background: #fbfcfd;
-  border-color: #cfd8e3;
-}
-
-.contract-list h2 {
-  margin-bottom: 2px;
-  letter-spacing: 0;
-}
-
-.contract-card {
-  gap: 10px;
-  padding: 16px;
-  border-color: color-mix(in srgb, var(--contract-accent) 16%, var(--contract-border));
-  background: #ffffff;
-  box-shadow: 0 16px 38px rgba(15, 23, 42, 0.09);
-}
-
-.contract-card strong {
-  font-size: 18px;
-  line-height: 1.18;
-}
-
-.contract-card span {
-  justify-self: start;
-  border: 1px solid color-mix(in srgb, var(--contract-accent) 22%, white);
-}
-
-.contract-card p {
-  padding-top: 7px;
-  border-top: 1px solid #eef2f6;
-}
-
-.metric-card {
-  padding: 14px;
-  border-color: color-mix(in srgb, var(--contract-accent) 16%, var(--contract-border));
-  background: #ffffff;
-}
-
-.metric-card strong {
-  font-size: 24px;
-}
-
-.contract-card button {
-  justify-self: start;
-  width: auto;
-  min-width: 160px;
-}
-
-button {
-  box-shadow: 0 10px 24px color-mix(in srgb, var(--contract-accent) 20%, transparent);
-}
-
-@media (max-width: 420px) {
-  .contract-header,
-  .contract-form,
-  .contract-card {
-    box-shadow: 0 10px 24px rgba(15, 23, 42, 0.07);
-  }
-}
-'''
-        return f''':root {{
-  color-scheme: light;
-  --contract-accent: {accent};
-  --contract-ink: #172026;
-  --contract-muted: #5c6670;
-  --contract-panel: #ffffff;
-  --contract-border: #d8dee4;
-}}
-
-body {{
-  margin: 0;
-  background: #f5f7f8;
-  color: var(--contract-ink);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}}
-
-.page {{
-  width: min(100%, 440px);
-  margin: 0 auto;
-  padding: 20px;
-  box-sizing: border-box;
-}}
-
-.contract-header,
-.contract-form,
-.contract-list,
-.contract-actions,
-.metrics-grid {{
-  display: grid;
-  gap: 12px;
-  margin-bottom: 16px;
-}}
-
-.contract-eyebrow {{
-  margin: 0;
-  color: var(--contract-accent);
-  font-weight: 700;
-  text-transform: uppercase;
-  font-size: 12px;
-}}
-
-h1, h2, p {{
-  margin-top: 0;
-}}
-
-.contract-copy,
-.contract-empty,
-.contract-card p {{
-  color: var(--contract-muted);
-}}
-
-label {{
-  display: grid;
-  gap: 6px;
-  font-weight: 600;
-}}
-
-input,
-textarea,
-select {{
-  border: 1px solid var(--contract-border);
-  border-radius: 8px;
-  padding: 11px 12px;
-  font: inherit;
-  background: white;
-  min-width: 0;
-}}
-
-input:focus-visible,
-textarea:focus-visible,
-select:focus-visible,
-button:focus-visible {{
-  outline: 3px solid color-mix(in srgb, var(--contract-accent) 28%, transparent);
-  outline-offset: 2px;
-}}
-
-button {{
-  min-height: 44px;
-  border: 0;
-  border-radius: 8px;
-  background: var(--contract-accent);
-  color: white;
-  padding: 10px 14px;
-  font: inherit;
-  font-weight: 700;
-}}
-
-[hidden] {{
-  display: none !important;
-}}
-
-.contract-state {{
-  padding: 10px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--contract-border);
-  background: white;
-  font-weight: 700;
-}}
-
-.contract-loading {{
-  color: var(--contract-muted);
-}}
-
-.contract-error {{
-  border-color: #fecaca;
-  background: #fef2f2;
-  color: #991b1b;
-}}
-
-.contract-success {{
-  border-color: #bbf7d0;
-  background: #f0fdf4;
-  color: #166534;
-}}
-
-.metrics-grid {{
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}}
-
-.metric-card {{
-  min-width: 0;
-  padding: 12px;
-  border: 1px solid var(--contract-border);
-  border-radius: 8px;
-  background: var(--contract-panel);
-}}
-
-.metric-card span {{
-  display: block;
-  color: var(--contract-muted);
-  font-size: 12px;
-}}
-
-.metric-card strong {{
-  display: block;
-  margin-top: 4px;
-  color: var(--contract-accent);
-  font-size: 22px;
-}}
-
-#contract-items {{
-  display: grid;
-  gap: 10px;
-}}
-
-.contract-card {{
-  display: grid;
-  gap: 8px;
-  padding: 14px;
-  background: var(--contract-panel);
-  border: 1px solid var(--contract-border);
-  border-radius: 8px;
-}}
-
-.contract-card span {{
-  width: max-content;
-  border-radius: 999px;
-  padding: 4px 9px;
-  background: color-mix(in srgb, var(--contract-accent) 12%, white);
-  color: var(--contract-accent);
-  font-size: 12px;
-  font-weight: 700;
-}}
-
-@media (max-width: 420px) {{
-  .page {{
-    padding: 16px;
-  }}
-
-  .metrics-grid {{
-    grid-template-columns: 1fr;
-  }}
-
-  .contract-card {{
-    overflow-wrap: anywhere;
-  }}
-}}
-{balanced_css}
-{quality_css}
-'''
-
-    @staticmethod
-    def _ensure_main_includes_generated_route(source_dir: Path) -> bool:
-        main_path = source_dir / "miniapp/app/main.py"
-        if not main_path.exists():
-            return False
-        original = main_path.read_text(encoding="utf-8")
-        updated = original
-        import_line = "from app.routes.generated_contract import router as generated_contract_router\n"
-        include_line = "app.include_router(generated_contract_router)\n"
-        if import_line not in updated:
-            anchor = "from app.routes.role_routes import router as role_router\n"
-            updated = updated.replace(anchor, anchor + import_line) if anchor in updated else import_line + updated
-        if include_line not in updated:
-            anchor = "app.include_router(role_router)\n"
-            updated = updated.replace(anchor, anchor + include_line) if anchor in updated else updated + "\n" + include_line
-        if updated == original:
-            return False
-        main_path.write_text(updated, encoding="utf-8")
-        return True
-
-    @staticmethod
     def _render_json(payload: dict[str, Any]) -> str:
         return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
@@ -1647,7 +684,7 @@ class MiniAppRouteRegistry:
                 issue = {
                     "code": "registry.missing_backend_route",
                     "expected": expected,
-                    "location": "miniapp/app/routes/generated_contract.py",
+                    "location": "miniapp/app/routes",
                 }
                 issues.append(issue)
                 recipes.append(
@@ -1657,7 +694,7 @@ class MiniAppRouteRegistry:
                         declared_routes=declared,
                         manifest_routes=manifest,
                         why_mismatch="The typed miniapp contract declares an API route that FastAPI route parsing cannot find.",
-                        suggested_patch_target="miniapp/app/routes/generated_contract.py",
+                        suggested_patch_target="miniapp/app/routes",
                         auto_fixable=True,
                     )
                 )
@@ -1698,7 +735,7 @@ class MiniAppRouteRegistry:
                         declared_routes=declared,
                         manifest_routes=manifest,
                         why_mismatch="Frontend JavaScript references an API path that is not declared by backend routes.",
-                        suggested_patch_target="miniapp/app/routes/generated_contract.py",
+                        suggested_patch_target="miniapp/app/routes",
                         auto_fixable=False,
                     )
                 )

@@ -3,20 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Client Preview</title>
+    <title>Mini App</title>
     <link rel="stylesheet" href="/static/shared/base.css" />
     <link rel="stylesheet" href="/static/client/styles.css" />
   </head>
-  <body>
-    <main class="page-shell">
-      <section class="page" data-role="client">
-        <div class="shell-panel">
-          <p class="shell-eyebrow">Preview entry</p>
-          <h1 class="shell-title">Client surface</h1>
-          <p class="shell-copy">This neutral starter screen should be replaced by the generated app.</p>
-        </div>
-      </section>
-    </main>
+  <body data-role="client">
+    <main id="app" class="page-shell" data-role="client"></main>
     <script src="/static/preview_bridge.js" defer></script>
     <script src="/static/client/app.js" defer></script>
   </body>

@@ -89,7 +89,7 @@ function getFrameId() {
       return rememberFrameId(frameId.trim(), role);
     }
   } catch {
-    // Ignore malformed URLs and fall back to session storage.
+    // Ignore malformed URLs; session storage may still contain the frame id.
   }
   try {
     const stored = window.sessionStorage.getItem(getFrameStorageKey(role));

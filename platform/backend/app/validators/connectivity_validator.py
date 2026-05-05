@@ -35,7 +35,7 @@ class ConnectivityValidator:
                                     "expected_route": f"{method} {normalized_endpoint}",
                                     "declared_routes": [f"{declared_method} {declared_path}" for declared_method, declared_path in sorted(api_route_paths)],
                                     "why_mismatch": "Frontend fetch reference has no matching FastAPI route by method/path.",
-                                    "suggested_patch_target": "miniapp/app/routes/generated_contract.py",
+                                    "suggested_patch_target": "miniapp/app/routes",
                                     "auto_fixable": False,
                                     "validator_may_be_stale": False,
                                 },

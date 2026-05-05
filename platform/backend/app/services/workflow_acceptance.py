@@ -50,6 +50,42 @@ def _sanitize_role_lists(values: Any, *, limit: int = 12) -> dict[str, list[str]
     }
 
 
+def _sanitize_roles(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    result: list[str] = []
+    for item in values:
+        role = str(item or "").strip().lower()
+        if role in ROLE_ORDER and role not in result:
+            result.append(role)
+    return result
+
+
+def _sanitize_role_state_contract(values: Any) -> dict[str, Any]:
+    source = values if isinstance(values, dict) else {}
+    return {
+        "source_roles": _sanitize_roles(source.get("source_roles") or source.get("creator_roles") or source.get("create_roles")),
+        "update_roles": _sanitize_roles(source.get("update_roles") or source.get("mutating_roles") or source.get("editor_roles")),
+        "observer_roles": _sanitize_roles(source.get("observer_roles") or source.get("viewer_roles") or source.get("consumer_roles")),
+        "status_values": _sanitize_prompt_list(source.get("status_values") or source.get("state_values"), limit=8),
+    }
+
+
+def _source_roles_from_prompt_hints(prompt_hints: dict[str, Any]) -> list[str]:
+    state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints, dict) else {}
+    if isinstance(state_contract, dict):
+        source_roles = _sanitize_roles(state_contract.get("source_roles"))
+        if source_roles:
+            return source_roles
+    role_fields = prompt_hints.get("role_field_hints") if isinstance(prompt_hints.get("role_field_hints"), dict) else {}
+    field_owned_roles = [
+        role
+        for role in ROLE_ORDER
+        if any(str(item).strip() for item in (role_fields.get(role) or []))
+    ]
+    return field_owned_roles[:1]
+
+
 def normalize_prompt_contract_analysis(
     prompt: str,
     analysis: dict[str, Any],
@@ -90,6 +126,11 @@ def normalize_prompt_contract_analysis(
     screen_plan = analysis.get("routeable_screen_plan") or analysis.get("screen_plan")
     if not isinstance(screen_plan, dict):
         screen_plan = {}
+    role_state_contract = _sanitize_role_state_contract(
+        analysis.get("role_state_contract")
+        or analysis.get("state_contract")
+        or analysis.get("role_ownership")
+    )
 
     return {
         "schema_version": PROMPT_ANALYSIS_SCHEMA_VERSION,
@@ -102,6 +143,7 @@ def normalize_prompt_contract_analysis(
         "role_field_hints": role_fields,
         "resource_hint": resource_hint or None,
         "role_action_prompts": role_actions,
+        "role_state_contract": role_state_contract,
         "routeable_screen_plan": screen_plan,
     }
 
@@ -153,8 +195,10 @@ def _role_screen_plan(
             },
         }
     role_prompts = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints, dict) else {}
+    role_fields = prompt_hints.get("role_field_hints") if isinstance(prompt_hints.get("role_field_hints"), dict) else {}
     field_hints = prompt_hints.get("field_hints") if isinstance(prompt_hints, dict) else []
     sentences = prompt_hints.get("prompt_sentences") if isinstance(prompt_hints, dict) else []
+    source_roles = set(_source_roles_from_prompt_hints(prompt_hints))
 
     role_screens: dict[str, list[dict[str, Any]]] = {}
     for role in ROLE_ORDER:
@@ -170,20 +214,30 @@ def _role_screen_plan(
                 "source": source_phrases[:1],
             }
         ]
-        if role == "client" and field_hints and not any(item["intent"] == "create_or_configure" for item in detected):
+        role_owned_fields = [
+            str(item).strip()
+            for item in (role_fields.get(role) or [])
+            if str(item).strip()
+        ]
+        source_fields = role_owned_fields or (field_hints if role in source_roles else [])
+        if role in source_roles and source_fields and not any(item["intent"] == "create_or_configure" for item in detected):
             detected.append(
                 {
                     "intent": "create_or_configure",
-                    "purpose": "form/select screen for the prompt-provided fields",
-                    "source": list(field_hints)[:6],
+                    "purpose": "form/select screen for the prompt-assigned source data",
+                    "source": list(source_fields)[:6],
                 }
             )
-        if role == "manager" and mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
+        if (
+            role == "manager"
+            and source_phrases
+            and mode_value in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}
+        ):
             if not any(item["intent"] == "summary_or_insight" for item in detected):
                 detected.append(
                     {
                         "intent": "summary_or_insight",
-                        "purpose": "management summary screen when the prompt asks for oversight or the mode adds deeper review",
+                        "purpose": "prompt-derived management summary screen",
                         "source": source_phrases[:3],
                     }
                 )
@@ -325,21 +379,24 @@ def build_acceptance_contract(
     if prompt_analysis is None:
         raise ValueError("LLM prompt analysis is required before building a workflow acceptance contract.")
     prompt_hints = extract_prompt_planning_hints(prompt, prompt_analysis=prompt_analysis)
+    source_roles = _source_roles_from_prompt_hints(prompt_hints)
+    state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
+    update_roles = _sanitize_roles(state_contract.get("update_roles"))
     flows: list[dict[str, Any]] = [
         {
             "id": "role_shared_persistence",
-            "title": "Shared persisted role workflow",
+            "title": "Shared persisted product workflow",
             "roles": list(ROLE_ORDER),
             "requirements": [
-                "Client role can submit a real form/action through a POST-capable backend API.",
-                "Specialist role can see saved client-created state and perform the prompt-derived operational action.",
-                "Manager role can see persisted shared state, summary metrics, and the prompt-derived oversight or control action.",
-                "If the prompt assigns creation of shared source state to manager or specialist, that role owns the creation flow and client consumes the persisted state.",
-                "Saved data remains visible after a reload through GET APIs; app source starts with no seed/mock records.",
+                "The agent chooses API routes, entities, and persistence shape from the prompt and current code; the platform does not provide a product CRUD scaffold.",
+                "Prompt-assigned source roles create, publish, configure, or import shared state only when the prompt requires that behavior.",
+                "Other roles load or change the same persisted state only through prompt-assigned actions.",
+                "No role is forced into unrequested workflow semantics.",
+                "Saved data remains visible after reload through the app-owned API; app source starts with no seed/mock records.",
             ],
             "required_tests": [
-                "Python generated test verifies empty GET, POST create, persisted GET, role update, and persisted update.",
-                "JS generated test verifies role pages, role-specific controls, frontend API usage, and handler wiring.",
+                "Python generated test verifies the actual app-owned API and persistence behavior, without assuming fixed update routes.",
+                "JS generated test verifies real role pages, prompt-specific controls, frontend API usage, and handler wiring.",
             ],
         }
     ]
@@ -347,15 +404,15 @@ def build_acceptance_contract(
         flows.append(
             {
                 "id": "related_resource_workflow",
-                "title": "Related status, summary, and operational updates",
+                "title": "Related prompt-derived operations",
                 "roles": list(ROLE_ORDER),
                 "requirements": [
-                    "The LLM-selected shared state supports create, process/update, review, and summary workflows.",
-                    "Role pages expose different actions for creating, processing, and reviewing saved state.",
-                    "Specialist or manager updates are visible to the other roles through later GET requests.",
+                    "The LLM-selected shared state supports create/list plus only the update, publish, edit, summary, or operational workflows implied by the prompt.",
+                    "Role pages expose different actions based on prompt-owned role responsibilities, not fixed processing roles.",
+                    "Prompt-assigned role updates are visible to the other relevant roles through later reads.",
                 ],
                 "required_tests": [
-                    "Generated tests cover the primary create/list/update flow and one related prompt-derived update or summary flow.",
+                    "Generated tests cover the primary persisted flow and one related prompt-derived action or summary flow.",
                 ],
             }
         )
@@ -368,8 +425,9 @@ def build_acceptance_contract(
         "features": {
             "cross_role_persistence": True,
             "refresh_persistence": True,
-            "workflow_update": True,
+            "workflow_update": bool(update_roles),
             "api_discovery_required": True,
+            "platform_product_scaffold": False,
         },
         "required_endpoints": [],
         "prompt_hints": prompt_hints,
@@ -377,13 +435,24 @@ def build_acceptance_contract(
             "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
             "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
             "resource_hint": prompt_hints.get("resource_hint") or None,
+            "role_state_contract": dict(prompt_hints.get("role_state_contract") or {}),
             "analysis_source": prompt_hints.get("analysis_source"),
             "analysis_status": prompt_hints.get("analysis_status"),
         },
         "required_controls": [
-            {"role": "client", "action": "submit the user-facing prompt-derived create/select/save flow through UI and POST-capable API"},
-            {"role": "specialist", "action": "perform the prompt-derived operational action through POST/PATCH when the workflow needs persisted updates"},
-            {"role": "manager", "action": "review shared state and trigger the prompt-derived oversight/control action"},
+            {
+                "role": role,
+                "action": "create, publish, configure, or import the prompt-derived shared state through app-owned UI/API",
+            }
+            for role in source_roles
+        ]
+        + [
+            {
+                "role": role,
+                "action": "perform the prompt-derived persisted update/control action when the workflow needs one",
+            }
+            for role in update_roles
+            if role not in source_roles
         ],
         "page_contract": {
             "multi_page_role_apps": True,
@@ -429,10 +498,20 @@ def build_implementation_plan(
                 "role_field_hints": {role: [] for role in ROLE_ORDER},
                 "resource_hint": None,
                 "role_action_prompts": {role: [] for role in ROLE_ORDER},
+                "role_state_contract": {
+                    "source_roles": [],
+                    "update_roles": [],
+                    "observer_roles": [],
+                    "status_values": [],
+                },
                 "routeable_screen_plan": {},
             }
         )
     screen_plan = _role_screen_plan(prompt_hints=prompt_hints, generation_mode=generation_mode)
+    source_roles = _source_roles_from_prompt_hints(prompt_hints)
+    state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
+    update_roles = _sanitize_roles(state_contract.get("update_roles"))
+    observer_roles = _sanitize_roles(state_contract.get("observer_roles"))
     required_controls = [
         dict(item)
         for item in (contract.get("required_controls") or [])
@@ -449,17 +528,35 @@ def build_implementation_plan(
         "prompt_hints": prompt_hints,
         "primary_entities": [prompt_hints.get("resource_hint")] if prompt_hints.get("resource_hint") else [],
         "role_actions": {
-            "client": (prompt_hints.get("role_action_prompts") or {}).get("client") or ["perform the prompt-derived user create, submit, select, or save action through UI and POST API"],
-            "specialist": (prompt_hints.get("role_action_prompts") or {}).get("specialist") or ["perform the prompt-derived operational processing/update action through UI and update API"],
-            "manager": (prompt_hints.get("role_action_prompts") or {}).get("manager") or ["review or control shared state and summary information through manager UI"],
+            role: (prompt_hints.get("role_action_prompts") or {}).get(role)
+            or (
+                ["create, publish, configure, or import the prompt-derived shared state through app-owned UI/API"]
+                if role in source_roles
+                else ["load shared state and perform the prompt-derived role action"]
+                if role in update_roles
+                else ["load shared state for this role's prompt-derived view"]
+            )
+            for role in ROLE_ORDER
+        },
+        "role_state_contract": {
+            "source_roles": source_roles,
+            "update_roles": update_roles,
+            "observer_roles": observer_roles,
+            "status_values": list(state_contract.get("status_values") or []),
         },
         "api_contract": {
             "required_endpoints": list(contract.get("required_endpoints") or []),
             "must_persist": True,
-            "must_support_update": bool((contract.get("features") or {}).get("workflow_update", True)),
+            "must_support_update": bool((contract.get("features") or {}).get("workflow_update", bool(update_roles))),
             "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
             "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
             "resource_hint": prompt_hints.get("resource_hint") or None,
+            "role_state_contract": {
+                "source_roles": source_roles,
+                "update_roles": update_roles,
+                "observer_roles": observer_roles,
+                "status_values": list(state_contract.get("status_values") or []),
+            },
             "analysis_source": prompt_hints.get("analysis_source"),
             "analysis_status": prompt_hints.get("analysis_status"),
         },
@@ -473,25 +570,30 @@ def build_implementation_plan(
             "role_specific_actions": True,
             "copy_quality": "Do not expose API paths, HTTP methods, route slugs, role slugs, raw enum codes, or internal implementation labels in normal role UI; render readable labels with clear spacing between label and value.",
             "role_independence": {
-                "client": "user-facing mobile app for the primary prompt-derived create/select/save flow; no links to specialist or manager surfaces",
-                "specialist": "operational mobile app for processing/updating shared state; no client-only duplicate page",
-                "manager": "oversight mobile app for summary, control, status, workload visibility, and any prompt-assigned shared-state creation flow; no specialist-only duplicate page",
+                role: (
+                    "source mobile app for creating or publishing the prompt-derived shared state"
+                    if role in source_roles
+                    else "mobile app for this role's prompt-derived update/control action"
+                    if role in update_roles
+                    else "mobile app for this role's prompt-derived read/selection experience"
+                )
+                for role in ROLE_ORDER
             },
             "shared_state_contract": [
-                "the prompt-assigned source role creates or selects persisted shared state through UI",
-                "specialist can load the same state and persist an update",
-                "manager can load the updated state and summary",
-                "client can reload and see the update through UI",
+                "prompt-assigned source role(s), if any, create/select/configure persisted shared state through UI",
+                "update roles persist only prompt-derived changes when the prompt needs those changes",
+                "observer roles load the same state without owning another role's controls when observer roles are explicit",
+                "all relevant roles can reload and see persisted state through UI",
             ],
         },
         "test_contract": {
             "generated_tests_required": bool(contract.get("required")),
             "browser_flow_required": bool(contract.get("required")),
             "proof_steps": [
-                "client_ui_action_changes_persisted_state",
-                "specialist_ui_action_updates_same_state",
-                "manager_role_observes_updated_state",
-                "client_role_observes_update_after_refresh",
+                "source_role_ui_action_changes_persisted_state",
+                "prompt_update_role_updates_same_state_when_required",
+                "observer_roles_load_persisted_state",
+                "source_role_observes_update_after_refresh",
                 "browser_proof_visits_routeable_screens_used_by_the_workflow",
             ],
         },
@@ -556,7 +658,7 @@ def orchestration_metadata_for_contract(
             "description": (
                 "Use owned agent worker drafts for backend/API, role UI, and generated tests, then merge non-conflicting diffs."
                 if isolated_worker_drafts
-                else "Use the contract-owned runtime as the first draft and serialize further backend/API, role UI, generated test, and design mutations through the coordinator tool loop."
+                else "Use the blank technical runtime plus prompt-contract metadata; serialize backend/API, role UI, test, and design mutations through the coordinator tool loop."
             ),
         },
         {

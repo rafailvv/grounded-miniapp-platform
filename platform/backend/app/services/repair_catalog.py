@@ -217,7 +217,7 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         signature="workflow.manager_missing_specialist_result_visibility",
         issue_code="manager_missing_specialist_result_visibility",
         severity="high",
-        likely_root_cause="Manager detail cards omit specialist-owned persisted fields, so approval happens without seeing the specialist result.",
+        likely_root_cause="Manager detail cards omit specialist-owned persisted fields, so a manager action happens without seeing the specialist result.",
         target_files=(
             "miniapp/app/static/manager/app.js",
             "miniapp/app/static/manager/index.html",
@@ -226,7 +226,7 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         verification_check="frontend_interaction_static_smoke",
         instruction=(
             "Read the manager role files and make the manager card/detail renderer display specialist-owned fields "
-            "before approval. Prefer rendering Object.entries(FIELD_LABELS) or explicitly include all specialist "
+            "before any manager decision/action. Prefer rendering Object.entries(FIELD_LABELS) or explicitly include all specialist "
             "contract keys, then update the generated browser test."
         ),
         required_next_tool="read_files",
@@ -258,7 +258,7 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         signature="workflow.prompt_specificity_mismatch",
         issue_code="prompt_specificity_missing_fields",
         severity="high",
-        likely_root_cause="Generated UI/API stayed on the generic contract scaffold instead of implementing the user's prompt-derived fields and role responsibilities.",
+        likely_root_cause="Generated UI/API stayed on a generic scaffold instead of implementing the user's prompt-derived fields and role responsibilities.",
         target_files=(
             "miniapp/app/static/client/index.html",
             "miniapp/app/static/client/app.js",
@@ -266,22 +266,22 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
             "miniapp/app/static/specialist/app.js",
             "miniapp/app/static/manager/index.html",
             "miniapp/app/static/manager/app.js",
-            "miniapp/app/routes/generated_contract.py",
+            "miniapp/app/routes",
             "miniapp/tests/test_generated_app.py",
             "miniapp/tests/generated_app.test.mjs",
         ),
         verification_check="frontend_interaction_static_smoke",
         instruction=(
-            "Replace generic Title/Note/shared-record UI with prompt-owned business fields, persist those fields through the API, "
-            "add role-specific specialist/manager actions, and update generated tests to prove the domain workflow."
+            "Replace generic placeholder UI with prompt-owned business fields, persist those fields through the API, "
+            "add prompt-assigned role actions, and update generated tests to prove the requested workflow."
         ),
         required_next_tool="read_files",
         verification_command="run_checks frontend_interaction_static_smoke",
         patterns=(
             _rx(r"prompt_specificity"),
             _rx(r"generic_scaffold_leakage"),
-            _rx(r"Title/Note"),
-            _rx(r"generic shared-record"),
+            _rx(r"placeholder labels"),
+            _rx(r"generic record UI"),
         ),
     ),
     RepairCatalogEntry(
@@ -312,7 +312,7 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         issue_code="workflow_patch_payload_field_mismatch",
         severity="high",
         likely_root_cause="Frontend sends fields the backend update schema does not accept, so role actions cannot persist the intended state.",
-        target_files=("miniapp/app/routes/generated_contract.py", "miniapp/app/static/**/app.js", "miniapp/tests/test_generated_app.py", "miniapp/tests/generated_app.test.mjs"),
+        target_files=("miniapp/app/routes", "miniapp/app/static/**/app.js", "miniapp/tests/test_generated_app.py", "miniapp/tests/generated_app.test.mjs"),
         verification_check="frontend_interaction_static_smoke",
         instruction="Align the backend Pydantic update/create schemas, frontend JSON payloads, and generated tests so every prompt-required field is accepted and persisted.",
         required_next_tool="read_files",

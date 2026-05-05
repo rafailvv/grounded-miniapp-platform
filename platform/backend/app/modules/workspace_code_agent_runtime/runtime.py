@@ -936,13 +936,9 @@ class WorkspaceCodeAgentRuntime:
             contract_materialized_paths = MiniAppContractMaterializer.materialize(
                 draft_source,
                 miniapp_contract,
-                include_role_shell=create_intent,
+                include_role_shell=False,
             )
-            contract_runtime_fast_path = (
-                create_intent
-                and generation_mode == GenerationMode.FAST
-                and bool(contract_materialized_paths)
-            )
+            contract_runtime_fast_path = False
             route_registry_snapshot = MiniAppRouteRegistry.snapshot(
                 draft_source,
                 miniapp_contract,
@@ -957,9 +953,11 @@ class WorkspaceCodeAgentRuntime:
                 {
                     "workspace_id": workspace_id,
                     "run_id": run_id,
-                    "status": "compiled_and_materialized",
+                    "status": "compiled_metadata_only",
                     "contract_id": miniapp_contract.contract_id,
                     "materialized_paths": contract_materialized_paths,
+                    "materialized_runtime": False,
+                    "materialized_tests": False,
                 },
             )
             self._store_report(
@@ -1038,7 +1036,7 @@ class WorkspaceCodeAgentRuntime:
                 "run_id": run_id,
                 "prefix": worker_prefix,
                 "contract": (
-                    "Worker branches are disabled for this mode; contract-owned files and subsequent mutations are serialized through the coordinator."
+                    "Worker branches are disabled for this mode; prompt-contract metadata is stable and mutations are serialized through the coordinator."
                     if not bool(worker_mailbox.get("enabled"))
                     else "Worker branches share this stable prefix; only owned task directive differs."
                 ),
@@ -1143,16 +1141,16 @@ class WorkspaceCodeAgentRuntime:
             else (contract_materialized_paths or ["miniapp", "docs", "README.md"])
         )
         if contract_materialized_paths and create_intent and not focused_visual_edit:
-            coordinator.complete_phase("editing", "Contract runtime materialized the initial backend, role UI, styles, and generated checks.")
+            coordinator.complete_phase("editing", "Prompt-contract metadata was written; product backend, UI, and tests remain agent-owned.")
             scratchpad.set_next_action(
-                action="run static, API, generated, browser, and mobile proof",
-                reason="contract_runtime_materialized",
+                action="build the prompt-derived product backend, role UI, tests, then run proof",
+                reason="prompt_contract_metadata_materialized",
                 payload={"paths": contract_materialized_paths[:24]},
             )
             self._append_event(
                 job,
                 "patch_apply_completed",
-                "Contract runtime materialized the initial mini-app draft.",
+                "Prompt-contract metadata materialized without product scaffold.",
                 {
                     "turn": 0,
                     "files": contract_materialized_paths[:24],
@@ -2926,19 +2924,19 @@ class WorkspaceCodeAgentRuntime:
                     *focused_rules,
                     f"Keep each turn applyable: use mutating tools for a compact coherent edit, or request only the specific read-only tools needed for the next patch.",
                     "Use the implementation_plan and acceptance_contract as the product contract. Derive entities, fields, routes, labels, and role actions from the user's prompt and current code, not from platform templates.",
-                    "If acceptance_contract.api_contract.field_hints is non-empty, the client form, persisted API payload, rendered cards, and generated tests must expose those prompt-derived fields. A generic Title/Note/Shared records scaffold is a blocking product failure, even if compile/apply passes.",
-                    "Specialist and manager surfaces must visibly reflect their own prompt sentences: operational updates for specialist, metrics/oversight/control for manager. Do not satisfy those roles with only a generic refresh/list page.",
+                    "If acceptance_contract.api_contract.field_hints is non-empty, the prompt-owned source role form, persisted API payload, rendered cards, and generated tests must expose those prompt-derived fields. Generic placeholder labels/lists are a blocking product failure, even if compile/apply passes.",
+                    "Each role surface must visibly reflect its own prompt sentences and implementation_plan.role_state_contract responsibilities. Do not satisfy a role with only a generic refresh/list page when the prompt assigns concrete actions.",
                     "Create/workflow completion requires real UI controls, JavaScript handlers, backend persistence, generated tests, cross-role visibility, refresh persistence, and browser/mobile proof.",
-                    "Build three isolated role surfaces in the miniapp shell: client creates/submits the main prompt-derived state, specialist processes or updates it, manager reviews/control-checks the persisted state. Do not link role roots to each other.",
+                    "Build three isolated role surfaces in the miniapp shell: source roles create/publish the main prompt-derived state, update roles edit/update it, and observer roles browse/use it. Do not link role roots to each other and do not force unrequested workflow semantics.",
                     "For multi-page role apps, shared static/<role>/app.js must initialize per page: use body[data-view] or route, guard optional DOM nodes from other pages, and bind every visible child-page form/button/control to persisted API behavior.",
-                    "The client/source role must display both its original submitted state and the persisted progress/update fields changed by specialist or manager roles after reload.",
+                    "The source role must display its original submitted state and any persisted prompt-derived update fields after reload; observer roles should show the shared state without duplicate source controls.",
                     "User-facing UI copy must be polished product language: do not render raw API paths, the word API, HTTP methods, internal route names, role slugs, or enum codes like `new`/`preparing`; map persisted values to human-readable labels and keep label/value pairs visually separated.",
                     "In async JavaScript form handlers, capture DOM nodes before any await, for example `const form = event.currentTarget`, then use `form.reset()` after awaited API calls. Do not read `event.currentTarget` after await because browsers clear it after dispatch.",
                     "Do not initialize workflow bindings only with `document.addEventListener('DOMContentLoaded', init)`. Use a readyState guard (`if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();`) so forms still bind when scripts load after DOMContentLoaded in preview/browser verification.",
                     "Fast should be compact and working; Balanced should add moderate workflow/design depth; Quality should first get the workflow green, then add a polished mobile design pass. Never add pages or resources just to satisfy a fixed count.",
                     "Mobile-first: target Telegram widths around 360-430px, use one consistent light neutral product visual system across all roles unless the user explicitly asks for a dark theme, preserve safe top spacing/preview bridge, and avoid horizontal scroll or overlapping cards/forms/actions.",
                     "Generated source must start empty: no mock, seed, demo, sample, fixture, preloaded, or hard-coded domain records. Empty states and validation test payloads are allowed.",
-                    "Generated tests must verify the actual app contract: persistent API create/list/update, real role HTML/JS selectors, role-specific actions, and no stale UI-only controls. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods. FastAPI generated tests should use `with TestClient(app) as client:` so lifespan/table setup runs, or explicitly create tables after generated ORM models are imported. JS generated tests run from cwd=miniapp, so read app/static/... and app/generated/... paths, not miniapp/app/... paths. Do not write pytest-only top-level test functions. Patch tests only when they are stale with the app contract.",
+                    "Generated tests must verify the actual app contract: persisted API behavior, real role HTML/JS selectors, prompt-assigned actions, and no stale UI-only controls. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods. FastAPI generated tests should use `with TestClient(app) as client:` so lifespan/table setup runs, or explicitly create tables after generated ORM models are imported. JS generated tests run from cwd=miniapp, so read app/static/... and app/generated/... paths, not miniapp/app/... paths. Do not write pytest-only top-level test functions. Patch tests only when they are stale with the app contract.",
                     "For edit/refine/fix/repair, patch existing files with small unified diffs. Use full-file replace only for new files, tiny files, create-mode work, or a file that repeatedly conflicts.",
                     "If checks/browser proof fail, repair the concrete failing slice from latest_checks/tool_results: align selectors, payload fields, API routes, rendered state, and tests together. Do not rewrite unrelated files.",
                     "Read-only tools never write files. Mutating tools are serialized through the draft edit validator. run_command is limited to safe diagnostics such as unittest, py_compile, node tests/checks, rg, sed, and ls.",
@@ -3854,10 +3852,10 @@ class WorkspaceCodeAgentRuntime:
             "Read the latest check/browser diagnostics as the source of truth, patch the smallest connected slice, then let validation run again.",
             "Prefer apply_patch_to_draft for existing files. Use write_file only for a new/missing/tiny file or after a repeated apply conflict on that same file.",
             "Keep the app prompt-owned and prompt-derived: do not introduce platform templates, seed/demo/mock domain records, or fixed resource/page names.",
-            "Prompt-specificity failures are blocking: replace generic Title/Note/shared-record UI with the user's fields, persisted payload fields, rendered card labels, and role-specific specialist/manager controls.",
+            "Prompt-specificity failures are blocking: replace generic placeholder UI with the user's fields, persisted payload fields, rendered card labels, and prompt-assigned role controls.",
             "For create/workflow failures, keep HTML controls, JavaScript handlers, API routes/schemas, persistence, and generated tests aligned to one actual contract.",
             "Browser-flow failures are product failures: make the UI action change persisted state, make other roles observe it, and make reload preserve it.",
-            "The source/user-facing role must render the persisted fields that operational roles can update, such as status, notes, comments, assignment, payment, or other prompt-derived progress fields. It is not enough to show only the fields originally submitted by the user.",
+            "The source/user-facing role must render persisted fields that prompt-assigned operational roles can update. It is not enough to show only the fields originally submitted by the user when the prompt requires later changes to be visible.",
             "Generated tests should verify the actual app contract. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods; use FastAPI TestClient as a context manager when app lifespan creates tables; never replace tests with pytest-only top-level functions. JS generated tests run from cwd=miniapp, so path reads should be app/static/... and app/generated/.... Patch stale/brittle test expectations only when the app behavior is already correct.",
             "Mobile layout fixes must target 360-430px width: no horizontal scroll, no overlapping critical cards/forms/actions, and readable wrapping.",
             "For multi-page role apps, a shared static/<role>/app.js must be view-aware: branch by body[data-view] or route, guard optional DOM nodes that exist only on other pages, and bind every visible form/button/control on root and child pages.",
@@ -5305,7 +5303,7 @@ class WorkspaceCodeAgentRuntime:
                     "For platform.missing_create_get_api/platform.missing_create_post_api, create or register a backend /api route with persistent GET and POST behavior. "
                     "For platform.frontend_missing_post_api, add form/fetch code that POSTs user-provided state to the matching /api route. "
                     "For platform.preloaded_domain_data, remove hard-coded domain records and start from empty persistent state. "
-                    "For platform.missing_role_workflow_actions on manager, add a real manager dashboard control such as a review/refresh/filter/oversight button with a guarded JavaScript handler, or a PATCH/PUT oversight action if the requested flow needs manager mutation. "
+                    "For platform.missing_role_workflow_actions on manager, add a real prompt-derived manager control such as refresh/filter/summary/configuration with a guarded JavaScript handler, or a PATCH/PUT action only if the requested flow needs manager mutation. "
                     "Do not rewrite unrelated role pages."
                 ),
                 "issues": issues[:24],

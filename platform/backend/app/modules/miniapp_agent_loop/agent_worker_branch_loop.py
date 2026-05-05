@@ -523,14 +523,10 @@ class AgentWorkerBranchLoop:
             html = self._read_text(role_dir / "index.html")
             js = self._read_text(role_dir / "app.js")
             css = self._read_text(role_dir / "styles.css")
-            if self._looks_like_neutral_starter(html):
+            if self._looks_like_neutral_shell(html):
                 missing.append(f"{role}/index.html prompt-specific role UI")
             if "fetch(" not in js or "addEventListener" not in js:
                 missing.append(f"{role}/app.js API fetch handlers")
-            if worker == "client_ui" and "method" not in js.lower():
-                missing.append("client/app.js POST submit method")
-            if worker in {"specialist_ui", "manager_ui"} and not any(method in js.lower() for method in ("patch", "put", "post")):
-                missing.append(f"{role}/app.js persisted update action")
             if self._looks_like_placeholder_css(css):
                 missing.append(f"{role}/styles.css non-placeholder mobile styling")
         elif worker == "backend_api":
@@ -540,12 +536,12 @@ class AgentWorkerBranchLoop:
                 for path in sorted((branch_source / "miniapp/app/routes").glob("*.py"))
             )
             lowered_routes = routes_text.lower()
-            if "/api" not in routes_text or "@router.post" not in lowered_routes or "@router.get" not in lowered_routes:
-                missing.append("backend GET+POST /api routes")
+            if "/api" not in routes_text or "@router.get" not in lowered_routes:
+                missing.append("backend GET /api route")
+            if not any(method in lowered_routes for method in ("@router.post", "@router.put", "@router.patch", "@router.delete")):
+                missing.append("backend prompt-owned mutating API route")
             if any(marker in routes_text for marker in ("APIRouter(prefix=\"/api", "APIRouter(prefix='/api")) and "include_router" not in main:
-                missing.append("app.main includes generated API router")
-            if "@router.patch" not in lowered_routes and "@router.put" not in lowered_routes and "@router.post" not in lowered_routes:
-                missing.append("backend persisted update endpoint")
+                missing.append("app.main includes API router")
         elif worker == "generated_tests":
             py_test = self._read_text(branch_source / "miniapp/tests/test_generated_app.py")
             js_test = self._read_text(branch_source / "miniapp/tests/generated_app.test.mjs")
@@ -578,12 +574,12 @@ class AgentWorkerBranchLoop:
             return None
 
     @staticmethod
-    def _looks_like_neutral_starter(text: str) -> bool:
+    def _looks_like_neutral_shell(text: str) -> bool:
         lowered = str(text or "").lower()
         return any(
             marker in lowered
             for marker in (
-                "neutral starter",
+                "neutral shell",
                 "preview entry",
                 "client surface",
                 "specialist surface",
@@ -840,10 +836,10 @@ class AgentWorkerBranchLoop:
             "instructions": [
                 "Inspect only the files you need for your owner scope.",
                 "Patch a complete owned slice that supports the prompt-derived role workflow.",
-                "Use shared_prefix.implementation_plan.prompt_hints as the source for nouns, fields, labels, and role actions. If prompt_hints has concrete terms, do not build a generic 'record/request' UI.",
+                "Use shared_prefix.implementation_plan.prompt_hints as the source for nouns, fields, labels, and role actions. If prompt_hints has concrete terms, do not build a generic placeholder record UI.",
                 "This branch must produce actual file changes; do not finish with read-only tool calls only.",
                 "Keep each role surface independent and mobile-first. Do not include another role's primary workflow controls in this role just to make verification easier.",
-                "Default role split: client creates/submits the user-provided state; specialist processes/updates existing shared state; manager reviews, summarizes, and controls shared state. If the user's prompt assigns shared-state creation to manager or specialist, that role must own that creation flow and client must consume the persisted state.",
+                "Prompt analysis decides the role split through shared_prefix.implementation_plan.role_state_contract; do not force a fixed client/specialist/manager workflow split. If the user's prompt assigns shared-state creation to manager or specialist, that role must own that creation flow and client must consume the persisted state without duplicate source controls.",
                 "Split role workflows into routeable mobile pages when that makes the product clearer; avoid one long dashboard-only page, but do not add pages just to satisfy a fixed count. Child pages must live under static/<role>/<page>/index.html and be reachable through route_manifest.json or filesystem role routing.",
                 "Use shared_prefix.implementation_plan.routeable_screen_plan for screen intent guidance; concrete route names are still owned by this worker and must come from the prompt/product vocabulary.",
                 "If you work on UI or generated tests, read the current backend route/schema files first and use their actual endpoint paths and field names exactly.",

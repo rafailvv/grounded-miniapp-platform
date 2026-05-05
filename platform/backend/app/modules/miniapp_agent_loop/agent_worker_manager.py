@@ -54,8 +54,8 @@ class AgentWorkerManager:
         # repair loop for mutations and reserve workers for future read-only
         # planning/verifier roles.
         enabled = generation_mode == GenerationMode.FAST
-        contract_runtime = implementation_plan.get("contract_runtime_v1") if isinstance(implementation_plan, dict) else {}
-        materialized_tests = bool(isinstance(contract_runtime, dict) and contract_runtime.get("materialized_tests"))
+        prompt_contract = implementation_plan.get("prompt_contract_v1") if isinstance(implementation_plan, dict) else {}
+        materialized_tests = bool(isinstance(prompt_contract, dict) and prompt_contract.get("materialized_tests"))
         workers = [
             {
                 "worker": scope.worker,

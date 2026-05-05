@@ -504,7 +504,7 @@ def test_repair_catalog_prefers_embedded_validator_recipe_over_generic_static_fa
                 json.dumps(
                     {
                         "code": "platform.manager_missing_specialist_result_visibility",
-                        "message": "Manager role must render specialist-owned persisted result fields before approval.",
+                        "message": "Manager role must render specialist-owned persisted result fields before manager action.",
                         "severity": "high",
                         "location": "miniapp/app/static/manager/app.js",
                         "blocking": True,

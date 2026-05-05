@@ -43,10 +43,11 @@ def test_fast_contract_compiler_creates_deterministic_resource_and_routes() -> N
     routes = {(endpoint.method, endpoint.path) for endpoint in contract.endpoints}
 
     assert contract.version == "grounded.miniapp.contract.v1"
-    assert ("GET", "/api/ledgers") in routes
-    assert ("POST", "/api/ledgers") in routes
-    assert ("PATCH", "/api/ledgers/{item_id}/status") in routes
+    assert routes == set()
+    assert contract.resources[0].slug == "ledgers"
     assert "miniapp/app/generated/route_manifest.json" in contract.allowed_file_graph.contract_owned_paths
+    assert all("miniapp/app/routes/" not in path for path in contract.allowed_file_graph.contract_owned_paths)
+    assert "miniapp/tests/test_generated_app.py" not in contract.allowed_file_graph.blocked_globs
 
 
 def test_materializer_is_idempotent_and_registry_passes(tmp_path: Path) -> None:
@@ -66,73 +67,80 @@ def test_materializer_is_idempotent_and_registry_passes(tmp_path: Path) -> None:
     preloaded_issues, preloaded_findings = CheckRunner._preloaded_domain_data_issues(source)
 
     assert "miniapp/app/generated/miniapp_contract.json" in first
+    assert all("miniapp/app/routes/" not in path for path in first)
+    assert "miniapp/tests/test_generated_app.py" not in first
     assert second == []
     assert snapshot.status == "passed"
     assert preloaded_issues == []
     assert preloaded_findings == []
-    assert "POST /api/records" in snapshot.declared_routes
     assert "/client" in snapshot.manifest_routes
 
 
-def test_contract_shell_copy_uses_product_labels_not_internal_status_or_workflow_copy(tmp_path: Path) -> None:
+def test_contract_materializer_does_not_write_product_role_shell(tmp_path: Path) -> None:
     source = _template_source(tmp_path)
+    original_client_html = (source / "miniapp/app/static/client/index.html").read_text(encoding="utf-8")
+    original_manager_html = (source / "miniapp/app/static/manager/index.html").read_text(encoding="utf-8")
+    original_manager_js = (source / "miniapp/app/static/manager/app.js").read_text(encoding="utf-8")
+    analysis = _analysis("товар")
+    analysis["role_field_hints"] = {
+        "client": [],
+        "specialist": [],
+        "manager": ["название товара", "цена", "остаток"],
+    }
+    analysis["role_action_prompts"] = {
+        "client": ["смотрит каталог"],
+        "specialist": [],
+        "manager": ["выкладывает товары"],
+    }
+    analysis["role_state_contract"] = {
+        "source_roles": ["manager"],
+        "update_roles": ["manager"],
+        "observer_roles": ["client", "specialist"],
+        "status_values": ["опубликован", "скрыт"],
+    }
     contract = MiniAppContractCompiler.compile(
         workspace_id="ws_test",
         run_id="run_test",
-        prompt="Создай приложение для заявок на аренду оборудования.",
+        prompt="Создай интернет-магазин: менеджер сам выкладывает товары, клиент смотрит каталог.",
         intent="create",
         generation_mode=GenerationMode.QUALITY,
-        prompt_analysis=_analysis("заявка"),
+        prompt_analysis=analysis,
     )
     MiniAppContractMaterializer.materialize(source, contract)
 
-    specialist_js = (source / "miniapp/app/static/specialist/app.js").read_text(encoding="utf-8")
-    specialist_html = (source / "miniapp/app/static/specialist/index.html").read_text(encoding="utf-8")
-
-    assert "Отметить обработку" in specialist_js
-    assert "statusLabel(item.status)" in specialist_js
-    assert 'ready: "Готово к согласованию"' in specialist_js
-    assert 'rejected: "Отклонена"' in specialist_js
+    client_html = (source / "miniapp/app/static/client/index.html").read_text(encoding="utf-8")
     manager_js = (source / "miniapp/app/static/manager/app.js").read_text(encoding="utf-8")
     manager_html = (source / "miniapp/app/static/manager/index.html").read_text(encoding="utf-8")
-    assert 'const DETAIL_FIELD_LABELS = {' in manager_js
-    assert '<option value="approved">Одобрена</option>' in manager_html
-    assert '<option value="rejected">Отклонена</option>' in manager_html
-    assert "Save progress" not in specialist_js
-    assert "workflow entries" not in specialist_js
-    assert "Specialist" not in specialist_html
-    assert "workflow" not in specialist_html
-    assert "Title" not in specialist_html
-    assert "Note" not in specialist_html
-    assert 'item.status || "new"' not in specialist_js
+
+    assert contract.resources[0].source_roles == ["manager"]
+    assert client_html == original_client_html
+    assert manager_html == original_manager_html
+    assert manager_js == original_manager_js
+    assert "nazvanieTovara" not in manager_html
+    assert "выкладывает товары" not in manager_html
+    assert "DETAIL_FIELD_LABELS" not in manager_js
+    assert "Одобрена" not in manager_html
+    assert "Отклонена" not in manager_html
+    assert "Контроль шаблонных записей" not in manager_html
 
 
-def test_role_operation_fields_are_visible_across_roles_when_prompt_has_no_field_hints(tmp_path: Path) -> None:
-    source = _template_source(tmp_path)
+def test_contract_compiler_does_not_invent_resource_when_llm_analysis_has_none() -> None:
     contract = MiniAppContractCompiler.compile(
         workspace_id="ws_test",
         run_id="run_test",
-        prompt="Создай приложение для согласования рабочего процесса.",
+        prompt="Создай полезное мобильное приложение.",
         intent="create",
         generation_mode=GenerationMode.FAST,
-        prompt_analysis=_analysis("заявка"),
+        prompt_analysis={**_analysis(""), "resource_hint": None},
     )
-    MiniAppContractMaterializer.materialize(source, contract)
 
-    client_js = (source / "miniapp/app/static/client/app.js").read_text(encoding="utf-8")
-    manager_html = (source / "miniapp/app/static/manager/index.html").read_text(encoding="utf-8")
-
-    assert 'name="managerDecision"' in manager_html
-    assert 'name="managerComment"' in manager_html
-    assert '"recordName": "Название записи"' in client_js
-    assert '"specialistDecision": "Решение специалиста"' in client_js
-    assert '"managerDecision": "Решение менеджера"' in client_js
-    assert "ROLE === \"manager\" ? FIELD_LABELS" not in client_js
+    assert contract.resources == []
+    assert contract.endpoints == []
 
 
-def test_internal_status_hint_stays_dedicated_control_not_detail_field(tmp_path: Path) -> None:
+def test_status_hint_remains_prompt_owned_metadata_field(tmp_path: Path) -> None:
     source = _template_source(tmp_path)
-    analysis = _analysis("заявка")
+    analysis = _analysis("документ")
     analysis["field_hints"] = ["название", "статус", "комментарий"]
     analysis["role_field_hints"] = {
         "client": ["название", "комментарий"],
@@ -142,19 +150,18 @@ def test_internal_status_hint_stays_dedicated_control_not_detail_field(tmp_path:
     contract = MiniAppContractCompiler.compile(
         workspace_id="ws_test",
         run_id="run_test",
-        prompt="Создай приложение для согласования заявки.",
+        prompt="Создай приложение для согласования документа.",
         intent="create",
         generation_mode=GenerationMode.FAST,
         prompt_analysis=analysis,
     )
     MiniAppContractMaterializer.materialize(source, contract)
 
-    client_js = (source / "miniapp/app/static/client/app.js").read_text(encoding="utf-8")
-    manager_html = (source / "miniapp/app/static/manager/index.html").read_text(encoding="utf-8")
+    resource = contract.resources[0]
 
-    assert '"status": "статус"' not in client_js
-    assert 'id="contract-status-field" name="status"' in manager_html
-    assert "statusLabel(item.status)" in client_js
+    assert "status" in resource.field_labels
+    assert "status" in resource.role_field_labels["specialist"]
+    assert "status" in resource.role_field_labels["manager"]
 
 
 def test_registry_returns_repair_recipe_for_backend_contract_drift(tmp_path: Path) -> None:
@@ -168,13 +175,16 @@ def test_registry_returns_repair_recipe_for_backend_contract_drift(tmp_path: Pat
         prompt_analysis=_analysis("task"),
     )
     MiniAppContractMaterializer.materialize(source, contract)
-    (source / "miniapp/app/routes/generated_contract.py").write_text("# route drift\n", encoding="utf-8")
+    (source / "miniapp/app/static/client/app.js").write_text(
+        'window.setupPreviewBridge?.("client");\nfetch("/api/tasks", { method: "GET" });\n',
+        encoding="utf-8",
+    )
 
     snapshot = MiniAppRouteRegistry.snapshot(source, contract)
 
     assert snapshot.status == "drift"
-    assert any(issue["code"] == "registry.missing_backend_route" for issue in snapshot.drift_issues)
-    assert any(recipe.suggested_patch_target == "miniapp/app/routes/generated_contract.py" for recipe in snapshot.repair_recipes)
+    assert any(issue["code"] == "registry.frontend_backend_drift" for issue in snapshot.drift_issues)
+    assert any(recipe.suggested_patch_target == "miniapp/app/routes" for recipe in snapshot.repair_recipes)
 
 
 def test_registry_sync_adds_filesystem_child_pages_to_route_manifest(tmp_path: Path) -> None:

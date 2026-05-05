@@ -21,13 +21,9 @@ class AgentEditValidator:
         "platform-state.json",
         "miniapp/app/routes/role_pages.py",
         "miniapp/app/routes/role_routes.py",
-        "miniapp/app/routes/generated_contract.py",
         "miniapp/app/generated/miniapp_contract.json",
-        "miniapp/app/generated/api_client.js",
         "miniapp/app/generated/route_manifest.json",
         "miniapp/app/generated/contract_validator.json",
-        "miniapp/tests/test_generated_app.py",
-        "miniapp/tests/generated_app.test.mjs",
     )
 
     @staticmethod
@@ -175,7 +171,7 @@ class AgentEditValidator:
                 if cls._role_page_neutral_template_issue(normalized_path, text):
                     return (
                         "neutral_role_template_write",
-                        f"{normalized_path} writes the platform neutral starter page back into a generated role app. Patch the prompt-derived workflow UI instead.",
+                        f"{normalized_path} writes the platform neutral shell page back into a generated role app. Patch the prompt-derived workflow UI instead.",
                     )
                 if any(marker in text for marker in cls.PATCH_ENVELOPE_MARKERS):
                     return (
@@ -193,7 +189,7 @@ class AgentEditValidator:
                 if cls._role_page_neutral_template_issue(normalized_path, patch_text):
                     return (
                         "neutral_role_template_patch",
-                        f"{normalized_path} patch would restore neutral starter role content. Patch the prompt-derived workflow UI instead.",
+                        f"{normalized_path} patch would restore neutral shell role content. Patch the prompt-derived workflow UI instead.",
                     )
                 if patch_text.lstrip().startswith("*** Begin Patch"):
                     issue = cls._validate_size(normalized_path, patch_text)
@@ -269,7 +265,7 @@ class AgentEditValidator:
             return False
         lowered = str(text or "").lower()
         markers = (
-            "neutral starter",
+            "neutral shell",
             "should be replaced by the generated app",
             "client surface",
             "specialist surface",
