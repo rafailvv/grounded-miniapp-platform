@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from app.models.threads import ArtifactRecord, ItemRecord, RolloutEventRecord, ThreadRecord, TurnRecord
 
@@ -161,6 +162,31 @@ class PlatformDb:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_events (
+                    event_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_run_events_run_sequence ON run_events(run_id, sequence, event_id)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_state_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_run_state_snapshots_run_created ON run_state_snapshots(run_id, created_at, snapshot_id)")
             conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                 (self.CURRENT_SCHEMA_VERSION, _utc_iso()),
@@ -320,6 +346,79 @@ class PlatformDb:
                 (thread_id, int(after_sequence or 0), max(1, min(limit, 1000))),
             ).fetchall()
         return [self._loads(row, RolloutEventRecord) for row in rows]
+
+    def append_run_event(self, run_id: str, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        created_at = _utc_iso()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM run_events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            sequence = int(row["next_sequence"] if row else 1)
+            record = {
+                "event_id": f"run_evt_{uuid4().hex}",
+                "run_id": run_id,
+                "event_type": event_type,
+                "sequence": sequence,
+                "payload": payload or {},
+                "created_at": created_at,
+            }
+            conn.execute(
+                """
+                INSERT INTO run_events(event_id, run_id, event_type, sequence, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["event_id"],
+                    run_id,
+                    event_type,
+                    sequence,
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                    created_at,
+                ),
+            )
+        return record
+
+    def list_run_events(self, run_id: str, *, after_sequence: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM run_events WHERE run_id = ? AND sequence > ? ORDER BY sequence, event_id LIMIT ?",
+                (run_id, int(after_sequence or 0), max(1, min(limit, 2000))),
+            ).fetchall()
+        return [json.loads(str(row["payload_json"])) for row in rows]
+
+    def insert_run_state_snapshot(self, *, run_id: str, reason: str, payload: dict[str, Any]) -> dict[str, Any]:
+        created_at = _utc_iso()
+        record = {
+            "snapshot_id": f"run_state_{uuid4().hex}",
+            "run_id": run_id,
+            "reason": reason,
+            "payload": payload,
+            "created_at": created_at,
+        }
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO run_state_snapshots(snapshot_id, run_id, reason, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    record["snapshot_id"],
+                    run_id,
+                    reason,
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                    created_at,
+                ),
+            )
+        return record
+
+    def list_run_state_snapshots(self, run_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM run_state_snapshots WHERE run_id = ? ORDER BY created_at DESC, snapshot_id DESC LIMIT ?",
+                (run_id, max(1, min(limit, 200))),
+            ).fetchall()
+        return [json.loads(str(row["payload_json"])) for row in rows]
 
     def insert_artifact(self, artifact: ArtifactRecord) -> ArtifactRecord:
         with self._lock, self._connect() as conn:

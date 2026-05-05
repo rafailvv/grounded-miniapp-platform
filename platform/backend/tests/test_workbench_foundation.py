@@ -77,6 +77,7 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     ).json()
     timeline = client.get(f"/runs/{run.run_id}/timeline").json()
     trace = client.get(f"/runs/{run.run_id}/trace-view").json()
+    run_events = client.get(f"/runs/{run.run_id}/events").json()
     doctor = client.get("/doctor").json()
     memory = client.post(
         f"/workspaces/{workspace['workspace_id']}/memory",
@@ -86,6 +87,9 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     workers = client.get(f"/runs/{run.run_id}/workers").json()
     permissions = client.get("/system/permissions/rules").json()
     lsp = client.get(f"/workspaces/{workspace['workspace_id']}/diagnostics/lsp").json()
+    thread = client.post("/threads", json={"workspace_id": workspace["workspace_id"], "title": "Workbench Thread"}).json()
+    thread_snapshot = client.get(f"/threads/{thread['thread_id']}").json()
+    resumed_thread = client.post(f"/threads/{thread['thread_id']}/resume").json()
     patch_preflight = client.post(
         f"/workspaces/{workspace['workspace_id']}/patch/preflight",
         json={
@@ -105,6 +109,7 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert evaluation["decision"]["action"] == "allow"
     assert timeline["items"][0]["kind"] == "prompt"
     assert trace["reducer"]["why"] == "Build a workflow"
+    assert run_events["schema"] == "grounded.run_events.v1"
     assert doctor["checks"]
     assert memory["items"][0]["text"] == "Use dense operational UI."
     assert any(item["id"] == "state-workflow" for item in skills["items"])
@@ -112,7 +117,74 @@ def test_workbench_public_endpoints_are_additive(tmp_path: Path) -> None:
     assert any(item["worker_id"] == "backend_api" for item in workers["workers"])
     assert any(item["rule_id"] == "block_destructive" for item in permissions["items"])
     assert lsp["status"] in {"passed", "failed"}
+    assert thread_snapshot["thread"]["thread_id"] == thread["thread_id"]
+    assert resumed_thread["status"] == "active"
     assert patch_preflight["status"] == "passed"
+
+
+def test_run_events_are_persisted_by_platform_db(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Run Event Workspace",
+            "description": "Run event persistence",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+    run = RunRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt="Build a workflow",
+        intent="create",
+        target_role_scope=["client", "specialist", "manager"],
+        model_profile="test",
+    )
+    job = JobRecord(
+        workspace_id=workspace["workspace_id"],
+        prompt=run.prompt,
+        status="running",
+        target_platform="telegram_mini_app",
+        preview_profile="telegram_mock",
+        generation_mode="fast",
+        linked_run_id=run.run_id,
+    )
+    app.state.container.store.upsert("runs", run.run_id, run.model_dump(mode="json"))
+    app.state.container.workspace_code_agent_runtime.append_event(
+        job,
+        "job_started",
+        "Workspace code agent started.",
+        {"run_id": run.run_id},
+    )
+
+    events = client.get(f"/runs/{run.run_id}/events").json()
+
+    assert events["items"][0]["event_type"] == "run.started"
+    assert events["items"][0]["payload"]["source_event_type"] == "job_started"
+    assert events["state_snapshots"][0]["reason"] == "job_started"
+
+
+def test_workspace_memory_rejects_secret_like_text(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    workspace = client.post(
+        "/workspaces",
+        json={
+            "name": "Memory Secret Guard",
+            "description": "Memory should not store secrets",
+            "target_platform": "telegram_mini_app",
+            "preview_profile": "telegram_mock",
+        },
+    ).json()
+
+    response = client.post(
+        f"/workspaces/{workspace['workspace_id']}/memory",
+        json={"kind": "project_rule", "text": "api_key=sk-secretvalue123456"},
+    )
+
+    assert response.status_code == 400
+    assert "secret" in response.json()["error"]["message"].lower()
 
 
 def test_reliability_gate_reconciles_completed_run_with_missing_product_proof(tmp_path: Path) -> None:

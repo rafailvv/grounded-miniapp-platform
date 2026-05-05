@@ -185,7 +185,9 @@ class ExecPolicyService:
             return "forbidden"
         executable = PurePosixPath(decision.argv[0]).name.lower() if decision.argv else ""
         args = [str(arg).lower() for arg in decision.argv]
-        if executable in {"rg", "sed", "ls", "python", "python3", "node"}:
+        if executable in {"rg", "sed", "ls", "python", "python3", "node", "find"}:
+            return "read_only"
+        if executable == "git" and decision.action == "allow" and decision.matched_prefix and decision.matched_prefix[0] == "git":
             return "read_only"
         if executable in {"curl", "wget", "git", "npm", "pnpm", "yarn", "pip", "pip3"}:
             return "network"

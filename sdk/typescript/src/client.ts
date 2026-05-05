@@ -7,6 +7,16 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [key:
 export type JsonObject = { [key: string]: JsonValue };
 export type RunEventType =
   | "run_started"
+  | "run.started"
+  | "turn.started"
+  | "tool.started"
+  | "tool.completed"
+  | "check.completed"
+  | "repair.packet"
+  | "browser.step"
+  | "gate.changed"
+  | "run.completed"
+  | "usage"
   | "tool_event"
   | "check_completed"
   | "repair_packet"
@@ -50,6 +60,37 @@ export class GroundedClient {
     });
   }
 
+  async listThreads(options: { workspaceId?: string; includeArchived?: boolean; limit?: number } = {}): Promise<JsonObject> {
+    const params = new URLSearchParams({
+      include_archived: String(options.includeArchived ?? false),
+      limit: String(options.limit ?? 50),
+    });
+    if (options.workspaceId) params.set("workspace_id", options.workspaceId);
+    return this.requestObject(`/threads?${params.toString()}`);
+  }
+
+  async startThread(workspaceId: string, options: { title?: string; metadata?: JsonObject } = {}): Promise<JsonObject> {
+    return this.requestObject("/threads", {
+      method: "POST",
+      body: JSON.stringify({ workspace_id: workspaceId, title: options.title ?? "", metadata: options.metadata ?? {} }),
+    });
+  }
+
+  async getThread(threadId: string): Promise<JsonObject> {
+    return this.requestObject(`/threads/${encodeURIComponent(threadId)}`);
+  }
+
+  async resumeThread(threadId: string): Promise<JsonObject> {
+    return this.requestObject(`/threads/${encodeURIComponent(threadId)}/resume`, { method: "POST" });
+  }
+
+  async startTurn(threadId: string, payload: JsonObject): Promise<JsonObject> {
+    return this.requestObject(`/threads/${encodeURIComponent(threadId)}/turns`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
   async getRun(runId: string): Promise<JsonObject> {
     return this.requestObject(`/runs/${encodeURIComponent(runId)}`);
   }
@@ -60,6 +101,14 @@ export class GroundedClient {
 
   async getTraceView(runId: string): Promise<JsonObject> {
     return this.requestObject(`/runs/${encodeURIComponent(runId)}/trace-view`);
+  }
+
+  async getRunEvents(runId: string, options: { afterSequence?: number; limit?: number } = {}): Promise<JsonObject> {
+    const params = new URLSearchParams({
+      after_sequence: String(options.afterSequence ?? 0),
+      limit: String(options.limit ?? 500),
+    });
+    return this.requestObject(`/runs/${encodeURIComponent(runId)}/events?${params.toString()}`);
   }
 
   async getGate(runId: string): Promise<JsonObject> {
@@ -137,8 +186,17 @@ export class GroundedClient {
   async *streamRunEvents(runId: string, options: { pollIntervalMs?: number; timeoutMs?: number } = {}): AsyncGenerator<RunEvent> {
     const started = Date.now();
     const seen = new Set<string>();
+    let lastSequence = 0;
     yield { type: "run_started", runId, payload: await this.getRun(runId) };
     while (true) {
+      const eventPage = await this.getRunEvents(runId, { afterSequence: lastSequence });
+      const runEvents = Array.isArray(eventPage.items) ? eventPage.items : [];
+      for (const event of runEvents) {
+        if (!isJsonObject(event)) continue;
+        lastSequence = Math.max(lastSequence, Number(event.sequence ?? 0));
+        const type = String(event.event_type ?? "run.event") as RunEventType;
+        yield { type, runId, payload: event };
+      }
       const timeline = await this.getTimeline(runId);
       const items = Array.isArray(timeline.items) ? timeline.items : [];
       for (const item of items) {

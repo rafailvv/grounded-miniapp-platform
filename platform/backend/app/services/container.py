@@ -76,6 +76,7 @@ class ServiceContainer:
             workspace_log_service=self.workspace_log_service,
             agent_tool_call_loop=self.agent_tool_call_loop,
             context_pack_builder=self.context_pack_builder,
+            platform_db=self.platform_db,
         )
         self.run_service = RunService(
             self.store,
@@ -100,6 +101,7 @@ class ServiceContainer:
             run_service=self.run_service,
             openai_client=self.openai_client,
             exec_policy_service=self.exec_policy_service,
+            platform_db=self.platform_db,
         )
         self.thread_service = ThreadService(
             self.platform_db,

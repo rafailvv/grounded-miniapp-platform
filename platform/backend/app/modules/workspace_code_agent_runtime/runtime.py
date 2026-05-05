@@ -71,6 +71,7 @@ from app.modules.workspace_code_agent_runtime.completion_gate import WorkspaceAg
 from app.modules.workspace_code_agent_runtime.prompt_contract import agent_system_prompt
 from app.modules.workspace_code_agent_runtime.process_recovery import AgentProcessRecovery
 from app.modules.workspace_code_agent_runtime.tool_executor import AgentToolExecutor
+from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
 from app.services.miniapp_contract import MiniAppContractCompiler, MiniAppContractMaterializer, MiniAppRouteRegistry
@@ -142,6 +143,7 @@ class WorkspaceCodeAgentRuntime:
         workspace_log_service: WorkspaceLogService,
         agent_tool_call_loop: AgentToolCallLoop,
         context_pack_builder: Any | None = None,
+        platform_db: PlatformDb | None = None,
     ) -> None:
         self.store = store
         self.workspace_service = workspace_service
@@ -184,6 +186,7 @@ class WorkspaceCodeAgentRuntime:
             read_artifact=lambda ref: self.store.get("reports", ref),
         )
         self.context_pack_builder = context_pack_builder
+        self.platform_db = platform_db
 
     def get_job(self, job_id: str) -> JobRecord:
         payload = self.store.get("jobs", job_id)
@@ -263,6 +266,12 @@ class WorkspaceCodeAgentRuntime:
         self._clear_trace(workspace_id)
         self._save_job(job)
         self._append_event(job, "job_started", "Workspace code agent started.", {"run_id": run_id, "mode": request.mode})
+        self._record_hook(
+            job=job,
+            hook="before_run",
+            status="completed",
+            payload={"run_id": run_id, "mode": request.mode, "generation_mode": generation_mode.value},
+        )
 
         if not self.openai_client.enabled:
             job.status = "blocked"
@@ -273,6 +282,12 @@ class WorkspaceCodeAgentRuntime:
             job.current_fix_phase = "failed"
             job.latency_breakdown["agent_total_ms"] = int((time.perf_counter() - started_at) * 1000)
             self._append_event(job, "job_failed", job.summary, {"failure_class": job.failure_class})
+            self._record_hook(
+                job=job,
+                hook="after_run",
+                status="failed",
+                payload={"status": job.status, "failure_class": job.failure_class},
+            )
             self._save_job(job)
             return job
 
@@ -1111,7 +1126,19 @@ class WorkspaceCodeAgentRuntime:
                     "changed_files": list(last_changed_files),
                 },
             )
+            self._record_hook(
+                job=job,
+                hook="before_checks",
+                status="started",
+                payload={"changed_files": list(last_changed_files), "has_draft_diff": has_draft_diff},
+            )
             if not has_draft_diff and cached_no_diff_checks is not None:
+                self._record_hook(
+                    job=job,
+                    hook="before_checks",
+                    status="completed",
+                    payload={"changed_files": list(last_changed_files), "cached": True, "has_draft_diff": False},
+                )
                 return cached_no_diff_checks
             check_plan = self.check_orchestrator.plan(
                 focused_visual_edit=focused_visual_edit,
@@ -1179,6 +1206,30 @@ class WorkspaceCodeAgentRuntime:
             )
             self._store_transcript_snapshot(job, artifact_run_id)
             self._store_agent_quality_report(workspace_id, run_id, execution)
+            failed_checks = [item for item in execution.results if item.status in {"failed", "blocked"}]
+            self._record_hook(
+                job=job,
+                hook="before_checks",
+                status="completed" if not failed_checks else "failed",
+                payload={
+                    "changed_files": list(last_changed_files),
+                    "failed_checks": [item.name for item in failed_checks],
+                    "check_count": len(execution.results),
+                },
+            )
+            if failed_checks:
+                self._record_hook(
+                    job=job,
+                    hook="on_check_failed",
+                    status="completed",
+                    payload={
+                        "failed_checks": [
+                            {"name": item.name, "status": item.status, "details": item.details}
+                            for item in failed_checks[:8]
+                        ],
+                        "changed_files": list(last_changed_files),
+                    },
+                )
             preview = self.preview_service.get(workspace_id)
             preview_details = self.check_orchestrator.preview_details(preview)
             if any(item.status == "failed" for item in execution.results) and not focused_visual_edit:
@@ -1326,7 +1377,11 @@ class WorkspaceCodeAgentRuntime:
                         root_cause_summary=str(llm_payload.get("error") or ""),
                     )
                 raw_tool_calls = self._agent_tool_calls(llm_payload.get("tool_calls") or [])
-                mutating_file_changes, mutating_tool_trace = self._file_changes_from_mutating_tool_calls(raw_tool_calls, draft_source=draft_source)
+                mutating_file_changes, mutating_tool_trace = self._file_changes_from_mutating_tool_calls(
+                    raw_tool_calls,
+                    draft_source=draft_source,
+                    run_id=artifact_run_id,
+                )
                 failed_mutating_tool_results = [
                     item
                     for item in mutating_tool_trace
@@ -1574,6 +1629,12 @@ class WorkspaceCodeAgentRuntime:
                 status="started",
                 payload={"turn": turn, "paths": paths, "file_change_count": len(file_changes)},
             )
+            self._record_hook(
+                job=job,
+                hook="before_apply",
+                status="started",
+                payload={"turn": turn, "paths": paths, "file_change_count": len(file_changes)},
+            )
             self.turn_diff_tracker.capture_baseline(
                 workspace_service=self.workspace_service,
                 workspace_id=workspace_id,
@@ -1616,6 +1677,12 @@ class WorkspaceCodeAgentRuntime:
             self._record_hook(
                 job=job,
                 hook="post_apply_patch",
+                status="completed" if getattr(apply_result, "status", "") == "applied" else "failed",
+                payload={"turn": turn, "paths": paths, "apply_status": getattr(apply_result, "status", None), "turn_diff_ref": job.turn_diff_ref},
+            )
+            self._record_hook(
+                job=job,
+                hook="after_apply",
                 status="completed" if getattr(apply_result, "status", "") == "applied" else "failed",
                 payload={"turn": turn, "paths": paths, "apply_status": getattr(apply_result, "status", None), "turn_diff_ref": job.turn_diff_ref},
             )
@@ -4403,11 +4470,12 @@ class WorkspaceCodeAgentRuntime:
     def _is_mutating_agent_tool_call(request_item: dict[str, Any]) -> bool:
         return is_mutating_agent_tool_call(request_item)
 
-    @staticmethod
     def _file_changes_from_mutating_tool_calls(
+        self,
         tool_calls: list[dict[str, Any]],
         *,
         draft_source: Path | None = None,
+        run_id: str = "",
     ) -> tuple[list[DraftAction], list[dict[str, object]]]:
         def read_text_file(relative_path: str) -> str | None:
             if draft_source is None:
@@ -4423,7 +4491,38 @@ class WorkspaceCodeAgentRuntime:
         return file_changes_from_mutating_tool_calls(
             tool_calls,
             read_text_file=read_text_file if draft_source is not None else None,
+            file_freshness=(
+                lambda relative_path: self.file_state_cache.freshness(
+                    run_id=run_id,
+                    root=draft_source,
+                    path=relative_path,
+                )
+            )
+            if draft_source is not None
+            else None,
+            find_similar_path=(lambda relative_path: self._find_similar_draft_path(draft_source, relative_path)) if draft_source is not None else None,
         )
+
+    @staticmethod
+    def _find_similar_draft_path(draft_source: Path, requested_path: str) -> str | None:
+        normalized = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(requested_path)
+        requested_name = Path(normalized).name
+        if not requested_name:
+            return None
+        root = draft_source / "miniapp"
+        if not root.exists():
+            return None
+        for path in sorted(root.rglob(requested_name)):
+            if path.is_file():
+                return path.relative_to(draft_source).as_posix()
+        requested_stem = Path(normalized).stem
+        requested_suffix = Path(normalized).suffix
+        if not requested_stem:
+            return None
+        for path in sorted(root.rglob(f"*{requested_suffix}")):
+            if path.is_file() and path.stem == requested_stem:
+                return path.relative_to(draft_source).as_posix()
+        return None
 
     def _read_state_repair_packets(
         self,
@@ -4920,6 +5019,12 @@ class WorkspaceCodeAgentRuntime:
         if loop_result.latest_preview_details:
             self._store_report(f"fix_runtime:{job.workspace_id}", {"workspace_id": job.workspace_id, **loop_result.latest_preview_details})
         event_type = "job_completed" if job.status == "completed" else "job_failed"
+        self._record_hook(
+            job=job,
+            hook="after_run",
+            status="completed" if job.status == "completed" else "failed",
+            payload={"status": job.status, "outcome_kind": job.outcome_kind, "failure_class": job.failure_class},
+        )
         self._append_event(job, event_type, job.summary or ("Workspace code agent completed." if job.status == "completed" else "Workspace code agent failed."))
         return job
 
@@ -5449,6 +5554,7 @@ class WorkspaceCodeAgentRuntime:
             event_type,
             {"message": message, "details": WorkspaceCodeAgentRuntime._compact_jsonish(details, max_chars=900, max_items=8)},
         )
+        self._persist_run_event(job, event_type, message, details)
         job.events.append(JobEvent(event_type=event_type, message=message, details=details))
         activity = self._activity_from_event(event_type, message, details)
         if activity is not None:
@@ -5472,6 +5578,79 @@ class WorkspaceCodeAgentRuntime:
             self._save_job(job)
         if not noisy_check_event:
             self.workspace_log_service.append(job.workspace_id, source=f"agent.{event_type}", message=message, payload=details)
+
+    def _persist_run_event(self, job: JobRecord, event_type: str, message: str, details: dict[str, Any]) -> None:
+        if self.platform_db is None or not job.linked_run_id:
+            return
+        sdk_event_type = self._sdk_event_type(event_type, details)
+        payload = {
+            "schema": "grounded.run_event.v1",
+            "job_id": job.job_id,
+            "workspace_id": job.workspace_id,
+            "status": job.status,
+            "apply_status": getattr(job, "apply_status", None),
+            "current_stage": getattr(job, "current_stage", None),
+            "progress_percent": getattr(job, "progress_percent", None),
+            "source_event_type": event_type,
+            "message": message,
+            "details": WorkspaceCodeAgentRuntime._compact_jsonish(details, max_chars=1400, max_items=10),
+        }
+        try:
+            event = self.platform_db.append_run_event(job.linked_run_id, sdk_event_type, payload)
+            if event_type in self._RUN_STATE_SNAPSHOT_EVENTS:
+                self.platform_db.insert_run_state_snapshot(
+                    run_id=job.linked_run_id,
+                    reason=event_type,
+                    payload={
+                        "schema": "grounded.run_state_snapshot.v1",
+                        "event": event,
+                        "job": {
+                            "job_id": job.job_id,
+                            "status": job.status,
+                            "apply_status": getattr(job, "apply_status", None),
+                            "current_stage": getattr(job, "current_stage", None),
+                            "progress_percent": getattr(job, "progress_percent", None),
+                            "failure_class": job.failure_class,
+                            "failure_signature": job.failure_signature,
+                            "token_usage": job.token_usage,
+                        },
+                    },
+                )
+        except Exception:
+            logger.exception("Failed to persist run event %s for run %s.", event_type, job.linked_run_id)
+
+    _RUN_STATE_SNAPSHOT_EVENTS = {
+        "job_started",
+        "iteration_ready",
+        "repair_iteration",
+        "patch_apply_completed",
+        "checks_completed",
+        "preview_validation_started",
+        "job_completed",
+        "job_failed",
+    }
+
+    @staticmethod
+    def _sdk_event_type(event_type: str, details: dict[str, Any]) -> str:
+        if event_type == "job_started":
+            return "run.started"
+        if event_type in {"job_completed", "job_failed"}:
+            return "run.completed"
+        if event_type == "agent_turn_started":
+            return "turn.started"
+        if event_type in {"tool_use_summary", "tool_batch", "tool_call_contract"}:
+            return "tool.completed"
+        if event_type in {"running_checks", "checks_completed", "final_checks_started"} or "check_step" in details:
+            return "check.completed"
+        if event_type in {"repair_iteration", "browser_repair_packet", "generated_test_repair_packet", "browser_replay_packet"}:
+            return "repair.packet"
+        if event_type in {"preview_validation_started", "browser_proof_failed", "browser_step_repair"}:
+            return "browser.step"
+        if event_type in {"patch_apply_started", "patch_apply_completed", "apply_started", "apply_completed"}:
+            return "gate.changed"
+        if event_type == "iteration_ready":
+            return "usage"
+        return event_type.replace("_", ".")
 
     @staticmethod
     def _is_noisy_check_progress_event(event_type: str, details: dict[str, Any]) -> bool:

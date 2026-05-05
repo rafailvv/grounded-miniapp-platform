@@ -15,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.models.domain import CreateRunRequest, RunRecord
+from app.repositories.platform_db import PlatformDb
 from app.repositories.state_store import StateStore
 from app.services.exec_policy_service import ExecPolicyService
 from app.services.miniapp_contract import MiniAppContractMaterializer, MiniAppRouteRegistry
@@ -45,6 +46,7 @@ class WorkbenchService:
         run_service: RunService,
         openai_client: OpenAIClient,
         exec_policy_service: ExecPolicyService,
+        platform_db: PlatformDb | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -52,6 +54,7 @@ class WorkbenchService:
         self.run_service = run_service
         self.openai_client = openai_client
         self.exec_policy_service = exec_policy_service
+        self.platform_db = platform_db
 
     def tool_events(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -82,6 +85,20 @@ class WorkbenchService:
                 )
             )
         return {"run_id": run_id, "tool_protocol_version": TOOL_PROTOCOL_VERSION, "events": events}
+
+    def run_events(self, run_id: str, *, after_sequence: int = 0, limit: int = 500) -> dict[str, Any]:
+        self.run_service.get_run(run_id)
+        items = self.platform_db.list_run_events(run_id, after_sequence=after_sequence, limit=limit) if self.platform_db is not None else []
+        snapshots = self.platform_db.list_run_state_snapshots(run_id, limit=20) if self.platform_db is not None else []
+        return {
+            "run_id": run_id,
+            "schema": "grounded.run_events.v1",
+            "status": "ok",
+            "blocking": False,
+            "items": items,
+            "state_snapshots": snapshots,
+            "next_sequence": max([int(item.get("sequence") or 0) for item in items], default=int(after_sequence or 0)),
+        }
 
     def trace_view(self, run_id: str) -> dict[str, Any]:
         run = self.run_service.get_run(run_id)
@@ -821,6 +838,10 @@ class WorkbenchService:
         }
         if not item["text"]:
             raise ValueError("Memory text is required.")
+        secret_scan = self._memory_secret_scan(str(item["text"]))
+        if secret_scan["status"] != "passed":
+            raise ValueError("Memory text appears to contain secret-like material; remove the secret before saving.")
+        item["secret_scan"] = secret_scan
         current.setdefault("items", []).append(item)
         bucket_map = {
             "user_preference": "user_preferences",
@@ -1321,16 +1342,41 @@ class WorkbenchService:
         self.workspace_service.get_workspace(workspace_id)
         root = self.workspace_service.draft_source_dir(workspace_id, run_id) if run_id else self.workspace_service.source_dir(workspace_id)
         items: list[dict[str, Any]] = []
+        tool_status: dict[str, str] = {}
         py_files = [path for path in root.rglob("*.py") if not self.workspace_service._is_ignored_workspace_path(path.relative_to(root))]
         for path in py_files[:120]:
             try:
                 result = subprocess.run([sys.executable, "-m", "py_compile", str(path)], text=True, capture_output=True, timeout=4)
             except Exception as exc:
-                items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": str(exc), "source": "py_compile"})
+                items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": str(exc), "source": "python_compile"})
                 continue
             if result.returncode != 0:
-                items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": (result.stderr or result.stdout).strip()[:1200], "source": "py_compile"})
+                items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": (result.stderr or result.stdout).strip()[:1200], "source": "python_compile"})
+        tool_status["python_compile"] = "completed"
+        if shutil.which("ruff") and (root / "miniapp/app").exists():
+            try:
+                result = subprocess.run(["ruff", "check", str(root / "miniapp/app")], text=True, capture_output=True, timeout=8)
+                tool_status["ruff"] = "passed" if result.returncode == 0 else "failed"
+                if result.returncode != 0:
+                    items.append({"path": "miniapp/app", "severity": "warning", "message": (result.stdout or result.stderr).strip()[:2000], "source": "ruff"})
+            except Exception as exc:
+                tool_status["ruff"] = "error"
+                items.append({"path": "miniapp/app", "severity": "warning", "message": str(exc), "source": "ruff"})
+        else:
+            tool_status["ruff"] = "skipped_unavailable"
+        if shutil.which("pyright") and (root / "miniapp/app").exists():
+            try:
+                result = subprocess.run(["pyright", str(root / "miniapp/app")], text=True, capture_output=True, timeout=10)
+                tool_status["pyright"] = "passed" if result.returncode == 0 else "failed"
+                if result.returncode != 0:
+                    items.append({"path": "miniapp/app", "severity": "warning", "message": (result.stdout or result.stderr).strip()[:2000], "source": "pyright"})
+            except Exception as exc:
+                tool_status["pyright"] = "error"
+                items.append({"path": "miniapp/app", "severity": "warning", "message": str(exc), "source": "pyright"})
+        else:
+            tool_status["pyright"] = "skipped_unavailable"
         if shutil.which("node"):
+            tool_status["node_check"] = "completed"
             for path in list(root.rglob("*.js"))[:80]:
                 if self.workspace_service._is_ignored_workspace_path(path.relative_to(root)):
                     continue
@@ -1341,7 +1387,17 @@ class WorkbenchService:
                     continue
                 if result.returncode != 0:
                     items.append({"path": path.relative_to(root).as_posix(), "severity": "error", "message": (result.stderr or result.stdout).strip()[:1200], "source": "node --check"})
-        return {"workspace_id": workspace_id, "run_id": run_id, "status": "passed" if not items else "failed", "items": items[:100], "symbols": self._symbol_overview(root, "")}
+        else:
+            tool_status["node_check"] = "skipped_unavailable"
+        return {
+            "workspace_id": workspace_id,
+            "run_id": run_id,
+            "status": "passed" if not items else "failed",
+            "items": items[:100],
+            "tool_status": tool_status,
+            "sources": sorted({str(item.get("source") or "unknown") for item in items} or {"none"}),
+            "symbols": self._symbol_overview(root, ""),
+        }
 
     def patch_preflight(self, workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         raw_ops = payload.get("ops") or payload.get("patch_actions") or []
@@ -1776,6 +1832,17 @@ class WorkbenchService:
                 }
             )
         return {"status": "stale" if stale else "fresh", "items": items}
+
+    def _memory_secret_scan(self, text: str) -> dict[str, Any]:
+        redacted = self.exec_policy_service.redact(text)
+        if redacted != text:
+            return {
+                "status": "blocked",
+                "blocking": True,
+                "issue": "secret_like_material",
+                "redacted_preview": redacted[:160],
+            }
+        return {"status": "passed", "blocking": False}
 
     @staticmethod
     def _text_exists_in_workspace(source_dir: Path, needle: str) -> bool:

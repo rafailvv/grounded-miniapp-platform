@@ -1220,6 +1220,31 @@ def test_diagnostics_delta_only_reports_changed_failures() -> None:
     assert delta["status"] == "changed"
     assert [item["name"] for item in delta["added"]] == ["browser_flow_smoke"]
     assert delta["changed"][0]["current"]["name"] == "changed_files_static"
+    assert delta["source_counts"]["browser_flow"] == 1
+    assert delta["source_counts"]["api_workflow"] == 1
+
+
+def test_diagnostics_delta_tracks_lsp_and_browser_sources() -> None:
+    snapshot = AgentDiagnosticsDelta.snapshot(
+        [
+            RunCheckResult(name="frontend_build", status="failed", command="npm run build", details="tsc failed"),
+            RunCheckResult(name="ruff", status="failed", command="ruff check miniapp/app", details="lint failed"),
+            RunCheckResult(name="pyright", status="failed", command="pyright miniapp/app", details="type failed"),
+            RunCheckResult(
+                name="browser_flow_smoke",
+                status="failed",
+                details="console errors",
+                diagnostics={"console_errors": ["ReferenceError"], "network_errors": ["/api/missing"]},
+            ),
+        ]
+    )
+    delta = AgentDiagnosticsDelta.delta({}, snapshot)
+
+    assert delta["source_counts"]["tsc"] == 1
+    assert delta["source_counts"]["ruff"] == 1
+    assert delta["source_counts"]["pyright"] == 1
+    assert delta["source_counts"]["browser_console"] == 1
+    assert delta["source_counts"]["browser_network"] == 1
 
 
 def test_safe_diagnostic_commands_are_scoped() -> None:
@@ -1877,11 +1902,64 @@ def test_exact_edit_tool_reports_multiple_matches_and_applies_unique_match(tmp_p
     assert "const status = 'ready';" in str(changes[0].content)
 
 
+def test_exact_edit_tool_requires_fresh_read_state_and_reports_similar_path(tmp_path: Path) -> None:
+    root = tmp_path
+    target = root / "miniapp/app/static/client/app.js"
+    target.parent.mkdir(parents=True)
+    target.write_text("const status = 'new';\n", encoding="utf-8")
+
+    changes, trace = file_changes_from_mutating_tool_calls(
+        [
+            {
+                "tool": "edit_file_exact",
+                "file_path": "miniapp/app/static/client/app.js",
+                "old_string": "new",
+                "new_string": "ready",
+            }
+        ],
+        read_text_file=lambda path: (root / path).read_text(encoding="utf-8") if (root / path).exists() else None,
+        file_freshness=lambda path: {"path": path, "status": "unread", "exists": True, "fresh": False},
+    )
+
+    assert changes == []
+    assert trace[0]["repair_packet"]["code"] == "file_not_read"  # type: ignore[index]
+    assert trace[0]["repair_packet"]["required_next_tool"] == "read_files"  # type: ignore[index]
+
+    changes, trace = file_changes_from_mutating_tool_calls(
+        [
+            {
+                "tool": "edit_file_exact",
+                "file_path": "miniapp/app/static/client/missing.js",
+                "old_string": "new",
+                "new_string": "ready",
+            }
+        ],
+        read_text_file=lambda path: (root / path).read_text(encoding="utf-8") if (root / path).exists() else None,
+        file_freshness=lambda path: {"path": path, "status": "missing", "exists": False, "fresh": False},
+        find_similar_path=lambda path: "miniapp/app/static/client/app.js",
+    )
+
+    assert changes == []
+    assert trace[0]["repair_packet"]["code"] == "similar_path_found"  # type: ignore[index]
+    assert trace[0]["repair_packet"]["target_files"] == ["miniapp/app/static/client/app.js"]  # type: ignore[index]
+
+
 def test_command_policy_blocks_shell_expansion_invariants() -> None:
     assert decide_workspace_command("PYTHONPATH=platform/backend pytest -q").action == "forbidden"
     assert decide_workspace_command("rg foo miniapp/app/*.py").action == "forbidden"
     assert decide_workspace_command("rg foo miniapp/app <<EOF").action == "forbidden"
     assert decide_workspace_command("python -m py_compile miniapp/app/main.py").action == "allow"
+
+
+def test_command_policy_handles_shell_git_rg_and_find_parser_invariants() -> None:
+    assert decide_workspace_command("bash -lc 'rg api miniapp/app'").action == "allow"
+    assert decide_workspace_command("bash -lc 'rg api miniapp/app > out.txt'").action == "forbidden"
+    assert decide_workspace_command("git status --short").action == "allow"
+    assert decide_workspace_command("git diff --output out.patch").action == "forbidden"
+    assert decide_workspace_command("git -c core.pager=cat status").action == "forbidden"
+    assert decide_workspace_command("rg --pre tool miniapp/app").action == "forbidden"
+    assert decide_workspace_command("find miniapp/app -type f").action == "allow"
+    assert decide_workspace_command("find miniapp/app -exec rm {} ;").action == "forbidden"
 
 
 def test_hook_trace_declares_record_only_side_effects() -> None:

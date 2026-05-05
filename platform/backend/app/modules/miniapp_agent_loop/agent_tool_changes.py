@@ -20,6 +20,8 @@ def file_changes_from_mutating_tool_calls(
     default_worker_id: str | None = None,
     default_owner_scope: str | None = None,
     read_text_file: Callable[[str], str | None] | None = None,
+    file_freshness: Callable[[str], dict[str, object]] | None = None,
+    find_similar_path: Callable[[str], str | None] | None = None,
 ) -> tuple[list[DraftAction], list[dict[str, object]]]:
     file_changes: list[DraftAction] = []
     trace: list[dict[str, object]] = []
@@ -51,6 +53,7 @@ def file_changes_from_mutating_tool_calls(
             )
         elif tool == "edit_file_exact":
             path_safe = _is_safe_exact_path(file_path)
+            freshness = file_freshness(file_path) if file_freshness is not None and path_safe else {}
             current = read_text_file(file_path) if read_text_file is not None and path_safe else None
             old_string = str(request_item.get("old_string") or "")
             new_string = str(request_item.get("new_string") or "")
@@ -60,6 +63,8 @@ def file_changes_from_mutating_tool_calls(
                 current=current,
                 old_string=old_string,
                 replace_all=replace_all,
+                freshness=freshness,
+                similar_path=find_similar_path(file_path) if find_similar_path is not None and path_safe and current is None else None,
             )
             if exact_failure is not None:
                 code, message, evidence = exact_failure
@@ -133,10 +138,27 @@ def _exact_edit_failure(
     current: str | None,
     old_string: str,
     replace_all: bool,
+    freshness: dict[str, object] | None = None,
+    similar_path: str | None = None,
 ) -> tuple[str, str, dict[str, object]] | None:
     if not _is_safe_exact_path(file_path):
         return ("unsafe_path", "Exact edit must target a relative file path inside miniapp/.", {})
+    freshness_payload = dict(freshness or {})
+    freshness_status = str(freshness_payload.get("status") or "").strip()
+    if freshness_status in {"unread", "stale", "partial"}:
+        code = "file_not_read" if freshness_status == "unread" else "stale_file" if freshness_status == "stale" else "partial_read"
+        return (
+            code,
+            f"{file_path} must be read with a fresh full read before edit_file_exact.",
+            {"target_files": [file_path], "freshness": freshness_payload},
+        )
     if current is None:
+        if similar_path:
+            return (
+                "similar_path_found",
+                f"{file_path} could not be read before exact edit; a similar file exists at {similar_path}.",
+                {"target_files": [similar_path], "requested_file_path": file_path, "similar_path": similar_path},
+            )
         return ("file_missing", f"{file_path} could not be read before exact edit.", {"target_files": [file_path]})
     if not old_string:
         return ("old_string_not_found", f"{file_path} exact edit requires a non-empty old_string.", {"target_files": [file_path]})

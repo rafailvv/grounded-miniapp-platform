@@ -30,6 +30,24 @@ class GroundedClient:
     def create_workspace(self, payload: JsonObject) -> JsonObject:
         return self._json_object("POST", "/workspaces", payload)
 
+    def list_threads(self, workspace_id: str | None = None, *, include_archived: bool = False, limit: int = 50) -> JsonObject:
+        params: dict[str, str] = {"include_archived": str(include_archived).lower(), "limit": str(limit)}
+        if workspace_id:
+            params["workspace_id"] = workspace_id
+        return self._json_object("GET", f"/threads?{parse.urlencode(params)}")
+
+    def start_thread(self, workspace_id: str, *, title: str | None = None, metadata: JsonObject | None = None) -> JsonObject:
+        return self._json_object("POST", "/threads", {"workspace_id": workspace_id, "title": title or "", "metadata": metadata or {}})
+
+    def get_thread(self, thread_id: str) -> JsonObject:
+        return self._json_object("GET", f"/threads/{parse.quote(thread_id)}")
+
+    def resume_thread(self, thread_id: str) -> JsonObject:
+        return self._json_object("POST", f"/threads/{parse.quote(thread_id)}/resume")
+
+    def start_turn(self, thread_id: str, payload: JsonObject) -> JsonObject:
+        return self._json_object("POST", f"/threads/{parse.quote(thread_id)}/turns", payload)
+
     def get_run(self, run_id: str) -> JsonObject:
         return self._json_object("GET", f"/runs/{parse.quote(run_id)}")
 
@@ -38,6 +56,10 @@ class GroundedClient:
 
     def trace_view(self, run_id: str) -> JsonObject:
         return self._json_object("GET", f"/runs/{parse.quote(run_id)}/trace-view")
+
+    def run_events(self, run_id: str, *, after_sequence: int = 0, limit: int = 500) -> JsonObject:
+        params = parse.urlencode({"after_sequence": str(after_sequence), "limit": str(limit)})
+        return self._json_object("GET", f"/runs/{parse.quote(run_id)}/events?{params}")
 
     def gate(self, run_id: str) -> JsonObject:
         return self._json_object("GET", f"/runs/{parse.quote(run_id)}/gate")
@@ -97,8 +119,16 @@ class GroundedClient:
     def stream_run_events(self, run_id: str, *, poll_interval_seconds: float = 1.0, timeout_seconds: float = 600.0) -> Iterator[RunEvent]:
         started = time.monotonic()
         seen_event_keys: set[str] = set()
+        last_sequence = 0
         yield RunEvent("run_started", run_id, self.get_run(run_id))
         while True:
+            event_page = self.run_events(run_id, after_sequence=last_sequence)
+            for event in cast(list[JsonValue], event_page.get("items", []) if isinstance(event_page, dict) else []):
+                if not isinstance(event, dict):
+                    continue
+                last_sequence = max(last_sequence, int(event.get("sequence") or 0))
+                event_type = str(event.get("event_type") or "run.event")
+                yield RunEvent(event_type, run_id, cast(JsonObject, event))
             timeline = self.timeline(run_id)
             for item in cast(list[JsonValue], timeline.get("items", []) if isinstance(timeline, dict) else []):
                 if not isinstance(item, dict):

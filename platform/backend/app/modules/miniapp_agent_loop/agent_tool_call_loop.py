@@ -20,6 +20,7 @@ from app.modules.miniapp_agent_loop.check_feedback import AgentCheckFeedback
 from app.modules.miniapp_agent_loop.context_builder import AgentContextBuilder
 from app.modules.miniapp_agent_loop.diagnostics_delta import AgentDiagnosticsDelta
 from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
+from app.modules.miniapp_agent_loop.agent_mutation_guard import AgentMutationGuard
 from app.modules.miniapp_agent_loop.repair_packets import RepairTransitionPolicy
 from app.modules.miniapp_agent_loop.result_classifier import AgentLoopResultFactory
 from app.modules.miniapp_agent_loop.types import AgentLoopCallbacks, AgentLoopResult
@@ -41,6 +42,7 @@ class AgentToolCallLoop:
         self.feedback = AgentCheckFeedback()
         self.edit_validator = AgentEditValidator()
         self.results = AgentLoopResultFactory()
+        self.mutation_guard = AgentMutationGuard()
 
     @staticmethod
     def _budget_state(callbacks: AgentLoopCallbacks, turn: int) -> dict[str, object]:
@@ -703,8 +705,9 @@ class AgentToolCallLoop:
             if callbacks.before_apply is not None:
                 callbacks.before_apply(turn + 1, synced_file_changes)
             try:
-                envelope = self.context_builder.workspace_service.build_patch_envelope_for_file_changes(workspace_id, run_id, synced_file_changes)
-                apply_result = self.context_builder.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
+                with self.mutation_guard.lock(run_id):
+                    envelope = self.context_builder.workspace_service.build_patch_envelope_for_file_changes(workspace_id, run_id, synced_file_changes)
+                    apply_result = self.context_builder.workspace_service.apply_patch_envelope_to_draft(workspace_id, run_id, envelope)
                 latest_apply_result = apply_result.model_dump(mode="json")
             except ValueError as exc:
                 apply_result = ApplyPatchResult(

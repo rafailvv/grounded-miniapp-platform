@@ -161,7 +161,7 @@ class AgentEditValidator:
         repeated_count: int = 0,
         evidence: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        code = "stale_file" if status == "stale" else "file_not_read" if status == "unread" else status
+        code = "stale_file" if status == "stale" else "file_not_read" if status == "unread" else "partial_read" if status == "partial" else status
         return EditFailurePacket.from_edit_issue(
             code=code,
             message=message,

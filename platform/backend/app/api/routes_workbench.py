@@ -29,6 +29,20 @@ class FilesRequest(BaseModel):
     files: list[str] = []
 
 
+class ThreadStartRequest(BaseModel):
+    workspace_id: str
+    title: str | None = None
+    metadata: dict[str, Any] = {}
+
+
+class TurnStartRequest(BaseModel):
+    prompt: str
+    mode: str = "generate"
+    generation_mode: str = "balanced"
+    intent: str = "auto"
+    metadata: dict[str, Any] = {}
+
+
 class PermissionRuleRequest(BaseModel):
     rule_id: str | None = None
     scope: str = "workspace"
@@ -76,6 +90,19 @@ def get_tool_events(run_id: str, container: ServiceContainer = Depends(get_conta
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/runs/{run_id}/events")
+def get_run_events(
+    run_id: str,
+    after_sequence: int = 0,
+    limit: int = 500,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    try:
+        return container.workbench_service.run_events(run_id, after_sequence=after_sequence, limit=limit)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/runs/{run_id}/approvals/{approval_id}/approve")
 def approve_tool_action(run_id: str, approval_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
@@ -112,6 +139,64 @@ def get_run_trace_view(run_id: str, container: ServiceContainer = Depends(get_co
 def get_run_artifact(run_id: str, artifact_ref: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
     try:
         return container.workbench_service.artifact(run_id, artifact_ref)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/threads")
+def list_threads(
+    workspace_id: str | None = None,
+    include_archived: bool = False,
+    limit: int = 50,
+    cursor: str | None = None,
+    container: ServiceContainer = Depends(get_container),
+) -> dict[str, Any]:
+    return container.thread_service.list_threads(
+        workspace_id=workspace_id,
+        include_archived=include_archived,
+        limit=limit,
+        cursor=cursor,
+    )
+
+
+@router.post("/threads")
+def start_thread(request: ThreadStartRequest, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.thread_service.start_thread(
+            workspace_id=request.workspace_id,
+            title=request.title,
+            metadata=request.metadata,
+        ).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/threads/{thread_id}")
+def get_thread(thread_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        snapshot = container.thread_service.read_thread(thread_id)
+        return {
+            "thread": snapshot.thread.model_dump(mode="json"),
+            "turns": [turn.model_dump(mode="json") for turn in snapshot.turns],
+            "items": [item.model_dump(mode="json") for item in snapshot.items],
+            "events": [event.model_dump(mode="json") for event in snapshot.events],
+        }
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/threads/{thread_id}/resume")
+def resume_thread(thread_id: str, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.thread_service.resume_thread(thread_id).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/threads/{thread_id}/turns")
+def start_thread_turn(thread_id: str, request: TurnStartRequest, container: ServiceContainer = Depends(get_container)) -> dict[str, Any]:
+    try:
+        return container.thread_service.start_turn(thread_id, request.model_dump()).model_dump(mode="json")
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

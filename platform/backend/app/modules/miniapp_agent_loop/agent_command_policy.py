@@ -49,12 +49,26 @@ class CommandPolicyDecision:
 class AgentCommandPolicy:
     """Prefix-rule shell policy for agent diagnostic commands."""
 
+    _SHELL_WRAPPERS = {"bash", "sh", "zsh"}
     _BLOCKED_META_CHARS = re.compile(r"[`$<>|;]")
     _BLOCKED_EXPANSION = re.compile(r"\$\(|\${|%[A-Za-z_][A-Za-z0-9_]*%")
     _BLOCKED_HEREDOC = re.compile(r"<<-?")
     _BLOCKED_LINE_CONTINUATION = re.compile(r"\\\s*(?:\r?\n)")
     _BLOCKED_ENV_ASSIGNMENT = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*=")
     _BLOCKED_BRACE_EXPANSION = re.compile(r"(?:^|[^$])\{[^{}\n]*,[^{}\n]*\}")
+    _UNSAFE_GIT_GLOBAL_OPTIONS = {
+        "-c",
+        "--config-env",
+        "--exec-path",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--paginate",
+    }
+    _SAFE_GIT_SUBCOMMANDS = {"status", "log", "diff", "show", "branch", "rev-parse"}
+    _UNSAFE_GIT_FLAGS = {"--output", "--ext-diff", "--textconv", "--external-diff", "--paginate", "-p"}
+    _UNSAFE_RG_OPTIONS = {"--pre", "--pre-glob", "--hostname-bin", "-z", "--search-zip"}
+    _UNSAFE_FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0", "-fprintf"}
 
     def __init__(self, rules: list[CommandPolicyRule] | None = None) -> None:
         self.rules = list(rules or self.default_rules())
@@ -205,6 +219,9 @@ class AgentCommandPolicy:
             return CommandPolicyDecision("forbidden", f"Command could not be parsed safely: {exc}.", command, normalized)
         if not args:
             return CommandPolicyDecision("forbidden", "Empty command.", command, normalized)
+        wrapper_decision = self._shell_wrapper_decision(command, normalized, args, cwd_policy=cwd_policy)
+        if wrapper_decision is not None:
+            return wrapper_decision
         if any(arg == ".." or arg.startswith("../") or "/../" in arg for arg in args):
             return CommandPolicyDecision("forbidden", "Parent-directory paths are blocked.", command, normalized, tuple(args))
         if any(str(arg).startswith(("/", "~")) for arg in args):
@@ -216,6 +233,9 @@ class AgentCommandPolicy:
         normalized_args = [Path(args[0]).name.lower(), *[str(arg).lower() for arg in args[1:]]]
         if normalized_args[0] in {"python3.10", "python3.11", "python3.12"}:
             normalized_args[0] = "python3"
+        structured_decision = self._structured_command_decision(command, normalized, args, normalized_args, cwd_policy=cwd_policy)
+        if structured_decision is not None:
+            return structured_decision
         if normalized_args[0] == "sed" and any(arg == "-i" or arg.startswith("-i") for arg in normalized_args[1:]):
             return CommandPolicyDecision("forbidden", "In-place sed edits are blocked.", command, normalized, tuple(args), ("sed",), cwd_policy)
         if normalized_args[0] in {"rm", "mv", "cp", "chmod", "chown", "curl", "wget"}:
@@ -239,6 +259,158 @@ class AgentCommandPolicy:
             normalized,
             tuple(args),
             cwd_policy=cwd_policy,
+        )
+
+    def _shell_wrapper_decision(
+        self,
+        command: str,
+        normalized: str,
+        args: list[str],
+        *,
+        cwd_policy: str,
+    ) -> CommandPolicyDecision | None:
+        executable = Path(args[0]).name.lower() if args else ""
+        if executable not in self._SHELL_WRAPPERS:
+            return None
+        if len(args) != 3 or args[1] not in {"-c", "-lc"}:
+            return CommandPolicyDecision(
+                "forbidden",
+                "Shell wrappers are allowed only as bash/sh/zsh -lc with a single inner diagnostic command.",
+                command,
+                normalized,
+                tuple(args),
+                (executable,),
+                cwd_policy,
+            )
+        inner = self.decide(args[2])
+        if inner.action == "forbidden":
+            return CommandPolicyDecision(
+                "forbidden",
+                f"Shell wrapper inner command is blocked: {inner.reason}",
+                command,
+                normalized,
+                tuple(args),
+                (executable,),
+                inner.cwd_policy,
+            )
+        return CommandPolicyDecision(
+            inner.action,
+            f"Shell wrapper accepted after inner command policy: {inner.reason}",
+            command,
+            normalized,
+            tuple(args),
+            inner.matched_prefix or (executable,),
+            inner.cwd_policy,
+        )
+
+    def _structured_command_decision(
+        self,
+        command: str,
+        normalized: str,
+        args: list[str],
+        normalized_args: list[str],
+        *,
+        cwd_policy: str,
+    ) -> CommandPolicyDecision | None:
+        executable = normalized_args[0] if normalized_args else ""
+        if executable == "git":
+            return self._git_decision(command, normalized, args, normalized_args, cwd_policy=cwd_policy)
+        if executable == "rg":
+            for arg in normalized_args[1:]:
+                if arg in self._UNSAFE_RG_OPTIONS or any(arg.startswith(f"{option}=") for option in self._UNSAFE_RG_OPTIONS):
+                    return CommandPolicyDecision(
+                        "forbidden",
+                        "ripgrep preprocessing, archive search, and binary helper options are blocked.",
+                        command,
+                        normalized,
+                        tuple(args),
+                        ("rg",),
+                        cwd_policy,
+                    )
+        if executable == "find":
+            for arg in normalized_args[1:]:
+                if arg in self._UNSAFE_FIND_ACTIONS:
+                    return CommandPolicyDecision(
+                        "forbidden",
+                        "find actions that execute commands, delete, or write files are blocked.",
+                        command,
+                        normalized,
+                        tuple(args),
+                        ("find",),
+                        cwd_policy,
+                    )
+            return CommandPolicyDecision(
+                "allow",
+                "Read-only find diagnostics are allowed inside the draft workspace.",
+                command,
+                normalized,
+                tuple(args),
+                ("find",),
+                cwd_policy,
+            )
+        return None
+
+    def _git_decision(
+        self,
+        command: str,
+        normalized: str,
+        args: list[str],
+        normalized_args: list[str],
+        *,
+        cwd_policy: str,
+    ) -> CommandPolicyDecision:
+        if len(normalized_args) < 2:
+            return CommandPolicyDecision("forbidden", "Git command must specify a read-only subcommand.", command, normalized, tuple(args), ("git",), cwd_policy)
+        first = normalized_args[1]
+        if first.startswith("-"):
+            return CommandPolicyDecision(
+                "forbidden",
+                "Git global options are blocked; use a direct read-only subcommand.",
+                command,
+                normalized,
+                tuple(args),
+                ("git",),
+                cwd_policy,
+            )
+        for arg in normalized_args[1:]:
+            if arg in self._UNSAFE_GIT_GLOBAL_OPTIONS or any(arg.startswith(f"{option}=") for option in self._UNSAFE_GIT_GLOBAL_OPTIONS):
+                return CommandPolicyDecision(
+                    "forbidden",
+                    "Git global options that can escape the workspace or run helpers are blocked.",
+                    command,
+                    normalized,
+                    tuple(args),
+                    ("git",),
+                    cwd_policy,
+                )
+            if arg in self._UNSAFE_GIT_FLAGS or any(arg.startswith(f"{option}=") for option in self._UNSAFE_GIT_FLAGS):
+                return CommandPolicyDecision(
+                    "forbidden",
+                    "Git output/helper flags that can write files or execute external diff tools are blocked.",
+                    command,
+                    normalized,
+                    tuple(args),
+                    ("git", first),
+                    cwd_policy,
+                )
+        if first not in self._SAFE_GIT_SUBCOMMANDS:
+            return CommandPolicyDecision(
+                "forbidden",
+                "Only read-only git diagnostics are allowed: status, log, diff, show, branch, and rev-parse.",
+                command,
+                normalized,
+                tuple(args),
+                ("git", first),
+                cwd_policy,
+            )
+        return CommandPolicyDecision(
+            "allow",
+            "Read-only git diagnostics are allowed inside the draft workspace.",
+            command,
+            normalized,
+            tuple(args),
+            ("git", first),
+            cwd_policy,
         )
 
     def validation_examples(self) -> list[dict[str, str]]:

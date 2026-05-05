@@ -48,13 +48,13 @@ def _default_target_files(file_path: str, evidence: dict[str, Any] | None = None
 def _severity_for_code(code: str) -> str:
     if code in {"unsafe_path", "protected_delete", "protected_path", "patch_conflict"}:
         return "critical"
-    if code in {"stale_file", "file_not_read", "missing_patch_diff", "invalid_patch_diff", "duplicate_path"}:
+    if code in {"stale_file", "file_not_read", "partial_read", "missing_patch_diff", "invalid_patch_diff", "duplicate_path"}:
         return "high"
     return "medium"
 
 
 def _required_tool_for_code(code: str) -> str:
-    if code in {"file_not_read", "stale_file", "old_string_not_found", "multiple_matches", "patch_conflict"}:
+    if code in {"file_not_read", "partial_read", "stale_file", "old_string_not_found", "multiple_matches", "similar_path_found", "patch_conflict"}:
         return "read_files"
     if code in {"duplicate_path", "patch_envelope_in_content", "invalid_patch_diff", "invalid_patch_envelope_position"}:
         return "write_file"
@@ -105,7 +105,8 @@ class EditFailurePacket:
         repeated_count: int = 0,
     ) -> "EditFailurePacket":
         normalized_path = _clean_path(file_path)
-        target_files = _default_target_files(normalized_path, evidence)
+        target_seed = "" if str(code or "") == "similar_path_found" else normalized_path
+        target_files = _default_target_files(target_seed, evidence)
         return cls(
             code=str(code or "invalid_edit_operation"),
             message=str(message or "Invalid edit operation."),
@@ -205,7 +206,9 @@ class RepairTransitionPolicy:
         "protected_path",
         "protected_delete",
         "file_not_read",
+        "partial_read",
         "stale_file",
+        "similar_path_found",
         "old_string_not_found",
         "multiple_matches",
         "invalid_patch_diff",
