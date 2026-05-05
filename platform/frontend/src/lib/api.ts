@@ -479,7 +479,7 @@ export type PromptContractReport = {
   resource_hint?: string | null;
   field_hints?: string[];
   role_field_hints?: Record<string, string[]>;
-  lexical_matching?: string;
+  local_prompt_matching?: string;
   findings: Array<Record<string, unknown>>;
 };
 

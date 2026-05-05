@@ -48,7 +48,7 @@ class WorkspaceAgentCompletionGate:
                 {
                     "kind": "meaningful_diff",
                     "check": "meaningful_diff",
-                    "details": "Generation must create a prompt-specific draft diff before completion.",
+                    "details": "Generation must create a contract-derived draft diff before completion.",
                     "blocking": True,
                 }
             )

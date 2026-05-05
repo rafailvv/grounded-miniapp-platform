@@ -971,8 +971,8 @@ class WorkbenchService:
             "resource_hint": prompt_hints.get("resource_hint"),
             "field_hints": list(prompt_hints.get("field_hints") or [])[:12],
             "role_field_hints": dict(prompt_hints.get("role_field_hints") or {}),
-            "lexical_matching": "disabled",
-            "findings": [] if status == "passed" else [{"severity": "medium", "message": "Prompt contract analysis is unavailable; generation should use LLM prompt analysis before applying domain-specific fields."}],
+            "local_prompt_matching": "disabled",
+            "findings": [] if status == "passed" else [{"severity": "medium", "message": "Prompt contract analysis is unavailable; generation should use LLM prompt analysis before applying product fields."}],
         }
         self.store.upsert("reports", f"prompt_contract:{run_id}", payload)
         return payload

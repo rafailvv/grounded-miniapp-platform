@@ -120,40 +120,40 @@ def test_quality_create_prompt_with_error_states_stays_quality_mode() -> None:
 
 def test_prompt_planning_hints_extract_role_fields_from_colon_and_action_sentences() -> None:
     hints = extract_prompt_planning_hints(
-        "Клиент описывает поставку: компания, офис, категория материалов, количество, бюджет, срок поставки, контакт и комментарий. "
-        "Специалист видит поставку, подбирает поставщика, уточняет наличие, цену, срок доставки, замену при отсутствии и рабочий статус. "
+        "Клиент описывает объект: название, локация, тип, количество, бюджет, срок, контакт и комментарий. "
+        "Специалист видит объект, указывает вариант, доступность, стоимость, срок исполнения, альтернативу и рабочее состояние. "
         "Менеджер контролирует бюджет и срочность, назначает приоритет, фиксирует лимит или замену, оставляет управленческий комментарий.",
         prompt_analysis=_prompt_analysis(
-            resource="поставка",
-            client=["компания", "офис", "категория материалов", "количество", "бюджет", "срок поставки", "контакт", "комментарий"],
-            specialist=["поставщика", "наличие", "цену", "срок доставки", "замену при отсутствии", "рабочий статус"],
+            resource="объект",
+            client=["название", "локация", "тип", "количество", "бюджет", "срок", "контакт", "комментарий"],
+            specialist=["вариант", "доступность", "стоимость", "срок исполнения", "альтернативу", "рабочее состояние"],
             manager=["приоритет", "лимит", "управленческий комментарий"],
         ),
     )
 
-    assert hints["resource_hint"] == "поставка"
+    assert hints["resource_hint"] == "объект"
     assert hints["role_field_hints"]["client"][:4] == [
-        "компания",
-        "офис",
-        "категория материалов",
+        "название",
+        "локация",
+        "тип",
         "количество",
     ]
-    assert "поставщика" in hints["role_field_hints"]["specialist"]
-    assert "наличие" in hints["role_field_hints"]["specialist"]
+    assert "вариант" in hints["role_field_hints"]["specialist"]
+    assert "доступность" in hints["role_field_hints"]["specialist"]
     assert "приоритет" in hints["role_field_hints"]["manager"]
     assert "утверждает лимит или замену" not in hints["role_field_hints"]["client"]
 
 
 def test_prompt_planning_hints_do_not_turn_workflow_actions_into_form_fields() -> None:
     hints = extract_prompt_planning_hints(
-        "Клиент: HR-менеджер описывает обучение: компания, подразделение, тема обучения, количество участников, бюджет, контакт. "
-        "Специалист: методист готовит обучение: программа, тренер, стоимость, доступные даты, рабочий статус. "
+        "Клиент описывает рабочий пакет: название, направление, тема, количество участников, бюджет, контакт. "
+        "Специалист готовит рабочий пакет: план, ответственный, стоимость, доступные даты, рабочий статус. "
         "Менеджер: руководитель согласует: приоритет, лимит бюджета, итоговое решение. "
-        "Нужно приложение с ролями /client, /specialist, /manager: создание карточки обучения, список карточек, выбор карточки специалистом и менеджером, обновление состояния, сохранение данных после перезагрузки.",
+        "Нужно приложение с ролями /client, /specialist, /manager: создание карточки, список карточек, выбор карточки специалистом и менеджером, обновление состояния, сохранение данных после перезагрузки.",
         prompt_analysis=_prompt_analysis(
-            resource="обучение",
-            client=["компания", "подразделение", "тема обучения", "количество участников", "бюджет", "контакт"],
-            specialist=["программа", "тренер", "стоимость", "доступные даты", "рабочий статус"],
+            resource="рабочий пакет",
+            client=["название", "направление", "тема", "количество участников", "бюджет", "контакт"],
+            specialist=["план", "ответственный", "стоимость", "доступные даты", "рабочий статус"],
             manager=["приоритет", "лимит бюджета", "итоговое решение"],
         ),
     )
@@ -164,12 +164,12 @@ def test_prompt_planning_hints_do_not_turn_workflow_actions_into_form_fields() -
         for field in fields
     ]
 
-    assert "компания" in hints["role_field_hints"]["client"]
-    assert "программа" in hints["role_field_hints"]["specialist"]
+    assert "название" in hints["role_field_hints"]["client"]
+    assert "план" in hints["role_field_hints"]["specialist"]
     assert "приоритет" in hints["role_field_hints"]["manager"]
-    assert "компания" not in hints["role_field_hints"]["manager"]
+    assert "название" not in hints["role_field_hints"]["manager"]
     assert "контакт" not in hints["role_field_hints"]["manager"]
-    assert "создание карточки обучения" not in all_fields
+    assert "создание карточки" not in all_fields
     assert "список карточек" not in all_fields
     assert "выбор карточки специалистом" not in all_fields
     assert "менеджером" not in all_fields
@@ -177,15 +177,15 @@ def test_prompt_planning_hints_do_not_turn_workflow_actions_into_form_fields() -
 
 def test_prompt_planning_hints_skip_actor_action_and_mode_instruction_fields() -> None:
     hints = extract_prompt_planning_hints(
-        "Клиент: HR-менеджер описывает корпоративное обучение, указывает компанию, количество участников, тему обучения, желаемые даты, формат, бюджет и комментарий. "
-        "Специалист: методист видит обучение, подбирает программу, тренера, длительность, стоимость, материалы и рабочий статус. "
-        "Менеджер: руководитель видит все карточки обучения и результат методиста, назначает приоритет, фиксирует лимит бюджета, выбирает финальные даты и оставляет управленческий комментарий. "
+        "Клиент описывает рабочий пакет, указывает название, количество участников, тему, желаемые даты, формат, бюджет и комментарий. "
+        "Специалист видит рабочий пакет, подбирает план, ответственного, длительность, стоимость, ресурсы и рабочий статус. "
+        "Менеджер видит все карточки и результат специалиста, назначает приоритет, фиксирует лимит бюджета, выбирает финальные даты и оставляет управленческий комментарий. "
         "Balanced режим: сделай дизайн лучше fast, метрики для менеджера, состояния empty/loading/error/success. "
         "Техническую инструкцию про generated metadata не добавляй как поле.",
         prompt_analysis=_prompt_analysis(
-            resource="обучение",
-            client=["компанию", "количество участников", "тему обучения", "желаемые даты", "формат", "бюджет", "комментарий"],
-            specialist=["программу", "тренера", "длительность", "стоимость", "материалы", "рабочий статус"],
+            resource="рабочий пакет",
+            client=["название", "количество участников", "тему", "желаемые даты", "формат", "бюджет", "комментарий"],
+            specialist=["план", "ответственного", "длительность", "стоимость", "ресурсы", "рабочий статус"],
             manager=["приоритет", "лимит бюджета", "финальные даты", "управленческий комментарий"],
         ),
     )
@@ -197,13 +197,12 @@ def test_prompt_planning_hints_skip_actor_action_and_mode_instruction_fields() -
     }
     manager_fields = set(hints["role_field_hints"]["manager"])
 
-    assert "HR-менеджер описывает обучение" not in all_fields
-    assert "методист видит обучение" not in all_fields
-    assert "руководитель видит все карточки обучения" not in all_fields
-    assert "на обучение" not in all_fields
-    assert "на корпоративное обучение" not in all_fields
-    assert "компанию" in hints["role_field_hints"]["client"]
-    assert "программу" in hints["role_field_hints"]["specialist"]
+    assert "Клиент описывает рабочий пакет" not in all_fields
+    assert "Специалист видит рабочий пакет" not in all_fields
+    assert "Менеджер видит все карточки" not in all_fields
+    assert "рабочий пакет" not in all_fields
+    assert "название" in hints["role_field_hints"]["client"]
+    assert "план" in hints["role_field_hints"]["specialist"]
     assert "приоритет" in hints["role_field_hints"]["manager"]
     assert "лимит бюджета" in hints["role_field_hints"]["manager"]
     assert not any("отклоняет" in field for field in all_fields)
@@ -222,7 +221,8 @@ def test_agent_prompt_is_tool_loop_contract_not_domain_template() -> None:
     assert "do not assert brittle implementation literals" in prompt
     assert "Never use visible technical placeholders" in prompt
     assert "Do not leave empty static/<role>/<child>/ directories" in prompt
-    assert "role entries must include a root field" in prompt
+    assert "do not patch it directly" in prompt
+    assert "manifest.roles.<role>.root" in prompt
     assert "return the persisted fields at the top level" in prompt
     assert "miniapp/app/generated/miniapp_contract.json" in prompt
     assert "keep names consistent across backend, JS payloads, renderers, and tests" in prompt
@@ -230,8 +230,8 @@ def test_agent_prompt_is_tool_loop_contract_not_domain_template() -> None:
 
 def test_implementation_plan_has_prompt_derived_routeable_screen_intents() -> None:
     prompt = (
-        "Я владелец пространства для мероприятий. Клиент должен выбрать формат, дату, "
-        "количество гостей и дополнительные услуги, специалист должен подготовить план, "
+        "Я владелец процесса. Клиент должен выбрать формат, дату, "
+        "количество участников и дополнительные параметры, специалист должен подготовить план, "
         "обновлять статус подготовки и оставлять комментарии, менеджер должен видеть "
         "загрузку команды, выручку и позиции, где есть задержки."
     )
@@ -246,8 +246,8 @@ def test_implementation_plan_has_prompt_derived_routeable_screen_intents() -> No
     contract = _contract_with_analysis(
         prompt,
         generation_mode=GenerationMode.BALANCED,
-        resource="мероприятие",
-        client=["формат", "дату", "количество гостей", "дополнительные услуги"],
+        resource="операция",
+        client=["формат", "дату", "количество участников", "дополнительные параметры"],
         specialist=["план", "статус подготовки", "комментарии"],
         manager=["загрузка команды", "выручка", "задержки"],
         screen_plan=screen_plan_payload,
@@ -323,208 +323,6 @@ def test_acceptance_contract_does_not_merge_followup_visibility_sentence_into_cl
     assert "стоимость" in contract["api_contract"]["role_field_hints"]["specialist"]
 
 
-def test_frontend_prompt_specificity_blocks_generic_scaffold(tmp_path: Path) -> None:
-    prompt = (
-        "Клиент планирует офисный ланч, указывает компанию, адрес, дату, количество персон, "
-        "бюджет, предпочтения по меню и комментарий. Специалист назначает меню, ставит статус "
-        "приготовления/доставки, добавляет комментарий кухни и время готовности. Менеджер видит "
-        "выручку, средний чек, проблемные задержки и управленческий комментарий."
-    )
-    contract = _contract_with_analysis(
-        prompt,
-        resource="ланч",
-        client=["компания", "адрес", "дату", "количество персон", "бюджет", "предпочтения по меню", "комментарий"],
-        specialist=["меню", "статус приготовления/доставки", "комментарий кухни", "время готовности"],
-        manager=["выручку", "средний чек", "проблемные задержки", "управленческий комментарий"],
-    )
-    role_text = {
-        "client": "<h1>Create Видит</h1><label>Title <input name='title'></label><label>Note <textarea name='note'></textarea></label><h2>Saved records</h2>",
-        "specialist": "<h1>Process Видит</h1><button>Update state</button><h2>Saved records</h2>",
-        "manager": "<h1>Inspect Видит</h1><button>Update state</button><h2>Saved records</h2>",
-    }
-
-    issues = CheckRunner._frontend_prompt_specificity_issues(
-        source_dir=tmp_path,
-        contract=contract,
-        role_text=role_text,
-        backend_text="class ContractItemCreate(BaseModel):\n    title: str\n    note: str\n",
-    )
-    codes = {issue.code for issue in issues}
-
-    assert "platform.generic_scaffold_leakage" in codes
-    assert "platform.prompt_specificity_missing_fields" in codes
-    assert any(issue.repair_recipe and issue.repair_recipe["required_next_tool"] == "read_files" for issue in issues)
-
-
-def test_frontend_prompt_specificity_accepts_prompt_owned_surfaces(tmp_path: Path) -> None:
-    prompt = (
-        "Клиент планирует офисный ланч, указывает компанию, адрес, дату, количество персон, "
-        "бюджет, предпочтения по меню и комментарий. Специалист назначает меню, ставит статус "
-        "приготовления/доставки, добавляет комментарий кухни и время готовности. Менеджер видит "
-        "выручку, средний чек, проблемные задержки, требует внимания и управленческий комментарий."
-    )
-    contract = _contract_with_analysis(
-        prompt,
-        resource="ланч",
-        client=["компания", "адрес", "дата", "количество персон", "бюджет", "предпочтения по меню", "комментарий"],
-        specialist=["меню", "статус приготовления", "доставка", "комментарий кухни", "время готовности"],
-        manager=["выручка", "средний чек", "проблемные задержки", "требует внимания", "управленческий комментарий"],
-    )
-    role_text = {
-        "client": "Компания Адрес Дата Количество персон Бюджет Предпочтения по меню Комментарий Офисный ланч",
-        "specialist": "Назначить меню Статус приготовления Доставка Комментарий кухни Время готовности Новые позиции",
-        "manager": "Выручка Средний чек Проблемные задержки Требует внимания Управленческий комментарий Позиции",
-    }
-
-    issues = CheckRunner._frontend_prompt_specificity_issues(
-        source_dir=tmp_path,
-        contract=contract,
-        role_text=role_text,
-        backend_text="company address date budget menu preferences kitchen comment revenue average check delay",
-    )
-
-    assert issues == []
-
-
-def test_frontend_prompt_specificity_requires_visible_client_form_fields(tmp_path: Path) -> None:
-    prompt = "Клиент указывает компанию, адрес, материалы и комментарий. Специалист обновляет статус."
-    contract = _contract_with_analysis(
-        prompt,
-        client=["компания", "адрес", "материалы", "комментарий"],
-        specialist=["статус"],
-    )
-    role_text = {
-        "client": "Компания Адрес Материалы Комментарий const FIELD_LABELS = { materials: 'Материалы', comment: 'Комментарий' }",
-        "specialist": "Статус Материалы Комментарий",
-        "manager": "Статус позиции",
-    }
-    role_html = {
-        "client": "<form><label>компания<input name='company'></label><label>адрес<input name='address'></label></form>",
-        "specialist": "Статус Материалы Комментарий",
-        "manager": "Статус позиции",
-    }
-
-    issues = CheckRunner._frontend_prompt_specificity_issues(
-        source_dir=tmp_path,
-        contract=contract,
-        role_text=role_text,
-        role_html_text=role_html,
-        backend_text="",
-    )
-
-    assert any(issue.code == "platform.prompt_specificity_missing_fields" for issue in issues)
-
-
-def test_frontend_prompt_specificity_blocks_role_fields_in_client_form(tmp_path: Path) -> None:
-    prompt = (
-        "Клиент создает проект, указывает компанию, телефон и бюджет. "
-        "Специалист добавляет комментарий цеха и дату готовности. "
-        "Менеджер может пометить приоритет."
-    )
-    contract = _contract_with_analysis(
-        prompt,
-        resource="проект",
-        client=["компания", "телефон", "бюджет"],
-        specialist=["комментарий цеха", "дату готовности"],
-        manager=["приоритет"],
-    )
-    role_text = {
-        "client": "компания телефон бюджет комментарий цеха дата готовности",
-        "specialist": "комментарий цеха дата готовности",
-        "manager": "приоритет",
-    }
-    role_html = {
-        "client": (
-            "<form><label>компания<input name='company'></label>"
-            "<label>телефон<input name='phone'></label>"
-            "<label>бюджет<input name='budget'></label>"
-            "<label>комментарий цеха<textarea name='workshop_comment'></textarea></label></form>"
-        ),
-        "specialist": "<form><label>комментарий цеха<textarea></textarea></label></form>",
-        "manager": "<form><label>приоритет<select></select></label></form>",
-    }
-
-    issues = CheckRunner._frontend_prompt_specificity_issues(
-        source_dir=tmp_path,
-        contract=contract,
-        role_text=role_text,
-        role_html_text=role_html,
-        backend_text="",
-    )
-
-    assert any(issue.code == "platform.prompt_specificity_cross_role_fields_in_client_form" for issue in issues)
-
-
-def test_frontend_prompt_specificity_allows_client_comment_without_specialist_comment_leak(tmp_path: Path) -> None:
-    prompt = (
-        "Клиент создает проект, указывает компанию, дату и комментарий. "
-        "Специалист добавляет комментарий бригады и дату визита."
-    )
-    contract = _contract_with_analysis(
-        prompt,
-        resource="проект",
-        client=["компания", "дата", "комментарий"],
-        specialist=["комментарий бригады", "дата визита"],
-    )
-    role_text = {
-        "client": "компания дата комментарий",
-        "specialist": "комментарий бригады дата визита",
-        "manager": "",
-    }
-    role_html = {
-        "client": "<form><label>компания<input name='company'></label><label>дата<input name='date'></label><label>комментарий<textarea name='comment'></textarea></label></form>",
-        "specialist": "<form><label>комментарий бригады<textarea></textarea></label><label>дата визита<input></label></form>",
-        "manager": "",
-    }
-
-    issues = CheckRunner._frontend_prompt_specificity_issues(
-        source_dir=tmp_path,
-        contract=contract,
-        role_text=role_text,
-        role_html_text=role_html,
-        backend_text="",
-    )
-
-    assert not any(issue.code == "platform.prompt_specificity_cross_role_fields_in_client_form" for issue in issues)
-
-
-def test_frontend_prompt_specificity_does_not_confuse_delivery_term_with_supplier(tmp_path: Path) -> None:
-    prompt = (
-        "Клиент описывает поставку: компания, желаемый срок поставки и комментарий. "
-        "Специалист подбирает поставщика и уточняет наличие."
-    )
-    contract = _contract_with_analysis(
-        prompt,
-        resource="поставка",
-        client=["компания", "желаемый срок поставки", "комментарий"],
-        specialist=["поставщика", "наличие"],
-    )
-    role_text = {
-        "client": "компания желаемый срок поставки комментарий",
-        "specialist": "поставщика наличие",
-        "manager": "",
-    }
-    role_html = {
-        "client": (
-            "<form><label>компания<input name='company'></label>"
-            "<label>желаемый срок поставки<input name='delivery'></label>"
-            "<label>комментарий<textarea name='comment'></textarea></label></form>"
-        ),
-        "specialist": "<form><label>поставщика<input></label><label>наличие<input></label></form>",
-        "manager": "",
-    }
-
-    issues = CheckRunner._frontend_prompt_specificity_issues(
-        source_dir=tmp_path,
-        contract=contract,
-        role_text=role_text,
-        role_html_text=role_html,
-        backend_text="",
-    )
-
-    assert not any(issue.code == "platform.prompt_specificity_cross_role_fields_in_client_form" for issue in issues)
-
-
 def test_cross_role_update_visibility_requires_client_renderer(tmp_path: Path) -> None:
     static_root = tmp_path / "miniapp/app/static"
     (static_root / "client").mkdir(parents=True)
@@ -534,58 +332,26 @@ def test_cross_role_update_visibility_requires_client_renderer(tmp_path: Path) -
         "manager": "",
     }
 
-    issues = CheckRunner._cross_role_update_visibility_issues(static_root=static_root, role_text=role_text)
+    issues = CheckRunner._cross_role_update_visibility_issues(
+        static_root=static_root,
+        role_text=role_text,
+        source_roles=["client"],
+        update_roles=["specialist"],
+    )
 
     assert issues
-    assert issues[0].code == "platform.cross_role_update_not_rendered_in_client"
-    assert set(issues[0].repair_recipe["evidence"]["missing_client_fields"]) >= {
+    assert issues[0].code == "platform.cross_role_update_not_rendered_in_role"
+    assert set(issues[0].repair_recipe["evidence"]["missing_role_fields"]) >= {
         "calculated_price",
         "ready_date",
         "workshop_comment",
     }
 
 
-def test_manager_must_render_specialist_result_fields() -> None:
-    role_field_hints = {
-        "specialist": ["программу", "тренера", "стоимость"],
-        "manager": ["приоритет", "лимит бюджета"],
-    }
-    bad_manager = """
-      const FIELD_LABELS = { programmu: "программу", trenera: "тренера", stoimost: "стоимость", prioritet: "приоритет" };
-      function itemDetails(item) {
-        const pairs = [
-          ["kompaniyu", item.kompaniyu],
-          ["prioritet", item.prioritet],
-        ];
-        return pairs.map(([key, value]) => `${FIELD_LABELS[key]}: ${value}`).join("");
-      }
-    """
-    good_manager = """
-      const FIELD_LABELS = { programmu: "программу", trenera: "тренера", stoimost: "стоимость", prioritet: "приоритет" };
-      function itemDetails(item) {
-        const rows = Object.entries(FIELD_LABELS).filter(([key]) => item[key]).map(([key, label]) => `${label}: ${item[key]}`);
-        return rows.join("");
-      }
-    """
-
-    issue = CheckRunner._manager_specialist_field_visibility_issue(
-        manager_text=bad_manager,
-        role_field_hints=role_field_hints,
-    )
-    ok = CheckRunner._manager_specialist_field_visibility_issue(
-        manager_text=good_manager,
-        role_field_hints=role_field_hints,
-    )
-
-    assert issue is not None
-    assert issue.code == "platform.manager_missing_specialist_result_visibility"
-    assert ok is None
-
-
 def test_contract_compiler_preserves_prompt_metadata_without_product_shell() -> None:
     prompt = (
-        "Клиент указывает компанию, бюджет и комментарий. "
-        "Специалист добавляет программу, тренера и стоимость. "
+        "Клиент указывает название, бюджет и комментарий. "
+        "Специалист добавляет план, ответственного и стоимость. "
         "Менеджер видит результат специалиста, фиксирует лимит и итоговое решение."
     )
     contract = MiniAppContractCompiler.compile(
@@ -597,9 +363,9 @@ def test_contract_compiler_preserves_prompt_metadata_without_product_shell() -> 
         acceptance_contract=_contract_with_analysis(
             prompt,
             generation_mode=GenerationMode.QUALITY,
-            resource="обучение",
-            client=["компания", "бюджет", "комментарий"],
-            specialist=["программа", "тренер", "стоимость"],
+            resource="рабочий пакет",
+            client=["название", "бюджет", "комментарий"],
+            specialist=["план", "ответственный", "стоимость"],
             manager=["лимит", "итоговое решение"],
         ),
     )
@@ -610,40 +376,6 @@ def test_contract_compiler_preserves_prompt_metadata_without_product_shell() -> 
     assert all("miniapp/app/routes/" not in path for path in contract.allowed_file_graph.contract_owned_paths)
     assert "miniapp/tests/test_generated_app.py" not in contract.allowed_file_graph.blocked_globs
     assert contract.acceptance_summary["features"]["platform_product_scaffold"] is False
-
-
-def test_role_prompt_update_payload_requires_real_specialist_controls() -> None:
-    prompt = (
-        "Клиент создает проект. Специалист назначает материалы, рассчитывает стоимость, "
-        "ставит статус производства, добавляет комментарий цеха и дату готовности. "
-        "Менеджер видит приоритет."
-    )
-    contract = _contract_with_analysis(
-        prompt,
-        resource="проект",
-        client=[],
-        specialist=["материалы", "стоимость", "статус производства", "комментарий цеха", "дата готовности"],
-        manager=["приоритет"],
-    )
-    role_text = {
-        "client": "",
-        "specialist": 'const WORKFLOW_FIELDS = { estimated_cost: "расчет стоимости" }; fetch("/api/items/1/update", { method: "PATCH", body: JSON.stringify({ status: "processed", updated_by: ROLE }) });',
-        "manager": '<select id="priority"></select> fetch("/api/items/1/update", { method: "PATCH", body: JSON.stringify({ priority: "high", management_comment: "ok", updated_by: ROLE }) });',
-    }
-    role_html = {
-        "client": "",
-        "specialist": "<button>Save progress</button>",
-        "manager": "<select id='priority'></select><textarea id='management'></textarea>",
-    }
-
-    issues = CheckRunner._role_prompt_update_payload_issues(
-        contract=contract,
-        role_text=role_text,
-        role_html_text=role_html,
-    )
-
-    assert [issue.location for issue in issues] == ["miniapp/app/static/specialist"]
-    assert issues[0].code == "platform.prompt_specificity_missing_role_update_payload"
 
 
 def test_role_surface_blocks_generic_workflow_copy_and_raw_status_rendering() -> None:
@@ -735,53 +467,6 @@ def test_role_surface_blocks_visible_http_api_copy_without_blocking_js_methods()
     assert js_markers == []
 
 
-def test_role_prompt_update_payload_accepts_formdata_dynamic_patch_fields() -> None:
-    prompt = (
-        "Клиент создает проект. Специалист назначает бригаду, рассчитывает стоимость, "
-        "добавляет комментарий бригады и дату визита. Менеджер видит приоритет."
-    )
-    contract = _contract_with_analysis(
-        prompt,
-        resource="проект",
-        client=[],
-        specialist=["бригаду", "стоимость", "комментарий бригады", "дату визита"],
-        manager=["приоритет"],
-    )
-    role_text = {
-        "client": "",
-        "specialist": '''
-          const updateForm = document.getElementById("contract-update-form");
-          updateForm.addEventListener("submit", async (event) => {
-            const formData = new FormData(updateForm);
-            const payload = { status: String(formData.get("status") || "processed"), updated_by: ROLE };
-            for (const [key, value] of formData.entries()) {
-              if (key !== "item_id" && key !== "status") payload[key] = String(value || "");
-            }
-            await fetch(`/api/items/${formData.get("item_id")}/update`, { method: "PATCH", body: JSON.stringify(payload) });
-          });
-        ''',
-        "manager": '<select id="priority"></select> fetch("/api/items/1/update", { method: "PATCH", body: JSON.stringify({ priority: "high", updated_by: ROLE }) });',
-    }
-    role_html = {
-        "client": "",
-        "specialist": (
-            "<form id='contract-update-form'>"
-            "<select name='item_id'></select><input name='brigadu'>"
-            "<input name='stoimost'><textarea name='kommentariyBrigady'></textarea>"
-            "<input name='datuVizita'><select name='status'></select></form>"
-        ),
-        "manager": "<select id='priority'></select>",
-    }
-
-    issues = CheckRunner._role_prompt_update_payload_issues(
-        contract=contract,
-        role_text=role_text,
-        role_html_text=role_html,
-    )
-
-    assert issues == []
-
-
 def test_frontend_form_field_reads_accept_dynamic_formdata_entries_payload() -> None:
     js_source = '''
       const form = document.getElementById("main-create-form");
@@ -863,20 +548,6 @@ def test_miniapp_contract_uses_role_scoped_fields_and_business_resource_name() -
     assert "комментарий цеха" in set(resource.role_field_labels["specialist"].values())
     assert resource.endpoints == []
     assert "kommentariyCeha" not in resource.role_field_labels["client"]
-
-
-def test_repair_catalog_classifies_prompt_specificity_failure() -> None:
-    packet = RepairCatalog.classify_issue(
-        {
-            "code": "platform.prompt_specificity_missing_fields",
-            "message": "Client create flow does not expose enough prompt-derived fields.",
-            "check": "frontend_interaction_static_smoke",
-        }
-    )
-
-    assert packet["signature"] == "workflow.prompt_specificity_mismatch"
-    assert packet["required_next_tool"] == "read_files"
-    assert packet["deterministic"] is True
 
 
 def test_frontend_backend_payload_validator_accepts_pydantic_extra_allow(tmp_path: Path) -> None:
@@ -1001,6 +672,54 @@ def test_role_surface_issues_accepts_generation_mode(tmp_path: Path) -> None:
     assert set(coverage) == {"client", "specialist", "manager"}
 
 
+def test_role_action_signals_follow_prompt_role_flow() -> None:
+    contract = {
+        "required": True,
+        "prompt_hints": {
+            "role_state_contract": {
+                "source_roles": ["manager"],
+                "update_roles": ["specialist"],
+                "observer_roles": ["client"],
+            },
+            "role_action_prompts": {
+                "manager": ["publishes the shared catalog"],
+                "client": ["filters and reads the catalog"],
+                "specialist": ["updates fulfillment state"],
+            },
+        },
+    }
+
+    manager_source = """
+    <form id="publish-form"><input name="name"><button>Publish</button></form>
+    <script>fetch("/api/catalog", { method: "POST", body: JSON.stringify({ name: "x" }) })</script>
+    """
+    client_observer = """
+    <select id="category-filter"></select>
+    <section id="catalog"></section>
+    <script>fetch("/api/catalog").then(renderCatalog)</script>
+    """
+    client_without_mutation = """
+    <form id="filter-form"><input name="query"><button>Search</button></form>
+    <script>fetch("/api/catalog").then(renderCatalog)</script>
+    """
+
+    assert CheckRunner._role_action_signals("manager", manager_source, acceptance_contract=contract)
+    assert CheckRunner._role_action_signals("client", client_observer, acceptance_contract=contract)
+    assert not CheckRunner._role_action_signals(
+        "specialist",
+        client_without_mutation,
+        acceptance_contract=contract,
+    )
+    dynamic_method_source = """
+    <form id="publish-form"><input name="name"><button>Publish</button></form>
+    <script>
+      const method = state.editingId ? "PATCH" : "POST";
+      publishForm.addEventListener("submit", () => fetch("/api/items", { method }));
+    </script>
+    """
+    assert CheckRunner._role_action_signals("manager", dynamic_method_source, acceptance_contract=contract)
+
+
 def test_openai_tool_step_extracts_response_function_calls() -> None:
     parsed = OpenAIClient._extract_response_tool_step(
         {
@@ -1123,6 +842,66 @@ def test_agent_edit_validator_rejects_unsafe_or_invalid_file_changes() -> None:
     assert invalid_patch.metadata["repair_packets"][0]["required_next_tool"] in {"read_files", "write_file"}
 
 
+def test_agent_edit_validator_protects_generated_artifacts_without_retrying_them() -> None:
+    plan = AgentEditValidator.normalize_plan(
+        AgentTurnPlan(
+            outcome="changes_ready",
+            file_changes=[
+                DraftAction(
+                    file_path="miniapp/app/generated/route_manifest.json",
+                    operation="replace",
+                    content="{}",
+                    reason="bad",
+                ),
+                DraftAction(
+                    file_path="miniapp/app/static/manager/app.js",
+                    operation="replace",
+                    content="console.log('ok');",
+                    reason="source repair",
+                ),
+            ],
+        )
+    )
+
+    packet = plan.metadata["repair_packets"][0]
+
+    assert plan.failure_signature == "generation.invalid_edit_operation:protected_path"
+    assert packet["code"] == "protected_path"
+    assert packet["retryable"] is False
+    assert "miniapp/app/generated/route_manifest.json" not in packet["target_files"]
+    assert packet["target_files"] == ["miniapp/app/static/manager/app.js"]
+
+
+def test_protected_route_repair_targets_allowed_role_sources() -> None:
+    plan = AgentEditValidator.normalize_plan(
+        AgentTurnPlan(
+            outcome="changes_ready",
+            file_changes=[
+                DraftAction(
+                    file_path="miniapp/app/routes/role_routes.py",
+                    operation="replace",
+                    content="bad",
+                    reason="bad",
+                )
+            ],
+        )
+    )
+    packet = plan.metadata["repair_packets"][0]
+    decision = RepairTransitionPolicy.decide(
+        repair_packets=[packet],
+        repeated_failure_signatures={str(packet["failure_signature"]): 1},
+        latest_files_read=[],
+    )
+
+    assert packet["code"] == "protected_path"
+    assert "miniapp/app/routes/role_routes.py" in packet["forbidden_target_files"]
+    assert "miniapp/app/routes/role_routes.py" not in packet["target_files"]
+    assert "miniapp/app/static/client/app.js" in packet["target_files"]
+    assert decision.active is True
+    assert decision.forced_tool_names == ["read_files"]
+    assert "miniapp/app/routes/role_routes.py" in decision.next_forced_action["forbidden_target_files"]
+
+
 def test_agent_file_state_cache_reports_freshness(tmp_path: Path) -> None:
     root = tmp_path
     target = root / "miniapp/app/static/client/app.js"
@@ -1205,6 +984,220 @@ def test_repair_catalog_returns_operational_packets() -> None:
     assert packet["required_next_tool"] == "read_files"
     assert packet["verification_command"]
     assert packet["deterministic"] is True
+
+
+def test_repair_catalog_embedded_connectivity_recipe_has_precise_targets() -> None:
+    packet = RepairCatalog.classify_issue(
+        {
+            "kind": "check_failure",
+            "check": "connectivity_validators",
+            "evidence": {
+                "logs": [
+                    json.dumps(
+                        {
+                            "code": "connectivity.missing_backend_route",
+                            "message": "miniapp/app/static/specialist/app.js references GET /api/flows/{param} but the matching backend route is missing.",
+                            "severity": "high",
+                            "location": "miniapp/app/routes",
+                            "blocking": True,
+                            "repair_recipe": {
+                                "frontend_ref": "miniapp/app/static/specialist/app.js: GET /api/flows/{param}",
+                                "expected_route": "GET /api/flows/{param}",
+                                "suggested_patch_target": "miniapp/app/routes",
+                            },
+                        }
+                    )
+                ]
+            },
+        }
+    )
+
+    assert packet["signature"] == "connectivity.missing_backend_route"
+    assert "miniapp/app/static/specialist/app.js" in packet["target_files"]
+    assert "miniapp/app/routes/api.py" in packet["target_files"]
+    assert packet["next_forced_action"]["target_files"] == packet["target_files"]
+
+
+def test_frontend_form_wiring_issue_emits_exact_repair_packet(tmp_path: Path) -> None:
+    static_root = tmp_path / "miniapp/app/static"
+    manager_dir = static_root / "manager"
+    specialist_dir = static_root / "specialist"
+    client_dir = static_root / "client"
+    tests_dir = tmp_path / "miniapp/tests"
+    for path in (manager_dir, specialist_dir, client_dir, tests_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    (manager_dir / "index.html").write_text(
+        '<form id="entry-form"><input name="title"><button type="submit">Save</button></form>',
+        encoding="utf-8",
+    )
+    (manager_dir / "app.js").write_text(
+        "async function saveOther(){ await fetch('/api/entries', {method: 'POST', body: JSON.stringify({title: 'x'})}); }\n",
+        encoding="utf-8",
+    )
+    (specialist_dir / "index.html").write_text("<button id='mark'>Mark</button>", encoding="utf-8")
+    (specialist_dir / "app.js").write_text(
+        "async function mark(id){ await fetch(`/api/entries/${id}`, {method: 'PATCH', body: JSON.stringify({review_note: 'done'})}); }\n",
+        encoding="utf-8",
+    )
+    (client_dir / "index.html").write_text("<main></main>", encoding="utf-8")
+    (client_dir / "app.js").write_text("async function load(){ await fetch('/api/entries'); }\n", encoding="utf-8")
+    (tests_dir / "generated_app.test.mjs").write_text("import test from 'node:test'; // post get update\n", encoding="utf-8")
+
+    issues = CheckRunner._frontend_interaction_contract_issues(
+        source_dir=tmp_path,
+        contract={
+            "required": True,
+            "features": {"workflow_update": True},
+            "prompt_hints": {
+                "role_state_contract": {
+                    "source_roles": ["manager"],
+                    "update_roles": ["specialist"],
+                    "observer_roles": ["client"],
+                }
+            },
+        },
+    )
+
+    form_index = next(index for index, issue in enumerate(issues) if issue.code == "platform.workflow_form_without_handler")
+    broad_index = next(index for index, issue in enumerate(issues) if issue.code == "platform.cross_role_update_not_rendered_in_role")
+    assert form_index < broad_index
+    issue = issues[form_index]
+    packet = RepairCatalog.classify_issue(
+        {
+            "check": "frontend_interaction_static_smoke",
+            "logs": [json.dumps(issue.model_dump(mode="json"))],
+        }
+    )
+    assert packet["signature"] == "frontend.unwired_form"
+    assert packet["suggested_tool_after_read"] == "write_file"
+    assert packet["target_files"][:2] == [
+        "miniapp/app/static/manager/index.html",
+        "miniapp/app/static/manager/app.js",
+    ]
+
+
+def test_generated_js_diagnostics_reject_brittle_route_manifest_root_assertion(tmp_path: Path) -> None:
+    test_file = tmp_path / "generated_app.test.mjs"
+    test_file.write_text(
+        "import assert from 'node:assert/strict';\n"
+        "assert.equal(manifest.roles.client.root, '/client');\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        ["file:///workspace/miniapp/tests/generated_app.test.mjs:2:8"],
+        test_file=test_file,
+    )
+
+    assert diagnostics["js_test_brittle_route_manifest_assertion"]["problem"] == "generated_js_test_requires_exact_route_manifest_root"
+    assert "Do not edit generated/route_manifest.json" in diagnostics["js_test_brittle_route_manifest_assertion"]["expected_fix"]
+    packet = RepairCatalog.classify_issue(
+        {
+            "check": "generated_app_js_tests",
+            "diagnostics": diagnostics,
+            "paths": ["miniapp/tests/generated_app.test.mjs"],
+        }
+    )
+    assert packet["signature"] == "tests.js_brittle_route_manifest_root"
+    assert packet["target_files"] == ["miniapp/tests/generated_app.test.mjs"]
+
+
+def test_button_wiring_issue_emits_exact_repair_recipe(tmp_path: Path) -> None:
+    source = '<button id="refreshNow" type="button">Refresh</button>'
+    js_path = tmp_path / "miniapp/app/static/client/app.js"
+    js_path.parent.mkdir(parents=True, exist_ok=True)
+    js_path.write_text("console.log('ready');\n", encoding="utf-8")
+
+    issues = CheckRunner._button_wiring_issues(
+        "miniapp/app/static/client/index.html",
+        js_path,
+        source,
+        js_path.read_text(encoding="utf-8"),
+    )
+
+    assert issues[0].repair_recipe is not None
+    assert issues[0].repair_recipe["target_files"] == [
+        "miniapp/app/static/client/index.html",
+        "miniapp/app/static/client/app.js",
+    ]
+
+
+def test_generated_js_browser_global_failure_gets_operational_packet(tmp_path: Path) -> None:
+    test_file = tmp_path / "generated_app.test.mjs"
+    test_file.write_text(
+        "import { pathToFileURL } from 'node:url';\n"
+        "await import(pathToFileURL(new URL('../app/static/specialist/app.js', import.meta.url).pathname));\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = CheckRunner._extract_generated_app_test_diagnostics(
+        [
+            "# /workspace/source/miniapp/app/static/specialist/app.js:2",
+            "# const view = document.body.dataset.view || 'dashboard';",
+            "#              ^",
+            "# ReferenceError: document is not defined",
+            "file:///workspace/miniapp/tests/generated_app.test.mjs:2:7",
+        ],
+        test_file=test_file,
+    )
+    packet = RepairCatalog.classify_issue(
+        {
+            "check": "generated_app_js_tests",
+            "details": "Generated JS app tests failed for the draft miniapp.",
+            "diagnostics": diagnostics,
+            "paths": ["miniapp/tests/generated_app.test.mjs"],
+        }
+    )
+
+    assert diagnostics["js_test_imports_browser_app_without_dom"]["missing_global"] == "document"
+    assert packet["signature"] == "tests.js_browser_global_import"
+    assert packet["target_files"] == ["miniapp/tests/generated_app.test.mjs"]
+
+
+def test_generated_python_assertion_failure_targets_api_contract_slice() -> None:
+    packet = RepairCatalog.classify_issue(
+        {
+            "check": "generated_app_python_tests",
+            "details": "Generated Python app tests failed for the draft miniapp.",
+            "logs": ["AssertionError: 'pending' != 'ready'"],
+            "diagnostics": {
+                "python_assertion_failures": [
+                    {
+                        "file_path": "miniapp/tests/test_generated_app.py",
+                        "line": 41,
+                        "source": "self.assertEqual(payload['state'], 'ready')",
+                    }
+                ]
+            },
+            "paths": ["miniapp/tests/test_generated_app.py"],
+        }
+    )
+
+    assert packet["signature"] == "tests.python_api_contract_mismatch"
+    assert "miniapp/app/routes/**" in packet["target_files"]
+    assert "miniapp/tests/test_generated_app.py" in packet["target_files"]
+
+
+def test_backend_import_name_error_targets_traceback_file() -> None:
+    diagnostics = CheckRunner._extract_backend_import_diagnostics(
+        [
+            '  File "/workspace/source/miniapp/app/routes/api.py", line 12, in <module>',
+            "    updated_at = mapped_column(onupdate=_now)",
+            "NameError: name '_now' is not defined",
+        ]
+    )
+    packet = RepairCatalog.classify_issue(
+        {
+            "check": "changed_files_static",
+            "details": "Backend import smoke failed for the draft miniapp.",
+            "diagnostics": diagnostics,
+            "paths": ["miniapp/app/routes/api.py"],
+        }
+    )
+
+    assert diagnostics["python_name_error"]["file_path"] == "miniapp/app/routes/api.py"
+    assert packet["signature"] == "backend.python_name_error"
+    assert packet["target_files"][0] == "miniapp/app/routes/api.py"
 
 
 def test_diagnostics_delta_only_reports_changed_failures() -> None:
@@ -1517,8 +1510,8 @@ def test_worker_manager_rejects_conflicting_owned_edits() -> None:
     assert report["conflicts"][0]["path"] == "miniapp/app/static/client/app.js"  # type: ignore[index]
 
 
-def test_balanced_quality_use_serial_contract_runtime_writes() -> None:
-    for mode in (GenerationMode.BALANCED, GenerationMode.QUALITY):
+def test_generation_modes_use_serial_contract_runtime_writes() -> None:
+    for mode in (GenerationMode.FAST, GenerationMode.BALANCED, GenerationMode.QUALITY):
         mailbox = AgentWorkerManager.mailbox_for_plan(
             generation_mode=mode,
             implementation_plan={"prompt_contract_v1": {"enabled": True, "metadata_only": True}},

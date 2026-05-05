@@ -309,6 +309,29 @@ def test_api_errors_use_typed_envelope(tmp_path: Path) -> None:
     assert payload["error"]["deterministic"] is True
 
 
+def test_provider_quota_errors_keep_typed_envelope(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+
+    @app.get("/test/provider-quota")
+    def provider_quota_probe() -> None:
+        raise RuntimeError(
+            'OpenAI responses returned 429: {"error":{"type":"insufficient_quota","code":"insufficient_quota"}}'
+        )
+
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.get("/test/provider-quota")
+
+    assert response.status_code == 429
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["blocking"] is True
+    assert payload["error"]["code"] == "provider.insufficient_quota"
+    assert payload["error"]["retryable"] is False
+    assert payload["error"]["deterministic"] is False
+    assert payload["error"]["failure_class"] == "provider.insufficient_quota"
+
+
 def test_run_record_reconciles_from_terminal_artifacts(tmp_path: Path) -> None:
     app = create_app(data_dir=tmp_path)
     workspace = TestClient(app).post(
@@ -437,7 +460,7 @@ def test_reliability_gate_blocks_missing_browser_proof(tmp_path: Path) -> None:
     ).json()
     run = RunRecord(
         workspace_id=workspace["workspace_id"],
-        prompt="Build a CRM workflow",
+        prompt="Build an operations workflow",
         intent="create",
         target_role_scope=["client", "specialist", "manager"],
         model_profile="test",
@@ -503,15 +526,15 @@ def test_repair_catalog_prefers_embedded_validator_recipe_over_generic_static_fa
             "logs": [
                 json.dumps(
                     {
-                        "code": "platform.manager_missing_specialist_result_visibility",
-                        "message": "Manager role must render specialist-owned persisted result fields before manager action.",
+                        "code": "platform.frontend_update_visibility",
+                        "message": "A role detail view omits persisted fields required by the contract before its action.",
                         "severity": "high",
                         "location": "miniapp/app/static/manager/app.js",
                         "blocking": True,
                         "repair_recipe": {
-                            "recipe_id": "workflow.prompt_specificity",
-                            "failure_class": "semantic_contract_mismatch",
-                            "failure_signature": "workflow.manager_missing_specialist_result_visibility",
+                            "recipe_id": "frontend.update_visibility",
+                            "failure_class": "frontend_interaction_static_smoke",
+                            "failure_signature": "frontend.update_visibility",
                             "required_next_tool": "read_files",
                             "suggested_tool_after_read": "write_file",
                             "target_files": ["miniapp/app/static/manager/app.js"],
@@ -520,8 +543,8 @@ def test_repair_catalog_prefers_embedded_validator_recipe_over_generic_static_fa
                             "retry_policy": "deterministic_repair",
                             "deterministic": True,
                             "retryable": True,
-                            "instruction": "Render specialist fields in the manager details.",
-                            "evidence": {"missing_specialist_fields": ["программу"]},
+                            "instruction": "Render the contract-required persisted fields in the role detail view.",
+                            "evidence": {"missing_contract_fields": ["результат"]},
                         },
                     }
                 )
@@ -531,13 +554,10 @@ def test_repair_catalog_prefers_embedded_validator_recipe_over_generic_static_fa
         }
     )
 
-    assert packet["signature"] == "workflow.manager_missing_specialist_result_visibility"
-    assert packet["code"] == "manager_missing_specialist_result_visibility"
+    assert packet["signature"] == "frontend.update_visibility"
+    assert packet["code"] == "frontend_update_visibility"
     assert packet["suggested_tool_after_read"] == "write_file"
-    assert packet["target_files"][:2] == [
-        "miniapp/app/static/manager/app.js",
-        "miniapp/app/static/manager/index.html",
-    ]
+    assert packet["target_files"] == ["miniapp/app/static/manager/app.js"]
 
 
 def test_thread_snapshots_are_persistent(tmp_path: Path) -> None:

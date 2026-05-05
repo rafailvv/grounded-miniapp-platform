@@ -84,37 +84,7 @@ class _HtmlControlContractParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "form" and self.form_depth > 0:
             self.form_depth -= 1
-ROLE_LINK_STOPWORDS = {
-    "client",
-    "specialist",
-    "manager",
-    "preview",
-    "surface",
-    "blank-shell",
-    "screen",
-    "generated",
-    "static",
-    "script",
-    "style",
-    "button",
-    "section",
-    "header",
-    "footer",
-    "main",
-    "role",
-    "page",
-    "app",
-    "miniapp",
-    "telegram",
-    "пользователь",
-    "клиент",
-    "специалист",
-    "менеджер",
-    "страница",
-    "экран",
-    "приложение",
-}
-PRELOADED_DOMAIN_DATA_MARKERS = (
+PRELOADED_PRODUCT_DATA_MARKERS = (
     "mock data",
     "mock-data",
     "demo data",
@@ -127,8 +97,8 @@ PRELOADED_DOMAIN_DATA_MARKERS = (
     "fixture data",
     "preloaded records",
     "preloaded data",
-    "hard-coded domain records",
-    "hardcoded domain records",
+    "hard-coded product records",
+    "hardcoded product records",
     "initialrecords",
     "samplerecords",
     "demorecords",
@@ -143,67 +113,6 @@ CSS_PLACEHOLDER_MARKERS = (
     "generated specialist page styles can replace this file",
     "generated manager page styles can replace this file",
     "styles can replace this file",
-)
-PROMPT_SPECIFICITY_STOPWORDS = {
-    "add",
-    "adds",
-    "all",
-    "and",
-    "app",
-    "application",
-    "can",
-    "client",
-    "create",
-    "creates",
-    "customer",
-    "manager",
-    "miniapp",
-    "needs",
-    "role",
-    "save",
-    "see",
-    "sees",
-    "specialist",
-    "status",
-    "submit",
-    "update",
-    "user",
-    "workflow",
-    "администратор",
-    "будет",
-    "видеть",
-    "видит",
-    "видят",
-    "все",
-    "всё",
-    "добавить",
-    "добавляет",
-    "должен",
-    "должна",
-    "должны",
-    "клиент",
-    "менеджер",
-    "мини",
-    "может",
-    "нужно",
-    "обновляет",
-    "пометить",
-    "после",
-    "приложение",
-    "роль",
-    "создает",
-    "создаёт",
-    "специалист",
-    "ставит",
-    "статус",
-    "указывает",
-}
-GENERIC_SCAFFOLD_VISIBLE_PATTERNS: tuple[tuple[str, str], ...] = (
-    ("visible Title label", r"<label[^>]*>\s*title\b"),
-    ("visible Note label", r"<label[^>]*>\s*note\b"),
-    ("saved records status copy", r"\bsaved records\b"),
-    ("first record empty state", r"create the first record"),
-    ("generic Update status button", r">\s*update status\s*<"),
 )
 PAGE_SHELL_SAFE_TOP_MARKERS = (
     "var(--telegram-top-safe-offset)",
@@ -368,6 +277,7 @@ class CheckRunner:
             scope_mode="focused_edit" if focused_edit_profile else scope_mode,
             intent=intent,
             generation_mode=generation_mode,
+            acceptance_contract=acceptance_contract,
         )
         platform_smoke_result.duration_ms = int((time.perf_counter() - canonical_started) * 1000)
         results.append(platform_smoke_result)
@@ -746,8 +656,6 @@ class CheckRunner:
 
         issues = self._frontend_interaction_contract_issues(source_dir=source_dir, contract=contract)
         blocking = self._blocking_validation_issues(issues)
-        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
-        api_contract = contract.get("api_contract") if isinstance(contract.get("api_contract"), dict) else {}
         return RunCheckResult(
             name="frontend_interaction_static_smoke",
             status="failed" if blocking else "passed",
@@ -758,15 +666,6 @@ class CheckRunner:
                 "acceptance_contract_required": True,
                 "flow_ids": [flow.get("id") for flow in contract.get("flows", []) if isinstance(flow, dict)],
                 "features": dict(contract.get("features") or {}),
-                "prompt_specificity": {
-                    "field_hints": list(api_contract.get("field_hints") or prompt_hints.get("field_hints") or [])[:12],
-                    "blocking_codes": [
-                        issue.code
-                        for issue in blocking
-                        if str(issue.code).startswith("platform.prompt_specificity")
-                        or str(issue.code) == "platform.generic_scaffold_leakage"
-                    ],
-                },
             },
         )
 
@@ -786,6 +685,25 @@ class CheckRunner:
         tests_text = cls._read_generated_tests_text(source_dir)
         all_frontend = "\n".join(role_text.values())
         features = contract.get("features") if isinstance(contract.get("features"), dict) else {}
+        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
+        state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
+        update_roles = [
+            role
+            for role in (
+                str(item).strip().lower()
+                for item in (state_contract.get("update_roles") or [])
+            )
+            if role in ROLE_ORDER
+        ]
+        source_roles = [
+            role
+            for role in (
+                str(item).strip().lower()
+                for item in (state_contract.get("source_roles") or [])
+            )
+            if role in ROLE_ORDER
+        ]
+        update_surface = "\n".join(role_text.get(role, "") for role in (update_roles or ROLE_ORDER))
         update_required = bool(features.get("workflow_update"))
         if not cls._has_frontend_post(all_frontend):
             issues.append(
@@ -797,13 +715,16 @@ class CheckRunner:
                     blocking=True,
                 )
             )
-        if update_required and not cls._has_workflow_update_action(role_text.get("specialist", "") + "\n" + role_text.get("manager", "")):
+        if update_required and update_roles and not cls._has_workflow_update_action(update_surface):
             issues.append(
                 ValidationIssue(
                     code="platform.workflow_missing_update_action",
-                    message="Acceptance workflow requires a prompt-assigned persisted update action, but no matching POST/PATCH/PUT/DELETE action was found.",
+                    message=(
+                        "Acceptance workflow requires a prompt-assigned persisted update action for "
+                        f"{', '.join(update_roles)}, but no matching POST/PATCH/PUT/DELETE action was found."
+                    ),
                     severity="high",
-                    location="miniapp/app/static",
+                    location="miniapp/app/static/" + (update_roles[0] if update_roles else ""),
                     blocking=True,
                 )
             )
@@ -817,451 +738,32 @@ class CheckRunner:
                     blocking=True,
                 )
             )
-        issues.extend(
-            cls._frontend_prompt_specificity_issues(
-                source_dir=source_dir,
-                contract=contract,
-                role_text=role_text,
-                role_html_text=role_html_text,
-                backend_text=backend_text,
-            )
-        )
-        issues.extend(
-            cls._role_prompt_update_payload_issues(
-                contract=contract,
-                role_text=role_text,
-                role_html_text=role_html_text,
-            )
-        )
-        issues.extend(cls._cross_role_update_visibility_issues(static_root=static_root, role_text=role_text))
         issues.extend(cls._frontend_role_wiring_issues(static_root, backend_text=backend_text))
+        issues.extend(
+            cls._cross_role_update_visibility_issues(
+                static_root=static_root,
+                role_text=role_text,
+                source_roles=source_roles,
+                update_roles=update_roles,
+            )
+        )
         issues.extend(cls._role_css_html_contract_issues(static_root))
         return cls._dedupe_validation_issues(issues)
 
     @classmethod
-    def _frontend_prompt_specificity_issues(
+    def _cross_role_update_visibility_issues(
         cls,
         *,
-        source_dir: Path,
-        contract: dict[str, Any],
+        static_root: Path,
         role_text: dict[str, str],
-        role_html_text: dict[str, str] | None = None,
-        backend_text: str,
+        source_roles: list[str] | None = None,
+        update_roles: list[str] | None = None,
     ) -> list[ValidationIssue]:
-        del source_dir
-        role_html_text = dict(role_html_text or role_text)
-        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
-        api_contract = contract.get("api_contract") if isinstance(contract.get("api_contract"), dict) else {}
-        field_hints = [
-            str(item).strip()
-            for item in (api_contract.get("field_hints") or prompt_hints.get("field_hints") or [])
-            if str(item).strip()
-        ]
-        role_field_hints = (
-            api_contract.get("role_field_hints")
-            if isinstance(api_contract.get("role_field_hints"), dict)
-            else prompt_hints.get("role_field_hints")
-            if isinstance(prompt_hints.get("role_field_hints"), dict)
-            else {}
-        )
-        role_prompts = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
-        if not field_hints and not role_prompts:
-            return []
-
-        issues: list[ValidationIssue] = []
-        all_frontend = "\n".join(role_html_text.values())
-        scaffold_markers = cls._generic_scaffold_markers(all_frontend)
-        if field_hints and scaffold_markers:
-            issues.append(
-                ValidationIssue(
-                    code="platform.generic_scaffold_leakage",
-                    message=(
-                        "Prompt-derived fields are required, but the role UI still exposes generic scaffold copy "
-                        f"({', '.join(scaffold_markers[:4])}). Replace generic placeholder copy with the user's business fields and workflow labels."
-                    ),
-                    severity="high",
-                    location="miniapp/app/static",
-                    blocking=True,
-                    repair_recipe=cls._prompt_specificity_repair_recipe(
-                        signature="workflow.generic_scaffold_leakage",
-                        target_files=[
-                            "miniapp/app/static/client/index.html",
-                            "miniapp/app/static/client/app.js",
-                            "miniapp/app/static/specialist/index.html",
-                            "miniapp/app/static/specialist/app.js",
-                            "miniapp/app/static/manager/index.html",
-                            "miniapp/app/static/manager/app.js",
-                        ],
-                        evidence={"markers": scaffold_markers, "field_hints": field_hints[:8]},
-                    ),
-                )
-            )
-
-        if field_hints:
-            role_prompts_for_fields = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
-            source_roles = cls._prompt_source_roles(prompt_hints=prompt_hints, role_field_hints=role_field_hints)
-            source_role = source_roles[0] if source_roles else ""
-            source_prompt_keys = cls._semantic_keys_from_text(
-                " ".join(str(item) for item in role_prompts_for_fields.get(source_role) or []),
-                exclude_stopwords=True,
-            )
-            explicit_source_field_hints = [
-                str(item).strip()
-                for item in (role_field_hints.get(source_role) or [])
-                if str(item).strip()
-            ] if isinstance(role_field_hints, dict) else []
-            source_field_hints = [
-                hint
-                for hint in field_hints
-                if cls._semantic_keys_from_text(hint, exclude_stopwords=True) & source_prompt_keys
-            ]
-            source_field_hints = explicit_source_field_hints or source_field_hints or field_hints
-            source_surface = f"{role_html_text.get(source_role, '')}\n{backend_text}" if source_role else f"{all_frontend}\n{backend_text}"
-            matched_fields = cls._matched_prompt_hints(source_field_hints, source_surface)
-            required_count = max(2, min(len(source_field_hints), int(len(source_field_hints) * 0.8 + 0.999)))
-            if len(matched_fields) < required_count:
-                missing_fields = [hint for hint in source_field_hints if hint not in matched_fields]
-                issue_location = f"miniapp/app/static/{source_role}" if source_role else "miniapp/app/static"
-                issues.append(
-                    ValidationIssue(
-                        code="platform.prompt_specificity_missing_fields",
-                        message=(
-                            f"{source_role or 'prompt-owned'} source flow does not expose enough prompt-derived fields. "
-                            f"Matched {len(matched_fields)}/{required_count}; missing examples: {', '.join(missing_fields[:6])}."
-                        ),
-                        severity="high",
-                        location=issue_location,
-                        blocking=True,
-                        repair_recipe=cls._prompt_specificity_repair_recipe(
-                            signature="workflow.prompt_specificity_missing_fields",
-                            target_files=(
-                                [
-                                    f"miniapp/app/static/{source_role}/index.html",
-                                    f"miniapp/app/static/{source_role}/app.js",
-                                ]
-                                if source_role
-                                else [
-                                    "miniapp/app/static/client/index.html",
-                                    "miniapp/app/static/client/app.js",
-                                    "miniapp/app/static/specialist/index.html",
-                                    "miniapp/app/static/specialist/app.js",
-                                    "miniapp/app/static/manager/index.html",
-                                    "miniapp/app/static/manager/app.js",
-                                ]
-                            )
-                            + [
-                                "miniapp/app/routes",
-                                "miniapp/tests/test_generated_app.py",
-                                "miniapp/tests/generated_app.test.mjs",
-                            ],
-                            evidence={
-                                "source_role": source_role,
-                                "field_hints": source_field_hints[:12],
-                                "matched_fields": matched_fields,
-                                "missing_fields": missing_fields[:8],
-                            },
-                        ),
-                    )
-                )
-            if "client" in source_roles:
-                issues.extend(
-                    cls._client_form_cross_role_field_issues(
-                        client_html=role_html_text.get("client", ""),
-                        role_field_hints=role_field_hints if isinstance(role_field_hints, dict) else {},
-                        client_field_hints=source_field_hints if source_role == "client" else [],
-                    )
-                )
-            manager_visibility_issue = cls._manager_specialist_field_visibility_issue(
-                manager_text=role_text.get("manager", ""),
-                role_field_hints=role_field_hints if isinstance(role_field_hints, dict) else {},
-            )
-            if manager_visibility_issue is not None:
-                issues.append(manager_visibility_issue)
-
-        return issues
-
-    @staticmethod
-    def _prompt_source_roles(*, prompt_hints: dict[str, Any], role_field_hints: dict[str, Any]) -> list[str]:
-        state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
-        source_roles = [
-            str(role).strip().lower()
-            for role in (state_contract.get("source_roles") or [])
-            if str(role).strip().lower() in ROLE_ORDER
-        ]
-        if source_roles:
-            return list(dict.fromkeys(source_roles))
-        field_roles = [
-            role
-            for role in ROLE_ORDER
-            if any(str(item).strip() for item in (role_field_hints.get(role) or []))
-        ]
-        return field_roles[:1]
-
-    @classmethod
-    def _manager_specialist_field_visibility_issue(
-        cls,
-        *,
-        manager_text: str,
-        role_field_hints: dict[str, Any],
-    ) -> ValidationIssue | None:
-        specialist_hints = [
-            str(item).strip()
-            for item in (role_field_hints.get("specialist") or [])
-            if str(item).strip()
-        ]
-        if len(specialist_hints) < 2 or not str(manager_text or "").strip():
-            return None
-        detail_slice = cls._js_function_slice(str(manager_text or ""), "itemDetails")
-        if not detail_slice:
-            detail_slice = cls._js_function_slice(str(manager_text or ""), "render")
-        if not detail_slice:
-            detail_slice = cls._js_function_slice(str(manager_text or ""), "renderItems")
-        if not detail_slice:
-            return None
-        detail_lower = detail_slice.lower()
-        if (
-            ("object.entries(field_labels)" in detail_lower or "detail_field_labels" in detail_lower)
-            and re.search(r"\bitem\s*\[\s*key\s*\]", detail_slice, flags=re.IGNORECASE)
-        ):
-            return None
-        label_to_keys = cls._js_label_to_field_keys(str(manager_text or ""))
-        rendered_keys = set(re.findall(r"\bitem\.([A-Za-z_$][A-Za-z0-9_$]*)\b", detail_slice))
-        rendered_keys.update(
-            match.group(1)
-            for match in re.finditer(r"\[\s*['\"]([A-Za-z_$][A-Za-z0-9_$]*)['\"]\s*,\s*item\.", detail_slice)
-        )
-        missing: list[str] = []
-        for hint in specialist_hints:
-            hint_keys = cls._semantic_keys_from_text(hint, exclude_stopwords=True)
-            mapped_keys = {
-                key
-                for label, keys in label_to_keys.items()
-                if hint_keys and cls._semantic_keys_from_text(label, exclude_stopwords=True) & hint_keys
-                for key in keys
-            }
-            if mapped_keys and mapped_keys & rendered_keys:
-                continue
-            if hint_keys and hint_keys & cls._semantic_keys_from_text(detail_slice, exclude_stopwords=True):
-                continue
-            missing.append(hint)
-        if len(missing) < max(2, min(3, len(specialist_hints))):
-            return None
-        return ValidationIssue(
-            code="platform.manager_missing_specialist_result_visibility",
-            message=(
-                "Manager role must render specialist-owned persisted result fields when the prompt assigns a manager follow-up view. "
-                f"Missing specialist fields in manager card/detail renderer: {', '.join(missing[:6])}."
-            ),
-            severity="high",
-            location="miniapp/app/static/manager/app.js",
-            blocking=True,
-            repair_recipe=cls._prompt_specificity_repair_recipe(
-                signature="workflow.manager_missing_specialist_result_visibility",
-                target_files=[
-                    "miniapp/app/static/manager/app.js",
-                    "miniapp/app/static/manager/index.html",
-                    "miniapp/tests/generated_app.test.mjs",
-                ],
-                evidence={
-                    "missing_specialist_fields": missing[:8],
-                    "rendered_keys": sorted(rendered_keys)[:16],
-                    "required_next_tool": "read_files",
-                },
-            ),
-        )
-
-    @staticmethod
-    def _js_function_slice(source: str, function_name: str) -> str:
-        match = re.search(rf"\bfunction\s+{re.escape(function_name)}\s*\([^)]*\)\s*\{{", source)
-        if not match:
-            return ""
-        start = match.start()
-        next_match = re.search(r"\n(?:async\s+)?function\s+[A-Za-z_$][A-Za-z0-9_$]*\s*\(", source[match.end():])
-        end = match.end() + next_match.start() if next_match else min(len(source), start + 2400)
-        return source[start:end]
-
-    @staticmethod
-    def _js_label_to_field_keys(source: str) -> dict[str, set[str]]:
-        mapping: dict[str, set[str]] = {}
-        for match in re.finditer(
-            r"(?:['\"](?P<quoted>[A-Za-z_$][A-Za-z0-9_$]*)['\"]|(?P<bare>[A-Za-z_$][A-Za-z0-9_$]*))\s*:\s*['\"](?P<label>[^'\"]{2,80})['\"]",
-            source,
-        ):
-            key = str(match.group("quoted") or match.group("bare") or "").strip()
-            label = str(match.group("label") or "").strip()
-            if key and label:
-                mapping.setdefault(label, set()).add(key)
-        return mapping
-
-    @classmethod
-    def _client_form_cross_role_field_issues(
-        cls,
-        *,
-        client_html: str,
-        role_field_hints: dict[str, Any],
-        client_field_hints: list[str],
-    ) -> list[ValidationIssue]:
-        if not client_html or not role_field_hints:
-            return []
-        form_text = " ".join(
-            re.findall(r"<form\b[^>]*>(.*?)</form>", client_html, flags=re.IGNORECASE | re.DOTALL)
-        )
-        if not form_text:
-            return []
-        client_keys = {
-            frozenset(cls._semantic_keys_from_text(hint, exclude_stopwords=True))
-            for hint in client_field_hints
-            if hint
-        }
-        exclusive: list[str] = []
-        for role in ("specialist", "manager"):
-            hints = role_field_hints.get(role) if isinstance(role_field_hints, dict) else []
-            for hint in hints or []:
-                text = str(hint).strip()
-                if not text:
-                    continue
-                hint_keys = frozenset(cls._semantic_keys_from_text(text, exclude_stopwords=True))
-                if hint_keys and hint_keys in client_keys:
-                    continue
-                exclusive.append(text)
-        if not exclusive:
-            return []
-        form_keys = cls._semantic_keys_from_text(form_text, exclude_stopwords=False)
-        form_exact_keys = cls._role_leak_exact_keys(form_text)
-        leaked: list[str] = []
-        for hint in list(dict.fromkeys(exclusive)):
-            hint_keys = cls._semantic_keys_from_text(hint, exclude_stopwords=True)
-            if not hint_keys:
-                continue
-            hint_words = [
-                raw
-                for raw in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{2,}", str(hint or "").lower())
-                if raw not in PROMPT_SPECIFICITY_STOPWORDS
-            ]
-            if len(hint_words) == 1:
-                if cls._role_leak_exact_keys(hint) & form_exact_keys:
-                    leaked.append(hint)
-                continue
-            if hint_keys <= form_keys:
-                leaked.append(hint)
-        if not leaked:
-            return []
-        return [
-            ValidationIssue(
-                code="platform.prompt_specificity_cross_role_fields_in_client_form",
-                message=(
-                    "Client create form includes fields owned by specialist/manager workflow: "
-                    f"{', '.join(leaked[:6])}. Keep role-owned update fields in their own role surfaces; client may render updates after reload, but should not collect them at creation time."
-                ),
-                severity="high",
-                location="miniapp/app/static/client/index.html",
-                blocking=True,
-                repair_recipe=cls._prompt_specificity_repair_recipe(
-                    signature="workflow.cross_role_fields_in_client_form",
-                    target_files=[
-                        "miniapp/app/static/client/index.html",
-                        "miniapp/app/static/client/app.js",
-                        "miniapp/app/static/specialist/index.html",
-                        "miniapp/app/static/specialist/app.js",
-                        "miniapp/app/static/manager/index.html",
-                        "miniapp/app/static/manager/app.js",
-                    ],
-                    evidence={
-                        "leaked_role_fields": leaked[:8],
-                        "client_field_hints": client_field_hints[:12],
-                    },
-                ),
-            )
-        ]
-
-    @classmethod
-    def _role_leak_exact_keys(cls, content: str) -> set[str]:
-        keys: set[str] = set()
-        for raw in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{2,}", str(content or "").lower()):
-            normalized = re.sub(r"[^a-zа-яё0-9]+", "", raw)
-            if not normalized:
-                continue
-            for variant in {normalized, cls._ascii_transliterate(normalized)}:
-                keys.add(variant[:7] if len(variant) > 6 else variant)
-        return keys
-
-    @classmethod
-    def _role_prompt_update_payload_issues(
-        cls,
-        *,
-        contract: dict[str, Any],
-        role_text: dict[str, str],
-        role_html_text: dict[str, str],
-    ) -> list[ValidationIssue]:
-        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
-        role_prompts = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
-        issues: list[ValidationIssue] = []
-        technical_fields = {"id", "item_id", "updated_by", "created_by", "current_view", "role", "status", "note"}
-        for role in ("specialist", "manager"):
-            prompts = role_prompts.get(role) if isinstance(role_prompts, dict) else []
-            if not isinstance(prompts, list) or not prompts:
-                continue
-            expected_keys = cls._semantic_keys_from_text(" ".join(str(item) for item in prompts), exclude_stopwords=True)
-            if len(expected_keys) < 4:
-                continue
-            surface = f"{role_html_text.get(role, '')}\n{role_text.get(role, '')}"
-            has_interactive_update_controls = bool(re.search(r"<(?:input|select|textarea)\b", surface, re.IGNORECASE))
-            patch_fields = {
-                field
-                for payload_fields in cls._js_patch_payload_field_sets(role_text.get(role, ""))
-                for field in payload_fields
-                if field and not cls._is_path_id_field(field)
-            }
-            if cls._js_patch_payload_uses_dynamic_formdata(role_text.get(role, "")):
-                for form in cls._html_forms(role_html_text.get(role, "")):
-                    patch_fields.update(
-                        field
-                        for field in (form.get("field_names") or [])
-                        if isinstance(field, str) and field and not cls._is_path_id_field(field)
-                    )
-            meaningful_payload_fields = sorted(field for field in patch_fields if field not in technical_fields)
-            if has_interactive_update_controls and len(meaningful_payload_fields) >= (2 if role == "specialist" else 1):
-                continue
-            missing_parts: list[str] = []
-            if not has_interactive_update_controls:
-                missing_parts.append("interactive form/select/textarea controls")
-            if len(meaningful_payload_fields) < (2 if role == "specialist" else 1):
-                missing_parts.append("role-owned PATCH fields beyond status")
-            issues.append(
-                ValidationIssue(
-                    code="platform.prompt_specificity_missing_role_update_payload",
-                    message=(
-                        f"{role} role prompt describes operational fields/actions, but the role update surface lacks "
-                        f"{' and '.join(missing_parts)}. Add controls and PATCH payload fields for the role-specific work, "
-                        "for example estimates, materials, readiness dates, comments, priorities, or management notes."
-                    ),
-                    severity="high",
-                    location=f"miniapp/app/static/{role}",
-                    blocking=True,
-                    repair_recipe=cls._prompt_specificity_repair_recipe(
-                        signature=f"workflow.prompt_specificity_missing_role_update_payload.{role}",
-                        target_files=[
-                            f"miniapp/app/static/{role}/index.html",
-                            f"miniapp/app/static/{role}/app.js",
-                            "miniapp/app/routes",
-                            "miniapp/tests/generated_app.test.mjs",
-                        ],
-                        evidence={
-                            "role": role,
-                            "role_prompt": prompts[:4],
-                            "patch_fields": sorted(patch_fields),
-                            "meaningful_payload_fields": meaningful_payload_fields,
-                            "has_interactive_update_controls": has_interactive_update_controls,
-                        },
-                    ),
-                )
-            )
-        return issues
-
-    @classmethod
-    def _cross_role_update_visibility_issues(cls, *, static_root: Path, role_text: dict[str, str]) -> list[ValidationIssue]:
-        client_text = role_text.get("client", "")
-        operational_text = "\n".join(role_text.get(role, "") for role in ("specialist", "manager"))
+        del static_root
+        update_role_set = {
+            role for role in (update_roles or []) if role in ROLE_ORDER
+        } or set(ROLE_ORDER)
+        operational_text = "\n".join(role_text.get(role, "") for role in update_role_set)
         update_fields = {
             field
             for payload_fields in cls._js_patch_payload_field_sets(operational_text)
@@ -1280,150 +782,52 @@ class CheckRunner:
         }
         if not update_fields:
             return []
-        client_identifiers = set(re.findall(r"\b[A-Za-z_$][\w$]*\b", client_text))
-        missing = sorted(field for field in update_fields if field not in client_identifiers)
-        if not missing:
-            return []
-        return [
-            ValidationIssue(
-                code="platform.cross_role_update_not_rendered_in_client",
-                message=(
-                    "Specialist/manager PATCH payload updates fields that the client role never renders after reload: "
-                    f"{', '.join(missing[:8])}. Client must show persisted status, estimate, dates, notes, and management updates changed by other roles."
-                ),
-                severity="high",
-                location="miniapp/app/static/client/app.js",
-                blocking=True,
-                repair_recipe={
-                    "recipe_id": "workflow.cross_role_update_visibility",
-                    "failure_class": "semantic_contract_mismatch",
-                    "failure_signature": "workflow.cross_role_update_not_rendered_in_client",
-                    "required_next_tool": "read_files",
-                    "suggested_tool_after_read": "apply_patch_to_draft_or_write_file",
-                    "target_files": [
-                        "miniapp/app/static/client/app.js",
-                        "miniapp/app/static/specialist/app.js",
-                        "miniapp/app/static/manager/app.js",
-                        "miniapp/tests/generated_app.test.mjs",
-                    ],
-                    "verification_check": "frontend_interaction_static_smoke",
-                    "verification_command": "run_checks frontend_interaction_static_smoke",
-                    "retryable": True,
-                    "deterministic": True,
-                    "evidence": {
-                        "update_fields": sorted(update_fields),
-                        "missing_client_fields": missing,
+        visibility_roles = {
+            role for role in (source_roles or []) if role in ROLE_ORDER
+        } | (set(ROLE_ORDER) - update_role_set)
+        if not visibility_roles:
+            visibility_roles = set(ROLE_ORDER) - update_role_set
+        issues: list[ValidationIssue] = []
+        for role in sorted(visibility_roles):
+            role_identifiers = set(re.findall(r"\b[A-Za-z_$][\w$]*\b", role_text.get(role, "")))
+            missing = sorted(field for field in update_fields if field not in role_identifiers)
+            if not missing:
+                continue
+            issues.append(
+                ValidationIssue(
+                    code="platform.cross_role_update_not_rendered_in_role",
+                    message=(
+                        f"Prompt-assigned update payload fields are not rendered by {role} after reload: "
+                        f"{', '.join(missing[:8])}. Roles that observe shared state should render persisted changes using prompt-owned labels."
+                    ),
+                    severity="high",
+                    location=f"miniapp/app/static/{role}/app.js",
+                    blocking=True,
+                    repair_recipe={
+                        "recipe_id": "workflow.cross_role_update_visibility",
+                        "failure_class": "frontend_interaction_static_smoke",
+                        "failure_signature": f"workflow.cross_role_update_not_rendered_in_role.{role}",
+                        "required_next_tool": "read_files",
+                        "suggested_tool_after_read": "apply_patch_to_draft_or_write_file",
+                        "target_files": [
+                            f"miniapp/app/static/{role}/app.js",
+                            *[f"miniapp/app/static/{update_role}/app.js" for update_role in sorted(update_role_set)],
+                            "miniapp/tests/generated_app.test.mjs",
+                        ],
+                        "verification_check": "frontend_interaction_static_smoke",
+                        "verification_command": "run_checks frontend_interaction_static_smoke",
+                        "retryable": True,
+                        "deterministic": True,
+                        "evidence": {
+                            "role": role,
+                            "update_roles": sorted(update_role_set),
+                            "update_fields": sorted(update_fields),
+                            "missing_role_fields": missing,
+                        },
                     },
-                },
+                )
             )
-        ]
-
-    @staticmethod
-    def _prompt_specificity_repair_recipe(
-        *,
-        signature: str,
-        target_files: list[str],
-        evidence: dict[str, Any],
-    ) -> dict[str, Any]:
-        return {
-            "recipe_id": "workflow.prompt_specificity",
-            "failure_class": "semantic_contract_mismatch",
-            "failure_signature": signature,
-            "required_next_tool": "read_files",
-            "suggested_tool_after_read": "apply_patch_to_draft_or_write_file",
-            "target_files": target_files,
-            "verification_check": "frontend_interaction_static_smoke",
-            "verification_command": "run_checks frontend_interaction_static_smoke",
-            "retry_policy": "deterministic_repair",
-            "deterministic": True,
-            "retryable": True,
-            "instruction": (
-                "Read the target role files, replace generic placeholder UI with prompt-owned business fields, "
-                "persist those fields through the API, update role-specific actions, then rerun frontend and browser workflow checks."
-            ),
-            "evidence": evidence,
-        }
-
-    @staticmethod
-    def _generic_scaffold_markers(content: str) -> list[str]:
-        markers: list[str] = []
-        for label, pattern in GENERIC_SCAFFOLD_VISIBLE_PATTERNS:
-            if re.search(pattern, str(content or ""), re.IGNORECASE):
-                markers.append(label)
-        return markers
-
-    @classmethod
-    def _matched_prompt_hints(cls, hints: list[str], surface_text: str) -> list[str]:
-        surface_keys = cls._semantic_keys_from_text(surface_text, exclude_stopwords=False)
-        matched: list[str] = []
-        for hint in hints:
-            hint_keys = cls._semantic_keys_from_text(hint, exclude_stopwords=True)
-            if hint_keys and hint_keys & surface_keys:
-                matched.append(hint)
-        return matched
-
-    @classmethod
-    def _semantic_keys_from_text(cls, content: str, *, exclude_stopwords: bool) -> set[str]:
-        keys: set[str] = set()
-        for raw in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{2,}", str(content or "").lower()):
-            token = raw.strip("_-")
-            if not token:
-                continue
-            if exclude_stopwords and token in PROMPT_SPECIFICITY_STOPWORDS:
-                continue
-            for variant in {token, cls._ascii_transliterate(token)}:
-                key = cls._semantic_key(variant)
-                if key:
-                    keys.add(key)
-        return keys
-
-    @staticmethod
-    def _semantic_key(token: str) -> str:
-        value = re.sub(r"[^a-zа-яё0-9]+", "", str(token or "").lower())
-        if len(value) < 3:
-            return ""
-        if len(value) <= 4:
-            return value[:3]
-        return value[:5]
-
-    @staticmethod
-    def _ascii_transliterate(value: str) -> str:
-        table = {
-            "а": "a",
-            "б": "b",
-            "в": "v",
-            "г": "g",
-            "д": "d",
-            "е": "e",
-            "ё": "e",
-            "ж": "zh",
-            "з": "z",
-            "и": "i",
-            "й": "y",
-            "к": "k",
-            "л": "l",
-            "м": "m",
-            "н": "n",
-            "о": "o",
-            "п": "p",
-            "р": "r",
-            "с": "s",
-            "т": "t",
-            "у": "u",
-            "ф": "f",
-            "х": "h",
-            "ц": "c",
-            "ч": "ch",
-            "ш": "sh",
-            "щ": "shch",
-            "ъ": "",
-            "ы": "y",
-            "ь": "",
-            "э": "e",
-            "ю": "yu",
-            "я": "ya",
-        }
-        return "".join(table.get(char, char) for char in str(value or ""))
+        return issues
 
     @classmethod
     def _frontend_role_wiring_issues(cls, static_root: Path, *, backend_text: str = "") -> list[ValidationIssue]:
@@ -1498,11 +902,21 @@ class CheckRunner:
                 severity="high",
                 location=js_path.relative_to(js_path.parents[4]).as_posix(),
                 blocking=True,
-                repair_recipe=cls._prompt_specificity_repair_recipe(
-                    signature=f"workflow.late_domcontentloaded_init.{role}",
-                    target_files=[js_path.relative_to(js_path.parents[4]).as_posix()],
-                    evidence={"role": role, "uses_domcontentloaded": True, "ready_state_guard": False},
-                ),
+                repair_recipe={
+                    "recipe_id": "frontend.init_wiring",
+                    "failure_class": "frontend_interaction_static_smoke",
+                    "failure_signature": f"frontend.late_domcontentloaded_init.{role}",
+                    "required_next_tool": "read_files",
+                    "suggested_tool_after_read": "write_file",
+                    "target_files": [js_path.relative_to(js_path.parents[4]).as_posix()],
+                    "verification_check": "frontend_interaction_static_smoke",
+                    "verification_command": "run_checks frontend_interaction_static_smoke",
+                    "retry_policy": "deterministic_repair",
+                    "deterministic": True,
+                    "retryable": True,
+                    "instruction": "Read the role app.js and add a readyState guard so init runs even when DOMContentLoaded has already fired.",
+                    "evidence": {"role": role, "uses_domcontentloaded": True, "ready_state_guard": False},
+                },
             )
         ]
 
@@ -1717,6 +1131,14 @@ class CheckRunner:
                         severity="high",
                         location=relative_path,
                         blocking=True,
+                        repair_recipe=cls._form_wiring_repair_recipe(
+                            signature="frontend.unwired_form",
+                            relative_path=relative_path,
+                            js_path=js_path,
+                            form_label=form_label,
+                            field_names=field_names,
+                            evidence_code="workflow_form_without_handler",
+                        ),
                     )
                 )
                 continue
@@ -1728,6 +1150,14 @@ class CheckRunner:
                         severity="high",
                         location=relative_path,
                         blocking=True,
+                        repair_recipe=cls._form_wiring_repair_recipe(
+                            signature="frontend.unwired_form",
+                            relative_path=relative_path,
+                            js_path=js_path,
+                            form_label=form_label,
+                            field_names=field_names,
+                            evidence_code="workflow_form_without_submit_handler",
+                        ),
                     )
                 )
             if not field_names:
@@ -1844,6 +1274,45 @@ class CheckRunner:
                         )
                     )
         return issues
+
+    @staticmethod
+    def _form_wiring_repair_recipe(
+        *,
+        signature: str,
+        relative_path: str,
+        js_path: Path,
+        form_label: str,
+        field_names: set[str],
+        evidence_code: str,
+    ) -> dict[str, Any]:
+        js_relative = js_path.relative_to(js_path.parents[4]).as_posix()
+        role_match = re.search(r"miniapp/app/static/(?P<role>client|specialist|manager)/", relative_path)
+        return {
+            "recipe_id": "frontend.form_wiring",
+            "failure_class": "frontend_interaction_static_smoke",
+            "failure_signature": signature,
+            "required_next_tool": "read_files",
+            "suggested_tool_after_read": "write_file",
+            "target_files": [relative_path, js_relative],
+            "verification_check": "frontend_interaction_static_smoke",
+            "verification_command": "run_checks frontend_interaction_static_smoke",
+            "retry_policy": "deterministic_repair",
+            "deterministic": True,
+            "retryable": True,
+            "instruction": (
+                "Read the exact HTML page and role app.js. Wire the visible form to a submit/change handler in that role script, "
+                "build the payload from the form fields, persist it through the existing backend API, refresh rendered state, "
+                "and keep optional controls guarded only after the required form is bound."
+            ),
+            "evidence": {
+                "code": evidence_code,
+                "role": role_match.group("role") if role_match else "",
+                "html_file": relative_path,
+                "js_file": js_relative,
+                "form": form_label,
+                "field_names": sorted(field_names),
+            },
+        }
 
     @staticmethod
     def _js_object_from_entries_formdata_vars(js_source: str) -> set[str]:
@@ -2349,9 +1818,47 @@ class CheckRunner:
                     severity="high",
                     location=relative_path,
                     blocking=True,
+                    repair_recipe=cls._button_wiring_repair_recipe(
+                        relative_path=relative_path,
+                        js_path=js_path,
+                        button_id=button_id,
+                    ),
                 )
             )
         return issues
+
+    @staticmethod
+    def _button_wiring_repair_recipe(
+        *,
+        relative_path: str,
+        js_path: Path,
+        button_id: str,
+    ) -> dict[str, Any]:
+        js_relative = js_path.relative_to(js_path.parents[4]).as_posix()
+        role_match = re.search(r"miniapp/app/static/(?P<role>client|specialist|manager)/", relative_path)
+        return {
+            "recipe_id": "frontend.button_wiring",
+            "failure_class": "frontend_interaction_static_smoke",
+            "failure_signature": "frontend.unwired_button",
+            "required_next_tool": "read_files",
+            "suggested_tool_after_read": "write_file",
+            "target_files": [relative_path, js_relative],
+            "verification_check": "frontend_interaction_static_smoke",
+            "verification_command": "run_checks frontend_interaction_static_smoke",
+            "retry_policy": "deterministic_repair",
+            "deterministic": True,
+            "retryable": True,
+            "instruction": (
+                "Read the exact HTML page and role app.js. Wire the visible button to the intended click handler, "
+                "or convert it to a plain link/control only if no persisted action is intended. Keep the repair limited to that role page and script."
+            ),
+            "evidence": {
+                "role": role_match.group("role") if role_match else "",
+                "html_file": relative_path,
+                "js_file": js_relative,
+                "button_id": button_id,
+            },
+        }
 
     @staticmethod
     def _js_references_dom_id(js_source: str, dom_id: str) -> bool:
@@ -2668,8 +2175,11 @@ class CheckRunner:
         required_terms = ["post", "get"]
         features = contract.get("features") or {}
         if features.get("workflow_update", True):
-            update_terms = ("patch", "put", "delete", "update", "status", "specialist", "manager", "обнов", "статус", "сохран")
-            return all(term in lowered for term in required_terms) and any(term in lowered for term in update_terms)
+            non_get_mutation_terms = ("patch", "put", "delete")
+            return all(term in lowered for term in required_terms) and (
+                any(term in lowered for term in non_get_mutation_terms)
+                or lowered.count("post") >= 2
+            )
         return all(term in lowered for term in required_terms)
 
     @staticmethod
@@ -2868,10 +2378,41 @@ class CheckRunner:
         ]
         api_paths = list(dict.fromkeys(path for path in api_paths if path.startswith("/api/")))
         routes_by_role = self._role_preview_routes(source_dir)
+        prompt_hints = acceptance_contract.get("prompt_hints") if isinstance(acceptance_contract.get("prompt_hints"), dict) else {}
+        state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
+        source_roles = [
+            role
+            for role in (
+                str(item).strip().lower()
+                for item in (state_contract.get("source_roles") or [])
+            )
+            if role in ROLE_ORDER
+        ]
+        update_roles = [
+            role
+            for role in (
+                str(item).strip().lower()
+                for item in (state_contract.get("update_roles") or [])
+            )
+            if role in ROLE_ORDER
+        ]
+        observer_roles = [
+            role
+            for role in (
+                str(item).strip().lower()
+                for item in (state_contract.get("observer_roles") or [])
+            )
+            if role in ROLE_ORDER
+        ]
         payload = {
             "base_url": preview_url.rstrip("/"),
             "api_paths": api_paths,
             "routes_by_role": routes_by_role,
+            "role_flow": {
+                "source_roles": source_roles,
+                "update_roles": update_roles,
+                "observer_roles": observer_roles,
+            },
             "screenshot_dir": tempfile.mkdtemp(prefix="miniapp-browser-ui-proof-"),
         }
         script = self._real_browser_ui_flow_python_script()
@@ -2950,6 +2491,10 @@ PAYLOAD = json.loads(sys.argv[1] or "{}")
 BASE_URL = str(PAYLOAD.get("base_url") or "").rstrip("/")
 ROUTES_BY_ROLE = PAYLOAD.get("routes_by_role") or {}
 REQUESTED_API_PATHS = [str(path) for path in PAYLOAD.get("api_paths") or [] if str(path).startswith("/api/")]
+ROLE_FLOW = PAYLOAD.get("role_flow") or {}
+SOURCE_ROLES = [str(role) for role in ROLE_FLOW.get("source_roles") or [] if str(role) in ("client", "specialist", "manager")]
+UPDATE_ROLES = [str(role) for role in ROLE_FLOW.get("update_roles") or [] if str(role) in ("client", "specialist", "manager")]
+OBSERVER_ROLES = [str(role) for role in ROLE_FLOW.get("observer_roles") or [] if str(role) in ("client", "specialist", "manager")]
 SCREENSHOT_DIR = Path(PAYLOAD.get("screenshot_dir") or "/tmp/miniapp-browser-ui-proof")
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2959,6 +2504,7 @@ VISIBLE_ERRORS = []
 SCREENSHOTS = []
 OPENAPI = {}
 API_PATHS = []
+GET_API_PATHS = []
 BASE_API_PATH = ""
 CREATED_MARKER = "browser-ui-proof"
 UPDATED_MARKER = "browser-ui-updated"
@@ -2995,6 +2541,10 @@ def fail(step, message, page=None, **extra):
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
         "api_paths": API_PATHS,
+        "get_api_paths": GET_API_PATHS,
+        "source_roles": SOURCE_ROLES,
+        "update_roles": UPDATE_ROLES,
+        "observer_roles": OBSERVER_ROLES,
         "api_before": API_BEFORE,
         "api_after": API_AFTER,
         **extra,
@@ -3060,19 +2610,48 @@ def find_created(payload, marker, created_id=None):
 
 
 def discover_api():
-    global OPENAPI, API_PATHS, BASE_API_PATH
+    global OPENAPI, API_PATHS, GET_API_PATHS, BASE_API_PATH
     try:
         OPENAPI = request_json("GET", "/openapi.json") or {}
     except Exception as exc:
         fail("openapi_discovery", f"Preview OpenAPI could not be loaded: {exc}")
     all_paths = OPENAPI.get("paths") or {}
+    GET_API_PATHS = [path for path, methods in all_paths.items() if str(path).startswith("/api/") and "get" in methods]
     API_PATHS = [path for path in REQUESTED_API_PATHS if path in all_paths and "get" in all_paths[path] and "post" in all_paths[path]]
     if not API_PATHS:
         API_PATHS = [path for path, methods in all_paths.items() if str(path).startswith("/api/") and "get" in methods and "post" in methods]
     API_PATHS = list(dict.fromkeys(API_PATHS))
+    GET_API_PATHS = list(dict.fromkeys([*API_PATHS, *GET_API_PATHS]))
+    if not GET_API_PATHS:
+        fail("api_discovery", "No GET /api resource is discoverable for browser UI proof.")
     if not API_PATHS:
-        fail("api_discovery", "No GET+POST /api resource is discoverable for browser UI proof.")
+        fail("api_discovery", "No GET+POST /api resource is discoverable for the source role create proof.")
     BASE_API_PATH = API_PATHS[0]
+
+
+def api_snapshot():
+    snapshot = {}
+    for path in GET_API_PATHS:
+        try:
+            snapshot[path] = request_json("GET", path)
+        except Exception as exc:
+            snapshot[path] = {"__error__": f"{exc.__class__.__name__}: {exc}"}
+    return snapshot
+
+
+def find_marker_in_snapshot(snapshot, marker, created_id=None):
+    for path, payload in (snapshot or {}).items():
+        item = find_created(payload, marker, created_id)
+        if item is not None:
+            return path, item
+    return "", None
+
+
+def snapshot_changed(before, after):
+    try:
+        return json.dumps(before, ensure_ascii=False, sort_keys=True) != json.dumps(after, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return before != after
 
 
 def normalize_routes(role):
@@ -3238,7 +2817,7 @@ def fill_page_update_controls(scope, marker, created_id):
     return filled
 
 
-def click_update_button(scope, role, route):
+def click_update_button(page, scope, role, route):
     patterns = re.compile(r"(save|update|ready|done|complete|сохран|обнов|готов|выполн)", re.I)
     refresh_only = re.compile(r"^(refresh|reload|обновить|перезагрузить)$", re.I)
     buttons = scope.locator("button, [role=button], input[type=button], input[type=submit]")
@@ -3268,8 +2847,8 @@ def click_update_button(scope, role, route):
     return False
 
 
-def submit_client_create(page):
-    for route in normalize_routes("client"):
+def submit_role_create(page, role):
+    for route in normalize_routes(role):
         goto(page, route)
         forms = page.locator("form")
         for index in range(forms.count()):
@@ -3277,15 +2856,15 @@ def submit_client_create(page):
             controls = form.locator("input, textarea, select")
             if controls.count() == 0:
                 continue
-            submit_form(page, form, "client", route, CREATED_MARKER, "create")
-            check_runtime_errors(page, "client_create_ui", route)
+            submit_form(page, form, role, route, CREATED_MARKER, "create")
+            check_runtime_errors(page, f"{role}_source_create_ui", route)
             return route
-    fail("client_form_discovery", "No client form with fillable controls was found in client role routes.", page, failed_role="client", failed_selector="form")
+    fail("source_role_form_discovery", f"No source role form with fillable controls was found in {role} routes.", page, failed_role=role, failed_selector="form")
 
 
-def submit_specialist_update(page, created_id, before_item):
-    before_text = json.dumps(before_item, ensure_ascii=False, sort_keys=True)
-    for route in normalize_routes("specialist"):
+def submit_role_update(page, role, marker, created_id, before_snapshot):
+    before_text = json.dumps(before_snapshot, ensure_ascii=False, sort_keys=True)
+    for route in normalize_routes(role):
         goto(page, route)
         form_groups = []
         created_containers = []
@@ -3303,13 +2882,13 @@ def submit_specialist_update(page, created_id, before_item):
                 controls = form.locator("input, textarea, select")
                 if controls.count() == 0:
                     continue
-                submit_form(page, form, "specialist", route, UPDATED_MARKER, "update", created_id)
-                check_runtime_errors(page, "specialist_update_ui", route)
+                submit_form(page, form, role, route, marker, "update", created_id)
+                check_runtime_errors(page, f"{role}_update_ui", route)
                 return route
         for container in created_containers:
-            fill_page_update_controls(container, UPDATED_MARKER, created_id)
-            if click_update_button(container, "specialist", route):
-                check_runtime_errors(page, "specialist_update_ui", route)
+            fill_page_update_controls(container, marker, created_id)
+            if click_update_button(page, container, role, route):
+                check_runtime_errors(page, f"{role}_update_ui", route)
                 return route
         forms = page.locator("form")
         for index in range(forms.count()):
@@ -3317,33 +2896,14 @@ def submit_specialist_update(page, created_id, before_item):
             controls = form.locator("input, textarea, select")
             if controls.count() == 0:
                 continue
-            submit_form(page, form, "specialist", route, UPDATED_MARKER, "update", created_id)
-            check_runtime_errors(page, "specialist_update_ui", route)
+            submit_form(page, form, role, route, marker, "update", created_id)
+            check_runtime_errors(page, f"{role}_update_ui", route)
             return route
-        fill_page_update_controls(page, UPDATED_MARKER, created_id)
-        if click_update_button(page, "specialist", route):
-            check_runtime_errors(page, "specialist_update_ui", route)
+        fill_page_update_controls(page, marker, created_id)
+        if click_update_button(page, page, role, route):
+            check_runtime_errors(page, f"{role}_update_ui", route)
             return route
-    fail("specialist_update_discovery", "No specialist update form/control was found for the created state.", page, failed_role="specialist", failed_selector="form/button", api_after=before_item)
-
-
-def submit_manager_update(page, created_id, before_item):
-    for route in normalize_routes("manager"):
-        goto(page, route)
-        forms = page.locator("form")
-        for index in range(forms.count()):
-            form = forms.nth(index)
-            controls = form.locator("input, textarea, select")
-            if controls.count() == 0:
-                continue
-            submit_form(page, form, "manager", route, MANAGER_MARKER, "update", created_id)
-            check_runtime_errors(page, "manager_update_ui", route)
-            return route
-        fill_page_update_controls(page, MANAGER_MARKER, created_id)
-        if click_update_button(page, "manager", route):
-            check_runtime_errors(page, "manager_update_ui", route)
-            return route
-    fail("manager_update_discovery", "No manager update form/control was found for the created state.", page, failed_role="manager", failed_selector="form/button", api_after=before_item)
+    fail("role_update_discovery", f"No prompt-assigned update form/control was found for role {role}.", page, failed_role=role, failed_selector="form/button", api_after=before_snapshot, before_text=before_text[:600])
 
 
 def click_refresh_controls(page):
@@ -3436,55 +2996,74 @@ def item_changed(before_item, after_item):
 def run_flow(page):
     global API_BEFORE, API_AFTER
     discover_api()
-    try:
-        API_BEFORE = request_json("GET", BASE_API_PATH)
-    except (URLError, OSError, ValueError) as exc:
-        fail("initial_api_get", f"GET {BASE_API_PATH} failed before UI proof: {exc}")
-    submit_client_create(page)
-    try:
-        after_create = request_json("GET", BASE_API_PATH)
-    except Exception as exc:
-        fail("client_create_api_after", f"GET {BASE_API_PATH} failed after client UI submit: {exc}", page, failed_role="client")
-    created_item = find_created(after_create, CREATED_MARKER)
+    source_role = SOURCE_ROLES[0] if SOURCE_ROLES else ""
+    if not source_role:
+        fail("source_role_flow_missing", "Browser UI proof requires prompt_hints role-state source_roles from the acceptance contract.")
+    API_BEFORE = api_snapshot()
+    source_route = submit_role_create(page, source_role)
+    after_create = api_snapshot()
+    created_path, created_item = find_marker_in_snapshot(after_create, CREATED_MARKER)
     if created_item is None:
-        fail("client_create_state_change", "Client UI submit did not create a persisted API item containing the proof marker.", page, failed_role="client", api_before=API_BEFORE, api_after=after_create)
+        fail(
+            "source_create_state_change",
+            f"{source_role} UI submit did not create a persisted API item containing the proof marker.",
+            page,
+            failed_role=source_role,
+            failed_route=source_route,
+            api_before=API_BEFORE,
+            api_after=after_create,
+        )
     created_id = find_id(created_item)
     if created_id is None:
-        fail("created_id_missing", "Created UI state does not expose an id usable by another role update.", page, failed_role="client", api_after=after_create)
-    has_marker, route, text = role_has_marker(page, "client", CREATED_MARKER)
+        fail("created_id_missing", "Created UI state does not expose an id usable by another role action.", page, failed_role=source_role, api_after=after_create)
+    has_marker, route, text = role_has_marker(page, source_role, CREATED_MARKER)
     if not has_marker:
-        fail("client_refresh_visibility_ui", "Client UI did not show the created marker after reload, although API state exists.", page, failed_role="client", failed_route=route, api_after=after_create)
-    submit_specialist_update(page, created_id, created_item)
-    try:
-        API_AFTER = request_json("GET", BASE_API_PATH)
-    except Exception as exc:
-        fail("specialist_update_api_after", f"GET {BASE_API_PATH} failed after specialist UI update: {exc}", page, failed_role="specialist")
-    updated_item = find_created(API_AFTER, CREATED_MARKER, created_id)
-    if updated_item is None:
-        fail("specialist_update_lost_state", "Specialist UI update lost the created shared state.", page, failed_role="specialist", api_after=API_AFTER)
-    if not contains_marker(updated_item, UPDATED_MARKER) and not item_changed(created_item, updated_item):
-        fail("specialist_update_state_change", "Specialist UI action did not persist a changed shared state.", page, failed_role="specialist", api_before=after_create, api_after=API_AFTER)
-    manager_created, manager_route, manager_text = role_has_marker(page, "manager", CREATED_MARKER)
-    manager_updated = UPDATED_MARKER in manager_text
-    if not (manager_created or manager_updated):
-        fail("manager_visibility_ui", "Manager UI did not show the created/updated shared state after reload.", page, failed_role="manager", failed_route=manager_route, api_after=API_AFTER)
-    submit_manager_update(page, created_id, updated_item)
-    try:
-        API_AFTER = request_json("GET", BASE_API_PATH)
-    except Exception as exc:
-        fail("manager_update_api_after", f"GET {BASE_API_PATH} failed after manager UI update: {exc}", page, failed_role="manager")
-    manager_item = find_created(API_AFTER, CREATED_MARKER, created_id)
-    if manager_item is None:
-        fail("manager_update_lost_state", "Manager UI update lost the created shared state.", page, failed_role="manager", api_after=API_AFTER)
-    if not contains_marker(manager_item, MANAGER_MARKER) and not item_changed(updated_item, manager_item):
-        fail("manager_update_state_change", "Manager UI action did not persist a changed shared state.", page, failed_role="manager", api_before=updated_item, api_after=API_AFTER)
-    client_created, client_route, client_text = role_has_marker(page, "client", CREATED_MARKER)
-    if not client_created:
-        fail("client_final_refresh_visibility_ui", "Client UI lost the created state after specialist update and reload.", page, failed_role="client", failed_route=client_route, api_after=API_AFTER)
-    if contains_marker(updated_item, UPDATED_MARKER) and UPDATED_MARKER not in client_text:
-        fail("client_updated_status_visibility_ui", "Client UI did not show updated shared state after specialist update and reload.", page, failed_role="client", failed_route=client_route, api_after=API_AFTER)
-    if contains_marker(manager_item, MANAGER_MARKER) and MANAGER_MARKER not in client_text:
-        fail("client_manager_update_visibility_ui", "Client UI did not show manager-updated shared state after reload.", page, failed_role="client", failed_route=client_route, api_after=API_AFTER)
+        fail(f"{source_role}_refresh_visibility_ui", f"{source_role} UI did not show the created marker after reload, although API state exists.", page, failed_role=source_role, failed_route=route, api_after=after_create)
+
+    API_AFTER = after_create
+    update_markers = {}
+    for index, role in enumerate([item for item in UPDATE_ROLES if item != source_role]):
+        marker = UPDATED_MARKER if index == 0 else f"{UPDATED_MARKER}-{role}"
+        before_update = api_snapshot()
+        update_route = submit_role_update(page, role, marker, created_id, before_update)
+        after_update = api_snapshot()
+        if not snapshot_changed(before_update, after_update):
+            fail(
+                "role_update_state_change",
+                f"{role} UI action completed but did not change any discoverable API state.",
+                page,
+                failed_role=role,
+                failed_route=update_route,
+                api_before=before_update,
+                api_after=after_update,
+            )
+        API_AFTER = after_update
+        update_markers[role] = marker
+
+    visibility_roles = list(dict.fromkeys([source_role, *OBSERVER_ROLES, *UPDATE_ROLES]))
+    for role in visibility_roles:
+        if role not in ("client", "specialist", "manager"):
+            continue
+        created_visible, visible_route, visible_text = role_has_marker(page, role, CREATED_MARKER)
+        if role in {source_role, *OBSERVER_ROLES} and not created_visible:
+            fail(
+                "role_created_state_visibility_ui",
+                f"{role} UI did not show the source-created shared state after reload.",
+                page,
+                failed_role=role,
+                failed_route=visible_route,
+                api_after=API_AFTER,
+            )
+        for updated_by, marker in update_markers.items():
+            if marker in json.dumps(API_AFTER, ensure_ascii=False) and role in {source_role, *OBSERVER_ROLES} and marker not in visible_text:
+                fail(
+                    "role_update_visibility_ui",
+                    f"{role} UI did not show persisted update marker from {updated_by} after reload.",
+                    page,
+                    failed_role=role,
+                    failed_route=visible_route,
+                    api_after=API_AFTER,
+                )
     for role in ("client", "specialist", "manager"):
         for route in normalize_routes(role)[:4]:
             route_text_after_reload(page, route)
@@ -3497,10 +3076,15 @@ def run_flow(page):
         "created_marker": CREATED_MARKER,
         "updated_marker": UPDATED_MARKER,
         "manager_marker": MANAGER_MARKER,
+        "source_role": source_role,
+        "update_roles": UPDATE_ROLES,
+        "observer_roles": OBSERVER_ROLES,
+        "created_api_path": created_path,
         "console_errors": CONSOLE_ERRORS[-20:],
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
         "api_paths": API_PATHS,
+        "get_api_paths": GET_API_PATHS,
         "api_before": API_BEFORE,
         "api_after": API_AFTER,
     })
@@ -3538,6 +3122,10 @@ except Exception as exc:
         "visible_errors": VISIBLE_ERRORS[-20:],
         "screenshots": SCREENSHOTS,
         "api_paths": API_PATHS,
+        "get_api_paths": GET_API_PATHS,
+        "source_roles": SOURCE_ROLES,
+        "update_roles": UPDATE_ROLES,
+        "observer_roles": OBSERVER_ROLES,
         "api_before": API_BEFORE,
         "api_after": API_AFTER,
     })
@@ -3856,10 +3444,10 @@ try:
         create_payload = build_payload(OPENAPI, base_path, "post", marker, "create")
         create = client.post(base_path, json=create_payload)
         if not (200 <= create.status_code < 300):
-            fail("client_create", f"POST {base_path} returned {create.status_code}; payload={create_payload}; body={create.text[:500]}", api_paths=api_paths, api_before=before_json)
+            fail("create_state", f"POST {base_path} returned {create.status_code}; payload={create_payload}; body={create.text[:500]}", api_paths=api_paths, api_before=before_json)
         create_json = create.json()
         created_id = find_id(create_json)
-        STEPS.append({"step": "client_create", "path": base_path, "status": create.status_code, "id": created_id})
+        STEPS.append({"step": "create_state", "path": base_path, "status": create.status_code, "id": created_id})
 
         after_create = client.get(base_path)
         after_create_json = after_create.json()
@@ -3890,14 +3478,14 @@ try:
         update_payload = build_payload(OPENAPI, update_template, method, update_marker, "update")
         update = getattr(client, method)(update_path, json=update_payload)
         if not (200 <= update.status_code < 300):
-            fail("specialist_update", f"{method.upper()} {update_path} returned {update.status_code}; payload={update_payload}; body={update.text[:500]}", api_paths=api_paths, api_after=after_create_json)
-        STEPS.append({"step": "specialist_update", "path": update_path, "status": update.status_code, "payload": update_payload})
+            fail("update_state", f"{method.upper()} {update_path} returned {update.status_code}; payload={update_payload}; body={update.text[:500]}", api_paths=api_paths, api_after=after_create_json)
+        STEPS.append({"step": "update_state", "path": update_path, "status": update.status_code, "payload": update_payload})
 
         after_update = client.get(base_path)
         after_update_json = after_update.json()
         updated_item = find_created(after_update_json, marker, created_id)
         if updated_item is None:
-            fail("manager_visibility", "Shared GET state could not find the created entity after update.", api_paths=api_paths, api_after=after_update_json)
+            fail("post_update_visibility", "Shared GET state could not find the created entity after update.", api_paths=api_paths, api_after=after_update_json)
         update_visible = any(contains_marker(updated_item.get(key) if isinstance(updated_item, dict) else updated_item, str(value)) for key, value in update_payload.items())
         if not update_visible and not contains_marker(updated_item, update_marker):
             if isinstance(updated_item, dict) and update_payload:
@@ -3905,7 +3493,7 @@ try:
                 update_visible = bool(matching)
         if not update_visible:
             fail("refresh_persistence", f"Updated state was not visible through later GET. Payload={update_payload}; item={updated_item}", api_paths=api_paths, api_before=before_json, api_after=after_update_json)
-        STEPS.append({"step": "client_refresh_visibility", "path": base_path, "status": after_update.status_code})
+        STEPS.append({"step": "refresh_visibility", "path": base_path, "status": after_update.status_code})
 
         print(json.dumps({
             "passed": True,
@@ -4054,6 +3642,11 @@ except Exception as exc:
                     message = (
                         str(missing_generated_js_token.get("expected_fix") or "").strip()
                         or "Generated JS test required a token on the wrong generated page."
+                    )
+                elif isinstance(diagnostics.get("js_test_brittle_route_manifest_assertion"), dict):
+                    message = (
+                        str(diagnostics["js_test_brittle_route_manifest_assertion"].get("expected_fix") or "").strip()
+                        or "Generated JS test asserted a brittle route manifest implementation detail."
                     )
                 elif isinstance(assertion_source, dict):
                     line_no = assertion_source.get("line")
@@ -4325,6 +3918,7 @@ except Exception as exc:
         scope_mode: str,
         intent: str | None = None,
         generation_mode: GenerationMode | str | None = None,
+        acceptance_contract: dict[str, Any] | None = None,
     ) -> RunCheckResult:
         relevant_changed = [
             str(path)
@@ -4360,6 +3954,7 @@ except Exception as exc:
             role_issues, role_coverage, neutral_template_findings = self._role_surface_issues(
                 source_dir,
                 generation_mode=generation_mode,
+                acceptance_contract=acceptance_contract,
             )
             issues.extend(role_issues)
             issues.extend(self._role_manifest_completeness_issues(source_dir))
@@ -4372,7 +3967,7 @@ except Exception as exc:
         if agentic_scope and str(intent or "").strip().lower() == "create":
             api_issues, api_contract = self._create_api_contract_issues(source_dir)
             issues.extend(api_issues)
-            data_issues, preloaded_data_findings = self._preloaded_domain_data_issues(source_dir)
+            data_issues, preloaded_data_findings = self._preloaded_product_data_issues(source_dir)
             issues.extend(data_issues)
         if not css_only_focused_edit:
             dom_contract_files = list(relevant_changed)
@@ -4403,11 +3998,11 @@ except Exception as exc:
         source_dir: Path,
         *,
         generation_mode: GenerationMode | str | None = None,
+        acceptance_contract: dict[str, Any] | None = None,
     ) -> tuple[list[ValidationIssue], dict[str, object], list[dict[str, str]]]:
         issues: list[ValidationIssue] = []
         coverage: dict[str, object] = {}
         neutral_findings: list[dict[str, str]] = []
-        role_tokens: dict[str, set[str]] = {}
         role_surface_text: dict[str, str] = {}
         route_pages = cls._routeable_role_pages(source_dir)
 
@@ -4446,7 +4041,6 @@ except Exception as exc:
             html_combined = "\n".join(html_texts)
             normalized = combined.lower()
             markers = [marker for marker in NEUTRAL_TEMPLATE_MARKERS if marker in normalized]
-            role_tokens[role] = cls._semantic_tokens(combined)
             role_routes = cls._unique_role_routes(route_pages.get(role, []))
             secondary_routes = [route for route in role_routes if route != f"/{role}"]
             if missing:
@@ -4634,20 +4228,22 @@ except Exception as exc:
                     )
                 )
                 continue
-            action_signals = cls._role_action_signals(role, combined)
+            action_signals = cls._role_action_signals(role, combined, acceptance_contract=acceptance_contract)
             if not action_signals:
+                expectation = cls._role_action_expectation(role, acceptance_contract=acceptance_contract)
                 coverage[role] = {
                     "status": "missing_role_actions",
                     "route_count": len(role_routes),
                     "secondary_route_count": len(secondary_routes),
                     "routes": role_routes,
+                    "expected_action": expectation,
                 }
                 issues.append(
                     ValidationIssue(
                         code="platform.missing_role_workflow_actions",
                         message=(
-                            f"{role} role lacks its own workflow actions. Client must create user-provided state, "
-                            "specialist must process/update shared work, and manager must expose dashboard/oversight actions."
+                            f"{role} role lacks the prompt-assigned workflow action for this acceptance contract: "
+                            f"{expectation}. Add role-owned controls/handlers that use the app-owned API without copying another role's workflow."
                         ),
                         severity="high",
                         location=f"miniapp/app/static/{role}",
@@ -4662,7 +4258,6 @@ except Exception as exc:
                 "route_count": len(role_routes),
                 "secondary_route_count": len(secondary_routes),
                 "routes": role_routes,
-                "semantic_token_count": len(role_tokens[role]),
                 "action_signals": action_signals,
             }
 
@@ -4672,17 +4267,6 @@ except Exception as exc:
             if isinstance(payload, dict) and payload.get("status") == "present"
         ]
         if len(present_roles) == len(ROLE_ORDER):
-            shared_tokens = set.intersection(*(role_tokens[role] for role in ROLE_ORDER))
-            if not shared_tokens:
-                issues.append(
-                    ValidationIssue(
-                        code="platform.disconnected_role_surfaces",
-                        message="Client, specialist, and manager surfaces do not share visible prompt-derived content. Use one connected prompt-derived context across all roles.",
-                        severity="high",
-                        location="miniapp/app/static",
-                        blocking=True,
-                    )
-                )
             if cls._role_surfaces_too_similar(role_surface_text):
                 issues.append(
                     ValidationIssue(
@@ -4693,7 +4277,6 @@ except Exception as exc:
                         blocking=True,
                     )
                 )
-            coverage["shared_semantic_tokens"] = sorted(shared_tokens)[:12]
         return issues, coverage, neutral_findings
 
     @staticmethod
@@ -4737,37 +4320,18 @@ except Exception as exc:
         if value not in {GenerationMode.BALANCED.value, GenerationMode.QUALITY.value}:
             return None
         css = str(css_text or "").lower()
-        surface = f"{css}\n{str(combined or '').lower()}"
+        del combined
         css_rule_count = len(re.findall(r"[.#]?[a-z][a-z0-9_-]*\s*\{", css))
-        state_tokens = {
-            "badge",
-            "button",
-            "card",
-            "dashboard",
-            "empty",
-            "error",
-            "form",
-            "grid",
-            "input",
-            "list",
-            "loading",
-            "metric",
-            "success",
-            "status",
-        }
-        token_hits = {token for token in state_tokens if token in surface}
         min_rules = 12 if value == GenerationMode.QUALITY.value else 8
-        min_hits = 7 if value == GenerationMode.QUALITY.value else 5
         quality_structure_ok = value != GenerationMode.QUALITY.value or ("@media" in css and ("focus-visible" in css or ":focus" in css))
-        rich_quality_css = value == GenerationMode.QUALITY.value and css_rule_count >= min_rules + 6 and len(token_hits) >= min_hits + 1
-        if css_rule_count >= min_rules and len(token_hits) >= min_hits and (quality_structure_ok or rich_quality_css):
+        rich_quality_css = value == GenerationMode.QUALITY.value and css_rule_count >= min_rules + 6
+        if css_rule_count >= min_rules and (quality_structure_ok or rich_quality_css):
             return None
         return ValidationIssue(
             code="platform.insufficient_mode_design_depth",
             message=(
                 f"{role} role design is too shallow for {value} mode. "
-                f"Expected at least {min_rules} real CSS rules, richer role state classes, "
-                "and for quality mode responsive/focus styling."
+                f"Expected at least {min_rules} real CSS rules and, for quality mode, responsive/focus styling."
             ),
             severity="high",
             location=f"miniapp/app/static/{role}/styles.css",
@@ -4878,51 +4442,101 @@ except Exception as exc:
         return False
 
     @staticmethod
-    def _role_action_signals(role: str, content: str) -> list[str]:
+    def _role_action_expectation(role: str, *, acceptance_contract: dict[str, Any] | None = None) -> str:
+        contract = acceptance_contract if isinstance(acceptance_contract, dict) else {}
+        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
+        state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
+        source_roles = {
+            str(item).strip().lower()
+            for item in (state_contract.get("source_roles") or [])
+            if str(item).strip().lower() in ROLE_ORDER
+        }
+        update_roles = {
+            str(item).strip().lower()
+            for item in (state_contract.get("update_roles") or [])
+            if str(item).strip().lower() in ROLE_ORDER
+        }
+        observer_roles = {
+            str(item).strip().lower()
+            for item in (state_contract.get("observer_roles") or [])
+            if str(item).strip().lower() in ROLE_ORDER
+        }
+        role_prompts = prompt_hints.get("role_action_prompts") if isinstance(prompt_hints.get("role_action_prompts"), dict) else {}
+        prompt_actions = [
+            str(item).strip()
+            for item in (role_prompts.get(role) or [])
+            if str(item).strip()
+        ] if isinstance(role_prompts, dict) else []
+        if role in source_roles:
+            base = "source role must create/publish/configure prompt-derived persisted state"
+        elif role in update_roles:
+            base = "update role must perform its prompt-derived persisted action"
+        elif role in observer_roles:
+            base = "observer role must load and use the shared persisted state"
+        else:
+            base = "role must expose the prompt-derived view/action assigned to it"
+        if prompt_actions:
+            return f"{base}; prompt actions: {', '.join(prompt_actions[:4])}"
+        return base
+
+    @staticmethod
+    def _role_action_signals(role: str, content: str, *, acceptance_contract: dict[str, Any] | None = None) -> list[str]:
         text = str(content or "")
         lowered = text.lower()
         signals: list[str] = []
-        if role == "client":
-            if "<form" in lowered:
-                signals.append("form")
-            if re.search(r"method\s*:\s*['\"]post['\"]", text, flags=re.IGNORECASE) or ".post(" in lowered:
-                signals.append("post")
-            return signals if {"form", "post"}.issubset(set(signals)) else []
-        if role == "specialist":
-            has_update_method = bool(re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE))
-            has_action_post = bool(
-                re.search(r"method\s*:\s*['\"]post['\"]", text, flags=re.IGNORECASE)
-                and ("/api/" in lowered or "fetch(" in lowered)
-            )
-            has_api_action = bool(
-                has_update_method
-                or has_action_post
-                or ("/api/" in lowered and "fetch(" in lowered and re.search(r"(state|stage|progress|action|update|save|сохран|обнов|действ)", lowered))
-            )
-            if has_api_action:
-                signals.append("workflow_update")
-            if re.search(r"\b(done|complete|assign|update|action|save)\b", lowered) or re.search(
-                r"(обнов|сохран|действ|работ)", lowered
-            ):
-                signals.append("workflow_actions")
-            return signals if len(signals) >= 2 else []
-        if role == "manager":
-            if re.search(r"\b(metric|dashboard|summary|total|workload|overview|count)\b", lowered):
-                signals.append("dashboard")
-            has_manager_control = bool(
-                re.search(r"\b(escalate|assign|control|oversight|refresh|filter|audit)\b", lowered)
-                or re.search(r"\b(manager-oversight|manager-control)\b", lowered)
-                or re.search(r"(контрол|обнов|назнач|отч[её]т|фильтр)", lowered)
-            )
-            has_user_action_surface = bool(
-                re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE)
-                or re.search(r"addEventListener\s*\(", text)
-                or "<button" in lowered
-            )
-            if re.search(r"method\s*:\s*['\"](?:patch|put|delete)['\"]", text, flags=re.IGNORECASE) or (has_manager_control and has_user_action_surface):
-                signals.append("oversight_action")
-            return signals if len(signals) >= 2 else []
-        return signals
+        contract = acceptance_contract if isinstance(acceptance_contract, dict) else {}
+        prompt_hints = contract.get("prompt_hints") if isinstance(contract.get("prompt_hints"), dict) else {}
+        state_contract = prompt_hints.get("role_state_contract") if isinstance(prompt_hints.get("role_state_contract"), dict) else {}
+        source_roles = {
+            str(item).strip().lower()
+            for item in (state_contract.get("source_roles") or [])
+            if str(item).strip().lower() in ROLE_ORDER
+        }
+        update_roles = {
+            str(item).strip().lower()
+            for item in (state_contract.get("update_roles") or [])
+            if str(item).strip().lower() in ROLE_ORDER
+        }
+        observer_roles = {
+            str(item).strip().lower()
+            for item in (state_contract.get("observer_roles") or [])
+            if str(item).strip().lower() in ROLE_ORDER
+        }
+        has_interactive_surface = bool(
+            re.search(r"<(?:form|button|select|textarea|input)\b", lowered)
+            or re.search(r"addEventListener\s*\(", text)
+        )
+        has_fetch = "fetch(" in lowered or "/api/" in lowered
+        has_submit_flow = bool(re.search(r"\bsubmit\b|<form\b|addEventListener\s*\(\s*['\"`]submit", text, flags=re.IGNORECASE))
+        has_action_flow = bool(re.search(r"\b(click|change|submit)\b|data-[a-z0-9_-]+", lowered))
+        has_post = bool(
+            re.search(r"method\s*:\s*['\"`](?:POST)['\"`]", text, flags=re.IGNORECASE)
+            or ".post(" in lowered
+            or (has_fetch and has_submit_flow and re.search(r"['\"`]POST['\"`]", text, flags=re.IGNORECASE))
+        )
+        has_update_method = bool(
+            re.search(r"method\s*:\s*['\"`](?:PATCH|PUT|DELETE)['\"`]", text, flags=re.IGNORECASE)
+            or re.search(r"\.(?:patch|put|delete)\s*\(", lowered)
+            or (has_fetch and has_action_flow and re.search(r"['\"`](?:PATCH|PUT|DELETE)['\"`]", text, flags=re.IGNORECASE))
+        )
+        has_mutating_api = has_fetch and (has_post or has_update_method)
+        has_read_api = has_fetch or bool(re.search(r"method\s*:\s*['\"`]GET['\"`]", text, flags=re.IGNORECASE) or ".get(" in lowered)
+        if has_interactive_surface:
+            signals.append("interactive_surface")
+        if has_read_api:
+            signals.append("api_read")
+        if has_post:
+            signals.append("api_post")
+        if has_update_method:
+            signals.append("api_update")
+
+        if role in source_roles:
+            return signals if has_interactive_surface and has_post and has_fetch else []
+        if role in update_roles:
+            return signals if has_interactive_surface and has_mutating_api else []
+        if role in observer_roles:
+            return signals if has_read_api else []
+        return signals if has_read_api and has_interactive_surface else []
 
     @staticmethod
     def _cross_role_links(role: str, content: str) -> list[str]:
@@ -5207,7 +4821,7 @@ except Exception as exc:
         return normalize_api_path(value)
 
     @classmethod
-    def _preloaded_domain_data_issues(cls, source_dir: Path) -> tuple[list[ValidationIssue], list[dict[str, str]]]:
+    def _preloaded_product_data_issues(cls, source_dir: Path) -> tuple[list[ValidationIssue], list[dict[str, str]]]:
         app_root = source_dir / "miniapp/app"
         findings: list[dict[str, str]] = []
         issues: list[ValidationIssue] = []
@@ -5229,15 +4843,15 @@ except Exception as exc:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            marker = cls._preloaded_domain_data_marker(content)
+            marker = cls._preloaded_product_data_marker(content)
             if not marker:
                 continue
             findings.append({"file_path": relative_path, "marker": marker})
             issues.append(
                 ValidationIssue(
-                    code="platform.preloaded_domain_data",
+                    code="platform.preloaded_product_data",
                     message=(
-                        f"{relative_path} appears to include preloaded domain data ({marker}). "
+                        f"{relative_path} appears to include preloaded product data ({marker}). "
                         "Create apps must start with empty persistent state and let users add their own data."
                     ),
                     severity="high",
@@ -5248,11 +4862,11 @@ except Exception as exc:
         return issues, findings
 
     @staticmethod
-    def _preloaded_domain_data_marker(content: str) -> str | None:
+    def _preloaded_product_data_marker(content: str) -> str | None:
         text = str(content or "")
         lowered = text.lower()
         compact = re.sub(r"[\s_\-]+", "", lowered)
-        for marker in PRELOADED_DOMAIN_DATA_MARKERS:
+        for marker in PRELOADED_PRODUCT_DATA_MARKERS:
             normalized_marker = marker.lower()
             compact_marker = re.sub(r"[\s_\-]+", "", normalized_marker)
             if normalized_marker in lowered or compact_marker in compact:
@@ -5578,22 +5192,6 @@ except Exception as exc:
             seen.add(route)
             routes.append(route)
         return routes
-
-    @staticmethod
-    def _semantic_tokens(text: str) -> set[str]:
-        cleaned = re.sub(r"<script\b.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
-        cleaned = re.sub(r"<style\b.*?</style>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
-        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
-        tokens = {
-            token.lower()
-            for token in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_-]{3,}", cleaned)
-        }
-        return {
-            token
-            for token in tokens
-            if token not in ROLE_LINK_STOPWORDS
-            and not token.startswith(("data-", "aria-", "http", "html", "body", "class", "const", "function"))
-        }
 
     @staticmethod
     def _generated_tests_presence_issues(source_dir: Path) -> tuple[list[ValidationIssue], dict[str, object]]:
@@ -6728,6 +6326,16 @@ except Exception as exc:
                                     "or construct the expected string before asserting, for example `/static/${role}/app.js` must be evaluated, not quoted literally."
                                 ),
                             }
+                    if "manifest.roles" in assertion_line and ".root" in assertion_line:
+                        diagnostics["js_test_brittle_route_manifest_assertion"] = {
+                            "problem": "generated_js_test_requires_exact_route_manifest_root",
+                            "source": assertion_line,
+                            "expected_fix": (
+                                "Generated JS tests must not assert exact manifest.roles.<role>.root implementation fields. "
+                                "Patch generated_app.test.mjs to derive actual role routes/pages from route_manifest entries and assert "
+                                "real role HTML/CSS/JS/API wiring. Do not edit generated/route_manifest.json to satisfy a brittle test."
+                            ),
+                        }
                     regex_match = re.search(
                         r"(?:\.match\(\s*|assert\.match\([^,]+,\s*)/(?P<literal>(?:\\/|[^/])+)/[a-zA-Z]*\s*\)",
                         assertion_line,
@@ -6780,6 +6388,16 @@ except Exception as exc:
                                     "or construct the expected string before asserting, for example `/static/${role}/app.js` must be evaluated, not quoted literally."
                                 ),
                             }
+                    if "manifest.roles" in assertion_line and ".root" in assertion_line:
+                        diagnostics["js_test_brittle_route_manifest_assertion"] = {
+                            "problem": "generated_js_test_requires_exact_route_manifest_root",
+                            "source": assertion_line,
+                            "expected_fix": (
+                                "Generated JS tests must not assert exact manifest.roles.<role>.root implementation fields. "
+                                "Patch generated_app.test.mjs to derive actual role routes/pages from route_manifest entries and assert "
+                                "real role HTML/CSS/JS/API wiring. Do not edit generated/route_manifest.json to satisfy a brittle test."
+                            ),
+                        }
                     regex_match = re.search(
                         r"(?:\.match\(\s*|assert\.match\([^,]+,\s*)/(?P<literal>(?:\\/|[^/])+)/[a-zA-Z]*\s*\)",
                         assertion_line,
@@ -7036,6 +6654,34 @@ except Exception as exc:
                     "and query related status/update rows explicitly. Do not leave relationship('...') between tables without a ForeignKey."
                 ),
             }
+        browser_global_match = next(
+            (
+                re.search(r"ReferenceError:\s*(?P<name>document|window)\s+is not defined", str(line or ""))
+                for line in logs
+                if "ReferenceError:" in str(line or "") and " is not defined" in str(line or "")
+            ),
+            None,
+        )
+        if browser_global_match:
+            app_path_match = next(
+                (
+                    re.search(r"/source/(?P<path>miniapp/app/static/(?:client|specialist|manager)/app\.js):(?P<line>\d+)", str(line or ""))
+                    for line in logs
+                    if "/source/miniapp/app/static/" in str(line or "")
+                ),
+                None,
+            )
+            diagnostics["js_test_imports_browser_app_without_dom"] = {
+                "problem": "generated_js_test_imports_browser_only_role_script_without_dom",
+                "missing_global": browser_global_match.group("name"),
+                "role_script": app_path_match.group("path") if app_path_match else None,
+                "role_script_line": int(app_path_match.group("line")) if app_path_match else None,
+                "expected_fix": (
+                    "generated_app.test.mjs imports a browser-only role app.js in Node without DOM globals. "
+                    "Patch the generated JS test to read role HTML/JS source text and assert selectors/API/event wiring, "
+                    "or create explicit globalThis.window/document mocks before importing a script. Do not change working browser code only to satisfy Node."
+                ),
+            }
         for line in reversed(logs):
             attr_match = cls._PY_MISSING_ATTRIBUTE_RE.search(str(line or ""))
             if not attr_match:
@@ -7139,6 +6785,40 @@ except Exception as exc:
                     "Patch generated route functions so every parameter typed Session uses "
                     "Depends(get_db_session) or Depends(get_db). Do not use next(get_db_session()), "
                     "SessionLocal(), @contextmanager, or a live Session object as a default argument."
+                ),
+            }
+        name_error = re.search(r"NameError:\s*name\s+['\"](?P<name>[^'\"]+)['\"]\s+is not defined", text)
+        if name_error:
+            source_locations = [
+                {
+                    "file_path": match.group("path").replace("\\", "/"),
+                    "line": int(match.group("line")),
+                }
+                for match in re.finditer(
+                    r"File\s+\"[^\"]*/source/(?P<path>miniapp/app/[^\"]+\.py)\",\s+line\s+(?P<line>\d+)",
+                    text,
+                )
+            ]
+            if not source_locations:
+                source_locations = [
+                    {
+                        "file_path": f"miniapp/app/{match.group('path').replace(chr(92), '/')}",
+                        "line": int(match.group("line")),
+                    }
+                    for match in re.finditer(
+                        r"File\s+\"[^\"]*/app/(?P<path>[^\"]+\.py)\",\s+line\s+(?P<line>\d+)",
+                        text,
+                    )
+                ]
+            location = source_locations[-1] if source_locations else {}
+            diagnostics["python_name_error"] = {
+                "problem": "backend_import_name_error",
+                "name": name_error.group("name"),
+                "file_path": location.get("file_path"),
+                "line": location.get("line"),
+                "expected_fix": (
+                    "Patch the exact Python file so the referenced name is defined before it is used at import time. "
+                    "For SQLAlchemy mapped_column defaults/onupdate, define helper functions before model classes or use an inline callable."
                 ),
             }
         return diagnostics

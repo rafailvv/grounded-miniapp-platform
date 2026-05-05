@@ -72,7 +72,7 @@ class AgentToolRegistry:
     """Single source of truth for model-facing agent tools.
 
     The registry is intentionally generic: it describes tool semantics, safety,
-    progress labels, and batching behavior. It does not know product domains or
+    progress labels, and batching behavior. It does not know product categories or
     generated app resource names.
     """
 
@@ -334,7 +334,10 @@ class AgentToolRegistry:
             spec = cls._SPECS[name]
             if name == "apply_patch_to_draft":
                 properties = {
-                    "file_path": {"type": "string"},
+                    "file_path": {
+                        "type": "string",
+                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
+                    },
                     "diff": {
                         "type": "string",
                         "description": "A unified diff for this one file. It must include @@ hunks with context and +/- lines.",
@@ -346,7 +349,10 @@ class AgentToolRegistry:
                 required = ["file_path", "diff", "reason"]
             elif name == "write_file":
                 properties = {
-                    "file_path": {"type": "string"},
+                    "file_path": {
+                        "type": "string",
+                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
+                    },
                     "content": {
                         "type": "string",
                         "description": "The complete resulting file content for this one file.",
@@ -358,7 +364,10 @@ class AgentToolRegistry:
                 required = ["file_path", "content", "reason"]
             elif name == "edit_file_exact":
                 properties = {
-                    "file_path": {"type": "string"},
+                    "file_path": {
+                        "type": "string",
+                        "description": "One app-owned miniapp/... file. Do not target generated/platform-owned files such as app/routes/role_pages.py, app/routes/role_routes.py, or app/generated/*.json.",
+                    },
                     "old_string": {
                         "type": "string",
                         "description": "Exact text currently present in the file. It must match exactly and uniquely unless replace_all is true.",
@@ -389,7 +398,7 @@ class AgentToolRegistry:
                         f"{spec.progress_label}. Kind: {spec.kind}. "
                         "Use this generic code-agent tool only when it directly advances the current plan. "
                         + (
-                            "This mutating tool applies exactly one file_path per call; for multiple files, call the tool once per file with that file's own content or diff."
+                            "This mutating tool applies exactly one app-owned file_path per call; for multiple files, call the tool once per file with that file's own content or diff. Generated/platform-owned paths are rejected."
                             if spec.kind == "mutating"
                             else ""
                         )

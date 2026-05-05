@@ -97,7 +97,7 @@ class AgentWorkerTaskPlanner:
             "miniapp/app/generated/miniapp_contract.json is prompt-analysis metadata only; do not treat it as a fixed product schema, route template, or API scaffold. "
             "Choose field keys and API routes from the prompt and keep them consistent across backend, JS payloads, renderers, and tests. "
             "Read the files you need, patch the smallest complete owned slice, run or request the relevant checks, and report exact changed paths and self-check result. "
-            "Do not create templates, seed records, mock records, domain-category shortcuts, or cross-role navigation links. "
+            "Do not create templates, seed records, mock records, fixed product-category shortcuts, or cross-role navigation links. "
             "Do not copy another role's primary workflow into this role surface: prompt_hints.role_state_contract decides source roles, update roles, and observer roles. "
             "Do not force any workflow semantics unless the user's prompt explicitly assigns them. "
             "If the prompt assigns shared-state creation to manager or specialist, that role must own the creation form and the client role must load or use that persisted state without duplicate source controls. "

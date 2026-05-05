@@ -49,11 +49,10 @@ class AgentWorkerManager:
     ) -> dict[str, object]:
         # Claude/Codex-style orchestration keeps independent reads parallel but
         # serializes writes through one coordinator when the app contract is
-        # already materialized. Balanced/quality runs are especially sensitive to
-        # route/schema drift from parallel writer branches, so they use the main
-        # repair loop for mutations and reserve workers for future read-only
-        # planning/verifier roles.
-        enabled = generation_mode == GenerationMode.FAST
+        # already materialized. Multi-writer draft branches were too expensive
+        # for Fast create runs and regularly produced route/schema/test drift, so
+        # all modes keep mutations in the main repair loop for now.
+        enabled = False
         prompt_contract = implementation_plan.get("prompt_contract_v1") if isinstance(implementation_plan, dict) else {}
         materialized_tests = bool(isinstance(prompt_contract, dict) and prompt_contract.get("materialized_tests"))
         workers = [

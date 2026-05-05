@@ -79,7 +79,7 @@ class AgentContextPressureAnalyzer:
 
         The model often loops by re-reading the same large files after every
         failed repair. This summary is intentionally generic: it does not know
-        anything about miniapp domains, only tool calls and file paths.
+        anything about product categories, only tool calls and file paths.
         """
         events = transcript.get("events") if isinstance(transcript, dict) else []
         if not isinstance(events, list):

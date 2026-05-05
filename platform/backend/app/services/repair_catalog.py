@@ -25,13 +25,21 @@ class RepairCatalogEntry:
 
     def packet(self, *, evidence: dict[str, Any] | None = None) -> dict[str, Any]:
         evidence_payload = evidence or {}
+        target_files: list[str] = []
+        for value in evidence_payload.get("paths") or evidence_payload.get("target_files") or []:
+            text = str(value or "").strip().replace("\\", "/")
+            if text.startswith("miniapp/") and text not in target_files:
+                target_files.append(text)
+        for value in self.target_files:
+            if value not in target_files:
+                target_files.append(value)
         return {
             "signature": self.signature,
             "issue_code": self.issue_code,
             "code": self.issue_code,
             "severity": self.severity,
             "likely_root_cause": self.likely_root_cause,
-            "target_files": list(self.target_files),
+            "target_files": target_files,
             "verification_check": self.verification_check,
             "verification_command": self.verification_command,
             "instruction": self.instruction,
@@ -47,7 +55,7 @@ class RepairCatalogEntry:
             "forbidden_tools_once": [],
             "next_forced_action": {
                 "required_next_tool": self.required_next_tool,
-                "target_files": list(self.target_files),
+                "target_files": target_files,
                 "verification_check": self.verification_check,
             },
             "evidence": evidence_payload,
@@ -70,6 +78,26 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         required_next_tool="read_files",
         verification_command="run_checks changed_files_static",
         patterns=(_rx(r"\bsyntaxerror\b"), _rx(r"node --check"), _rx(r"unexpected token")),
+    ),
+    RepairCatalogEntry(
+        signature="backend.python_name_error",
+        issue_code="python_name_error",
+        severity="critical",
+        likely_root_cause="Generated Python imports reference a name before it is defined.",
+        target_files=("miniapp/app/**/*.py",),
+        verification_check="changed_files_static",
+        instruction=(
+            "Read the traceback and patch the exact Python file. Move helper functions/constants above import-time model/route declarations "
+            "or replace the reference with an inline callable so app.main imports cleanly."
+        ),
+        required_next_tool="read_files",
+        suggested_tool_after_read="write_file",
+        verification_command="run_checks changed_files_static",
+        patterns=(
+            _rx(r"python_name_error"),
+            _rx(r"NameError:\s*name\s+['\"][^'\"]+['\"]\s+is not defined"),
+            _rx(r"backend_import_name_error"),
+        ),
     ),
     RepairCatalogEntry(
         signature="frontend.missing_dom_id",
@@ -120,16 +148,83 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         patterns=(_rx(r"no such table"), _rx(r"has no column named"), _rx(r"operationalerror")),
     ),
     RepairCatalogEntry(
+        signature="tests.python_api_contract_mismatch",
+        issue_code="generated_python_api_contract_mismatch",
+        severity="high",
+        likely_root_cause="Generated Python acceptance tests and the generated API behavior disagree about the prompt-owned persisted workflow.",
+        target_files=(
+            "miniapp/app/routes/**",
+            "miniapp/app/schemas.py",
+            "miniapp/app/db.py",
+            "miniapp/tests/test_generated_app.py",
+            "miniapp/app/static/**/app.js",
+        ),
+        verification_check="generated_app_python_tests",
+        instruction=(
+            "Read the failing assertion context, backend route/schema, and prompt contract. If the API violates the requested persisted workflow, "
+            "patch the backend and frontend payloads; if the test asserts stale behavior, patch the generated test. Keep all three aligned."
+        ),
+        required_next_tool="read_files",
+        suggested_tool_after_read="apply_patch_to_draft_or_write_file",
+        verification_command="run_checks generated_app_python_tests",
+        patterns=(
+            _rx(r"generated_app_python_tests"),
+            _rx(r"python_assertion_failures"),
+            _rx(r"AssertionError:\s*.+\s*!=\s*.+"),
+        ),
+    ),
+    RepairCatalogEntry(
+        signature="tests.js_brittle_route_manifest_root",
+        issue_code="generated_js_brittle_route_manifest_root",
+        severity="high",
+        likely_root_cause="Generated JS tests assert an implementation-specific route manifest root field instead of deriving actual role pages.",
+        target_files=("miniapp/tests/generated_app.test.mjs",),
+        verification_check="generated_app_js_tests",
+        instruction=(
+            "Patch generated_app.test.mjs to derive actual role routes/pages from route_manifest routes/pages and filesystem HTML files. "
+            "Do not edit generated/route_manifest.json and do not require manifest.roles.<role>.root."
+        ),
+        required_next_tool="read_files",
+        suggested_tool_after_read="write_file",
+        verification_command="run_checks generated_app_js_tests",
+        patterns=(
+            _rx(r"js_test_brittle_route_manifest_assertion"),
+            _rx(r"generated_js_test_requires_exact_route_manifest_root"),
+            _rx(r"manifest\.roles\.[A-Za-z0-9_]+\.root"),
+            _rx(r"routeManifest\.roles\.[A-Za-z0-9_]+\.root"),
+        ),
+    ),
+    RepairCatalogEntry(
         signature="contract.route_manifest_drift",
         issue_code="route_manifest_drift",
         severity="high",
         likely_root_cause="Route manifest, generated contract, and filesystem role pages disagree.",
-        target_files=("miniapp/app/generated/route_manifest.json", "miniapp/app/static/**/index.html"),
+        target_files=("miniapp/app/static/**/index.html", "miniapp/tests/generated_app.test.mjs"),
         verification_check="schema_validators",
-        instruction="Regenerate or repair route manifest entries so each role route maps to the actual static page.",
+        instruction="Do not edit generated route_manifest.json directly. Create/remove the actual role page files or patch stale generated tests; the platform will resync generated route metadata.",
         required_next_tool="read_files",
         verification_command="run_checks schema_validators",
         patterns=(_rx(r"route_manifest"), _rx(r"duplicate_static_route"), _rx(r"declared routes")),
+    ),
+    RepairCatalogEntry(
+        signature="tests.js_browser_global_import",
+        issue_code="generated_js_browser_global_import",
+        severity="high",
+        likely_root_cause="Generated JS acceptance tests import browser-only role scripts in Node without providing DOM globals.",
+        target_files=("miniapp/tests/generated_app.test.mjs",),
+        verification_check="generated_app_js_tests",
+        instruction=(
+            "Patch generated_app.test.mjs so it does not import browser-only app.js directly unless it creates explicit window/document mocks first. "
+            "Prefer reading role HTML/JS source text and asserting real selectors, API calls, route pages, and event handlers."
+        ),
+        required_next_tool="read_files",
+        suggested_tool_after_read="write_file",
+        verification_command="run_checks generated_app_js_tests",
+        patterns=(
+            _rx(r"js_test_imports_browser_app_without_dom"),
+            _rx(r"ReferenceError:\s*(?:document|window)\s+is not defined"),
+            _rx(r"generated_app\.test\.mjs.*import.*app/static/(?:client|specialist|manager)/app\.js"),
+        ),
     ),
     RepairCatalogEntry(
         signature="preview.blank_screen",
@@ -183,10 +278,10 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         signature="workflow.missing_role_actions",
         issue_code="missing_role_workflow_actions",
         severity="high",
-        likely_root_cause="A required role page exists but lacks prompt-specific create/process/oversight actions.",
-        target_files=("miniapp/app/static/manager/index.html", "miniapp/app/static/manager/app.js", "miniapp/app/static/manager/styles.css"),
+        likely_root_cause="A required role page exists but lacks the prompt-assigned persisted action or shared-state view.",
+        target_files=("miniapp/app/static/**/index.html", "miniapp/app/static/**/app.js", "miniapp/app/static/**/styles.css"),
         verification_check="platform_invariants",
-        instruction="Add the missing role-specific controls and JS handlers. For manager, expose dashboard/oversight actions that mutate shared workflow state through the accepted API.",
+        instruction="Read the acceptance contract and add only the missing role-owned controls and JS handlers. Use only the role responsibilities described by the LLM-derived contract.",
         required_next_tool="read_files",
         verification_command="run_checks platform_invariants",
         patterns=(_rx(r"missing_role_workflow_actions"), _rx(r"lacks its own workflow actions"), _rx(r"missing_role_actions")),
@@ -199,9 +294,9 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         target_files=("miniapp/app/static/**/app.js", "miniapp/app/static/**/index.html"),
         verification_check="platform_invariants",
         instruction=(
-            "Read the implicated role app.js. Replace every direct status passthrough with a fixed human label: "
-            "do not use `item.status`, `status`, `value`, or `key` after `||`; use a constant like `На обработке` "
-            "or `Без статуса` for unknown values, and render only statusLabel(...) in HTML."
+            "Read the implicated role app.js. Replace every direct persisted-state passthrough with a user-facing label "
+            "derived from the contract or current UI copy; do not render `item.status`, `status`, `value`, or `key` "
+            "as the visible default text."
         ),
         required_next_tool="read_files",
         suggested_tool_after_read="write_file",
@@ -211,31 +306,6 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
             _rx(r"raw_status_copy"),
             _rx(r"status label raw passthrough"),
             _rx(r"renders persisted status codes directly"),
-        ),
-    ),
-    RepairCatalogEntry(
-        signature="workflow.manager_missing_specialist_result_visibility",
-        issue_code="manager_missing_specialist_result_visibility",
-        severity="high",
-        likely_root_cause="Manager detail cards omit specialist-owned persisted fields, so a manager action happens without seeing the specialist result.",
-        target_files=(
-            "miniapp/app/static/manager/app.js",
-            "miniapp/app/static/manager/index.html",
-            "miniapp/tests/generated_app.test.mjs",
-        ),
-        verification_check="frontend_interaction_static_smoke",
-        instruction=(
-            "Read the manager role files and make the manager card/detail renderer display specialist-owned fields "
-            "before any manager decision/action. Prefer rendering Object.entries(FIELD_LABELS) or explicitly include all specialist "
-            "contract keys, then update the generated browser test."
-        ),
-        required_next_tool="read_files",
-        suggested_tool_after_read="write_file",
-        verification_command="run_checks frontend_interaction_static_smoke",
-        patterns=(
-            _rx(r"manager_missing_specialist_result_visibility"),
-            _rx(r"Manager role must render specialist-owned persisted result fields"),
-            _rx(r"Missing specialist fields in manager card/detail renderer"),
         ),
     ),
     RepairCatalogEntry(
@@ -255,40 +325,31 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         ),
     ),
     RepairCatalogEntry(
-        signature="workflow.prompt_specificity_mismatch",
-        issue_code="prompt_specificity_missing_fields",
+        signature="frontend.unwired_form",
+        issue_code="workflow_form_without_handler",
         severity="high",
-        likely_root_cause="Generated UI/API stayed on a generic scaffold instead of implementing the user's prompt-derived fields and role responsibilities.",
-        target_files=(
-            "miniapp/app/static/client/index.html",
-            "miniapp/app/static/client/app.js",
-            "miniapp/app/static/specialist/index.html",
-            "miniapp/app/static/specialist/app.js",
-            "miniapp/app/static/manager/index.html",
-            "miniapp/app/static/manager/app.js",
-            "miniapp/app/routes",
-            "miniapp/tests/test_generated_app.py",
-            "miniapp/tests/generated_app.test.mjs",
-        ),
+        likely_root_cause="A visible workflow form is present in HTML but the role JavaScript never binds a submit/change handler for it.",
+        target_files=("miniapp/app/static/**/index.html", "miniapp/app/static/**/app.js"),
         verification_check="frontend_interaction_static_smoke",
         instruction=(
-            "Replace generic placeholder UI with prompt-owned business fields, persist those fields through the API, "
-            "add prompt-assigned role actions, and update generated tests to prove the requested workflow."
+            "Read the exact role HTML page and app.js. Bind the visible form to a submit/change handler, build the API payload from the form fields, "
+            "persist it through the existing backend route, refresh rendered state, and keep optional controls guarded only after the required form is wired."
         ),
         required_next_tool="read_files",
+        suggested_tool_after_read="write_file",
         verification_command="run_checks frontend_interaction_static_smoke",
         patterns=(
-            _rx(r"prompt_specificity"),
-            _rx(r"generic_scaffold_leakage"),
-            _rx(r"placeholder labels"),
-            _rx(r"generic record UI"),
+            _rx(r"workflow_form_without_handler"),
+            _rx(r"workflow_form_without_submit_handler"),
+            _rx(r"Visible workflow forms must have a submit handler"),
+            _rx(r"no submit/change handler is wired"),
         ),
     ),
     RepairCatalogEntry(
         signature="workflow.cross_role_update_not_rendered_in_client",
         issue_code="cross_role_update_not_rendered_in_client",
         severity="high",
-        likely_root_cause="Operational roles persist update fields that the client page does not render after reload.",
+        likely_root_cause="A role persists update fields that another prompt-assigned observer/source role does not render after reload.",
         target_files=(
             "miniapp/app/static/client/app.js",
             "miniapp/app/static/specialist/app.js",
@@ -297,13 +358,14 @@ REPAIR_CATALOG: tuple[RepairCatalogEntry, ...] = (
         ),
         verification_check="frontend_interaction_static_smoke",
         instruction=(
-            "Align specialist/manager PATCH payload fields with the client card renderer so status, estimate, dates, notes, "
-            "priority, and management updates are visible to the client after reload."
+            "Align prompt-assigned update payload fields with the role card/detail renderers so persisted changes are visible after reload "
+            "where the acceptance contract says shared state must be observed."
         ),
         required_next_tool="read_files",
         verification_command="run_checks frontend_interaction_static_smoke",
         patterns=(
             _rx(r"cross_role_update_not_rendered_in_client"),
+            _rx(r"cross_role_update_not_rendered_in_role"),
             _rx(r"never renders after reload"),
         ),
     ),
@@ -453,11 +515,11 @@ class RepairCatalog:
             "repair_recipe": recipe,
             "source_issue": issue,
         }
-        target_files = list(
-            (catalog_entry.target_files if catalog_entry else None)
-            or recipe.get("target_files")
-            or issue.get("paths")
-            or []
+        target_files = RepairCatalog._target_files_from_recipe(
+            catalog_entry=catalog_entry,
+            recipe=recipe,
+            issue=issue,
+            candidate=candidate,
         )
         verification_check = str(
             (catalog_entry.verification_check if catalog_entry else None)
@@ -543,8 +605,52 @@ class RepairCatalog:
         return candidates
 
     @staticmethod
+    def _target_files_from_recipe(
+        *,
+        catalog_entry: RepairCatalogEntry | None,
+        recipe: dict[str, Any],
+        issue: dict[str, Any],
+        candidate: dict[str, Any],
+    ) -> list[str]:
+        paths: list[str] = []
+        missing_backend_route = str(candidate.get("code") or "").endswith("missing_backend_route") or bool(recipe.get("expected_route"))
+
+        def add(value: object) -> None:
+            text = str(value or "").strip().replace("\\", "/")
+            if not text:
+                return
+            if ":" in text and text.startswith("miniapp/"):
+                text = text.split(":", 1)[0].strip()
+            if text.startswith("miniapp/app/generated/"):
+                return
+            if text.startswith("miniapp/") and text not in paths:
+                paths.append(text)
+
+        for value in recipe.get("target_files") or []:
+            add(value)
+        for value in issue.get("paths") or []:
+            add(value)
+        add(candidate.get("location"))
+        add(recipe.get("frontend_ref"))
+        add(recipe.get("suggested_patch_target"))
+        if catalog_entry is not None and not missing_backend_route:
+            for value in catalog_entry.target_files:
+                add(value)
+        if missing_backend_route:
+            add(recipe.get("frontend_ref"))
+            add("miniapp/app/routes")
+            add("miniapp/app/routes/api.py")
+            add("miniapp/app/main.py")
+            add("miniapp/app/schemas.py")
+        if not paths and catalog_entry is not None:
+            for value in catalog_entry.target_files:
+                add(value)
+        return paths[:12]
+
+    @staticmethod
     def _entry_for_signature(signature: str, issue_code: str) -> RepairCatalogEntry | None:
+        normalized_issue = str(issue_code or "").split(".")[-1]
         for entry in REPAIR_CATALOG:
-            if entry.signature == signature or entry.issue_code == issue_code:
+            if entry.signature == signature or entry.issue_code == issue_code or entry.issue_code == normalized_issue:
                 return entry
         return None

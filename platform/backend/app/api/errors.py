@@ -81,6 +81,40 @@ def _code_for_status(status_code: int) -> str:
     return "api_error"
 
 
+def _provider_error_payload(request: Request, exc: Exception) -> tuple[int, dict[str, Any]] | None:
+    message = str(exc) or "Unhandled server error."
+    lowered = message.lower()
+    if "insufficient_quota" in lowered or "exceeded your current quota" in lowered:
+        status_code = 429
+        code = "provider.insufficient_quota"
+        return status_code, api_error_payload(
+            code=code,
+            message=message,
+            status_code=status_code,
+            retryable=False,
+            deterministic=False,
+            failure_class=code,
+            failure_signature=f"{code}:{request.url.path}",
+            details={"error_type": type(exc).__name__, "provider": "openai"},
+            path=request.url.path,
+        )
+    if "rate_limit" in lowered or "rate limit" in lowered or "returned 429" in lowered:
+        status_code = 429
+        code = "provider.rate_limited"
+        return status_code, api_error_payload(
+            code=code,
+            message=message,
+            status_code=status_code,
+            retryable=True,
+            deterministic=False,
+            failure_class=code,
+            failure_signature=f"{code}:{request.url.path}",
+            details={"error_type": type(exc).__name__, "provider": "openai"},
+            path=request.url.path,
+        )
+    return None
+
+
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     detail = exc.detail
     if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
@@ -120,6 +154,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    provider_error = _provider_error_payload(request, exc)
+    if provider_error is not None:
+        status_code, payload = provider_error
+        return JSONResponse(status_code=status_code, content=payload)
     payload = api_error_payload(
         code="internal_error",
         message=str(exc) or "Unhandled server error.",

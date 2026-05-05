@@ -12,6 +12,7 @@ from app.modules.miniapp_agent_loop.agent_file_state import AgentFileStateCache
 from app.modules.miniapp_agent_loop.agent_process_manager import AgentProcessManager
 from app.modules.miniapp_agent_loop.agent_kernel import plan_agent_tool_batches
 from app.modules.miniapp_agent_loop.agent_tool_registry import AgentToolRegistry
+from app.modules.miniapp_agent_loop.edit_validator import AgentEditValidator
 from app.modules.miniapp_agent_loop.semantic_tools import semantic_scan
 from app.modules.miniapp_agent_loop.agent_tool_runtime import (
     list_workspace_files,
@@ -57,7 +58,11 @@ class AgentToolExecutor:
     ) -> tuple[dict[str, str], list[dict[str, object]]]:
         loaded_context: dict[str, str] = {}
         tool_results: list[dict[str, object]] = []
-        workspace_tree = self.workspace_service.file_tree(workspace_id, run_id=run_id)
+        workspace_tree = [
+            path
+            for path in self.workspace_service.file_tree(workspace_id, run_id=run_id)
+            if self._is_model_visible_path(path)
+        ]
         tool_batch_plan = plan_agent_tool_batches(tool_calls)
         tool_results.append(
             {
@@ -94,7 +99,14 @@ class AgentToolExecutor:
             return [
                 self._strip_leading_dot_slash(item)
                 for item in request_item.get("targets") or []
-                if str(item or "").strip()
+                if str(item or "").strip() and self._is_model_visible_path(self._strip_leading_dot_slash(item))
+            ]
+
+        def blocked_targets(request_item: dict[str, Any]) -> list[str]:
+            return [
+                self._strip_leading_dot_slash(item)
+                for item in request_item.get("targets") or []
+                if str(item or "").strip() and not self._is_model_visible_path(self._strip_leading_dot_slash(item))
             ]
 
         def execute_read_only(request_item: dict[str, Any]) -> tuple[dict[str, str], dict[str, object]]:
@@ -102,6 +114,7 @@ class AgentToolExecutor:
             tool_name = str(request_item.get("tool") or "").strip().lower()
             use_id = str(request_item.get("tool_use_id") or tool_use_id(tool_name))
             request_targets = targets(request_item)
+            blocked_read_targets = blocked_targets(request_item)
             reason = str(request_item.get("reason") or "").strip()
             activity, label = tool_activity(tool_name)
             emit_activity(
@@ -133,6 +146,10 @@ class AgentToolExecutor:
                     "tool": "read_files",
                     "tool_use_id": use_id,
                     "targets": request_targets,
+                    "blocked_targets": blocked_read_targets,
+                    "blocked_target_reason": "protected generated/platform-owned files are hidden from model-facing read context; patch app-owned static role files, backend modules, or generated tests instead."
+                    if blocked_read_targets
+                    else "",
                     "files": summarize_read_file_payloads(file_contents=local_context),
                     "reason": reason,
                 }
@@ -164,7 +181,7 @@ class AgentToolExecutor:
                 emit_activity("hook_completed", "Post-tool hook", {"hook": "post_tool_use", "tool_use_id": use_id, "tool": tool_name, "status": "completed"})
                 return local_context, result
             if tool_name == "semantic_scan":
-                result = {**semantic_scan(root=draft_source, targets=request_targets), "reason": reason, "tool_use_id": use_id}
+                result = {**semantic_scan(root=draft_source, targets=request_targets), "reason": reason, "tool_use_id": use_id, "blocked_targets": blocked_read_targets}
                 total_items = (
                     len(result.get("python") or [])
                     + len(result.get("html") or [])
@@ -492,3 +509,8 @@ class AgentToolExecutor:
         while path.startswith("./"):
             path = path[2:]
         return path
+
+    @staticmethod
+    def _is_model_visible_path(raw_path: object) -> bool:
+        path = AgentToolExecutor._strip_leading_dot_slash(raw_path)
+        return bool(path) and not AgentEditValidator.is_protected_path(path)

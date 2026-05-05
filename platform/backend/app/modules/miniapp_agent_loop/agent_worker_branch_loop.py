@@ -524,7 +524,7 @@ class AgentWorkerBranchLoop:
             js = self._read_text(role_dir / "app.js")
             css = self._read_text(role_dir / "styles.css")
             if self._looks_like_neutral_shell(html):
-                missing.append(f"{role}/index.html prompt-specific role UI")
+                missing.append(f"{role}/index.html contract-derived role UI")
             if "fetch(" not in js or "addEventListener" not in js:
                 missing.append(f"{role}/app.js API fetch handlers")
             if self._looks_like_placeholder_css(css):
@@ -849,7 +849,7 @@ class AgentWorkerBranchLoop:
                 "Use read/search tools first if you need context; otherwise patch directly.",
                 "Use apply_patch_to_draft for existing files and write_file for new or full owned files.",
                 "Mutating tools write exactly one file_path per tool call. If your owned slice needs index.html, app.js, and styles.css, call write_file/apply_patch_to_draft separately for each file.",
-                "Do not write preloaded domain records.",
+                    "Do not write preloaded product records.",
             ],
             "current_step_instruction": (
                 "You have inspected enough context; now call write_file or apply_patch_to_draft for every required owned file."
@@ -866,6 +866,7 @@ class AgentWorkerBranchLoop:
                     "FastAPI tests must use `with TestClient(app) as client:` or explicitly create tables after importing generated ORM models before requests",
                     "generated_app.test.mjs as node:test",
                     "JS tests run with cwd=miniapp; read app/static/... and app/generated/... paths, not miniapp/app/... paths",
+                    "JS tests run in Node without browser DOM; do not import browser-only role app.js files unless the test creates explicit window/document mocks first",
                     "JS tests must derive role pages from app/generated/route_manifest.json and search the actual role HTML files; never assert that the manifest is empty",
                     "tests must import/run cleanly; do not write pytest-only top-level functions for Python",
                     "Python helpers must be valid code, for example '\\n'.join([a, b, c]) not str.join(a, b, c)",

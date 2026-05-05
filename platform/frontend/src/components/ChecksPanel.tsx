@@ -45,7 +45,7 @@ export function ChecksPanel({ matrix, promptContract, miniappContract, previewRu
             ))}
           </div>
         ) : (
-          <p className="muted">Prompt contract uses structured analysis; local lexical matching is disabled.</p>
+          <p className="muted">Prompt contract uses structured LLM analysis.</p>
         )}
         {promptContract ? <small>{promptContract.analysis_status ?? "analysis not loaded"}</small> : null}
       </div>

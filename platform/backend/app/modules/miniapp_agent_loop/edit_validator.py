@@ -25,6 +25,22 @@ class AgentEditValidator:
         "miniapp/app/generated/route_manifest.json",
         "miniapp/app/generated/contract_validator.json",
     )
+    PROTECTED_PATH_REPAIR_TARGETS = (
+        "miniapp/app/main.py",
+        "miniapp/app/schemas.py",
+        "miniapp/app/db.py",
+        "miniapp/app/static/client/index.html",
+        "miniapp/app/static/client/app.js",
+        "miniapp/app/static/client/styles.css",
+        "miniapp/app/static/specialist/index.html",
+        "miniapp/app/static/specialist/app.js",
+        "miniapp/app/static/specialist/styles.css",
+        "miniapp/app/static/manager/index.html",
+        "miniapp/app/static/manager/app.js",
+        "miniapp/app/static/manager/styles.css",
+        "miniapp/tests/test_generated_app.py",
+        "miniapp/tests/generated_app.test.mjs",
+    )
 
     @staticmethod
     def normalize_plan(plan: AgentTurnPlan) -> AgentTurnPlan:
@@ -79,10 +95,38 @@ class AgentEditValidator:
         }
         if evidence:
             payload.update(evidence)
+        if code == "protected_path":
+            blocked_files = [
+                cls._strip_leading_dot_slash(getattr(item, "file_path", ""))
+                for item in file_changes
+                if cls._strip_leading_dot_slash(getattr(item, "file_path", "")).startswith("miniapp/")
+                and cls._is_protected_path(cls._strip_leading_dot_slash(getattr(item, "file_path", "")))
+            ]
+            allowed_targets = [
+                cls._strip_leading_dot_slash(getattr(item, "file_path", ""))
+                for item in file_changes
+                if cls._strip_leading_dot_slash(getattr(item, "file_path", "")).startswith("miniapp/")
+                and not cls._is_protected_path(cls._strip_leading_dot_slash(getattr(item, "file_path", "")))
+            ]
+            if not allowed_targets:
+                allowed_targets = cls._protected_path_repair_targets(blocked_files)
+            payload.update(
+                {
+                    "blocked_files": blocked_files[:8],
+                    "forbidden_target_files": blocked_files[:8],
+                    "target_files": allowed_targets[:8],
+                    "allowed_alternative_files": allowed_targets[:8],
+                    "required_next_action": (
+                        "Do not edit protected generated/platform files. Read the allowed app-owned targets, "
+                        "then implement the behavior in static role files, app-owned backend modules, or generated tests."
+                    ),
+                }
+            )
+        packet_file_path = "" if code == "protected_path" else file_path
         return EditFailurePacket.from_edit_issue(
             code=code,
             message=message,
-            file_path=file_path,
+            file_path=packet_file_path,
             evidence=payload,
             attempt=attempt,
             repeated_count=repeated_count,
@@ -153,7 +197,13 @@ class AgentEditValidator:
         total_chars = 0
         seen_paths: set[str] = set()
         for operation in file_changes:
-            normalized_path = cls._normalize_path(getattr(operation, "file_path", ""))
+            raw_path = cls._strip_leading_dot_slash(getattr(operation, "file_path", ""))
+            if raw_path.startswith("miniapp/") and cls._is_protected_path(raw_path):
+                return (
+                    "protected_path",
+                    f"{raw_path} is protected generated/platform-owned output and cannot be edited by the agent loop. Patch app-owned static role files, backend modules, or generated tests instead.",
+                )
+            normalized_path = cls._normalize_path(raw_path)
             if not normalized_path:
                 return ("unsafe_path", "Every file change must target a relative path inside miniapp/.")
             if normalized_path in seen_paths:
@@ -234,6 +284,10 @@ class AgentEditValidator:
         return path
 
     @classmethod
+    def is_protected_path(cls, path: str) -> bool:
+        return cls._is_protected_path(path)
+
+    @classmethod
     def _is_protected_path(cls, path: str) -> bool:
         normalized = cls._strip_leading_dot_slash(path)
         parts = set(normalized.split("/"))
@@ -241,6 +295,31 @@ class AgentEditValidator:
         if parts.intersection(protected_dirs):
             return True
         return any(not item.endswith("/") and (normalized == item or normalized.endswith(f"/{item}")) for item in cls.PROTECTED_PATHS)
+
+    @classmethod
+    def _protected_path_repair_targets(cls, blocked_files: list[str]) -> list[str]:
+        blocked = {cls._strip_leading_dot_slash(path) for path in blocked_files}
+        if any(path.startswith("miniapp/app/routes/role_") for path in blocked):
+            return [
+                "miniapp/app/static/client/index.html",
+                "miniapp/app/static/client/app.js",
+                "miniapp/app/static/specialist/index.html",
+                "miniapp/app/static/specialist/app.js",
+                "miniapp/app/static/manager/index.html",
+                "miniapp/app/static/manager/app.js",
+                "miniapp/tests/generated_app.test.mjs",
+            ]
+        if any(path.startswith("miniapp/app/generated/") for path in blocked):
+            return [
+                "miniapp/app/main.py",
+                "miniapp/app/schemas.py",
+                "miniapp/app/static/client/app.js",
+                "miniapp/app/static/specialist/app.js",
+                "miniapp/app/static/manager/app.js",
+                "miniapp/tests/test_generated_app.py",
+                "miniapp/tests/generated_app.test.mjs",
+            ]
+        return list(cls.PROTECTED_PATH_REPAIR_TARGETS[:8])
 
     @staticmethod
     def _strip_leading_dot_slash(raw_path: object) -> str:

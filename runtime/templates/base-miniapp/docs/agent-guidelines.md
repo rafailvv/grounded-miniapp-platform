@@ -15,7 +15,7 @@ The user's prompt is the only source of product meaning. Template files provide 
 - Name models, routes, pages, and UI with the user's own product language from the prompt.
 - Generate light-mode UI by default: light backgrounds, dark readable text, and accessible contrast. Use a dark theme only when the user explicitly asks for it.
 - Every generated create app must be usable, not static-only: include forms/buttons, frontend `fetch` calls, and backend APIs that save user-provided records.
-- Do not include mock data, seed data, demo data, sample data, fixtures, preloaded records, or hard-coded domain records in generated app source. Start with empty persistent state and prompt-specific empty states.
+- Do not include mock data, seed data, demo data, sample data, fixtures, preloaded records, or hard-coded product records in generated app source. Start with empty persistent state and prompt-derived empty states.
 - Fast create needs at least one prompt-derived persistent flow with `GET` and `POST`. Balanced should connect a small number of related flows or add status/update behavior. Quality should provide detailed multi-role workflows with richer validation and design.
 - Add generated app tests in `miniapp/tests/test_generated_app.py` and `miniapp/tests/generated_app.test.mjs`.
 - Keep generated tests dependency-free beyond the template runtime: Python `unittest` + FastAPI `TestClient`, and Node `node:test` + `fs/path`.

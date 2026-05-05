@@ -90,7 +90,7 @@ def normalize_prompt_contract_analysis(
     prompt: str,
     analysis: dict[str, Any],
 ) -> dict[str, Any]:
-    """Normalize structured LLM prompt analysis without local lexical extraction.
+    """Normalize structured LLM prompt analysis without local term extraction.
 
     This function is intentionally not an NLP parser and does not locally mine
     product terms from the prompt. The LLM is the only component allowed to
@@ -156,9 +156,8 @@ def extract_prompt_planning_hints(
     """Return contract hints from structured LLM analysis only.
 
     The previous implementation tried to infer fields/resources from prompt
-    local lexical parsing. That was too brittle and could accidentally bias
-    generation toward a domain. The runtime now requires structured model
-    analysis.
+    local term parsing. That was too brittle and could accidentally bias
+    generation. The runtime now requires structured model analysis.
     """
     return normalize_prompt_contract_analysis(prompt, prompt_analysis)
 
@@ -271,89 +270,6 @@ def normalized_generation_mode(generation_mode: GenerationMode | str | None) -> 
     return str(getattr(generation_mode, "value", generation_mode) or "").strip().lower()
 
 
-def is_behavior_workflow_prompt(prompt: str) -> bool:
-    text = str(prompt or "").strip().lower()
-    if not text:
-        return False
-    strong_markers = (
-        "after adding",
-        "does not load",
-        "doesn't load",
-        "не подгружается",
-        "не работает",
-        "не нажим",
-        "после добавления",
-        "должно появляться",
-        "появлялось",
-    )
-    if any(marker in text for marker in strong_markers):
-        return True
-    broad_flow_terms = ("button", "form", "list", "кнопк", "форма", "список")
-    if any(marker in text for marker in broad_flow_terms) and any(
-        marker in text
-        for marker in (
-            "does not",
-            "doesn't",
-            "not work",
-            "не работает",
-            "не нажим",
-            "после",
-            "появ",
-            "refresh",
-            "подгруж",
-        )
-    ):
-        return True
-    role_markers = (
-        "client",
-        "specialist",
-        "manager",
-        "worker",
-        "клиент",
-        "исполнитель",
-        "специалист",
-        "менеджер",
-    )
-    cross_role_markers = (
-        "all three",
-        "three parts",
-        "across roles",
-        "visible in",
-        "во всех трех",
-        "во всех трёх",
-        "в трех частях",
-        "в трёх частях",
-        "видна во",
-        "видно во",
-        "видит",
-    )
-    add_or_extend_markers = (
-        "add",
-        "extend",
-        "include",
-        "добав",
-        "расшир",
-        "выбирает",
-        "фильтр",
-        "сводк",
-    )
-    persistence_markers = (
-        "persist",
-        "save",
-        "refresh",
-        "reload",
-        "сохраня",
-        "после обновления",
-        "после перезагруз",
-    )
-    role_count = sum(1 for marker in role_markers if marker in text)
-    return (
-        any(marker in text for marker in add_or_extend_markers)
-        and (role_count >= 2 or any(marker in text for marker in cross_role_markers))
-        and any(marker in text for marker in persistence_markers + cross_role_markers)
-    )
-
-
 def build_acceptance_contract(
     *,
     prompt: str,
@@ -396,7 +312,7 @@ def build_acceptance_contract(
             ],
             "required_tests": [
                 "Python generated test verifies the actual app-owned API and persistence behavior, without assuming fixed update routes.",
-                "JS generated test verifies real role pages, prompt-specific controls, frontend API usage, and handler wiring.",
+                "JS generated test verifies real role pages, contract-derived controls, frontend API usage, and handler wiring.",
             ],
         }
     ]
@@ -645,7 +561,7 @@ def orchestration_metadata_for_contract(
         else "agent_tool_call_loop_with_design_pass" if enabled and mode_value == GenerationMode.QUALITY.value
         else "agent_tool_call_loop" if enabled else "none"
     )
-    isolated_worker_drafts = enabled and mode_value == GenerationMode.FAST.value
+    isolated_worker_drafts = False
     phases = [
         {
             "id": "spec_extract",
@@ -655,11 +571,7 @@ def orchestration_metadata_for_contract(
         {
             "id": "build",
             "status": "planned" if enabled else "not_required",
-            "description": (
-                "Use owned agent worker drafts for backend/API, role UI, and generated tests, then merge non-conflicting diffs."
-                if isolated_worker_drafts
-                else "Use the blank technical runtime plus prompt-contract metadata; serialize backend/API, role UI, test, and design mutations through the coordinator tool loop."
-            ),
+            "description": "Use the blank technical runtime plus prompt-contract metadata; serialize backend/API, role UI, test, and design mutations through the coordinator tool loop.",
         },
         {
             "id": "merge",
@@ -691,7 +603,7 @@ def orchestration_metadata_for_contract(
         {
             "worker": "manager_ui",
             "ownership": ["miniapp/app/static/manager/**"],
-            "responsibility": "Dashboard metrics, oversight controls, and shared-state visibility.",
+            "responsibility": "Prompt-derived manager workflow, shared-state visibility, and any manager-owned source/update controls.",
         },
         {
             "worker": "generated_tests",
@@ -705,7 +617,7 @@ def orchestration_metadata_for_contract(
         "workflow_kind": workflow_kind,
         "execution_style": execution_style,
         "isolated_worker_drafts": isolated_worker_drafts,
-        "agent_worker_count": len(worker_summaries) if enabled else 0,
+        "agent_worker_count": len(worker_summaries) if enabled and isolated_worker_drafts else 0,
         "phases": phases,
-        "worker_summaries": worker_summaries if enabled else [],
+        "worker_summaries": worker_summaries if enabled and isolated_worker_drafts else [],
     }

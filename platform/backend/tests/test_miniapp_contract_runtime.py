@@ -64,7 +64,7 @@ def test_materializer_is_idempotent_and_registry_passes(tmp_path: Path) -> None:
     first = MiniAppContractMaterializer.materialize(source, contract)
     second = MiniAppContractMaterializer.materialize(source, contract)
     snapshot = MiniAppRouteRegistry.snapshot(source, contract)
-    preloaded_issues, preloaded_findings = CheckRunner._preloaded_domain_data_issues(source)
+    preloaded_issues, preloaded_findings = CheckRunner._preloaded_product_data_issues(source)
 
     assert "miniapp/app/generated/miniapp_contract.json" in first
     assert all("miniapp/app/routes/" not in path for path in first)
@@ -81,16 +81,16 @@ def test_contract_materializer_does_not_write_product_role_shell(tmp_path: Path)
     original_client_html = (source / "miniapp/app/static/client/index.html").read_text(encoding="utf-8")
     original_manager_html = (source / "miniapp/app/static/manager/index.html").read_text(encoding="utf-8")
     original_manager_js = (source / "miniapp/app/static/manager/app.js").read_text(encoding="utf-8")
-    analysis = _analysis("товар")
+    analysis = _analysis("каталог")
     analysis["role_field_hints"] = {
         "client": [],
         "specialist": [],
-        "manager": ["название товара", "цена", "остаток"],
+        "manager": ["название элемента", "тип", "доступность"],
     }
     analysis["role_action_prompts"] = {
         "client": ["смотрит каталог"],
         "specialist": [],
-        "manager": ["выкладывает товары"],
+        "manager": ["публикует элементы"],
     }
     analysis["role_state_contract"] = {
         "source_roles": ["manager"],
@@ -101,7 +101,7 @@ def test_contract_materializer_does_not_write_product_role_shell(tmp_path: Path)
     contract = MiniAppContractCompiler.compile(
         workspace_id="ws_test",
         run_id="run_test",
-        prompt="Создай интернет-магазин: менеджер сам выкладывает товары, клиент смотрит каталог.",
+        prompt="Создай каталог: менеджер публикует элементы, клиент смотрит каталог.",
         intent="create",
         generation_mode=GenerationMode.QUALITY,
         prompt_analysis=analysis,
@@ -117,7 +117,7 @@ def test_contract_materializer_does_not_write_product_role_shell(tmp_path: Path)
     assert manager_html == original_manager_html
     assert manager_js == original_manager_js
     assert "nazvanieTovara" not in manager_html
-    assert "выкладывает товары" not in manager_html
+    assert "публикует элементы" not in manager_html
     assert "DETAIL_FIELD_LABELS" not in manager_js
     assert "Одобрена" not in manager_html
     assert "Отклонена" not in manager_html

@@ -78,7 +78,6 @@ from app.services.platform_shell import BASE_STYLESHEET_HREF, BASE_STYLESHEET_PA
 from app.services.workflow_acceptance import (
     build_acceptance_contract,
     build_implementation_plan,
-    is_behavior_workflow_prompt,
     orchestration_metadata_for_contract,
 )
 from app.services.workspace.log_service import WorkspaceLogService
@@ -101,99 +100,6 @@ FOCUSED_VISUAL_CONTENT_MAX_LENGTH = 12000
 TOOL_RESULT_SPILL_THRESHOLD_CHARS = 6000
 PATCH_FIRST_EXISTING_FILE_CHAR_LIMIT = 2500
 PATCH_FIRST_EXISTING_FILE_LINE_LIMIT = 120
-FOCUSED_VISUAL_STYLE_MARKERS = (
-    "background",
-    "border",
-    "color",
-    "colors",
-    "css",
-    "font",
-    "palette",
-    "padding",
-    "spacing",
-    "style",
-    "theme",
-    "typography",
-    "visual",
-    "акцент",
-    "визуал",
-    "внешний вид",
-    "отступ",
-    "палитр",
-    "размер",
-    "стил",
-    "тем",
-    "фон",
-    "цвет",
-    "шрифт",
-    "фиолет",
-    "синий",
-    "синю",
-    "синее",
-    "сини",
-    "красн",
-    "зелен",
-    "зелён",
-    "желт",
-    "жёлт",
-    "черн",
-    "чёрн",
-    "бел",
-    "серый",
-    "серую",
-    "серое",
-    "серые",
-)
-FOCUSED_COPY_EDIT_MARKERS = (
-    "copy",
-    "heading",
-    "label",
-    "rename",
-    "text",
-    "title",
-    "заголов",
-    "лейбл",
-    "назван",
-    "надпис",
-    "переимен",
-    "слово",
-    "текст",
-)
-BEHAVIOR_EDIT_MARKERS = (
-    "/api",
-    "api",
-    "app.js",
-    "backend",
-    "database",
-    "endpoint",
-    "fetch",
-    "javascript",
-    "method:",
-    "patch",
-    "post",
-    "put",
-    "route",
-    "server",
-    "status",
-    "бекенд",
-    "бэк",
-    "логик",
-    "маршрут",
-    "сервер",
-    "статус",
-    "эндпоинт",
-)
-VISUAL_EDIT_NEGATES_LOGIC_MARKERS = (
-    "do not change logic",
-    "don't change logic",
-    "no logic changes",
-    "without changing logic",
-    "без изменения логики",
-    "логику не меняй",
-    "не менять логику",
-    "не меняй логику",
-    "не трогай логику",
-)
 READ_ONLY_WRITE_PREFIXES = (
     ".git/",
     "node_modules/",
@@ -454,24 +360,7 @@ class WorkspaceCodeAgentRuntime:
         intent = str(request.intent or "").strip().lower()
         if intent not in {"edit", "refine", "role_only_change"}:
             return "standard"
-        prompt = str(request.prompt or "").strip().lower()
-        if not prompt:
-            return "behavior_edit"
-        if is_behavior_workflow_prompt(prompt):
-            return "behavior_workflow_edit"
-        if cls._contains_any_marker(prompt, FOCUSED_VISUAL_STYLE_MARKERS) and cls._contains_any_marker(prompt, VISUAL_EDIT_NEGATES_LOGIC_MARKERS):
-            return "visual_style_edit"
-        if cls._contains_any_marker(prompt, BEHAVIOR_EDIT_MARKERS):
-            return "behavior_edit"
-        if cls._contains_any_marker(prompt, FOCUSED_VISUAL_STYLE_MARKERS):
-            return "visual_style_edit"
-        if cls._contains_any_marker(prompt, FOCUSED_COPY_EDIT_MARKERS):
-            return "small_copy_edit"
         return "behavior_edit"
-
-    @staticmethod
-    def _contains_any_marker(text: str, markers: tuple[str, ...]) -> bool:
-        return any(marker in text for marker in markers)
 
     @staticmethod
     def _focused_visual_css_paths(role_scope: list[str] | tuple[str, ...] | None = None) -> list[str]:
@@ -538,7 +427,7 @@ class WorkspaceCodeAgentRuntime:
     def _sync_route_manifest_from_static_pages(source_dir: Path) -> bool:
         """Keep platform routing metadata aligned with generated role pages.
 
-        This does not generate product UI or domain data. It only makes every
+        This does not generate product UI or product data. It only makes every
         existing static role page reachable through the mini-app shell so
         tests, preview, and browser proof operate on the same route graph.
         """
@@ -2641,7 +2530,11 @@ class WorkspaceCodeAgentRuntime:
         next_forced_action: dict[str, Any] | None = None,
         diagnostics_delta: dict[str, Any] | None = None,
     ) -> str:
-        file_tree = self.workspace_service.file_tree(workspace_id, run_id=run_id)
+        file_tree = [
+            path
+            for path in self.workspace_service.file_tree(workspace_id, run_id=run_id)
+            if self._agent_model_visible_path(path)
+        ]
         generation_mode = self._generation_mode(request.generation_mode)
         intent_value = str(request.intent or "").strip().lower()
         current_draft_diff = self.workspace_service.diff(workspace_id, run_id=run_id).strip()
@@ -2729,13 +2622,15 @@ class WorkspaceCodeAgentRuntime:
                 )
             )
             for path in repair_context_paths:
+                if not self._agent_model_visible_path(path):
+                    continue
                 content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
                 if content is not None:
                     repair_context[path] = content
             if generated_tests_repair:
                 for path, content in extra_file_context.items():
                     normalized = self._strip_leading_dot_slash(path)
-                    if normalized.startswith("miniapp/") and normalized not in repair_context:
+                    if normalized.startswith("miniapp/") and self._agent_model_visible_path(normalized) and normalized not in repair_context:
                         repair_context[normalized] = content
         file_context_payload = (
             self._compact_file_contexts(
@@ -2746,13 +2641,43 @@ class WorkspaceCodeAgentRuntime:
             if compact_repair_prompt
             else {
                 **self._compact_file_contexts(
-                    initial_context,
+                    {
+                        path: content
+                        for path, content in initial_context.items()
+                        if self._agent_model_visible_path(path)
+                    },
                     max_files=8 if focused_visual_edit else 14,
                     max_chars=9000 if focused_visual_edit else 6000,
                 ),
-                **self._compact_file_contexts(extra_file_context, max_files=4 if focused_visual_edit else 12),
+                **self._compact_file_contexts(
+                    {
+                        path: content
+                        for path, content in extra_file_context.items()
+                        if self._agent_model_visible_path(path)
+                    },
+                    max_files=4 if focused_visual_edit else 12,
+                ),
             }
         )
+        forced_registry_tools: set[str] | None = None
+        if isinstance(next_forced_action, dict):
+            forced_registry_tools = {
+                str(item)
+                for item in (next_forced_action or {}).get("forced_tool_names", [])
+                if str(item).strip()
+            }
+            if not forced_registry_tools:
+                nested_forced = (next_forced_action or {}).get("next_forced_action")
+                if isinstance(nested_forced, dict):
+                    forced_registry_tools = {
+                        str(item)
+                        for item in nested_forced.get("allowed_tools", [])
+                        if str(item).strip()
+                    }
+        if not forced_registry_tools and (
+            generated_tests_repair or browser_step_repair or (compact_repair_prompt and repeated_no_progress > 0)
+        ):
+            forced_registry_tools = {"apply_patch_to_draft", "write_file"}
         payload = {
             "task": "Edit the draft workspace to satisfy the user prompt and pass platform invariant checks.",
             "workspace_id": workspace_id,
@@ -2831,9 +2756,7 @@ class WorkspaceCodeAgentRuntime:
                 else {}
             ),
             "tool_registry": self._agent_tool_registry_payload(
-                {"apply_patch_to_draft", "write_file"}
-                if generated_tests_repair or browser_step_repair or (compact_repair_prompt and repeated_no_progress > 0)
-                else None
+                forced_registry_tools
             ),
             "repair_focus": (
                 str((next_forced_action or {}).get("repair_focus") or "")
@@ -2924,10 +2847,10 @@ class WorkspaceCodeAgentRuntime:
                     *focused_rules,
                     f"Keep each turn applyable: use mutating tools for a compact coherent edit, or request only the specific read-only tools needed for the next patch.",
                     "Use the implementation_plan and acceptance_contract as the product contract. Derive entities, fields, routes, labels, and role actions from the user's prompt and current code, not from platform templates.",
-                    "If acceptance_contract.api_contract.field_hints is non-empty, the prompt-owned source role form, persisted API payload, rendered cards, and generated tests must expose those prompt-derived fields. Generic placeholder labels/lists are a blocking product failure, even if compile/apply passes.",
-                    "Each role surface must visibly reflect its own prompt sentences and implementation_plan.role_state_contract responsibilities. Do not satisfy a role with only a generic refresh/list page when the prompt assigns concrete actions.",
+                    "Do not satisfy the contract with fixed sample nouns or a platform-default workflow; implement the concrete entities, controls, and persisted state described by the LLM-derived acceptance contract and the current code.",
+                    "Each role surface must satisfy its own LLM-derived role responsibilities. Do not satisfy a role with only a generic data-refresh page when the contract assigns concrete actions.",
                     "Create/workflow completion requires real UI controls, JavaScript handlers, backend persistence, generated tests, cross-role visibility, refresh persistence, and browser/mobile proof.",
-                    "Build three isolated role surfaces in the miniapp shell: source roles create/publish the main prompt-derived state, update roles edit/update it, and observer roles browse/use it. Do not link role roots to each other and do not force unrequested workflow semantics.",
+                    "Build three isolated role surfaces in the miniapp shell. Role responsibilities come only from the LLM-derived acceptance contract; do not link role roots to each other and do not force unrequested workflow semantics.",
                     "For multi-page role apps, shared static/<role>/app.js must initialize per page: use body[data-view] or route, guard optional DOM nodes from other pages, and bind every visible child-page form/button/control to persisted API behavior.",
                     "The source role must display its original submitted state and any persisted prompt-derived update fields after reload; observer roles should show the shared state without duplicate source controls.",
                     "User-facing UI copy must be polished product language: do not render raw API paths, the word API, HTTP methods, internal route names, role slugs, or enum codes like `new`/`preparing`; map persisted values to human-readable labels and keep label/value pairs visually separated.",
@@ -2935,8 +2858,8 @@ class WorkspaceCodeAgentRuntime:
                     "Do not initialize workflow bindings only with `document.addEventListener('DOMContentLoaded', init)`. Use a readyState guard (`if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();`) so forms still bind when scripts load after DOMContentLoaded in preview/browser verification.",
                     "Fast should be compact and working; Balanced should add moderate workflow/design depth; Quality should first get the workflow green, then add a polished mobile design pass. Never add pages or resources just to satisfy a fixed count.",
                     "Mobile-first: target Telegram widths around 360-430px, use one consistent light neutral product visual system across all roles unless the user explicitly asks for a dark theme, preserve safe top spacing/preview bridge, and avoid horizontal scroll or overlapping cards/forms/actions.",
-                    "Generated source must start empty: no mock, seed, demo, sample, fixture, preloaded, or hard-coded domain records. Empty states and validation test payloads are allowed.",
-                    "Generated tests must verify the actual app contract: persisted API behavior, real role HTML/JS selectors, prompt-assigned actions, and no stale UI-only controls. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods. FastAPI generated tests should use `with TestClient(app) as client:` so lifespan/table setup runs, or explicitly create tables after generated ORM models are imported. JS generated tests run from cwd=miniapp, so read app/static/... and app/generated/... paths, not miniapp/app/... paths. Do not write pytest-only top-level test functions. Patch tests only when they are stale with the app contract.",
+                    "Generated source must start empty: no mock, seed, demo, sample, fixture, preloaded, or hard-coded product records. Empty states and validation test payloads are allowed.",
+                    "Generated tests must verify the actual app contract: persisted API behavior, real role HTML/JS selectors, prompt-assigned actions, and no stale UI-only controls. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods. FastAPI generated tests should use `with TestClient(app) as client:` so lifespan/table setup runs, or explicitly create tables after generated ORM models are imported. JS generated tests run from cwd=miniapp, so read app/static/... and app/generated/... paths, not miniapp/app/... paths. Node has no browser DOM: do not import browser-only role app.js files unless the test creates explicit window/document mocks first; prefer source-text assertions for selectors, API calls, routes, and handlers. Do not write pytest-only top-level test functions. Patch tests only when they are stale with the app contract.",
                     "For edit/refine/fix/repair, patch existing files with small unified diffs. Use full-file replace only for new files, tiny files, create-mode work, or a file that repeatedly conflicts.",
                     "If checks/browser proof fail, repair the concrete failing slice from latest_checks/tool_results: align selectors, payload fields, API routes, rendered state, and tests together. Do not rewrite unrelated files.",
                     "Read-only tools never write files. Mutating tools are serialized through the draft edit validator. run_command is limited to safe diagnostics such as unittest, py_compile, node tests/checks, rg, sed, and ls.",
@@ -2977,7 +2900,7 @@ class WorkspaceCodeAgentRuntime:
             "system_contract": {
                 "agent_style": "plan, inspect, patch, verify, repair",
                 "source_of_truth": "user prompt, current code, validation, and browser proof",
-                "domain_binding": "none",
+                "product_binding": "none",
                 "completion_gate": "strict checks plus real browser/mobile proof",
             },
             "implementation_plan": WorkspaceCodeAgentRuntime._compact_jsonish(implementation_plan, max_chars=1400, max_items=10),
@@ -3274,7 +3197,7 @@ class WorkspaceCodeAgentRuntime:
             f"{failed_step!r} for role {failed_role!r} on route {failed_route!r} selector {failed_selector!r}. "
             "Patch the smallest relevant role UI/JS/CSS slice so the browser action changes persisted state, "
             "the affected role renders it after reload, and downstream roles observe it. "
-            "Do not rebuild worker branches, add domain templates, or rewrite unrelated files."
+            "Do not rebuild worker branches, add product templates, or rewrite unrelated files."
         )
 
     @staticmethod
@@ -3851,12 +3774,11 @@ class WorkspaceCodeAgentRuntime:
             "This is a compact code-agent repair turn for the current draft. Do not rebuild the whole app unless the failing file is missing.",
             "Read the latest check/browser diagnostics as the source of truth, patch the smallest connected slice, then let validation run again.",
             "Prefer apply_patch_to_draft for existing files. Use write_file only for a new/missing/tiny file or after a repeated apply conflict on that same file.",
-            "Keep the app prompt-owned and prompt-derived: do not introduce platform templates, seed/demo/mock domain records, or fixed resource/page names.",
-            "Prompt-specificity failures are blocking: replace generic placeholder UI with the user's fields, persisted payload fields, rendered card labels, and prompt-assigned role controls.",
+            "Keep the app prompt-owned and prompt-derived: do not introduce platform templates, seed/demo/mock product records, or fixed resource/page names.",
             "For create/workflow failures, keep HTML controls, JavaScript handlers, API routes/schemas, persistence, and generated tests aligned to one actual contract.",
             "Browser-flow failures are product failures: make the UI action change persisted state, make other roles observe it, and make reload preserve it.",
-            "The source/user-facing role must render persisted fields that prompt-assigned operational roles can update. It is not enough to show only the fields originally submitted by the user when the prompt requires later changes to be visible.",
-            "Generated tests should verify the actual app contract. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods; use FastAPI TestClient as a context manager when app lifespan creates tables; never replace tests with pytest-only top-level functions. JS generated tests run from cwd=miniapp, so path reads should be app/static/... and app/generated/.... Patch stale/brittle test expectations only when the app behavior is already correct.",
+            "A role that creates shared state must render the persisted fields relevant to its contract. If the contract assigns later changes to another role, those changes must become visible to the relevant roles after refresh.",
+            "Generated tests should verify the actual app contract. Python generated tests must be unittest-discoverable: import unittest, define a unittest.TestCase subclass, and put assertions inside test_* methods; use FastAPI TestClient as a context manager when app lifespan creates tables; never replace tests with pytest-only top-level functions. JS generated tests run from cwd=miniapp, so path reads should be app/static/... and app/generated/.... Node has no browser DOM: do not import browser-only role app.js files unless the test creates explicit window/document mocks first; prefer source-text assertions for selectors, API calls, routes, and handlers. Patch stale/brittle test expectations only when the app behavior is already correct.",
             "Mobile layout fixes must target 360-430px width: no horizontal scroll, no overlapping critical cards/forms/actions, and readable wrapping.",
             "For multi-page role apps, a shared static/<role>/app.js must be view-aware: branch by body[data-view] or route, guard optional DOM nodes that exist only on other pages, and bind every visible form/button/control on root and child pages.",
         ]
@@ -3886,12 +3808,12 @@ class WorkspaceCodeAgentRuntime:
     def _first_blocking_issue_from_execution(execution: CheckExecutionRecord) -> dict[str, object]:
         priority = {
             "changed_files_static": 0,
-            "platform_invariants": 1,
-            "frontend_interaction_static_smoke": 2,
-            "browser_flow_smoke": 3,
-            "generated_app_python_tests": 4,
-            "generated_app_js_tests": 5,
-            "connectivity_validators": 6,
+            "connectivity_validators": 1,
+            "platform_invariants": 2,
+            "frontend_interaction_static_smoke": 3,
+            "browser_flow_smoke": 4,
+            "generated_app_python_tests": 5,
+            "generated_app_js_tests": 6,
         }
         for result in sorted(
             [item for item in execution.results if item.status == "failed"],
@@ -3930,10 +3852,17 @@ class WorkspaceCodeAgentRuntime:
             location = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(
                 str(diagnostics.get("location") or diagnostics.get("path") or diagnostics.get("file_path") or "")
             )
+            diagnostic_code = str(diagnostics.get("code") or result.name)
+            for nested_key in ("static_js_syntax_error", "python_name_error"):
+                nested = diagnostics.get(nested_key)
+                if isinstance(nested, dict) and nested.get("file_path"):
+                    location = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(str(nested.get("file_path") or ""))
+                    diagnostic_code = nested_key
+                    break
             if location:
                 return {
                     "check": result.name,
-                    "code": str(diagnostics.get("code") or result.name),
+                    "code": diagnostic_code,
                     "message": str(result.details or "")[:1000],
                     "location": location,
                     "required_next_action": "Patch the named source file and the smallest connected workflow slice.",
@@ -3950,9 +3879,10 @@ class WorkspaceCodeAgentRuntime:
                 diagnostics.get("path"),
                 diagnostics.get("location"),
             ]
-            syntax_error = diagnostics.get("static_js_syntax_error")
-            if isinstance(syntax_error, dict):
-                candidates.append(syntax_error.get("file_path"))
+            for diagnostic_key in ("static_js_syntax_error", "python_name_error"):
+                diagnostic_payload = diagnostics.get(diagnostic_key)
+                if isinstance(diagnostic_payload, dict):
+                    candidates.append(diagnostic_payload.get("file_path"))
             if result.name == "generated_app_python_tests":
                 candidates.append("miniapp/tests/test_generated_app.py")
                 candidates.extend(
@@ -4001,7 +3931,7 @@ class WorkspaceCodeAgentRuntime:
                     code = str(payload.get("code") or "")
                     location = str(payload.get("location") or payload.get("path") or payload.get("file_path") or "").replace("\\", "/")
                     if code == "platform.frontend_missing_update_api" or location.rstrip("/") == "miniapp/app/static":
-                        for role in ("specialist", "manager"):
+                        for role in ROLE_ORDER:
                             candidates.extend(
                                 [
                                     f"miniapp/app/static/{role}/index.html",
@@ -4300,7 +4230,7 @@ class WorkspaceCodeAgentRuntime:
                 "If this is a repair for an existing draft, patch the smallest coherent failing workflow slice and touch only the concrete failed files/checks; do not rebuild the whole app. "
                 "If this is the first implementation, write a compact but complete prompt-derived app surface, avoid inline styles and long comments, and do not request more context unless a specific required file is absent. "
                 "Keep the app working, not static-only: align backend API routes, form/fetch frontend code, and generated tests around the same persisted fields. "
-                "Do not add mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded domain records."
+                "Do not add mock data, seed data, demo data, sample data, fixture records, preloaded records, or hard-coded product records."
             )
         else:
             next_action = (
@@ -4325,7 +4255,7 @@ class WorkspaceCodeAgentRuntime:
                 "Call apply_patch_to_draft or write_file now. Do not request more read-only tools in the next answer. "
                 "Use the file_contexts and latest_checks already provided. "
                 + (
-                    "For create, produce compact writes that advance the prompt-derived app contract across backend, role UI, frontend behavior, route manifest when needed, and generated tests. Keep HTML concise and do not include large inline style blocks or preloaded domain records."
+                    "For create, produce compact writes that advance the prompt-derived app contract across backend, role UI, frontend behavior, route manifest when needed, and generated tests. Keep HTML concise and do not include large inline style blocks or preloaded product records."
                     if create_task
                     else "For edit/fix, patch the smallest complete set of files needed for the requested behavior."
                 )
@@ -4534,6 +4464,11 @@ class WorkspaceCodeAgentRuntime:
         while path.startswith("./"):
             path = path[2:]
         return path
+
+    @staticmethod
+    def _agent_model_visible_path(raw_path: object) -> bool:
+        path = WorkspaceCodeAgentRuntime._strip_leading_dot_slash(raw_path)
+        return bool(path) and not AgentEditValidator.is_protected_path(path)
 
     def _store_agent_quality_report(self, workspace_id: str, run_id: str, execution: CheckExecutionRecord) -> None:
         role_coverage: dict[str, Any] = {}
@@ -5200,10 +5135,14 @@ class WorkspaceCodeAgentRuntime:
             if result.status != "failed" or result.name != "changed_files_static":
                 continue
             diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
-            syntax_error = diagnostics.get("static_js_syntax_error")
-            if not isinstance(syntax_error, dict):
+            diagnostic_payload = diagnostics.get("static_js_syntax_error")
+            context_kind = "javascript_syntax"
+            if not isinstance(diagnostic_payload, dict):
+                diagnostic_payload = diagnostics.get("python_name_error")
+                context_kind = "python_import"
+            if not isinstance(diagnostic_payload, dict):
                 continue
-            file_path = self._strip_leading_dot_slash(syntax_error.get("file_path"))
+            file_path = self._strip_leading_dot_slash(diagnostic_payload.get("file_path"))
             if file_path:
                 content = self.workspace_service.try_read_text_file(workspace_id, file_path, run_id=run_id)
                 if content is not None:
@@ -5214,21 +5153,22 @@ class WorkspaceCodeAgentRuntime:
                     "details": result.details,
                     "command": result.command,
                     "logs": list(result.logs or [])[-20:],
-                    "diagnostics": syntax_error,
+                    "diagnostics": diagnostic_payload,
+                    "context_kind": context_kind,
                 }
             )
         if not failures:
             return
-        if any(item.get("tool") == "static_js_failure_context" for item in tool_results if isinstance(item, dict)):
+        if any(item.get("tool") in {"static_js_failure_context", "static_build_failure_context"} for item in tool_results if isinstance(item, dict)):
             return
         tool_results.append(
             {
-                "tool": "static_js_failure_context",
-                "contract": "changed_files_static is a blocking platform syntax check for generated JavaScript.",
+                "tool": "static_build_failure_context",
+                "contract": "changed_files_static is a blocking platform import/syntax check for generated source.",
                 "required_next_action": (
-                    "Patch the exact file_path from diagnostics so node --check passes. "
-                    "Use a targeted hunk patch or full-file replace for that JavaScript file. "
-                    "Do not spend the next turn rewriting unrelated pages or tests while this syntax error remains."
+                    "Patch the exact file_path from diagnostics so the static/import check passes. "
+                    "For JavaScript, make node --check pass. For Python import NameError, define the referenced name before import-time use. "
+                    "Do not spend the next turn rewriting unrelated pages or tests while this blocking static failure remains."
                 ),
                 "failures": failures,
             }
@@ -5255,7 +5195,8 @@ class WorkspaceCodeAgentRuntime:
             "platform.missing_create_get_api",
             "platform.missing_create_post_api",
             "platform.frontend_missing_post_api",
-            "platform.preloaded_domain_data",
+            "platform.preloaded_product_data",
+            "connectivity.missing_backend_route",
         }
         issues: list[dict[str, object]] = []
         for result in latest_execution.results:
@@ -5277,11 +5218,23 @@ class WorkspaceCodeAgentRuntime:
                         "code": code,
                         "location": str(payload.get("location") or ""),
                         "message": str(payload.get("message") or ""),
+                        "repair_recipe": payload.get("repair_recipe") if isinstance(payload.get("repair_recipe"), dict) else None,
                     }
                 )
         if not issues:
             return
-        for path in ["miniapp/app/generated/route_manifest.json", *[str(issue.get("location") or "") for issue in issues]]:
+        target_paths: list[str] = []
+        for issue in issues:
+            recipe = issue.get("repair_recipe") if isinstance(issue.get("repair_recipe"), dict) else {}
+            if isinstance(recipe, dict):
+                frontend_ref = str(recipe.get("frontend_ref") or "").strip()
+                if frontend_ref.startswith("miniapp/"):
+                    target_paths.append(frontend_ref.split(":", 1)[0].strip())
+                suggested = str(recipe.get("suggested_patch_target") or "").strip()
+                if suggested:
+                    target_paths.append(suggested)
+            target_paths.append(str(issue.get("location") or ""))
+        for path in ["miniapp/app/routes/api.py", "miniapp/app/main.py", "miniapp/app/schemas.py", *target_paths]:
             if not path or path in extra_file_context:
                 continue
             content = self.workspace_service.try_read_text_file(workspace_id, path, run_id=run_id)
@@ -5302,8 +5255,8 @@ class WorkspaceCodeAgentRuntime:
                     "For platform.missing_generated_app_tests, create miniapp/tests/test_generated_app.py and miniapp/tests/generated_app.test.mjs. "
                     "For platform.missing_create_get_api/platform.missing_create_post_api, create or register a backend /api route with persistent GET and POST behavior. "
                     "For platform.frontend_missing_post_api, add form/fetch code that POSTs user-provided state to the matching /api route. "
-                    "For platform.preloaded_domain_data, remove hard-coded domain records and start from empty persistent state. "
-                    "For platform.missing_role_workflow_actions on manager, add a real prompt-derived manager control such as refresh/filter/summary/configuration with a guarded JavaScript handler, or a PATCH/PUT action only if the requested flow needs manager mutation. "
+                    "For platform.preloaded_product_data, remove preloaded product records and start from empty persistent state. "
+                    "For connectivity.missing_backend_route, patch either the exact frontend API reference from repair_recipe.frontend_ref or the matching FastAPI route; do not rewrite unrelated UI/tests first. "
                     "Do not rewrite unrelated role pages."
                 ),
                 "issues": issues[:24],
