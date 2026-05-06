@@ -2270,6 +2270,22 @@ class RunService:
             max_attempts=1,
             auto_start=True,
         )
+        run.current_stage = "auto_repair_queued"
+        run.summary = "Strict-green validation did not pass yet. Auto repair continuation was queued from the active repair case."
+        run.updated_at = datetime.now(timezone.utc)
+        self._save_run(run)
+        self._append_job_event(
+            run.linked_job_id,
+            "auto_repair_continuation_queued",
+            "Auto repair continuation queued from active repair case.",
+            {
+                "run_id": run.run_id,
+                "task_id": task.task_id,
+                "repair_case_id": active_case.get("case_id"),
+                "depth": depth + 1,
+                "max_depth": max_depth,
+            },
+        )
         self.store.upsert(
             "reports",
             f"auto_repair_continuation:{run.run_id}",

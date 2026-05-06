@@ -1492,6 +1492,9 @@ def test_run_service_schedules_auto_repair_continuation_from_active_case(tmp_pat
     report = app.state.container.store.get("reports", f"auto_repair_continuation:{run.run_id}")
     assert report["status"] == "scheduled"
     assert report["task_id"] == "task_auto_repair"
+    saved = run_service.get_run(run.run_id)
+    assert saved.current_stage == "auto_repair_queued"
+    assert "Auto repair continuation" in (saved.summary or "")
 
 
 def test_repair_catalog_extracts_nested_workflow_evidence() -> None:
