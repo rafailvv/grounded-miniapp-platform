@@ -34,6 +34,7 @@ from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
 from app.services.miniapp_contract import MiniAppContractCompiler
+from app.services.repair_cases import RepairCaseService
 from app.services.run_protocol import RunProtocolService
 from app.services.run_state_machine import RunStateMachine
 from app.services.workflow_acceptance import build_acceptance_contract, build_implementation_plan, orchestration_metadata_for_contract
@@ -122,10 +123,14 @@ class RunService:
         self.openai_client = openai_client
         self.workspace_log_service = workspace_log_service
         self.run_protocol_service = run_protocol_service
+        self.background_task_service: Any | None = None
         self._active_workers: dict[str, threading.Thread] = {}
         self._startup_started_at = datetime.now(timezone.utc)
         self._recover_orphaned_active_runs()
         self._recover_orphaned_terminal_jobs()
+
+    def attach_background_task_service(self, background_task_service: Any) -> None:
+        self.background_task_service = background_task_service
 
     def stop_run(self, run_id: str) -> RunRecord:
         run = self.get_run(run_id)
@@ -1605,6 +1610,7 @@ class RunService:
             self._store_run_artifacts(run, change_plan, job, preview)
             if run.status in TERMINAL_RUN_STATUSES or run.apply_status in {"applied", "blocked", "failed"}:
                 self._extract_run_memory_stage1(run)
+            self._schedule_auto_repair_continuation_if_needed(run)
             self.store.delete("reports", f"run_stop_request:{run.run_id}")
             logger.info(
                 "run_finished run_id=%s workspace_id=%s status=%s progress=%s",
@@ -2198,6 +2204,102 @@ class RunService:
             artifacts = {}
         payload = WorkspaceMemoryPipeline.extract_run(run, artifacts)
         self.store.upsert("reports", f"memory_stage1:{run.workspace_id}:{run.run_id}", payload)
+
+    def _schedule_auto_repair_continuation_if_needed(self, run: RunRecord) -> None:
+        try:
+            max_depth = int(os.getenv("GROUNDED_AUTO_REPAIR_CONTINUATION_MAX", "1") or "0")
+        except ValueError:
+            max_depth = 1
+        if max_depth <= 0 or self.background_task_service is None:
+            return
+        if run.status not in {"blocked", "failed"} or not run.draft_ready:
+            return
+        if str(run.current_stage or "") == "blocked_provider_quota":
+            return
+        budget_exhausted = (
+            "budget exhausted" in str(run.failure_reason or "").lower()
+            or "token budget exhausted" in str(run.failure_reason or "").lower()
+            or bool((run.budget_status or {}).get("exhausted"))
+            or str(run.current_stage or "") == "blocked_budget_exhausted"
+        )
+        if not budget_exhausted:
+            return
+        if self.store.get("reports", f"auto_repair_continuation:{run.run_id}"):
+            return
+        depth = self._auto_repair_continuation_depth(run)
+        if depth >= max_depth:
+            self.store.upsert(
+                "reports",
+                f"auto_repair_continuation:{run.run_id}",
+                {
+                    "schema": "grounded.auto_repair_continuation.v1",
+                    "status": "skipped",
+                    "reason": "max_depth_reached",
+                    "run_id": run.run_id,
+                    "workspace_id": run.workspace_id,
+                    "depth": depth,
+                    "max_depth": max_depth,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            return
+        repair_cases = RepairCaseService(self.store).list_cases(run.run_id)
+        active_case = repair_cases.get("active_case") if isinstance(repair_cases, dict) else None
+        if not isinstance(active_case, dict):
+            return
+        prompt = (
+            "Continue this failed generation from the active repair case. "
+            "Do not restart product design and do not invent fallback product semantics. "
+            "Patch only the evidence-backed target slice, then rerun the expected proof.\n"
+            f"{json.dumps(active_case.get('repair_prompt') or active_case, ensure_ascii=False, default=str)[:5000]}"
+        )
+        task = self.background_task_service.create_task(
+            workspace_id=run.workspace_id,
+            task_type="repair_failed_run",
+            title="Auto repair continuation",
+            run_id=run.run_id,
+            input_payload={
+                "source_run_id": run.run_id,
+                "prompt": prompt,
+                "auto_continuation": True,
+                "auto_continuation_depth": depth + 1,
+                "repair_case_id": active_case.get("case_id"),
+                "repair_cases_ref": RepairCaseService.index_ref(run.run_id),
+            },
+            owner="agent_auto_repair",
+            max_attempts=1,
+            auto_start=True,
+        )
+        self.store.upsert(
+            "reports",
+            f"auto_repair_continuation:{run.run_id}",
+            {
+                "schema": "grounded.auto_repair_continuation.v1",
+                "status": "scheduled",
+                "run_id": run.run_id,
+                "workspace_id": run.workspace_id,
+                "task_id": task.task_id,
+                "repair_case_id": active_case.get("case_id"),
+                "depth": depth + 1,
+                "max_depth": max_depth,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    def _auto_repair_continuation_depth(self, run: RunRecord) -> int:
+        depth = 0
+        seen: set[str] = set()
+        current: RunRecord | None = run
+        while current and current.resume_from_run_id and current.resume_from_run_id not in seen:
+            seen.add(current.resume_from_run_id)
+            report = self.store.get("reports", f"auto_repair_continuation:{current.resume_from_run_id}")
+            if isinstance(report, dict) and report.get("status") == "scheduled":
+                depth += 1
+            try:
+                current = self.get_run(current.resume_from_run_id)
+            except KeyError:
+                break
+        return depth
 
     def _resolve_intent(self, workspace: WorkspaceRecord, request: CreateRunRequest, *, resolved_role_scope: list[str] | None = None) -> str:
         if request.intent != "auto":

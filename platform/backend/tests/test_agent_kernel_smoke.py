@@ -184,6 +184,26 @@ def test_lsp_static_diagnostics_reports_structured_python_issue(tmp_path: Path) 
     assert result.diagnostics["items"][0]["file"] == "miniapp/app/main.py"
 
 
+def test_lsp_static_diagnostics_checks_role_dom_ids(tmp_path: Path) -> None:
+    static_dir = tmp_path / "miniapp" / "app" / "static" / "client"
+    static_dir.mkdir(parents=True)
+    (static_dir / "index.html").write_text("<main id='client-root'></main>\n", encoding="utf-8")
+    (static_dir / "app.js").write_text(
+        "document.querySelector('#missing-control')?.addEventListener('click', () => {});\n",
+        encoding="utf-8",
+    )
+    runner = object.__new__(CheckRunner)
+
+    result = runner._lsp_static_diagnostics(source_dir=tmp_path)
+
+    assert result.name == "lsp_static_diagnostics"
+    assert result.status == "failed"
+    assert any(
+        item["source"] == "selector_static" and item["code"] == "missing_dom_id"
+        for item in result.diagnostics["items"]
+    )
+
+
 def test_lsp_tool_service_reports_jumpable_changed_file_diagnostics(tmp_path: Path) -> None:
     app_dir = tmp_path / "miniapp" / "app"
     app_dir.mkdir(parents=True)

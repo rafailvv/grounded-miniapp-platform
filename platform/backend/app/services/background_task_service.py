@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import threading
 from typing import Any
 
@@ -8,6 +9,7 @@ from app.models.domain import BackgroundTaskRecord, CreateRunRequest
 from app.repositories.state_store import StateStore
 from app.services.check_runner import CheckRunner
 from app.services.memory_pipeline import WorkspaceMemoryPipeline
+from app.services.repair_cases import RepairCaseService
 from app.services.workspace.preview_service import PreviewService
 from app.services.workspace.run_service import RunService
 from app.services.workspace.service import WorkspaceService
@@ -84,7 +86,13 @@ class BackgroundTaskService:
         if workspace_id:
             items = [item for item in items if item.workspace_id == workspace_id]
         if run_id:
-            items = [item for item in items if item.run_id == run_id]
+            items = [
+                item
+                for item in items
+                if item.run_id == run_id
+                or str(item.input.get("source_run_id") or "") == run_id
+                or str(item.linked_refs.get("source_run_id") or "") == run_id
+            ]
         if status:
             items = [item for item in items if item.status == status]
         items.sort(key=lambda item: item.updated_at, reverse=True)
@@ -266,7 +274,17 @@ class BackgroundTaskService:
         if not source_run_id:
             raise ValueError("repair_failed_run requires source_run_id or run_id.")
         source = self.run_service.get_run(source_run_id)
-        prompt = str(task.input.get("prompt") or f"Repair failed run {source_run_id}: {source.failure_reason or source.summary or source.prompt}")
+        prompt = str(task.input.get("prompt") or "").strip()
+        if not prompt:
+            repair_cases = RepairCaseService(self.store).list_cases(source_run_id)
+            active_case = repair_cases.get("active_case") if isinstance(repair_cases, dict) else None
+            if isinstance(active_case, dict):
+                prompt = (
+                    "Repair the source run from this active repair case. Do not broaden the task.\n"
+                    f"{json.dumps(active_case.get('repair_prompt') or active_case, ensure_ascii=False, default=str)[:5000]}"
+                )
+        if not prompt:
+            prompt = f"Repair failed run {source_run_id}: {source.failure_reason or source.summary or source.prompt}"
         request = CreateRunRequest(
             prompt=prompt,
             mode="fix",

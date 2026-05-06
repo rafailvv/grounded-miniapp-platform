@@ -1348,6 +1348,152 @@ def test_repair_case_service_blocks_repeated_patch_attempts(tmp_path: Path) -> N
     assert attempts["items"][0]["forbidden_repeat_action"]["type"] == "same_patch_sha256"
 
 
+def test_repair_case_service_focuses_latest_check_cases_and_sets_next_action(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    service = app.state.container.repair_case_service
+    run = RunRecord(workspace_id="ws_1", prompt="Build a prompt-derived workflow", intent="create", status="blocked")
+
+    first = service.sync_from_packets(
+        workspace_id=run.workspace_id,
+        run_id=run.run_id,
+        packets=[
+            {
+                "signature": "frontend.old_blocker",
+                "failure_class": "frontend_interaction_static_smoke",
+                "severity": "high",
+                "target_files": ["miniapp/app/static/client/app.js"],
+                "verification_check": "frontend_interaction_static_smoke",
+            }
+        ],
+        source="agent_loop_checks",
+    )
+    old_case_id = first["active_case"]["case_id"]
+    plan = service.sync_from_packets(
+        workspace_id=run.workspace_id,
+        run_id=run.run_id,
+        packets=[
+            {
+                "signature": "generation.invalid_edit_operation:patch_conflict",
+                "failure_class": "generation.invalid_edit_operation",
+                "severity": "high",
+                "target_files": ["miniapp/app/static/manager/app.js"],
+                "verification_check": "repair_case_attempt_ledger",
+            }
+        ],
+        source="agent_loop_plan",
+    )
+    plan_case_id = plan["active_case"]["case_id"]
+
+    latest = service.sync_from_packets(
+        workspace_id=run.workspace_id,
+        run_id=run.run_id,
+        packets=[
+            {
+                "signature": "frontend.current_blocker",
+                "failure_class": "platform_invariants",
+                "severity": "high",
+                "target_files": ["miniapp/app/static/manager/app.js"],
+                "verification_check": "platform_invariants",
+            }
+        ],
+        source="agent_loop_checks",
+    )
+
+    old_case = service.get_case(run.run_id, old_case_id)
+    plan_case = service.get_case(run.run_id, plan_case_id)
+    assert old_case["status"] == "superseded"
+    assert plan_case["status"] == "superseded"
+    assert latest["active_case"]["failure_signature"] == "frontend.current_blocker"
+    assert latest["active_case"]["next_action"]["target_files"] == ["miniapp/app/static/manager/app.js"]
+    assert latest["active_case"]["repair_prompt"]["sections"]["next_action"]["action"]
+
+
+def test_repair_case_service_expands_role_directory_evidence_targets(tmp_path: Path) -> None:
+    app = create_app(data_dir=tmp_path)
+    service = app.state.container.repair_case_service
+    run = RunRecord(workspace_id="ws_1", prompt="Build a prompt-derived workflow", intent="create", status="blocked")
+
+    cases = service.sync_from_packets(
+        workspace_id=run.workspace_id,
+        run_id=run.run_id,
+        packets=[
+            {
+                "signature": "frontend.raw_status_rendered_to_user.manager",
+                "failure_class": "platform_invariants",
+                "severity": "high",
+                "verification_check": "platform_invariants",
+                "evidence": {
+                    "validator_issue": {
+                        "code": "platform.raw_status_rendered_to_user",
+                        "location": "miniapp/app/static/manager",
+                    }
+                },
+            }
+        ],
+        source="agent_loop_checks",
+    )
+
+    target_files = cases["active_case"]["target_files"]
+    assert "miniapp/app/static/manager/app.js" in target_files
+    assert "miniapp/app/static/manager/index.html" in target_files
+    assert cases["active_case"]["next_action"]["first_tool"] == "read_files"
+
+
+def test_run_service_schedules_auto_repair_continuation_from_active_case(tmp_path: Path, monkeypatch) -> None:
+    app = create_app(data_dir=tmp_path)
+    run_service = app.state.container.run_service
+    repair_service = app.state.container.repair_case_service
+    run = RunRecord(
+        workspace_id="ws_1",
+        prompt="Build a prompt-derived workflow",
+        intent="create",
+        status="blocked",
+        apply_status="blocked",
+        draft_ready=True,
+        draft_status="ready",
+        failure_reason="Generation token budget exhausted: 1200001/1200000 tokens.",
+    )
+    repair_service.sync_from_packets(
+        workspace_id=run.workspace_id,
+        run_id=run.run_id,
+        packets=[
+            {
+                "signature": "frontend.raw_status_rendered_to_user.manager",
+                "failure_class": "platform_invariants",
+                "severity": "high",
+                "target_files": ["miniapp/app/static/manager/app.js"],
+                "verification_check": "platform_invariants",
+            }
+        ],
+        source="agent_loop_checks",
+    )
+
+    class FakeBackgroundTaskService:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def create_task(self, **kwargs):
+            self.calls.append(kwargs)
+            return type("Task", (), {"task_id": "task_auto_repair"})()
+
+    fake = FakeBackgroundTaskService()
+    monkeypatch.setenv("GROUNDED_AUTO_REPAIR_CONTINUATION_MAX", "1")
+    run_service.attach_background_task_service(fake)
+
+    run_service._schedule_auto_repair_continuation_if_needed(run)
+
+    assert fake.calls
+    call = fake.calls[0]
+    assert call["task_type"] == "repair_failed_run"
+    assert call["auto_start"] is True
+    assert call["input_payload"]["source_run_id"] == run.run_id
+    assert call["input_payload"]["repair_case_id"]
+    assert "repair_prompt" in call["input_payload"]["prompt"] or "grounded.repair_prompt.v1" in call["input_payload"]["prompt"]
+    report = app.state.container.store.get("reports", f"auto_repair_continuation:{run.run_id}")
+    assert report["status"] == "scheduled"
+    assert report["task_id"] == "task_auto_repair"
+
+
 def test_repair_catalog_extracts_nested_workflow_evidence() -> None:
     packets = RepairCatalog.classify_many(
         [

@@ -3449,6 +3449,12 @@ class WorkspaceCodeAgentRuntime:
             generated_tests_repair or browser_step_repair or (compact_repair_prompt and repeated_no_progress > 0)
         ):
             forced_registry_tools = {"apply_patch_to_draft", "write_file"}
+        active_repair_case_payload = self._active_repair_case_payload(repair_packets or [])
+        active_repair_next_action = (
+            active_repair_case_payload.get("next_action")
+            if isinstance(active_repair_case_payload.get("next_action"), dict)
+            else {}
+        )
         payload = {
             "task": "Edit the draft workspace to satisfy the user prompt and pass platform invariant checks.",
             "workspace_id": workspace_id,
@@ -3501,6 +3507,11 @@ class WorkspaceCodeAgentRuntime:
                 max_chars=2400 if compact_repair_prompt else 3600,
                 max_items=6,
             ),
+            "active_repair_case": self._compact_jsonish(
+                active_repair_case_payload,
+                max_chars=2200 if compact_repair_prompt else 3200,
+                max_items=8,
+            ),
             "next_forced_action": self._compact_jsonish(
                 next_forced_action or {},
                 max_chars=1200,
@@ -3530,6 +3541,9 @@ class WorkspaceCodeAgentRuntime:
                 forced_registry_tools
             ),
             "repair_focus": (
+                str(active_repair_next_action.get("instruction") or active_repair_next_action.get("action") or "")
+                if active_repair_next_action
+                else
                 str((next_forced_action or {}).get("repair_focus") or "")
                 if isinstance(next_forced_action, dict) and next_forced_action.get("active")
                 else
@@ -3639,6 +3653,28 @@ class WorkspaceCodeAgentRuntime:
             ),
         }
         return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _active_repair_case_payload(repair_packets: list[dict[str, Any]]) -> dict[str, Any]:
+        for packet in repair_packets:
+            if not isinstance(packet, dict):
+                continue
+            prompt = packet.get("repair_prompt")
+            if not isinstance(prompt, dict):
+                continue
+            sections = prompt.get("sections") if isinstance(prompt.get("sections"), dict) else {}
+            next_action = prompt.get("next_action") if isinstance(prompt.get("next_action"), dict) else sections.get("next_action")
+            return {
+                "case_id": prompt.get("case_id") or packet.get("repair_case_id"),
+                "failure": prompt.get("failure") or sections.get("failure") or packet.get("failure_signature"),
+                "target_files": prompt.get("target_files") or sections.get("target_files") or packet.get("target_files") or [],
+                "allowed_edit_slice": prompt.get("allowed_edit_slice") or sections.get("allowed_edit_slice") or [],
+                "next_action": next_action if isinstance(next_action, dict) else {},
+                "expected_proof": prompt.get("expected_proof") or sections.get("expected_proof") or [],
+                "attempt_count": prompt.get("attempt_count") or packet.get("attempt_count") or 0,
+                "forbidden_repeat_action": prompt.get("forbidden_repeat_action") or packet.get("forbidden_repeat_action") or "",
+            }
+        return {}
 
     @staticmethod
     def _agent_tool_registry_payload(allowed: set[str] | None = None) -> dict[str, dict[str, object]]:

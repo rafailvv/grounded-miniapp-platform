@@ -139,6 +139,15 @@ class AgentToolCallLoop:
                 path = match.group("path").replace("\\", "/")
                 if path not in paths:
                     paths.append(path)
+            for match in re.finditer(r"(?P<path>miniapp/app/static/(?P<role>client|specialist|manager))(?![A-Za-z0-9_./-])", str(text or "")):
+                role = match.group("role")
+                for path in (
+                    f"miniapp/app/static/{role}/index.html",
+                    f"miniapp/app/static/{role}/app.js",
+                    f"miniapp/app/static/{role}/styles.css",
+                ):
+                    if path not in paths:
+                        paths.append(path)
         return paths[:8]
 
     @staticmethod

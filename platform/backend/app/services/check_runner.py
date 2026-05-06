@@ -32,6 +32,7 @@ from app.validators.static_analysis import (
     extract_js_dom_ids,
     extract_script_refs,
     normalize_api_path,
+    role_html_ids,
     role_static_root,
 )
 from app.validators.suite import ValidationSuite
@@ -1024,6 +1025,27 @@ class CheckRunner:
                     severity="high" if blocking else "medium",
                     location=js_path.relative_to(js_path.parents[4]).as_posix(),
                     blocking=blocking,
+                    repair_recipe={
+                        "recipe_id": "frontend.selector_wiring",
+                        "failure_class": "frontend_interaction_static_smoke",
+                        "failure_signature": f"frontend.selector_matches_no_html.{role}",
+                        "required_next_tool": "read_files",
+                        "suggested_tool_after_read": "apply_patch_to_draft_or_write_file",
+                        "target_files": [
+                            js_path.relative_to(js_path.parents[4]).as_posix(),
+                            f"miniapp/app/static/{role}/index.html",
+                        ],
+                        "verification_check": "frontend_interaction_static_smoke",
+                        "verification_command": "run_checks frontend_interaction_static_smoke",
+                        "retry_policy": "deterministic_repair",
+                        "deterministic": True,
+                        "retryable": True,
+                        "instruction": (
+                            "Align the queried selector with real role HTML: either add the visible control when the workflow requires it, "
+                            "or change the JavaScript to bind the existing prompt-owned control. Keep the edit inside this role surface."
+                        ),
+                        "evidence": {"role": role, "selector": selector, "blocking": blocking},
+                    },
                 )
             )
         return issues
@@ -4255,6 +4277,27 @@ except Exception as exc:
                         severity="high",
                         location=f"miniapp/app/static/{role}",
                         blocking=True,
+                        repair_recipe={
+                            "recipe_id": "frontend.humanize_persisted_values",
+                            "failure_class": "platform_invariants",
+                            "failure_signature": f"frontend.raw_status_rendered_to_user.{role}",
+                            "required_next_tool": "read_files",
+                            "suggested_tool_after_read": "apply_patch_to_draft_or_write_file",
+                            "target_files": [
+                                f"miniapp/app/static/{role}/app.js",
+                                f"miniapp/app/static/{role}/index.html",
+                            ],
+                            "verification_check": "platform_invariants",
+                            "verification_command": "run_checks platform_invariants",
+                            "retry_policy": "deterministic_repair",
+                            "deterministic": True,
+                            "retryable": True,
+                            "instruction": (
+                                "Map persisted enum/code values to polished user-facing labels before rendering. "
+                                "Do not expose raw status, priority, route, role, or API implementation values in visible UI copy."
+                            ),
+                            "evidence": {"role": role, "markers": raw_status_markers},
+                        },
                     )
                 )
                 continue

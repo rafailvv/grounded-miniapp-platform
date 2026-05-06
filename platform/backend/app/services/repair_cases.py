@@ -27,16 +27,36 @@ def _clean_path(value: object) -> str:
     path = str(value or "").strip().replace("\\", "/")
     while path.startswith("./"):
         path = path[2:]
+    if path.startswith("miniapp/") and ":" in path:
+        path = path.split(":", 1)[0].strip()
     return path
+
+
+def _expanded_paths(value: object) -> list[str]:
+    path = _clean_path(value)
+    if not path.startswith("miniapp/"):
+        return []
+    role_dir = re.fullmatch(r"miniapp/app/static/(client|specialist|manager)/?", path)
+    if role_dir:
+        role = role_dir.group(1)
+        return [
+            f"miniapp/app/static/{role}/index.html",
+            f"miniapp/app/static/{role}/app.js",
+            f"miniapp/app/static/{role}/styles.css",
+        ]
+    route_dir = re.fullmatch(r"miniapp/app/routes/?", path)
+    if route_dir:
+        return ["miniapp/app/routes/api.py", "miniapp/app/main.py"]
+    return [path]
 
 
 def _paths_from_any(value: Any) -> list[str]:
     paths: list[str] = []
 
     def add(candidate: object) -> None:
-        path = _clean_path(candidate)
-        if path.startswith("miniapp/") and path not in paths:
-            paths.append(path)
+        for path in _expanded_paths(candidate):
+            if path not in paths:
+                paths.append(path)
 
     def visit(item: Any) -> None:
         if item is None:
@@ -44,6 +64,10 @@ def _paths_from_any(value: Any) -> list[str]:
         if isinstance(item, str):
             for match in re.finditer(r"(miniapp/[A-Za-z0-9_./-]+\.(?:py|js|mjs|html|css|json))", item):
                 add(match.group(1))
+            for match in re.finditer(r"(miniapp/app/static/(?:client|specialist|manager))(?![A-Za-z0-9_./-])", item):
+                add(match.group(1))
+            if re.fullmatch(r"\s*miniapp/app/static/(?:client|specialist|manager)/?\s*", item):
+                add(item)
             return
         if isinstance(item, dict):
             for key in ("path", "file", "file_path", "location", "frontend_ref", "suggested_patch_target"):
@@ -111,6 +135,7 @@ class RepairPromptBuilder:
             "forbidden_files": forbidden_files,
             "first_tool": first_tool,
             "allowed_edit_slice": case.get("allowed_edit_slice") or target_files,
+            "next_action": case.get("next_action") or {},
             "expected_proof": case.get("expected_proof") or [],
             "retry_policy": case.get("retry_policy") or {},
         }
@@ -126,6 +151,7 @@ class RepairPromptBuilder:
             "forbidden_files": forbidden_files,
             "first_tool": first_tool,
             "allowed_edit_slice": sections["allowed_edit_slice"],
+            "next_action": sections["next_action"],
             "expected_proof": sections["expected_proof"],
             "retry_policy": sections["retry_policy"],
             "attempt_count": len(case.get("attempts") or []),
@@ -192,25 +218,50 @@ class RepairCaseService:
     ) -> dict[str, Any]:
         if not packets:
             return self.list_cases(run_id)
-        existing_by_id = {
-            str(item.get("case_id")): item
+        existing_items = [
+            item
             for item in self.list_cases(run_id).get("items") or []
             if isinstance(item, dict)
+        ]
+        existing_by_id = {
+            str(item.get("case_id")): item
+            for item in existing_items
         }
         case_refs: list[str] = []
         values: dict[str, dict[str, Any]] = {}
+        current_case_ids: set[str] = set()
         for packet in packets:
             if not isinstance(packet, dict):
                 continue
             case = self._case_from_packet(workspace_id=workspace_id, run_id=run_id, packet=packet, source=source, trace_state=trace_state)
+            current_case_ids.add(str(case["case_id"]))
             existing = existing_by_id.get(str(case["case_id"]))
             if existing:
                 case["attempts"] = list(existing.get("attempts") or [])
                 case["created_at"] = existing.get("created_at") or case["created_at"]
-                case["status"] = existing.get("status") if existing.get("status") in {"failed_attempt", "blocked"} else case["status"]
+                if existing.get("status") in {"failed_attempt", "blocked"}:
+                    case["status"] = existing.get("status")
+            case["current"] = True
+            case["last_seen_at"] = _now()
             ref = self.case_ref(workspace_id, run_id, str(case["case_id"]))
             case_refs.append(ref)
             values[ref] = case
+        if source == "agent_loop_checks":
+            for existing in existing_items:
+                case_id = str(existing.get("case_id") or "")
+                if not case_id or case_id in current_case_ids:
+                    continue
+                if str(existing.get("source") or "") not in {"agent_loop_checks", "agent_loop_plan", "agent_loop_runtime"}:
+                    continue
+                if str(existing.get("status") or "open") in {"repaired", "resolved", "superseded", "stale"}:
+                    continue
+                existing = dict(existing)
+                existing["current"] = False
+                existing["status"] = "superseded"
+                existing["superseded_at"] = _now()
+                existing["superseded_reason"] = "not_present_in_latest_check_packet_set"
+                existing["updated_at"] = _now()
+                values[self.case_ref(workspace_id, run_id, case_id)] = existing
         if values:
             self.store.upsert_many("reports", values)
         all_refs = list(dict.fromkeys([*(self.store.get("reports", self.index_ref(run_id)) or {}).get("case_refs", []), *case_refs]))
@@ -280,6 +331,7 @@ class RepairCaseService:
         case["attempts"] = attempts[-20:]
         case["status"] = "failed_attempt" if payload["status"] in {"failed", "blocked", "conflict"} else case.get("status") or "open"
         case["updated_at"] = _now()
+        case["next_action"] = self._next_action(case)
         case["repair_prompt"] = RepairPromptBuilder.build(case)
         self.store.upsert("reports", self.case_ref(workspace_id, run_id, case_id), case)
         return case
@@ -365,6 +417,8 @@ class RepairCaseService:
             },
         }
         retry_policy = cls._retry_policy(packet)
+        if target_files and retry_policy.get("first_tool") == "semantic_scan":
+            retry_policy = {**retry_policy, "first_tool": "read_files"}
         case = {
             "schema": REPAIR_CASE_SCHEMA,
             "case_id": case_id,
@@ -386,11 +440,47 @@ class RepairCaseService:
             "attempts": [],
             "evidence": _compact_evidence(evidence),
             "forbidden_repeat_action": "Do not repeat the same patch hash, same stale edit payload, or same broad rewrite for this case.",
+            "current": True,
+            "last_seen_at": _now(),
             "created_at": _now(),
             "updated_at": _now(),
         }
+        case["next_action"] = cls._next_action(case)
         case["repair_prompt"] = RepairPromptBuilder.build(case)
         return case
+
+    @staticmethod
+    def _next_action(case: dict[str, Any]) -> dict[str, Any]:
+        retry_policy = case.get("retry_policy") if isinstance(case.get("retry_policy"), dict) else {}
+        target_files = list(case.get("target_files") or [])
+        first_tool = str(case.get("required_next_tool") or retry_policy.get("first_tool") or ("read_files" if target_files else "semantic_scan"))
+        expected_proof = list(case.get("expected_proof") or [])
+        verification_check = ""
+        if expected_proof and isinstance(expected_proof[0], dict):
+            verification_check = str(expected_proof[0].get("value") or "")
+        attempt_count = len(case.get("attempts") or [])
+        if attempt_count >= 3:
+            action = "fresh_context_repair"
+            instruction = (
+                "Stop broad retry. Re-read only the target files, compare the latest failed proof against the last attempt, "
+                "then use a different constrained patch or hand off this exact case to repair_worker."
+            )
+        elif first_tool in {"lsp.diagnostics", "lsp.route_static_context", "semantic_scan"}:
+            action = "collect_exact_evidence"
+            instruction = "Collect exact diagnostics/context for the target slice before patching; do not inspect unrelated files."
+        else:
+            action = "patch_constrained_slice"
+            instruction = "Read the target files if needed, patch only the allowed edit slice, then rerun the expected proof check."
+        return {
+            "action": action,
+            "first_tool": first_tool,
+            "target_files": target_files[:12],
+            "forbidden_files": list(case.get("forbidden_files") or [])[:12],
+            "verification_check": verification_check,
+            "instruction": instruction,
+            "attempt_count": attempt_count,
+            "retry_policy_id": str(retry_policy.get("policy_id") or case.get("retry_policy") or "evidence_driven_repair_case"),
+        }
 
     @staticmethod
     def _retry_policy(packet: dict[str, Any]) -> dict[str, Any]:
@@ -445,11 +535,31 @@ class RepairCaseService:
 
     @staticmethod
     def _active_case(items: list[dict[str, Any]]) -> dict[str, Any] | None:
-        open_items = [item for item in items if str(item.get("status") or "open") not in {"repaired", "resolved"}]
+        inactive = {"repaired", "resolved", "superseded", "stale", "closed"}
+        open_items = [item for item in items if str(item.get("status") or "open") not in inactive]
         if not open_items:
             return None
-        return sorted(open_items, key=lambda item: (RepairCaseService._severity_rank(item.get("severity")), len(item.get("attempts") or [])))[0]
+        return sorted(
+            open_items,
+            key=lambda item: (
+                0 if item.get("current") else 1,
+                RepairCaseService._source_rank(item.get("source")),
+                RepairCaseService._severity_rank(item.get("severity")),
+                0 if item.get("target_files") else 1,
+                len(item.get("attempts") or []),
+                str(item.get("updated_at") or ""),
+            ),
+        )[0]
 
     @staticmethod
     def _severity_rank(value: object) -> int:
         return {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(str(value or "").lower(), 4)
+
+    @staticmethod
+    def _source_rank(value: object) -> int:
+        return {
+            "agent_loop_checks": 0,
+            "review": 1,
+            "agent_loop_runtime": 2,
+            "agent_loop_plan": 3,
+        }.get(str(value or ""), 4)

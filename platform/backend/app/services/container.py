@@ -111,6 +111,7 @@ class ServiceContainer:
             preview_service=self.preview_service,
             check_runner=self.check_runner,
         )
+        self.run_service.attach_background_task_service(self.background_task_service)
         self.workbench_service = WorkbenchService(
             settings=self.settings,
             store=self.store,
